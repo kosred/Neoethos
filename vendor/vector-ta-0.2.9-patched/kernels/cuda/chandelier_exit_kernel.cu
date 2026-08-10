@@ -386,3 +386,234 @@ extern "C" __global__ void chandelier_exit_many_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — chandelier_exit
+// ===========================================================================
+// Reference: src/indicators/chandelier_exit.rs
+//   `ce_first_valid`             (:626) — the first-valid rule
+//   `ce_prepare`                 (:646) — refusals, warm = first + period - 1
+//   `chandelier_exit_with_kernel`(:882) — the ATR call and the stop recurrence
+//   src/indicators/atr.rs
+//   `first_valid_hlc`            (:197) — ATR's OWN first-valid
+//   `atr_compute_into_scalar`    (:319) — the Wilder seed and update
+//   Batch route: `cpu_batch.rs:14231` sweeps `period`; mult = 3.0,
+//   use_close = true, and the "value" output is `long_stop` (`:14263`).
+//
+// FIRST-VALID: `HlcCloseOnly`, NOT the common rule.
+//   With `use_close == true` — the batch default — `ce_first_valid` returns
+//   `close.iter().position(|x| !x.is_nan())` and NEVER LOOKS AT high or low.
+//   That is the `adxr` rule. (With `use_close == false` it would be the MIN of
+//   the three firsts, which is a fourth rule again and is unreachable from the
+//   batch route; the kernel implements it anyway so the branch is not a trap.)
+//
+// TWO DIFFERENT FIRST-VALID INDICES LIVE IN THIS ONE KERNEL.
+//   The stop recurrence uses `ce_first_valid`. The ATR it consumes is produced
+//   by `atr_with_kernel`, which computes its own `first_valid_hlc` — all three
+//   series non-NaN SIMULTANEOUSLY — and its own warmup off that. On a frame
+//   where high or low starts later than close the two indices differ, and
+//   using one for both would move the ATR seed window. Both are derived inside
+//   the kernel from the arrays it already has; the host's `first_valid` is
+//   used only as a bounds check.
+//
+// ROUNDINGS.
+//   ATR seed:  sum_tr accumulated ascending, then `rma = sum_tr / length` (1).
+//   ATR step:  `rma = (-alpha).mul_add(rma, rma) + alpha * tr` — fma, mul, add,
+//              THREE. NOT `(tr - rma).mul_add(alpha, rma)`, which is two. This
+//              is the same class of error the brief names in natr; here the
+//              CPU is the one taking three, so the kernel takes three.
+//   stops:     `ls0 = ai.mul_add(-mult, highest)` and
+//              `ss0 = ai.mul_add(mult, lowest)` — ONE fma each.
+//
+// `ls0.max(lsp)` / `ss0.min(ssp)` ARE `f64::max` / `f64::min` — they return the
+// non-NaN operand — so they become `fmax` / `fmin`. The `if` guards around
+// them (`close[i-1] > lsp`) are plain comparisons and stay plain.
+//
+// THE TRUE-RANGE MAX INSIDE ATR IS AN IF-CHAIN (`if hc > tr { tr = hc }`), so
+// a NaN `hc` leaves `tr` alone — deliberately NOT fmax, which would be the
+// same thing here only by accident of which operand is NaN.
+// ===========================================================================
+
+#define CE_MAX_PERIOD 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_chandelier_exit_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+    const double mult = 3.0;        // ChandelierExitParams::get_mult -> 3.0
+    const bool use_close = true;    // ... ::get_use_close -> true
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) || (period > CE_MAX_PERIOD) ||
+        (first_valid < 0) || (first_valid >= n);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+
+    // ---- ce_first_valid -------------------------------------------------
+    int fc = -1;
+    for (int i = 0; i < n; ++i) { if (!isnan(close[i])) { fc = i; break; } }
+    int first;
+    if (use_close) {
+        if (fc < 0) return;
+        first = fc;
+    } else {
+        int fh = -1, fl = -1;
+        for (int i = 0; i < n; ++i) { if (!isnan(high[i])) { fh = i; break; } }
+        for (int i = 0; i < n; ++i) { if (!isnan(low[i]))  { fl = i; break; } }
+        if (fh < 0 || fl < 0 || fc < 0) return;
+        first = fh < fl ? fh : fl;
+        if (fc < first) first = fc;
+    }
+    if ((n - first) < period) return;
+
+    const int warm = first + period - 1;
+
+    // ---- ATR, with its OWN first_valid and warmup ------------------------
+    // `atr_with_kernel` allocates a NaN prefix to `atr_warm` and writes from
+    // there; values before it are NaN and feed the stop formula as NaN, which
+    // is exactly what the CPU does.
+    int atr_first = n;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(high[i]) && !isnan(low[i]) && !isnan(close[i])) { atr_first = i; break; }
+    }
+    if (atr_first >= n) return;
+    if ((n - atr_first) < period) return;
+    const int atr_warm = atr_first + period - 1;
+    if (atr_warm >= n) return;
+
+    const double alpha = 1.0 / (double)period;
+
+    // ---- the stop recurrence, with ATR computed in step ------------------
+    // ATR is a strictly forward recurrence and the stop loop walks the same
+    // bars forward, so it is produced inline rather than in a scratch matrix.
+    // Its seed needs bars [atr_first, atr_warm], which the loop reaches before
+    // the first bar it is read at only when atr_warm <= warm; when it does not,
+    // the seed is finished in this pre-pass instead.
+    double sum_tr = high[atr_first] - low[atr_first];
+    if (atr_warm > atr_first) {
+        double prev_c = close[atr_first];
+        for (int i = atr_first + 1; i <= atr_warm; ++i) {
+            const double hi = high[i];
+            const double lo = low[i];
+            double tr = hi - lo;
+            const double hc = fabs(hi - prev_c);
+            if (hc > tr) tr = hc;
+            const double lc = fabs(lo - prev_c);
+            if (lc > tr) tr = lc;
+            sum_tr += tr;
+            prev_c = close[i];
+        }
+    }
+    double rma = sum_tr / (double)period;
+    double atr_prev_c = (atr_warm + 1 > 0) ? close[atr_warm] : close[0];
+    int atr_next = atr_warm + 1;
+
+    double long_raw_prev = neo_s2_qnan();
+    double short_raw_prev = neo_s2_qnan();
+    int prev_dir = 1;
+
+    // Monotone deques over the max/min source. `cap` is the CPU's
+    // `period.next_power_of_two()`, and the head/tail are free-running
+    // counters masked into it — reproduced so the wrap behaviour matches.
+    int cap = 1;
+    while (cap < period) cap <<= 1;
+    const int mask = cap - 1;
+    int dq_max[CE_MAX_PERIOD * 2];
+    int dq_min[CE_MAX_PERIOD * 2];
+    unsigned hmax = 0u, tmax = 0u, hmin = 0u, tmin = 0u;
+
+    const double* src_max = use_close ? close : high;
+    const double* src_min = use_close ? close : low;
+
+    for (int i = 0; i < n; ++i) {
+        // Keep the ATR up to date for bar i.
+        while (atr_next <= i && atr_next < n) {
+            const int k = atr_next;
+            const double hi = high[k];
+            const double lo = low[k];
+            double tr = hi - lo;
+            const double hc = fabs(hi - atr_prev_c);
+            if (hc > tr) tr = hc;
+            const double lc = fabs(lo - atr_prev_c);
+            if (lc > tr) tr = lc;
+            rma = fma(-alpha, rma, rma) + alpha * tr;
+            atr_prev_c = close[k];
+            atr_next += 1;
+        }
+        const double ai = (i < atr_warm) ? neo_s2_qnan() : rma;
+
+        while (hmax != tmax) {
+            const int idx = dq_max[hmax & mask];
+            if (idx + period <= i) hmax += 1u; else break;
+        }
+        while (hmin != tmin) {
+            const int idx = dq_min[hmin & mask];
+            if (idx + period <= i) hmin += 1u; else break;
+        }
+
+        const double v_max = src_max[i];
+        if (!isnan(v_max)) {
+            while (hmax != tmax) {
+                const unsigned back_pos = (tmax - 1u) & (unsigned)mask;
+                if (src_max[dq_max[back_pos]] < v_max) tmax -= 1u; else break;
+            }
+            dq_max[tmax & mask] = i;
+            tmax += 1u;
+        }
+        const double v_min = src_min[i];
+        if (!isnan(v_min)) {
+            while (hmin != tmin) {
+                const unsigned back_pos = (tmin - 1u) & (unsigned)mask;
+                if (src_min[dq_min[back_pos]] > v_min) tmin -= 1u; else break;
+            }
+            dq_min[tmin & mask] = i;
+            tmin += 1u;
+        }
+
+        if (i < warm) continue;
+
+        const double highest = (hmax != tmax) ? src_max[dq_max[hmax & mask]] : neo_s2_qnan();
+        const double lowest  = (hmin != tmin) ? src_min[dq_min[hmin & mask]] : neo_s2_qnan();
+
+        const double ls0 = fma(ai, -mult, highest);
+        const double ss0 = fma(ai, mult, lowest);
+
+        const double lsp = (i == warm || isnan(long_raw_prev))  ? ls0 : long_raw_prev;
+        const double ssp = (i == warm || isnan(short_raw_prev)) ? ss0 : short_raw_prev;
+
+        const double ls = (i > warm && close[i - 1] > lsp) ? fmax(ls0, lsp) : ls0;
+        const double ss = (i > warm && close[i - 1] < ssp) ? fmin(ss0, ssp) : ss0;
+
+        int d;
+        if (close[i] > ssp)      d = 1;
+        else if (close[i] < lsp) d = -1;
+        else                     d = prev_dir;
+
+        long_raw_prev = ls;
+        short_raw_prev = ss;
+        prev_dir = d;
+
+        row[i] = (d == 1) ? ls : neo_s2_qnan();
+    }
+}

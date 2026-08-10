@@ -307,3 +307,227 @@ void kama_many_series_one_param_time_major_f32(
         prev_price = price;
     }
 }
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/moving_averages/kama.rs
+//   * kama_prepare (:190) — first_valid = first non-NaN of the source.
+//   * kama_with_kernel (:255) — warm = first + period; the NaN prefix is that
+//     long and out[first + period] is the SEED, written as the raw price.
+//   * kama_scalar (:312) — the arithmetic reproduced below.
+//
+// ROUNDING COUNT. Two fused steps on the CPU, both reproduced as fma():
+//     let t = er.mul_add(const_diff, const_max);   -> fma(er, const_diff, const_max)
+//     kama = (price - kama).mul_add(sc, kama);     -> fma(price - kama, sc, kama)
+// Everything else is a plain operation and -fmad=false keeps it unfused.
+//
+// const_max and const_diff are the CPU's exact expressions, NOT decimal
+// approximations: 2.0/(30.0+1.0) and (2.0/(2.0+1.0)) - const_max. Writing
+// 0.06451612903225806 instead would be a different double.
+//
+// The er guard is an EXACT ZERO test (sum_roc1 == 0.0), not a tolerance. There
+// is no epsilon here to re-derive for f64 — inventing one would change which
+// bars take the branch.
+//
+// Sequential: kama, sum_roc1 and the trailing window carry across bars.
+// One thread per column.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_kama() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__
+void neoethos_kama_f64(const double* __restrict__ prices,
+                       int n,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const double QNAN = nef_qnan_kama();
+
+    const int period = periods[r];
+    if (period <= 0 || first_valid < 0 || first_valid >= n) {
+        for (int i = 0; i < n; ++i) row[i] = QNAN;
+        return;
+    }
+
+    // kama.rs:255 — warm = first + period.
+    const int warm = (first_valid + period) < n ? (first_valid + period) : n;
+    for (int i = 0; i < warm; ++i) row[i] = QNAN;
+
+    const int lookback = period - 1;
+    const int initial_idx = first_valid + lookback + 1;
+    if (initial_idx >= n) return;
+
+    const double const_max = 2.0 / (30.0 + 1.0);
+    const double const_diff = (2.0 / (2.0 + 1.0)) - const_max;
+
+    double sum_roc1 = 0.0;
+    const int today = first_valid;
+    {
+        double prev = prices[today];
+        for (int i = 0; i <= lookback; ++i) {
+            const double next = prices[today + i + 1];
+            sum_roc1 += fabs(next - prev);
+            prev = next;
+        }
+    }
+
+    double kama = prices[initial_idx];
+    row[initial_idx] = kama;
+
+    int trailing_idx = today;
+    double trailing_value = prices[trailing_idx];
+
+    for (int i = initial_idx + 1; i < n; ++i) {
+        const double price_prev = prices[i - 1];
+        const double price = prices[i];
+
+        const double next_tail = prices[trailing_idx + 1];
+        const double old_diff = fabs(next_tail - trailing_value);
+        const double new_diff = fabs(price - price_prev);
+        sum_roc1 += new_diff - old_diff;
+
+        trailing_value = next_tail;
+        trailing_idx += 1;
+
+        const double direction = fabs(price - next_tail);
+        const double er = (sum_roc1 == 0.0) ? 0.0 : (direction / sum_roc1);
+        const double t = fma(er, const_diff, const_max);
+        const double sc = t * t;
+
+        kama = fma(price - kama, sc, kama);
+        row[i] = kama;
+    }
+}
+
+
+
+// ===========================================================================
+// S1 f64 LANE  --  kama
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/moving_averages/kama.rs -- `kama_scalar` (:312), `kama_prepare` (:191), `kama_with_kernel` (:256)
+//
+// PERIOD-BASED via `compute_ma_batch`.
+//
+// ARITHMETIC ORDER -- two `mul_add`s, ONE rounding each:
+//   `t = er.mul_add(const_diff, const_max)` then `sc = t * t`.
+//   `kama = (price - kama).mul_add(sc, kama)` -- the same one-rounding shape
+//   the brief names for `natr`. `kama + (price - kama) * sc` would be two.
+// The constants are computed exactly as the CPU spells them:
+//   `const_max  = 2.0 / (30.0 + 1.0)`
+//   `const_diff = (2.0 / (2.0 + 1.0)) - const_max`
+// -- NOT pre-folded to decimal literals, because 2/31 and 2/3 are not
+// representable and a decimal literal would be a different double.
+//
+// THE EFFICIENCY-RATIO SUM slides with `sum_roc1 += new_diff - old_diff`: a
+// subtract then an add, in that order, and the trailing value is taken from
+// the data BEFORE the pointer advances. Reproduced literally; recomputing the
+// window sum would be a different number even though it is the same quantity.
+//
+// `er = if sum_roc1 == 0.0 { 0.0 } else { direction / sum_roc1 }` is an exact
+// zero test, not an epsilon -- an epsilon would change which bars take it.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + period)`; the seed value
+// `out[first + period]` is then written by the compute, so the first emitted
+// bar is `first + period`, one LATER than the usual `first + period - 1`. The
+// seed loop reads `data[first + lookback + 1] = data[first + period]`, which is
+// why `kama_prepare` rejects `len - first <= period` (strictly).
+//
+// KERNEL SELECTION CAVEAT: `choose_kama_kernel` maps `Auto` to `Avx2` when the
+// host has avx2+fma (kama.rs:341-353). This kernel is written against
+// `kama_scalar`; if the two disagree the fix belongs in the CPU.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_kama_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) <= period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+
+    const int lookback = period - 1;
+    const double const_max = 2.0 / (30.0 + 1.0);
+    const double const_diff = (2.0 / (2.0 + 1.0)) - const_max;
+
+    double sum_roc1 = 0.0;
+    const int today = first_valid;
+    double prev = prices[today];
+    for (int i = 0; i <= lookback; ++i) {
+        const double next = prices[today + i + 1];
+        sum_roc1 += fabs(next - prev);
+        prev = next;
+    }
+
+    const int initial_idx = today + lookback + 1;
+    double kama = prices[initial_idx];
+    row[initial_idx] = kama;
+
+    int trailing_idx = today;
+    double trailing_value = prices[trailing_idx];
+
+    for (int i = initial_idx + 1; i < n; ++i) {
+        const double price_prev = prices[i - 1];
+        const double price = prices[i];
+
+        const double next_tail = prices[trailing_idx + 1];
+        const double old_diff = fabs(next_tail - trailing_value);
+        const double new_diff = fabs(price - price_prev);
+        sum_roc1 += new_diff - old_diff;
+
+        trailing_value = next_tail;
+        trailing_idx += 1;
+
+        const double direction = fabs(price - next_tail);
+        const double er = (sum_roc1 == 0.0) ? 0.0 : (direction / sum_roc1);
+        const double t = fma(er, const_diff, const_max);
+        const double sc = t * t;
+
+        kama = fma(price - kama, sc, kama);
+        row[i] = kama;
+    }
+}

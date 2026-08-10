@@ -287,3 +287,244 @@ extern "C" __global__ void chop_many_series_one_param_f32(
         out_tm[(size_t)r * cols + s] = y;
     }
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  chop
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/chop.rs -- `chop_scalar` (:469), `chop_scalar_period_14_drift_1` (:601), `chop_with_kernel` (:245)
+//
+// PERIOD-BASED. `compute_chop_batch` (cpu_batch.rs:15086) reads `period`
+// (default 14), `scalar` (100.0) and `drift` (1).
+//
+// TWO CPU PATHS THAT ARE GENUINELY DIFFERENT ARITHMETIC, BOTH WRITTEN OUT.
+// `chop_scalar` forks at (period == 14 && drift == 1) to
+// `chop_scalar_period_14_drift_1`, and the fork is NOT a mere unroll:
+//   * general:  out = (scalar * (log10(sum_atr) - log10(range))) / log10(period)
+//   * (14, 1):  ratio = sum_atr / range; out = (scalar/ln(14)) * ln(ratio),
+//               with `ln_1p(ratio - 1)` substituted when |ratio - 1| < 1e-8.
+// These agree in exact arithmetic and differ in floating point at essentially
+// every bar -- a difference of logarithm base, of the order of the division,
+// and of the function used near ratio == 1. Since 14 is the DEFAULT period, a
+// sweep hits the second form on one row and the first on the others, so both
+// must exist. The 1e-8 is the crossover where `ln_1p` beats `ln` in DOUBLE
+// precision; it is already an f64-sized threshold and is carried over
+// unchanged (an f32-sized 1e-4 here would be wrong in both directions).
+//
+// NaN SEMANTICS -- THE adx-CLASS BUG, CHECKED: true range is
+// `hl.max(hc).max(lc)`, which is `f64::max` and therefore returns the NON-NaN
+// operand. An if-chain would let a NaN survive and poison every later bar of
+// the ATR recursion. Written with `fmax`.
+//
+// THE MONOTONIC DEQUES ARE REPRODUCED EXACTLY, NOT APPROXIMATED. The CPU keeps
+// a max-deque over `high` (pop back while `high[back] <= hi`) and a min-deque
+// over `low` (pop back while `low[back] >= lo`), and reads the FRONT. The
+// front is the smallest index in the window that no later window element has
+// killed, and an element is killed only by a strictly comparable neighbour --
+// a NaN kills nothing and is itself never killed, so a NaN inside the window
+// can legitimately BE the front and make `range` NaN. A plain `fmax` scan
+// would skip the NaN and emit a number where the CPU emits NaN. The helpers
+// below therefore simulate the deque with a backward walk: identical front,
+// identical NaN behaviour, O(period) per bar instead of amortised O(1). With
+// one thread per period-combo (rows are the period list, typically five) that
+// cost is irrelevant and the exactness is not.
+//
+// PER-THREAD RING: the general path slides `rolling_sum_atr` over a ring of
+// `period` values with subtract-then-add, so the ring must exist -- the sum is
+// accumulation-order dependent and cannot be recomputed. It is a fixed
+// per-thread array, so the kernel carries a hard period bound, declared to the
+// host as `CHOP_MAX_PERIOD` and REFUSED BY NAME rather than truncated.
+//
+// WARMUP: `first_valid + period - 1`, and first_valid is the first index where
+// high, low and close are simultaneously non-NaN (chop.rs:281-287).
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+#define NEO_S1_CHOP_MAX_PERIOD 1024
+
+// Front of the CPU's max-deque over `high` for the window [win_start, i].
+// An element k survives iff no LATER window element j has `high[k] <= high[j]`.
+// NaN makes that comparison false in both directions, so a NaN is never popped
+// and never pops -- which is why this is a simulation and not an fmax scan.
+__device__ __forceinline__ double neo_s1_chop_front_high(
+    const double* __restrict__ high, int win_start, int i)
+{
+    double m = -INFINITY;
+    int front = i;
+    for (int k = i; k >= win_start; --k) {
+        const double hk = high[k];
+        const bool survives = neo_s1_isnan(hk) || !(hk <= m);
+        if (survives) front = k;
+        if (!neo_s1_isnan(hk) && hk > m) m = hk;
+    }
+    return high[front];
+}
+
+// Front of the CPU's min-deque over `low`: k survives iff no later j has
+// `low[k] >= low[j]`.
+__device__ __forceinline__ double neo_s1_chop_front_low(
+    const double* __restrict__ low, int win_start, int i)
+{
+    double m = INFINITY;
+    int front = i;
+    for (int k = i; k >= win_start; --k) {
+        const double lk = low[k];
+        const bool survives = neo_s1_isnan(lk) || !(lk >= m);
+        if (survives) front = k;
+        if (!neo_s1_isnan(lk) && lk < m) m = lk;
+    }
+    return low[front];
+}
+
+extern "C" __global__ void neoethos_chop_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // `ChopParams::default()` as read by cpu_batch.rs:15093-15095.
+    const double scalar = 100.0;
+    const int drift = 1;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period <= 0) || (period > NEO_S1_CHOP_MAX_PERIOD) ||
+        (drift <= 0) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+    if (warm >= n) return;
+
+    double atr_ring[NEO_S1_CHOP_MAX_PERIOD];
+    for (int k = 0; k < period; ++k) atr_ring[k] = 0.0;
+    int atr_ring_idx = 0;
+    double rolling_sum_atr = 0.0;
+
+    double prev_close = close[first_valid];
+
+    if (period == 14 && drift == 1) {
+        // `chop_scalar_period_14_drift_1`: the ring holds TRUE RANGE, not the
+        // smoothed ATR, and the output is the natural log form.
+        const double scale_ln = scalar / log(14.0);
+        for (int i = first_valid; i < n; ++i) {
+            const double hi = high[i];
+            const double lo = low[i];
+            const double hl = hi - lo;
+            double tr;
+            if (i == first_valid) {
+                tr = hl;
+            } else {
+                const double hc = fabs(hi - prev_close);
+                const double lc = fabs(lo - prev_close);
+                tr = fmax(fmax(hl, hc), lc);
+            }
+            prev_close = close[i];
+
+            rolling_sum_atr -= atr_ring[atr_ring_idx];
+            atr_ring[atr_ring_idx] = tr;
+            rolling_sum_atr += tr;
+            if (++atr_ring_idx == 14) atr_ring_idx = 0;
+
+            if (i - first_valid >= 13) {
+                const int win_start = i - 13;
+                const double range = neo_s1_chop_front_high(high, win_start, i)
+                                   - neo_s1_chop_front_low(low, win_start, i);
+                if (range > 0.0 && rolling_sum_atr > 0.0) {
+                    const double ratio = rolling_sum_atr / range;
+                    row[i] = (fabs(ratio - 1.0) < 1e-8)
+                                 ? scale_ln * log1p(ratio - 1.0)
+                                 : scale_ln * log(ratio);
+                } else {
+                    row[i] = neo_s1_qnan();
+                }
+            }
+        }
+        return;
+    }
+
+    // General path.
+    const double alpha = 1.0 / (double)drift;
+    const double logp = log10((double)period);
+    double rma_atr = neo_s1_qnan();
+    double sum_tr = 0.0;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+        const double hl = hi - lo;
+        double tr;
+        if (i == first_valid) {
+            sum_tr = hl;
+            tr = hl;
+        } else {
+            const double hc = fabs(hi - prev_close);
+            const double lc = fabs(lo - prev_close);
+            tr = fmax(fmax(hl, hc), lc);
+        }
+
+        const int rel = i - first_valid;
+        if (rel < drift) {
+            if (i != first_valid) sum_tr += tr;
+            if (rel == drift - 1) rma_atr = sum_tr / (double)drift;
+        } else {
+            rma_atr += alpha * (tr - rma_atr);
+        }
+        prev_close = close[i];
+
+        double current_atr;
+        if (rel < drift) {
+            current_atr = (rel == drift - 1) ? rma_atr : neo_s1_qnan();
+        } else {
+            current_atr = rma_atr;
+        }
+
+        rolling_sum_atr -= atr_ring[atr_ring_idx];
+        const double new_val = neo_s1_isnan(current_atr) ? 0.0 : current_atr;
+        atr_ring[atr_ring_idx] = new_val;
+        rolling_sum_atr += new_val;
+        if (++atr_ring_idx == period) atr_ring_idx = 0;
+
+        if (rel >= period - 1) {
+            const int win_start = (i >= period - 1) ? (i - (period - 1)) : 0;
+            const double range = neo_s1_chop_front_high(high, win_start, i)
+                               - neo_s1_chop_front_low(low, win_start, i);
+            if (range > 0.0 && rolling_sum_atr > 0.0) {
+                row[i] = (scalar * (log10(rolling_sum_atr) - log10(range))) / logp;
+            } else {
+                row[i] = neo_s1_qnan();
+            }
+        }
+    }
+}

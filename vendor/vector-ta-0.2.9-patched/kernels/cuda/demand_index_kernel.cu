@@ -439,3 +439,181 @@ extern "C" __global__ void demand_index_batch_f64(
         has_prev_p = true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/demand_index.rs:634
+// (demand_index_with_kernel). The column this emits is demand_index, which is
+// what output_id == "value" resolves to (dispatch/cpu_batch.rs:13669-13672).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- three
+// moving averages carried across bars (the volume average, and the buying and
+// selling pressure averages) plus the previous bar's price sum, and the CPU
+// FEEDS AN INVALID BAR INTO EACH AVERAGE as an explicit "no value" step rather
+// than skipping it, so the ring positions advance even on a hole. Skipping
+// would desynchronise every later window.
+//
+// PERIOD-INVARIANT. compute_demand_index_batch (cpu_batch.rs:13647-13650)
+// reads len_bs, len_bs_ma, len_di_ma and ma_type and NEVER period, so five
+// swept periods give five identical CPU columns and this kernel emits five
+// identical rows. All four CPU defaults are pinned below, ma_type "ema" among
+// them.
+//
+// WHAT IS DELIBERATELY ABSENT: the signal average (len_di_ma). It consumes the
+// demand index, it does not produce it. len_di_ma is still VALIDATED, because
+// the CPU refuses the whole computation for a non-positive one.
+//
+// THE SCRATCH IS PER-THREAD, so its size is a property of THIS COMPILED
+// KERNEL. The three averages need len_bs * 2 + len_bs_ma * 4 slots (a value
+// and a validity flag each); at the pinned 19 that is 114, far under the bound
+// below, which is checked rather than assumed.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and handles holes inside
+// the loop rather than by skipping a prefix, so there is no warmup index. The
+// lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double exp/fabs, no f32-suffixed math
+// function, no fast-math intrinsic. normalize_h0_l0 floors the range at 1e-12,
+// an f64-sized guard against dividing by a zero bar range -- not an f32
+// epsilon carried forward (rule 2).
+// ---------------------------------------------------------------------------
+
+#define NEO_DEMAND_LEN_BS 19
+#define NEO_DEMAND_LEN_BS_MA 19
+#define NEO_DEMAND_LEN_DI_MA 19
+#define NEO_DEMAND_MA_CODE MA_EMA
+#define NEO_DEMAND_SCRATCH_CAP 1024
+
+extern "C" __global__ void demand_index_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int len_bs = NEO_DEMAND_LEN_BS;
+    const int len_bs_ma = NEO_DEMAND_LEN_BS_MA;
+    const int len_di_ma = NEO_DEMAND_LEN_DI_MA;
+    const int ma_code = NEO_DEMAND_MA_CODE;
+
+    if (len_bs <= 0 || len_bs_ma <= 0 || len_di_ma <= 0) {
+        return;
+    }
+    if (ma_code < MA_EMA || ma_code > MA_RMA) {
+        return;
+    }
+
+    const int needed = len_bs * 2 + len_bs_ma * 4;
+    if (needed > NEO_DEMAND_SCRATCH_CAP) {
+        return;
+    }
+
+    double scratch[NEO_DEMAND_SCRATCH_CAP];
+    int offset = 0;
+
+    double* volume_values = scratch + offset;
+    offset += len_bs;
+    double* volume_valid = scratch + offset;
+    offset += len_bs;
+
+    double* bp_values = scratch + offset;
+    offset += len_bs_ma;
+    double* bp_valid = scratch + offset;
+    offset += len_bs_ma;
+
+    double* sp_values = scratch + offset;
+    offset += len_bs_ma;
+    double* sp_valid = scratch + offset;
+
+    MaState volume_avg;
+    MaState bp_avg;
+    MaState sp_avg;
+    volume_avg.init(ma_code, len_bs, volume_values, volume_valid);
+    bp_avg.init(ma_code, len_bs_ma, bp_values, bp_valid);
+    sp_avg.init(ma_code, len_bs_ma, sp_values, sp_valid);
+
+    double h0 = NAN;
+    double l0 = NAN;
+    bool has_h0_l0 = false;
+    double prev_p = NAN;
+    bool has_prev_p = false;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        const double v = volume[i];
+
+        if (!valid_ohlcv(h, l, c, v)) {
+            double unused = NAN;
+            volume_avg.update(false, 0.0, &unused);
+
+            double bp_ma = NAN;
+            double sp_ma = NAN;
+            const bool has_bp_ma = bp_avg.update(false, 0.0, &bp_ma);
+            const bool has_sp_ma = sp_avg.update(false, 0.0, &sp_ma);
+
+            double di = NAN;
+            const bool has_di = finalize_di(has_bp_ma, bp_ma, has_sp_ma, sp_ma, &di);
+            row[i] = has_di ? di : NAN;
+            has_prev_p = false;
+            continue;
+        }
+
+        if (!has_h0_l0) {
+            h0 = h;
+            l0 = l;
+            has_h0_l0 = true;
+        }
+
+        double volume_avg_now = NAN;
+        const bool has_volume_avg = volume_avg.update(true, v, &volume_avg_now);
+        const double p = h + l + 2.0 * c;
+
+        if (!has_prev_p) {
+            double bp_ma = NAN;
+            double sp_ma = NAN;
+            const bool has_bp_ma = bp_avg.update(false, 0.0, &bp_ma);
+            const bool has_sp_ma = sp_avg.update(false, 0.0, &sp_ma);
+            double di = NAN;
+            const bool has_di = finalize_di(has_bp_ma, bp_ma, has_sp_ma, sp_ma, &di);
+            row[i] = has_di ? di : NAN;
+            prev_p = p;
+            has_prev_p = true;
+            continue;
+        }
+
+        double bp = NAN;
+        double sp = NAN;
+        const bool has_bp_sp =
+            compute_bp_sp(has_volume_avg, volume_avg_now, v, p, prev_p, h0, l0, &bp, &sp);
+
+        double bp_ma = NAN;
+        double sp_ma = NAN;
+        const bool has_bp_ma = bp_avg.update(has_bp_sp, bp, &bp_ma);
+        const bool has_sp_ma = sp_avg.update(has_bp_sp, sp, &sp_ma);
+
+        double di = NAN;
+        const bool has_di = finalize_di(has_bp_ma, bp_ma, has_sp_ma, sp_ma, &di);
+        row[i] = has_di ? di : NAN;
+        prev_p = p;
+        has_prev_p = true;
+    }
+}

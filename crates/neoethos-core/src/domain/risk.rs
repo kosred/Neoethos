@@ -328,6 +328,43 @@ impl RevengeTradeDetector {
     }
 }
 
+/// # ⚠ NOT WIRED. DECISION PENDING — do not wire, do not delete.
+///
+/// **State verified 2026-08-09 (audit #137).** This type carries
+/// `check_trade_allowed`, the prop-firm daily-loss / max-drawdown /
+/// drawdown-recovery tiers, the revenge-trade detector and
+/// `calculate_position_size` — and it has **no production
+/// constructor**. Every `RiskManager::new` call site in the entire
+/// workspace (`:799`, `:808`, `:829`) is inside this file's own
+/// `#[cfg(test)]` module. Nothing in `neoethos-app`, `neoethos-cli`,
+/// `neoethos-trader`, `desktop/`, `mesh/` or `mcp/` constructs one.
+///
+/// **Two Settings keys therefore reach this file and stop here:**
+/// `risk.daily_dd_warning_pct` and `risk.challenge_mode`. The
+/// operator can set both from the UI and neither does anything. They
+/// are NOT dead config to be deleted — they are config whose only
+/// recipient is not switched on.
+///
+/// **Why it is still here.** It is also the decoy that let audit
+/// finding #204 survive: a reader looking for "where is the risk
+/// gate" finds 847 lines of correct-looking risk logic and stops
+/// looking. Deleting it would remove that trap but also remove the
+/// only implementation of the prop-firm tiers.
+///
+/// **The decision is the operator's, not a maintainer's:**
+///
+/// - *Wire it.* `check_trade_allowed` starts refusing entries the
+///   live loop currently sends, and `calculate_position_size` starts
+///   bounding size on a funded account. That is a change to live
+///   sizing and to which trades are sent. It must not happen as a
+///   side effect of a cleanup.
+/// - *Delete it.* The prop-firm tier logic leaves the codebase, and
+///   `risk.daily_dd_warning_pct` / `risk.challenge_mode` must be
+///   removed from `Settings` in the same change or they become knobs
+///   with no recipient at all.
+///
+/// Until he chooses, this comment is the wiring: anyone reading the
+/// struct learns it is inert before they reason about it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RiskManager {
     pub prop_rules: PropFirmRules,

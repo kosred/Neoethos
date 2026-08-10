@@ -216,3 +216,191 @@ extern "C" __global__ void deviation_many_series_one_param_f32(
         t += stride;
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — deviation
+// ===========================================================================
+// Reference: src/indicators/deviation.rs
+//   `deviation_prepare` (:256)  — first_valid + the four Err branches
+//   `deviation_with_kernel` (:354) — `alloc_with_nan_prefix(len, first+period-1)`
+//   `deviation_compute_into` (:296) — devtype 0 is the batch default
+//     (`cpu_batch.rs:3628` reads `devtype` with default 0), which routes to
+//   `standard_deviation_rolling_into` (:1055), which itself delegates to
+//   `standard_deviation_rolling_finite_into` (:1211) WHENEVER every value from
+//   `first` on is finite. Both paths are transcribed below and selected by the
+//   SAME test, because they are not the same arithmetic: the finite path
+//   rebuilds `sum`/`sumsq` from scratch only when the running pair goes
+//   non-finite, whereas the general path carries a `bad` counter and emits NaN
+//   while it is non-zero.
+//
+// WHAT THE f32 KERNELS ABOVE GET WRONG
+//   1. f32 throughout, including `sqrtf` and a `__int_as_float` NaN.
+//   2. The catastrophic-cancellation guard. The CPU re-derives the variance
+//      from `(x-mean)^2` when `|var| / max(|sumsq/n|, 1e-30) < 1e-10`. Those
+//      two constants are sized for DOUBLE — 1e-30 is far below f32's smallest
+//      normal (1.18e-38 is close, but 1e-10 is *above* f32 epsilon 1.19e-7),
+//      so in f32 the guard fires on essentially every bar or never, depending
+//      on scale. They are taken verbatim from the f64 CPU here, which is the
+//      only place they are meaningful.
+//   3. `sumsq = v.mul_add(v, sumsq)` is ONE rounding on the CPU. Written as
+//      `sumsq += v*v` it is two. `fma` below reproduces the CPU exactly.
+//
+// One thread per column: the rolling sums are a cross-bar recurrence.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// `var.abs() / scale.max(1e-30) < 1e-10` → recompute from (x-mean)^2.
+// Constants lifted from deviation.rs:1237 / :1110 unchanged, because the CPU
+// they came from is already f64 and IS the oracle.
+__device__ __forceinline__ double neo_s3_dev_var(
+    const double* __restrict__ d, int start, int end, double sum, double sumsq, double n)
+{
+    const double mean = sum / n;
+    double var = (sumsq / n) - mean * mean;
+    const double scale = fabs(sumsq / n);
+    if (fabs(var) / fmax(scale, 1e-30) < 1e-10) {
+        double v2 = 0.0;
+        for (int k = start; k <= end; ++k) {
+            const double dd = d[k] - mean;
+            v2 = fma(dd, dd, v2);
+        }
+        var = v2 / n;
+    }
+    if (var < 0.0) var = 0.0;
+    return var;
+}
+
+extern "C" __global__ void neoethos_deviation_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // Every `deviation_prepare` branch that returns Err → the CPU produces no
+    // series at all, which this lane represents as an all-NaN row.
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warm >= n) return;
+
+    // `standard_deviation_rolling_into` :1061 — period == 1 writes 0.0 from
+    // `first`, not from `warm`. With period == 1 the two coincide.
+    if (period == 1) {
+        for (int i = first_valid; i < n; ++i) row[i] = 0.0;
+        return;
+    }
+
+    const double nd = (double)period;
+
+    // `data[first..].iter().all(|x| x.is_finite())` — deviation.rs:1079.
+    bool all_finite = true;
+    for (int i = first_valid; i < n; ++i) {
+        if (!isfinite(data[i])) { all_finite = false; break; }
+    }
+
+    if (all_finite) {
+        // ---- standard_deviation_rolling_finite_into (:1211) ----
+        double sum = 0.0, sumsq = 0.0;
+        for (int j = first_valid; j < first_valid + period; ++j) {
+            const double v = data[j];
+            sum += v;
+            sumsq = fma(v, v, sumsq);
+        }
+        if (!isfinite(sum) || !isfinite(sumsq)) {
+            row[warm] = neo_s3_qnan();
+        } else {
+            row[warm] = sqrt(neo_s3_dev_var(data, first_valid, warm, sum, sumsq, nd));
+        }
+
+        for (int i = warm + 1; i < n; ++i) {
+            const double v_in = data[i];
+            const double v_out = data[i - period];
+            sum += v_in;
+            sumsq = fma(v_in, v_in, sumsq);
+            sum -= v_out;
+            sumsq -= v_out * v_out;
+
+            const int start = i + 1 - period;
+            if (!isfinite(sum) || !isfinite(sumsq)) {
+                sum = 0.0;
+                sumsq = 0.0;
+                for (int k = start; k <= i; ++k) {
+                    const double x = data[k];
+                    sum += x;
+                    sumsq = fma(x, x, sumsq);
+                }
+                if (!isfinite(sum) || !isfinite(sumsq)) {
+                    row[i] = neo_s3_qnan();
+                    continue;
+                }
+            }
+            row[i] = sqrt(neo_s3_dev_var(data, start, i, sum, sumsq, nd));
+        }
+        return;
+    }
+
+    // ---- standard_deviation_rolling_into, the `bad`-counter path (:1083) ----
+    double sum = 0.0, sumsq = 0.0;
+    int bad = 0;
+    for (int j = first_valid; j < first_valid + period; ++j) {
+        const double v = data[j];
+        if (!isfinite(v)) { bad += 1; }
+        else { sum += v; sumsq = fma(v, v, sumsq); }
+    }
+
+    if (bad > 0 || !isfinite(sum) || !isfinite(sumsq)) {
+        row[warm] = neo_s3_qnan();
+    } else {
+        row[warm] = sqrt(neo_s3_dev_var(data, warm + 1 - period, warm, sum, sumsq, nd));
+    }
+
+    for (int i = warm + 1; i < n; ++i) {
+        const double v_in = data[i];
+        const double v_out = data[i - period];
+        if (!isfinite(v_in)) { bad += 1; }
+        else { sum += v_in; sumsq = fma(v_in, v_in, sumsq); }
+        if (!isfinite(v_out)) { bad = (bad > 0) ? bad - 1 : 0; }
+        else { sum -= v_out; sumsq -= v_out * v_out; }
+
+        if (bad > 0 || !isfinite(sum) || !isfinite(sumsq)) {
+            if (bad == 0) {
+                const int start = i + 1 - period;
+                double s = 0.0, s2 = 0.0;
+                for (int k = start; k <= i; ++k) {
+                    const double v = data[k];
+                    s += v;
+                    s2 = fma(v, v, s2);
+                }
+                if (isfinite(s) && isfinite(s2)) {
+                    row[i] = sqrt(neo_s3_dev_var(data, start, i, s, s2, nd));
+                } else {
+                    row[i] = neo_s3_qnan();
+                }
+            } else {
+                row[i] = neo_s3_qnan();
+            }
+        } else {
+            row[i] = sqrt(neo_s3_dev_var(data, i + 1 - period, i, sum, sumsq, nd));
+        }
+    }
+}

@@ -51,9 +51,6 @@ use crate::parallel_trainer::{
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::dispatch::{DispatchPlan, build_dispatch_plan};
-use crate::runtime::exports::{
-    ONNX_EXPORT_STATUS_FILE_NAME, OnnxExportStatus, write_onnx_export_status,
-};
 use crate::runtime::hpo::{
     OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord, ValidationMetrics,
     evaluate_prediction_quality, time_series_holdout_split, write_optimization_report,
@@ -206,6 +203,29 @@ fn drop_nonfinite_rows(
         clean_labels.push(labels[old_idx]);
     }
     (clean, clean_labels, dropped)
+}
+
+/// Write a hardware-plan value into a model's params, RECORDING the fact when
+/// it replaced a different value that config or a per-model override had put
+/// there.
+///
+/// Audit #177/#178/#180/#182/#183/#184/#186/#188 — the "config knob whose
+/// reader is overwritten" family. The plan winning is correct and intentional
+/// (it is what keeps the never-OOM invariant); the plan winning **silently** is
+/// the defect. `models.train_batch_size` is the measured case: 13 readers, all
+/// replaced here, and nothing told the operator his value never arrived.
+fn plan_insert(
+    params: &mut HashMap<String, String>,
+    overridden: &mut Vec<String>,
+    key: &str,
+    value: String,
+) {
+    if let Some(prev) = params.get(key)
+        && prev != &value
+    {
+        overridden.push(format!("{key}: configured={prev} → effective={value}"));
+    }
+    params.insert(key.to_string(), value);
 }
 
 fn burn_policy_from_workload_device(device: &str) -> String {
@@ -544,10 +564,24 @@ impl TrainingOrchestrator {
             // this flag produced. To avoid silently dropping its
             // training, keep it auto-requested under the same flag so
             // existing configs still train both the SAC entry policy and
-            // the exit-decision agent. (The exit agent's ExitDecision3
-            // outputs are not soft-voted — F-318 — but the artifact
-            // stays available for the exit-side pipeline.)
+            // the exit-decision agent.
+            //
+            // ⚠ AUDIT #173/#175 — CORRECTING THIS COMMENT. It used to end
+            // "…but the artifact stays available for the exit-side pipeline",
+            // which reads as though a consumer exists. NONE DOES. `exit_agent`
+            // is absent from `DEFAULT_BOOTSTRAP_EXPERT_NAMES`
+            // (`ensemble_inference/bootstrap.rs:102-149`) and explicitly
+            // whitelisted as a non-voter at `ensemble_inference/mod.rs:907`, so
+            // its `ExitDecision3` output is read by nothing in production. It
+            // trains every run for nobody. Whether to ship the exit-side
+            // decision loop or stop training it is the OPERATOR'S call; this
+            // code does not decide it, it only refuses to hide the cost.
             requested_models.push("exit_agent".to_string());
+            warn!(
+                "exit_agent queued for training and NOTHING CONSUMES IT — its ExitDecision3 \
+                 output has no production reader (audit #173/#175, decision pending: ship the \
+                 exit-side loop or stop training it). This costs training time on every run."
+            );
         }
         if self.settings.models.use_rl_agent || self.settings.models.use_rllib_agent {
             requested_models.push("dqn".to_string());
@@ -731,36 +765,79 @@ impl TrainingOrchestrator {
             "__planned_memory_budget_gb".to_string(),
             format!("{:.6}", workload.memory_budget_gb),
         );
-        params.insert(
-            "cpu_threads".to_string(),
+        // ── AUDIT #177/#178/#180/#182/#183/#184/#186/#188 — the "knob whose
+        // reader is overwritten" family, made VISIBLE ────────────────────
+        //
+        // Everything below deliberately WINS over config and per-model
+        // overrides: the machine's real capacity is authoritative, and that is
+        // the correct precedence (it is what keeps the never-OOM invariant).
+        // The defect was never the precedence — it was the SILENCE. A knob the
+        // operator sets in `config.yaml` (`models.train_batch_size` is the
+        // measured case: 13 readers, all replaced here) is simply gone by the
+        // time training runs, with nothing anywhere saying it was replaced or
+        // by what. He tunes a number, the number does nothing, and no log line
+        // contradicts him.
+        //
+        // Nothing about WHICH value wins changes here. Only that a replaced
+        // value is now named, with its configured and effective figures, once
+        // per model. If a knob you set never appears in this line, the plan did
+        // not touch it — and its reader is a different problem.
+        let mut overridden: Vec<String> = Vec::new();
+
+        plan_insert(
+            params,
+            &mut overridden,
+            "cpu_threads",
             workload.cpu_threads.to_string(),
         );
         if workload.batch_size > 0 {
-            params.insert("batch_size".to_string(), workload.batch_size.to_string());
+            plan_insert(
+                params,
+                &mut overridden,
+                "batch_size",
+                workload.batch_size.to_string(),
+            );
         }
-        params.insert(
-            "memory_budget_gb".to_string(),
+        plan_insert(
+            params,
+            &mut overridden,
+            "memory_budget_gb",
             format!("{:.6}", workload.memory_budget_gb),
         );
 
         match family {
             ModelFamily::Tree | ModelFamily::Rl => {
-                params.insert("device".to_string(), workload.device.clone());
+                plan_insert(params, &mut overridden, "device", workload.device.clone());
             }
             ModelFamily::Deep | ModelFamily::Exit => {
-                params.insert(
-                    "device".to_string(),
+                plan_insert(
+                    params,
+                    &mut overridden,
+                    "device",
                     burn_policy_from_workload_device(&workload.device),
                 );
-                params.insert(
-                    "training_precision".to_string(),
+                plan_insert(
+                    params,
+                    &mut overridden,
+                    "training_precision",
                     workload.precision.as_str().to_string(),
                 );
             }
             ModelFamily::Evolutionary if canonical_model_name(name) == "genetic" => {
-                params.insert("device".to_string(), workload.device.clone());
+                plan_insert(params, &mut overridden, "device", workload.device.clone());
             }
             _ => {}
+        }
+
+        if !overridden.is_empty() {
+            tracing::warn!(
+                target: "neoethos_models::training",
+                model = %name,
+                overrides = %overridden.join("; "),
+                "hardware execution plan REPLACED configured training parameters — the machine's \
+                 measured capacity is authoritative (never-OOM), so these config values do not \
+                 reach training"
+            );
         }
     }
 
@@ -855,10 +932,6 @@ impl TrainingOrchestrator {
         params.insert(
             "__embargo_minutes".to_string(),
             self.settings.models.embargo_minutes.to_string(),
-        );
-        params.insert(
-            "__export_onnx".to_string(),
-            self.settings.models.export_onnx.to_string(),
         );
     }
 
@@ -2691,10 +2764,6 @@ fn accuracy_weight_from_params(params: &HashMap<String, String>) -> f64 {
     parse_f64_param(params, "__accuracy_weight", 0.10).clamp(0.0, 1.0)
 }
 
-fn export_onnx_requested(params: &HashMap<String, String>) -> bool {
-    parse_bool_param(params, "__export_onnx", false)
-}
-
 fn parse_parent_selection_policy(params: &HashMap<String, String>) -> ParentSelectionPolicy {
     ParentSelectionPolicy::parse(
         parse_string_param(params, "parent_selection")
@@ -2837,7 +2906,6 @@ fn training_runtime_profile(
         requested_hpo_trials: hpo_trials_from_params(&config.params),
         holdout_pct: holdout_pct_from_params(&config.params),
         embargo_minutes: embargo_minutes_from_params(&config.params),
-        export_onnx_requested: export_onnx_requested(&config.params),
         rllib_requested,
         rllib_num_workers: parse_usize_param(
             &config.params,
@@ -3110,7 +3178,6 @@ where
         if let Some(report) = optimization_report {
             write_optimization_report(&staged_dir.join(OPTIMIZATION_REPORT_FILE_NAME), report)?;
         }
-        write_onnx_status_sidecar(staged_dir, config, payload)?;
         let profile = write_training_profile_sidecar(
             staged_dir,
             settings,
@@ -4259,38 +4326,6 @@ fn optimize_model_config(
     };
 
     Ok((best_params, report))
-}
-
-fn write_onnx_status_sidecar(
-    artifact_dir: &std::path::Path,
-    config: &ModelConfig,
-    payload: &TrainingPayload,
-) -> Result<()> {
-    if !export_onnx_requested(&config.params) {
-        return Ok(());
-    }
-    if !artifact_dir.is_dir() {
-        anyhow::bail!(
-            "cannot write ONNX export status without saved artifact directory {}",
-            artifact_dir.display()
-        );
-    }
-
-    // ONNX export through PyO3/Python has been removed in favour of pure-Rust
-    // inference via the `ort` crate; no in-process Python runtime is wired any
-    // more. Record a placeholder status so downstream tooling that reads the
-    // export manifest still sees a deterministic entry.
-    let status = OnnxExportStatus::skipped(
-        config.name.clone(),
-        config.capability_family,
-        config.capability_state,
-        "none",
-        artifact_dir.to_path_buf(),
-        payload.frame.width(),
-        payload.frame.height().min(512),
-        "trained runtime artifact saved; ONNX export not attempted (Python export bridge has been removed in the pure-Rust runtime)",
-    );
-    write_onnx_export_status(&artifact_dir.join(ONNX_EXPORT_STATUS_FILE_NAME), &status)
 }
 
 /// v0.5 ML-integration Stage 1(b): per-(symbol,TF) overfit gate + tree-budget
@@ -5615,25 +5650,6 @@ mod tests {
             "profile must record the honest rllib-unavailable degradation reason; notes were: {:?}",
             profile.notes
         );
-    }
-
-    #[test]
-    fn write_onnx_status_sidecar_requires_saved_artifact_dir() {
-        let config = ModelConfig {
-            name: "mlp".to_string(),
-            model_type: ModelType::MLP,
-            capability_family: crate::runtime::capabilities::ModelFamily::Deep,
-            capability_state: CapabilityState::Implemented,
-            params: HashMap::from([("__export_onnx".to_string(), "true".to_string())]),
-        };
-        let payload =
-            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 2)), vec![0, 1, 2, 1])
-                .expect("build payload");
-        let artifact_dir = unique_test_dir("onnx_missing_dir");
-
-        let err = write_onnx_status_sidecar(&artifact_dir, &config, &payload)
-            .expect_err("missing artifact dir must fail");
-        assert!(err.to_string().contains("without saved artifact directory"));
     }
 
     #[test]

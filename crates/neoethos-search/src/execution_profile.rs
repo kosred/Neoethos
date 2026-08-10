@@ -27,6 +27,462 @@
 
 use serde::Serialize;
 
+// ─── RETIRED ENVIRONMENT VARIABLES ──────────────────────────────────────────
+//
+// 2026-08-10, the env→config wave. Every name below USED to change what this
+// crate computed. None of them does any more: each is now either a typed value
+// resolved from the single `Settings`, or a quantity derived from the probed
+// hardware.
+//
+// THE FAILURE MODE THIS CLOSES is not "the env var exists". It is "the env var
+// is exported on a box, the operator believes it is in force, and the run
+// quietly means something else". A retired name that is still set in the shell
+// is therefore not ignored quietly — it is reported at ERROR, by name, with the
+// value that was found and the thing that decides instead.
+//
+// The names ALSO still appear in `raw_env(...)` captures below, on purpose: the
+// run profile records what was ambient so a post-hoc reader can see the same
+// stale export the startup banner shouted about.
+
+/// `(env var, what decides it now)`. Production names only — test-gating names
+/// (`NEOETHOS_REQUIRE_GPU` inside `#[cfg(test)]`, `FUSED_TEST_NSAMPLES`) are
+/// deliberately absent because they still do exactly what they say.
+/// `pub(crate)` so the env-knob census test can assert that anything it
+/// classifies as `Retired` is genuinely declared retired here, rather than
+/// letting the exemption become a place to park a knob that is still read.
+pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    // ── backend / GPU policy ──
+    (
+        "NEOETHOS_REQUIRE_GPU",
+        "system.enable_gpu_preference / models.prop_search_device (use a *_required value); \
+         with a card present the backend already escalates to GPU-preferred on its own",
+    ),
+    // ── cubecl lane selection ──
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
+        "the compiled lane (f32 cubecl / f64 prototype B); config field routed to config.rs",
+    ),
+    (
+        "NEOETHOS_BOT_TRAIN_PRECISION",
+        "the compiled lane; config field routed to config.rs",
+    ),
+    (
+        "FOREX_TRAIN_PRECISION",
+        "the compiled lane; config field routed to config.rs",
+    ),
+    (
+        "NEOETHOS_GPU_F64",
+        "the compiled lane; config field routed to config.rs",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL",
+        "always on — the kernel is the lane",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
+        "always on — the kernel is the lane",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS",
+        "the launch geometry the kernel computes from the work size",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
+        "the launch geometry the kernel computes from the work size",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE",
+        "the per-lane device_override the scheduler passes (default device 0)",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE",
+        "the per-lane device_override the scheduler passes",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES",
+        "the scheduler's per-process device assignment",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES",
+        "the scheduler's per-process device assignment",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_USE_IGPU",
+        "the hardware probe (an integrated GPU is detected, not declared)",
+    ),
+    (
+        "NEOETHOS_GPU_FUSED_EVAL",
+        "auto-detection from the probe + whether prototype B owns population eval",
+    ),
+    (
+        "NEOETHOS_GPU_TIMING",
+        "the DEBUG log level on target neoethos_search::gpu_timing",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_VRAM_LOG",
+        "the DEBUG log level on target neoethos_search::cubecl_eval",
+    ),
+    // ── memory budgets: hardware, never a user parameter (never-OOM invariant) ──
+    (
+        "NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB",
+        "the device-probed per-buffer cap (auto_tune_memory_budgets)",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB",
+        "the probed VRAM budget (auto_tune_memory_budgets)",
+    ),
+    (
+        "NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB",
+        "the probed host-RAM budget (auto_tune_memory_budgets)",
+    ),
+    // ── backtest arithmetic ──
+    (
+        "NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY",
+        "models.backtest_runtime.initial_equity",
+    ),
+    (
+        "NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS",
+        "models.backtest_runtime.month_capacity",
+    ),
+    (
+        "NEOETHOS_BOT_RUST_THREADS",
+        "models.backtest_runtime.rayon_threads",
+    ),
+    (
+        "RAYON_NUM_THREADS",
+        "models.backtest_runtime.rayon_threads (this crate; tree_models still reads it)",
+    ),
+    // ── quality scoring ──
+    (
+        "NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH",
+        "models.quality_runtime.min_trades_per_month",
+    ),
+    (
+        "NEOETHOS_BOT_TRADING_DAYS_PER_MONTH",
+        "models.quality_runtime.trading_days_per_month",
+    ),
+    // ── seen-signature memory ──
+    (
+        "NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY",
+        "models.seen_signature_runtime.flush_every",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SEEN_LOAD_MAX",
+        "models.seen_signature_runtime.load_max",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES",
+        "models.seen_signature_runtime.max_entries (0 now means DERIVE from RAM, not unbounded)",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SEEN_FILE",
+        "models.seen_signature_runtime.file_path",
+    ),
+    // ── adaptive stops ──
+    (
+        "NEOETHOS_ADAPTIVE_STOPS",
+        "models.stop_target_runtime.adaptive_stops_enabled (config field routed to config.rs; \
+         the typed default is ON)",
+    ),
+    (
+        "NEOETHOS_ADAPTIVE_STOP_RR",
+        "models.stop_target_runtime.adaptive_stops_rr (config field routed to config.rs; \
+         the typed default is 2.0)",
+    ),
+    // ── SMC gene injection ──
+    (
+        "NEOETHOS_BOT_PROP_SMC_ENABLE_P",
+        "models.smc_search_runtime.p_* (per-flag)",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_FORCE_RATIO",
+        "models.smc_search_runtime.force_ratio",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_MIN_FLAGS",
+        "models.smc_search_runtime.min_flags",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED",
+        "models.smc_search_runtime.force_enabled",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_OB",
+        "models.smc_search_runtime.p_ob",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_FVG",
+        "models.smc_search_runtime.p_fvg",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_LIQ",
+        "models.smc_search_runtime.p_liq",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_PREMIUM",
+        "models.smc_search_runtime.p_premium",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT",
+        "models.smc_search_runtime.p_inducement",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_MTF",
+        "models.smc_search_runtime.p_mtf",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_BOS",
+        "models.smc_search_runtime.p_bos",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_CHOCH",
+        "models.smc_search_runtime.p_choch",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_EQH",
+        "models.smc_search_runtime.p_eqh",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_EQL",
+        "models.smc_search_runtime.p_eql",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT",
+        "models.smc_search_runtime.p_displacement",
+    ),
+    // ── feature cube (neoethos-data) ──
+    (
+        "NEOETHOS_FEATURE_CUBE_MODE",
+        "the free-RAM probe (never-OOM invariant)",
+    ),
+];
+
+/// The GA-selection, cost-profile and SMC-weight names, retired with
+/// `GeneticSearchRuntimeOverrides::from_env` and
+/// `StrategyEvaluationRuntimeOverrides::from_env`.
+///
+/// Split out only because they share one replacement sentence each and listing
+/// 44 near-identical rows above would bury the ones with a story. Reported
+/// exactly like [`RETIRED_ENV_VARS`].
+///
+/// These are the most dangerous names in the whole set: the RNG SEED, the
+/// parent/survivor selection policy, and the spread/commission/pip-value the
+/// P&L is computed from. Every one of them could change what a run selected
+/// while appearing in no config file and no artifact.
+pub(crate) const RETIRED_SEARCH_ENV_VARS: &[(&str, &str)] = &[
+    ("NEOETHOS_BOT_SEARCH_SEED", "models.search_runtime.seed"),
+    (
+        "NEOETHOS_BOT_NOVELTY_WEIGHT",
+        "models.search_runtime.novelty_weight",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_STAGNATION_GENS",
+        "models.search_runtime.stagnation_patience",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_CONVERGENCE_GENS",
+        "models.search_runtime.convergence_patience",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC",
+        "models.search_runtime.convergence_min_elapsed_fraction",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_MIN_IMPROVEMENT",
+        "models.search_runtime.min_improvement",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_TOURNAMENT_SIZE",
+        "models.search_runtime.tournament_size_override",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ARCHIVE_CAP",
+        "models.search_runtime.archive_cap_override",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SEEN_RETRY",
+        "models.search_runtime.seen_retry_attempts",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ARCHIVE_MODE",
+        "models.search_runtime.archive_scoring.mode",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET",
+        "models.search_runtime.archive_scoring.min_net",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF",
+        "models.search_runtime.archive_scoring.min_pf",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE",
+        "models.search_runtime.archive_scoring.min_sharpe",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_PARENT_SELECTION",
+        "models.search_runtime.selection.parent",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SURVIVOR_SELECTION",
+        "models.search_runtime.selection.survivor",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS",
+        "models.search_runtime.selection.immigrant_ratio",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SURVIVOR_FRACTION",
+        "models.search_runtime.selection.survivor_fraction",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_ELITE_FRACTION",
+        "models.search_runtime.selection.survivor_fraction (the older spelling)",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE",
+        "models.search_runtime.selection.temperature",
+    ),
+    (
+        "NEOETHOS_BOT_DISABLE_SMC_GATE",
+        "models.search_runtime.smc_gate.disable_gate",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_GATE_START",
+        "models.search_runtime.smc_gate.start",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_GATE_END",
+        "models.search_runtime.smc_gate.end",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_GATE_CURVE",
+        "models.search_runtime.smc_gate.curve",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP",
+        "models.search_runtime.smc_gate.stagnation_step",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_GATE",
+        "models.eval_runtime.smc_gate_threshold (and the search_runtime curve)",
+    ),
+    ("NEOETHOS_BOT_PROP_SYMBOL", "system.symbol"),
+    (
+        "NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY",
+        "risk.account_currency / system.account_currency",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_PIP_VALUE",
+        "models.eval_runtime.pip_value",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT",
+        "models.eval_runtime.pip_value_per_lot",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE",
+        "models.eval_runtime.quote_to_account_rate",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SPREAD_PIPS",
+        "risk.backtest_spread_pips (the eval_runtime copy never wins)",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_COMMISSION",
+        "risk.commission_per_lot (the eval_runtime copy never wins)",
+    ),
+    (
+        "NEOETHOS_BOT_REJECT_PIP_FALLBACK",
+        "models.eval_runtime.reject_pip_fallback",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_OB",
+        "models.eval_runtime.smc_w_ob",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_FVG",
+        "models.eval_runtime.smc_w_fvg",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_LIQ",
+        "models.eval_runtime.smc_w_liq",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_PREMIUM",
+        "models.eval_runtime.smc_w_premium",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT",
+        "models.eval_runtime.smc_w_inducement",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_MTF",
+        "models.eval_runtime.smc_w_mtf",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_BOS",
+        "models.eval_runtime.smc_w_bos",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_CHOCH",
+        "models.eval_runtime.smc_w_choch",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_EQH",
+        "models.eval_runtime.smc_w_eqh",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_EQL",
+        "models.eval_runtime.smc_w_eql",
+    ),
+    (
+        "NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT",
+        "models.eval_runtime.smc_w_displacement",
+    ),
+];
+
+/// Report, once per process and at ERROR, every retired environment variable
+/// that is still exported — by name, with the value found, and with what
+/// decides that quantity now.
+///
+/// Called from [`crate::eval::install_backtest_runtime_overrides_from_settings`],
+/// which every production binary reaches through
+/// `install_search_runtime_overrides_from_settings` at startup. There is no
+/// second call site by design: a substitution announced twice is a substitution
+/// nobody reads.
+pub fn report_retired_env_vars() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut found = 0usize;
+        for (name, replacement) in RETIRED_ENV_VARS.iter().chain(RETIRED_SEARCH_ENV_VARS) {
+            let Ok(value) = std::env::var(name) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            found += 1;
+            tracing::error!(
+                target: "neoethos_search::retired_env",
+                env_var = %name,
+                value_found = %value,
+                decided_by = %replacement,
+                "RETIRED ENVIRONMENT VARIABLE IS SET AND WAS IGNORED — this value did NOT \
+                 reach the run. Remove it from the shell and set the named config key instead."
+            );
+        }
+        if found > 0 {
+            tracing::error!(
+                target: "neoethos_search::retired_env",
+                count = found,
+                "{found} retired NEOETHOS/FOREX environment variable(s) were set and ignored. \
+                 The environment no longer configures this crate: one config, no env."
+            );
+        }
+    });
+}
+
 /// Which compute lane the population evaluation could take, and every ambient
 /// knob that picks between them or changes their arithmetic.
 ///
@@ -137,7 +593,7 @@ impl ExecutionEnvironmentProfile {
             stop_target: crate::stop_target::current_stop_target_runtime_overrides(),
             seen_memory:
                 crate::genetic::evolution_math::current_seen_signature_memory_runtime_overrides(),
-            smc_search: crate::genetic::smc_indicators::SmcSearchConfig::from_env(),
+            smc_search: crate::genetic::smc_indicators::SmcSearchConfig::current(),
             adaptive_stops_enabled: crate::stop_target::adaptive_stops_enabled(),
             adaptive_stops_rr: crate::stop_target::adaptive_stops_rr(),
             effective_rayon_threads: rayon::current_num_threads(),
@@ -173,6 +629,18 @@ impl ExecutionEnvironmentProfile {
     }
 }
 
+/// Record an ambient environment variable into the run profile.
+///
+/// KEPT ON PURPOSE, and it is the only `env::var` in this crate outside the
+/// retired-env reporter and `#[cfg(test)]`. It is a RECORDER, not a reader:
+/// nothing branches on what it returns, so it cannot change what a run
+/// computes. Since 2026-08-10 every name below is retired, which makes these
+/// fields strictly more useful than before — a profile that shows
+/// `require_gpu_env: Some("1")` next to a CPU-fallback run is the evidence
+/// that a stale export was present and correctly ignored.
+///
+/// It also keeps the retired names present in this crate's source, which is
+/// what the `discovery_tests.rs` env census matches its table against.
 fn raw_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }

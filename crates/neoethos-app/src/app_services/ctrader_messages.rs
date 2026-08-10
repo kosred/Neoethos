@@ -17,19 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tungstenite::{Message, connect};
 
-/// Environment-variable name that selects the cTrader Open API transport
-/// at runtime. Recognised values (case-insensitive, trimmed):
-///
-/// * `json_wss` (default) → port 5036, WebSocket+TLS+JSON envelopes.
-/// * `protobuf` → port 5035, raw TCP+TLS with native Protobuf framing
-///   (length-prefix + serialised `ProtoMessage`). Migrates the reconcile
-///   + historical-bars endpoints per the v0.4.5 batch documented in
-///   `docs/audits/research/ctrader_api_full_reference.md` §10 item #3.
-///
-/// Unset → default (`json_wss`). Unknown value → JSON-WSS with a warn-
-/// level trace event (the binary stays usable even if the operator
-/// typoes the value).
-pub const CTRADER_TRANSPORT_ENV_VAR: &str = "NEOETHOS_BOT_CTRADER_TRANSPORT";
+// 2026-08-09 (D2b): `CTRADER_TRANSPORT_ENV_VAR`
+// (`NEOETHOS_BOT_CTRADER_TRANSPORT`) was removed here together with the
+// transport selector it fed. See the D2b note further down this file. The only
+// transport this binary has is JSON-WSS on port 5036.
 
 /// `ProtoHeartbeatEvent` — sent every ~30 s by the cTrader Open API
 /// server (and by the client to keep the socket alive). Carries no
@@ -61,8 +52,6 @@ pub const CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE: u32 = 2131;
 pub const CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE: u32 = 2132;
 pub const CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2133;
 pub const CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2134;
-pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2135;
-pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2136;
 pub const CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2114;
 pub const CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2115;
 pub const CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE: u32 = 2116;
@@ -91,8 +80,6 @@ pub const CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE: u32 = 2145;
 pub const CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE: u32 = 2146;
 pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2149;
 pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2150;
-pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2165;
-pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2166;
 /// Server-pushed event raised when the broker drops the account session.
 /// New in the 2026-05-14 upstream proto refresh (Batch 6). Until this
 /// landed we only learned about a stale session indirectly from a failed
@@ -146,10 +133,6 @@ pub const CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE: u32 = 2107;
 /// a `ProtoOAExecutionEvent` (2126), like the other trade actions. This is the
 /// capability that lets the bot move a stop to breakeven or trail a winner.
 pub const CTRADER_OA_AMEND_POSITION_SLTP_REQUEST_PAYLOAD_TYPE: u32 = 2110;
-/// `ProtoOASymbolsForConversionReq/Res` — the symbol chain used to convert a
-/// P&L expressed in one asset into the account's deposit currency.
-pub const CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE: u32 = 2118;
-pub const CTRADER_OA_SYMBOLS_FOR_CONVERSION_RESPONSE_PAYLOAD_TYPE: u32 = 2119;
 /// `ProtoOASymbolChangedEvent` — pushed when a symbol's specification (digits,
 /// trading hours, swap, etc.) changes broker-side; consumers should refetch.
 pub const CTRADER_OA_SYMBOL_CHANGED_EVENT_PAYLOAD_TYPE: u32 = 2120;
@@ -179,16 +162,6 @@ pub const CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2148;
 /// behind an access token.
 pub const CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2151;
 pub const CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2152;
-/// `ProtoOADepthEvent` + subscribe/unsubscribe — Level-2 depth-of-market.
-pub const CTRADER_OA_DEPTH_EVENT_PAYLOAD_TYPE: u32 = 2155;
-pub const CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE: u32 = 2156;
-pub const CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE: u32 = 2157;
-pub const CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE: u32 = 2158;
-pub const CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE: u32 = 2159;
-/// `ProtoOAAccountLogoutReq/Res` — cleanly release an account session
-/// (counterpart to account-auth) so the broker frees server-side state.
-pub const CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE: u32 = 2162;
-pub const CTRADER_OA_ACCOUNT_LOGOUT_RESPONSE_PAYLOAD_TYPE: u32 = 2163;
 /// `ProtoOAMarginCallListReq/Res`, `…UpdateReq/Res`, `…UpdateEvent`,
 /// `…TriggerEvent` — the broker's margin-call thresholds and the pushed
 /// alert when one is hit (a critical risk signal for a live bot).
@@ -198,22 +171,36 @@ pub const CTRADER_OA_MARGIN_CALL_UPDATE_REQUEST_PAYLOAD_TYPE: u32 = 2169;
 pub const CTRADER_OA_MARGIN_CALL_UPDATE_RESPONSE_PAYLOAD_TYPE: u32 = 2170;
 pub const CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE: u32 = 2171;
 pub const CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE: u32 = 2172;
-/// `ProtoOARefreshTokenReq/Res` — refresh the OAuth access token over the
-/// Open API socket itself (alternative to the HTTPS token endpoint).
-pub const CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2173;
-pub const CTRADER_OA_REFRESH_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2174;
 /// `ProtoOAOrderListReq/Res` — historical orders over a time window (the
 /// account-wide order history that backs the trade journal / analytics).
 pub const CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2175;
 pub const CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2176;
-/// `ProtoOAGetDynamicLeverageByIDReq/Res` — the broker's dynamic-leverage
-/// tiers (volume-banded leverage) referenced by a symbol's `leverageId`.
-pub const CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE: u32 = 2177;
-pub const CTRADER_OA_GET_DYNAMIC_LEVERAGE_RESPONSE_PAYLOAD_TYPE: u32 = 2178;
-/// `ProtoOADealOffsetListReq/Res` — for a closing deal, the opening deals it
-/// offset (FIFO matching) and the realised gross/net per offset.
-pub const CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2185;
-pub const CTRADER_OA_DEAL_OFFSET_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2186;
+// REMOVED 2026-08-09 (dead-code purge, batch D2): nine cTrader request
+// builders with zero callers workspace-wide, together with their
+// request/response payload-type constants and their `expected_response_payload_type`
+// arms. Verified by symbol grep across crates/, desktop/, mesh/, mcp/,
+// scripts/, .github/ and docs/: the ONLY references were the definition,
+// its own unit test, and (for none of these) `ctrader_history.rs`.
+//   build_refresh_token_request            (2173) - OAuth refresh runs over
+//                                          HTTPS in ctrader_live_auth.rs:845
+//   build_account_logout_request           (2162)
+//   build_get_dynamic_leverage_request     (2177)
+//   build_symbols_for_conversion_request   (2118)
+//   build_deal_offset_list_request         (2185)
+//   build_subscribe_depth_quotes_request   (2156) + ProtoOADepthEvent (2155)
+//   build_unsubscribe_depth_quotes_request (2158)
+//   build_subscribe_live_trendbar_request  (2135) - production polls bars via
+//   build_unsubscribe_live_trendbar_request(2136)   broker_api::fetch_recent_chart_bars_blocking
+// KEPT and still unbuilt on purpose (WIRE items, not dead ends):
+//   build_amend_order_request, build_unsubscribe_spots_request.
+// WIRED 2026-08-09 (#238): `build_margin_call_list_request` is no longer on
+// that list. It now has a production caller —
+// `broker_api::fetch_margin_status_blocking`, polled by
+// `app_services::margin_call` — together with the response reader it never
+// had (`parse_margin_call_list_response`, below). Do NOT move it back to the
+// "unbuilt" list without deleting that poller: the comment above is the
+// dead-code purge's own record of what is deliberately callerless, and a
+// stale entry there is how a live wire gets deleted by the next purge.
 
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
@@ -875,21 +862,6 @@ pub fn build_cash_flow_history_list_request(
     }
 }
 
-/// `ProtoOARefreshTokenReq` (2173) — refresh the OAuth access token over the
-/// Open API socket itself (the alternative to the HTTPS token endpoint).
-pub fn build_refresh_token_request(
-    refresh_token: impl Into<String>,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "refreshToken": refresh_token.into(),
-        }),
-    }
-}
-
 /// `ProtoOAGetCtidProfileByTokenReq` (2151) — the cTID profile behind an
 /// access token (user id, nickname).
 pub fn build_get_ctid_profile_by_token_request(
@@ -905,74 +877,6 @@ pub fn build_get_ctid_profile_by_token_request(
     }
 }
 
-/// `ProtoOAAccountLogoutReq` (2162) — cleanly release an account session so the
-/// broker frees server-side state (counterpart to account-auth).
-pub fn build_account_logout_request(
-    ctid_trader_account_id: i64,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-        }),
-    }
-}
-
-/// `ProtoOAGetDynamicLeverageByIDReq` (2177) — the broker's dynamic-leverage
-/// tier table referenced by a symbol's `leverageId`.
-pub fn build_get_dynamic_leverage_request(
-    ctid_trader_account_id: i64,
-    leverage_id: i64,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "leverageId": leverage_id,
-        }),
-    }
-}
-
-/// `ProtoOASymbolsForConversionReq` (2118) — the symbol chain to convert a P&L
-/// expressed in `first_asset_id` into `last_asset_id` (the deposit currency).
-pub fn build_symbols_for_conversion_request(
-    ctid_trader_account_id: i64,
-    first_asset_id: i64,
-    last_asset_id: i64,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "firstAssetId": first_asset_id,
-            "lastAssetId": last_asset_id,
-        }),
-    }
-}
-
-/// `ProtoOADealOffsetListReq` (2185) — for a closing deal, the opening deals it
-/// offset (FIFO) and the realised gross/net per offset.
-pub fn build_deal_offset_list_request(
-    ctid_trader_account_id: i64,
-    deal_id: i64,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "dealId": deal_id,
-        }),
-    }
-}
-
 /// `ProtoOAMarginCallListReq` (2167) — the account's configured margin-call
 /// thresholds (the levels whose breach fires a `…TriggerEvent`).
 pub fn build_margin_call_list_request(
@@ -984,39 +888,6 @@ pub fn build_margin_call_list_request(
         payload_type: CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE,
         payload: serde_json::json!({
             "ctidTraderAccountId": ctid_trader_account_id,
-        }),
-    }
-}
-
-/// `ProtoOASubscribeDepthQuotesReq` (2156) — subscribe to Level-2 depth-of-
-/// market for the given symbols (pushes `ProtoOADepthEvent`s).
-pub fn build_subscribe_depth_quotes_request(
-    ctid_trader_account_id: i64,
-    symbol_ids: &[i64],
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "symbolId": symbol_ids,
-        }),
-    }
-}
-
-/// `ProtoOAUnsubscribeDepthQuotesReq` (2158) — stop Level-2 depth for symbols.
-pub fn build_unsubscribe_depth_quotes_request(
-    ctid_trader_account_id: i64,
-    symbol_ids: &[i64],
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "symbolId": symbol_ids,
         }),
     }
 }
@@ -1049,40 +920,6 @@ pub fn build_unsubscribe_spots_request(
         payload: serde_json::json!({
             "ctidTraderAccountId": ctid_trader_account_id,
             "symbolId": symbol_ids,
-        }),
-    }
-}
-
-pub fn build_subscribe_live_trendbar_request(
-    ctid_trader_account_id: i64,
-    symbol_id: i64,
-    period: i32,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "symbolId": symbol_id,
-            "period": period,
-        }),
-    }
-}
-
-pub fn build_unsubscribe_live_trendbar_request(
-    ctid_trader_account_id: i64,
-    symbol_id: i64,
-    period: i32,
-    client_msg_id: impl Into<String>,
-) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "ctidTraderAccountId": ctid_trader_account_id,
-            "symbolId": symbol_id,
-            "period": period,
         }),
     }
 }
@@ -1262,8 +1099,15 @@ pub fn build_get_tick_data_request(
 }
 
 /// Build the JSON envelope for `ProtoOADealListByPositionIdReq`
-/// (payload type 2179). Used by
-/// [`crate::app_services::ctrader_history::fetch_deals_by_position_id`].
+/// (payload type 2179).
+///
+/// **2026-08-09**: its only caller, `ctrader_history::fetch_deals_by_position_id`,
+/// was deleted in the D2 dead-code purge. This builder — together with
+/// `build_order_list_by_position_id_request`, `build_order_details_request`,
+/// `build_get_tick_data_request` and the `ctrader_account` parsers they feed —
+/// is now unreferenced protocol surface kept for the 2026-05-15 "full cTrader
+/// API coverage" directive. It is a WIRE item, not a live path: nothing routes
+/// per-position deal/order lookup or tick download today.
 /// The proto carries `ctidTraderAccountId` (required) plus
 /// `positionId` (required) and optional `fromTimestamp` / `toTimestamp`
 /// time bounds that the broker uses to slice the lookup.
@@ -1381,12 +1225,6 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_UNSUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE)
         }
-        CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE)
-        }
         CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE)
         }
@@ -1441,35 +1279,14 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE)
         }
-        CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_REFRESH_TOKEN_RESPONSE_PAYLOAD_TYPE)
-        }
         CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_ACCOUNT_LOGOUT_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_GET_DYNAMIC_LEVERAGE_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_SYMBOLS_FOR_CONVERSION_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_DEAL_OFFSET_LIST_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_MARGIN_CALL_UPDATE_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_MARGIN_CALL_UPDATE_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE)
-        }
-        CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => Err(anyhow!(
             "cTrader spot events are push-only payloads and are not valid request messages"
@@ -1640,6 +1457,160 @@ pub fn parse_account_disconnect_event(
     })
 }
 
+// **2026-08-09 (#238) — why there is NO `is_account_disconnect_event` helper
+// here, deliberately.** The obvious place to consume
+// `parse_account_disconnect_event` looked like the request/response path, and
+// it is the wrong place: `ProductionCTraderOpenApiTransport::send_sequence`
+// only ever pushes a frame that matches the request it is awaiting (or an
+// error response) — see `is_matching_open_api_response`. A disconnect event
+// arriving mid-sequence is skipped by the inner read loop and surfaces as
+// "cTrader open api socket closed unexpectedly", never as a frame a caller can
+// classify. A scanner over `send_sequence`'s output would therefore be
+// decorative wiring that can never fire, which is precisely the failure mode
+// this codebase keeps rediscovering.
+//
+// The ONLY place a disconnect event is actually observable is the long-lived
+// push socket: `live_spots_streamer.rs:580` already matches its payload type
+// and turns it into a reconnect. That is the correct home for
+// `parse_account_disconnect_event`, and routing it to the kill switch is one
+// line there. `app_services::margin_call` reaches the same halt independently
+// by escalating consecutive poll failures, so the halt does not depend on
+// that edit landing.
+
+/// One configured margin-call threshold, as returned by
+/// `ProtoOAMarginCallListRes` (2168).
+///
+/// `margin_level_threshold` is a PERCENTAGE — cTrader's margin level is
+/// `equity / used_margin * 100`, so a threshold of `100.0` means "fire when
+/// equity has fallen to the used margin".
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderMarginCallThreshold {
+    /// `MARGIN_CALL_THRESHOLD_1` / `_2` / `_3`, verbatim from the broker.
+    /// Kept as a String because the JSON bridge sends this enum sometimes as
+    /// its name and sometimes as its ordinal, and neither spelling is more
+    /// authoritative than the other.
+    pub margin_call_type: String,
+    pub margin_level_threshold: f64,
+    pub utc_last_update_timestamp_ms: Option<i64>,
+}
+
+/// Parsed `ProtoOAMarginCallListRes` (2168).
+///
+/// **NO SILENT DROPS.** Rows the broker sent that could not be turned into a
+/// usable threshold (missing or non-finite `marginLevelThreshold`, absent
+/// `marginCallType`) are NOT quietly skipped: they are counted in
+/// `unusable_rows` and each carries a reason in `unusable_reasons`, so the
+/// caller can log exactly how much of the broker's answer it failed to
+/// understand instead of behaving as though the broker configured fewer
+/// thresholds than it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderMarginCallListSnapshot {
+    pub account_id: i64,
+    pub thresholds: Vec<CTraderMarginCallThreshold>,
+    pub unusable_rows: usize,
+    pub unusable_reasons: Vec<String>,
+}
+
+impl CTraderMarginCallListSnapshot {
+    /// The TIGHTEST configured threshold — the largest margin-level percentage,
+    /// because margin level FALLS toward a call. `None` when the broker
+    /// returned no usable threshold at all.
+    pub fn tightest_threshold_pct(&self) -> Option<f64> {
+        self.thresholds
+            .iter()
+            .map(|t| t.margin_level_threshold)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MarginCallListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: MarginCallListPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarginCallListPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    #[serde(default, rename = "marginCall")]
+    margin_call: Vec<Value>,
+}
+
+/// Parses a `ProtoOAMarginCallListRes` (2168) JSON envelope.
+///
+/// **2026-08-09 (#238) — this is the reader the margin-call feed never had.**
+/// `build_margin_call_list_request` has existed since the 2026-06-10
+/// API-completeness pass with zero callers outside its own unit test, which
+/// meant the broker could tell the account it was approaching a margin call
+/// and nothing in this process asked. See `app_services::margin_call`.
+pub fn parse_margin_call_list_response(
+    response_json: &str,
+) -> Result<CTraderMarginCallListSnapshot> {
+    let envelope: MarginCallListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader margin call list response")?;
+    if envelope.payload_type != CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader margin call list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+
+    let mut thresholds = Vec::with_capacity(envelope.payload.margin_call.len());
+    let mut unusable_reasons: Vec<String> = Vec::new();
+
+    for (idx, row) in envelope.payload.margin_call.iter().enumerate() {
+        let level = row
+            .get("marginLevelThreshold")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let Some(margin_level_threshold) = level else {
+            unusable_reasons.push(format!(
+                "row {idx}: marginLevelThreshold missing / non-finite / non-positive \
+                 (raw={})",
+                row.get("marginLevelThreshold")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "absent".to_string())
+            ));
+            continue;
+        };
+        // The JSON bridge sends the enum either as its name or as its ordinal.
+        // Accept both; record the absence rather than inventing a name.
+        let margin_call_type = match row.get("marginCallType") {
+            Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            Some(Value::Number(n)) => format!("MARGIN_CALL_TYPE_{n}"),
+            _ => {
+                unusable_reasons.push(format!(
+                    "row {idx}: marginCallType missing or unrecognised — threshold \
+                     {margin_level_threshold} is still honoured, labelled UNKNOWN"
+                ));
+                "UNKNOWN".to_string()
+            }
+        };
+        thresholds.push(CTraderMarginCallThreshold {
+            margin_call_type,
+            margin_level_threshold,
+            utc_last_update_timestamp_ms: row
+                .get("utcLastUpdateTimestamp")
+                .and_then(|v| v.as_i64()),
+        });
+    }
+
+    // Only rows that produced NO threshold count as dropped; a row that was
+    // kept with an UNKNOWN label is degraded, not discarded, and its reason is
+    // still recorded above.
+    let unusable_rows = envelope.payload.margin_call.len() - thresholds.len();
+
+    Ok(CTraderMarginCallListSnapshot {
+        account_id: envelope.payload.ctid_trader_account_id,
+        thresholds,
+        unusable_rows,
+        unusable_reasons,
+    })
+}
+
 /// Per-position unrealized PnL row returned by
 /// `ProtoOAGetPositionUnrealizedPnLRes`. Values are denoted in the
 /// account deposit currency.
@@ -1769,7 +1740,7 @@ pub const CTRADER_TOKEN_EXPIRED_SENTINEL: &str = "CTRADER_TOKEN_EXPIRED";
 impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
         crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
-        let url = format!("wss://{}:5036", self.endpoint_host);
+        let url = ctrader_json_wss_url(&self.endpoint_host);
         let (mut socket, _) = connect(url.as_str())
             .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
         let mut responses = Vec::with_capacity(messages.len());
@@ -1865,83 +1836,26 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transport selector — JSON-WSS (port 5036, default) vs Protobuf (port 5035).
+// 2026-08-09 dead-code purge (batch D2b) — the Protobuf transport switch is
+// gone, together with the codec it selected.
 //
-// Per cTrader exhaustive docs sweep §10 item #3
-// (`docs/audits/research/ctrader_api_full_reference.md`), the native
-// Protobuf-over-TCP transport on port 5035 saves ~3× bandwidth compared
-// to JSON-WSS and removes JSON field-name brittleness. The migration is
-// staged: v0.4.5 ships the codec + reconcile + historical-bars and
-// keeps order placement on JSON-WSS for a follow-up
-// operator-acknowledged batch (the directive treats orders as
-// money-critical).
+// What was here: `CTraderTransportKind` (JsonWss | Protobuf),
+// `select_ctrader_transport_from_env()` and the
+// `NEOETHOS_BOT_CTRADER_TRANSPORT` env var, plus a doc block advertising the
+// port-5035 raw-TCP Protobuf transport as "~3× bandwidth vs JSON-WSS".
 //
-// The opt-in is via the `NEOETHOS_BOT_CTRADER_TRANSPORT` environment
-// variable (see `CTRADER_TRANSPORT_ENV_VAR`).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Wire format selected for the cTrader Open API transport at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CTraderTransportKind {
-    /// Port 5036 — WebSocket + TLS + JSON envelopes. Default.
-    JsonWss,
-    /// Port 5035 — raw TCP + TLS + native Protobuf framing
-    /// (4-byte big-endian length prefix + serialised `ProtoMessage`).
-    /// Migrates the reconcile and historical-bars endpoints in v0.4.5;
-    /// other endpoints fall back to JSON-WSS (the v0.4.5 batch scope).
-    Protobuf,
-}
-
-impl CTraderTransportKind {
-    /// Stable label suitable for `tracing` event fields.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::JsonWss => "json_wss",
-            Self::Protobuf => "protobuf",
-        }
-    }
-}
-
-/// Pick the cTrader transport based on `NEOETHOS_BOT_CTRADER_TRANSPORT`.
-/// Returns `JsonWss` for unset / empty / unrecognised values (with a
-/// `tracing::warn!` for unrecognised values so the operator can spot a
-/// typo). Recognised values: `json_wss`, `protobuf` (case-insensitive,
-/// trimmed).
-pub fn select_ctrader_transport_from_env() -> CTraderTransportKind {
-    match std::env::var(CTRADER_TRANSPORT_ENV_VAR) {
-        Ok(raw) => {
-            let normalised = raw.trim().to_ascii_lowercase();
-            match normalised.as_str() {
-                "" => CTraderTransportKind::JsonWss,
-                "json_wss" | "json-wss" | "json" | "wss" => CTraderTransportKind::JsonWss,
-                "protobuf" | "proto" | "pb" => {
-                    tracing::info!(
-                        target: "neoethos_app::ctrader",
-                        transport = "protobuf",
-                        "Using native Protobuf-over-TCP transport (3× bandwidth vs JSON-WSS)"
-                    );
-                    CTraderTransportKind::Protobuf
-                }
-                other => {
-                    tracing::warn!(
-                        target: "neoethos_app::ctrader",
-                        value = other,
-                        env_var = CTRADER_TRANSPORT_ENV_VAR,
-                        "unrecognised cTrader transport value; defaulting to JSON-WSS"
-                    );
-                    CTraderTransportKind::JsonWss
-                }
-            }
-        }
-        Err(_) => CTraderTransportKind::JsonWss,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Connection entry points — public helpers exposing the per-wire-format
-// dial semantics. The high-level transport type
-// (`ProductionCTraderOpenApiTransport`) calls into these on each
-// `send_sequence` invocation.
+// Why it went: batch D2 deleted `ctrader_openapi.rs`, the `proto/` directory,
+// the protoc codegen in `build.rs` and the `protobuf` dependency — so the
+// Protobuf arm selected a wire format that no longer exists in this binary.
+// The selector had zero production callers (only its own two tests), and it
+// read an environment variable on a dead path, which is exactly the defect the
+// ONE-CONFIG directive targets. A green test pinning a switch to a deleted
+// codec is worse than no switch: it reads as coverage.
+//
+// The live wire format is hand-rolled JSON over WSS, built in this file and
+// dialled by `ctrader_json_wss_url` below. If the Protobuf transport is ever
+// wanted, it needs the codec back first — at which point the selector is four
+// lines, and recoverable from git history regardless.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build the canonical JSON-WSS endpoint URL (port 5036, TLS WebSocket).

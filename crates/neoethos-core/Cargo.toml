@@ -95,16 +95,14 @@ thiserror = "2.0.16"
 # params! + query/execute (storage.rs), unchanged from 0.37 through 0.40.
 rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
 chrono = { version = "0.4.44", features = ["serde"] }
-uuid = { version = "1.19.0", features = ["v4", "serde"] }
-ndarray = "0.17.2"
+# NB (2026-08-09, D3 purge): `uuid`, `ndarray` and `secrecy` were removed
+# here because their last consumers in this crate were the orphaned
+# `domain::{events, portfolio, news_filter}` modules. `secrecy` in
+# particular guarded an LLM API key on a `NewsFilter` nothing constructed;
+# if a real secret-holding type lands in core, bring the dep back WITH it.
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
 reqwest = { version = "0.13.3", default-features = true, features = ["rustls", "json", "blocking", "query", "form"] }
-# API key wrapped in `secrecy::SecretString` (a `Box<str>` that cannot
-# reallocate, zeroized on drop). The zeroize upstream docs explicitly point
-# users to `secrecy` for string-shaped secrets because `Zeroizing<String>`
-# leaves un-zeroed reallocated buffers on the heap.
-secrecy = "0.10"
 # TOML serializer for the broker credentials file. Owns the
 # canonical on-disk shape so both neoethos-app and neoethos-cli can
 # read + write `broker_credentials.toml` without a workspace cycle.

@@ -687,3 +687,218 @@ void rvi_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `rvi_scalar` (src/indicators/rvi.rs:400), the `devtype == 0`
+ * (standard deviation) and `matype == 1` (EMA) arm -- :603-719. Those are the
+ * batch defaults (cpu_batch.rs:16610-16611), and `rvi_with_kernel` maps
+ * `Kernel::Auto` onto `Kernel::Scalar` outright (:272), so there is exactly
+ * one CPU answer to match.
+ *
+ * PERIOD-SWEPT. `compute_rvi_batch` reads a parameter literally named
+ * `period`, default 10 (cpu_batch.rs:16608). `ma_len` (14), `matype` (1) and
+ * `devtype` (0) are NOT swept and are pinned to those defaults here.
+ *
+ * SINGLE OUTPUT: `output_id == "value"` is the only column this indicator
+ * offers (cpu_batch.rs:16626).
+ *
+ * WARMUP: `first + (period - 1) + (ma_len - 1)` (:415). Note the CPU's own
+ * walk starts at index 0, NOT at `first`: `prev` is seeded from `data[0]`
+ * (:471) and the variance window is seeded from `data[0..period]` (:459).
+ * `first` enters only through the warmup gate. Starting the kernel at
+ * `first` instead would seed a different variance and shift every value.
+ *
+ * THE EPSILON IS ALREADY f64. `denom.abs() < f64::EPSILON` (:710) uses
+ * 2.220446049250313e-16, the DOUBLE epsilon -- it is carried across
+ * unchanged, and that is correct precisely because it was not an f32
+ * constant to begin with. The f32 lane in this file is not the reference for
+ * it.
+ *
+ * NaN IS LOAD-BEARING, NOT AN ACCIDENT. Four separate resets hang off it: a
+ * non-finite bar blanks `d`, blanks `dev`, and RESTARTS both EMA seeds
+ * (`up_started = false`, :675). fmax/fmin would erase exactly the behaviour
+ * being reproduced, so the comparisons here are the CPU's `is_nan` tests, not
+ * fmax.
+ *
+ * THE VARIANCE WINDOW IS ROLLED, AND RE-SEEDED ON A HOLE. `sum += x - leaving;
+ * sumsq += x*x - leaving*leaving` (:648) is the steady state; when either end
+ * of the window or an accumulator is NaN the CPU RESCANS the whole window
+ * from scratch (:628-645). Both branches are reproduced, in that order --
+ * a kernel that only rolled would carry a poisoned accumulator forever.
+ *
+ * ONE ROUNDING, NOT THREE: `alpha.mul_add(up_i, one_m_alpha * up_prev)`
+ * (:685) is `fma(alpha, up_i, one_m_alpha * up_prev)`.
+ *
+ * NO PER-THREAD ARRAY: the variance window is read straight out of the
+ * resident input and the EMA carries two scalars, so there is no compile-time
+ * bound and no `max_period`.
+ *
+ * SEQUENTIAL, one thread per combo column.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* f64::EPSILON -- rvi.rs:710. NOT an f32 constant. */
+#define RVI_NEO_F64_EPS 2.2204460492503131e-16
+
+#define RVI_NEO_MA_LEN 14   /* cpu_batch.rs:16609 */
+
+extern "C" __global__
+void rvi_neo_batch_f64(const double* __restrict__ data,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int n = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    if (n == 0) return;
+    if (first_valid < 0 || first_valid >= n) return;
+
+    const int period = periods[combo];
+    const int ma_len = RVI_NEO_MA_LEN;
+    if (period <= 0 || ma_len <= 0 || period > n || ma_len > n) return;   /* :253 */
+
+    const int max_needed = (period - 1) + (ma_len - 1);
+    if (n - first_valid <= max_needed) return;                            /* :260 */
+
+    const int warmup = first_valid + max_needed;                          /* :415 */
+
+    const double inv_p = 1.0 / (double)period;
+    const double inv_m = 1.0 / (double)ma_len;
+    const double alpha = 2.0 / ((double)ma_len + 1.0);
+    const double one_m_alpha = 1.0 - alpha;
+
+    /* Seed of the variance window, :459-468. Walks from index 0. */
+    double sum = 0.0, sumsq = 0.0;
+    {
+        const int lim = min(period, n);
+        for (int i = 0; i < lim; ++i) {
+            const double x = data[i];
+            if (isnan(x)) { sum = NEO_F64_NAN; sumsq = NEO_F64_NAN; break; }
+            sum   += x;
+            sumsq += x * x;
+        }
+    }
+
+    double up_prev = 0.0, dn_prev = 0.0;
+    bool   up_started = false, dn_started = false;
+    double up_seed_sum = 0.0, dn_seed_sum = 0.0;
+    int    up_seed_cnt = 0,   dn_seed_cnt = 0;
+
+    double prev = data[0];                                                /* :471 */
+
+    for (int i = 0; i < n; ++i) {
+        const double x = data[i];
+        const double d = (i == 0 || isnan(x) || isnan(prev))
+                             ? NEO_F64_NAN
+                             : (x - prev);
+        prev = x;
+
+        double dev;
+        if (i + 1 < period) {
+            dev = NEO_F64_NAN;
+        } else if (i == period - 1) {
+            if (isnan(sum)) {
+                dev = NEO_F64_NAN;
+            } else {
+                const double mean    = sum   * inv_p;
+                const double mean_sq = sumsq * inv_p;
+                dev = sqrt(mean_sq - mean * mean);
+            }
+        } else {
+            const double leaving = data[i - period];
+            if (isnan(leaving) || isnan(x) || isnan(sum) || isnan(sumsq)) {
+                /* Full rescan, :628-645. */
+                sum = 0.0; sumsq = 0.0;
+                const int start = i + 1 - period;
+                bool bad = false;
+                for (int k = start; k <= i; ++k) {
+                    const double v = data[k];
+                    if (isnan(v)) { bad = true; break; }
+                    sum   += v;
+                    sumsq += v * v;
+                }
+                if (bad) {
+                    sum = NEO_F64_NAN; sumsq = NEO_F64_NAN;
+                    dev = NEO_F64_NAN;
+                } else {
+                    const double mean    = sum   * inv_p;
+                    const double mean_sq = sumsq * inv_p;
+                    dev = sqrt(mean_sq - mean * mean);
+                }
+            } else {
+                sum   += x - leaving;
+                sumsq += x * x - leaving * leaving;
+                const double mean    = sum   * inv_p;
+                const double mean_sq = sumsq * inv_p;
+                dev = sqrt(mean_sq - mean * mean);
+            }
+        }
+
+        double up_i, dn_i;
+        if (isnan(d) || isnan(dev)) { up_i = NEO_F64_NAN; dn_i = NEO_F64_NAN; }
+        else if (d > 0.0)           { up_i = dev;         dn_i = 0.0; }
+        else if (d < 0.0)           { up_i = 0.0;         dn_i = dev; }
+        else                        { up_i = 0.0;         dn_i = 0.0; }
+
+        double up_s;
+        if (isnan(up_i)) {
+            up_started = false; up_seed_sum = 0.0; up_seed_cnt = 0;
+            up_s = NEO_F64_NAN;
+        } else if (!up_started) {
+            up_seed_sum += up_i;
+            up_seed_cnt += 1;
+            if (up_seed_cnt == ma_len) {
+                up_prev = up_seed_sum * inv_m;
+                up_started = true;
+                up_s = up_prev;
+            } else {
+                up_s = NEO_F64_NAN;
+            }
+        } else {
+            up_prev = fma(alpha, up_i, one_m_alpha * up_prev);            /* :685 */
+            up_s = up_prev;
+        }
+
+        double dn_s;
+        if (isnan(dn_i)) {
+            dn_started = false; dn_seed_sum = 0.0; dn_seed_cnt = 0;
+            dn_s = NEO_F64_NAN;
+        } else if (!dn_started) {
+            dn_seed_sum += dn_i;
+            dn_seed_cnt += 1;
+            if (dn_seed_cnt == ma_len) {
+                dn_prev = dn_seed_sum * inv_m;
+                dn_started = true;
+                dn_s = dn_prev;
+            } else {
+                dn_s = NEO_F64_NAN;
+            }
+        } else {
+            dn_prev = fma(alpha, dn_i, one_m_alpha * dn_prev);
+            dn_s = dn_prev;
+        }
+
+        if (i >= warmup) {
+            if (isnan(up_s) || isnan(dn_s)) {
+                o[i] = NEO_F64_NAN;
+            } else {
+                const double denom = up_s + dn_s;
+                o[i] = (fabs(denom) < RVI_NEO_F64_EPS)
+                           ? NEO_F64_NAN
+                           : (100.0 * (up_s / denom));                    /* :713 */
+            }
+        }
+    }
+}

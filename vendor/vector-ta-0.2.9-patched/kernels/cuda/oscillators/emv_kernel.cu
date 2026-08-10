@@ -161,3 +161,181 @@ extern "C" __global__ void emv_many_series_one_param_f32(
         last_mid = current_mid;
     }
 }
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/emv.rs
+//   * emv_with_kernel (:219) — first_valid is the first index at which HIGH,
+//     LOW and VOLUME are ALL non-NaN simultaneously, and the warmup prefix is
+//     first + 1 (:235) because the first bar has no previous midpoint.
+//   * emv_scalar (:335) — the arithmetic reproduced below.
+//
+// PERIOD-INVARIANT. compute_emv_batch (cpu_batch.rs:2825) takes |_params| — it
+// reads no parameter at all, so every row of a period sweep is identical.
+//
+// INPUTS ARE (high, low, VOLUME) — three series, and the third is volume, not
+// close. Feeding close here computes a different indicator while passing every
+// length check on the way in.
+//
+// NaN and zero-range branches are EXACT tests, not tolerances: the CPU writes
+// NaN when any of h/l/v is NaN, and NaN again when range == 0.0 exactly while
+// still ADVANCING last_mid. There is no epsilon here to re-derive; inventing
+// one would change which bars emit a value.
+//
+// Sequential: last_mid carries across bars. One thread per column.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_emv() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__
+void neoethos_emv_f64(const double* __restrict__ high,
+                      const double* __restrict__ low,
+                      const double* __restrict__ volume,
+                      int n,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+    (void)periods;  // PERIOD-INVARIANT: see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const double QNAN = nef_qnan_emv();
+
+    if (first_valid < 0 || first_valid >= n) {
+        for (int i = 0; i < n; ++i) row[i] = QNAN;
+        return;
+    }
+
+    {
+        const int warm = (first_valid + 1) < n ? (first_valid + 1) : n;
+        for (int i = 0; i < warm; ++i) row[i] = QNAN;
+        for (int i = warm; i < n; ++i) row[i] = QNAN;
+    }
+
+    double last_mid = 0.5 * (high[first_valid] + low[first_valid]);
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double v = volume[i];
+
+        if (isnan(h) || isnan(l) || isnan(v)) { row[i] = QNAN; continue; }
+
+        const double current_mid = 0.5 * (h + l);
+        const double range = h - l;
+        if (range == 0.0) { row[i] = QNAN; last_mid = current_mid; continue; }
+
+        const double dmid = current_mid - last_mid;
+        row[i] = dmid * range * 10000.0 / v;
+        last_mid = current_mid;
+    }
+}
+
+
+
+// ===========================================================================
+// S1 f64 LANE  --  emv
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/emv.rs -- `emv_scalar` (:335), `emv_with_kernel` (:195)
+//
+// PERIOD-INVARIANT. `compute_emv_batch` (cpu_batch.rs:2818) takes
+// `|_params|`; emv has no period parameter.
+//
+// INPUT SHAPE: high, low, VOLUME -- NOT high/low/close. `emv_with_kernel`
+// destructures close as `_close` (emv.rs:196) and never reads it, and
+// first_valid is the first index at which HIGH, LOW and VOLUME are
+// simultaneously non-NaN (emv.rs:219); close is never scanned. Handing this
+// kernel an (high, low, close) triple would compute a different indicator AND
+// adopt a different first-valid, which is why the lane declares a distinct
+// `HighLowVolume` input kind for it rather than reusing `Hlc`.
+//
+// ARITHMETIC ORDER: `dmid * range * 10_000.0 / v` is LEFT TO RIGHT --
+// ((dmid*range)*10000)/v, three roundings. Regrouping it as
+// `dmid * (range * 10000.0 / v)` would be a different number. The 10_000.0 is
+// an exact scale factor, not an epsilon, and does not change with precision.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + 1)` -- one bar LATER than the
+// usual `first`, because the first output needs a previous midpoint. The two
+// in-loop NaN emissions are reproduced exactly: a bar with any NaN input, and
+// a bar whose range is EXACTLY zero. The CPU tests `range == 0.0`, not
+// `|range| < eps`; substituting an epsilon would change WHICH bars are
+// emitted, not merely their value.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_emv_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < 2);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    // `alloc_with_nan_prefix(len, first + 1)`.
+    const int warm = first_valid + 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+
+    double last_mid = 0.5 * (high[first_valid] + low[first_valid]);
+
+    for (int i = warm; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double v = volume[i];
+
+        if (neo_s1_isnan(h) || neo_s1_isnan(l) || neo_s1_isnan(v)) {
+            row[i] = neo_s1_qnan();
+            continue;
+        }
+
+        const double current_mid = 0.5 * (h + l);
+        const double range = h - l;
+        if (range == 0.0) {
+            row[i] = neo_s1_qnan();
+            last_mid = current_mid;
+            continue;
+        }
+
+        const double dmid = current_mid - last_mid;
+        row[i] = dmid * range * 10000.0 / v;
+        last_mid = current_mid;
+    }
+}

@@ -357,3 +357,316 @@ void vidya_many_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[t * stride + series_idx] = val;
     }
 }
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/vidya.rs
+//   * vidya_with_kernel (:366) — warmup prefix = first + long_period - 2.
+//   * vidya_scalar (:494) — the arithmetic reproduced below.
+//
+// PERIOD-INVARIANT. compute_vidya_batch (cpu_batch.rs:15699) reads
+// short_period (default 2), long_period (default 5) and alpha (default 0.2),
+// and NEVER reads period. A period sweep therefore emits identical CPU rows and
+// must emit identical rows here.
+//
+// NaN SEMANTICS. The CPU writes
+//     let mut k = short_std / long_std;
+//     if k.is_nan() { k = 0.0; }
+// A comparison chain would NOT catch this: every comparison against NaN is
+// false, so the NaN would survive into the recurrence and poison every later
+// bar. isnan() is the only correct test and is what is used here.
+//
+// ROUNDING COUNT. Four fused steps on the CPU, all reproduced as fma():
+//     long_sum2 = x.mul_add(x, long_sum2)                 -> fma(x, x, long_sum2)
+//     long_sum2 = (-x_out).mul_add(x_out, long_sum2)      -> fma(-x_out, x_out, long_sum2)
+//     val = (x - val).mul_add(k, val)                     -> fma(x - val, k, val)
+// Note the STEADY-STATE long/short sums use `+= x_new2` (unfused) on the way in
+// and a FUSED negative multiply-add on the way out — an asymmetry that is
+// deliberate in the CPU source and is reproduced rather than tidied.
+//
+// Sequential: four accumulators and val carry across bars. One thread per column.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_vidya() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+#define NEF_VIDYA_SHORT 2
+#define NEF_VIDYA_LONG  5
+#define NEF_VIDYA_ALPHA 0.2
+
+extern "C" __global__
+void neoethos_vidya_f64(const double* __restrict__ prices,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+    (void)periods;  // PERIOD-INVARIANT: see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const double QNAN = nef_qnan_vidya();
+
+    const int short_period = NEF_VIDYA_SHORT;
+    const int long_period = NEF_VIDYA_LONG;
+    const double alpha = NEF_VIDYA_ALPHA;
+
+    if (first_valid < 0 || first_valid + long_period > n) {
+        for (int i = 0; i < n; ++i) row[i] = QNAN;
+        return;
+    }
+
+    {
+        const int warm = (first_valid + long_period - 2) < n ? (first_valid + long_period - 2) : n;
+        for (int i = 0; i < warm; ++i) row[i] = QNAN;
+        for (int i = warm; i < n; ++i) row[i] = QNAN;
+    }
+
+    double long_sum = 0.0, long_sum2 = 0.0, short_sum = 0.0, short_sum2 = 0.0;
+
+    const double sp_f = (double)short_period;
+    const double lp_f = (double)long_period;
+    const double short_inv = 1.0 / sp_f;
+    const double long_inv = 1.0 / lp_f;
+
+    const int warm_end = first_valid + long_period;
+    const int short_head = warm_end - short_period;
+
+    for (int i = first_valid; i < short_head; ++i) {
+        const double x = prices[i];
+        long_sum += x;
+        long_sum2 = fma(x, x, long_sum2);
+    }
+    for (int i = short_head; i < warm_end; ++i) {
+        const double x = prices[i];
+        long_sum += x;
+        long_sum2 = fma(x, x, long_sum2);
+        short_sum += x;
+        short_sum2 = fma(x, x, short_sum2);
+    }
+
+    const int idx_m2 = warm_end - 2;
+    const int idx_m1 = warm_end - 1;
+
+    double val = prices[idx_m2];
+    row[idx_m2] = val;
+
+    if (idx_m1 < n) {
+        const double short_mean = short_sum * short_inv;
+        const double long_mean = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - (short_mean * short_mean);
+        const double long_var = long_sum2 * long_inv - (long_mean * long_mean);
+        const double short_std = sqrt(short_var);
+        const double long_std = sqrt(long_var);
+
+        double k = short_std / long_std;
+        if (isnan(k)) k = 0.0;
+        k *= alpha;
+
+        const double x = prices[idx_m1];
+        val = fma(x - val, k, val);
+        row[idx_m1] = val;
+    }
+
+    for (int t = warm_end; t < n; ++t) {
+        const double x_new = prices[t];
+        const double x_new2 = x_new * x_new;
+
+        long_sum += x_new;
+        long_sum2 += x_new2;
+        short_sum += x_new;
+        short_sum2 += x_new2;
+
+        const double x_long_out = prices[t - long_period];
+        const double x_short_out = prices[t - short_period];
+        long_sum -= x_long_out;
+        long_sum2 = fma(-x_long_out, x_long_out, long_sum2);
+        short_sum -= x_short_out;
+        short_sum2 = fma(-x_short_out, x_short_out, short_sum2);
+
+        const double short_mean = short_sum * short_inv;
+        const double long_mean = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - (short_mean * short_mean);
+        const double long_var = long_sum2 * long_inv - (long_mean * long_mean);
+        const double short_std = sqrt(short_var);
+        const double long_std = sqrt(long_var);
+
+        double k = short_std / long_std;
+        if (isnan(k)) k = 0.0;
+        k *= alpha;
+
+        val = fma(x_new - val, k, val);
+        row[t] = val;
+    }
+}
+
+
+// ===========================================================================
+// S1 f64 LANE  --  vidya
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/vidya.rs -- `vidya_scalar` (:494), `vidya_with_kernel` (:317)
+//
+// PERIOD-INVARIANT. `compute_vidya_batch` (cpu_batch.rs:15693) reads
+// `short_period` (2), `long_period` (5) and `alpha` (0.2). There is no
+// `period` parameter, so every row of a sweep is byte-identical.
+//
+// ARITHMETIC ORDER, and every `mul_add` that must stay `fma`:
+//   seed sums: `long_sum2 = x.mul_add(x, long_sum2)` -- ONE rounding per bar,
+//   not a multiply plus an add.
+//   slide: `long_sum2 = (-x_out).mul_add(x_out, long_sum2)` -- likewise, and
+//   note the negation is on the FIRST operand, which matters for the sign of
+//   the rounding of the product.
+//   recurrence: `val = (x - val).mul_add(k, val)` -- ONE rounding. This is the
+//   same shape the brief names for `natr`: `(tr - atr).mul_add(inv_p, atr)`.
+//   Written as `val + (x - val) * k` it would be two roundings and a different
+//   series from the seed bar onward.
+// The variance is the RAW form `sum2 * inv - mean * mean`, which is what the
+// CPU computes; the numerically-better centred form would be a different
+// number and is deliberately not used.
+//
+// `k.is_nan()` -> 0.0 is a NaN TEST, not a comparison chain: when `long_std`
+// is zero the ratio is NaN (0/0) or infinite, and only the NaN case is mapped
+// to zero. Reproduced with an explicit `x != x`, because an `fmax`-style
+// rewrite would silently also swallow the infinite case.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + long_period - 2)` -- note the
+// `- 2`, not the `- 1` most windowed indicators use, and the first two emitted
+// bars are written by the seed block rather than by the main loop.
+//
+// KERNEL SELECTION CAVEAT, RECORDED RATHER THAN HIDDEN: `vidya_with_kernel`
+// maps `Kernel::Auto` to `detect_best_kernel()` with Avx512 folded to Avx2
+// (vidya.rs:357-362), so on an x86_64 host with `nightly-avx` the CPU answer
+// is `vidya_avx2`, not `vidya_scalar`. This kernel is written against the
+// SCALAR reference. If the two disagree the fix belongs in the CPU -- the same
+// remedy `wilders` already received (one shared seed function) -- not in a
+// tolerance here.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_vidya_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    // `VidyaParams::default()` as read by cpu_batch.rs:15700-15702.
+    const int short_period = 2;
+    const int long_period = 5;
+    const double alpha = 0.2;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (short_period < 2) ||
+        (long_period < short_period) || (long_period < 2) || (long_period > n) ||
+        ((n - first_valid) < long_period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warmup = first_valid + long_period - 2;
+    for (int i = 0; i < warmup && i < n; ++i) row[i] = neo_s1_qnan();
+
+    double long_sum = 0.0, long_sum2 = 0.0, short_sum = 0.0, short_sum2 = 0.0;
+    const double short_inv = 1.0 / (double)short_period;
+    const double long_inv  = 1.0 / (double)long_period;
+
+    const int warm_end = first_valid + long_period;
+    const int short_head = warm_end - short_period;
+
+    for (int i = first_valid; i < short_head; ++i) {
+        const double x = prices[i];
+        long_sum += x;
+        long_sum2 = fma(x, x, long_sum2);
+    }
+    for (int i = short_head; i < warm_end; ++i) {
+        const double x = prices[i];
+        long_sum += x;
+        long_sum2 = fma(x, x, long_sum2);
+        short_sum += x;
+        short_sum2 = fma(x, x, short_sum2);
+    }
+
+    const int idx_m2 = warm_end - 2;
+    const int idx_m1 = warm_end - 1;
+
+    double val = prices[idx_m2];
+    row[idx_m2] = val;
+
+    if (idx_m1 < n) {
+        const double short_mean = short_sum * short_inv;
+        const double long_mean = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - (short_mean * short_mean);
+        const double long_var = long_sum2 * long_inv - (long_mean * long_mean);
+        const double short_std = sqrt(short_var);
+        const double long_std = sqrt(long_var);
+
+        double k = short_std / long_std;
+        if (neo_s1_isnan(k)) k = 0.0;
+        k *= alpha;
+
+        const double x = prices[idx_m1];
+        val = fma(x - val, k, val);
+        row[idx_m1] = val;
+    }
+
+    for (int t = warm_end; t < n; ++t) {
+        const double x_new = prices[t];
+        const double x_new2 = x_new * x_new;
+
+        long_sum += x_new;
+        long_sum2 += x_new2;
+        short_sum += x_new;
+        short_sum2 += x_new2;
+
+        const double x_long_out = prices[t - long_period];
+        const double x_short_out = prices[t - short_period];
+        long_sum -= x_long_out;
+        long_sum2 = fma(-x_long_out, x_long_out, long_sum2);
+        short_sum -= x_short_out;
+        short_sum2 = fma(-x_short_out, x_short_out, short_sum2);
+
+        const double short_mean = short_sum * short_inv;
+        const double long_mean = long_sum * long_inv;
+        const double short_var = short_sum2 * short_inv - (short_mean * short_mean);
+        const double long_var = long_sum2 * long_inv - (long_mean * long_mean);
+        const double short_std = sqrt(short_var);
+        const double long_std = sqrt(long_var);
+
+        double k = short_std / long_std;
+        if (neo_s1_isnan(k)) k = 0.0;
+        k *= alpha;
+
+        val = fma(x_new - val, k, val);
+        row[t] = val;
+    }
+}

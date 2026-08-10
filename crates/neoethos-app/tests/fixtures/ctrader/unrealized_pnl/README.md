@@ -8,10 +8,13 @@ payloads are forbidden here per the 2026-05-15 operator directive
 
 ## Schema reference
 
-Source of truth: `crates/neoethos-app/proto/OpenApiMessages.proto:789-794`
-(message `ProtoOAGetPositionUnrealizedPnLRes`, payload type **2188**)
-and `OpenApiModelMessages.proto:714-718` (the per-row
-`ProtoOAPositionUnrealizedPnL` body). Documented in
+Source of truth: upstream `spotware/openapi-proto-messages`,
+`OpenApiMessages.proto` (message `ProtoOAGetPositionUnrealizedPnLRes`, payload
+type **2188**) and `OpenApiModelMessages.proto` (the per-row
+`ProtoOAPositionUnrealizedPnL` body). The local `crates/neoethos-app/proto/`
+copy was deleted 2026-08-09 in dead-code purge batch D2 together with the
+protoc codegen that fed the never-referenced `ctrader_openapi.rs`, so the line
+numbers previously cited here no longer resolve. Documented in
 `docs/audits/research/ctrader_api_full_reference.md` §4.1 (payload-type
 table) and §5 (model schemas).
 

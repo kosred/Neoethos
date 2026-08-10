@@ -308,3 +308,211 @@ void tradjema_many_series_one_param_time_major_f32(
         out_tm[i * num_series + series] = static_cast<float>(y);
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — tradjema  (true-range adjusted EMA)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/tradjema.rs
+//   `tradjema_prepare`             (:238) — first_valid + refusals
+//   `tradjema_with_kernel`         (:297) — warm = first + length - 1
+//   `tradjema_compute_into_scalar` (:353) — the two monotonic deques and the
+//                                            adaptive-alpha recurrence
+//   Batch route: `ma_batch.rs:1537` maps `period_range` onto `length` and
+//   leaves `mult` at `TradjemaBatchRange::default()` (10.0, `:120`).
+//
+// FIRST-VALID RULE — NOT THE COMMON ONE.
+//   `tradjema_prepare:260` scans CLOSE ALONE (`close.iter().position(...)`).
+//   High and low are never examined. That is the same rule `adxr` uses, so the
+//   registry row declares `HlcCloseOnly`, not `AllInputsNonNan`. Using the
+//   common rule would shift the whole series on any frame where high or low
+//   starts later than close.
+//
+// max3 IS AN IF-CHAIN AND MUST STAY ONE.
+//   `max3` (:459) is `let m = if a > b {a} else {b}; if m > c {m} else {c}`.
+//   That is NOT `f64::max`: with a NaN first operand it returns the SECOND,
+//   and with a NaN third operand it returns `m`. Replacing it with `fmax` here
+//   would change the answer on a gapped bar, so the if-chain is reproduced
+//   literally. Rule 4 asks for the CPU's semantics, and the CPU's semantics at
+//   this line are the if-chain, not `f64::max`.
+//
+// ROUNDINGS.
+//   seed:  y = src0.mul_add(a0, 0.0)      -> ONE fma. Not `src0 * a0`, which
+//          rounds differently for a subnormal product, and this value seeds
+//          every later bar.
+//   step:  y = (src - y).mul_add(a, y)    -> sub + fma, TWO. Not
+//          `a*src + (1-a)*y`, which is four.
+//
+// THE DEQUES. Capacity is `length` exactly, as on the CPU, in per-thread local
+// arrays bounded by TRADJEMA_MAX_LENGTH. The host refuses a longer length by
+// name. The wrap-when-full behaviour of a `length`-capacity circular deque
+// holding `length` monotone entries is the CPU's, and is reproduced rather
+// than "fixed", because a fix here would be a silent divergence.
+// ===========================================================================
+
+#define TRADJEMA_MAX_LENGTH 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+__device__ __forceinline__ int neo_s2_inc(int i, int cap) {
+    int j = i + 1;
+    return (j == cap) ? 0 : j;
+}
+__device__ __forceinline__ int neo_s2_dec(int i, int cap) {
+    return (i == 0) ? (cap - 1) : (i - 1);
+}
+
+// `max3` from tradjema.rs:459 — an if-chain, deliberately not fmax.
+__device__ __forceinline__ double neo_s2_max3(double a, double b, double c) {
+    const double m = (a > b) ? a : b;
+    return (m > c) ? m : c;
+}
+
+extern "C" __global__ void neoethos_tradjema_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int length = periods[r];
+    const double mult = 10.0;   // TradjemaParams::get_mult -> unwrap_or(10.0)
+
+    const bool declined =
+        (n <= 0) ||
+        (length < 2) || (length > n) || (length > TRADJEMA_MAX_LENGTH) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < length) ||
+        !(mult > 0.0);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    const int warm = first_valid + length - 1;
+    // `alloc_with_nan_prefix(len, warm)`, then the compute fills warm..n-1.
+    // Filling the whole row with NaN first also covers the `warm >= n` early
+    // return, where the CPU leaves the tail untouched.
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    if (warm >= n) return;
+
+    const double alpha = 2.0 / ((double)length + 1.0);
+    const int cap = length;
+
+    double min_vals[TRADJEMA_MAX_LENGTH];
+    int    min_idx [TRADJEMA_MAX_LENGTH];
+    double max_vals[TRADJEMA_MAX_LENGTH];
+    int    max_idx [TRADJEMA_MAX_LENGTH];
+    int min_head = 0, min_tail = 0;
+    int max_head = 0, max_tail = 0;
+
+    const double tr0 = high[first_valid] - low[first_valid];
+    {
+        int back = neo_s2_dec(min_tail, cap);
+        while (min_tail != min_head && min_vals[back] > tr0) {
+            min_tail = back;
+            back = neo_s2_dec(min_tail, cap);
+        }
+        min_vals[min_tail] = tr0;
+        min_idx[min_tail] = first_valid;
+        min_tail = neo_s2_inc(min_tail, cap);
+
+        back = neo_s2_dec(max_tail, cap);
+        while (max_tail != max_head && max_vals[back] < tr0) {
+            max_tail = back;
+            back = neo_s2_dec(max_tail, cap);
+        }
+        max_vals[max_tail] = tr0;
+        max_idx[max_tail] = first_valid;
+        max_tail = neo_s2_inc(max_tail, cap);
+    }
+    double last_tr = tr0;
+
+    for (int i = first_valid + 1; i <= warm; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+        const double pc1 = close[i - 1];
+        const double tr = neo_s2_max3(hi - lo, fabs(hi - pc1), fabs(lo - pc1));
+
+        int back = neo_s2_dec(min_tail, cap);
+        while (min_tail != min_head && min_vals[back] > tr) {
+            min_tail = back;
+            back = neo_s2_dec(min_tail, cap);
+        }
+        min_vals[min_tail] = tr;
+        min_idx[min_tail] = i;
+        min_tail = neo_s2_inc(min_tail, cap);
+
+        back = neo_s2_dec(max_tail, cap);
+        while (max_tail != max_head && max_vals[back] < tr) {
+            max_tail = back;
+            back = neo_s2_dec(max_tail, cap);
+        }
+        max_vals[max_tail] = tr;
+        max_idx[max_tail] = i;
+        max_tail = neo_s2_inc(max_tail, cap);
+
+        last_tr = tr;
+    }
+
+    const double tr_low = min_vals[min_head];
+    const double tr_high = max_vals[max_head];
+    const double denom = tr_high - tr_low;
+    const double tr_adj0 = (denom != 0.0) ? ((last_tr - tr_low) / denom) : 0.0;
+    const double a0 = alpha * (1.0 + tr_adj0 * mult);
+    const double src0 = close[warm - 1];
+    double y = fma(src0, a0, 0.0);
+    row[warm] = y;
+
+    for (int i = warm + 1; i < n; ++i) {
+        // q_expire: lim = cur.saturating_sub(len)
+        const int lim = (i > length) ? (i - length) : 0;
+        while (min_head != min_tail && min_idx[min_head] <= lim) {
+            min_head = neo_s2_inc(min_head, cap);
+        }
+        while (max_head != max_tail && max_idx[max_head] <= lim) {
+            max_head = neo_s2_inc(max_head, cap);
+        }
+
+        const double hi = high[i];
+        const double lo = low[i];
+        const double pc1 = close[i - 1];
+        const double tr = neo_s2_max3(hi - lo, fabs(hi - pc1), fabs(lo - pc1));
+
+        int back = neo_s2_dec(min_tail, cap);
+        while (min_tail != min_head && min_vals[back] > tr) {
+            min_tail = back;
+            back = neo_s2_dec(min_tail, cap);
+        }
+        min_vals[min_tail] = tr;
+        min_idx[min_tail] = i;
+        min_tail = neo_s2_inc(min_tail, cap);
+
+        back = neo_s2_dec(max_tail, cap);
+        while (max_tail != max_head && max_vals[back] < tr) {
+            max_tail = back;
+            back = neo_s2_dec(max_tail, cap);
+        }
+        max_vals[max_tail] = tr;
+        max_idx[max_tail] = i;
+        max_tail = neo_s2_inc(max_tail, cap);
+
+        const double lo_tr = min_vals[min_head];
+        const double hi_tr = max_vals[max_head];
+        const double den = hi_tr - lo_tr;
+        const double tr_adj = (den != 0.0) ? ((tr - lo_tr) / den) : 0.0;
+        const double a = alpha * (1.0 + tr_adj * mult);
+        const double src = pc1;
+        y = fma(src - y, a, y);
+        row[i] = y;
+    }
+}

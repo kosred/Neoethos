@@ -241,3 +241,85 @@ void highpass_many_series_one_param_time_major_f32(const float* __restrict__ pri
         }
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — highpass (Ehlers one-pole high-pass)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/highpass.rs
+//   `highpass_with_kernel` (:303) — first_valid, Err branches,
+//                                   `alloc_with_nan_prefix(len, first)`
+//   `highpass_scalar` (:438)      — the recursion, run over `data[first..]`
+//
+// FIRST-VALID IS THE WARMUP. Unlike every windowed indicator in this shard the
+// prefix is `first`, NOT `first + period - 1`: the CPU slices `data[first..]`
+// and the filter emits from its very first bar, `out[first] = data[first]`.
+//
+// THE ALPHA GUARD IS 1e-15, AND IT IS AN ERROR, NOT A CLAMP. `highpass.rs:337`
+// returns `Err(InvalidAlpha)` when `|cos(2*PI/period)| < 1e-15`, so the CPU
+// emits NO series — an all-NaN row here, not a saturated one. 1e-15 is an f64
+// constant; the f32 kernel's `1e-6f` at L49 is a DIFFERENT test that fires on
+// periods the CPU accepts and computes normally.
+//
+// ROUNDING. `oma.mul_add(y_im1, c * (x_i - x_im1))` — the inner product is
+// rounded once, the fma once. TWO roundings. `oma*y + c*(x-xp)` would be four.
+// The CPU's 2x unroll performs the identical operations on the identical values
+// and is not reproduced structurally.
+//
+// One thread per column, bars ascending: this is a first-order IIR.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_highpass_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const double two_pi_k_div = 2.0 * 3.14159265358979323846 * 1.0 / (double)period;
+    const double cos_val = cos(two_pi_k_div);
+
+    const bool declined =
+        (n <= 2) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period) ||
+        (fabs(cos_val) < 1e-15);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    for (int i = 0; i < first_valid; ++i) row[i] = neo_s3_qnan();
+
+    // `highpass_scalar` recomputes theta from `period` itself (:446-449); the
+    // same expression, evaluated once, is used here.
+    const double theta = 2.0 * 3.14159265358979323846 / (double)period;
+    const double alpha = 1.0 + ((sin(theta) - 1.0) / cos(theta));
+    const double c   = 1.0 - 0.5 * alpha;
+    const double oma = 1.0 - alpha;
+
+    row[first_valid] = data[first_valid];
+    if (n - first_valid == 1) return;
+
+    double x_im1 = data[first_valid];
+    double y_im1 = row[first_valid];
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double x_i = data[i];
+        const double y_i = fma(oma, y_im1, c * (x_i - x_im1));
+        row[i] = y_i;
+        x_im1 = x_i;
+        y_im1 = y_i;
+    }
+}

@@ -1,23 +1,32 @@
 # `ProtoOAOrderListByPositionIdRes` fixtures
 
-This directory holds **real, captured** `ProtoOAOrderListByPositionIdRes`
-JSON envelopes used by the Batch 5/13 follow-up
-(`docs/audits/research/ctrader_api_full_reference.md` Appendix C
-item #5: server-side per-position drill-down) tests in
-`crates/neoethos-app/src/app_services/ctrader_history.rs::tests`.
+> **STATUS 2026-08-09 (dead-code purge, batch D2).** This directory is
+> currently **EMPTY of fixtures** — none was ever captured. The tests that
+> would have consumed them lived in
+> `crates/neoethos-app/src/app_services/ctrader_history.rs`, deleted in D2
+> because every public item in that file had zero callers. What survives is
+> the parser, `ctrader_account::parse_order_list_by_position_id_response`,
+> and its request builder, `ctrader_messages::build_order_list_by_position_id_request`
+> — both now unreferenced protocol surface kept as a WIRE item for the
+> 2026-05-15 "full cTrader API coverage" directive. This file is retained
+> because it is the only surviving description of the wire shape.
+
+This directory is *intended* to hold **real, captured**
+`ProtoOAOrderListByPositionIdRes` JSON envelopes.
 Synthetic broker payloads are forbidden here per the 2026-05-15
 operator directive (no-silent-fallback / no-synthetic-data) — same
 policy as the sibling `unrealized_pnl/` fixture directory.
 
 ## Schema reference
 
-Source of truth: `crates/neoethos-app/proto/OpenApiMessages.proto`
-(message `ProtoOAOrderListByPositionIdRes`, payload type **2184**)
-and `OpenApiModelMessages.proto` (the per-order `ProtoOAOrder`
-body — same shape as the `order` array inside
-`ProtoOAReconcileRes`). Documented in
-`docs/audits/research/ctrader_api_full_reference.md` §4.14 (history
-queries table) and §9.3 (order-list semantics).
+Source of truth: the upstream Spotware proto
+(`https://github.com/spotware/openapi-proto-messages` —
+message `ProtoOAOrderListByPositionIdRes`, payload type **2184**, and the
+per-order `ProtoOAOrder` body, same shape as the `order` array inside
+`ProtoOAReconcileRes`). The local `crates/neoethos-app/proto/` copy was
+deleted in D2 along with the protoc codegen that nothing consumed, and
+`docs/audits/research/ctrader_api_full_reference.md` does not exist in this
+repo.
 
 ```json
 {
@@ -53,10 +62,11 @@ queries table) and §9.3 (order-list semantics).
 
 The request side accepts `fromTimestamp` / `toTimestamp` in unix ms
 (both optional) and the response is filtered locally to the same
-window inside `fetch_orders_by_position_id_with_transport` via
-`filter_orders_to_window` — so a captured fixture should ideally
-cover at least 2 orders straddling the requested window so the
-clamping codepath is exercised by the test.
+window. That local clamp lived in
+`ctrader_history::fetch_orders_by_position_id_with_transport`
+(`filter_orders_to_window`) and was deleted with the file — a future wiring
+must re-implement it. A captured fixture should still cover at least 2 orders
+straddling the requested window so the clamping codepath gets exercised.
 
 ## Expected fixture file names
 
@@ -112,10 +122,10 @@ bytes is the entire point.
 
 ## Why this matters (cross-reference)
 
-The same `fetch_orders_by_position_id` helper replaces the
-client-side N-call filter pattern documented in Appendix C item
-#5 of `ctrader_api_full_reference.md`. Before this batch the
-operator-facing flow was:
+A `fetch_orders_by_position_id` helper would replace the client-side N-call
+filter pattern below. (The 2026-05 implementation was deleted in D2 as dead
+code; only the builder and parser remain.) The operator-facing flow today is
+still:
 
 ```
 ProtoOAOrderListReq  (whole account)

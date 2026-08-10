@@ -414,3 +414,291 @@ void stc_many_series_one_param_f32(const float* __restrict__ prices_tm,
         if (i >= warm) out_tm[i * cols + s] = out_i;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `stc_scalar` (src/indicators/stc.rs:479) with the default
+ * `fast_ma_type == slow_ma_type == "ema"` (:132, :136). That function then
+ * picks between TWO implementations on a property of the DATA, not of the
+ * parameters (:491):
+ *
+ *   all of data[first..] finite -> `stc_scalar_classic_ema_finite` (:561)
+ *   otherwise                   -> `stc_scalar_classic_ema`        (:773)
+ *
+ * BOTH ARE TRANSCRIBED HERE, and the kernel runs the same scan to choose
+ * between them. They are NOT the same doubles: the finite path counts ring
+ * occupancy with `macd_count` and only stores VALID entries, while the
+ * non-finite path keeps a per-slot validity ring, requires `macd_valid_sum ==
+ * k`, and -- the part that actually changes numbers -- gates the MACD on
+ * `slow_init_cnt >= slow` ALONE (:857) instead of on both EMA counters
+ * (:639), and CARRIES the last d/final EMA forward through a hole instead of
+ * emitting NaN. Implementing only the finite path would have been correct on
+ * clean data and silently wrong on the first gapped symbol.
+ *
+ * PERIOD-INVARIANT. `compute_stc_batch` reads `fast_period` (23),
+ * `slow_period` (50), `k_period` (10) and `d_period` (3) -- NEVER `period`
+ * (cpu_batch.rs:16571-16574). Five swept periods give five identical CPU
+ * columns, so the kernel writes five identical rows.
+ *
+ * SINGLE OUTPUT: "value" is the only column (cpu_batch.rs:16591).
+ *
+ * NO WARMUP PREFIX BEYOND `first`. `stc_with_kernel` allocates
+ * `alloc_with_nan_prefix(len, first)` (:311) -- the ONLY blanked region is
+ * before `first`. Every bar from `first` on is written by the walk, most of
+ * them 50.0 or NaN. A kernel that blanked out to `first + slow + k + d` would
+ * erase bars the CPU emits.
+ *
+ * ONE ROUNDING: the file's local `fma` helper is `(x - prev).mul_add(a, prev)`
+ * (:571) -- ONE rounding -- so `fma(x - prev, a, prev)` here, not
+ * `prev + a*(x-prev)`.
+ *
+ * THE EPSILON IS ALREADY f64. `EPS = f64::EPSILON` (:576) is 2.22e-16, the
+ * DOUBLE epsilon. Carried across unchanged because it was never an f32
+ * constant.
+ *
+ * THE EXTREMES ARE TERNARY CHAINS, NOT fmin/fmax. `if v < mn { mn = v }`
+ * (:664) keeps `mn` when `v` is NaN and keeps NaN once `mn` is NaN. fmin
+ * would return the non-NaN operand and disagree.
+ *
+ * TWO PER-THREAD RINGS OF `k_period` DOUBLES (10 at the default) plus two
+ * `k_period` byte rings. Sized at a compile-time 512 so an oversized k is
+ * refused by name rather than truncated -- but k is not swept, so this is a
+ * guard, not a live limit.
+ *
+ * SEQUENTIAL, one thread per combo column.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* f64::EPSILON -- stc.rs:576. NOT an f32 constant. */
+#define STC_NEO_F64_EPS 2.2204460492503131e-16
+
+#define STC_NEO_FAST 23   /* cpu_batch.rs:16571 */
+#define STC_NEO_SLOW 50   /* :16572 */
+#define STC_NEO_K    10   /* :16573 */
+#define STC_NEO_D    3    /* :16574 */
+
+#define STC_NEO_MAX_K 512
+
+/* stc.rs:571 -- ONE rounding. */
+__device__ __forceinline__ double stc_neo_ema_step(double prev, double a, double x)
+{
+    return fma(x - prev, a, prev);
+}
+
+/* The ternary min/max fold the CPU performs over a k-slot ring (:659-671). */
+__device__ __forceinline__ double stc_neo_stoch(const double* __restrict__ ring,
+                                                int k, double v)
+{
+    double mn = ring[0];
+    double mx = mn;
+    for (int j = 1; j < k; ++j) {
+        const double x = ring[j];
+        if (x < mn) mn = x;
+        if (x > mx) mx = x;
+    }
+    const double range = mx - mn;
+    if (fabs(range) > STC_NEO_F64_EPS) return (v - mn) * (100.0 / range);
+    return 50.0;
+}
+
+extern "C" __global__
+void stc_neo_batch_f64(const double* __restrict__ data,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;                       /* PERIOD-INVARIANT -- see header. */
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (len == 0) return;
+    if (first_valid < 0 || first_valid >= len) return;
+
+    const int fast = STC_NEO_FAST;
+    const int slow = STC_NEO_SLOW;
+    const int k    = STC_NEO_D > STC_NEO_K ? STC_NEO_D : STC_NEO_K;  /* k ring width */
+    const int kk   = STC_NEO_K;
+    const int d    = STC_NEO_D;
+    (void)k;
+    if (kk <= 0 || kk > STC_NEO_MAX_K) return;
+
+    int needed = fast;
+    if (slow > needed) needed = slow;
+    if (kk   > needed) needed = kk;
+    if (d    > needed) needed = d;
+    if (len - first_valid < needed) return;               /* :294 */
+
+    const int first = first_valid;
+    const int n     = len - first;
+
+    const double fast_a   = 2.0 / ((double)fast + 1.0);
+    const double slow_a   = 2.0 / ((double)slow + 1.0);
+    const double d_a      = 2.0 / ((double)d + 1.0);
+    const double fast_inv = 1.0 / (double)fast;
+    const double slow_inv = 1.0 / (double)slow;
+    const double d_inv    = 1.0 / (double)d;
+
+    /* stc.rs:491 -- the CPU picks its implementation on this scan. */
+    bool all_finite = true;
+    for (int i = first; i < len; ++i) {
+        if (!isfinite(data[i])) { all_finite = false; break; }
+    }
+
+    double fast_sum = 0.0, slow_sum = 0.0;
+    int    fast_init_cnt = 0, slow_init_cnt = 0;
+    double fast_ema = NEO_F64_NAN, slow_ema = NEO_F64_NAN;
+
+    double macd_ring[STC_NEO_MAX_K];
+    double d_ring[STC_NEO_MAX_K];
+    unsigned char macd_valid_ring[STC_NEO_MAX_K];
+    unsigned char d_valid_ring[STC_NEO_MAX_K];
+    for (int j = 0; j < kk; ++j) {
+        macd_ring[j] = NEO_F64_NAN;
+        d_ring[j]    = NEO_F64_NAN;
+        macd_valid_ring[j] = 0;
+        d_valid_ring[j]    = 0;
+    }
+    int macd_count = 0, macd_vpos = 0, macd_valid_sum = 0;
+    int d_count = 0, d_vpos = 0, d_valid_sum = 0;
+
+    double d_ema = NEO_F64_NAN, d_sum = 0.0;
+    int    d_init_cnt = 0;
+    double final_ema = NEO_F64_NAN, final_sum = 0.0;
+    int    final_init_cnt = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const double x = data[first + i];
+        const bool   x_is_finite = isfinite(x);
+
+        /* --------------------------------------------------------------
+         * The two paths differ from here. `all_finite` never changes
+         * inside the loop, so the branch is uniform across the whole walk
+         * and costs nothing in divergence.
+         * -------------------------------------------------------------- */
+        if (all_finite || x_is_finite) {
+            if (fast_init_cnt < fast) {
+                fast_init_cnt += 1;
+                fast_sum += x;
+                if (fast_init_cnt == fast) fast_ema = fast_sum * fast_inv;
+            } else {
+                fast_ema = stc_neo_ema_step(fast_ema, fast_a, x);
+            }
+            if (slow_init_cnt < slow) {
+                slow_init_cnt += 1;
+                slow_sum += x;
+                if (slow_init_cnt == slow) slow_ema = slow_sum * slow_inv;
+            } else {
+                slow_ema = stc_neo_ema_step(slow_ema, slow_a, x);
+            }
+        }
+
+        double stok;
+        double macd;
+        if (all_finite) {
+            /* stc_scalar_classic_ema_finite, :639-683 */
+            const bool macd_is_valid = (fast_init_cnt >= fast) && (slow_init_cnt >= slow);
+            macd = macd_is_valid ? (fast_ema - slow_ema) : NEO_F64_NAN;
+
+            if (macd_is_valid) {
+                macd_ring[macd_vpos] = macd;
+                macd_vpos += 1; if (macd_vpos == kk) macd_vpos = 0;
+                if (macd_count < kk) macd_count += 1;
+            }
+
+            if (!macd_is_valid)          stok = NEO_F64_NAN;
+            else if (macd_count == kk)   stok = stc_neo_stoch(macd_ring, kk, macd);
+            else                         stok = 50.0;
+        } else {
+            /* stc_scalar_classic_ema, :856-903 */
+            macd = (slow_init_cnt >= slow) ? (fast_ema - slow_ema) : NEO_F64_NAN;
+
+            if (i >= kk) macd_valid_sum -= (int)macd_valid_ring[macd_vpos];
+            const unsigned char mv = isnan(macd) ? 0 : 1;
+            macd_valid_ring[macd_vpos] = mv;
+            macd_valid_sum += (int)mv;
+            if (mv) macd_ring[macd_vpos] = macd;
+            macd_vpos += 1; if (macd_vpos == kk) macd_vpos = 0;
+
+            if (macd_valid_sum == kk && mv) stok = stc_neo_stoch(macd_ring, kk, macd);
+            else if (mv)                    stok = 50.0;
+            else                            stok = NEO_F64_NAN;
+        }
+
+        /* ---- d_val. The finite path emits NaN when stok is NaN (:700);
+           the non-finite path CARRIES the running mean/EMA (:920-926). --- */
+        double d_val;
+        if (!isnan(stok)) {
+            if (d_init_cnt < d) {
+                d_sum += stok;
+                d_init_cnt += 1;
+                if (d_init_cnt == d) { d_ema = d_sum * d_inv; d_val = d_ema; }
+                else                 { d_val = d_sum / (double)d_init_cnt; }
+            } else {
+                d_ema = stc_neo_ema_step(d_ema, d_a, stok);
+                d_val = d_ema;
+            }
+        } else if (all_finite) {
+            d_val = NEO_F64_NAN;
+        } else {
+            if      (d_init_cnt == 0) d_val = NEO_F64_NAN;
+            else if (d_init_cnt <  d) d_val = d_sum / (double)d_init_cnt;
+            else                      d_val = d_ema;
+        }
+
+        double kd;
+        if (all_finite) {
+            const bool d_is_valid = !isnan(d_val);
+            if (d_is_valid) {
+                d_ring[d_vpos] = d_val;
+                d_vpos += 1; if (d_vpos == kk) d_vpos = 0;
+                if (d_count < kk) d_count += 1;
+            }
+            if (!d_is_valid)         kd = NEO_F64_NAN;
+            else if (d_count == kk)  kd = stc_neo_stoch(d_ring, kk, d_val);
+            else                     kd = 50.0;
+        } else {
+            if (i >= kk) d_valid_sum -= (int)d_valid_ring[d_vpos];
+            const unsigned char dv = isnan(d_val) ? 0 : 1;
+            d_valid_ring[d_vpos] = dv;
+            d_valid_sum += (int)dv;
+            if (dv) d_ring[d_vpos] = d_val;
+            d_vpos += 1; if (d_vpos == kk) d_vpos = 0;
+
+            if (d_valid_sum == kk && dv) kd = stc_neo_stoch(d_ring, kk, d_val);
+            else if (dv)                 kd = 50.0;
+            else                         kd = NEO_F64_NAN;
+        }
+
+        /* ---- final EMA. IDENTICAL in both paths (:742-762, :967-988). --- */
+        double dst;
+        if (!isnan(kd)) {
+            if (final_init_cnt < d) {
+                final_sum += kd;
+                final_init_cnt += 1;
+                if (final_init_cnt == d) { final_ema = final_sum * d_inv; dst = final_ema; }
+                else                     { dst = final_sum / (double)final_init_cnt; }
+            } else {
+                final_ema = stc_neo_ema_step(final_ema, d_a, kd);
+                dst = final_ema;
+            }
+        } else if (final_init_cnt == 0) {
+            dst = NEO_F64_NAN;
+        } else if (final_init_cnt < d) {
+            dst = final_sum / (double)final_init_cnt;
+        } else {
+            dst = final_ema;
+        }
+
+        o[first + i] = dst;
+    }
+}

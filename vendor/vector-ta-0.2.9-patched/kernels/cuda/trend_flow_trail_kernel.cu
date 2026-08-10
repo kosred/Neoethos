@@ -581,3 +581,327 @@ extern "C" __global__ void trend_flow_trail_batch_f64(
             crossunder(prev_mfi_ready, prev_mfi_value, mfi, 10.0) ? 1.0 : NAN;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — trend_flow_trail
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/trend_flow_trail.rs:497
+ *   TrendFlowTrailState::update, driving HmaLikeStream::update (:384) ->
+ *   HmaStream::update (moving_averages/hma.rs:844) -> LinWma::update (:750),
+ *   EmaStream::update (moving_averages/ema.rs:592) and
+ *   MoneyFlowRawState::update (:423).
+ *
+ * Column: output_id "value" resolves to out.alpha_trail —
+ *   cpu_batch.rs:4487 accepts "alpha_trail"/"value". The other sixteen
+ *   columns are separate output ids; the state they need (prev_mfi,
+ *   prev_alpha_dir, prev_close) is still CARRIED here because the alpha_trail
+ *   recurrence reads prev_upper, prev_lower, prev_trail and prev_close.
+ *
+ * PERIOD-INVARIANT: compute_trend_flow_trail_batch reads alpha_length (33),
+ *   alpha_multiplier (3.3) and mfi_length (14) and NEVER period
+ *   (cpu_batch.rs:4465-4468).
+ *
+ * FIRST-VALID IGNORED: update RESETS every stream on a bar where ANY of open,
+ *   high, low, close or volume is non-finite (:506-516) and compute_row walks
+ *   every bar from index 0, writing NaN for a None.
+ *
+ * Input: (open, high, low, close, volume) — extract_ohlcv_full_input
+ *   (cpu_batch.rs:4457) — F64InputKind::Ohlcv5. OPEN is read ONLY by the
+ *   validity gate, and that is precisely why it cannot be dropped: a bar with
+ *   a non-finite open and finite h/l/c/v RESETS the whole cascade on the CPU,
+ *   and a kernel that never saw open would carry straight through it.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. Four stateful stages — a
+ *   Hull MA on close, an EMA on the bar range, a 14-deep money-flow ring, and
+ *   a second Hull MA on the money-flow ratio — feed a band pair that clamps
+ *   against ITS OWN previous values and a latched trail.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * LinWma keeps sum and wsum incrementally as
+ *     sum = prev_sum + value - old and wsum = n.mul_add(value, wsum - prev_sum)
+ *     (hma.rs:803-805) — ONE fma over a pre-formed difference — and multiplies
+ *     by a PRECOMPUTED inv_norm rather than dividing (:806).
+ *   * The Hull combination is 2.0.mul_add(half, -full) (hma.rs:849) — ONE fma,
+ *     not 2*half - full.
+ *   * The EMA seeds on the first value, runs a RUNNING MEAN for bars
+ *     2..=period as (x - mean).mul_add(1/count, mean), and only then switches
+ *     to beta.mul_add(mean, alpha * x) (ema.rs:600-607). Three regimes.
+ *   * The money-flow ratio is pos_sum / neg_sum and the index is
+ *     100 - (100 / (1 + ratio)) (:437-438) — reproduced as written, including
+ *     the 0/0 that yields NaN and the finite/0 that yields the exact 100.
+ *   * The band clamps are written as IF-CHAINS on the CPU (:539-549), not as
+ *     min/max, and they are reproduced as if-chains for that reason: the CPU
+ *     keeps the PREVIOUS band when the test fails, which is not what fmin
+ *     would return for a NaN operand.
+ *   * There is no epsilon anywhere in this column.
+ *
+ * NaN semantics: LinWma tracks a nan_count and returns NaN for the whole
+ *   window while any member is NaN, then REBUILDS the accumulators from the
+ *   ring once the window is clean again (hma.rs:783-800). That rebuild is not
+ *   an optimisation — it is what stops a NaN-poisoned incremental sum from
+ *   persisting — so it is reproduced exactly, including its own accumulation
+ *   order (oldest first, weight i+1).
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:4465-4468, plus MFI_HMA_LENGTH (:33). Each sizes
+ * a per-thread ring, so the bounds belong to the COMPILED kernel. */
+#define NEO_TFT_ALPHA_LENGTH      33
+#define NEO_TFT_ALPHA_MULTIPLIER  3.3
+#define NEO_TFT_MFI_LENGTH        14
+#define NEO_TFT_MFI_HMA_LENGTH     7
+#define NEO_TFT_WMA_MAX           NEO_TFT_ALPHA_LENGTH
+
+/* LinWma (moving_averages/hma.rs:696). */
+struct NeoTftWma {
+    int    period;
+    double inv_norm;
+    double buffer[NEO_TFT_WMA_MAX];
+    int    head;
+    bool   filled;
+    int    count;
+    double sum;
+    double wsum;
+    int    nan_count;
+    bool   dirty;
+};
+
+static __device__ inline void neo_tft_wma_init(NeoTftWma* w, int period) {
+    const double norm = (double)period * ((double)period + 1.0) * 0.5;
+    w->period   = period;
+    w->inv_norm = 1.0 / norm;
+    for (int i = 0; i < period; ++i) w->buffer[i] = NEO_F64_NAN;
+    w->head = 0; w->filled = false; w->count = 0;
+    w->sum = 0.0; w->wsum = 0.0; w->nan_count = 0; w->dirty = false;
+}
+
+static __device__ inline void neo_tft_wma_rebuild(NeoTftWma* w) {
+    w->sum = 0.0; w->wsum = 0.0; w->nan_count = 0;
+    int idx = w->head;
+    for (int i = 0; i < w->period; ++i) {
+        const double v = w->buffer[idx];
+        if (isnan(v)) {
+            ++w->nan_count;
+        } else {
+            w->sum += v;
+            w->wsum = fma((double)i + 1.0, v, w->wsum);
+        }
+        idx = (idx + 1 == w->period) ? 0 : (idx + 1);
+    }
+    w->dirty = (w->nan_count != 0);
+}
+
+static __device__ inline bool neo_tft_wma_update(NeoTftWma* w, double value, double* outv) {
+    const double n = (double)w->period;
+
+    const double old = w->buffer[w->head];
+    w->buffer[w->head] = value;
+    w->head = (w->head + 1 == w->period) ? 0 : (w->head + 1);
+
+    if (!w->filled) {
+        ++w->count;
+        if (isnan(value)) {
+            ++w->nan_count;
+            w->dirty = true;
+        } else {
+            w->sum += value;
+            w->wsum = fma((double)w->count, value, w->wsum);
+        }
+        if (w->count == w->period) {
+            w->filled = true;
+            *outv = (w->nan_count > 0) ? NEO_F64_NAN : (w->wsum * w->inv_norm);
+            return true;
+        }
+        return false;
+    }
+
+    if (isnan(old))   { if (w->nan_count > 0) --w->nan_count; }
+    if (isnan(value)) ++w->nan_count;
+
+    if (w->nan_count > 0) { w->dirty = true; *outv = NEO_F64_NAN; return true; }
+
+    if (w->dirty) {
+        neo_tft_wma_rebuild(w);
+        w->dirty = false;
+        *outv = w->wsum * w->inv_norm;
+        return true;
+    }
+
+    const double prev_sum = w->sum;
+    w->sum  = prev_sum + value - old;
+    w->wsum = fma(n, value, w->wsum - prev_sum);
+    *outv = w->wsum * w->inv_norm;
+    return true;
+}
+
+/* HmaStream (moving_averages/hma.rs:812). */
+struct NeoTftHma { NeoTftWma half, full, sqrtw; };
+
+static __device__ inline void neo_tft_hma_init(NeoTftHma* s, int period) {
+    const int half = period / 2;
+    int sqrt_len = (int)floor(sqrt((double)period));
+    neo_tft_wma_init(&s->half, half);
+    neo_tft_wma_init(&s->full, period);
+    neo_tft_wma_init(&s->sqrtw, sqrt_len);
+}
+
+static __device__ inline bool neo_tft_hma_update(NeoTftHma* s, double value, double* outv) {
+    double f, h;
+    const bool have_f = neo_tft_wma_update(&s->full, value, &f);
+    const bool have_h = neo_tft_wma_update(&s->half, value, &h);
+    if (have_f && have_h) {
+        const double x = fma(2.0, h, -f);
+        return neo_tft_wma_update(&s->sqrtw, x, outv);
+    }
+    return false;
+}
+
+extern "C" __global__
+void trend_flow_trail_neo_batch_f64(const double* __restrict__ open,
+                                    const double* __restrict__ high,
+                                    const double* __restrict__ low,
+                                    const double* __restrict__ close,
+                                    const double* __restrict__ volume,
+                                    int n,
+                                    const int* __restrict__ periods,
+                                    int n_combos,
+                                    int first_valid,
+                                    double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant — see header */
+    (void)first_valid; /* the mid-series reset reproduces it — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int    alpha_length = NEO_TFT_ALPHA_LENGTH;
+    const double alpha_mult   = NEO_TFT_ALPHA_MULTIPLIER;
+    const int    mfi_length   = NEO_TFT_MFI_LENGTH;
+
+    NeoTftHma basis, mfi_hma;
+    neo_tft_hma_init(&basis, alpha_length);
+    neo_tft_hma_init(&mfi_hma, NEO_TFT_MFI_HMA_LENGTH);
+
+    /* EmaStream(alpha_length) */
+    const double ema_alpha = 2.0 / ((double)alpha_length + 1.0);
+    const double ema_beta  = 1.0 - ema_alpha;
+    int    ema_count = 0;
+    double ema_mean  = NEO_F64_NAN;
+    bool   ema_filled = false;
+
+    /* MoneyFlowRawState(mfi_length) */
+    double mf_pos[NEO_TFT_MFI_LENGTH], mf_neg[NEO_TFT_MFI_LENGTH];
+    for (int k = 0; k < mfi_length; ++k) { mf_pos[k] = 0.0; mf_neg[k] = 0.0; }
+    int    mf_head = 0, mf_count = 0;
+    double mf_pos_sum = 0.0, mf_neg_sum = 0.0;
+    bool   mf_have_prev = false;
+    double mf_prev_src  = 0.0;
+
+    bool   have_prev_upper = false, have_prev_lower = false, have_prev_trail = false;
+    bool   have_prev_close = false;
+    double prev_upper_s = 0.0, prev_lower_s = 0.0, prev_trail_s = 0.0, prev_close_s = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double op = open[i], h = high[i], l = low[i], c = close[i], v = volume[i];
+
+        if (!(isfinite(op) && isfinite(h) && isfinite(l) && isfinite(c) && isfinite(v))) {
+            neo_tft_hma_init(&basis, alpha_length);
+            neo_tft_hma_init(&mfi_hma, NEO_TFT_MFI_HMA_LENGTH);
+            ema_count = 0; ema_mean = NEO_F64_NAN; ema_filled = false;
+            for (int k = 0; k < mfi_length; ++k) { mf_pos[k] = 0.0; mf_neg[k] = 0.0; }
+            mf_head = 0; mf_count = 0; mf_pos_sum = 0.0; mf_neg_sum = 0.0;
+            mf_have_prev = false; mf_prev_src = 0.0;
+            have_prev_upper = false; have_prev_lower = false;
+            have_prev_trail = false; have_prev_close = false;
+            prev_upper_s = 0.0; prev_lower_s = 0.0; prev_trail_s = 0.0; prev_close_s = 0.0;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        double basis_v;
+        const bool have_basis = neo_tft_hma_update(&basis, c, &basis_v);
+
+        /* EmaStream::update over |high - low|, scaled by alpha_multiplier. */
+        const double range_in = fabs(h - l);
+        ++ema_count;
+        if (ema_count == 1) {
+            ema_mean = range_in;
+        } else if (ema_count <= alpha_length) {
+            const double inv = 1.0 / (double)ema_count;
+            ema_mean = fma(range_in - ema_mean, inv, ema_mean);
+        } else {
+            ema_mean = fma(ema_beta, ema_mean, ema_alpha * range_in);
+        }
+        if (!ema_filled && ema_count >= alpha_length) ema_filled = true;
+        const bool   have_spread = ema_filled;
+        const double spread_v    = ema_mean * alpha_mult;
+
+        /* MoneyFlowRawState::update on (hlc3, volume), then the MFI Hull MA. */
+        const double src   = (h + l + c) / 3.0;
+        const double delta = mf_have_prev ? (src - mf_prev_src) : 0.0;
+        mf_have_prev = true;
+        mf_prev_src  = src;
+        const double pos_flow = (delta > 0.0) ? (v * src) : 0.0;
+        const double neg_flow = (delta < 0.0) ? (v * src) : 0.0;
+        if (mf_count == mfi_length) {
+            mf_pos_sum -= mf_pos[mf_head];
+            mf_neg_sum -= mf_neg[mf_head];
+        } else {
+            ++mf_count;
+        }
+        mf_pos[mf_head] = pos_flow;
+        mf_neg[mf_head] = neg_flow;
+        mf_pos_sum += pos_flow;
+        mf_neg_sum += neg_flow;
+        mf_head = (mf_head + 1) % mfi_length;
+
+        bool   have_mfi = false;
+        double mfi_v    = NEO_F64_NAN;
+        if (mf_count >= mfi_length) {
+            const double ratio = mf_pos_sum / mf_neg_sum;
+            const double raw   = 100.0 - (100.0 / (1.0 + ratio));
+            have_mfi = neo_tft_hma_update(&mfi_hma, raw, &mfi_v);
+        }
+
+        const bool   had_prev_close = have_prev_close;
+        const double prev_close_v   = prev_close_s;
+        have_prev_close = true;
+        prev_close_s    = c;
+
+        const bool   had_prev_trail = have_prev_trail;
+        const double prev_trail_v   = prev_trail_s;
+
+        if (!(have_basis && have_spread && have_mfi && isfinite(mfi_v))) {
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        double upper = basis_v + spread_v;
+        double lower = basis_v - spread_v;
+        const double prev_upper = have_prev_upper ? prev_upper_s : 0.0;
+        const double prev_lower = have_prev_lower ? prev_lower_s : 0.0;
+        const double prev_close_value = had_prev_close ? prev_close_v : 0.0;
+
+        lower = (lower > prev_lower || prev_close_value < prev_lower) ? lower : prev_lower;
+        upper = (upper < prev_upper || prev_close_value > prev_upper) ? upper : prev_upper;
+
+        double alpha_dir;
+        if (!had_prev_trail)                    alpha_dir = 1.0;
+        else if (prev_trail_v == prev_upper)    alpha_dir = (c > upper) ? -1.0 : 1.0;
+        else if (c < lower)                     alpha_dir = 1.0;
+        else                                    alpha_dir = -1.0;
+
+        const double alpha_trail = (alpha_dir < 0.0) ? lower : upper;
+
+        have_prev_upper = true; prev_upper_s = upper;
+        have_prev_lower = true; prev_lower_s = lower;
+        have_prev_trail = true; prev_trail_s = alpha_trail;
+
+        o[i] = alpha_trail;
+    }
+}

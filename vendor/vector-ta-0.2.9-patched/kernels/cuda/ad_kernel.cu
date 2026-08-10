@@ -277,3 +277,66 @@ extern "C" __global__ void ad_many_series_one_param_time_major_f32(
     }
 #endif
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — ad (accumulation / distribution)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/ad.rs:298 `ad_scalar`.
+ *
+ * THREE FACTS THE f32 LANE ABOVE GETS WRONG OR HIDES:
+ *   1. `ad_scalar` starts at index 0 and IGNORES first_valid entirely — there
+ *      is no warmup prefix and no NaN prefix. Registered as
+ *      F64FirstValidRule::Ignored so the table says so out loud rather than
+ *      declaring a rule the kernel does not honour.
+ *   2. PERIOD-INVARIANT: `ad_scalar` takes no period. Every row of a sweep is
+ *      byte-identical.
+ *   3. The f32 lane is a THREE-PASS BLOCK SCAN
+ *      (`ad_series_scan_blocks_f32` -> `ad_scan_block_sums_f64` ->
+ *      `ad_add_block_offsets_f32`). A block scan re-associates the running
+ *      sum. The CPU adds one bar at a time; so does this.
+ *
+ * `hl != 0.0` is the CPU's exact guard: when high == low the bar contributes
+ * NOTHING and `sum` is carried unchanged — it is not a divide-by-zero guarded
+ * by an epsilon, and inventing an epsilon here would drop real bars.
+ * `__fdividef` in the f32 file is the fast approximate divide; the exact
+ * `/` is used here.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void ad_neo_batch_f64(const double* __restrict__ high,
+                      const double* __restrict__ low,
+                      const double* __restrict__ close,
+                      const double* __restrict__ volume,
+                      int series_len,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods; (void)first_valid;    // see notes 1 and 2 above
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+
+    double sum = 0.0;
+    for (int i = 0; i < len; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        const double v = volume[i];
+
+        const double hl = h - l;
+        if (hl != 0.0) {
+            const double num = (c - l) - (h - c);
+            sum += (num / hl) * v;
+        }
+        o[i] = sum;
+    }
+}

@@ -568,3 +568,136 @@ extern "C" __global__ void edcf_ms1p_tiled_f32_tx128_ty4(const float* __restrict
                                                           float* __restrict__ out_tm) {
     edcf_ms1p_tiled_f32_impl<128, 4>(prices_tm, first_valids, period, cols, rows, out_tm);
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  edcf
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/moving_averages/edcf.rs -- `edcf_scalar_o1_into` (:337), `edcf_prepare` (:206), `edcf_with_kernel` (:270)
+//
+// PERIOD-BASED via `compute_ma_batch`. `edcf_prepare` maps `Kernel::Auto` to
+// `Kernel::Scalar` outright (edcf.rs:236-239), so `edcf_scalar_o1_into` is the
+// CPU answer on every host and there is no scalar/AVX disagreement to settle.
+//
+// TWO RINGS ARE STRUCTURAL, NOT AN OPTIMISATION. The O(1) reformulation keeps
+// the last `period` prices AND the last `period` weights, and both `num` and
+// `den` slide by subtracting the departing contribution -- so the sums are
+// accumulation-order dependent and cannot be recomputed from the window. The
+// rings are fixed per-thread arrays, so the kernel carries a hard period bound
+// (`EDCF_MAX_PERIOD`), refused BY NAME at the host rather than truncated.
+//
+// ARITHMETIC ORDER -- three `mul_add`s, ONE rounding each:
+//   `w_new = p_minus1_f.mul_add(x2, sum_prev_sq) - (2.0 * value * sum_prev)`
+//   `num   = w_new.mul_add(value, num)`
+//   `sum_prev_sq = value.mul_add(value, sum_prev_sq)`
+// and one that is deliberately NOT fused: `sum_prev_sq -= drop_x * drop_x`.
+//
+// THE HEAD POINTER IS READ TWICE PER BAR at two different times -- once before
+// the write (the departing pair) and once after the increment (the value
+// dropping out of the `sum_prev` window). That second read is why the ring
+// index is advanced in the middle of the body and not at the end.
+//
+// `den != 0.0` is an exact zero test, not an epsilon.
+//
+// WARMUP: `first + 2 * period` -- TWICE the period, and the input is rejected
+// unless `len - first >= 2 * period`. The state loop still starts at
+// `first_valid`; only the emission is gated.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+#define NEO_S1_EDCF_MAX_PERIOD 512
+
+extern "C" __global__ void neoethos_edcf_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) || (period > NEO_S1_EDCF_MAX_PERIOD) ||
+        ((n - first_valid) < 2 * period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + 2 * period;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+
+    double buf[NEO_S1_EDCF_MAX_PERIOD];
+    double wbuf[NEO_S1_EDCF_MAX_PERIOD];
+    for (int k = 0; k < period; ++k) { buf[k] = 0.0; wbuf[k] = 0.0; }
+
+    int head = 0;
+    int count = 0;
+    double sum_prev = 0.0, sum_prev_sq = 0.0;
+    double den = 0.0, num = 0.0;
+    const double p_minus1_f = (double)(period - 1);
+
+    for (int idx = first_valid; idx < n; ++idx) {
+        const double value = prices[idx];
+
+        const double old_x = buf[head];
+        const double old_w = wbuf[head];
+        const bool had_full_window = (count >= period);
+
+        double w_new;
+        if (count >= period) {
+            const double x2 = value * value;
+            w_new = fma(p_minus1_f, x2, sum_prev_sq) - (2.0 * value * sum_prev);
+        } else {
+            w_new = 0.0;
+        }
+
+        if (had_full_window) {
+            den -= old_w;
+            num -= old_w * old_x;
+        }
+        den += w_new;
+        num = fma(w_new, value, num);
+
+        buf[head] = value;
+        wbuf[head] = w_new;
+        if (++head == period) head = 0;
+
+        sum_prev += value;
+        sum_prev_sq = fma(value, value, sum_prev_sq);
+        if (count >= period - 1) {
+            const double drop_x = buf[head];
+            sum_prev -= drop_x;
+            sum_prev_sq -= drop_x * drop_x;
+        }
+
+        ++count;
+
+        if (idx >= warm) {
+            row[idx] = (den != 0.0) ? (num / den) : neo_s1_qnan();
+        }
+    }
+}

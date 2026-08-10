@@ -279,3 +279,121 @@ extern "C" __global__ void donchian_many_series_one_param_f32(
         else { upper_tm[idx] = maxv; lower_tm[idx] = minv; middle_tm[idx] = 0.5f * (maxv + minv); }
     }
 }
+
+
+// ===========================================================================
+// f64 LANE  --  shard S6
+//
+// CPU reference: `donchian_scalar` (src/indicators/donchian.rs:425).
+//
+// OUTPUT: `upper`, which is `OUTPUTS_BOLLINGER[0]` (registry.rs:1054 ->
+// [OUTPUT_UPPER, OUTPUT_MIDDLE, OUTPUT_LOWER]). The f64 lane carries one
+// matrix per indicator; middle is `(upper - lower).mul_add(0.5, lower)` and
+// lower is the window min, both one launch away once the lane grows an output
+// selector.
+//
+// FIRST VALID IS NOT THE COMMON RULE. donchian.rs:183-188 scans high and low
+// INDEPENDENTLY and takes `h.max(l)` -- the same construction `adx` uses over
+// three series. It is NOT "the first index at which both are non-NaN": if low
+// starts at 0 and high has a hole at 3 that clears by 5, the independent-max
+// answer is 0 and the simultaneous answer is 0 too, but move the hole to
+// before low's first bar and they part company. Declared as
+// `F64FirstValidRule::MaxOfIndependentFirsts`.
+//
+// THE CPU HAS TWO DIFFERENT VALIDITY TESTS AND THEY DISAGREE ON INFINITIES.
+// This is reproduced, not silently unified, because the CPU is the oracle:
+//   * period <= 32 (:470-506) rejects a window on `h.is_nan() || l.is_nan()`.
+//     An INFINITE high therefore flows straight through and becomes the upper
+//     band.
+//   * period  > 32 (:509-548) builds its block max/min from
+//     `ok = h.is_finite() & l.is_finite()`, so an infinite high is treated as
+//     MISSING and the bar becomes NaN.
+// So `donchian(period=32)` and `donchian(period=33)` answer differently for
+// the same infinite bar. That is a defect in vector-ta worth fixing on the CPU
+// side, but fixing it here alone would put the device out of parity with the
+// host, which is strictly worse. Reported rather than papered over.
+//
+// PARALLEL OVER (combo, bar), not one thread per column: donchian carries no
+// state across bars -- every output is a fresh max/min over its own window --
+// so `F64Kernel::is_sequential` is false for it and the launcher uses the
+// (bars x rows) grid. The window scan is the CPU's naive `for k in 0..period`
+// (:481-495), which is what makes it bit-identical; the CPU's block-max
+// reformulation for period > 32 computes the SAME max by a different route
+// and is an optimisation this shape does not need, because the work is spread
+// over bars instead of over one thread.
+//
+// f32 -> f64 audit: the f32 lane above uses `fmaxf` x2, `fminf` x2 and
+// `__int_as_float` x2. Below there is no f32-suffixed function and no
+// fast-math intrinsic. The comparison chains `if (hj > maxv)` / `if (lj < minv)`
+// are kept as comparisons and NOT converted to fmax/fmin -- that is deliberate
+// and it is the CPU's own structure (:487-493): NaN can never reach them
+// because `has_nan` breaks out first, and in the period > 32 arm an invalid
+// bar has already been mapped to -INFINITY / +INFINITY exactly as :531-532
+// does. Using fmax here would change nothing for valid data and would MASK the
+// infinity behaviour the CPU has. No epsilon exists in this indicator.
+// ===========================================================================
+
+static __device__ __forceinline__ double donchian_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void donchian_batch_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int r = blockIdx.y;
+    if (r >= n_combos) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double nan_d = donchian_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(r) * static_cast<size_t>(n);
+
+    const int period = periods[r];
+    if (period <= 0 || period > n || first_valid < 0) { row[i] = nan_d; return; }
+
+    const int warmup = first_valid + period - 1;      // :443
+    if (i < warmup) { row[i] = nan_d; return; }
+
+    if (period == 1) {                                 // :445-468
+        const double h = high[i];
+        const double l = low[i];
+        row[i] = (isnan(h) || isnan(l)) ? nan_d : h;
+        return;
+    }
+
+    const int start = i + 1 - period;
+
+    if (period <= 32) {                                // :470-506
+        double maxv = -INFINITY;
+        bool has_nan = false;
+        for (int k = 0; k < period; ++k) {
+            const double h = high[start + k];
+            const double l = low[start + k];
+            if (isnan(h) || isnan(l)) { has_nan = true; break; }
+            if (h > maxv) maxv = h;
+        }
+        row[i] = has_nan ? nan_d : maxv;
+        return;
+    }
+
+    // :509-548 -- validity is `is_finite`, and an invalid bar contributes
+    // -INFINITY to the max, then the whole window is voided by the valid
+    // prefix-sum check. Both halves reproduced.
+    double acc_max = -INFINITY;
+    bool all_valid = true;
+    for (int k = 0; k < period; ++k) {
+        const double h = high[start + k];
+        const double l = low[start + k];
+        const bool ok = isfinite(h) && isfinite(l);
+        if (!ok) { all_valid = false; }
+        const double hv = ok ? h : -INFINITY;
+        if (hv > acc_max) acc_max = hv;
+    }
+    row[i] = all_valid ? acc_max : nan_d;
+}

@@ -7,7 +7,7 @@
 use axum::Json;
 use axum::extract::State;
 
-use super::state::{AppApiState, launched_by_flutter};
+use super::state::AppApiState;
 
 #[derive(serde::Serialize)]
 pub struct HealthResponse {
@@ -16,19 +16,19 @@ pub struct HealthResponse {
     /// client to detect mismatched bundles (UI says 0.4.21 but server
     /// is still 0.4.20).
     pub version: &'static str,
-    /// F-270 (2026-05-28): true iff this backend was spawned by a
-    /// Flutter supervisor (`--launched-by-flutter` CLI flag set).
-    /// The Flutter `BackendSupervisor.ensureRunning()` reads this to
-    /// distinguish "another NeoEthos UI owns this backend" (refuse
-    /// second launch) from "a stale backend is holding port 7423 with
-    /// no UI" (attach to it instead of exiting).
-    pub launched_by_flutter: bool,
+    // REMOVED 2026-08-09 (dead-code purge, batch D2): `launched_by_flutter`.
+    // Its sole intended consumer was Flutter's `BackendSupervisor`, deleted in
+    // the 2026-06-22 Tauri migration. The desktop shell now runs the backend
+    // in-process on an ephemeral port (`desktop/src-tauri/src/lib.rs:31`
+    // binds 127.0.0.1:0), so the port-7423-ownership problem this field
+    // encoded no longer exists. No client ever read it: grep for
+    // `launchedByFlutter` across desktop/src, crates/neoethos-mcp,
+    // crates/neoethos-cli, mesh/ and mcp/ returned zero.
 }
 
 pub async fn healthz(State(_state): State<AppApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
-        launched_by_flutter: launched_by_flutter(),
     })
 }

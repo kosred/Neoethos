@@ -356,3 +356,234 @@ void damiani_volatmeter_many_series_one_param_time_major_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — damiani_volatmeter
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/damiani_volatmeter.rs
+ *   `damiani_volatmeter_prepare`   (:297) — first_valid, needed, Err branches,
+ *                                           and `Slice(s) => (s, s, s)`
+ *   `damiani_volatmeter_with_kernel`(:380)— the warm prefix AND the SECOND
+ *                                           NaN pass at :412-418
+ *   `damiani_volatmeter_scalar`    (:491) — the two Wilder ATRs, the two
+ *                                           rolling variances, the lag term
+ *
+ * WHICH SERIES THIS EMITS. `compute_damiani_volatmeter_batch`
+ * (cpu_batch.rs:14400) maps output_id "value" -> `out.vol`. One matrix, so
+ * this is VOL. `anti` is a separate output.
+ *
+ * INPUT IS ONE SERIES, NOT THREE. `compute_damiani_volatmeter_batch` calls
+ * `from_slice(close)`, and `damiani_volatmeter_prepare:323` expands a Slice to
+ * `(slice, slice, slice)`. So high == low == close, `tr1 = high - low` is
+ * IDENTICALLY ZERO and the true range collapses to `|c - prev_c|`. It is
+ * written out in full below anyway, because the collapse is a property of how
+ * the batch happens to call it and not of the indicator.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. The batch reads `vis_atr` (13),
+ * `vis_std` (20), `sed_atr` (40), `sed_std` (100) and `threshold` (1.4) —
+ * cpu_batch.rs:14380-14384 — never `period`. Identical CPU columns, identical
+ * rows here. The two std rings are therefore compile-time 20 and 100 slots and
+ * this kernel needs no `max_period`.
+ *
+ * THE ATR WARM-UP TESTS THE ABSOLUTE INDEX, NOT THE OFFSET FROM first_valid.
+ * damiani_volatmeter.rs:548 is `if i < vis_atr`, and `i` is an index into the
+ * whole series while the loop starts at `first`. On a series whose first bar
+ * is valid the two coincide; on a gapped one they do not, and the ATR seeds
+ * over fewer bars than the period. That is what the reference does and it is
+ * reproduced literally — noted here so it reads as a copied quirk rather than
+ * a transcription slip.
+ *
+ * A DEFECT IN THE REFERENCE, AND WHAT THIS KERNEL DOES ABOUT IT.
+ * `vol[i]` reads `vol[i-1]` and `vol[i-3]` and tests them with `is_nan()`.
+ * `alloc_with_nan_prefix` (helpers.rs:103) NaN-fills only `[0, warm)` and
+ * leaves the tail UNINITIALISED in release builds. When `first_valid == 0`,
+ * `warm == needed - 1`, so the very first read at `i == needed` touches index
+ * `needed - 1`, which is past the NaN prefix and has not been written yet:
+ * the reference reads uninitialised memory. When `first_valid > 0` the same
+ * index IS inside the prefix and the read is a well-defined NaN -> 0.0.
+ * This kernel NaN-fills the WHOLE row before the loop, which makes every such
+ * read the well-defined branch. That is the only self-consistent reading of
+ * the reference, it is what the reference does for every gapped series, and
+ * it is stated here rather than left to be discovered as a parity mismatch.
+ *
+ * THE SECOND NaN PASS IS NOT REDUNDANT. :412-418 blanks `[0, warm_end + 1)`
+ * AFTER the loop has run. Bars in `[needed, warm_end]` are therefore COMPUTED,
+ * READ by later bars through the `p1`/`p3` lag, and only then erased. Blanking
+ * them up front would change every subsequent value.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. `const float EPS = 1.1920929e-7f` at damiani_volatmeter_kernel.cu:68 IS
+ *     f32 MACHINE EPSILON. The reference uses `f64::EPSILON`, which is
+ *     2.220446049250313e-16 — nine orders of magnitude smaller. Copying the
+ *     f32 constant into an f64 kernel would make the zero-guard fire on
+ *     denominators that are perfectly usable and would shift `vol` wherever
+ *     the sedimentary ATR is small. This is exactly the hazard the brief names
+ *     and it is re-derived here, not copied.
+ *  2. `fabsf` x3, `fmaxf` x3, `sqrtf` x1 -> `fabs`, `fmax`, `sqrt`. The maxima
+ *     ARE `f64::max` in the reference (:538, :615, :620), so `fmax` is
+ *     correct here — unlike `cksp` and the `ttm_squeeze` warm-up, which use
+ *     comparison chains and must not.
+ *  3. `__int_as_float(0x7f...)` -> `__longlong_as_double(0x7ff8...)`.
+ *  4. THE ATR STEP IS THREE ROUNDINGS, NOT ONE. :554 is
+ *     `((p - 1)*atr + tr) / p` — multiply, add, divide. It is NOT the Wilder
+ *     `fma` form used by `atr`/`natr` elsewhere in this crate. Writing
+ *     `fma(inv_p, tr - atr, atr)` here would be one rounding where the
+ *     reference has three, and would disagree from the first bar.
+ *
+ * ONE THREAD PER COLUMN. Carried: two ATRs, four rolling sums, two rings.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_DAMIANI_VIS_ATR   13
+#define NEO_DAMIANI_VIS_STD   20
+#define NEO_DAMIANI_SED_ATR   40
+#define NEO_DAMIANI_SED_STD  100
+#define NEO_DAMIANI_THRESHOLD 1.4
+/* f64::EPSILON — NOT the f32 1.1920929e-7f the f32 kernel above uses. */
+#define NEO_F64_EPSILON 2.2204460492503131e-16
+
+extern "C" __global__
+void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
+                                      int series_len,
+                                      const int* __restrict__ periods,
+                                      int n_combos,
+                                      int first_valid,
+                                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;   /* period-invariant — see the header. */
+
+    const int vis_atr = NEO_DAMIANI_VIS_ATR;
+    const int vis_std = NEO_DAMIANI_VIS_STD;
+    const int sed_atr = NEO_DAMIANI_SED_ATR;
+    const int sed_std = NEO_DAMIANI_SED_STD;
+
+    /* needed = max(vis_atr, vis_std, sed_atr, sed_std, 3) */
+    int needed = vis_atr;
+    if (vis_std > needed) needed = vis_std;
+    if (sed_atr > needed) needed = sed_atr;
+    if (sed_std > needed) needed = sed_std;
+    if (3 > needed) needed = 3;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        vis_atr > len || vis_std > len || sed_atr > len || sed_std > len ||
+        (len - first_valid) < needed) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    /* Whole row NaN — see "A DEFECT IN THE REFERENCE" above. */
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    /* high == low == close on this path (prepare:323). */
+    const double* high  = data;
+    const double* low   = data;
+    const double* close = data;
+
+    double atr_vis_val = NEO_F64_NAN;
+    double atr_sed_val = NEO_F64_NAN;
+    double sum_vis = 0.0, sum_sed = 0.0;
+
+    const double vis_atr_f = (double)vis_atr;
+    const double sed_atr_f = (double)sed_atr;
+
+    double prev_close = NEO_F64_NAN;
+    bool have_prev = false;
+
+    double ring_vis[NEO_DAMIANI_VIS_STD];
+    double ring_sed[NEO_DAMIANI_SED_STD];
+    for (int k = 0; k < vis_std; ++k) ring_vis[k] = 0.0;
+    for (int k = 0; k < sed_std; ++k) ring_sed[k] = 0.0;
+
+    double sum_vis_std = 0.0, sum_sq_vis_std = 0.0;
+    double sum_sed_std = 0.0, sum_sq_sed_std = 0.0;
+    int idx_vis = 0, idx_sed = 0;
+    int filled_vis = 0, filled_sed = 0;
+
+    const double lag_s = 0.5;
+
+    for (int i = first_valid; i < len; ++i) {
+        const double ci = close[i];
+
+        double tr;
+        if (have_prev && isfinite(ci)) {
+            const double tr1 = high[i] - low[i];
+            const double tr2 = fabs(high[i] - prev_close);
+            const double tr3 = fabs(low[i] - prev_close);
+            tr = fmax(fmax(tr1, tr2), tr3);   /* :538 is `f64::max` */
+        } else {
+            tr = 0.0;
+        }
+
+        if (isfinite(ci)) { prev_close = ci; have_prev = true; }
+
+        /* :548 — ABSOLUTE index, see the header. */
+        if (i < vis_atr) {
+            sum_vis += tr;
+            if (i == vis_atr - 1) atr_vis_val = sum_vis / vis_atr_f;
+        } else if (isfinite(atr_vis_val)) {
+            atr_vis_val = ((vis_atr_f - 1.0) * atr_vis_val + tr) / vis_atr_f;
+        }
+
+        if (i < sed_atr) {
+            sum_sed += tr;
+            if (i == sed_atr - 1) atr_sed_val = sum_sed / sed_atr_f;
+        } else if (isfinite(atr_sed_val)) {
+            atr_sed_val = ((sed_atr_f - 1.0) * atr_sed_val + tr) / sed_atr_f;
+        }
+
+        const double val = isnan(ci) ? 0.0 : ci;
+
+        const double old_v = ring_vis[idx_vis];
+        ring_vis[idx_vis] = val;
+        idx_vis = (idx_vis + 1) % vis_std;
+        if (filled_vis < vis_std) {
+            filled_vis += 1;
+            sum_vis_std += val;
+            sum_sq_vis_std += val * val;
+        } else {
+            sum_vis_std = sum_vis_std - old_v + val;
+            sum_sq_vis_std = sum_sq_vis_std - (old_v * old_v) + (val * val);
+        }
+
+        const double old_s = ring_sed[idx_sed];
+        ring_sed[idx_sed] = val;
+        idx_sed = (idx_sed + 1) % sed_std;
+        if (filled_sed < sed_std) {
+            filled_sed += 1;
+            sum_sed_std += val;
+            sum_sq_sed_std += val * val;
+        } else {
+            sum_sed_std = sum_sed_std - old_s + val;
+            sum_sq_sed_std = sum_sq_sed_std - (old_s * old_s) + (val * val);
+        }
+
+        if (i >= needed) {
+            const double v1 = (i >= 1) ? o[i - 1] : NEO_F64_NAN;
+            const double v3 = (i >= 3) ? o[i - 3] : NEO_F64_NAN;
+            const double p1 = (i >= 1 && !isnan(v1)) ? v1 : 0.0;
+            const double p3 = (i >= 3 && !isnan(v3)) ? v3 : 0.0;
+
+            const double sed_safe =
+                (isfinite(atr_sed_val) && atr_sed_val != 0.0)
+                    ? atr_sed_val
+                    : (atr_sed_val + NEO_F64_EPSILON);
+
+            o[i] = (atr_vis_val / sed_safe) + lag_s * (p1 - p3);
+        }
+    }
+
+    /* :412-418 — the SECOND NaN pass, AFTER the loop. */
+    const int warm_end = first_valid + needed - 1;
+    int cut = warm_end + 1;
+    if (cut > len) cut = len;
+    for (int i = 0; i < cut; ++i) o[i] = NEO_F64_NAN;
+}

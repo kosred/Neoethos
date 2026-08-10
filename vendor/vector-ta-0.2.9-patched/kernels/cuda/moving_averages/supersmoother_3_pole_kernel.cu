@@ -378,3 +378,85 @@ void supersmoother_3_pole_many_series_one_param_time_major_f32(
     supersmoother_3_pole_row_strided_with_coefs(
         series_prices, series_len, stride, first_valid, coefs, series_out);
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — supersmoother_3_pole
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/moving_averages/supersmoother_3_pole.rs:271
+ * `supersmoother_3_pole_compute_into` (reached via `..._scalar`, :371).
+ *
+ * THE WARP SCAN ABOVE IS NOT THIS FUNCTION. `supersmoother_3_pole_batch_warp_scan_f32`
+ * reformulates a 3-pole IIR as a matrix-power scan across lanes. That is a
+ * legitimate way to compute the same recurrence in exact arithmetic and a
+ * DIFFERENT SEQUENCE OF ROUNDINGS in floating point. The CPU walks bars one at
+ * a time; so does this — one thread per column.
+ *
+ * The three seeded bars are COPIES of the input, not filtered values
+ * (supersmoother_3_pole.rs:294-300), and the recurrence starts at first+3.
+ *
+ * The coefficient chain is the CPU's, term for term:
+ *      a = exp(-PI/period)
+ *      b = 2*a*cos(1.738*PI/period)      <- 1.738, not 1.738000001, and not
+ *                                           a "cleaned up" sqrt(3)
+ *      c = a*a ;  c2 = c*c
+ * `expf`/`cosf` would give ~7 digits where these coefficients are raised to
+ * the power of the series length by the recursion.
+ *
+ * Each output bar is THREE chained fmas (:313-315), which is three roundings,
+ * not one big expression. Reproduced with the same nesting.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void supersmoother_3_pole_neo_batch_f64(const double* __restrict__ data,
+                                        int series_len,
+                                        const int* __restrict__ periods,
+                                        int n_combos,
+                                        int first_valid,
+                                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) return;
+
+    const double PI_ = 3.14159265358979323846;
+    const double inv_p = 1.0 / (double)period;
+    const double a  = exp(-PI_ * inv_p);
+    const double b  = 2.0 * a * cos(1.738 * PI_ * inv_p);
+    const double c  = a * a;
+    const double c2 = c * c;
+
+    const double coef_source = 1.0 - c2 - b + b * c;
+    const double coef_prev1  = b + c;
+    const double coef_prev2  = -c - b * c;
+    const double coef_prev3  = c2;
+
+    o[first_valid] = data[first_valid];
+    if (first_valid + 1 < len) o[first_valid + 1] = data[first_valid + 1];
+    if (first_valid + 2 < len) o[first_valid + 2] = data[first_valid + 2];
+
+    if (first_valid + 3 >= len) return;
+
+    double y0 = o[first_valid];
+    double y1 = o[first_valid + 1];
+    double y2 = o[first_valid + 2];
+
+    for (int i = first_valid + 3; i < len; ++i) {
+        const double di = data[i];
+        const double t0 = fma(coef_prev1, y2, coef_source * di);
+        const double t1 = fma(coef_prev2, y1, t0);
+        const double y3 = fma(coef_prev3, y0, t1);
+        o[i] = y3;
+        y0 = y1; y1 = y2; y2 = y3;
+    }
+}

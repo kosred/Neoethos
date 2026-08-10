@@ -9,8 +9,18 @@ neoethos-data = { path = "../neoethos-data" }
 neoethos-core = { path = "../neoethos-core" }
 neoethos-search = { path = "../neoethos-search" }
 ndarray = { version = "0.17.2", features = ["rayon", "serde"] }
-tch = { version = "0.22.0", optional = true }
-ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] }
+# REMOVED 2026-08-09 (batch D4): `tch` (libtorch) and `ort` (ONNX Runtime).
+#
+# Both were optional dependencies behind features — `tch = ["dep:tch"]` and
+# `onnx = ["dep:ort"]` — that NO crate, script, workflow or aggregate ever
+# enabled. Their code was cfg-deleted from every binary this repo has ever
+# produced: `tch` gated a CUDA device probe whose only compiled arm returned
+# "0 GPUs", and `ort` gated `runtime/onnx.rs`, an inference engine nothing
+# constructed. `tch` was the last reason anything in this crate wanted the
+# ~2 GB libtorch download; both build.rs files already recorded that d4df966a
+# dropped it from neoethos-search for the same reason.
+#
+# Do not re-add either without a caller that runs in a shipped build.
 tracing = "0.1.42"
 anyhow = "1.0.100"
 
@@ -136,8 +146,8 @@ nalgebra = "0.33.0"
 
 [features]
 default = ["tree-models", "pure-rust-ml"]
-onnx = ["dep:ort"]
-tch = ["dep:tch"]
+# `onnx = ["dep:ort"]` and `tch = ["dep:tch"]` removed 2026-08-09 (batch D4) —
+# see the dependency note above. Nothing enabled either one.
 # `openmp` is not an optimisation flag — it is the difference between a
 # multi-threaded and a SINGLE-THREADED LightGBM. lightgbm3-sys' build.rs
 # passes `USE_OPENMP=OFF` to cmake unless this feature is on, so every build
@@ -206,7 +216,11 @@ pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", 
 # that crashes at startup because libcuda.dll is absent.
 #
 # - gpu-cuda    →  NVIDIA path: cubecl(cuda) + lightgbm(cuda+gpu) +
-#                  candle(cuda) + ort(cuda).
+#                  candle(cuda) + xgb(cuda) + rlkit(cuda) + statistical-gpu.
+#                  (This line used to claim `ort(cuda)`. It never was in the
+#                  aggregate below; `ort` is gone entirely as of 2026-08-09.
+#                  A manifest comment that lists a feature the manifest does
+#                  not enable is the same defect this batch exists to remove.)
 # - gpu-vulkan  →  Cross-vendor path: burn-wgpu(Vulkan ICD). Works on
 #                  AMD Radeon, Intel Arc/Iris, NVIDIA (via Vulkan
 #                  driver), and even Apple Silicon (MoltenVK shim).
@@ -236,6 +250,22 @@ gpu-cuda = [
     # complete CUDA softmax train + predict kernel — was compiled by nothing
     # and shipped in no binary. Whether a run USES it is config:
     # `models.statistical_device`, default `cpu`.
+    # 2026-08-09: these two were the same defect as `neoethos-data/gpu-cuda` —
+    # the aggregate listed the CONSTITUENTS (`neuro-evolution`, `dep:cubecl`,
+    # `reinforcement-learning`, `rlkit/cuda`, `candle-core/cuda`) but never the
+    # FEATURE NAMES, so every `#[cfg(feature = "neuro-evolution-gpu")]` (16
+    # sites, the CR-FM-NES and NEAT cubecl kernels) and every
+    # `#[cfg(feature = "reinforcement-learning-cuda")]` (11 sites, the DQN CUDA
+    # device selection) was cfg-deleted from a build that had ALREADY paid for
+    # the dependencies. The RL case was the worst trade in the tree: an NVIDIA
+    # build compiled candle-kernels/cudaforge, cudarc and ug-cuda in full, then
+    # removed the only code that could ever hand candle a CUDA device.
+    # Naming the features here subsumes the constituent entries below.
+    # Note the warning at the candle-core dependency: this path changes the
+    # kernels behind the DQN/RL models, so compile parity is not enough — it
+    # needs a card run before the numbers are trusted.
+    "neuro-evolution-gpu",
+    "reinforcement-learning-cuda",
     "statistical-gpu",
     # LightGBM's CUDA tree learner. The old comment here said `lightgbm3/cuda`
     # "does NOT actually build a GPU tree learner", and pointed at the runtime

@@ -330,48 +330,70 @@ impl Default for SeenSignatureMemoryRuntimeOverrides {
     }
 }
 
-impl SeenSignatureMemoryRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_SEEN_*` env vars.
-    pub fn from_env() -> Self {
-        let flush_every = std::env::var("NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096)
-            .max(1);
-        let load_max = std::env::var("NEOETHOS_BOT_PROP_SEEN_LOAD_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3_000_000);
-        let max_entries_raw = std::env::var("NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(load_max);
-        let max_entries = if max_entries_raw == 0 {
-            usize::MAX
-        } else {
-            max_entries_raw.max(1)
-        };
-        let file_path = std::env::var("NEOETHOS_BOT_PROP_SEEN_FILE")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        Self {
-            flush_every,
-            load_max,
-            max_entries,
-            file_path,
-        }
+/// The cap `max_entries: 0` derives to, from the machine rather than from a
+/// number nobody could pick.
+///
+/// WHY THIS REPLACED `usize::MAX` (2026-08-10). `0` used to mean UNBOUNDED: a
+/// `HashSet<u64>` plus a `VecDeque<u64>` growing for the whole run — and `0` is
+/// exactly what someone types for "no limit", so the sentinel meant what it
+/// looked like right up until the box swapped. Peak memory is a function of the
+/// hardware, never of a user parameter.
+///
+/// Sizing: one signature costs 8 B in the deque plus a hashbrown slot (8 B key
+/// + 1 B control, ~1.14× for the 87.5 % load factor) ≈ 27 B; we budget 32 B.
+/// The dedup memory gets 2 % of available RAM, clamped to [1 M, 64 M] entries —
+/// at 32 B that is 32 MB to 2 GB. The old flat default was 3 M entries (~96 MB),
+/// which lands inside the band on any box with ≥ 5 GB free, so this is not a
+/// quiet behaviour change on ordinary hardware.
+fn derived_seen_max_entries() -> usize {
+    const BYTES_PER_ENTRY: u64 = 32;
+    const FLOOR: usize = 1_000_000;
+    const CEILING: usize = 64_000_000;
+    let available = neoethos_core::system::available_memory_bytes();
+    if available == 0 {
+        // The probe failed. Say so and take the floor — a failed probe must not
+        // look like a generous answer.
+        tracing::warn!(
+            target: "neoethos_search::seen_memory",
+            entries = FLOOR,
+            "available-memory probe returned 0; seen-signature cap falls back to the floor"
+        );
+        return FLOOR;
     }
+    let budget = (available / 50).max(1); // 2 %
+    ((budget / BYTES_PER_ENTRY) as usize).clamp(FLOOR, CEILING)
+}
 
-    /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_SEEN_*` env
-    /// vars). `max_entries == 0` means unbounded, like the env reader. A
-    /// `seen_signature_from_settings_default_matches_env_default` test
-    /// guarantees a fresh `Settings` reproduces [`Self::default`].
+impl SeenSignatureMemoryRuntimeOverrides {
+    // `from_env()` DELETED 2026-08-10 with `NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY`,
+    // `_LOAD_MAX`, `_MAX_ENTRIES` and `_FILE`. The last of those seeded the
+    // dedup memory from a file ACROSS RUNS, so it changed which candidates a
+    // run could generate — cross-run state, set by export, recorded nowhere.
+    // All four are typed on `models.seen_signature_runtime`.
+
+    /// Config-driven constructor. `max_entries == 0` now means **DERIVE from
+    /// available RAM** (see [`derived_seen_max_entries`]) rather than
+    /// UNBOUNDED.
+    ///
+    /// ⚠ WHAT THIS CHANGES. Eviction is FIFO, so a cap that BITES re-admits
+    /// previously-seen genes and changes what the run explores — it is not a
+    /// pure memory knob. The effective cap is therefore logged whenever it is
+    /// derived, and the first eviction is logged too (`insert_in_memory`), so a
+    /// run that started recycling signatures says so instead of quietly
+    /// exploring differently.
     pub fn from_settings(s: &neoethos_core::Settings) -> Self {
         let c = &s.models.seen_signature_runtime;
         let max_entries = if c.max_entries == 0 {
-            usize::MAX
+            let derived = derived_seen_max_entries();
+            tracing::info!(
+                target: "neoethos_search::seen_memory",
+                configured = 0,
+                effective = derived,
+                "models.seen_signature_runtime.max_entries is 0 = DERIVE; the seen-signature \
+                 cap is sized from available RAM. Eviction is FIFO, so if this cap binds the \
+                 run will re-admit genes it has already tried."
+            );
+            derived
         } else {
             c.max_entries.max(1)
         };
@@ -401,11 +423,17 @@ pub fn install_seen_signature_memory_runtime_overrides(
     SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_SEEN_*`
-/// env vars once and installs them. Idempotent.
+/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
+/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
 pub fn install_seen_signature_memory_runtime_overrides_from_env() {
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_seen_signature_memory_runtime_overrides_from_env() is RETIRED and installs \
+         typed DEFAULTS — the NEOETHOS_BOT_PROP_SEEN_* layer no longer exists. Call \
+         install_seen_signature_memory_runtime_overrides_from_settings(&settings)."
+    );
     let _ = SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
-        .set(SeenSignatureMemoryRuntimeOverrides::from_env());
+        .set(SeenSignatureMemoryRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the seen-signature knobs from the single
@@ -425,7 +453,17 @@ pub fn current_seen_signature_memory_runtime_overrides() -> SeenSignatureMemoryR
 }
 
 impl SeenSignatureMemory {
+    /// Deprecated spelling of [`Self::current`] — it has read no environment
+    /// since the typed boundary landed, and none at all since 2026-08-10.
+    /// Retained because `discovery.rs`, `genetic/search_engine.rs` and
+    /// `discovery_ledger.rs` call it.
     pub fn from_env() -> Self {
+        Self::current()
+    }
+
+    /// Build the dedup memory from the installed runtime overrides, seeding it
+    /// from the persisted signature file when one is configured.
+    pub fn current() -> Self {
         let overrides = current_seen_signature_memory_runtime_overrides();
         let flush_every = overrides.flush_every.max(1);
         let load_max = overrides.load_max;
@@ -484,6 +522,24 @@ impl SeenSignatureMemory {
             while self.all.len() > self.max_entries {
                 if let Some(old) = self.order.pop_front() {
                     self.all.remove(&old);
+                    // FIRST EVICTION (2026-08-10). Past this point the memory
+                    // is no longer a dedup guarantee: eviction is FIFO, so the
+                    // oldest signatures become admissible again and the GA can
+                    // re-generate genes it already evaluated. That changes what
+                    // the run EXPLORES, not just what it stores, so it is said
+                    // out loud exactly once instead of being a silent property
+                    // of a memory number.
+                    static EVICTED: std::sync::Once = std::sync::Once::new();
+                    let cap = self.max_entries;
+                    EVICTED.call_once(|| {
+                        tracing::warn!(
+                            target: "neoethos_search::seen_memory",
+                            max_entries = cap,
+                            "seen-signature cap reached — evicting oldest signatures FIFO. \
+                             Previously-tried genes are now re-admissible, so this run will \
+                             explore differently from one with a larger cap."
+                        );
+                    });
                 } else {
                     break;
                 }
@@ -620,6 +676,118 @@ pub fn current_threshold_ladder() -> [f32; 6] {
         .unwrap_or(STATIC_THRESHOLD_LADDER)
 }
 
+/// Per-RUN dataset scale for the gene stop/target band: the median ATR of the
+/// bars being searched, in pips. `None` = no scale installed, use the absolute
+/// pip band.
+///
+/// A replaceable cell rather than a `OnceLock` for exactly the reason audit D06
+/// gave for the threshold ladder above: the batch orchestrator runs many
+/// (symbol, timeframe) combos in ONE process, sequentially, and a first-write-
+/// wins cell would apply the first combo's M5 scale to every later H1 and H4 run
+/// — the very cross-timeframe confusion this whole change exists to remove.
+/// Discovery is single-instance and its combos are sequential, so a per-run
+/// replace is correct; the `RwLock` still lets the GA's reader threads read
+/// concurrently within a run.
+static GENE_STOP_ATR_PIPS: std::sync::RwLock<Option<f64>> = std::sync::RwLock::new(None);
+
+/// Install (REPLACE) this run's ATR scale, in pips. Non-finite or non-positive
+/// values clear the scale instead of installing a band that would collapse to a
+/// point — a zero ATR would otherwise produce `sl ∈ [0, 0]`.
+pub fn install_gene_stop_atr_scale(atr_pips: f64) {
+    let mut guard = GENE_STOP_ATR_PIPS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = if atr_pips.is_finite() && atr_pips > 0.0 {
+        Some(atr_pips)
+    } else {
+        None
+    };
+}
+
+/// Clear back to the absolute pip band. Called at the start of a run that does
+/// NOT scale by ATR, so the PREVIOUS combo's scale cannot leak into it.
+pub fn clear_gene_stop_atr_scale() {
+    let mut guard = GENE_STOP_ATR_PIPS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// The stop/target band, resolved to pips for the dataset currently being
+/// searched.
+///
+/// WHAT CHANGED AND WHAT IT PERMITS (2026-08-09). The band used to be four
+/// literals: `sl.clamp(6, 20)`, `tp.clamp(12, 45)`, reward:risk sampled in
+/// `[1.5, 2.5]`. Those are M5 pip counts. On H1 (ATR ≈ 12 pips) the whole stop
+/// band sits inside one bar's range; on H4 (ATR ≈ 30 pips) it sits below it. So
+/// every "just search a higher timeframe" suggestion was void — the higher
+/// timeframes could not be expressed by any gene the GA was able to write.
+///
+/// The band also excluded the reward:risk its own payoff floor required. With
+/// barriers only, payoff is `(tp - c)/(sl + c)`, so a 2.0 floor needs
+/// `tp >= 2·sl + 3·c`; at the charged c = 2.89 pips a 20-pip stop needs
+/// `tp >= 48.67`, outside the 45-pip ceiling, and no draw sampled above 2.5 R.
+///
+/// WHAT IT DOES NOT BUY. Nothing, in expectation. Measured across the exit-
+/// geometry sweep, expectancy stayed at -4.15 pips per trade while payoff moved
+/// 0.91 → 2.53. Widening the band changes which shapes are REACHABLE. Whether
+/// any of them pays is decided by the expectancy gate, not here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedGeneStopBounds {
+    pub sl_min_pips: f64,
+    pub sl_max_pips: f64,
+    pub tp_min_pips: f64,
+    pub tp_max_pips: f64,
+    pub rr_min: f64,
+    pub rr_max: f64,
+    /// The ATR (pips) the band was derived from, or `None` when the absolute
+    /// fallback band is in force. Reported so a run's log can say which.
+    pub atr_pips: Option<f64>,
+}
+
+impl ResolvedGeneStopBounds {
+    /// A stop/target pair in the middle of the band — what the old
+    /// `(15.0, 30.0)` literal expressed on M5, stated as a position in the band
+    /// instead of as two pip counts that only meant something on one timeframe.
+    pub fn mid_pair(&self) -> (f64, f64) {
+        let sl = 0.5 * (self.sl_min_pips + self.sl_max_pips);
+        let rr = 0.5 * (self.rr_min + self.rr_max);
+        (sl, (sl * rr).clamp(self.tp_min_pips, self.tp_max_pips))
+    }
+}
+
+/// Resolve the configured multiples against this run's installed ATR scale.
+pub fn current_gene_stop_bounds() -> ResolvedGeneStopBounds {
+    let cfg = super::runtime_overrides::current_gene_stop_bounds_overrides();
+    let atr = *GENE_STOP_ATR_PIPS.read().unwrap_or_else(|e| e.into_inner());
+    let atr = if cfg.atr_scaled { atr } else { None };
+    match atr {
+        Some(atr_pips) => {
+            let sl_min = (cfg.sl_min_atr * atr_pips).max(1e-6);
+            let sl_max = (cfg.sl_max_atr * atr_pips).max(sl_min);
+            ResolvedGeneStopBounds {
+                sl_min_pips: sl_min,
+                sl_max_pips: sl_max,
+                // The target band is the stop band times the reward:risk band, so
+                // every (sl, rr) the initialiser can draw lands INSIDE the clamp.
+                // The old ceiling was independent of the stop band, which is how
+                // a legal draw (sl 20 × rr 2.5 = 50) got silently clipped to 45
+                // and became a 2.25 R gene the search never asked for.
+                tp_min_pips: sl_min * cfg.rr_min,
+                tp_max_pips: sl_max * cfg.rr_max,
+                rr_min: cfg.rr_min,
+                rr_max: cfg.rr_max,
+                atr_pips: Some(atr_pips),
+            }
+        }
+        None => ResolvedGeneStopBounds {
+            sl_min_pips: cfg.sl_min_pips,
+            sl_max_pips: cfg.sl_max_pips,
+            tp_min_pips: cfg.tp_min_pips,
+            tp_max_pips: cfg.tp_max_pips,
+            rr_min: cfg.rr_min,
+            rr_max: cfg.rr_max,
+            atr_pips: None,
+        },
+    }
+}
+
 fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
     // F-273 narrow ladder by default; F-277 adaptive ladder when the
     // operator opts in via `install_adaptive_threshold_ladder` from
@@ -737,22 +905,33 @@ pub fn new_random_gene(
     let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(rng)).collect();
     let long_threshold = random_coarse_threshold(rng);
     let short_threshold = -random_coarse_threshold(rng);
-    // SL/TP in pips. Operator directive (2026-07-23): keep ~2R reward:risk but
-    // STOP targeting huge distances. Large TPs are rarely reached live — the
-    // position exits on the next signal flip long before a 70-100 pip target —
-    // so the backtest (which holds to TP) was letting the GA reward-hack by
-    // pinning TP at the old 100-pip ceiling (median discovered TP was 64p, 43%
-    // over 70p). Smaller-SL bounds with the reward:risk still ~2R land TP in
-    // ~20-40 pips while leaving the GA free to SEARCH within them. (The
-    // volatility-adaptive ATR path in `stop_target.rs` is the follow-up that
-    // makes these distances scale with market volatility; these tightened
-    // fixed-pip bounds are the interim step.)
+    // SL/TP in pips, drawn from the band resolved for THIS dataset.
+    //
+    // History. Operator directive (2026-07-23) replaced a 100-pip ceiling with
+    // the literals `sl ∈ [6, 20]`, `tp ∈ [12, 45]`, `rr ∈ [1.5, 2.5]`, to stop
+    // the GA pinning TP at a target live trading never reached. That fixed the
+    // symptom and created two new defects, both measured 2026-08-09:
+    //   1. Those are M5 pip counts. H1 (ATR ≈ 12 pips) and H4 (ATR ≈ 30 pips)
+    //      were literally inexpressible — the entire stop band sat inside one
+    //      bar's range.
+    //   2. `rr <= 2.5` with a 45-pip ceiling cannot reach the reward:risk a 2.0
+    //      payoff floor demands (`tp >= 2·sl + 3·c`; 48.67 at sl = 20, c = 2.89).
+    //      The gate and the search space contradicted each other.
+    // `current_gene_stop_bounds()` is now the single owner of the band, in ATR
+    // units, so it means the same thing on every timeframe. It falls back to the
+    // exact literals above when no ATR scale is installed, so the
+    // `neoethos-models` GA and every test fixture are unchanged.
+    //
+    // This buys no expected profit — see `ResolvedGeneStopBounds` for the
+    // measurement. It makes shapes reachable; the expectancy gate decides which
+    // of them survive.
+    let bounds = current_gene_stop_bounds();
     let (sl_pips, tp_pips) = if rng.random_bool(0.2) {
-        (15.0, 30.0)
+        bounds.mid_pair()
     } else {
-        let sl: f64 = rng.random_range(6.0..=20.0);
-        let rr: f64 = rng.random_range(1.5..=2.5);
-        let tp = (sl * rr).clamp(12.0, 45.0);
+        let sl: f64 = rng.random_range(bounds.sl_min_pips..=bounds.sl_max_pips);
+        let rr: f64 = rng.random_range(bounds.rr_min..=bounds.rr_max);
+        let tp = (sl * rr).clamp(bounds.tp_min_pips, bounds.tp_max_pips);
         (sl, tp)
     };
     // Adaptive stops (Stage 2c): when enabled, seed a searchable volatility
@@ -1021,15 +1200,19 @@ pub fn mutate(
                         * rng.random_range((1.0 - range)..(1.0 + range)))
                     .clamp(0.3, 4.0);
                 } else {
-                    // Fixed-stop gene: match the tightened generation bounds
-                    // (2026-07-23) so evolution can't drift back to the old
-                    // 100-pip target.
+                    // Fixed-stop gene: mutate inside the SAME band the
+                    // initialiser draws from, resolved for this dataset. Using
+                    // the literals here while the initialiser used ATR units
+                    // would let mutation drag every gene back to the M5 band one
+                    // generation after birth — which is how a per-timeframe fix
+                    // silently becomes an M5-only fix.
+                    let bounds = current_gene_stop_bounds();
                     mutated.tp_pips = (mutated.tp_pips
                         * rng.random_range((1.0 - range)..(1.0 + range)))
-                    .clamp(12.0, 45.0);
+                    .clamp(bounds.tp_min_pips, bounds.tp_max_pips);
                     mutated.sl_pips = (mutated.sl_pips
                         * rng.random_range((1.0 - range)..(1.0 + range)))
-                    .clamp(6.0, 20.0);
+                    .clamp(bounds.sl_min_pips, bounds.sl_max_pips);
                 }
             }
             _ => {
@@ -1084,6 +1267,111 @@ pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]], growth_objective
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The band must mean the same thing on every timeframe, and the absolute
+    /// band must still be exactly the pre-2026-08-09 literals when no scale is
+    /// installed — otherwise this "fix" silently changes the `neoethos-models`
+    /// GA and every test fixture that never installs one.
+    ///
+    /// These tests mutate process-wide state, so they run in ONE test function.
+    /// Split into three, cargo's thread-per-test would interleave the installs
+    /// and the assertions would depend on scheduling.
+    #[test]
+    fn the_stop_band_scales_with_the_dataset_and_falls_back_to_the_old_literals() {
+        clear_gene_stop_atr_scale();
+        let absolute = current_gene_stop_bounds();
+        assert_eq!(absolute.atr_pips, None);
+        assert_eq!(absolute.sl_min_pips, 6.0, "the pre-2026-08-09 stop floor");
+        assert_eq!(absolute.sl_max_pips, 20.0, "the pre-2026-08-09 stop ceiling");
+        assert_eq!(absolute.tp_min_pips, 12.0);
+        assert_eq!(absolute.tp_max_pips, 45.0);
+
+        // EURUSD M5: ATR ≈ 5 pips. The band the literals were tuned for.
+        install_gene_stop_atr_scale(5.0);
+        let m5 = current_gene_stop_bounds();
+        assert_eq!(m5.atr_pips, Some(5.0));
+        assert!(
+            (m5.sl_min_pips - 5.0).abs() < 1e-9 && (m5.sl_max_pips - 20.0).abs() < 1e-9,
+            "M5 must land on roughly the old band, got [{}, {}]",
+            m5.sl_min_pips,
+            m5.sl_max_pips
+        );
+
+        // EURUSD H1: ATR ≈ 12 pips. Under the old literals the ENTIRE stop band
+        // ([6, 20]) sat inside one bar's range, so an H1 gene could not express
+        // a stop the market could not reach by accident. This is the defect that
+        // made every "search a higher timeframe" suggestion void.
+        install_gene_stop_atr_scale(12.0);
+        let h1 = current_gene_stop_bounds();
+        assert!(
+            h1.sl_min_pips >= 12.0,
+            "an H1 stop floor must be at least one bar's range, got {}",
+            h1.sl_min_pips
+        );
+        assert!(h1.sl_max_pips > 20.0, "H1 must reach past the old ceiling");
+
+        // H4: ATR ≈ 30 pips. The old ceiling was below the old FLOOR here.
+        install_gene_stop_atr_scale(30.0);
+        let h4 = current_gene_stop_bounds();
+        assert!(h4.sl_min_pips > 20.0 && h4.tp_max_pips > 45.0);
+
+        // The reward:risk a 2.0 payoff floor demands must be INSIDE the band.
+        // Payoff with barriers only is (tp - c)/(sl + c); at c = 2.89 pips a
+        // 20-pip stop needs tp >= 48.67, i.e. rr >= 2.43. The old rr ceiling was
+        // 2.50 with a 45-pip tp clamp, so the draw that satisfied it was clipped
+        // away before it could be evaluated.
+        install_gene_stop_atr_scale(5.0);
+        let band = current_gene_stop_bounds();
+        let c = 2.89_f64;
+        let sl = band.sl_max_pips;
+        let needed_tp = 2.0 * sl + 3.0 * c;
+        assert!(
+            band.rr_max * sl >= needed_tp && band.tp_max_pips >= needed_tp,
+            "a 2.0 payoff floor needs tp >= {needed_tp:.2} at sl {sl:.2}; band allows \
+             rr_max*sl = {:.2}, tp_max = {:.2}",
+            band.rr_max * sl,
+            band.tp_max_pips
+        );
+
+        // A degenerate scale must CLEAR, never install a band that collapses to
+        // a point — `random_range(0.0..=0.0)` is not a search.
+        install_gene_stop_atr_scale(0.0);
+        assert_eq!(current_gene_stop_bounds().atr_pips, None);
+        install_gene_stop_atr_scale(f64::NAN);
+        assert_eq!(current_gene_stop_bounds().atr_pips, None);
+
+        // Every gene the initialiser and the mutator can produce must sit inside
+        // the resolved band — a mutator using different bounds from the
+        // initialiser drags the population back to the M5 band one generation
+        // after birth.
+        install_gene_stop_atr_scale(30.0);
+        let band = current_gene_stop_bounds();
+        let smc = crate::genetic::SmcSearchConfig::default();
+        let mut rng = rand::rng();
+        for _ in 0..200 {
+            let gene = new_random_gene(8, 4, 0, &smc, &mut rng);
+            assert!(
+                gene.sl_pips >= band.sl_min_pips - 1e-9
+                    && gene.sl_pips <= band.sl_max_pips + 1e-9,
+                "initialised sl {} outside [{}, {}]",
+                gene.sl_pips,
+                band.sl_min_pips,
+                band.sl_max_pips
+            );
+            let mutated = mutate(&gene, 8, 4, 1, &smc, 0, &mut rng);
+            assert!(
+                mutated.sl_pips >= band.sl_min_pips - 1e-9
+                    && mutated.sl_pips <= band.sl_max_pips + 1e-9,
+                "mutated sl {} outside [{}, {}]",
+                mutated.sl_pips,
+                band.sl_min_pips,
+                band.sl_max_pips
+            );
+        }
+
+        // Leave the process as we found it so no later test inherits an H4 scale.
+        clear_gene_stop_atr_scale();
+    }
 
     #[test]
     fn rank_weights_follow_candidate_order() {
@@ -1142,6 +1430,31 @@ mod tests {
         assert_eq!(
             SeenSignatureMemoryRuntimeOverrides::from_settings(&s),
             SeenSignatureMemoryRuntimeOverrides::default()
+        );
+    }
+
+    /// `0` used to mean UNBOUNDED — a `HashSet` + `VecDeque` growing for the
+    /// whole run, on the sentinel someone types for "no limit". It now means
+    /// DERIVE, and the derived value must be a real, bounded cap.
+    #[test]
+    fn zero_max_entries_derives_a_bounded_cap_instead_of_unbounded() {
+        let mut s = neoethos_core::Settings::default();
+        s.models.seen_signature_runtime.max_entries = 0;
+        let resolved = SeenSignatureMemoryRuntimeOverrides::from_settings(&s);
+        assert_ne!(
+            resolved.max_entries,
+            usize::MAX,
+            "0 must derive from RAM, never resolve to unbounded"
+        );
+        assert!(
+            resolved.max_entries >= 1_000_000,
+            "the derived cap must not fall below the floor: {}",
+            resolved.max_entries
+        );
+        assert!(
+            resolved.max_entries <= 64_000_000,
+            "the derived cap must not exceed the ceiling: {}",
+            resolved.max_entries
         );
     }
 

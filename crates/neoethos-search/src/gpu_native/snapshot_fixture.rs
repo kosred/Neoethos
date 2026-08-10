@@ -12,7 +12,6 @@ use crate::gpu_native::prototype_population::{
     PrototypeBcRequirements, PrototypePopulationError, PrototypePopulationWorkload,
 };
 use ndarray::Array2;
-use neoethos_gpu_contracts::device::ScenarioDescriptor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -316,14 +315,12 @@ impl SnapshotPopulationFixture {
         let scenarios = candidate_ids
             .iter()
             .copied()
-            .map(|candidate_id| ScenarioDescriptor {
-                base_candidate_id: candidate_id,
-                scenario_id: candidate_id,
-                rng_counter: 0,
-                window_offset: 0,
-                window_len: self.bars() as u32,
-                scenario_type: 0,
-                ..ScenarioDescriptor::default()
+            // Through the ONE builder. A hand-written descriptor with
+            // `..default()` wrote `spread_ticks: 0, commission_micros: 0`, which
+            // stopped meaning "use the settings' costs" and started meaning
+            // "charge nothing" when the sentinel became -1.
+            .map(|candidate_id| {
+                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id, self.bars())
             })
             .collect();
         (

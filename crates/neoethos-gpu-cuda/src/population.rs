@@ -378,6 +378,12 @@ pub struct PopulationSession {
     bars: usize,
     feature_count: usize,
     population: usize,
+    /// Threads the walk launches and metric rows it returns.
+    ///
+    /// Equal to `population` for a caller that uploads one scenario per gene —
+    /// which is what makes that case identical to the pre-scenario engine — and
+    /// larger for a screen that asks for many treatments of the same genes.
+    scenario_count: usize,
     emitted_events: usize,
     dataset_uploaded: bool,
     genes_uploaded: bool,
@@ -410,6 +416,7 @@ impl PopulationSession {
             bars: 0,
             feature_count: 0,
             population: 0,
+            scenario_count: 0,
             emitted_events: 0,
             dataset_uploaded: false,
             genes_uploaded: false,
@@ -429,6 +436,12 @@ impl PopulationSession {
 
     pub fn population(&self) -> usize {
         self.population
+    }
+
+    /// Scenarios in the last upload — the number of metric rows an evaluate
+    /// will produce.
+    pub fn scenario_count(&self) -> usize {
+        self.scenario_count
     }
 
     pub fn bars(&self) -> usize {
@@ -517,11 +530,24 @@ impl PopulationSession {
         self.population = population;
         self.genes_uploaded = true;
         self.scenarios_uploaded = false;
+        self.scenario_count = 0;
         self.metrics_ready = false;
         self.pending_event = None;
         Ok(())
     }
 
+    /// Upload the work list.
+    ///
+    /// The count is NO LONGER required to equal the population. That equality is
+    /// why a screen wanting 101 treatments of one gene had to clone the gene 101
+    /// times; each descriptor now names its own gene, window, costs and
+    /// perturbation counter, so 174 genes and 17 574 scenarios go up together.
+    ///
+    /// What is still required is that every scenario names a gene that exists —
+    /// checked here rather than only natively, because an out-of-range index is
+    /// an out-of-bounds device read of thresholds and CSR offsets that would
+    /// still produce a metric row. The native side checks it again, including
+    /// the window bounds it alone knows the series length for.
     pub fn upload_scenarios(
         &mut self,
         scenarios: &[ScenarioDescriptor],
@@ -532,11 +558,17 @@ impl PopulationSession {
                 STATUS_MISSING_UPLOAD,
             ));
         }
-        if scenarios.len() != self.population {
+        if scenarios.is_empty() {
+            return Err(invalid("scenario array is empty"));
+        }
+        if let Some((index, scenario)) = scenarios
+            .iter()
+            .enumerate()
+            .find(|(_, scenario)| scenario.base_candidate_id as usize >= self.population)
+        {
             return Err(invalid(format!(
-                "scenario count {} does not match population {}",
-                scenarios.len(),
-                self.population
+                "scenario {index} names gene {} outside the population of {}",
+                scenario.base_candidate_id, self.population
             )));
         }
         let raw = RawScenarioView {
@@ -548,6 +580,7 @@ impl PopulationSession {
         if status != STATUS_OK {
             return Err(CudaPopulationError::native("upload_scenarios", status));
         }
+        self.scenario_count = scenarios.len();
         self.scenarios_uploaded = true;
         self.metrics_ready = false;
         self.pending_event = None;
@@ -607,7 +640,11 @@ impl PopulationSession {
                 STATUS_MISSING_UPLOAD,
             ));
         }
-        let mut rows = vec![NeoPopulationMetricRow::default(); self.population];
+        // One row per SCENARIO. Sizing this by the population was correct only
+        // while the two were forced equal; a 174-gene, 17 574-scenario launch
+        // would have been refused for readback capacity, which is the honest
+        // failure but not the useful one.
+        let mut rows = vec![NeoPopulationMetricRow::default(); self.scenario_count];
         let mut written = 0_usize;
         let mut raw = RawReadback {
             rows: rows.as_mut_ptr(),
@@ -619,47 +656,91 @@ impl PopulationSession {
         if status != STATUS_OK {
             return Err(CudaPopulationError::native("read_metrics", status));
         }
-        if written != self.population {
+        if written != self.scenario_count {
             return Err(invalid(format!(
                 "native metric readback wrote {written} rows, expected {}",
-                self.population
+                self.scenario_count
             )));
         }
         Ok(rows)
     }
 
-    /// Diagnostic-only event/outcome readback. Never call this inside a timed
-    /// benchmark repetition: it is a full device-to-host copy that exists to
-    /// localize a parity failure.
-    pub fn read_diagnostics(&mut self) -> Result<PopulationDiagnostics, CudaPopulationError> {
+    /// Diagnostic-only outcome readback for the FIRST `scenarios` scenarios.
+    ///
+    /// The outcome array is scenario-major with [`MAX_TRADES_PER_CANDIDATE`]
+    /// slots each, so a prefix of it is exactly "the trades of the first N
+    /// scenarios" — which is what a parity investigation wants, and the whole
+    /// array is not.
+    ///
+    /// Never call it inside a timed benchmark repetition: it is a device-to-host
+    /// copy that exists to localize a parity failure.
+    pub fn read_diagnostics_for(
+        &mut self,
+        scenarios: usize,
+    ) -> Result<PopulationDiagnostics, CudaPopulationError> {
         if !self.metrics_ready {
             return Err(CudaPopulationError::native(
                 "read_diagnostics",
                 STATUS_MISSING_UPLOAD,
             ));
         }
-        let mut events = vec![NeoPopulationEvent::default(); self.emitted_events];
-        let mut outcomes = vec![NeoPopulationOutcome::default(); self.emitted_events];
+        let wanted = (scenarios as u64)
+            .saturating_mul(MAX_TRADES_PER_CANDIDATE)
+            .min(self.emitted_events as u64) as usize;
+        let mut outcomes = vec![NeoPopulationOutcome::default(); wanted];
         let mut written = 0_usize;
         let mut raw = RawDiagnosticReadback {
-            events: events.as_mut_ptr(),
+            // NULL, deliberately. There is no event stream — the reduce opens
+            // positions from the signal — and the native side used to MEMSET a
+            // buffer this size to zero to carry nothing: at the ~20 000-scenario
+            // launches the new sizing approves that is 163.8 M records, 9.2 GB
+            // of host RAM allocated and zeroed for no content, next to 11.8 GB
+            // of outcomes. On the rented box where this is actually run, that is
+            // most of the machine.
+            events: std::ptr::null_mut(),
             outcomes: outcomes.as_mut_ptr(),
-            capacity: self.emitted_events,
+            capacity: wanted,
             written: &mut written,
         };
-        // SAFETY: both buffers cover `capacity` elements and do not alias.
+        // SAFETY: `outcomes` covers `capacity` elements and does not alias; the
+        // native side accepts a null `events` and skips it.
         let status =
             unsafe { neoethos_gpu_cuda_population_read_diagnostics(self.handle, &mut raw) };
         if status != STATUS_OK {
             return Err(CudaPopulationError::native("read_diagnostics", status));
         }
-        if written != self.emitted_events {
+        if written != wanted {
             return Err(invalid(format!(
-                "native diagnostic readback wrote {written} events, expected {}",
+                "native diagnostic readback wrote {written} outcomes, expected {wanted}"
+            )));
+        }
+        Ok(PopulationDiagnostics {
+            // Always empty: nothing emits events. Kept in the struct so the
+            // diagnostic contract does not change shape under callers.
+            events: Vec::new(),
+            outcomes,
+        })
+    }
+
+    /// Every recorded outcome, refused above a host-RAM budget.
+    ///
+    /// `emitted_events` is `scenario_count * MAX_TRADES_PER_CANDIDATE`, which
+    /// grew by ~100x when the scenario became the unit of work. This used to
+    /// allocate two vectors of that length unconditionally.
+    pub fn read_diagnostics(&mut self) -> Result<PopulationDiagnostics, CudaPopulationError> {
+        const MAX_DIAGNOSTIC_BYTES: usize = 1 << 30;
+        let bytes = self
+            .emitted_events
+            .saturating_mul(std::mem::size_of::<NeoPopulationOutcome>());
+        if bytes > MAX_DIAGNOSTIC_BYTES {
+            return Err(invalid(format!(
+                "a full diagnostic readback of {} outcomes wants {bytes} B of host RAM; ask for \
+                 a range with `read_diagnostics_for(scenarios)` instead",
                 self.emitted_events
             )));
         }
-        Ok(PopulationDiagnostics { events, outcomes })
+        let scenarios = self.scenario_count;
+        self.read_diagnostics_for(scenarios)
     }
 }
 

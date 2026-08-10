@@ -581,3 +581,150 @@ void net_myrsi_many_series_one_param_time_major_f32(
             }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `net_myrsi_kernel_scalar` (src/indicators/net_myrsi.rs:287), which
+ * `net_myrsi_compute_into` (:202) selects for `Kernel::Auto`, and which
+ * `net_myrsi_prepare` (:842) forces by mapping Auto onto Scalar.
+ *
+ * ONE KERNEL COVERS BOTH CPU PATHS. `net_myrsi_kernel_scalar` hands period 14
+ * to `net_myrsi_kernel_period14_scalar` (:415). The two were compared line by
+ * line: the algorithm, the ring updates, the comparison counting and the
+ * denominator are IDENTICAL -- the specialised copy only fixes `PERIOD` as a
+ * const and drops the `period > 1` test on the first written bar, which is
+ * true at 14 anyway. So there is no second numeric path to reproduce, unlike
+ * msw, where the two DO differ.
+ *
+ * PERIOD-SWEPT. `compute_net_myrsi_batch` reads a parameter literally named
+ * `period`, default 14 (cpu_batch.rs:16704).
+ *
+ * SINGLE OUTPUT: "value" is the only column (cpu_batch.rs:16717).
+ *
+ * WARMUP: `first + period - 1` (:861), and that bar is written as EXACTLY
+ * 0.0 (:312) -- not left NaN. `num` is still zero there, and the CPU stores
+ * it before the walk begins.
+ *
+ * THIS IS NOT THE `compute_myrsi_from` / `compute_net_from` PAIR (:240, :263).
+ * Those recompute `cu`/`cd` as a FRESH sum over the window at every bar; the
+ * scalar kernel ROLLS them (`cu -= old`, :348) and rolls the rank count too.
+ * The two are algebraically equal and numerically different, and the rolled
+ * pair is what the batch runs.
+ *
+ * THE RANK NUMERATOR IS AN INTEGER. `num` is an `i32` counting comparisons
+ * (:307), converted to double only at the division (:407). Accumulating it as
+ * a double would be exact for these magnitudes but would still be a different
+ * program; it is kept as `int` so it cannot silently become one.
+ *
+ * TWO PER-THREAD RINGS OF `period` DOUBLES, hence a `max_period` of 512 --
+ * the same S2_RING_MAX_PERIOD the shard-2 kernels declare. An oversized
+ * period is REFUSED BY NAME rather than truncated into a different indicator.
+ *
+ * SEQUENTIAL, one thread per combo column.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Must equal S2_RING_MAX_PERIOD in src/cuda/neoethos_f64_wrapper.rs. */
+#define NET_MYRSI_NEO_MAX_PERIOD 512
+
+/* lt_minus_gt_scalar, net_myrsi.rs:316-324, over the ring slice [lo, hi). */
+__device__ __forceinline__ int net_myrsi_neo_lt_minus_gt(
+    const double* __restrict__ ring, int lo, int hi, double s)
+{
+    int lt = 0, gt = 0;
+    for (int j = lo; j < hi; ++j) {
+        const double v = ring[j];
+        lt += (v < s) ? 1 : 0;
+        gt += (v > s) ? 1 : 0;
+    }
+    return lt - gt;
+}
+
+extern "C" __global__
+void net_myrsi_neo_batch_f64(const double* __restrict__ data,
+                             int series_len,
+                             const int* __restrict__ periods,
+                             int n_combos,
+                             int first_valid,
+                             double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (first_valid < 0 || first_valid >= len) return;
+
+    const int period = periods[combo];
+    if (period <= 0 || period > len) return;                       /* :826 */
+    if (period > NET_MYRSI_NEO_MAX_PERIOD) return;                 /* refused upstream by name */
+    if (len - first_valid < period + 1) return;                    /* :833 */
+    if (len <= first_valid + 1) return;                            /* :294 */
+
+    double diffs[NET_MYRSI_NEO_MAX_PERIOD];
+    double myr[NET_MYRSI_NEO_MAX_PERIOD];
+
+    double cu = 0.0, cd = 0.0;
+    int d_head = 0, d_count = 0;
+    int m_head = 0, m_count = 0;
+    int num = 0;
+    const double denom = (double)(period * (period - 1)) * 0.5;    /* :308 */
+
+    const int warm = first_valid + period - 1;
+    if (warm < len) o[warm] = (period > 1) ? 0.0 : NEO_F64_NAN;    /* :312 */
+
+    for (int i = first_valid + 1; i < len; ++i) {
+        const double diff = data[i] - data[i - 1];
+
+        if      (diff > 0.0) cu += diff;
+        else if (diff < 0.0) cd += -diff;
+
+        if (d_count < period) {
+            diffs[d_head] = diff;
+            d_head += 1; if (d_head == period) d_head = 0;
+            d_count += 1;
+        } else {
+            const double old = diffs[d_head];
+            if      (old > 0.0) cu -= old;
+            else if (old < 0.0) cd -= -old;
+            diffs[d_head] = diff;
+            d_head += 1; if (d_head == period) d_head = 0;
+        }
+
+        if (d_count >= period) {
+            const double s = cu + cd;
+            const double r = (s != 0.0) ? ((cu - cd) / s) : 0.0;    /* :361 */
+
+            if (m_count < period) {
+                num += net_myrsi_neo_lt_minus_gt(myr, 0, m_head, r);
+                myr[m_head] = r;
+                m_head += 1; if (m_head == period) m_head = 0;
+                m_count += 1;
+            } else {
+                const double z = myr[m_head];
+                int rm1 = (m_head + 1 < period)
+                    ? net_myrsi_neo_lt_minus_gt(myr, m_head + 1, period, z) : 0;
+                int rm2 = (m_head > 0)
+                    ? net_myrsi_neo_lt_minus_gt(myr, 0, m_head, z) : 0;
+                num += rm1 + rm2;
+
+                int ad1 = (m_head + 1 < period)
+                    ? net_myrsi_neo_lt_minus_gt(myr, m_head + 1, period, r) : 0;
+                int ad2 = (m_head > 0)
+                    ? net_myrsi_neo_lt_minus_gt(myr, 0, m_head, r) : 0;
+                num += ad1 + ad2;
+
+                myr[m_head] = r;
+                m_head += 1; if (m_head == period) m_head = 0;
+            }
+
+            if (denom != 0.0) o[i] = ((double)num) / denom;         /* :407 */
+        }
+    }
+}

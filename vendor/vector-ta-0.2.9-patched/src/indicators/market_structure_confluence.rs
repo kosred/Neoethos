@@ -1408,7 +1408,11 @@ fn axis_f64(
     Ok(out)
 }
 
-fn expand_grid(
+/// Public so the CUDA wrapper expands the SAME grid, in the SAME order, as the
+/// CPU. A second implementation of the cross product would be a second place
+/// for it to drift, and a row-order difference would pair every combo with the
+/// wrong output row.
+pub fn expand_grid(
     range: &MarketStructureConfluenceBatchRange,
 ) -> Result<Vec<MarketStructureConfluenceParams>, MarketStructureConfluenceError> {
     let swing_sizes = axis_usize(range.swing_size)?;

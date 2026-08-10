@@ -219,3 +219,83 @@ void vwma_multi_series_one_param_tm_coalesced_f32(const double* __restrict__ pv_
                                            : nan_f32();
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `moving_averages/vwma.rs::vwma_scalar` (l.377). Inputs are
+// (price, volume).
+//   seed   = for i in 0..period: `sum += p*v; vsum += v` — ONE ELEMENT AT A
+//            TIME, no grouping. (Contrast `qstick`/`var` in this same shard,
+//            whose seeds DO group by four; the two are not interchangeable.)
+//   emit0  = out[first + period - 1] = `sum / vsum` — a DIVIDE, not a
+//            reciprocal multiply.
+//   roll   = `sum += pn*vn; sum -= po*vo; vsum += vn - vo` in exactly that
+//            order — three roundings — then `sum / vsum`. The CPU's 4-wide
+//            unroll performs the identical operations per element in the
+//            identical order, so a flat loop reproduces it exactly.
+//
+// f32 -> f64 audit: the f32 file was already `mix` (f32 in, f64 accumulator);
+// this makes the whole path f64 — inputs, accumulator and output. Literals
+// widened, `__int_as_float` NaN -> f64 quiet-NaN pattern, no fast-math
+// intrinsic, no epsilon (a zero `vsum` divides to Inf/NaN exactly as it does on
+// the CPU), no min/max chain.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double vwma_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void vwma_batch_f64(const double* __restrict__ price,
+                    const double* __restrict__ volume,
+                    int n,
+                    const int*   __restrict__ periods,
+                    int n_combos,
+                    int first_valid,
+                    double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = vwma_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long warm_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period) - 1;
+    if (period <= 0 || warm_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int warm = static_cast<int>(warm_ll);
+    const int base = first_valid;
+
+    for (int t = 0; t < warm; ++t) row[t] = nan_d;
+
+    double sum = 0.0;
+    double vsum = 0.0;
+    for (int i = 0; i < period; ++i) {
+        const double p = price[base + i];
+        const double v = volume[base + i];
+        sum += p * v;
+        vsum += v;
+    }
+    row[warm] = sum / vsum;
+
+    int new_idx = base + period;
+    int old_idx = base;
+    while (new_idx < n) {
+        const double pn = price[new_idx];
+        const double vn = volume[new_idx];
+        const double po = price[old_idx];
+        const double vo = volume[old_idx];
+        sum += pn * vn;
+        sum -= po * vo;
+        vsum += vn - vo;
+        row[new_idx] = sum / vsum;
+        ++new_idx;
+        ++old_idx;
+    }
+}

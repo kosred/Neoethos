@@ -177,3 +177,103 @@ void fwma_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `moving_averages/fwma.rs::fwma_scalar` (l.560), weights built
+// at `fwma.rs:331-341`:
+//     fib[0] = fib[1] = 1.0 ; fib[i] = fib[i-1] + fib[i-2]  for i in 2..period
+//     fib_sum = fib.iter().sum()          <- ASCENDING, left-associated
+//     fib[i] /= fib_sum                   <- a DIVIDE per weight, not a
+//                                            multiply by a reciprocal
+//     for i in (first + period - 1)..len:
+//         window = data[i+1-period ..= i]              (index 0 = OLDEST bar)
+//         sum accumulated in GROUPS OF FOUR:
+//             sum += d0*w0 + d1*w1 + d2*w2 + d3*w3
+//         then the remainder ONE AT A TIME: sum += d*w
+//         out[i] = sum
+//
+// NO FMA. The CPU writes `d*w` and then `+`, so each tap is two roundings; an
+// `fma(d, w, sum)` would be one and a different number. The group of four is a
+// left-associated 4-term product sum added to `sum` in a SINGLE add — not four
+// adds — so the grouping is reproduced literally.
+//
+// The normalised weight table is built once per thread into a fixed local
+// array, which is why the compiled kernel carries a period bound and the host
+// refuses an oversized period by name.
+//
+// f32 -> f64 audit: pointers/locals widened; `0.0f`/`1.0f` widened;
+// `__int_as_float` NaN x3 -> the f64 quiet-NaN bit pattern; no fast-math
+// intrinsic survives; no epsilon (`fib_sum == 0.0` is an exact test on the CPU
+// and stays exact); no min/max chain.
+// ---------------------------------------------------------------------------
+
+#ifndef FWMA_MAX_PERIOD_F64
+#define FWMA_MAX_PERIOD_F64 512
+#endif
+
+static __device__ __forceinline__ double fwma_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void fwma_batch_f64(const double* __restrict__ prices,
+                    int n,
+                    const int*   __restrict__ periods,
+                    int n_combos,
+                    int first_valid,
+                    double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = fwma_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long warm_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period) - 1;
+    if (period <= 0 || period > FWMA_MAX_PERIOD_F64 || warm_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int warm = static_cast<int>(warm_ll);
+
+    double fib[FWMA_MAX_PERIOD_F64];
+    for (int k = 0; k < period; ++k) {
+        fib[k] = (k < 2) ? 1.0 : (fib[k - 1] + fib[k - 2]);
+    }
+    double fib_sum = 0.0;
+    for (int k = 0; k < period; ++k) fib_sum += fib[k];
+    if (fib_sum == 0.0) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    for (int k = 0; k < period; ++k) fib[k] /= fib_sum;
+
+    for (int t = 0; t < warm; ++t) row[t] = nan_d;
+
+    const int p4 = period & ~3;
+
+    for (int i = warm; i < n; ++i) {
+        const int start = i + 1 - period;
+        double sum = 0.0;
+
+        int k = 0;
+        while (k < p4) {
+            sum += prices[start + k + 0] * fib[k + 0]
+                 + prices[start + k + 1] * fib[k + 1]
+                 + prices[start + k + 2] * fib[k + 2]
+                 + prices[start + k + 3] * fib[k + 3];
+            k += 4;
+        }
+        while (k < period) {
+            sum += prices[start + k] * fib[k];
+            ++k;
+        }
+
+        row[i] = sum;
+    }
+}

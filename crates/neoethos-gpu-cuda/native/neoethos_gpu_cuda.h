@@ -203,6 +203,14 @@ struct NeoPopulationCounters {
 /// `header.row_count` long except `indicators` (feature-major
 /// `feature_count * row_count`), `smc_rows` (`row_count * 11`) and the optional
 /// adaptive stop base, whose length is stated separately.
+///
+/// `indicators` IS AND STAYS FEATURE-MAJOR. The Prototype B walk reads it
+/// bar-major, and `upload_dataset` transposes it once on the device into a
+/// buffer of its own; the feature-major staging copy is freed before that call
+/// returns. This is stated here because the layout the device prefers changed
+/// and this contract did not — the CPU oracle, the parity fixtures and
+/// prototypes A and C all still build and consume feature-major, and a caller
+/// that "helpfully" pre-transposes would silently evaluate a transposed matrix.
 struct NeoPopulationDatasetView {
   NeoDatasetHeader header;
   const double* close;
@@ -238,20 +246,74 @@ struct NeoPopulationGeneView {
   std::uint32_t smc_gate_disabled;
 };
 
+/// The work list. `count` is the number of THREADS the walk launches and the
+/// number of metric rows `read_metrics` returns — it is NOT required to equal
+/// the uploaded gene count.
+///
+/// It used to be. That equality is why a screen wanting 101 treatments of one
+/// gene had to clone the gene 101 times, and why the Monte-Carlo pass staged
+/// 17 400 gene clones on the host and sent them in six launches. Each descriptor
+/// now carries its own gene index, window, costs and perturbation counter, so
+/// 174 genes and 17 574 scenarios go up together in one launch.
+///
+/// Every field of `NeoScenarioDescriptor` is read by the device. The contract:
+///
+///   * `base_candidate_id` — index into the uploaded gene array. MUST be inside
+///     it; the upload refuses anything else, because an out-of-range value is an
+///     out-of-bounds read of thresholds and CSR offsets that still produces a
+///     plausible metric row.
+///   * `scenario_id` — opaque, returned in the metric row so a mixed array can
+///     be demultiplexed without relying on position.
+///   * `window_offset` / `window_len` — bars `[offset, offset+len)`. A `len` of
+///     0 means "to the end of the series". `offset = 0, len = bars` is the whole
+///     series and is bit-identical to the pre-scenario walk.
+///   * `scenario_type` — 0 base, 1 device-perturbed Monte-Carlo, 2 cost.
+///   * `spread_ticks` / `slippage_ticks` — MILLIPIPS (thousandths of a pip).
+///     `-1` in `spread_ticks` means "no override, use the settings' per-bar
+///     spread"; a sentinel rather than 0 because charging NO spread is a
+///     legitimate thing to ask. `slippage_ticks` has no sentinel: 0 means none,
+///     and it is the only value the CPU engine can mirror.
+///   * `commission_micros` — millionths of one account-currency unit per lot.
+///     `-1` means "no override".
+///   * `rng_counter` — the perturbation stream, read only for type 1.
+///   * `perturbation_offset` / `perturbation_count` / `reserved` — still unused.
+///
+/// The integer cost fields are converted by DIVISION by their scale (1000 and
+/// 1e6), never by multiplication by a reciprocal, because the scales are exactly
+/// representable and their reciprocals are not. The host refuses to build a
+/// descriptor whose cost does not survive that round trip rather than rounding
+/// it, so a spread the descriptor cannot carry is an error the operator reads
+/// and never a launch that quietly charged a different number.
 struct NeoPopulationScenarioView {
   const NeoScenarioDescriptor* descriptors;
   std::size_t count;
 };
 
+/// One row per SCENARIO, in scenario order, each carrying both the gene's
+/// `candidate_id` and its own `scenario_id`. `capacity` must therefore cover the
+/// uploaded scenario count, which is the gene count only when the caller
+/// uploaded the identity descriptor array.
 struct NeoPopulationReadback {
   NeoPopulationMetricRow* rows;
   std::size_t capacity;
   std::size_t* written;
 };
 
-/// Diagnostic-only readback of the device event/outcome streams. It exists so a
-/// parity failure on rented hardware can be localized; it must never run inside
-/// a timed benchmark repetition.
+/// Diagnostic-only readback of the device outcome stream. It exists so a parity
+/// failure on rented hardware can be localized; it must never run inside a timed
+/// benchmark repetition.
+///
+/// `capacity` is a RANGE REQUEST, not a minimum. The outcome array is
+/// scenario-major with `kMaxTradesPerCandidate` slots each, so the first
+/// `capacity` records are exactly the trades of the first
+/// `capacity / kMaxTradesPerCandidate` scenarios, and `written` says how many
+/// were copied. It used to be an exact-fit requirement, which forced the host to
+/// allocate for the whole array — 163.8 M records at a 20 000-scenario launch.
+///
+/// `events` MAY BE NULL. Nothing emits events any more (the reduce opens
+/// positions from the signal), so a non-null pointer is merely memset to zero;
+/// pass null to skip 56 B per slot of host allocation that carries nothing.
+/// `outcomes` and `written` are required.
 struct NeoPopulationDiagnosticReadback {
   NeoPopulationEvent* events;
   NeoPopulationOutcome* outcomes;
@@ -277,6 +339,13 @@ struct NeoCudaPopulationSession;
 #define NEO_POPULATION_STATUS_UNKNOWN_EVENT (-41)
 #define NEO_POPULATION_STATUS_DATASET_REUPLOAD (-42)
 
+/// `max_events` is VESTIGIAL: it must be non-zero, and the device ignores it.
+///
+/// It once sized a per-session event buffer. Nothing has allocated that buffer
+/// since the reduce started opening positions from the signal directly, and the
+/// only kernel that filled it is not launched. The parameter is kept so the ABI
+/// and every caller stay unchanged; it is documented here rather than removed
+/// so no future sizing arithmetic budgets device memory for it again.
 NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
     std::uint32_t abi_version,
     std::int32_t device,

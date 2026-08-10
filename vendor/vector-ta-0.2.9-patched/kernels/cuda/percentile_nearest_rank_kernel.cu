@@ -336,3 +336,120 @@ void percentile_nearest_rank_one_series_many_params_same_len_f32(
         __syncthreads();
     }
 }
+
+
+// ===========================================================================
+// f64 LANE  --  shard S6
+//
+// CPU reference: `pnr_compute_into`
+// (src/indicators/percentile_nearest_rank.rs:193), reached from
+// `percentile_nearest_rank_with_kernel` (:342). `pnr_prepare` pins
+// `Kernel::Auto -> Kernel::Scalar` (:186-189), so there is one CPU answer.
+//
+// first_valid: `data.iter().position(|x| !x.is_nan())` (:161-163) over the
+// single source series (default "close", :103) ->
+// `F64FirstValidRule::AllInputsNonNan`.
+//
+// warm = first + length - 1 (:205). The swept `periods` value IS `length`;
+// `percentage` keeps its default of 50.0 (:112-114), so `p_frac = 0.5`.
+//
+// THIS IS AN ORDER STATISTIC, AND ORDER STATISTICS HAVE NO ROUNDING.
+// The CPU maintains a sorted multiset of the window's non-NaN values and
+// returns `sorted[idx]` (:249) -- it SELECTS an input value, it never
+// combines two of them. So there is no accumulation order to match and no ULP
+// to lose: any method that names the same element is bit-identical. That is
+// what makes this one PARALLEL OVER (combo, bar) rather than one thread per
+// column, even though the CPU's incremental insert/remove (:256-268) looks
+// sequential. The window at bar i is exactly [i+1-length, i] for every i from
+// `warm` on, which the CPU's own slide maintains, so each bar is independent.
+//
+// SELECTION WITHOUT STORAGE. The obvious device translation -- a per-thread
+// sorted array of `length` doubles -- would need an unbounded local array and
+// would force a `max_period` bound on the kernel. It is not needed: the
+// idx-th smallest is the unique value v in the window with
+// `#{u < v} <= idx < #{u <= v}`, and both counts are two O(length) passes
+// with no storage at all. That is why this kernel declares no `max_period`.
+// Ties are not a hazard: tied elements are EQUAL doubles, so whichever the
+// CPU's `sort_unstable_by` happened to place at `idx`, the value written out
+// is the same bit pattern.
+//
+// THE RANK FORMULA IS THE CPU'S, INCLUDING ITS mul_add AND ITS ROUNDING MODE.
+// :242-247 computes `raw = (p_frac.mul_add(wl as f64, 0.0)).round() as isize - 1`
+// then clamps to [0, wl-1]. `f64::round` is round-half-AWAY-FROM-ZERO and so
+// is CUDA's `round()`; `rint`/`nearbyint` would be round-half-to-EVEN and
+// would name a different element at every exact .5 (which `p_frac = 0.5` and
+// an odd `wl` produce constantly). `fma(p_frac, wl, 0.0)` reproduces
+// `mul_add` -- one rounding, not two.
+// Note `wl` is the count of NON-NaN values in the window, not `length`
+// (:216-221 pushes only non-NaN), so a gapped window shortens the rank.
+//
+// f32 -> f64 audit: the f32 lane above uses `floorf` x2 and `__int_as_float`
+// x1. Below: `round` (see above -- NOT floor, and NOT the f32 `roundf`),
+// `fma`, and the f64 quiet-NaN bit pattern. No f32 literal, no fast-math
+// intrinsic. No epsilon exists in this indicator and none was invented: an
+// equality comparison between two doubles is exactly what the CPU's
+// `partial_cmp` does, and loosening it with a tolerance would merge values the
+// host keeps distinct.
+// ===========================================================================
+
+static __device__ __forceinline__ double pnr_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void percentile_nearest_rank_batch_f64(const double* __restrict__ data,
+                                       int n,
+                                       const int* __restrict__ lengths,
+                                       int n_combos,
+                                       int first_valid,
+                                       double* __restrict__ out)
+{
+    const int r = blockIdx.y;
+    if (r >= n_combos) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double nan_d = pnr_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(r) * static_cast<size_t>(n);
+
+    const int length = lengths[r];
+    const int first  = (first_valid < 0) ? 0 : first_valid;
+
+    if (length <= 0 || length > n || first >= n) { row[i] = nan_d; return; }
+
+    const int start_i = first + length - 1;              // :205
+    if (i < start_i || start_i >= n) { row[i] = nan_d; return; }
+
+    const int wstart = i + 1 - length;
+
+    // wl = the number of non-NaN values in the window (:216-221).
+    int wl = 0;
+    for (int k = 0; k < length; ++k) {
+        if (!isnan(data[wstart + k])) ++wl;
+    }
+    if (wl == 0) { row[i] = nan_d; return; }             // :235-236
+
+    // percentage defaults to 50.0 (:112-114) -> p_frac = 50.0 * 0.01.
+    const double p_frac = 50.0 * 0.01;                   // :224
+
+    // :242-247
+    long long raw = static_cast<long long>(round(fma(p_frac, static_cast<double>(wl), 0.0))) - 1;
+    int idx = (raw <= 0) ? 0 : static_cast<int>(raw);
+    if (idx >= wl) idx = wl - 1;
+
+    // The unique v with #{u < v} <= idx < #{u <= v}.
+    double answer = nan_d;
+    for (int k = 0; k < length; ++k) {
+        const double v = data[wstart + k];
+        if (isnan(v)) continue;
+        int lt = 0, le = 0;
+        for (int j = 0; j < length; ++j) {
+            const double u = data[wstart + j];
+            if (isnan(u)) continue;
+            if (u <  v) ++lt;
+            if (u <= v) ++le;
+        }
+        if (lt <= idx && idx < le) { answer = v; break; }
+    }
+    row[i] = answer;
+}

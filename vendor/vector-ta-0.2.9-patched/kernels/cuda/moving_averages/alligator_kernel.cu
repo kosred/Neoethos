@@ -242,3 +242,257 @@ void alligator_many_series_one_param_f32(const float* __restrict__ prices_tm,
     if (tl < series_len && i >= warm_base_l) out_lips_tm[size_t(tl) * stride + col] = prev_l;
   }
 }
+
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/alligator.rs
+//   * `alligator_with_kernel` (:300) — first_valid = first non-NaN of the
+//     SOURCE, and the source is `hl2` (cpu_batch.rs:13912
+//     `extract_slice_input("alligator", req.data, "hl2")`), NOT close. Handing
+//     this kernel close computes a different indicator.
+//   * `alligator_scalar` (:552) — jaw/teeth/lips NaN prefixes are
+//     `first + period - 1 + offset`, one per line.
+//   * `alligator_smma_scalar` (:706) — the arithmetic reproduced below.
+//
+// PERIOD-INVARIANT. `compute_alligator_batch` (cpu_batch.rs:13938) reads
+// jaw_period 13 / jaw_offset 8, teeth_period 8 / teeth_offset 5,
+// lips_period 5 / lips_offset 3 and NEVER reads `period`.
+//
+// DEFAULT OUTPUT is JAW: cpu_batch.rs:13914 maps output_id "value" to
+// `AlligatorOutputField::Jaw`. `neoethos_alligator_jaw_f64` is therefore the
+// entry point the registry names; teeth and lips ship beside it so an
+// output-aware caller can reach them without a second conversion pass.
+//
+// ROUNDING COUNT. The CPU recurrence is
+//     smma = (smma * scale + x) * inv_period;
+// — multiply, add, multiply: THREE roundings, and NOT a `mul_add`. Written
+// literally here; `-fmad=false` keeps nvcc from fusing the first two.
+//
+// The seed is `sum / period` — a true divide, not a multiply by the reciprocal.
+//
+// Sequential: `smma` carries across bars. One thread per column.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_alli() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// One SMMA line of the alligator, written into `row` shifted by `offset`.
+__device__ __forceinline__ void nef_alligator_line(const double* __restrict__ src,
+                                                   int n,
+                                                   int first_valid,
+                                                   int period,
+                                                   int offset,
+                                                   double* __restrict__ row)
+{
+    const double QNAN = nef_qnan_alli();
+
+    // alligator_scalar:553 — warm = first + period - 1 + offset.
+    long long warm_ll = (long long)first_valid + (long long)period - 1 + (long long)offset;
+    int warm = warm_ll > (long long)n ? n : (int)warm_ll;
+    if (warm < 0) warm = 0;
+    for (int i = 0; i < warm; ++i) row[i] = QNAN;
+    // Bars after the warm prefix that the shifted write never reaches keep the
+    // CPU's NaN too — the CPU leaves them at the prefix value only when
+    // shifted_index >= len, which cannot happen below warm.
+    for (int i = warm; i < n; ++i) row[i] = QNAN;
+
+    if (period <= 0 || first_valid < 0 || first_valid >= n) return;
+
+    const double scale = (double)(period - 1);
+    const double inv_period = 1.0 / (double)period;
+
+    double sum = 0.0;
+    double val = 0.0;
+    bool ready = false;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double x = src[i];
+        if (!ready) {
+            if (i < first_valid + period) {
+                sum += x;
+                if (i == first_valid + period - 1) {
+                    val = sum / (double)period;
+                    ready = true;
+                    const int shifted = i + offset;
+                    if (shifted < n) row[shifted] = val;
+                }
+            }
+        } else {
+            val = (val * scale + x) * inv_period;
+            const int shifted = i + offset;
+            if (shifted < n) row[shifted] = val;
+        }
+    }
+}
+
+#define NEF_ALLI_JAW_PERIOD   13
+#define NEF_ALLI_JAW_OFFSET    8
+#define NEF_ALLI_TEETH_PERIOD  8
+#define NEF_ALLI_TEETH_OFFSET  5
+#define NEF_ALLI_LIPS_PERIOD   5
+#define NEF_ALLI_LIPS_OFFSET   3
+
+extern "C" __global__
+void neoethos_alligator_jaw_f64(const double* __restrict__ hl2,
+                                int n,
+                                const int* __restrict__ periods,
+                                int n_combos,
+                                int first_valid,
+                                double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+    (void)periods;  // PERIOD-INVARIANT.
+    nef_alligator_line(hl2, n, first_valid,
+                       NEF_ALLI_JAW_PERIOD, NEF_ALLI_JAW_OFFSET,
+                       out + (size_t)r * (size_t)n);
+}
+
+extern "C" __global__
+void neoethos_alligator_teeth_f64(const double* __restrict__ hl2,
+                                  int n,
+                                  const int* __restrict__ periods,
+                                  int n_combos,
+                                  int first_valid,
+                                  double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+    (void)periods;
+    nef_alligator_line(hl2, n, first_valid,
+                       NEF_ALLI_TEETH_PERIOD, NEF_ALLI_TEETH_OFFSET,
+                       out + (size_t)r * (size_t)n);
+}
+
+extern "C" __global__
+void neoethos_alligator_lips_f64(const double* __restrict__ hl2,
+                                 int n,
+                                 const int* __restrict__ periods,
+                                 int n_combos,
+                                 int first_valid,
+                                 double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos || n <= 0) return;
+    (void)periods;
+    nef_alligator_line(hl2, n, first_valid,
+                       NEF_ALLI_LIPS_PERIOD, NEF_ALLI_LIPS_OFFSET,
+                       out + (size_t)r * (size_t)n);
+}
+
+
+// ===========================================================================
+// S1 f64 LANE  --  alligator
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/alligator.rs -- `alligator_smma_one_scalar` (:414), `alligator_scalar` (:552), `alligator_with_kernel` (:300)
+//
+// SOURCE SERIES IS hl2, NOT close: `compute_alligator_batch`
+// (cpu_batch.rs:13912) calls `extract_slice_input("alligator", req.data,
+// "hl2")`. Declared `Hl2Slice` for the same reason `cci`/`mfi` declare hlc3.
+//
+// PERIOD-INVARIANT. The batch arm reads jaw/teeth/lips period and offset
+// (13/8, 8/5, 5/3) and has no `period` parameter.
+//
+// PRIMARY OUTPUT: `jaw`. cpu_batch.rs:13914 maps output_id "value" to
+// `AlligatorOutputField::Jaw`. Teeth and lips are separate series and this
+// lane carries one matrix per launch; the three are INDEPENDENT smoothings of
+// the same input, so dropping two changes no value of the first.
+//
+// ARITHMETIC ORDER: the SMMA update is
+// `value = (value * scale + data_point) * inv_period` with
+// `scale = period - 1` -- multiply, add, multiply: THREE roundings, and NOT
+// `mul_add`. Note this differs from the Wilder form `(x - y).mul_add(a, y)`
+// used elsewhere in this crate: same mathematics, different rounding count,
+// and the CPU here spells it the three-rounding way.
+// The seed is `sum / period` over the first `period` bars accumulated
+// ASCENDING -- plain `+=`, no grouping.
+//
+// THE OFFSET IS A WRITE SHIFT, NOT A READ SHIFT: the value computed at bar i
+// is stored at `i + offset`, and only when that index is inside the series.
+// Bars between the seed and the shift therefore keep their NaN prefix.
+//
+// `alligator_avx2` and `alligator_avx512` both call `alligator_scalar`
+// verbatim (alligator.rs:590-620), so there is one CPU answer on every host.
+//
+// WARMUP: `first + jaw_period - 1 + jaw_offset` for the jaw series.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_alligator_batch_f64(
+    const double* __restrict__ hl2,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    // `AlligatorParams` defaults as read by cpu_batch.rs:13939-13944.
+    const int jaw_period = 13;
+    const int jaw_offset = 8;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (jaw_period == 0) || (jaw_period > n) || (jaw_offset > n) ||
+        ((n - first_valid) < jaw_period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    // The whole row starts as NaN: the offset means the written indices are
+    // not contiguous from the warmup, so every bar the CPU never assigns must
+    // stay NaN rather than hold whatever the allocation contained.
+    for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+
+    const double scale = (double)(jaw_period - 1);
+    const double inv_period = 1.0 / (double)jaw_period;
+
+    double sum = 0.0;
+    double value = 0.0;
+    bool ready = false;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double data_point = hl2[i];
+        if (!ready) {
+            if (i < first_valid + jaw_period) {
+                sum += data_point;
+                if (i == first_valid + jaw_period - 1) {
+                    value = sum / (double)jaw_period;
+                    ready = true;
+                    const int shifted = i + jaw_offset;
+                    if (shifted < n) row[shifted] = value;
+                }
+            }
+        } else {
+            value = (value * scale + data_point) * inv_period;
+            const int shifted = i + jaw_offset;
+            if (shifted < n) row[shifted] = value;
+        }
+    }
+}

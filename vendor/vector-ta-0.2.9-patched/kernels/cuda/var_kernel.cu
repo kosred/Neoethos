@@ -220,3 +220,105 @@ extern "C" __global__ void var_many_series_one_param_f32(
         t += stride;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `var.rs::var_scalar` (l.322). Defaults: period 14, nbdev 1.0
+// (`var.rs:106`, `var.rs:110`); the registry sweeps `period` and takes the CPU
+// default for `nbdev`, so `nbdev2 == 1.0` — kept as a named constant rather
+// than folded away, because folding it would silently change what a future
+// nbdev sweep means.
+//
+// Accumulation order, reproduced exactly:
+//   seed  = `chunks_exact(4)` over data[first .. first+period], with
+//           `sum    += x0 + x1 + x2 + x3`
+//           `sum_sq += x0*x0 + x1*x1 + x2*x2 + x3*x3`
+//           i.e. ONE add into the accumulator of a left-associated 4-term sum,
+//           then the remainder one element at a time. A flat loop is a
+//           different summation tree and a different seed.
+//   roll  = `sum += new - old; sum_sq += new*new - old*old`
+//   emit  = `(sum_sq * inv_p - mean*mean) * nbdev2`, mean = `sum * inv_p`,
+//           inv_p = `1.0 / period` — a reciprocal multiply, not a divide.
+//
+// f32 -> f64 audit: pointers/locals widened; `__int_as_float` NaN -> f64
+// quiet-NaN pattern; the f32 file's device-side prefix-sum reformulation
+// (`var_build_prefix_f32`) is NOT used, because a prefix sum has a different
+// rounding from the CPU's rolling accumulator; no fast-math intrinsic; no
+// epsilon in this indicator; no min/max chain to convert.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double var_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void var_batch_f64(const double* __restrict__ prices,
+                   int n,
+                   const int*   __restrict__ periods,
+                   int n_combos,
+                   int first_valid,
+                   double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = var_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long idx0_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period) - 1;
+    if (period <= 0 || idx0_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int idx0 = static_cast<int>(idx0_ll);
+
+    const double nbdev = 1.0;                 // var.rs:110 default
+    const double nbdev2 = nbdev * nbdev;
+    const double inv_p = 1.0 / static_cast<double>(period);
+    const int first = first_valid;
+
+    for (int t = 0; t < idx0; ++t) row[t] = nan_d;
+
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    const int quad_end = first + (period & ~3);
+    int k = first;
+    while (k < quad_end) {
+        const double x0 = prices[k];
+        const double x1 = prices[k + 1];
+        const double x2 = prices[k + 2];
+        const double x3 = prices[k + 3];
+        sum += x0 + x1 + x2 + x3;
+        sum_sq += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+        k += 4;
+    }
+    const int init_end = first + period;
+    while (k < init_end) {
+        const double x = prices[k];
+        sum += x;
+        sum_sq += x * x;
+        ++k;
+    }
+
+    const double mean0 = sum * inv_p;
+    row[idx0] = (sum_sq * inv_p - mean0 * mean0) * nbdev2;
+
+    int in_new = first + period;
+    int in_old = first;
+    int o = idx0 + 1;
+    while (in_new < n) {
+        const double nv = prices[in_new];
+        const double ov = prices[in_old];
+        sum += nv - ov;
+        sum_sq += nv * nv - ov * ov;
+        const double mean = sum * inv_p;
+        row[o] = (sum_sq * inv_p - mean * mean) * nbdev2;
+        ++in_new;
+        ++in_old;
+        ++o;
+    }
+}

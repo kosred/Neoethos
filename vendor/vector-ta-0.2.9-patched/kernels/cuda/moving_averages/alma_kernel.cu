@@ -1176,3 +1176,132 @@ extern "C" __global__ void NAME(                                                
 
 DEFINE_ALMA_MS1P_TILED(alma_ms1p_tiled_f32_tx128_ty2, 128, 2)
 DEFINE_ALMA_MS1P_TILED(alma_ms1p_tiled_f32_tx128_ty4, 128, 4)
+
+
+// ===========================================================================
+// S1 f64 LANE  --  alma
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/moving_averages/alma.rs -- `alma_scalar` (:492), `alma_scalar_period9` (:460), `alma_prepare` (:298)
+//
+// PERIOD-BASED via `compute_ma_batch`. `offset` (0.85) and `sigma` (6.0) are
+// the CPU defaults (alma.rs:125,129) and are read from nothing else in the
+// batch path.
+//
+// THE WEIGHTS ARE BUILT ON THE DEVICE IN THE CPU'S EXACT ORDER:
+//   `m = offset * (period - 1)`, `s = period / sigma`, `s2 = 2*s*s`,
+//   `inv_s2 = 1/s2`, then for i ascending `w = exp(-diff*diff*inv_s2)` with
+//   `norm += w`. The normaliser is an ASCENDING accumulation of the same
+//   exponentials, not a closed form, because the closed form does not exist
+//   and a different summation order is a different `inv_norm` for every bar.
+//   `exp`, not `__expf` and not `expf` -- this is the f64 `exp`.
+//
+// THE DOT PRODUCT'S ASSOCIATION IS NOT THE OBVIOUS ONE. The CPU's inner line
+// is `sum += d0*w0 + d1*w1 + d2*w2 + d3*w3`, i.e. the four products are folded
+// LEFT-TO-RIGHT INTO A GROUP and only the group is added to `sum`. Adding the
+// four products to `sum` one at a time is a different number. The 4-wide group
+// and the scalar tail below reproduce it exactly.
+//
+// `alma_scalar_period9` (the CPU's period == 9 fast path, and 9 is the default
+// period) turns out to be the SAME association: its two four-term groups and
+// its single trailing term are exactly the `p4 = 8` case of the general loop.
+// Verified term by term, which is why there is one body here and not two.
+//
+// `alma_prepare` also pins `Kernel::Scalar` for `Auto` when period == 9
+// (alma.rs:352), so at the default period the scalar reference is the CPU
+// answer on every host.
+//
+// NO f32 EPSILON SURVIVES: the f32 kernel above carries `1e-6f` guards at two
+// sites (originally lines 186 and 1057 of this file). They are f32-sized and
+// are NOT carried into this lane -- the CPU reference has no epsilon at all in
+// the weight build or the dot product, so the correct f64 translation of those
+// guards is their absence.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + period - 1)`.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+#define NEO_S1_ALMA_MAX_PERIOD 1024
+
+extern "C" __global__ void neoethos_alma_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // `AlmaParams` defaults -- alma.rs:125, :129.
+    const double offset = 0.85;
+    const double sigma = 6.0;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) || (period > NEO_S1_ALMA_MAX_PERIOD) ||
+        ((n - first_valid) < period) ||
+        (sigma <= 0.0) ||
+        (offset < 0.0) || (offset > 1.0);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+    if (warm >= n) return;
+
+    double weights[NEO_S1_ALMA_MAX_PERIOD];
+    const double m = offset * (double)(period - 1);
+    const double s = (double)period / sigma;
+    const double s2 = 2.0 * s * s;
+    const double inv_s2 = 1.0 / s2;
+    double norm = 0.0;
+    for (int i = 0; i < period; ++i) {
+        const double diff = (double)i - m;
+        const double w = exp(-diff * diff * inv_s2);
+        weights[i] = w;
+        norm += w;
+    }
+    const double inv_norm = 1.0 / norm;
+
+    const int p4 = period & ~3;
+
+    for (int i = warm; i < n; ++i) {
+        const int start = i + 1 - period;
+
+        double sum = 0.0;
+        for (int k = 0; k < p4; k += 4) {
+            sum += prices[start + k]     * weights[k]
+                 + prices[start + k + 1] * weights[k + 1]
+                 + prices[start + k + 2] * weights[k + 2]
+                 + prices[start + k + 3] * weights[k + 3];
+        }
+        for (int k = p4; k < period; ++k) {
+            sum += prices[start + k] * weights[k];
+        }
+
+        row[i] = sum * inv_norm;
+    }
+}

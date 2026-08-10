@@ -197,3 +197,86 @@ void nma_many_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[row * stride + series] = latest * ratio + prev * (1.0f - ratio);
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `moving_averages/nma.rs::nma_scalar` (l.307).
+//     ln_values[i] = data[i].max(1e-10).ln()
+//     sqrt_diffs[i]= sqrt(i+1) - sqrt(i)                for i in 0..period
+//     for j in (first + period)..len:
+//         for i in 0..period:
+//             oi     = |ln[j-i] - ln[j-i-1]|
+//             num   += oi * sqrt_diffs[i]
+//             denom += oi
+//         ratio = if denom == 0.0 { 0.0 } else { num / denom }
+//         out[j]= data[j-(period-1)]*ratio + data[j-period]*(1.0 - ratio)
+//
+// THE 1e-10 IS NOT AN EPSILON. It is a DOMAIN CLAMP that keeps log off the
+// non-positive axis, and it is already an f64-sized quantity in the reference,
+// so it is carried across UNCHANGED. Re-deriving it for f64 would move the
+// clamp point and change every bar of a series that touches it. (Contrast the
+// f32 machine epsilons elsewhere in this shard, which must be re-derived.)
+//
+// data[i].max(1e-10) is f64::max, which returns the NON-NaN operand: a NaN
+// input therefore yields 1e-10, not NaN. fmax has exactly that semantics; an
+// if (x > 1e-10) chain does not, and would let the NaN through into log and
+// poison every window that touches the bar. This kernel uses fmax.
+//
+// The accumulators num and denom are a single flat ascending sum on the CPU --
+// no grouping, no fma -- so this kernel does the same: num += oi * sd is TWO
+// roundings, and writing it as fma(oi, sd, num) would be one.
+//
+// f32 -> f64 audit: pointers/locals widened; fabsf->fabs, logf->log,
+// sqrtf->sqrt (x4), fmaxf->fmax (x2); __int_as_float NaN -> f64 quiet-NaN
+// pattern; no fast-math intrinsic survives.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double nma_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void nma_batch_f64(const double* __restrict__ prices,
+                   int n,
+                   const int*   __restrict__ periods,
+                   int n_combos,
+                   int first_valid,
+                   double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = nma_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long start_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period);
+    if (period <= 0 || start_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int start = static_cast<int>(start_ll);
+
+    for (int t = 0; t < start; ++t) row[t] = nan_d;
+
+    for (int j = start; j < n; ++j) {
+        double num = 0.0;
+        double denom = 0.0;
+
+        for (int i = 0; i < period; ++i) {
+            const double a = log(fmax(prices[j - i], 1e-10));
+            const double b = log(fmax(prices[j - i - 1], 1e-10));
+            const double oi = fabs(a - b);
+            const double sd = sqrt(static_cast<double>(i) + 1.0) - sqrt(static_cast<double>(i));
+            num += oi * sd;
+            denom += oi;
+        }
+
+        const double ratio = (denom == 0.0) ? 0.0 : (num / denom);
+        const int i_off = period - 1;
+        row[j] = prices[j - i_off] * ratio + prices[j - i_off - 1] * (1.0 - ratio);
+    }
+}

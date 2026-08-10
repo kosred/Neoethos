@@ -166,3 +166,146 @@ extern "C" __global__ void trend_trigger_factor_batch_f64(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — trend_trigger_factor                        (Closer 5)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/trend_trigger_factor.rs
+ *   :346 compute_trend_trigger_factor_into  <- the per-bar body
+ *   :241 calc_ttf                           200*(buy-sell)/denom
+ *   :252 IndexMonoQueue                     cap == window + 1
+ *   :211 first_valid_high_low               BOTH finite, not merely non-NaN
+ *   :418 trend_trigger_factor_with_kernel   warm = first + length - 1
+ *
+ * PERIOD-INVARIANT (cpu_batch.rs:10524 reads "length", default 15), so both
+ * monotone deques and both history rings are the CPU fixed sizes and live in
+ * per-thread arrays.
+ *
+ * FIRST-VALID: HighLowFinite. The CPU scan is is_finite on BOTH series at the
+ * same index -- an INFINITE high is skipped, which a plain non-NaN scan would
+ * accept and then feed to a subtraction.
+ *
+ * SEQUENTIAL, one thread per column: two monotone deques plus a length-deep
+ * hh/ll history are carried across bars.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_TTF_LENGTH 15
+#define NEO_TTF_QCAP   16   /* IndexMonoQueue::new(window) -> window + 1 */
+
+extern "C" __global__
+void trend_trigger_factor_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int series_len,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;
+
+    if (len <= 0) return;
+
+    const int length = NEO_TTF_LENGTH;
+
+    // prepare(): length > len, or (len - first) < length, is an Err on the CPU,
+    // i.e. no column at all -- so the device answer is a NaN column.
+    if (first_valid < 0 || first_valid >= len || length > len ||
+        (len - first_valid) < length) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warm = first_valid + length - 1;
+    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+    if (warm >= len) return;
+
+    int maxq[NEO_TTF_QCAP];
+    int minq[NEO_TTF_QCAP];
+    int max_head = 0, max_tail = 0, max_count = 0;
+    int min_head = 0, min_tail = 0, min_count = 0;
+
+    double hh_history[NEO_TTF_LENGTH];
+    double ll_history[NEO_TTF_LENGTH];
+    int hist_head = 0, hist_len = 0;
+
+    for (int i = first_valid; i < len; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        if (!isfinite(h) || !isfinite(l)) {
+            if (i >= warm) o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        int window_start = i + 1 - length;
+        if (window_start < 0) window_start = 0;
+        if (window_start < first_valid) window_start = first_valid;
+
+        while (max_count > 0 && maxq[max_head] < window_start) {
+            max_head += 1;
+            if (max_head == NEO_TTF_QCAP) max_head = 0;
+            max_count -= 1;
+        }
+        while (min_count > 0 && minq[min_head] < window_start) {
+            min_head += 1;
+            if (min_head == NEO_TTF_QCAP) min_head = 0;
+            min_count -= 1;
+        }
+
+        while (max_count > 0) {
+            const int back = (max_tail == 0) ? (NEO_TTF_QCAP - 1) : (max_tail - 1);
+            if (high[maxq[back]] <= h) { max_tail = back; max_count -= 1; }
+            else break;
+        }
+        maxq[max_tail] = i;
+        max_tail += 1;
+        if (max_tail == NEO_TTF_QCAP) max_tail = 0;
+        max_count += 1;
+
+        while (min_count > 0) {
+            const int back = (min_tail == 0) ? (NEO_TTF_QCAP - 1) : (min_tail - 1);
+            if (low[minq[back]] >= l) { min_tail = back; min_count -= 1; }
+            else break;
+        }
+        minq[min_tail] = i;
+        min_tail += 1;
+        if (min_tail == NEO_TTF_QCAP) min_tail = 0;
+        min_count += 1;
+
+        if (i >= warm) {
+            const double hh = high[maxq[max_head]];
+            const double ll = low[minq[min_head]];
+            const double hist_hh = (hist_len == length) ? hh_history[hist_head] : 0.0;
+            const double hist_ll = (hist_len == length) ? ll_history[hist_head] : 0.0;
+
+            const double buy_power  = hh - hist_ll;
+            const double sell_power = hist_hh - ll;
+            const double denom = buy_power + sell_power;
+            o[i] = (isfinite(denom) && denom != 0.0)
+                 ? (200.0 * (buy_power - sell_power) / denom)
+                 : NEO_F64_NAN;
+
+            if (hist_len < length) {
+                int pos = hist_head + hist_len;
+                if (pos >= length) pos -= length;
+                hh_history[pos] = hh;
+                ll_history[pos] = ll;
+                hist_len += 1;
+            } else {
+                hh_history[hist_head] = hh;
+                ll_history[hist_head] = ll;
+                hist_head += 1;
+                if (hist_head == length) hist_head = 0;
+            }
+        }
+    }
+}

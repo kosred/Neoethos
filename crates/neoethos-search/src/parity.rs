@@ -211,6 +211,7 @@ mod tests {
             trailing_enabled: config.trailing_enabled,
             trailing_atr_multiplier: config.trailing_atr_multiplier,
             trailing_be_trigger_r: config.trailing_be_trigger_r,
+            trailing_min_lock_pips: config.trailing_min_lock_pips,
             pip_value: config.pip_value,
             spread_pips: config.spread_pips,
             commission_per_trade: config.commission_per_trade,

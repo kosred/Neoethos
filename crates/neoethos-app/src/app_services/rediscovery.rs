@@ -3,9 +3,36 @@
 //!
 //! Auto-cull already closes the NEGATIVE half of the feedback loop: a live
 //! strategy that hits the loss criteria is stopped and its fingerprint is
-//! permanently blacklisted (never selectable, never re-discovered). This
-//! module closes the POSITIVE half: the retirement leaves a coverage gap on
-//! that (symbol, base_tf) — so queue a fresh Discovery run to refill it.
+//! permanently blacklisted. This module closes the POSITIVE half: the
+//! retirement leaves a coverage gap on that (symbol, base_tf) — so queue a
+//! fresh Discovery run to refill it.
+//!
+//! # What "blacklisted" does and does not mean — corrected 2026-08-09 (#219)
+//!
+//! This header used to say the retired strategy is *"never selectable, never
+//! re-discovered"*. **The second half was false and is the reason this item is
+//! open.** `neoethos-search` contains zero references to the blacklist: the
+//! GA is free to re-derive the retired rule on the very run this module
+//! queues, and it does not know it is doing so.
+//!
+//! What actually holds today:
+//!
+//! * **Selection is guarded.** `server::autonomous` and `app_services::federation`
+//!   both call [`strategy_blacklist::is_blacklisted`] before a portfolio can go
+//!   live, and `server::portfolios` hides retired ones from the listing.
+//! * **Identity is now the gene, not the file** ([`strategy_blacklist`], #218),
+//!   so a re-discovered artifact describing the SAME rule is caught at
+//!   selection even though its bytes differ. That is what closed the practical
+//!   hole this module opened.
+//! * **Still open:** a rediscovery whose portfolio contains the culled gene
+//!   *alongside different ones* hashes differently and is not blocked, and the
+//!   search still wastes the run re-deriving it. The durable fix is for
+//!   discovery to consult the blacklist before a gene reaches
+//!   `live_portfolio.json`; that lives in `neoethos-search`, which this crate
+//!   must not edit, and is still OPEN.
+//!
+//! [`strategy_blacklist`]: crate::app_services::strategy_blacklist
+//! [`strategy_blacklist::is_blacklisted`]: crate::app_services::strategy_blacklist::is_blacklisted
 //!
 //! Design: the live-engine loop only PUSHES a request into a process-global
 //! queue (it has no access to `AppApiState`); a watcher spawned at server

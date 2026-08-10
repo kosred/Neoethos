@@ -279,3 +279,156 @@ void reflex_many_series_one_param_f32(const float* __restrict__ prices_tm,
         ssf_sum += ssf_t - ssf_ip;
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — reflex
+// ===========================================================================
+// Reference: src/indicators/moving_averages/reflex.rs
+//   `reflex_prepare`     (:332) — first_valid + the refusals
+//   `reflex_with_kernel` (:190) — alloc_with_nan_prefix(len, period), then
+//                                 out[..period].fill(0.0)
+//   `reflex_scalar`      (:238) — the two-pole super-smoother recurrence and
+//                                 the RMS normaliser
+//
+// THREE THINGS THIS FIXES
+//  1. f32 -> f64 for the whole 2-pole IIR. Same argument as gaussian: the pole
+//     radius is exp(-1.414*PI/(period/2)), which at period 200 is 0.9578, so
+//     an f32 rounding is remembered for hundreds of bars.
+//  2. `ms` is an exponentially-weighted MEAN SQUARE and the output divides by
+//     its square root. In f32 a small `ms` loses half its significant digits
+//     before `sqrt`, and the quotient is the indicator itself.
+//  3. NaN was built with `__int_as_float`; here it is the f64 quiet-NaN bit
+//     pattern.
+//
+// ROUNDING COUNT, per bar, from the CPU line by line:
+//     t0     = c * (di + dim1)                  -> add, mul        (2)
+//     t1     = (-a2).mul_add(ssf_im2, t0)       -> fma             (1)
+//     ssf_i  = b.mul_add(ssf_im1, t1)           -> fma             (1)
+//     my_sum = ssf_i.mul_add(beta, ssf_ip*alpha) - mean_lp -> mul, fma, sub (3)
+//     ms     = 0.96.mul_add(ms, 0.04*(my_sum*my_sum)) -> mul, mul, fma  (3)
+// Reproduced one for one below. `0.96` and `0.04` are Ehlers' constants, not
+// f32-sized epsilons, so they are carried unchanged — they are exact in
+// neither width and the CPU's f64 value of `0.04` is what we must match, which
+// is what writing `0.04` in a double context gives.
+//
+// THE RING. `ssf` is `period + 1` doubles and the recursion needs the entry
+// from `period` bars ago, so there is no way to drop it. It is a per-thread
+// local array bounded at compile time by REFLEX_MAX_PERIOD, exactly as
+// `neoethos_mfi_batch_f64` bounds its two rings, and the host refuses a larger
+// period BY NAME (`F64Kernel::max_period`) rather than truncating the window.
+//
+// WHERE THIS IS MORE DEFINED THAN THE CPU. `alloc_with_nan_prefix(len, period)`
+// leaves indices >= period UNINITIALISED, and `reflex_scalar` writes index i
+// only when `ms > 0`. In practice `ms` is positive from the first bar past the
+// warmup, so the CPU's uninitialised window is empty; this kernel fills the
+// whole row with NaN first so that if it ever is not empty the answer is a
+// loud NaN rather than whatever was in the buffer.
+// ===========================================================================
+
+// Rust's `std::f64::consts::PI`, written out rather than relying on `M_PI`
+// (which MSVC hides behind _USE_MATH_DEFINES) or on `CUDART_PI` being in
+// scope. Same bits either way; stated once so it cannot drift.
+#define NEO_S2_PI 3.14159265358979323846264338327950288
+
+#define REFLEX_MAX_PERIOD 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_reflex_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (period < 2) || (period > REFLEX_MAX_PERIOD) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period > (n - first_valid));
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    // `alloc_with_nan_prefix(len, period)` then `out[..period].fill(0.0)`:
+    // the first `period` bars are ZERO, not NaN. Everything after starts NaN
+    // and is overwritten by the loop.
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    const int zend = period < n ? period : n;
+    for (int i = 0; i < zend; ++i) row[i] = 0.0;
+
+    if (n < 2) return;
+
+    // `half_p = (period / 2).max(1) as f64` — INTEGER division first.
+    const int half_i = (period / 2) > 1 ? (period / 2) : 1;
+    const double half_p = (double)half_i;
+    const double a = exp(-1.414 * NEO_S2_PI / half_p);
+    const double a2 = a * a;
+    const double b = 2.0 * a * cos(1.414 * NEO_S2_PI / half_p);
+    const double c = 0.5 * (1.0 + a2 - b);
+
+    const int ring_len = period + 1;
+    double ssf[REFLEX_MAX_PERIOD + 1];
+    for (int i = 0; i < ring_len; ++i) ssf[i] = 0.0;
+
+    ssf[0] = prices[0];
+    ssf[1] = prices[1];
+    double ssf_sum = ssf[0] + ssf[1];
+
+    const double inv_p = 1.0 / (double)period;
+    const double alpha = 0.5 * (1.0 + inv_p);
+    const double beta = 1.0 - alpha;
+
+    double ms = 0.0;
+
+    int idx_im2 = 0;
+    int idx_im1 = 1;
+    int idx = 2;
+
+    for (int i = 2; i < n; ++i) {
+        const double di = prices[i];
+        const double dim1 = prices[i - 1];
+        const double ssf_im1 = ssf[idx_im1];
+        const double ssf_im2 = ssf[idx_im2];
+
+        const double t0 = c * (di + dim1);
+        const double t1 = fma(-a2, ssf_im2, t0);
+        const double ssf_i = fma(b, ssf_im1, t1);
+
+        ssf[idx] = ssf_i;
+
+        if (i < period) {
+            ssf_sum += ssf_i;
+        } else {
+            int idx_ip = idx + 1;
+            if (idx_ip == ring_len) idx_ip = 0;
+            const double ssf_ip = ssf[idx_ip];
+
+            const double mean_lp = ssf_sum * inv_p;
+            const double my_sum = fma(ssf_i, beta, ssf_ip * alpha) - mean_lp;
+
+            ms = fma(0.96, ms, 0.04 * (my_sum * my_sum));
+            if (ms > 0.0) {
+                row[i] = my_sum / sqrt(ms);
+            }
+
+            ssf_sum += ssf_i - ssf_ip;
+        }
+
+        idx_im2 = idx_im1;
+        idx_im1 = idx;
+        idx += 1;
+        if (idx == ring_len) idx = 0;
+    }
+}

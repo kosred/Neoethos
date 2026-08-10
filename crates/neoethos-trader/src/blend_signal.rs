@@ -60,16 +60,37 @@ pub enum BlendMode {
     MlScale,
 }
 
+/// Default floor on the ML agreement term (audit #232).
+///
+/// This number and [`DEFAULT_BLEND_VETO_BELOW`] SCALE EVERY ENTRY'S RISK on
+/// the live path (`live_trading.rs` builds a `BlendConfig` and multiplies the
+/// gene's size by the resulting confidence). Until 2026-08-09 both were bare
+/// literals inside `Default` with **no config recipient anywhere**, so the
+/// operator could not see them, let alone change them. They are named here so
+/// they are greppable and so a config field can bind to them without moving
+/// the number; the values themselves are UNCHANGED.
+///
+/// The config recipient (`models.blend.gate_floor` / `.veto_below`) still does
+/// not exist — `neoethos-core/src/config.rs` is owned by another workflow this
+/// wave. [`BlendConfig::from_config_values`] is the seam it plugs into.
+pub const DEFAULT_BLEND_GATE_FLOOR: f64 = 0.34;
+
+/// Default effective-multiplier floor below which the trade is SKIPPED.
+/// See [`DEFAULT_BLEND_GATE_FLOOR`] for why this is a named constant.
+pub const DEFAULT_BLEND_VETO_BELOW: f64 = 0.15;
+
 /// Blend tunables. Defaults keep the gene edge dominant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlendConfig {
     pub mode: BlendMode,
     /// Floor on the ML agreement term so a healthy gene bar always trades a
-    /// meaningful size even when ML is only lukewarm. Default 0.34.
+    /// meaningful size even when ML is only lukewarm.
+    /// Default [`DEFAULT_BLEND_GATE_FLOOR`].
     pub gate_floor: f64,
     /// Below this effective multiplier the trade is SKIPPED (set Flat, not just
     /// confidence 0 — the sizing floor would otherwise open min volume).
-    /// In `MlConfirm` also vetoes when the raw ML `p_side` is below it. Default 0.15.
+    /// In `MlConfirm` also vetoes when the raw ML `p_side` is below it.
+    /// Default [`DEFAULT_BLEND_VETO_BELOW`].
     pub veto_below: f64,
 }
 
@@ -77,8 +98,65 @@ impl Default for BlendConfig {
     fn default() -> Self {
         Self {
             mode: BlendMode::GenesOnly,
-            gate_floor: 0.34,
-            veto_below: 0.15,
+            gate_floor: DEFAULT_BLEND_GATE_FLOOR,
+            veto_below: DEFAULT_BLEND_VETO_BELOW,
+        }
+    }
+}
+
+impl BlendConfig {
+    /// Build a config from OPTIONAL operator-supplied values — the seam a
+    /// config recipient plugs into (audit #232).
+    ///
+    /// SAFETY POSTURE: a value that is absent, non-finite, or outside `[0,1]`
+    /// does NOT silently become something else. It falls back to the shipped
+    /// default and the fallback is logged at `warn` with both numbers, because
+    /// these two multipliers scale real position size. `veto_below` above
+    /// `gate_floor` would veto every trade the floor was meant to keep
+    /// tradeable, so that combination is also refused back to the defaults and
+    /// logged — fail toward the validated behaviour, never toward a novel one.
+    pub fn from_config_values(
+        mode: BlendMode,
+        gate_floor: Option<f64>,
+        veto_below: Option<f64>,
+    ) -> Self {
+        fn resolve(name: &'static str, given: Option<f64>, fallback: f64) -> f64 {
+            match given {
+                Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => v,
+                Some(v) => {
+                    tracing::warn!(
+                        target: "neoethos_trader::blend",
+                        knob = name,
+                        configured = v,
+                        used = fallback,
+                        "blend knob outside [0,1] or non-finite — REFUSED, using the \
+                         shipped default. This multiplier scales every entry's size."
+                    );
+                    fallback
+                }
+                None => fallback,
+            }
+        }
+        let gate_floor = resolve("gate_floor", gate_floor, DEFAULT_BLEND_GATE_FLOOR);
+        let veto_below = resolve("veto_below", veto_below, DEFAULT_BLEND_VETO_BELOW);
+        if veto_below > gate_floor {
+            tracing::warn!(
+                target: "neoethos_trader::blend",
+                configured_gate_floor = gate_floor,
+                configured_veto_below = veto_below,
+                "veto_below exceeds gate_floor — every floored bar would be vetoed. \
+                 REFUSED: reverting BOTH to the shipped defaults."
+            );
+            return Self {
+                mode,
+                gate_floor: DEFAULT_BLEND_GATE_FLOOR,
+                veto_below: DEFAULT_BLEND_VETO_BELOW,
+            };
+        }
+        Self {
+            mode,
+            gate_floor,
+            veto_below,
         }
     }
 }
@@ -124,6 +202,10 @@ pub fn blend_decision(dir: Direction, ml: &MlDecision, cfg: &BlendConfig) -> (Di
 pub struct BlendedSignalEngine {
     per_symbol_dir: HashMap<String, Vec<Direction>>,
     per_symbol_ml: HashMap<String, Vec<MlDecision>>,
+    /// Per-bar STRATEGY brackets in pips (audit #226). Empty ⇒ no bracket, and
+    /// the DecisionEngine's synthetic stop applies (and says so).
+    per_symbol_sl: HashMap<String, Vec<f64>>,
+    per_symbol_tp: HashMap<String, Vec<f64>>,
     cfg: BlendConfig,
     cursors: HashMap<String, usize>,
 }
@@ -136,6 +218,8 @@ impl BlendedSignalEngine {
         Self {
             per_symbol_dir,
             per_symbol_ml: HashMap::new(),
+            per_symbol_sl: HashMap::new(),
+            per_symbol_tp: HashMap::new(),
             cfg: BlendConfig::default(),
             cursors: HashMap::new(),
         }
@@ -157,9 +241,20 @@ impl BlendedSignalEngine {
         Self {
             per_symbol_dir,
             per_symbol_ml,
+            per_symbol_sl: HashMap::new(),
+            per_symbol_tp: HashMap::new(),
             cfg,
             cursors: HashMap::new(),
         }
+    }
+
+    /// Attach the genes' OWN per-bar brackets (pips) to whatever this engine
+    /// already serves. The ML gate can shrink or veto SIZE; it never touches
+    /// the bracket, so the stop stays the one the gene was scored on.
+    pub fn with_brackets(mut self, symbol: &str, sl_pips: Vec<f64>, tp_pips: Vec<f64>) -> Self {
+        self.per_symbol_sl.insert(symbol.to_string(), sl_pips);
+        self.per_symbol_tp.insert(symbol.to_string(), tp_pips);
+        self
     }
 }
 
@@ -175,6 +270,16 @@ impl SignalEngine for BlendedSignalEngine {
             .per_symbol_ml
             .get(&entry.symbol)
             .and_then(|v| v.get(cur).copied());
+        let sl_pips = self
+            .per_symbol_sl
+            .get(&entry.symbol)
+            .and_then(|v| v.get(cur).copied())
+            .unwrap_or(0.0);
+        let tp_pips = self
+            .per_symbol_tp
+            .get(&entry.symbol)
+            .and_then(|v| v.get(cur).copied())
+            .unwrap_or(0.0);
         self.cursors.insert(entry.symbol.clone(), cur + 1);
 
         match (self.cfg.mode, ml) {
@@ -186,6 +291,8 @@ impl SignalEngine for BlendedSignalEngine {
                     dir,
                     confidence,
                     source: SignalSource::Strategy,
+                    sl_pips,
+                    tp_pips,
                 }
             }
             (_, Some(decision)) => {
@@ -195,6 +302,8 @@ impl SignalEngine for BlendedSignalEngine {
                     dir: out_dir,
                     confidence,
                     source: SignalSource::Blend,
+                    sl_pips,
+                    tp_pips,
                 }
             }
         }
@@ -277,6 +386,30 @@ mod tests {
         let (dir, conf) = blend_decision(Direction::Long, &anomalous, &cfg);
         assert_eq!(dir, Direction::Flat, "hard anomaly veto must skip the trade");
         assert_eq!(conf, 0.0);
+    }
+
+    /// Audit #232: an out-of-range or inverted operator value must NOT be
+    /// applied — these two numbers scale every entry's size.
+    #[test]
+    fn from_config_values_refuses_bad_input_and_keeps_the_shipped_defaults() {
+        let d = BlendConfig::default();
+
+        let out_of_range =
+            BlendConfig::from_config_values(BlendMode::MlScale, Some(1.5), Some(-0.2));
+        assert_eq!(out_of_range.gate_floor, d.gate_floor);
+        assert_eq!(out_of_range.veto_below, d.veto_below);
+
+        let inverted = BlendConfig::from_config_values(BlendMode::MlScale, Some(0.10), Some(0.80));
+        assert_eq!(inverted.gate_floor, d.gate_floor, "inverted pair must revert both");
+        assert_eq!(inverted.veto_below, d.veto_below);
+
+        let good = BlendConfig::from_config_values(BlendMode::MlScale, Some(0.50), Some(0.20));
+        assert_eq!(good.gate_floor, 0.50);
+        assert_eq!(good.veto_below, 0.20);
+
+        let unset = BlendConfig::from_config_values(BlendMode::GenesOnly, None, None);
+        assert_eq!(unset.gate_floor, DEFAULT_BLEND_GATE_FLOOR);
+        assert_eq!(unset.veto_below, DEFAULT_BLEND_VETO_BELOW);
     }
 
     #[test]

@@ -33,9 +33,18 @@ use std::path::Path;
 /// kept, how much data the stage-1 funnel sees, what counts as in-sample for
 /// the prefilter), so they belong in typed config rather than ambient env
 /// state. These are configured via `models.discovery_runtime` (typed config)
-/// and resolved by [`DiscoveryRuntimeOverrides::from_settings`]; the legacy
-/// [`DiscoveryRuntimeOverrides::from_env`] reader is retained for reference
-/// only — the discovery cycle no longer reads the environment for them.
+/// and resolved by [`DiscoveryRuntimeOverrides::from_settings`], which is the
+/// ONLY constructor that reads operator input.
+///
+/// 2026-08-10: the legacy `from_env()` reader was deleted. It carried six
+/// `NEOETHOS_BOT_*` names — `PREFILTER_TOP_K`, `PREFILTER_INSAMPLE`,
+/// `PREFILTER_MIN_PER_TF`, `FUNNEL_STAGE1_PCT`, `FUNNEL_STAGE1_WINDOW`,
+/// `MIN_HISTORY_YEARS` — had zero production callers, and was "retained for
+/// reference": a second, invisible way to set the same knobs. `prefilter_top_k`
+/// is the exact key `shipped_config_matches_defaults.rs` exists to protect, and
+/// an env var that silently lowers it to 50 collapses the base feature set from
+/// 217 columns to roughly 64 with the SMC, session and footprint families dying
+/// first. One config, no env.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Stage1Window {
     /// Slice from the most recent rows. Captures the latest regime but is
@@ -49,7 +58,10 @@ pub enum Stage1Window {
 }
 
 impl Stage1Window {
-    fn from_env_str(value: &str) -> Option<Self> {
+    /// Parse the `models.discovery_runtime.stage1_window` config string. An
+    /// unrecognised value returns `None` and the caller keeps the default —
+    /// which it says out loud rather than substituting in silence.
+    fn from_config_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "most_recent" | "recent" | "tail" => Some(Self::MostRecent),
             "earliest" | "head" | "oldest" => Some(Self::Earliest),
@@ -93,7 +105,17 @@ pub struct DiscoveryRuntimeOverrides {
 impl Default for DiscoveryRuntimeOverrides {
     fn default() -> Self {
         Self {
-            prefilter_top_k: 50,
+            // 240, matching config.yaml AND
+            // `neoethos_core::config::DiscoveryRuntimeConfig::default()`. The
+            // three had drifted — code 50 / root yaml 240 / desktop yaml 50 —
+            // so a run's indicator pool was five times smaller or larger
+            // depending on whether a config file could be read, and no
+            // artifact recorded which branch ran. The other two sites were
+            // fixed by the indicator-vocabulary workflow and are pinned by
+            // `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`;
+            // this is the third, applied from
+            // `docs/pending-edits-forbidden-territory.md` §2.
+            prefilter_top_k: 240,
             prefilter_insample_frac: 0.80,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
@@ -108,8 +130,10 @@ impl Default for DiscoveryRuntimeOverrides {
             // the same pipeline and the operator gets a *result* (even if
             // empty portfolio because the strategies overfit) rather than
             // a hard "Failed: insufficient history" preflight stop. Operators
-            // who want the strict 10y gate back can set
-            // `NEOETHOS_BOT_MIN_HISTORY_YEARS=10` via env.
+            // who want the strict 10y gate back set
+            // `models.discovery_runtime.min_history_years: 10` in config.
+            // (Before 2026-08-10 this comment named an env var; that reader is
+            // deleted — there is one place to set this and it is the config.)
             //
             // F-096 history (2026-05-24, now superseded): the previous
             // default was 10 because synthetic-data leaks into discovery
@@ -122,61 +146,11 @@ impl Default for DiscoveryRuntimeOverrides {
 }
 
 impl DiscoveryRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_*` env vars. This is the only
-    /// place in `neoethos-search` that consults the environment for these
-    /// knobs; production callers should prefer constructing the struct from
-    /// typed config.
-    pub fn from_env() -> Self {
-        let mut overrides = Self::default();
-        if let Some(top_k) = std::env::var("NEOETHOS_BOT_PREFILTER_TOP_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            overrides.prefilter_top_k = top_k;
-        }
-        if let Some(insample) = std::env::var("NEOETHOS_BOT_PREFILTER_INSAMPLE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
-        {
-            overrides.prefilter_insample_frac = insample;
-        }
-        if let Some(min_per_tf) = std::env::var("NEOETHOS_BOT_PREFILTER_MIN_PER_TF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            overrides.prefilter_min_per_timeframe = min_per_tf;
-        }
-        if let Some(stage1) = std::env::var("NEOETHOS_BOT_FUNNEL_STAGE1_PCT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        {
-            overrides.funnel_stage1_pct = stage1.clamp(0.01, 1.0);
-        }
-        if let Some(window) = std::env::var("NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW")
-            .ok()
-            .and_then(|v| Stage1Window::from_env_str(&v))
-        {
-            overrides.stage1_window = window;
-        }
-        // F-096: minimum-history-years env override. 0 disables the
-        // check (for test runners and `--allow-short-history` operator
-        // flag). Production deployments leave it at the default 10y.
-        if let Some(years) = std::env::var("NEOETHOS_BOT_MIN_HISTORY_YEARS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            overrides.min_history_years = years;
-        }
-        overrides
-    }
-
-    /// Config-driven replacement for [`from_env`]: reads the discovery
-    /// runtime knobs from `models.discovery_runtime` instead of the
-    /// `NEOETHOS_BOT_*` environment. The validation mirrors `from_env`
-    /// (out-of-range values fall back to the default) so config defaults
-    /// reproduce the env-absent behaviour exactly.
+    /// The ONE constructor that reads operator input: `models.discovery_runtime`.
+    ///
+    /// There is no env reader. An out-of-range value keeps the default, and
+    /// says so by name with both numbers — a knob that quietly reverts is
+    /// indistinguishable from a knob that was honoured.
     pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
@@ -186,13 +160,49 @@ impl DiscoveryRuntimeOverrides {
             && cfg.prefilter_insample_frac <= 1.0
         {
             overrides.prefilter_insample_frac = cfg.prefilter_insample_frac;
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key = "models.discovery_runtime.prefilter_insample_frac",
+                configured = cfg.prefilter_insample_frac,
+                effective = overrides.prefilter_insample_frac,
+                "configured value is not a fraction in (0, 1] — the DEFAULT is in force, \
+                 not your number"
+            );
         }
         overrides.prefilter_min_per_timeframe = cfg.prefilter_min_per_timeframe;
         if cfg.funnel_stage1_pct.is_finite() {
-            overrides.funnel_stage1_pct = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
+            let clamped = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
+            if (clamped - cfg.funnel_stage1_pct).abs() > f64::EPSILON {
+                tracing::warn!(
+                    target: "neoethos_search::config_resolution",
+                    key = "models.discovery_runtime.funnel_stage1_pct",
+                    configured = cfg.funnel_stage1_pct,
+                    effective = clamped,
+                    "configured value is outside [0.01, 1.0] and was CLAMPED — stage 1 sees \
+                     a different slice of the data than you asked for"
+                );
+            }
+            overrides.funnel_stage1_pct = clamped;
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key = "models.discovery_runtime.funnel_stage1_pct",
+                configured = cfg.funnel_stage1_pct,
+                effective = overrides.funnel_stage1_pct,
+                "configured value is non-finite — the DEFAULT is in force"
+            );
         }
-        if let Some(window) = Stage1Window::from_env_str(&cfg.stage1_window) {
-            overrides.stage1_window = window;
+        match Stage1Window::from_config_str(&cfg.stage1_window) {
+            Some(window) => overrides.stage1_window = window,
+            None => tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key = "models.discovery_runtime.stage1_window",
+                configured = %cfg.stage1_window,
+                effective = ?overrides.stage1_window,
+                "unrecognised stage1_window — accepted values are \
+                 most_recent|recent|tail and earliest|head|oldest. The DEFAULT is in force"
+            ),
         }
         overrides.min_history_years = cfg.min_history_years;
         overrides
@@ -206,7 +216,7 @@ impl DiscoveryRuntimeOverrides {
         }
     }
 
-    fn resolved_prefilter_insample_frac(&self) -> f64 {
+    pub(crate) fn resolved_prefilter_insample_frac(&self) -> f64 {
         if self.prefilter_insample_frac.is_finite()
             && self.prefilter_insample_frac > 0.0
             && self.prefilter_insample_frac <= 1.0
@@ -218,13 +228,326 @@ impl DiscoveryRuntimeOverrides {
     }
 }
 
+/// Name the winner of every knob that exists twice in this config, with both
+/// values, once per run.
+///
+/// Called from [`DiscoveryConfig::from_settings`]. It changes no behaviour — it
+/// removes the ability for a duplicate to be edited invisibly. The three pairs
+/// here are the ones whose deciding read lives in `neoethos-search`; the shape
+/// is deliberately copied from `session_spread_pips()` above, which the
+/// 2026-08-09 knob pass names as the honest pattern every other twin should
+/// look like.
+fn resolve_and_log_duplicate_knobs(settings: &neoethos_core::Settings) {
+    // ── 1. TRAILING 💰 ───────────────────────────────────────────────────────
+    //
+    // `models.exit_policy.*` DECIDES. `risk.trailing_*` reaches nothing.
+    //
+    // The search's exit geometry arrives through
+    // `StrategyEvaluationRuntimeOverrides::exit_policy` → `EvaluationConfig::
+    // default()` (strategy_gene.rs) → every evaluator, CPU and CUDA alike. The
+    // `risk.trailing_*` four are ledgered as SHADOWED DUPLICATE in
+    // `config_has_recipient.rs`. The operator's live store at
+    // `%LOCALAPPDATA%\neoethos\config.yaml` sets the RISK copy — including
+    // hand-tuned `trailing_atr_multiplier: 0.4` and `trailing_be_trigger_r:
+    // 0.1` — and does not contain an `exit_policy` block at all, so those
+    // deliberate numbers move nothing and the ExitPolicy Rust defaults are what
+    // actually runs.
+    //
+    // NOTE for whoever deletes the risk four: live execution
+    // (`live_trading.rs`) trails UNCONDITIONALLY with no config recipient of any
+    // kind. Deleting the visible-but-dead keys before live reads
+    // `models.exit_policy` converts a visibly-wrong value into an invisible
+    // hardcode on the path that spends real money. Log first, wire live, then
+    // delete.
+    let risk_trail = &settings.risk;
+    let exit = &settings.models.exit_policy;
+    let trailing_disagrees = risk_trail.trailing_enabled != exit.trailing_enabled
+        || (risk_trail.trailing_atr_multiplier - exit.trailing_stop_multiplier).abs()
+            > f64::EPSILON
+        || (risk_trail.trailing_be_trigger_r - exit.trailing_be_trigger_r).abs() > f64::EPSILON
+        || (risk_trail.trailing_min_lock_pips - exit.trailing_min_lock_pips).abs() > f64::EPSILON;
+    if trailing_disagrees {
+        tracing::warn!(
+            target: "neoethos_search::config_resolution",
+            winner = "models.exit_policy",
+            loser = "risk.trailing_*",
+            effective_trailing_enabled = exit.trailing_enabled,
+            effective_stop_multiplier = exit.trailing_stop_multiplier,
+            effective_be_trigger_r = exit.trailing_be_trigger_r,
+            effective_min_lock_pips = exit.trailing_min_lock_pips,
+            ignored_risk_trailing_enabled = risk_trail.trailing_enabled,
+            ignored_risk_atr_multiplier = risk_trail.trailing_atr_multiplier,
+            ignored_risk_be_trigger_r = risk_trail.trailing_be_trigger_r,
+            ignored_risk_min_lock_pips = risk_trail.trailing_min_lock_pips,
+            "TRAILING IS SET TWICE AND THE TWO DISAGREE. This search uses \
+             models.exit_policy.*; the risk.trailing_* values above are ignored — they \
+             reach no evaluator, CPU or CUDA. If the risk.* numbers are the ones you \
+             tuned, copy them into models.exit_policy.* (note the rename: \
+             risk.trailing_atr_multiplier -> models.exit_policy.trailing_stop_multiplier, \
+             and despite its old name it was never an ATR multiple — it is a multiple of \
+             the position's own stop distance)."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::config_resolution",
+            winner = "models.exit_policy",
+            trailing_enabled = exit.trailing_enabled,
+            trailing_stop_multiplier = exit.trailing_stop_multiplier,
+            trailing_be_trigger_r = exit.trailing_be_trigger_r,
+            trailing_min_lock_pips = exit.trailing_min_lock_pips,
+            "trailing resolved from models.exit_policy (risk.trailing_* is a shadowed \
+             duplicate and agrees with it)"
+        );
+    }
+
+    // ── 2. COST 💰 ───────────────────────────────────────────────────────────
+    //
+    // `risk.*` DECIDES, unconditionally. `models.eval_runtime.spread_pips` /
+    // `.commission_per_trade` reach nothing in a discovery run.
+    //
+    // `DiscoveryConfig::from_settings` computes `evaluation_spread_pips` and
+    // `evaluation_commission_per_trade` from `risk.*` and passes them as the
+    // EXPLICIT per-call override into `EvaluationConfig::for_symbol` →
+    // `infer_market_cost_profile`, which is step (1) of a four-step chain whose
+    // step (2) is the eval_runtime pair. Step (1) is filled on every discovery
+    // run and `run_discovery_cycle` refuses a non-finite override, so step (2)
+    // is unreachable from here. This matters because the Settings screen renders
+    // the eval_runtime pair as `cost.spread_pips` / `cost.commission_per_trade`
+    // WITH tuning presets: the surface the operator is offered is the one that
+    // loses.
+    let eval_cost = &settings.models.eval_runtime;
+    if let Some(shadow_spread) = eval_cost.spread_pips {
+        tracing::warn!(
+            target: "neoethos_search::config_resolution",
+            winner = "risk.backtest_spread_pips + risk.slippage_pips",
+            loser = "models.eval_runtime.spread_pips",
+            effective_spread_pips = settings.risk.backtest_spread_pips.max(0.0)
+                + settings.risk.slippage_pips.max(0.0),
+            ignored_spread_pips = shadow_spread,
+            "SPREAD IS SET TWICE. Discovery charges the risk.* number; \
+             models.eval_runtime.spread_pips (what the Settings screen calls \
+             cost.spread_pips) is ignored on every discovery run."
+        );
+    }
+    if let Some(shadow_commission) = eval_cost.commission_per_trade {
+        tracing::warn!(
+            target: "neoethos_search::config_resolution",
+            winner = "risk.commission_per_lot (broker metadata first)",
+            loser = "models.eval_runtime.commission_per_trade",
+            ignored_commission_per_trade = shadow_commission,
+            "COMMISSION IS SET TWICE. Discovery charges the broker-authoritative or \
+             risk.* number; models.eval_runtime.commission_per_trade (what the Settings \
+             screen calls cost.commission_per_trade) is ignored on every discovery run."
+        );
+    }
+
+    // ── 3. SYMBOL / ACCOUNT CURRENCY 💰 ──────────────────────────────────────
+    //
+    // `system.*` DECIDES whenever non-empty, and `from_settings` above reads
+    // ONLY `system.*`. Two `symbol:` keys ~1300 lines apart in the same file is
+    // how a run ends up measuring the wrong instrument's pip value.
+    if let Some(shadow_symbol) = eval_cost.symbol.as_deref().map(str::trim) {
+        if !shadow_symbol.is_empty() && !shadow_symbol.eq_ignore_ascii_case(&settings.system.symbol)
+        {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                winner = "system.symbol",
+                loser = "models.eval_runtime.symbol",
+                effective_symbol = %settings.system.symbol,
+                ignored_symbol = %shadow_symbol,
+                "SYMBOL IS SET TWICE AND THE TWO DISAGREE. Discovery evaluates \
+                 system.symbol."
+            );
+        }
+    }
+    if let Some(shadow_ccy) = eval_cost.account_currency.as_deref().map(str::trim) {
+        if !shadow_ccy.is_empty()
+            && !shadow_ccy.eq_ignore_ascii_case(&settings.system.account_currency)
+        {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                winner = "system.account_currency",
+                loser = "models.eval_runtime.account_currency",
+                effective_account_currency = %settings.system.account_currency,
+                ignored_account_currency = %shadow_ccy,
+                "ACCOUNT CURRENCY IS SET TWICE AND THE TWO DISAGREE. Discovery converts \
+                 pip value into system.account_currency; a wrong currency silently \
+                 rescales every result."
+            );
+        }
+    }
+}
+
+/// Print each admission/export gate's EFFECTIVE value beside the Rust `Default`
+/// it came from, once per run.
+///
+/// Why the Default is printed and not the file: the four config surfaces
+/// (`Default`, repo `config.yaml`, the desktop seed, and
+/// `%LOCALAPPDATA%\neoethos\config.yaml`) disagree on these keys, and a run has
+/// no way to know which file it was handed — that resolution is logged at load
+/// time by `Settings::load`. What a run CAN say is "this gate is off and the
+/// Default says on", which is exactly the class of surprise §3 of the
+/// 2026-08-09 knob pass describes: a gate the operator deliberately disarmed
+/// silently re-arming after a reinstall, or an install that lost a key keeping
+/// a gate disarmed with no diff to explain why exports stopped.
+///
+/// This function changes NOTHING. It does not turn a gate on. Turning any of
+/// these on changes what the search admits, and that is the operator's call.
+fn log_gate_states(settings: &neoethos_core::Settings) {
+    let d = neoethos_core::Settings::default();
+    let m = &settings.models;
+    let dm = &d.models;
+
+    macro_rules! gate_bool {
+        ($key:literal, $eff:expr, $def:expr, $what:literal) => {{
+            let eff: bool = $eff;
+            let def: bool = $def;
+            if eff == def {
+                tracing::info!(
+                    target: "neoethos_search::gate_state",
+                    key = $key,
+                    effective = eff,
+                    rust_default = def,
+                    what_it_gates = $what,
+                    "gate state (agrees with its Rust default)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "neoethos_search::gate_state",
+                    key = $key,
+                    effective = eff,
+                    rust_default = def,
+                    what_it_gates = $what,
+                    "GATE DIFFERS FROM ITS RUST DEFAULT. If this was a deliberate \
+                     decision it is holding; if a config file lost or gained this key, \
+                     this run just changed what it admits with no diff to explain it."
+                );
+            }
+        }};
+    }
+
+    gate_bool!(
+        "models.require_walkforward_for_export",
+        m.require_walkforward_for_export,
+        dm.require_walkforward_for_export,
+        "hard out-of-sample export gate: false lets a portfolio export without \
+         clearing walk-forward."
+    );
+    gate_bool!(
+        "models.enable_cpcv",
+        m.enable_cpcv,
+        dm.enable_cpcv,
+        "the SEARCH's combinatorial-purged-CV admission gate (not the training-side \
+         models.ml_cpcv_enabled): false promotes a portfolio with no purged OOS \
+         validation at all."
+    );
+    gate_bool!(
+        "models.ml_cpcv_enabled",
+        m.ml_cpcv_enabled,
+        dm.ml_cpcv_enabled,
+        "the TRAINING-side CPCV, a different gate that shares the letters. Disarming \
+         the wrong one of the two admits candidates that never passed purged CV."
+    );
+    gate_bool!(
+        "models.regime_router_enabled",
+        m.regime_router_enabled,
+        dm.regime_router_enabled,
+        "per-regime routing of candidates."
+    );
+    gate_bool!(
+        "models.l1_feature_selection_enabled",
+        m.l1_feature_selection_enabled,
+        dm.l1_feature_selection_enabled,
+        "L1 feature selection: off means the full feature set reaches the model."
+    );
+    gate_bool!(
+        "models.l1_feature_selection_per_regime",
+        m.l1_feature_selection_per_regime,
+        dm.l1_feature_selection_per_regime,
+        "per-regime L1 feature selection."
+    );
+    gate_bool!(
+        "system.multi_resolution_enabled",
+        settings.system.multi_resolution_enabled,
+        d.system.multi_resolution_enabled,
+        "multi-timeframe resolution — the seed config calls this 'the pre-GA wall that \
+         stopped combos completing on laptop AND VPS'."
+    );
+    gate_bool!(
+        "risk.challenge_mode",
+        settings.risk.challenge_mode,
+        d.risk.challenge_mode,
+        "prop-firm challenge mode. UNWIRED: domain::risk::RiskManager has no production \
+         constructor, so this arms nothing today — it is retained as recorded intent."
+    );
+    gate_bool!(
+        "risk.max_trades_per_day_enabled",
+        settings.risk.max_trades_per_day_enabled,
+        d.risk.max_trades_per_day_enabled,
+        "the daily entry cap. Arming it live without arming it in the search means the \
+         backtest that selected your strategies took entries live will refuse."
+    );
+
+    // ── the two money floors, printed as numbers 💰 ──────────────────────────
+    if (m.prop_search_min_payoff_ratio - dm.prop_search_min_payoff_ratio).abs() > f64::EPSILON {
+        tracing::warn!(
+            target: "neoethos_search::gate_state",
+            key = "models.prop_search_min_payoff_ratio",
+            effective = m.prop_search_min_payoff_ratio,
+            rust_default = dm.prop_search_min_payoff_ratio,
+            "PAYOFF FLOOR DIFFERS FROM ITS RUST DEFAULT. 0.0 means the quality screen's \
+             payoff criterion is OFF (it is guarded by `> 0.0`), leaving the screen as \
+             net-expectancy plus the trade-count floors."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::gate_state",
+            key = "models.prop_search_min_payoff_ratio",
+            effective = m.prop_search_min_payoff_ratio,
+            "payoff floor in force"
+        );
+    }
+    if (m.prop_firm_min_pass_rate - dm.prop_firm_min_pass_rate).abs() > f64::EPSILON {
+        tracing::warn!(
+            target: "neoethos_search::gate_state",
+            key = "models.prop_firm_min_pass_rate",
+            effective = m.prop_firm_min_pass_rate,
+            rust_default = dm.prop_firm_min_pass_rate,
+            "PROP-FIRM PASS-RATE FLOOR DIFFERS FROM ITS RUST DEFAULT. 0.0 = RANKING ONLY: \
+             the window gate runs, ranks, and rejects nothing."
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     pub timeframe_label: String,
     pub evaluation_symbol: String,
     pub evaluation_account_currency: String,
     pub evaluation_spread_pips: f64,
+    /// ROUND-TRIP commission per lot, in account currency.
+    ///
+    /// The evaluators subtract this exactly once per closed trade, so a
+    /// per-side broker quote must already have been doubled before it lands
+    /// here — `from_settings` does that through
+    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`], gated
+    /// on `risk.commission_per_lot_is_per_side`.
     pub evaluation_commission_per_trade: f64,
+    /// Session-aware spread curve in pips, `[asian, overlap, late_ny]`,
+    /// slippage already folded in — or `None` for a flat spread at every hour.
+    ///
+    /// The per-bar lookup has existed on both the CPU path (`eval.rs:843`) and
+    /// the CUDA kernel (`prototype_b_population.cu:47`) for months and was
+    /// populated ONLY under `#[cfg(test)]`: every production construction site
+    /// left `session_spread_profile: None`. So the London open and 03:00 Tokyo
+    /// were charged the same spread, and a strategy that only trades the Asian
+    /// session was measured at a cost it would never get. `None` here keeps
+    /// exactly that behaviour and the run says so out loud; `Some` turns the
+    /// curve on for CPU and card alike with no kernel change.
+    pub session_spread_pips: Option<[f64; 3]>,
+    /// Round-trip cost band in pips, `(optimistic, pessimistic)`, that every
+    /// reported result is measured against. See `RiskConfig::cost_band_pips`.
+    pub cost_band_pips: Option<(f64, f64)>,
     /// Broker overnight financing, pips/night, from the symbol's metadata
     /// (`daily_swap_long_pips` / `daily_swap_short_pips`). Decision D
     /// (2026-08-09): a zero-swap backtest silently overstates every held
@@ -400,6 +723,20 @@ impl Default for DiscoveryConfig {
             evaluation_account_currency: String::new(),
             evaluation_spread_pips: f64::NAN,
             evaluation_commission_per_trade: f64::NAN,
+            // Flat spread at every hour — the behaviour every production run
+            // has had since the profile type was written. `from_settings`
+            // populates this when the operator has measured a curve.
+            session_spread_pips: None,
+            // The same 1.6–2.4 band `RiskConfig::default()` resolves to.
+            //
+            // This was `None` on the reasoning that `default()` is only a test
+            // fixture. It is not: `engines_control` falls back to `default()`
+            // whenever config.yaml cannot be read, so that reasoning shipped a
+            // production path on which every candidate came back
+            // `cost_band_unmeasured` and nothing said why. An unmeasured band
+            // is not neutral — it is the absence of the only evidence that
+            // separates a result from a result-at-the-optimistic-edge.
+            cost_band_pips: Some((1.6, 2.4)),
             swap_long_pips_per_day: 0.0,
             swap_short_pips_per_day: 0.0,
             population: 1000,
@@ -418,6 +755,11 @@ impl Default for DiscoveryConfig {
             // — a run that lands here because config.yaml failed to load must
             // NOT silently drop the floor to 0. Kept in lockstep with
             // `models.prop_search_min_payoff_ratio`'s default (divergence test).
+            //
+            // The expectancy fields are left at their `Default` (0.0 / 0.0),
+            // which for `min_net_expectancy_per_trade` means "strictly positive
+            // required" — the floor is unconditional and cannot be configured
+            // away, here or anywhere.
             target_profile: TargetProfile {
                 min_payoff_ratio: 2.0,
                 ..TargetProfile::default()
@@ -455,7 +797,13 @@ impl Default for DiscoveryConfig {
             mc_min_profitable: 70,
             sensitivity_spread_pips: 2.0,
             sensitivity_commission_per_lot: 7.0,
-            adaptive_thresholds: false,
+            // Matches `DiscoveryRuntimeConfig::default()`, which moved to `true`
+            // in the same batch. The gene threshold ladder's own comment says it
+            // is "calibrated for z-score-normalised features"; leaving this
+            // `false` on the config-load-failure path meant the fallback run
+            // searched a different objective from the configured one and said
+            // nothing about it.
+            adaptive_thresholds: true,
             // Env-absent default reproduces the retired
             // resolve_discovery_mode() fallback (PropFirm).
             mode: DiscoveryMode::PropFirm,
@@ -543,10 +891,112 @@ impl DiscoveryConfig {
             None => (0.0, 0.0),
         };
         let config_commission = settings.risk.commission_per_lot.max(0.0);
-        let resolved_commission = meta
+        let quoted_commission = meta
             .and_then(|m| m.commission_per_lot)
             .filter(|c| *c > 0.0)
             .unwrap_or(config_commission);
+        // PER SIDE -> ROUND TRIP (2026-08-09). Both sources above are broker
+        // quotes, and a broker quotes per side; every evaluator here subtracts
+        // `commission_per_trade` exactly ONCE per closed trade. So the number
+        // has to be doubled somewhere, and this is one of the only two places
+        // that do it (the other is `infer_market_cost_profile`, which never
+        // sees a value that has already been through here — discovery passes
+        // this as the explicit `commission_override`). At the shipped 7.0 the
+        // charge goes from $7 to $14 per lot per closed trade: about 1.4 pips
+        // on a EURUSD standard lot instead of 0.7. That is not an improvement
+        // to the strategies, it is the removal of a subsidy the search was
+        // selecting on.
+        let commission_is_per_side = settings.risk.commission_per_lot_is_per_side;
+        let resolved_commission = crate::genetic::strategy_gene::round_trip_commission_per_lot(
+            quoted_commission,
+            commission_is_per_side,
+        );
+        tracing::info!(
+            target: "neoethos_search::cost_model",
+            symbol = %symbol,
+            quoted_commission_per_lot = quoted_commission,
+            commission_is_per_side,
+            round_trip_commission_per_lot = resolved_commission,
+            "commission resolved to a ROUND TRIP charge — the evaluators subtract \
+             it once per closed trade"
+        );
+
+        // The session-spread curve. `Err` is a partial / malformed curve and is
+        // refused rather than repaired: a cost model configured for two of the
+        // three UTC buckets charges an unchosen number for a third of every
+        // trading day. `Ok(None)` is the shipped state and gets a WARN naming
+        // what it costs, because the curve existing-but-never-populated is the
+        // exact defect this field was added to end.
+        let session_spread_pips: Option<[f64; 3]> = match settings.risk.session_spread_pips() {
+            Ok(Some(curve)) => {
+                let slip = settings.risk.slippage_pips.max(0.0);
+                // Slippage rides on each bucket exactly as it rides on the flat
+                // `evaluation_spread_pips` below, so the two paths charge the
+                // same thing when the curve is uniform.
+                let with_slip = [curve[0] + slip, curve[1] + slip, curve[2] + slip];
+                tracing::info!(
+                    target: "neoethos_search::cost_model",
+                    symbol = %symbol,
+                    asian_pips = with_slip[0],
+                    overlap_pips = with_slip[1],
+                    late_ny_pips = with_slip[2],
+                    slippage_pips = slip,
+                    "session spread curve ACTIVE — spread is now resolved per bar from its \
+                     UTC hour on the CPU path and in the CUDA kernel alike"
+                );
+                Some(with_slip)
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "neoethos_search::cost_model",
+                    symbol = %symbol,
+                    flat_spread_pips = settings.risk.backtest_spread_pips.max(0.0)
+                        + settings.risk.slippage_pips.max(0.0),
+                    "no session spread curve configured — a FLAT spread is charged at 03:00 \
+                     Tokyo and at the London open alike. The per-bar lookup exists on both the \
+                     CPU path and the CUDA kernel and is simply unpopulated. Measure your \
+                     broker's per-hour spread and set risk.backtest_spread_pips_{{asian,\
+                     overlap,late_ny}}. Until then, any result that depends on WHEN it trades \
+                     is measured at the wrong cost."
+                );
+                None
+            }
+            Err(reason) => {
+                // Not a panic and not a silent flat fall-back: the run continues
+                // on the flat spread, but the operator is told their curve was
+                // rejected and why, in the same words the config doc uses.
+                tracing::error!(
+                    target: "neoethos_search::cost_model",
+                    symbol = %symbol,
+                    reason = %reason,
+                    "session spread curve REFUSED — falling back to the flat spread. Fix the \
+                     three risk.backtest_spread_pips_* keys or remove all three."
+                );
+                None
+            }
+        };
+
+        // The cost band every reported result is measured against. `None` means
+        // the operator's band is unusable (inverted, negative or non-finite) —
+        // reported as such rather than silently collapsed to a point estimate.
+        let cost_band_pips = settings.risk.cost_band_pips();
+        match cost_band_pips {
+            Some((lo, hi)) => tracing::info!(
+                target: "neoethos_search::cost_model",
+                optimistic_pips = lo,
+                pessimistic_pips = hi,
+                "cost band ACTIVE — every survivor is re-measured at BOTH edges and one that \
+                 clears only the optimistic edge is flagged, not reported as a result"
+            ),
+            None => tracing::warn!(
+                target: "neoethos_search::cost_model",
+                optimistic_pips = settings.risk.cost_band_optimistic_pips,
+                pessimistic_pips = settings.risk.cost_band_pessimistic_pips,
+                "cost band is unusable (non-finite, negative, or optimistic > pessimistic) — \
+                 results will carry a single cost point, which nobody can check"
+            ),
+        }
+
         if meta.is_none() || (swap_long == 0.0 && swap_short == 0.0) {
             tracing::warn!(
                 target: "neoethos_search::discovery",
@@ -570,6 +1020,35 @@ impl DiscoveryConfig {
                 "Decision D: charging broker-authoritative swap + commission"
             );
         }
+
+        // ── DUPLICATE-KNOB RESOLUTION, SAID OUT LOUD (2026-08-10) ────────────
+        //
+        // Three knobs in this config exist TWICE under different section
+        // names. In every case one copy decides and the other reaches nothing,
+        // and until now nothing said which. An operator editing the losing copy
+        // saw a saved value, a green config, and no change in behaviour — the
+        // failure wearing the costume of a choice.
+        //
+        // This block does not change which copy wins. It names the winner, the
+        // loser and both values, once per run, before a bar is read. The
+        // deletion of the losing fields is a separate, config-side change; a
+        // key that has been telling the truth in the log for a run or two is
+        // safe to remove, a key removed while it still looked live is not.
+        resolve_and_log_duplicate_knobs(settings);
+
+        // ── GATE STATE, AND WHERE IT CAME FROM ───────────────────────────────
+        //
+        // Every gate below is a safety check the code implements and a shipped
+        // config can switch off. §3 of the 2026-08-09 knob pass calls this "the
+        // most consequential class in the report": a lost key silently re-arms
+        // a gate the operator deliberately disarmed, or keeps one disarmed that
+        // the Rust Default says should be on, and no config diff explains why
+        // exports stopped or started.
+        //
+        // The line below is the record. It prints the EFFECTIVE value and the
+        // Rust Default beside it, so "these two differ" is visible in the log
+        // of the run itself rather than derivable only by diffing four files.
+        log_gate_states(settings);
 
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
@@ -595,6 +1074,8 @@ impl DiscoveryConfig {
             evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0)
                 + settings.risk.slippage_pips.max(0.0),
             evaluation_commission_per_trade: resolved_commission,
+            session_spread_pips,
+            cost_band_pips,
             swap_long_pips_per_day: swap_long,
             swap_short_pips_per_day: swap_short,
             population: model_settings.prop_search_population.max(10),
@@ -620,6 +1101,13 @@ impl DiscoveryConfig {
             corr_threshold: model_settings.prop_search_corr_threshold.clamp(0.0, 1.0),
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.2),
             target_profile: TargetProfile {
+                // `.max(0.0)` is deliberate and load-bearing: a negative floor
+                // configured here would admit money-losers by arithmetic. The
+                // floor may be raised above zero, never below it.
+                min_net_expectancy_per_trade: model_settings
+                    .prop_search_min_net_expectancy_per_trade
+                    .max(0.0),
+                min_expectancy_t_stat: model_settings.prop_search_min_expectancy_t_stat.max(0.0),
                 min_win_rate: model_settings.prop_search_min_win_rate.clamp(0.0, 1.0),
                 min_payoff_ratio: model_settings.prop_search_min_payoff_ratio.max(0.0),
                 max_in_market: model_settings.prop_search_max_in_market.max(0.0),
@@ -1164,7 +1652,18 @@ pub struct DiscoveryRunProfile {
     pub evaluation_symbol: String,
     pub evaluation_account_currency: String,
     pub evaluation_spread_pips: f64,
+    /// ROUND-TRIP commission per lot actually charged. Two runs that differ
+    /// only in `risk.commission_per_lot_is_per_side` produce different money,
+    /// so the resolved number — not the quote — belongs in the profile.
     pub evaluation_commission_per_trade: f64,
+    /// Session spread curve `[asian, overlap, late_ny]` in pips (slippage
+    /// folded in), or `None` for a flat spread at every hour. `None` is not a
+    /// neutral value: it means the run could not distinguish a strategy that
+    /// only trades the London open from one that only trades Tokyo.
+    pub session_spread_pips: Option<[f64; 3]>,
+    /// Round-trip cost band `(optimistic, pessimistic)` in pips that this run's
+    /// survivors were re-measured against.
+    pub cost_band_pips: Option<(f64, f64)>,
     /// Broker overnight financing charged in the backtest (Decision D). Part of
     /// the cost basis: two runs at different swap are not comparable.
     pub swap_long_pips_per_day: f64,
@@ -1520,12 +2019,37 @@ fn discovery_backtest_settings(
             40.0
         },
         max_hold_bars: evaluation.max_hold_bars,
+        // All four exit-geometry fields together. `trailing_min_lock_pips` used
+        // to be omitted here and silently inherited `BacktestSettings::default()`
+        // (2.0) — a fourth number of the same policy arriving by a different
+        // route, which is how policies drift apart one field at a time.
         trailing_enabled: evaluation.trailing_enabled,
         trailing_atr_multiplier: evaluation.trailing_atr_multiplier,
         trailing_be_trigger_r: evaluation.trailing_be_trigger_r,
+        trailing_min_lock_pips: evaluation.trailing_min_lock_pips,
         pip_value: evaluation.pip_value,
         spread_pips: evaluation.spread_pips,
         commission_per_trade: evaluation.commission_per_trade,
+        // THE WIRE (2026-08-09). `SessionSpreadProfile` has existed since the
+        // type was written; `spread_pips_for_bar` reads it on the CPU path
+        // (`eval.rs:843`) and `spread_pips_for_bar` in
+        // `prototype_b_population.cu:47` reads it on the card. Every production
+        // construction site left it `None` — the only `Some(..)` in the tree
+        // were under `#[cfg(test)]` — so the curve was dead code and a flat
+        // spread was charged at every hour of the day. This is the single point
+        // all discovery settings flow through, so setting it here turns the
+        // curve on for the GA, the quality screen, walk-forward and CPCV at
+        // once, with no kernel change.
+        //
+        // `None` reproduces the old behaviour exactly; `from_settings` has
+        // already WARNed in that case.
+        session_spread_profile: config.session_spread_pips.map(|curve| {
+            crate::eval::SessionSpreadProfile {
+                asian_pips: curve[0],
+                overlap_pips: curve[1],
+                late_ny_pips: curve[2],
+            }
+        }),
         pip_value_per_lot: evaluation.pip_value_per_lot,
         // Decision D: charge overnight financing (the engine applies it in both
         // the CPU path and the CUDA kernel; it was silently 0 here before).
@@ -1893,24 +2417,91 @@ fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
 /// This is not a threshold to tune alongside `max_dd`; it is the boundary of
 /// what the numbers can mean, so it is checked separately and unconditionally.
 /// Anything at or beyond total loss is rejected whatever else it scores.
-/// The shape of strategy the operator is willing to trade.
+/// What a candidate must be to survive: one correctness bound, then the
+/// operator's shape preferences.
 ///
-/// Separate from the quality floors because it is a *preference*, not a
-/// correctness bound: a 40 %-win-rate trend follower is a perfectly good system,
-/// it is just not the one being looked for. Every field `0.0` means "no
-/// preference", which is the default, so a run says nothing about shape unless
-/// the operator asked it to.
+/// THE CORRECTNESS BOUND — cost-charged net expectancy per trade. This is not a
+/// preference and it is not optional. `min_net_expectancy_per_trade` is the only
+/// field on this struct for which `0.0` does NOT mean "no preference": it means
+/// "must be strictly greater than zero". There is no configuration in which a
+/// candidate that loses money on the average trade is admitted.
+///
+/// WHY IT HAD TO BE ADDED — the proof, with the measured numbers.
+///
+/// Until 2026-08-09 this struct held shape preferences only, and with
+/// `prop_search_min_win_rate` and `prop_search_max_in_market` both defaulting to
+/// `0.0`, `accepts` reduced to exactly one comparison:
+/// `payoff_ratio >= min_payoff_ratio`. That single comparison gated EVERY
+/// survival path in the quality screen — both the strict and the opportunistic
+/// branch require `profile_ok` (see the screen, below in this file). So the
+/// payoff ratio alone decided who lived.
+///
+/// A payoff ratio cannot do that job, because it says nothing about money. It is
+/// `avg_win / avg_loss`: a description of the SHAPE of the win/loss split, blind
+/// to how often each occurs and blind to what the broker charges. Measured on
+/// real EURUSD bars while sweeping the trailing-stop geometry:
+///
+///   trail multiplier 1.0 → payoff 0.91, expectancy -4.15 pips/trade
+///   trail multiplier 3.0 → payoff 2.53, expectancy -4.18 pips/trade
+///
+/// The payoff ratio moved by a factor of 2.8. The money did not move at all. On
+/// a driftless price, exit geometry REDISTRIBUTES the (win-rate, payoff) split
+/// and their product stays pinned at minus the cost. A 2.0 payoff floor accepts
+/// the second row and rejects the first, and the second row empties the account
+/// 0.7 % faster than the first.
+///
+/// That is the reward hack this gate exists to close, and it is not hypothetical:
+/// the same commit that made the trailing stop searchable would have handed the
+/// GA a free way to clear a 2.0 payoff floor by widening the trail. Making the
+/// trail searchable WITHOUT this gate is strictly worse than changing neither.
+///
+/// The payoff floor remains, as a secondary filter. It expresses a real operator
+/// preference — a 2:1 system survives a losing run differently from a 0.6:1
+/// system at the same expectancy — and it can only narrow what the expectancy
+/// gate already admitted. It can never admit anything on its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct TargetProfile {
-    /// Lowest acceptable win rate, as a fraction.
+    /// PRIMARY. Lowest acceptable cost-charged net expectancy per trade, in
+    /// account currency. `0.0` means "must be strictly positive", NOT "no
+    /// preference" — see the type doc.
+    pub min_net_expectancy_per_trade: f64,
+    /// PRIMARY. How many standard errors above zero that expectancy must sit.
+    /// `0.0` requires only the sign.
+    ///
+    /// This bounds SAMPLING noise on one candidate's own trades. It does not
+    /// bound selection bias across the thousands of candidates the GA tried —
+    /// only DSR/PBO over the per-trial return series can do that. Those series
+    /// are now persisted (`trial_returns.rs`); nothing reads them yet.
+    ///
+    /// SHIPPED AT 0.0, deliberately and on the record. `TargetProfile::evaluate`
+    /// guards this check with `> 0.0`, so at the shipped value
+    /// `net_expectancy_stderr` and `net_expectancy_t_stat` are computed on every
+    /// candidate and consulted on none, and the objective reduces to
+    /// `profit_per_trade > 0` — in-sample net profit over the screen window.
+    /// What currently carries the load against a lucky sample is
+    /// `prop_search_val_min_trades_per_month` (15 strict, 10 opportunistic): a
+    /// trade-COUNT floor, which over a ten-year window demands ~1200 trades and
+    /// so does defeat the two-lucky-trades case. It is not a noise bound.
+    ///
+    /// It ships off because the 2026-08-09 diagnostic run must first establish
+    /// what the ten rejection counters look like with no new gate binding; a
+    /// significance floor introduced in the same run would confound that
+    /// baseline. `t >= 2.0` is the value to set once the baseline is read — at
+    /// 1200+ trades it costs almost nothing to clear if there is a real edge.
+    pub min_expectancy_t_stat: f64,
+    /// Lowest acceptable win rate, as a fraction. `0.0` = no preference.
     pub min_win_rate: f64,
-    /// Lowest acceptable average-win over average-loss.
+    /// SECONDARY. Lowest acceptable average-win over average-loss. `0.0` = no
+    /// preference.
     ///
     /// Stated separately from the win rate because `profit_factor` folds the two
     /// together: 30 % of trades at 5:1 and 70 % at 0.6:1 both give about 2.1, and
     /// they are completely different systems to hold through a losing run.
+    /// Never sufficient on its own — payoff 2.53 at expectancy -4.18 pips is a
+    /// gate-passing money-loser.
     pub min_payoff_ratio: f64,
-    /// Most of the span a candidate may spend holding a position.
+    /// Most of the span a candidate may spend holding a position. `0.0` = no
+    /// preference.
     ///
     /// A strategy in the market almost always is not selecting entries, and its
     /// win rate converges on the market's base rate however the entry rule is
@@ -1918,15 +2509,62 @@ pub struct TargetProfile {
     pub max_in_market: f64,
 }
 
-impl TargetProfile {
-    /// Whether `metrics` has the shape asked for. Vacuously true when nothing
-    /// was asked, which is the default.
-    pub fn accepts(&self, metrics: &StrategyMetrics) -> bool {
-        if self.min_win_rate > 0.0 && metrics.win_rate < self.min_win_rate {
-            return false;
+/// Why a candidate was refused by [`TargetProfile::accepts`].
+///
+/// Named, one variant per criterion, because "rejected" with no reason is what
+/// the quality screen used to report: a single `rejected_base_quality` counter
+/// standing in for at least eight independent gates, from which no run could
+/// ever say WHY it found nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProfileRejection {
+    /// The average trade loses money after costs. The one unconditional refusal.
+    NegativeNetExpectancy,
+    /// The expectancy is positive but inside its own sampling noise.
+    ExpectancyNotSignificant,
+    TooFewWinners,
+    PayoffTooLow,
+    TooMuchTimeInMarket,
+}
+
+impl TargetProfileRejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NegativeNetExpectancy => "net_expectancy",
+            Self::ExpectancyNotSignificant => "expectancy_significance",
+            Self::TooFewWinners => "win_rate",
+            Self::PayoffTooLow => "payoff_ratio",
+            Self::TooMuchTimeInMarket => "in_market",
         }
+    }
+}
+
+impl TargetProfile {
+    /// `Ok(())` when the candidate may survive, or the FIRST criterion it failed.
+    ///
+    /// Order matters and is deliberate: the money question is asked first, so a
+    /// rejection census reads "most candidates lose money" rather than "most
+    /// candidates have the wrong shape" when both are true.
+    pub fn evaluate(&self, metrics: &StrategyMetrics) -> Result<(), TargetProfileRejection> {
+        // UNCONDITIONAL. Note the strict `>`, and note that it is NOT guarded by
+        // `if self.min_net_expectancy_per_trade > 0.0`. Every other criterion on
+        // this struct is opt-in; this one is the floor under all of them. A
+        // candidate with zero trades reports 0.0 here and is refused, which is
+        // also correct: nothing traded is not an edge.
+        if !(metrics.profit_per_trade > self.min_net_expectancy_per_trade) {
+            return Err(TargetProfileRejection::NegativeNetExpectancy);
+        }
+        if self.min_expectancy_t_stat > 0.0
+            && metrics.net_expectancy_t_stat < self.min_expectancy_t_stat
+        {
+            return Err(TargetProfileRejection::ExpectancyNotSignificant);
+        }
+        if self.min_win_rate > 0.0 && metrics.win_rate < self.min_win_rate {
+            return Err(TargetProfileRejection::TooFewWinners);
+        }
+        // SECONDARY, and only ever subtractive: by the time control reaches this
+        // line the candidate has already proven it makes money after costs.
         if self.min_payoff_ratio > 0.0 && metrics.payoff_ratio < self.min_payoff_ratio {
-            return false;
+            return Err(TargetProfileRejection::PayoffTooLow);
         }
         // Exposure rejects only when it was measurable. A candidate whose trades
         // carry no exit times reports 0.0, and reading that as "never in the
@@ -1935,9 +2573,15 @@ impl TargetProfile {
             && metrics.in_market_pct > 0.0
             && metrics.in_market_pct > self.max_in_market
         {
-            return false;
+            return Err(TargetProfileRejection::TooMuchTimeInMarket);
         }
-        true
+        Ok(())
+    }
+
+    /// Whether `metrics` may survive. Never vacuously true — see
+    /// [`Self::evaluate`] and the type doc.
+    pub fn accepts(&self, metrics: &StrategyMetrics) -> bool {
+        self.evaluate(metrics).is_ok()
     }
 }
 
@@ -2060,6 +2704,16 @@ struct DiscoveryBacktestPolicy {
     trailing_enabled: bool,
     trailing_atr_multiplier: f64,
     trailing_be_trigger_r: f64,
+    /// The FOURTH field of the same exit policy. Added 2026-08-09: it was
+    /// omitted while its three siblings were hashed, so two artifacts produced
+    /// under different min-lock values hashed identically and were
+    /// indistinguishable afterwards — reproducing the exact defect class the
+    /// field was introduced to close (it used to travel by a separate route and
+    /// silently inherit `BacktestSettings::default() = 2.0`). Adding it changes
+    /// the policy hash and therefore invalidates cached artifact identity across
+    /// this change, which is correct: artifacts on either side were produced
+    /// under a policy the hash could not tell apart.
+    trailing_min_lock_pips: f64,
     pip_value: f64,
     spread_pips: f64,
     commission_per_trade: f64,
@@ -2163,6 +2817,7 @@ fn discovery_backtest_policy_hash(
         trailing_enabled: settings.trailing_enabled,
         trailing_atr_multiplier: settings.trailing_atr_multiplier,
         trailing_be_trigger_r: settings.trailing_be_trigger_r,
+        trailing_min_lock_pips: settings.trailing_min_lock_pips,
         pip_value: settings.pip_value,
         spread_pips: settings.spread_pips,
         commission_per_trade: settings.commission_per_trade,
@@ -2265,6 +2920,48 @@ fn evaluate_cpcv_gate(
         n
     };
     let offset = n.saturating_sub(capped_n);
+    // ── COVERAGE, REPORTED (2026-08-10) 💰 ──────────────────────────────────
+    //
+    // This gate validates the TAIL ONLY — `offset = n - capped_n` — and until
+    // now it returned pass/fail with no coverage figure anywhere. 200 000 rows
+    // against 1.05 M bars is 19% of history: the out-of-sample gate that
+    // promotes a strategy toward real money reported a clean pass on a fifth of
+    // the record, and nothing in the run said which fifth.
+    //
+    // Nothing is refused here. `cpcv_max_rows` is a memory bound, and refusing
+    // a run because the operator's box is small is the wrong trade. What
+    // changes is that the number is now in the log next to the verdict, so a
+    // "CPCV passed" can be read together with what it passed on.
+    let coverage_fraction = if n > 0 {
+        capped_n as f64 / n as f64
+    } else {
+        0.0
+    };
+    if coverage_fraction < 0.50 {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            cpcv_max_rows = config.cpcv_max_rows,
+            rows_available = n,
+            rows_validated = capped_n,
+            first_validated_row = offset,
+            coverage_fraction,
+            "CPCV COVERAGE IS BELOW HALF THE LOADED HISTORY. The gate validates the \
+             most recent rows only, so a pass here is a statement about the tail of the \
+             dataset and not about the record. Raise models.cpcv_max_rows (0 = every \
+             row) if the box has the memory."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            cpcv_max_rows = config.cpcv_max_rows,
+            rows_available = n,
+            rows_validated = capped_n,
+            first_validated_row = offset,
+            coverage_fraction,
+            "CPCV coverage (tail-anchored: the gate validates the most recent \
+             rows_validated bars)"
+        );
+    }
     let cv = CombinatorialPurgedCV::new(
         config.cpcv_n_splits,
         config.cpcv_n_test_groups,
@@ -3117,9 +3814,10 @@ struct GeneExport<'a> {
 ///
 /// `min_history_years` defaults to **0** (use whatever data exists, ratio-
 /// split via `prop_search_val_years` downstream — see operator directive
-/// 2026-05-26 in `DiscoveryRuntimeOverrides::default`). Set to a positive
-/// integer either via `NEOETHOS_BOT_MIN_HISTORY_YEARS` env or explicitly in
-/// the override struct to re-instate a hard floor.
+/// 2026-05-26 in `DiscoveryRuntimeOverrides::default`). Set
+/// `models.discovery_runtime.min_history_years` to a positive integer to
+/// re-instate a hard floor. There is no env reader for it in this crate as of
+/// 2026-08-10.
 pub fn ensure_sufficient_history(
     ohlcv: &Ohlcv,
     symbol: &str,
@@ -3139,10 +3837,10 @@ pub fn ensure_sufficient_history(
              need at least {required_bars} (≈ {min_history_years} years × {bars_per_year} \
              bars/yr). Remediation: (1) Settings → Data → 'Download history from broker' \
              with a ~{min_history_years}-year window for {symbol} {timeframe}, then re-run \
-             Discovery; OR (2) relax the floor via the NEOETHOS_BOT_MIN_HISTORY_YEARS \
-             environment variable — set it to 0 to run on whatever data exists \
-             (accepts the over-fitting risk). Operator policy 2026-05-24: refuse \
-             synthetic / insufficient data."
+             Discovery; OR (2) relax the floor by setting \
+             `models.discovery_runtime.min_history_years` in config — 0 runs on \
+             whatever data exists (accepts the over-fitting risk). Operator policy \
+             2026-05-24: refuse synthetic / insufficient data."
         );
     }
     Ok(())
@@ -3174,6 +3872,169 @@ pub fn approx_bars_per_year(tf: &str) -> usize {
     }
 }
 
+/// Which of the TEN independent base-quality criteria rejected a candidate.
+///
+/// (Eight when this split was written; the net-expectancy objective added two
+/// more `TargetProfile` criteria in the same batch, and this enum follows it
+/// rather than duplicating it.)
+///
+/// MEASUREMENT SLICE (2026-08-09). `rejected_base_quality` used to be one
+/// counter standing in for at least eight independent gates
+/// (`TargetProfile::accepts` is five, `passes_strict_quality` is four counting
+/// the total-loss guard, and the opportunistic lane's enable switch is a ninth
+/// way to die that no metric explains). A run could therefore report "174
+/// screened, 0 survived" without anyone being able to say WHICH condition did
+/// it — and the answer, in that run, was a single one: the payoff floor, which
+/// was arithmetically unreachable under the run's own exit geometry.
+///
+/// Order is the ATTRIBUTION order, not the evaluation order of the original
+/// code: a candidate is charged to the FIRST variant it fails, so the counters
+/// partition the rejects exactly (they sum to `base_quality`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseQualityReject {
+    /// `max_drawdown_pct >= 1.0` — the account reached zero. Checked first
+    /// because past total loss the other numbers describe a state that cannot
+    /// exist.
+    AccountWiped,
+    /// `target_profile.min_net_expectancy_per_trade` — the average trade loses
+    /// money after costs. THE primary criterion, and the only unconditional one.
+    ProfileNetExpectancy,
+    /// `target_profile.min_expectancy_t_stat` — the expectancy is positive but
+    /// inside its own sampling noise.
+    ProfileExpectancySignificance,
+    /// `target_profile.min_win_rate`.
+    ProfileWinRate,
+    /// `target_profile.min_payoff_ratio` — the gate that decided the 0-of-174
+    /// run all by itself.
+    ProfilePayoffRatio,
+    /// `target_profile.max_in_market`.
+    ProfileInMarket,
+    /// Would have cleared the OPPORTUNISTIC bar's metric floors, but the lane
+    /// is switched off (`opportunistic_enabled` / `use_opportunistic_candidates`).
+    /// Killed by a config switch, not by a measurement — which is a completely
+    /// different thing to know.
+    OpportunisticLaneClosed,
+    /// `filtering.min_positive_months` (and the opportunistic lane did not
+    /// rescue it).
+    PositiveMonths,
+    /// `filtering.min_trades_per_month` (ditto).
+    TradesPerMonth,
+    /// `filtering.min_monthly_return_pct` (ditto).
+    MonthlyReturn,
+}
+
+impl BaseQualityReject {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AccountWiped => "base_quality.account_wiped",
+            Self::ProfileNetExpectancy => "base_quality.profile_net_expectancy",
+            Self::ProfileExpectancySignificance => {
+                "base_quality.profile_expectancy_significance"
+            }
+            Self::ProfileWinRate => "base_quality.profile_win_rate",
+            Self::ProfilePayoffRatio => "base_quality.profile_payoff_ratio",
+            Self::ProfileInMarket => "base_quality.profile_in_market",
+            Self::OpportunisticLaneClosed => "base_quality.opportunistic_lane_closed",
+            Self::PositiveMonths => "base_quality.positive_months",
+            Self::TradesPerMonth => "base_quality.trades_per_month",
+            Self::MonthlyReturn => "base_quality.monthly_return",
+        }
+    }
+}
+
+/// Attribute a base-quality rejection to exactly one criterion.
+///
+/// `None` = the candidate PASSED the base-quality stage; the bool is
+/// `opportunistic_quality` (it passed on the opportunistic lane rather than the
+/// strict one), preserving the caller's existing lane bookkeeping.
+///
+/// Pure, so the attribution is testable without a run. It reproduces the
+/// original control flow exactly — `profile_ok && (strict || opportunistic)` —
+/// and only adds a reason to the `false` branch.
+fn classify_base_quality(
+    metrics: &StrategyMetrics,
+    profile: &TargetProfile,
+    cfg: &crate::genetic::FilteringConfig,
+) -> Result<bool, BaseQualityReject> {
+    // Total loss first: it is a boundary of meaning, not a threshold.
+    if !survived_the_backtest(metrics) {
+        return Err(BaseQualityReject::AccountWiped);
+    }
+    // DELEGATED, never re-implemented. A previous revision of this function
+    // spelled the profile's criteria out inline; when the net-expectancy gate
+    // was added to `TargetProfile::evaluate` the copy here did not learn about
+    // it, so the quality screen would have kept admitting money-losers with a
+    // high payoff ratio — the exact reward hack the expectancy gate exists to
+    // close. One implementation, one place, mapped here to a counter.
+    if let Err(rejection) = profile.evaluate(metrics) {
+        return Err(match rejection {
+            TargetProfileRejection::NegativeNetExpectancy => {
+                BaseQualityReject::ProfileNetExpectancy
+            }
+            TargetProfileRejection::ExpectancyNotSignificant => {
+                BaseQualityReject::ProfileExpectancySignificance
+            }
+            TargetProfileRejection::TooFewWinners => BaseQualityReject::ProfileWinRate,
+            TargetProfileRejection::PayoffTooLow => BaseQualityReject::ProfilePayoffRatio,
+            TargetProfileRejection::TooMuchTimeInMarket => BaseQualityReject::ProfileInMarket,
+        });
+    }
+
+    if passes_strict_quality(metrics, cfg) {
+        return Ok(false);
+    }
+    if passes_opportunistic_quality(metrics, cfg) {
+        return Ok(true);
+    }
+
+    // Strict said no and the opportunistic lane did not rescue it. Ask whether
+    // the lane REFUSED it or was simply closed: "N candidates were killed by a
+    // switch" and "N candidates missed a metric" call for opposite decisions.
+    let lane_closed = !cfg.opportunistic_enabled || !cfg.use_opportunistic_candidates;
+    if lane_closed {
+        let mut open = *cfg;
+        open.opportunistic_enabled = true;
+        open.use_opportunistic_candidates = true;
+        if passes_opportunistic_quality(metrics, &open) {
+            return Err(BaseQualityReject::OpportunisticLaneClosed);
+        }
+    }
+
+    if cfg.min_positive_months > 0 && metrics.positive_months < cfg.min_positive_months {
+        return Err(BaseQualityReject::PositiveMonths);
+    }
+    if cfg.min_trades_per_month > 0.0 && metrics.trades_per_month < cfg.min_trades_per_month {
+        return Err(BaseQualityReject::TradesPerMonth);
+    }
+    // The strict-only criterion, tested EXPLICITLY rather than assumed.
+    //
+    // The forward mapping is compiler-guarded (the counter match over
+    // `BaseQualityReject` is exhaustive); the inverse mapping was not. An
+    // unguarded `Err(MonthlyReturn)` here books whatever reaches this line as a
+    // monthly-return failure, so adding a fourth criterion to
+    // `passes_strict_quality` would silently misattribute those rejections — and
+    // the run-end sum self-check would still balance, because the total and the
+    // buckets both increment. In a slice whose whole purpose is attribution
+    // integrity, that was the one place attribution could go wrong quietly.
+    if cfg.min_monthly_return_pct > 0.0
+        && metrics.avg_monthly_return_pct < cfg.min_monthly_return_pct
+    {
+        return Err(BaseQualityReject::MonthlyReturn);
+    }
+    tracing::error!(
+        target: "neoethos_search::funnel",
+        avg_monthly_return_pct = metrics.avg_monthly_return_pct,
+        positive_months = metrics.positive_months,
+        trades_per_month = metrics.trades_per_month,
+        "base-quality attribution FELL THROUGH: strict said no, the opportunistic lane did \
+         not rescue it, and none of the three named criteria fired. `passes_strict_quality` \
+         has grown a criterion this function does not know about. Counting it as \
+         base_quality.monthly_return so the totals still balance, but the attribution for \
+         these candidates is WRONG and must not be read."
+    );
+    Err(BaseQualityReject::MonthlyReturn)
+}
+
 /// Which gate inside the quality screen rejected how many candidates.
 ///
 /// The screen is four independent tests chained with `&&`, and it is routinely
@@ -3181,15 +4042,35 @@ pub fn approx_bars_per_year(tf: &str) -> usize {
 /// not actionable: widening the Monte-Carlo floor and widening the regime check
 /// are different decisions with different risks, and only the split says which
 /// one is even relevant.
+///
+/// 2026-08-09: `base_quality` is now itself split ten ways (see
+/// [`BaseQualityReject`]) and the Monte-Carlo/sensitivity EVALUATION errors are
+/// no longer conflated — they used to share one counter, so an infrastructure
+/// failure in the sensitivity launch was reported as a Monte-Carlo error.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct QualityScreenRejects {
-    /// Failed both the strict and the opportunistic metric bars.
+    /// Failed both the strict and the opportunistic metric bars. Equal to the
+    /// sum of the ten fields below it, by construction.
     base_quality: usize,
+    bq_account_wiped: usize,
+    bq_profile_net_expectancy: usize,
+    bq_profile_expectancy_significance: usize,
+    bq_profile_win_rate: usize,
+    bq_profile_payoff_ratio: usize,
+    bq_profile_in_market: usize,
+    bq_opportunistic_lane_closed: usize,
+    bq_positive_months: usize,
+    bq_trades_per_month: usize,
+    bq_monthly_return: usize,
     /// Lost more than `max_regime_loss_pct` in some market regime.
     regime: usize,
     /// The batched Monte-Carlo evaluation itself failed (a real bug, not a
     /// verdict on the candidate).
     mc_error: usize,
+    /// The SENSITIVITY launch failed. Was folded into `mc_error` until
+    /// 2026-08-09, which made a broken sensitivity launch look like a
+    /// Monte-Carlo problem.
+    sensitivity_error: usize,
     /// Fewer than `mc_min_profitable` of `mc_runs` perturbations stayed
     /// profitable.
     mc_floor: usize,
@@ -3199,9 +4080,171 @@ struct QualityScreenRejects {
     sensitivity: usize,
 }
 
+/// Run-level tally of [`CostBandVerdict`] across every screened candidate.
+///
+/// Read `optimistic_edge_only` before reading the survivor count. Those
+/// candidates cleared every configured gate and are still not results: they are
+/// profitable only at the cheap end of a cost the operator cannot pin down to a
+/// tenth of a pip.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CostBandCensus {
+    pub survives: usize,
+    pub optimistic_edge_only: usize,
+    pub fails: usize,
+    pub unmeasured: usize,
+    pub not_discriminating: usize,
+}
+
+impl CostBandCensus {
+    pub fn total(&self) -> usize {
+        self.survives
+            + self.optimistic_edge_only
+            + self.fails
+            + self.unmeasured
+            + self.not_discriminating
+    }
+}
+
+/// Can the configured band tell anything apart from the baseline it is measured
+/// against?
+///
+/// The band edges are charged as a TOTAL round-trip cost, replacing spread and
+/// commission both. Cost is monotone: a candidate that cleared the baseline at
+/// cost `c` clears any cheaper cost by construction. So if the PESSIMISTIC edge
+/// is at or below the run's own charged cost, every survivor is guaranteed
+/// `SurvivesBand` and the census reads clean on every run — which is worse than
+/// no census, because a reader takes it as evidence.
+///
+/// MEASURED at the shipped configuration (2026-08-09 review): baseline is
+/// `backtest_spread 1.5 + slippage 0.5 + commission 14 USD/lot ÷ 10 USD/pip`
+/// = 3.4 pips, against band edges 1.6 / 2.4. Both edges are CHEAPER than the run
+/// the candidate already survived.
+pub fn cost_band_discriminates(band: Option<(f64, f64)>, baseline_cost_pips: f64) -> bool {
+    match band {
+        Some((_, pessimistic)) => {
+            pessimistic.is_finite() && baseline_cost_pips.is_finite() && pessimistic > baseline_cost_pips
+        }
+        None => false,
+    }
+}
+
+/// What a candidate did across the round-trip cost band.
+///
+/// The band exists because a backtest result is a function of the cost you
+/// charged it, and nobody knows their all-in cost to a tenth of a pip. A single
+/// cost point cannot be checked by a reader; two edges can.
+///
+/// `OptimisticEdgeOnly` is the finding this type exists to make unmissable:
+/// profitable at the cheap end of the band and not at the expensive end. It is
+/// NOT a result, and it must not be reported as one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CostBandVerdict {
+    /// No band configured, or both launches failed. The candidate carries NO
+    /// cost-robustness evidence — which is different from carrying good news.
+    #[default]
+    Unmeasured,
+    /// The band cannot discriminate: its pessimistic edge is at or below the
+    /// cost the run already charged, so passing it is arithmetic, not evidence.
+    /// Counted separately and never as good news. See
+    /// [`cost_band_discriminates`].
+    NotDiscriminating,
+    /// Profitable at BOTH edges. The only verdict that supports a claim.
+    SurvivesBand,
+    /// Profitable at the optimistic edge, not at the pessimistic one.
+    OptimisticEdgeOnly,
+    /// Unprofitable at both edges.
+    FailsBand,
+}
+
+impl CostBandVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unmeasured => "cost_band_unmeasured",
+            Self::NotDiscriminating => "cost_band_not_discriminating",
+            Self::SurvivesBand => "cost_band_survives",
+            Self::OptimisticEdgeOnly => "cost_band_optimistic_edge_only",
+            Self::FailsBand => "cost_band_fails",
+        }
+    }
+
+    /// Classify one candidate from the two edge net-profits. `None` on either
+    /// edge means that edge was not measured, and an unmeasured edge cannot be
+    /// counted as passed.
+    pub fn from_edges(optimistic: Option<f64>, pessimistic: Option<f64>) -> Self {
+        match (optimistic, pessimistic) {
+            (Some(lo), Some(hi)) => {
+                let lo_ok = lo.is_finite() && lo > 0.0;
+                let hi_ok = hi.is_finite() && hi > 0.0;
+                match (lo_ok, hi_ok) {
+                    (true, true) => Self::SurvivesBand,
+                    (true, false) => Self::OptimisticEdgeOnly,
+                    // Unprofitable cheap but profitable expensive is not a
+                    // coherent outcome for a monotone cost; it means the two
+                    // launches disagree about something other than cost. Treat
+                    // it as a failure rather than inventing a pass.
+                    (false, _) => Self::FailsBand,
+                }
+            }
+            _ => Self::Unmeasured,
+        }
+    }
+}
+
 impl QualityScreenRejects {
     fn total(&self) -> usize {
-        self.base_quality + self.regime + self.mc_error + self.mc_floor + self.sensitivity
+        self.base_quality
+            + self.regime
+            + self.mc_error
+            + self.sensitivity_error
+            + self.mc_floor
+            + self.sensitivity
+    }
+
+    /// The ten base-quality criteria, named. Used for both the run-end log
+    /// and the persisted funnel, so the two can never disagree.
+    fn base_quality_breakdown(&self) -> [(&'static str, usize); 10] {
+        [
+            (
+                BaseQualityReject::AccountWiped.label(),
+                self.bq_account_wiped,
+            ),
+            (
+                BaseQualityReject::ProfileNetExpectancy.label(),
+                self.bq_profile_net_expectancy,
+            ),
+            (
+                BaseQualityReject::ProfileExpectancySignificance.label(),
+                self.bq_profile_expectancy_significance,
+            ),
+            (
+                BaseQualityReject::ProfileWinRate.label(),
+                self.bq_profile_win_rate,
+            ),
+            (
+                BaseQualityReject::ProfilePayoffRatio.label(),
+                self.bq_profile_payoff_ratio,
+            ),
+            (
+                BaseQualityReject::ProfileInMarket.label(),
+                self.bq_profile_in_market,
+            ),
+            (
+                BaseQualityReject::OpportunisticLaneClosed.label(),
+                self.bq_opportunistic_lane_closed,
+            ),
+            (
+                BaseQualityReject::PositiveMonths.label(),
+                self.bq_positive_months,
+            ),
+            (
+                BaseQualityReject::TradesPerMonth.label(),
+                self.bq_trades_per_month,
+            ),
+            (
+                BaseQualityReject::MonthlyReturn.label(),
+                self.bq_monthly_return,
+            ),
+        ]
     }
 }
 
@@ -3517,6 +4560,156 @@ where
         crate::genetic::clear_adaptive_threshold_ladder();
     }
 
+    // ── Gene stop/target band scale (2026-08-09) ──────────────────────────
+    //
+    // The GA drew every stop from `[6, 20]` pips and every target from
+    // `[12, 45]` pips — M5 numbers, hardcoded in `evolution_math.rs`. On H1
+    // (ATR ≈ 12 pips) the whole stop band sits inside one bar's range; on H4
+    // (ATR ≈ 30 pips) it sits below it. Every "search a higher timeframe"
+    // suggestion was therefore void: the higher timeframes could not be
+    // expressed by any gene the search was able to write.
+    //
+    // Install THIS dataset's median ATR as the band's unit, or clear back to the
+    // absolute band, exactly like the threshold ladder above and for the same
+    // audit-D06 reason — the batch orchestrator runs many (symbol, timeframe)
+    // combos in one process and a leaked M5 scale is worse than no scale.
+    //
+    // Stated plainly so nobody sells this as an edge: widening the band has ZERO
+    // prior expected value in money. Measured across the exit-geometry sweep,
+    // expectancy stayed at -4.15 pips per trade while payoff moved 0.91 → 2.53.
+    // This changes which shapes are REACHABLE. The expectancy gate decides which
+    // of them survive.
+    {
+        let bounds_cfg = crate::genetic::current_gene_stop_bounds_overrides();
+        let evaluation = config.evaluation_config(ohlcv.close.last().copied());
+        let pip = crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
+        let atr = if bounds_cfg.atr_scaled {
+            crate::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, pip, 14)
+        } else {
+            None
+        };
+        match atr {
+            Some(atr_pips) => {
+                crate::genetic::install_gene_stop_atr_scale(atr_pips);
+                let resolved = crate::genetic::current_gene_stop_bounds();
+                tracing::info!(
+                    target: "neoethos_search::discovery",
+                    timeframe = %config.timeframe_label,
+                    atr_pips = atr_pips,
+                    sl_min_pips = resolved.sl_min_pips,
+                    sl_max_pips = resolved.sl_max_pips,
+                    tp_min_pips = resolved.tp_min_pips,
+                    tp_max_pips = resolved.tp_max_pips,
+                    rr_min = resolved.rr_min,
+                    rr_max = resolved.rr_max,
+                    "gene stop/target band scaled to this dataset's median ATR"
+                );
+            }
+            None => {
+                crate::genetic::clear_gene_stop_atr_scale();
+                let resolved = crate::genetic::current_gene_stop_bounds();
+                tracing::warn!(
+                    target: "neoethos_search::discovery",
+                    timeframe = %config.timeframe_label,
+                    atr_scaled_requested = bounds_cfg.atr_scaled,
+                    sl_min_pips = resolved.sl_min_pips,
+                    sl_max_pips = resolved.sl_max_pips,
+                    tp_min_pips = resolved.tp_min_pips,
+                    tp_max_pips = resolved.tp_max_pips,
+                    "gene stop/target band is the ABSOLUTE pip band — no ATR scale for this \
+                     dataset (too few bars, or a constant series, or atr_scaled disabled). On \
+                     anything above M5 this band is far tighter than one bar's range"
+                );
+            }
+        }
+    }
+
+    // ── CONFIG-IDENTITY GATE (2026-08-09) ─────────────────────────────────
+    //
+    // Refuse to start a run whose configured payoff floor cannot be reached
+    // under this run's own resolved trailing settings, stop/target band and
+    // charged cost. It must come AFTER the ATR band above (which decides
+    // `sl_min`/`tp_max` for this dataset) and BEFORE anything is searched.
+    //
+    // WHAT THIS REFUSES, stated explicitly: exactly one class of run — the one
+    // whose outcome was arithmetically fixed before a bar was read. The
+    // 2026-08-09 review established that "174 candidates screened, 0 survived"
+    // was such a run: `target_profile.accepts()` gates EVERY survival path in
+    // the quality screen, both `min_win_rate` and `max_in_market` defaulted to
+    // 0.0, so the profile reduced to `payoff_ratio >= 2.0` — against a realised
+    // payoff the exit geometry pinned near 1.0. It permits nothing new.
+    //
+    // WHAT IT DOES NOT BUY: nothing, in money. It converts an unfalsifiable
+    // multi-hour "the market said no" into an immediate, arithmetic
+    // "the configuration said no".
+    {
+        let pip_value_per_lot = config
+            .evaluation_config(ohlcv.close.last().copied())
+            .pip_value_per_lot;
+        let inputs = crate::run_identity::payoff_inputs_for_config(config, pip_value_per_lot);
+        match crate::run_identity::assert_payoff_floor_reachable(
+            config.target_profile.min_payoff_ratio,
+            &inputs,
+        ) {
+            Ok(ceiling) => {
+                tracing::info!(
+                    target: "neoethos_search::run_identity",
+                    payoff_floor = config.target_profile.min_payoff_ratio,
+                    enforced_ceiling = ceiling.enforced_ceiling,
+                    arithmetic_ceiling = ceiling.arithmetic_ceiling,
+                    initializer_ceiling = ceiling.initializer_ceiling,
+                    binding = ceiling.binding.label(),
+                    sl_min_pips = inputs.sl_min_pips,
+                    tp_max_pips = inputs.tp_max_pips,
+                    cost_pips_round_trip = inputs.cost_pips_round_trip,
+                    trailing_enabled = inputs.trailing_enabled,
+                    required_win_rate = ceiling.required_win_rate_at_floor,
+                    breakeven_win_rate = ceiling.breakeven_win_rate_at_ceiling,
+                    zero_edge_base_rate = ceiling.zero_edge_base_rate,
+                    edge_points_required = ceiling.edge_points_required_to_break_even(),
+                    "config-identity gate passed — the configured payoff floor is reachable \
+                     under this run's own settings"
+                );
+                // Stamp the resolved config into the LOG as well as the ledger,
+                // so a run with the ledger disabled still names what it
+                // searched under. Same function, same hash — a log line and a
+                // ledger entry from one run are comparable by `config_hash`.
+                let normalize_features =
+                    neoethos_data::current_data_runtime_overrides().normalize_features;
+                match crate::run_identity::stamp_resolved_config(
+                    config,
+                    &inputs,
+                    ceiling,
+                    pip_value_per_lot,
+                    normalize_features,
+                ) {
+                    Ok(stamp) => {
+                        let stamp_json = serde_json::to_string(&stamp)
+                            .unwrap_or_else(|e| format!("<unserializable: {e}>"));
+                        tracing::info!(
+                            target: "neoethos_search::run_identity",
+                            config_hash = %stamp.config_hash,
+                            stamp = %stamp_json,
+                            "resolved-config stamp — the decision-critical values this run \
+                             resolved. Two runs with the same config_hash are the same \
+                             experiment."
+                        );
+                    }
+                    Err(err) => tracing::warn!(
+                        target: "neoethos_search::run_identity",
+                        error = %err,
+                        "could not stamp the resolved config — this run will not be \
+                         attributable to a configuration after the fact"
+                    ),
+                }
+            }
+            Err(err) => {
+                funnel.finalize("preflight_failed_payoff_floor_unreachable");
+                return Err(err);
+            }
+        }
+    }
+
     // F-096 pre-flight: refuse to run with insufficient history per
     // operator's real-data directive 2026-05-24. The minimum-years
     // threshold lives on `DiscoveryRuntimeOverrides` (operator-tunable
@@ -3539,6 +4732,95 @@ where
     let n_after_trim = ohlcv.close.len();
     funnel.record_stage("rows_after_trimming", n_input_rows, n_after_trim);
     funnel.record_stage("features_built", 0, features.n_features());
+
+    // ── INDICATOR-BUILD CENSUS (2026-08-09) ───────────────────────────────
+    //
+    // How many of the declared indicator ids actually produced columns in the
+    // cube this run is about to search. Logged ONCE, on the PRE-prefilter frame
+    // — after the prefilter the number would measure the prefilter, not the
+    // build.
+    //
+    // WHAT THIS HOOK CAN AND CANNOT SEE. `neoethos-data` builds an
+    // `IndicatorLedger` inside `core::hpc_ta` that records EVERY discarded
+    // column with a typed `DropReason` (kernel panic, unknown indicator, short
+    // series, degenerate, duplicate, over budget). That ledger is
+    // `log_summary`'d inside the builder and then DROPPED — it is not returned
+    // with the `FeatureFrame`, so from here we can only observe presence, not
+    // cause. THE HOOK STILL NEEDED: `prepare_multitimeframe_features*` should
+    // return the `IndicatorLedger` (or stash it on the `FeatureFrame`) so the
+    // discovery run can record per-reason drop counts in its own artifacts
+    // instead of leaving them in a log line nobody correlates with a result.
+    // That change belongs to whoever owns `neoethos-data`.
+    //
+    // What IS reachable and is used here:
+    //   * `ALL_INDICATORS` — the declared vocabulary;
+    //   * longest-id-wins attribution of each column to a declared id, so
+    //     `ema_21` is charged to `ema` and never double-charged to a longer id
+    //     that also prefixes it;
+    //   * `unknown_feature_names` — the registry gate that has existed with
+    //     ZERO callers repo-wide. It is now called.
+    {
+        use neoethos_data::core::all_indicators::ALL_INDICATORS;
+
+        let declared: Vec<&'static str> = ALL_INDICATORS.to_vec();
+        let mut producing: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        let mut unattributed = 0usize;
+        for name in &features.names {
+            // Strip the higher-timeframe prefix so `H4_rsi_21` is charged to
+            // `rsi` and counted once, not treated as its own vocabulary.
+            // The `len()` guard is not decorative: `timeframe_group("H4")`
+            // returns `Some("H4")` for a column with no suffix at all, and an
+            // unguarded `&name[tf.len() + 1..]` would panic mid-run on it.
+            let bare = match timeframe_group(name) {
+                Some(tf) if name.len() > tf.len() => &name[tf.len() + 1..],
+                _ => name.as_str(),
+            };
+            // Longest declared id that is `bare` or a `bare` prefix ending on a
+            // `_` boundary. Longest-wins so `rolling_z_score_trend_zscore` is
+            // not attributed to a shorter id that happens to prefix it.
+            let mut best: Option<&'static str> = None;
+            for id in declared.iter().copied() {
+                let matches = bare == id
+                    || (bare.len() > id.len()
+                        && bare.starts_with(id)
+                        && bare.as_bytes()[id.len()] == b'_');
+                if matches && best.map(|b| id.len() > b.len()).unwrap_or(true) {
+                    best = Some(id);
+                }
+            }
+            match best {
+                Some(id) => {
+                    producing.insert(id);
+                }
+                // SMC / session / regime / quant columns are not in
+                // ALL_INDICATORS and legitimately land here. Counted, never
+                // silently ignored, so a sudden jump is visible.
+                None => unattributed += 1,
+            }
+        }
+        let non_producing: Vec<&'static str> = declared
+            .iter()
+            .copied()
+            .filter(|id| !producing.contains(id))
+            .collect();
+        let unregistered =
+            neoethos_data::core::feature_registry::unknown_feature_names(&features.names);
+        tracing::info!(
+            target: "neoethos_search::indicator_census",
+            declared_ids = declared.len(),
+            producing_ids = producing.len(),
+            non_producing_ids = non_producing.len(),
+            columns_total = features.names.len(),
+            columns_not_attributable_to_a_declared_id = unattributed,
+            columns_unregistered = unregistered.len(),
+            non_producing_sample = ?non_producing.iter().take(24).collect::<Vec<_>>(),
+            unregistered_sample = ?unregistered.iter().take(12).collect::<Vec<_>>(),
+            "indicator-build census — declared ids vs ids that produced a column in this run's \
+             cube. Per-DROP-REASON attribution needs the hpc_ta IndicatorLedger to be returned \
+             to the caller; from here only presence is observable."
+        );
+    }
 
     // Feature Pre-filtering (Idea #3)
     // The "indicator pool" (prefilter_top_k) can never meaningfully exceed the
@@ -3566,13 +4848,197 @@ where
     let prefilter_min_per_tf = config.runtime_overrides.prefilter_min_per_timeframe;
     let n_features_before_prefilter = features.names.len();
     if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
-        features = prefilter_features(
-            &features,
-            &ohlcv,
-            prefilter_top_k,
-            prefilter_insample_frac,
-            prefilter_min_per_tf,
+        // The prefilter's inputs, assembled HERE so the function has no ambient
+        // state. Two of them are new and both are behaviour changes:
+        //
+        //  * the TARGET is now the triple-barrier / first-passage label the
+        //    objective actually scores, not the 1-bar forward return, and
+        //  * the ranking is refit INSIDE each CPCV fold's purged train set
+        //    instead of once on a leading prefix.
+        let evaluation = config.evaluation_config(ohlcv.close.last().copied());
+        let pip = if evaluation.pip_value.is_finite() && evaluation.pip_value > 0.0 {
+            evaluation.pip_value
+        } else {
+            // The cost-model guard upstream has already bailed on a non-finite
+            // spread, so this is only reachable for an exotic with no pip size.
+            // Charging zero cost into the label would make it claim trades pay
+            // for free, so refuse the cost term instead and say so.
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                pip_value = evaluation.pip_value,
+                "prefilter label: no usable pip size — the first-passage barriers carry NO \
+                 cost, so the label is optimistic about which trades would have paid"
+            );
+            0.0
+        };
+        // Round-trip cost in PRICE units: the full spread (slippage already
+        // folded in by `from_settings`) plus the round-trip commission
+        // converted from account currency into pips via the per-lot pip value.
+        let commission_pips = if evaluation.pip_value_per_lot.is_finite()
+            && evaluation.pip_value_per_lot > 0.0
+            && evaluation.commission_per_trade.is_finite()
+        {
+            evaluation.commission_per_trade / evaluation.pip_value_per_lot
+        } else {
+            0.0
+        };
+        let round_trip_cost_px = (evaluation.spread_pips.max(0.0) + commission_pips.max(0.0)) * pip;
+        // The gene stop band this run installed, converted from pips back into
+        // ATR multiples so the labeller (which sizes barriers off its own
+        // rolling ATR in price units) speaks the same language. Falls back to
+        // the pre-2026-08-09 literals, loudly, when no ATR scale is in force —
+        // the absolute pip band cannot be turned into an ATR multiple.
+        let (label_sl_atr_mult, label_rr) = {
+            let bounds = crate::genetic::current_gene_stop_bounds();
+            let mid_rr = 0.5 * (bounds.rr_min + bounds.rr_max);
+            match bounds.atr_pips {
+                Some(atr_pips) if atr_pips.is_finite() && atr_pips > 0.0 => {
+                    let mid_sl_pips = 0.5 * (bounds.sl_min_pips + bounds.sl_max_pips);
+                    let mult = mid_sl_pips / atr_pips;
+                    if mult.is_finite() && mult > 0.0 && mid_rr.is_finite() && mid_rr > 0.0 {
+                        (mult, mid_rr)
+                    } else {
+                        (1.0, 2.0)
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "neoethos_search::prefilter",
+                        sl_min_pips = bounds.sl_min_pips,
+                        sl_max_pips = bounds.sl_max_pips,
+                        rr_min = bounds.rr_min,
+                        rr_max = bounds.rr_max,
+                        "no ATR scale installed for this dataset, so the prefilter label falls \
+                         back to the literal (1.0 ATR, rr 2.0) geometry. That is the bottom \
+                         corner of the searchable band and the ranking it produces is not \
+                         representative of what the GA will explore."
+                    );
+                    (1.0, 2.0)
+                }
+            }
+        };
+        let spec = PrefilterSpec {
+            top_k: prefilter_top_k,
+            insample_frac: prefilter_insample_frac,
+            min_per_tf: prefilter_min_per_tf,
+            max_hold_bars: if evaluation.max_hold_bars > 0 {
+                evaluation.max_hold_bars
+            } else {
+                // A gene with no vertical barrier still cannot be graded over
+                // an unbounded horizon by a labeller, so the label uses the
+                // configured triple-barrier horizon. Stated, not silent.
+                35
+            },
+            atr_period: 14,
+            // THE LABEL'S GEOMETRY, read from the band the GA will actually
+            // search rather than pinned to a literal. Corrected 2026-08-09: the
+            // hardcoded (1.0 ATR, rr 2.0) was the very bottom corner of a band
+            // that change #3 made searchable (sl 1–4 ATR, rr 1.5–4.0), so a
+            // feature that predicts first passage for a 3-ATR stop at rr 3.5 was
+            // ranked as if it did not.
+            //
+            // The MIDPOINT of the band, not a sweep across it: scoring at k
+            // points multiplies the fold×column correlation work by k, and with
+            // two direction labels and up to 8 refit folds that is already the
+            // expensive part of the gate. The midpoint is a strictly better
+            // single representative than a corner; a full band sweep, keeping
+            // the worst point the way the fold rule keeps the worst fold, is the
+            // follow-up and it costs k× the correlation pass.
+            sl_atr_mult: label_sl_atr_mult,
+            rr: label_rr,
+            round_trip_cost_px,
+            cpcv: config.enable_cpcv.then_some((
+                config.cpcv_n_splits,
+                config.cpcv_n_test_groups,
+                config.cpcv_embargo_pct,
+                config.cpcv_purge_pct,
+                config.cpcv_max_rows,
+            )),
+        };
+        let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec);
+        features = filtered_frame;
+
+        let total_labels =
+            census.label_up + census.label_down + census.label_vertical + census.label_ambiguous;
+        tracing::info!(
+            target: "neoethos_search::prefilter",
+            columns_considered = census.columns_considered,
+            columns_kept = census.columns_kept,
+            regime_forced = census.regime_forced,
+            columns_with_nonfinite_rows = census.columns_with_nonfinite_rows,
+            columns_unrankable = census.columns_unrankable,
+            refit_folds_used = census.refit_folds_used,
+            refit_folds_available = census.refit_folds_available,
+            mean_fold_instability = census.mean_fold_instability,
+            label_sl_atr_mult = spec.sl_atr_mult,
+            label_rr = spec.rr,
+            label_up = census.label_up,
+            label_down = census.label_down,
+            label_vertical = census.label_vertical,
+            label_ambiguous = census.label_ambiguous,
+            label_short_win = census.label_short_win,
+            label_short_loss = census.label_short_loss,
+            label_vertical_short = census.label_vertical_short,
+            label_ambiguous_short = census.label_ambiguous_short,
+            label_undefined = census.label_undefined,
+            label_fell_back_to_forward_return = census.label_fell_back_to_forward_return,
+            label_decided_pct = if total_labels > 0 {
+                100.0 * (census.label_up + census.label_down) as f64 / total_labels as f64
+            } else {
+                0.0
+            },
+            round_trip_cost_px = spec.round_trip_cost_px,
+            "prefilter — target is the triple-barrier label in BOTH directions, geometry read \
+             from this run's gene stop band, ranking refit inside every fold, correlation \
+             two-pass f64. Ranking MOVED relative to any earlier run."
         );
+        if census.columns_unrankable > 0 {
+            tracing::warn!(
+                target: "neoethos_search::prefilter",
+                count = census.columns_unrankable,
+                sample = ?census.unrankable_sample,
+                "columns EXCLUDED as unrankable — fewer than the minimum pairwise-complete \
+                 rows, or no variance, in at least one fold. They are named and dropped, not \
+                 scored 0.0 and left to win a tie-break, which is what the old f32 code did."
+            );
+        }
+        if census.columns_with_nonfinite_rows > 0 {
+            tracing::warn!(
+                target: "neoethos_search::prefilter",
+                count = census.columns_with_nonfinite_rows,
+                "columns carried non-finite rows; the correlation used the pairwise-complete \
+                 rows only. Before 2026-08-09 a single NaN scored the whole column exactly 0.0, \
+                 which is how every H1/H4/D1 column lost its rank to a stable-sort tie-break."
+            );
+        }
+        if neoethos_data::current_data_runtime_overrides().normalize_features
+            && census.columns_with_nonfinite_rows == 0
+        {
+            tracing::info!(
+                target: "neoethos_search::prefilter",
+                "normalize_features is ON, so non-finite cells were already turned into 0.0 \
+                 upstream and this pass legitimately sees none. The higher-timeframe alignment \
+                 gap is therefore NOT visible here — it shows up as a constant leading block \
+                 instead. Read the indicator ledger for that evidence, not this counter."
+            );
+        }
+        // Named reject buckets so the persisted funnel answers "which columns
+        // left, and why" without needing the run's logs. Zero-count reasons are
+        // not recorded — an absent bucket means the cause did not fire.
+        for (reason, count) in [
+            ("prefilter_unrankable_correlation", census.columns_unrankable),
+            (
+                "prefilter_below_worst_fold_top_k",
+                census
+                    .columns_considered
+                    .saturating_sub(census.columns_kept)
+                    .saturating_sub(census.columns_unrankable),
+            ),
+        ] {
+            if count > 0 {
+                funnel.add_reject_reason("features_after_prefilter", reason, count);
+            }
+        }
     }
     funnel.record_stage(
         "features_after_prefilter",
@@ -3832,31 +5298,695 @@ where
     Ok(result)
 }
 
-fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
-    let n = x.len() as f32;
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut sum_xy = 0.0;
-    let mut sum_x2 = 0.0;
-    let mut sum_y2 = 0.0;
+// ─────────────────────────────────────────────────────────────────────────────
+// The prefilter statistic (rewritten 2026-08-09)
+//
+// The function that used to live here was the textbook single-pass covariance,
+// in f32, with `n` as f32:
+//
+//     num = n*Sxy - Sx*Sy
+//     den = sqrt( (n*Sx2 - Sx*Sx) * (n*Sy2 - Sy*Sy) )
+//
+// `n*Sx2 - Sx*Sx` subtracts two nearly equal large numbers, and it cancels
+// catastrophically exactly when the mean is large relative to the spread — which
+// is EVERY level and distance feature in this cube: `ema_*`, `sma_*`, `vwap_*`,
+// `session_*_dist`, `smc_fib_*`, `quant_pivot_dist`. Measured at the real row
+// count on a price-scale column: |r| = 0.000070 in f32 versus 0.000289 in f64, a
+// factor of 0.24 — and the RANK moved, which is the only thing this number is
+// used for.
+//
+// It is replaced by `neoethos_data::core::stats_f64::pearson_pairwise_f32`:
+// two-pass, mean-centred, accumulated in f64, and pairwise-complete so a single
+// NaN no longer scores an entire column exactly 0.0 (the old `!den.is_finite()`
+// guard did that, which is indistinguishable from "genuinely uncorrelated" — and
+// every higher-timeframe column carries a NaN prefix by construction).
+//
+// THIS CHANGES FEATURE RANKING, AND THEREFORE WHAT THE SEARCH EXPLORES. That is
+// the point, not a side effect. No artifact produced before this is comparable
+// to one produced after.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    for i in 0..x.len() {
-        let a = x[i];
-        let b = y[i];
-        sum_x += a;
-        sum_y += b;
-        sum_xy += a * b;
-        sum_x2 += a * a;
-        sum_y2 += b * b;
+/// How many CPCV folds the prefilter refits inside.
+///
+/// The gate's own fold count is `C(n_splits, n_test_groups)` — 28 at the shipped
+/// 8/2 — and the refit is `folds × columns × train_rows` of two-pass f64 work.
+/// Eight evenly-spaced folds is enough to see whether a feature's correlation is
+/// stable across the series; the run LOGS how many of how many it used, so the
+/// subsample is a stated fact rather than a hidden one.
+const PREFILTER_MAX_REFIT_FOLDS: usize = 8;
+
+/// Everything `prefilter_features` needs, gathered at the one call site so the
+/// function has no ambient inputs.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefilterSpec {
+    pub top_k: usize,
+    /// Fallback in-sample prefix fraction, used only when no CPCV fold
+    /// structure is available (CPCV disabled, or too few rows to split).
+    pub insample_frac: f64,
+    pub min_per_tf: usize,
+    /// Vertical barrier, in bars.
+    pub max_hold_bars: usize,
+    /// ATR lookback used to size the horizontal barriers.
+    pub atr_period: usize,
+    /// Stop distance = `sl_atr_mult × ATR`.
+    pub sl_atr_mult: f64,
+    /// Take distance = `rr × stop distance`.
+    pub rr: f64,
+    /// Round-trip cost in PRICE units, charged into both barriers so the label
+    /// says "would this trade have paid" rather than "did price move".
+    pub round_trip_cost_px: f64,
+    /// CPCV fold geometry to refit inside: `(n_splits, n_test_groups,
+    /// embargo_pct, purge_pct, max_rows)`. `None` = fit once on the prefix,
+    /// which is the contaminating behaviour this replaces.
+    pub cpcv: Option<(usize, usize, f64, f64, usize)>,
+}
+
+/// Counted outcomes of one prefilter pass. Nothing on this path is discarded
+/// without a name and a number.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PrefilterCensus {
+    pub columns_considered: usize,
+    pub columns_kept: usize,
+    /// Columns force-kept because they are `regime_*`.
+    pub regime_forced: usize,
+    /// Columns whose ranking slice contained non-finite rows. Those rows were
+    /// EXCLUDED pairwise rather than zero-filled, and this is how many columns
+    /// were affected. Before 2026-08-09 each of these scored exactly 0.0.
+    pub columns_with_nonfinite_rows: usize,
+    /// Columns excluded because no fold produced a rankable correlation (too
+    /// few pairwise-complete rows, or zero variance). NOT scored 0.0 and left
+    /// to compete — named and dropped.
+    pub columns_unrankable: usize,
+    /// A few unrankable column names, for the log line.
+    pub unrankable_sample: Vec<String>,
+    /// Folds the refit actually used, and how many the gate will use.
+    pub refit_folds_used: usize,
+    pub refit_folds_available: usize,
+    /// Mean across kept columns of `max_fold|r| - min_fold|r|`. A large value
+    /// means the ranking a single up-front fit produced was an artifact of
+    /// which rows it happened to see.
+    pub mean_fold_instability: f64,
+    /// Triple-barrier label census, LONG direction.
+    pub label_up: usize,
+    pub label_down: usize,
+    pub label_vertical: usize,
+    pub label_ambiguous: usize,
+    /// Same, SHORT direction. Kept separate rather than summed: the two labels
+    /// are different questions and a reader must be able to see that one of them
+    /// decided far more often than the other, which is exactly what a 2:1
+    /// asymmetric barrier pair produces.
+    pub label_short_win: usize,
+    pub label_short_loss: usize,
+    pub label_vertical_short: usize,
+    pub label_ambiguous_short: usize,
+    /// Bars with no usable entry price or ATR. Counted once (both directions
+    /// share the guard), so `label_undefined` plus each direction's four buckets
+    /// covers every bar exactly once.
+    pub label_undefined: usize,
+    /// The first-passage label was degenerate (almost nothing reached either
+    /// barrier inside the horizon), so the ranking fell back to the 1-bar
+    /// forward return. A ranking produced this way is the OLD target and must
+    /// not be read as evidence about the objective's label.
+    pub label_fell_back_to_forward_return: bool,
+}
+
+/// Below this many DECIDED first-passage labels (upper or lower touched), the
+/// label carries no information and every column would come back unrankable —
+/// which would empty the feature pool. That is a fixture or a mis-specified
+/// barrier, not a market fact, so the prefilter says so and falls back rather
+/// than silently deleting the cube.
+const MIN_DECIDED_FIRST_PASSAGE_LABELS: usize = 100;
+
+/// The two first-passage label series, one per trade direction.
+///
+/// The GA emits both `+1` and `-1` signals, so a single long-only label ranks
+/// features by what predicts a decline and calls it a target. Each column is
+/// scored against BOTH and keeps whichever direction it predicts better.
+struct FirstPassageLabels {
+    long: Vec<f32>,
+    short: Vec<f32>,
+}
+
+/// Rolling mean true range in f64, for sizing the label's horizontal barriers.
+///
+/// f64 throughout: the OHLC arrays are f64 and a barrier distance derived in f32
+/// on a 1.08-level instrument loses the digits that distinguish a 6-pip stop
+/// from a 7-pip one.
+fn rolling_atr_f64(ohlcv: &Ohlcv, period: usize) -> Vec<f64> {
+    let n = ohlcv.close.len();
+    let period = period.max(1);
+    let mut tr = vec![0.0f64; n];
+    for i in 0..n {
+        let hi = ohlcv.high[i];
+        let lo = ohlcv.low[i];
+        let prev_close = if i > 0 { ohlcv.close[i - 1] } else { ohlcv.close[i] };
+        if !hi.is_finite() || !lo.is_finite() || !prev_close.is_finite() {
+            tr[i] = f64::NAN;
+            continue;
+        }
+        tr[i] = (hi - lo)
+            .max((hi - prev_close).abs())
+            .max((lo - prev_close).abs());
     }
+    // Simple trailing mean over the finite entries in the window. A window with
+    // no finite true range yields NaN, which the labeller treats as "no label"
+    // and COUNTS — it does not silently become a zero-width barrier.
+    let mut out = vec![f64::NAN; n];
+    for i in 0..n {
+        let start = (i + 1).saturating_sub(period);
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for value in tr.iter().take(i + 1).skip(start) {
+            if value.is_finite() {
+                sum += *value;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            out[i] = sum / count as f64;
+        }
+    }
+    out
+}
 
-    let num = n * sum_xy - sum_x * sum_y;
-    let den = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
-    if den == 0.0 || !den.is_finite() {
-        0.0
+/// Triple-barrier / first-passage label — the thing the objective actually
+/// scores.
+///
+/// The prefilter used to rank features by their correlation with the **1-bar
+/// forward return**, which is not what any gene is graded on. A gene opens a
+/// position with a stop, a target and a maximum hold, and is graded on whether
+/// the target was reached before the stop. Those two quantities can rank
+/// features in opposite orders: a slow trend feature has near-zero 1-bar
+/// correlation by construction (it barely moves between adjacent base bars) and
+/// can still be the best predictor of which barrier gets hit first over 35 bars.
+/// That mismatch is why the per-timeframe force-keep quota had to be invented in
+/// the first place — it was papering over a target that asked the wrong
+/// question.
+///
+/// Returned label at bar `i`:
+/// * `+1` upper barrier touched first,
+/// * `-1` lower barrier touched first,
+/// * `0` neither touched inside the horizon (vertical barrier), OR both touched
+///   inside the SAME bar.
+///
+/// The both-in-one-bar case is genuinely undecidable at bar resolution and is
+/// labelled 0 and COUNTED as `ambiguous`. It is not resolved by guessing from
+/// the close — that would invent intrabar information and the label would then
+/// encode the guess rather than the market.
+///
+/// The round-trip cost is charged into BOTH barriers, so the label answers
+/// "would this trade have paid" and not "did price move".
+fn first_passage_labels(ohlcv: &Ohlcv, spec: &PrefilterSpec) -> (FirstPassageLabels, PrefilterCensus) {
+    let n = ohlcv.close.len();
+    let mut long_labels = vec![f32::NAN; n];
+    let mut short_labels = vec![f32::NAN; n];
+    let mut census = PrefilterCensus::default();
+    if n < 2 {
+        census.label_undefined = n;
+        return (
+            FirstPassageLabels {
+                long: long_labels,
+                short: short_labels,
+            },
+            census,
+        );
+    }
+    let atr = rolling_atr_f64(ohlcv, spec.atr_period);
+    let hold = spec.max_hold_bars.max(1);
+    let sl_mult = if spec.sl_atr_mult.is_finite() && spec.sl_atr_mult > 0.0 {
+        spec.sl_atr_mult
     } else {
-        num / den
+        1.0
+    };
+    let rr = if spec.rr.is_finite() && spec.rr > 0.0 {
+        spec.rr
+    } else {
+        2.0
+    };
+    let cost = if spec.round_trip_cost_px.is_finite() && spec.round_trip_cost_px >= 0.0 {
+        spec.round_trip_cost_px
+    } else {
+        0.0
+    };
+
+    for i in 0..n {
+        let entry = ohlcv.close[i];
+        let a = atr[i];
+        if !entry.is_finite() || !a.is_finite() || a <= 0.0 || i + 1 >= n {
+            census.label_undefined += 1;
+            continue;
+        }
+        let stop_distance = sl_mult * a;
+        let take_distance = rr * stop_distance;
+        // NOT symmetric, and the comment that used to sit here said it was.
+        // Corrected 2026-08-09 on two counts.
+        //
+        // 1. TWO LABELS, one per direction. The old single label put the take
+        //    profit `rr × stop` above and the stop `stop` below, which is a LONG
+        //    trade's geometry. At the configured rr = 2 the loss barrier is half
+        //    as far as the win barrier, so on a driftless walk P(-1) is roughly
+        //    twice P(+1) and a `-1` means only "price fell one stop" — the SHORT
+        //    trade's take profit was never modelled at all, while the GA emits
+        //    both +1 and -1 signals. Columns were being ranked by what predicts
+        //    a one-ATR decline. Now the short trade gets its own mirrored barrier
+        //    pair and each column is scored on whichever direction it predicts.
+        //
+        // 2. THE COST SIGN on the losing side was inverted. For the net loss to
+        //    equal the stop distance the exit must be at `entry - stop + cost`
+        //    (the trade gives back the stop AND pays the round trip). The old
+        //    `entry - stop - cost` sat further away, making a loss rarer than the
+        //    cost model implies. Both of a long's barriers therefore shift UP by
+        //    the cost, and both of a short's shift DOWN — that is what "charge
+        //    the round trip to the trade" actually looks like.
+        let long_tp = entry + take_distance + cost;
+        let long_sl = entry - stop_distance + cost;
+        let short_tp = entry - take_distance - cost;
+        let short_sl = entry + stop_distance - cost;
+        let horizon_end = (i + hold).min(n - 1);
+
+        let mut long_label = 0.0f32;
+        let mut short_label = 0.0f32;
+        let mut long_decided = false;
+        let mut short_decided = false;
+        for f in (i + 1)..=horizon_end {
+            let hi = ohlcv.high[f];
+            let lo = ohlcv.low[f];
+            let hi_ok = hi.is_finite();
+            let lo_ok = lo.is_finite();
+            if !long_decided {
+                match (hi_ok && hi >= long_tp, lo_ok && lo <= long_sl) {
+                    // Both barriers inside one bar is genuinely undecidable at
+                    // bar resolution: labelled 0 and COUNTED, never guessed at
+                    // from the close.
+                    (true, true) => {
+                        census.label_ambiguous += 1;
+                        long_decided = true;
+                    }
+                    (true, false) => {
+                        long_label = 1.0;
+                        census.label_up += 1;
+                        long_decided = true;
+                    }
+                    (false, true) => {
+                        long_label = -1.0;
+                        census.label_down += 1;
+                        long_decided = true;
+                    }
+                    (false, false) => {}
+                }
+            }
+            if !short_decided {
+                match (lo_ok && lo <= short_tp, hi_ok && hi >= short_sl) {
+                    (true, true) => {
+                        census.label_ambiguous_short += 1;
+                        short_decided = true;
+                    }
+                    (true, false) => {
+                        short_label = 1.0;
+                        census.label_short_win += 1;
+                        short_decided = true;
+                    }
+                    (false, true) => {
+                        short_label = -1.0;
+                        census.label_short_loss += 1;
+                        short_decided = true;
+                    }
+                    (false, false) => {}
+                }
+            }
+            if long_decided && short_decided {
+                break;
+            }
+        }
+        if !long_decided {
+            census.label_vertical += 1;
+        }
+        if !short_decided {
+            census.label_vertical_short += 1;
+        }
+        long_labels[i] = long_label;
+        short_labels[i] = short_label;
     }
+    (
+        FirstPassageLabels {
+            long: long_labels,
+            short: short_labels,
+        },
+        census,
+    )
+}
+
+/// The row index sets the prefilter refits inside.
+///
+/// With CPCV configured this is the gate's OWN fold train sets (purged and
+/// embargoed), subsampled to [`PREFILTER_MAX_REFIT_FOLDS`]. Without it, one set:
+/// the leading `insample_frac` prefix — the old behaviour, kept only so a
+/// CPCV-disabled fixture still runs, and it is the contaminating one.
+fn prefilter_fit_windows(n_rows: usize, spec: &PrefilterSpec) -> (Vec<Vec<usize>>, usize) {
+    if let Some((n_splits, n_test_groups, embargo_pct, purge_pct, max_rows)) = spec.cpcv {
+        let capped = if max_rows > 0 {
+            max_rows.min(n_rows)
+        } else {
+            n_rows
+        };
+        let offset = n_rows.saturating_sub(capped);
+        let cv = CombinatorialPurgedCV::new(n_splits, n_test_groups, embargo_pct, purge_pct);
+        let splits = cv.split(capped);
+        let available = splits.len();
+        if available > 0 {
+            // Evenly spaced subsample so the kept folds span the whole
+            // combination space rather than clustering at one end.
+            let step = available.div_ceil(PREFILTER_MAX_REFIT_FOLDS).max(1);
+            let windows: Vec<Vec<usize>> = splits
+                .into_iter()
+                .step_by(step)
+                .take(PREFILTER_MAX_REFIT_FOLDS)
+                .map(|(train, _test)| train.into_iter().map(|i| i + offset).collect())
+                .filter(|w: &Vec<usize>| !w.is_empty())
+                .collect();
+            if !windows.is_empty() {
+                return (windows, available);
+            }
+        }
+    }
+    let train_end = ((n_rows as f64) * spec.insample_frac).floor() as usize;
+    let train_end = train_end.clamp(2, n_rows.saturating_sub(1)).max(2);
+    (vec![(0..train_end.saturating_sub(1)).collect()], 0)
+}
+
+fn prefilter_features(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    spec: &PrefilterSpec,
+) -> (FeatureFrame, PrefilterCensus) {
+    let n_rows = features.n_samples();
+    let n_cols = features.n_features();
+    if n_rows < 2 || n_cols <= spec.top_k {
+        let census = PrefilterCensus {
+            columns_considered: n_cols,
+            columns_kept: n_cols,
+            ..PrefilterCensus::default()
+        };
+        return (features.clone(), census);
+    }
+
+    // THE TARGET (2026-08-09). Was the 1-bar forward return; is now the
+    // triple-barrier label the objective scores. See `first_passage_labels`.
+    let (label_set, mut census) = first_passage_labels(ohlcv, spec);
+    let mut labels = label_set.long;
+    let mut short_labels = Some(label_set.short);
+    census.columns_considered = n_cols;
+
+    // Degenerate-label guard. If nearly nothing reached a barrier the label is
+    // constant, every correlation comes back `degenerate`, every column is
+    // unrankable, and the feature pool would empty out — an outcome produced by
+    // the labeller, not by the market. Fall back to the old 1-bar forward
+    // return, and make the fallback impossible to miss: a ranking produced this
+    // way is NOT evidence about the objective's label.
+    // Both directions must be degenerate before falling back — one side can be
+    // starved by an asymmetric barrier pair while the other decides plenty.
+    let decided_long = census.label_up + census.label_down;
+    let decided_short = census.label_short_win + census.label_short_loss;
+    if decided_long.max(decided_short) < MIN_DECIDED_FIRST_PASSAGE_LABELS {
+        tracing::error!(
+            target: "neoethos_search::prefilter",
+            label_up = census.label_up,
+            label_down = census.label_down,
+            label_vertical = census.label_vertical,
+            label_ambiguous = census.label_ambiguous,
+            minimum = MIN_DECIDED_FIRST_PASSAGE_LABELS,
+            atr_period = spec.atr_period,
+            sl_atr_mult = spec.sl_atr_mult,
+            rr = spec.rr,
+            max_hold_bars = spec.max_hold_bars,
+            "first-passage label is degenerate — almost no bar reached either barrier inside \
+             the horizon. Ranking falls back to the 1-bar FORWARD RETURN (the pre-2026-08-09 \
+             target). Check the barrier geometry against this timeframe's ATR before reading \
+             anything into this run's feature selection."
+        );
+        census.label_fell_back_to_forward_return = true;
+        let n = ohlcv.close.len();
+        let mut returns = vec![f32::NAN; n];
+        for i in 0..n.saturating_sub(1) {
+            let denom = ohlcv.close[i];
+            if denom.abs() > 1e-12 {
+                returns[i] = ((ohlcv.close[i + 1] - denom) / denom) as f32;
+            }
+        }
+        labels = returns;
+        // The forward return has no direction pair; scoring against a stale
+        // short label would silently mix two targets.
+        short_labels = None;
+    }
+    let short_labels = short_labels;
+
+    // THE FIT WINDOWS (2026-08-09). Was one leading prefix, computed ONCE
+    // up front — which means every CPCV "out of sample" number in every prior
+    // run was contaminated: the features the folds were scored on had been
+    // chosen with the folds' own test bars visible. Now the ranking is refit
+    // inside each fold's purged, embargoed TRAIN set and a column is scored by
+    // its WORST fold.
+    //
+    // Worst-fold, not mean: the question a prefilter should answer is "would
+    // this column have been selected whatever slice of history we looked at",
+    // and a mean lets one spectacular fold carry a column that six folds
+    // reject. This is deliberately conservative and it is a behaviour change.
+    //
+    // WHAT REMAINS, stated here and not only in a report, because the comment is
+    // what the next reader finds: this does NOT make CPCV clean. ONE global
+    // top-K is selected from the worst-across-folds scores, and every fold's
+    // test group is another fold's train rows, so the union of the fit windows
+    // covers essentially the whole series and the selected feature set is still
+    // a function of nearly every row. What went away is the WORST form — a
+    // single fit on a leading prefix that overlaps every fold's test group.
+    // `mean_fold_instability` is the residual measure. Removing the rest means
+    // re-running the GA per fold: 28× the cost and a pipeline restructure.
+    //
+    // Compounding it: with `normalize_features: true` the robust z-score fits
+    // its median/MAD on the leading `NORM_FIT_FRACTION` of rows
+    // (neoethos-data `normalization.rs`), which overlaps most CPCV test groups,
+    // so the values handed to the fold-wise correlation are already scaled using
+    // statistics fitted on those test rows.
+    //
+    // The purge does hold: 2% of at most 200k rows is up to 4000 bars against a
+    // 35-bar label horizon, so the label's own forward window cannot leak across
+    // a fold boundary.
+    let (windows, folds_available) = prefilter_fit_windows(n_rows, spec);
+    census.refit_folds_used = windows.len();
+    census.refit_folds_available = folds_available;
+
+    struct ColumnScore {
+        idx: usize,
+        score: f64,
+        instability: f64,
+        had_nonfinite: bool,
+        rankable: bool,
+    }
+
+    let scored: Vec<ColumnScore> = (0..n_cols)
+        .into_par_iter()
+        .map(|col_idx| {
+            let name = &features.names[col_idx];
+            if name.starts_with("regime_") {
+                // Force-keep, unchanged: regime columns are the GA's context
+                // channel and are not selected on correlation.
+                return ColumnScore {
+                    idx: col_idx,
+                    score: f64::INFINITY,
+                    instability: 0.0,
+                    had_nonfinite: false,
+                    rankable: true,
+                };
+            }
+            let col: Vec<f32> = features.feature_column(col_idx).iter().copied().collect();
+            let mut worst = f64::INFINITY;
+            let mut best = 0.0f64;
+            let mut had_nonfinite = false;
+            let mut rankable_in_all = true;
+            for window in &windows {
+                let mut xs: Vec<f32> = Vec::with_capacity(window.len());
+                let mut ys: Vec<f32> = Vec::with_capacity(window.len());
+                let mut ys_short: Vec<f32> = Vec::with_capacity(window.len());
+                for &row in window {
+                    // The label series is bar-indexed and the feature cube is
+                    // row-indexed; they are the same length in production, but a
+                    // caller that hands over mismatched lengths must lose the
+                    // extra rows rather than index out of bounds. The two lives
+                    // in the same guard so neither can be forgotten.
+                    if row >= n_rows || row >= labels.len() {
+                        continue;
+                    }
+                    xs.push(col[row]);
+                    ys.push(labels[row]);
+                    if let Some(short) = short_labels.as_ref() {
+                        ys_short.push(short.get(row).copied().unwrap_or(f32::NAN));
+                    }
+                }
+                let outcome = neoethos_data::core::stats_f64::pearson_pairwise_f32(&xs, &ys);
+                if outcome.skipped > 0 {
+                    had_nonfinite = true;
+                }
+                // A column is scored on the direction it predicts BETTER. The
+                // GA trades both ways, so a feature that only calls declines is
+                // as useful as one that only calls advances — and ranking on the
+                // long label alone silently preferred the latter.
+                let mut a = if outcome.is_rankable() {
+                    Some(outcome.abs())
+                } else {
+                    None
+                };
+                if short_labels.is_some() {
+                    let short_outcome =
+                        neoethos_data::core::stats_f64::pearson_pairwise_f32(&xs, &ys_short);
+                    if short_outcome.skipped > 0 {
+                        had_nonfinite = true;
+                    }
+                    if short_outcome.is_rankable() {
+                        let s = short_outcome.abs();
+                        a = Some(a.map_or(s, |l: f64| l.max(s)));
+                    }
+                }
+                // Unrankable in BOTH directions is what excludes a column — one
+                // direction being degenerate is not enough to drop it.
+                let Some(a) = a else {
+                    rankable_in_all = false;
+                    break;
+                };
+                worst = worst.min(a);
+                best = best.max(a);
+            }
+            if !rankable_in_all || !worst.is_finite() {
+                return ColumnScore {
+                    idx: col_idx,
+                    score: f64::NEG_INFINITY,
+                    instability: 0.0,
+                    had_nonfinite,
+                    rankable: false,
+                };
+            }
+            ColumnScore {
+                idx: col_idx,
+                score: worst,
+                instability: best - worst,
+                had_nonfinite,
+                rankable: true,
+            }
+        })
+        .collect();
+
+    let mut correlations: Vec<(usize, f64)> = Vec::with_capacity(n_cols);
+    let mut instability_sum = 0.0f64;
+    let mut instability_count = 0usize;
+    for entry in &scored {
+        if entry.had_nonfinite {
+            census.columns_with_nonfinite_rows += 1;
+        }
+        if !entry.rankable {
+            census.columns_unrankable += 1;
+            if census.unrankable_sample.len() < 12 {
+                census
+                    .unrankable_sample
+                    .push(features.names[entry.idx].clone());
+            }
+            // NOT pushed into `correlations`: an unrankable column is excluded
+            // by name, never scored 0.0 and left to lose a tie-break.
+            continue;
+        }
+        if entry.score.is_finite() {
+            instability_sum += entry.instability;
+            instability_count += 1;
+        }
+        correlations.push((entry.idx, entry.score));
+    }
+    census.mean_fold_instability = if instability_count > 0 {
+        instability_sum / instability_count as f64
+    } else {
+        0.0
+    };
+    census.regime_forced = features
+        .names
+        .iter()
+        .filter(|n| n.starts_with("regime_"))
+        .count();
+
+    correlations.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Keep top_k + the regime columns (which occupy the INFINITY slots at the
+    // head of the sort, so they do not consume the operator's budget).
+    let actual_top_k = (spec.top_k + census.regime_forced).min(n_cols);
+
+    let mut keep_indices: Vec<usize> = correlations
+        .iter()
+        .take(actual_top_k)
+        .map(|(idx, _)| *idx)
+        .collect();
+
+    // Per-higher-timeframe quota (2026-06-08), retained. Its original
+    // justification — "a higher-TF indicator's 1-bar-forward correlation is ~0
+    // by construction" — is weaker now that the target is a 35-bar first-passage
+    // label rather than a 1-bar return, so this quota should ADD less than it
+    // used to. It is kept because the quota also guarantees the multi-TF seed
+    // templates resolve, and because removing two things at once makes neither
+    // measurable. If the per-TF coverage log shows the quota is no longer
+    // binding, that is the evidence to drop it.
+    if spec.min_per_tf > 0 {
+        let mut kept: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
+        let mut per_group: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for &idx in &keep_indices {
+            if let Some(group) = timeframe_group(&features.names[idx]) {
+                *per_group.entry(group).or_insert(0) += 1;
+            }
+        }
+        for &(idx, _) in &correlations {
+            let Some(group) = timeframe_group(&features.names[idx]) else {
+                continue;
+            };
+            let count = per_group.entry(group).or_insert(0);
+            if *count >= spec.min_per_tf {
+                continue;
+            }
+            if kept.insert(idx) {
+                *count += 1;
+            }
+        }
+        // Force-keep the EXACT features the multi-TF seed templates reference,
+        // resolved by the templates' own role logic against the full
+        // pre-prefilter names — single source of truth, no duplicated family
+        // list.
+        for idx in crate::genetic::seed_templates::template_feature_indices(&features.names) {
+            kept.insert(idx);
+        }
+        keep_indices = kept.into_iter().collect();
+    }
+
+    keep_indices.sort(); // Maintain original order
+    keep_indices.dedup();
+    let n_keep = keep_indices.len();
+    census.columns_kept = n_keep;
+
+    let mut new_names = Vec::with_capacity(n_keep);
+    let mut new_data = ndarray::Array2::zeros((n_rows, n_keep));
+
+    for (new_col_idx, &orig_col_idx) in keep_indices.iter().enumerate() {
+        new_names.push(features.names[orig_col_idx].clone());
+        new_data
+            .column_mut(new_col_idx)
+            .assign(&features.feature_column(orig_col_idx));
+    }
+
+    (
+        FeatureFrame {
+            timestamps: features.timestamps.clone(),
+            names: new_names,
+            data: neoethos_data::FeatureData::InMemory(new_data),
+        },
+        census,
+    )
 }
 
 /// Identify the higher-timeframe prefix group of a multi-TF feature name.
@@ -3886,146 +6016,6 @@ fn timeframe_group(name: &str) -> Option<&str> {
         return None;
     }
     Some(head)
-}
-
-fn prefilter_features(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
-    top_k: usize,
-    insample_frac: f64,
-    min_per_tf: usize,
-) -> FeatureFrame {
-    let n_rows = features.n_samples();
-    let n_cols = features.n_features();
-    if n_rows < 2 || n_cols <= top_k {
-        return features.clone();
-    }
-
-    // BUGFIX (data snooping): the prefilter ranks indicators by correlation
-    // with 1-bar FORWARD returns. Computing this over the full dataset means
-    // the "best" indicators are chosen with full knowledge of the OOS bars
-    // they will later be evaluated on, inflating in-sample metrics.
-    // Restrict the ranking to an IN-SAMPLE prefix so the final 30% of bars
-    // (which the GA/walk-forward later treats as held-out) cannot leak into
-    // the feature-selection step. The fraction is supplied by the caller
-    // through `DiscoveryRuntimeOverrides::prefilter_insample_frac`.
-    let train_end = ((n_rows as f64) * insample_frac).floor() as usize;
-    let train_end = train_end.clamp(2, n_rows.saturating_sub(1)).max(2);
-
-    // Calculate 1-bar forward returns ONLY for the in-sample window.
-    // Returns past `train_end-1` are ignored (treated as zeros) so the
-    // correlation reflects in-sample behaviour only.
-    let mut returns = vec![0.0f32; n_rows];
-    for (i, ret_slot) in returns
-        .iter_mut()
-        .enumerate()
-        .take(train_end.saturating_sub(1))
-    {
-        let denom = ohlcv.close[i];
-        if denom.abs() > 1e-12 {
-            *ret_slot = ((ohlcv.close[i + 1] - denom) / denom) as f32;
-        }
-    }
-
-    let mut correlations = Vec::with_capacity(n_cols);
-    for col_idx in 0..n_cols {
-        let name = &features.names[col_idx];
-        if name.starts_with("regime_") {
-            // Force keep regime columns by giving them infinite correlation
-            correlations.push((col_idx, f32::INFINITY));
-        } else {
-            // Restrict the column slice to the in-sample window so the
-            // Pearson correlation only sees in-sample co-movement.
-            let col = features.feature_column(col_idx);
-            let col_full: Vec<f32> = col.iter().copied().collect();
-            let col_train = &col_full[..train_end.saturating_sub(1)];
-            let ret_train = &returns[..train_end.saturating_sub(1)];
-            let corr = pearson_correlation(col_train, ret_train);
-            correlations.push((col_idx, corr.abs()));
-        }
-    }
-
-    correlations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Calculate how many to actually keep: top_k + any regime columns
-    let regime_count = features
-        .names
-        .iter()
-        .filter(|n| n.starts_with("regime_"))
-        .count();
-    let actual_top_k = (top_k + regime_count).min(n_cols);
-
-    let mut keep_indices: Vec<usize> = correlations
-        .iter()
-        .take(actual_top_k)
-        .map(|(idx, _)| *idx)
-        .collect();
-
-    // Per-higher-timeframe quota (2026-06-08). The ranking above is against
-    // the BASE timeframe's 1-bar forward return. A higher-TF indicator is
-    // near-constant across many base bars, so its 1-bar-forward correlation is
-    // ~0 by construction — the global top-K therefore systematically discards
-    // EVERY multi-TF feature (confirmed live: the surviving set was 100%
-    // base-TF and the GA's multi-TF seed templates found no `H1_`/`H4_`/…
-    // prefixes → 0 seeds → random cold start), wasting the whole
-    // multi-resolution cube. Force-keep each present higher-TF group's top
-    // `min_per_tf` features by |corr|, ADDITIVELY (mirrors the regime_
-    // force-keep). `correlations` is already sorted by descending |corr| so
-    // each group is topped up with its strongest features first.
-    if min_per_tf > 0 {
-        let mut kept: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
-        let mut per_group: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for &idx in &keep_indices {
-            if let Some(group) = timeframe_group(&features.names[idx]) {
-                *per_group.entry(group).or_insert(0) += 1;
-            }
-        }
-        for &(idx, _) in &correlations {
-            let Some(group) = timeframe_group(&features.names[idx]) else {
-                continue;
-            };
-            let count = per_group.entry(group).or_insert(0);
-            if *count >= min_per_tf {
-                continue;
-            }
-            if kept.insert(idx) {
-                *count += 1;
-            }
-        }
-        // Force-keep the EXACT features the multi-TF seed templates reference,
-        // resolved by the templates' own role logic against the full
-        // pre-prefilter names. The per-TF correlation quota above guarantees
-        // general multi-TF REPRESENTATION, but the warm-start templates need
-        // SPECIFIC slow families (ema/rsi/macd/atr) per TF that rarely top the
-        // 1-bar-forward correlation ranking — without this the templates still
-        // resolve <2 roles and the GA cold-starts random. Single source of
-        // truth: the templates themselves (no duplicated family list).
-        for idx in crate::genetic::seed_templates::template_feature_indices(&features.names) {
-            kept.insert(idx);
-        }
-        keep_indices = kept.into_iter().collect();
-    }
-
-    keep_indices.sort(); // Maintain original order
-    keep_indices.dedup();
-    let n_keep = keep_indices.len();
-
-    let mut new_names = Vec::with_capacity(n_keep);
-    let mut new_data = ndarray::Array2::zeros((n_rows, n_keep));
-
-    for (new_col_idx, &orig_col_idx) in keep_indices.iter().enumerate() {
-        new_names.push(features.names[orig_col_idx].clone());
-        new_data
-            .column_mut(new_col_idx)
-            .assign(&features.feature_column(orig_col_idx));
-    }
-
-    FeatureFrame {
-        timestamps: features.timestamps.clone(),
-        names: new_names,
-        data: neoethos_data::FeatureData::InMemory(new_data),
-    }
 }
 
 fn validate_regime_robustness(
@@ -4119,16 +6109,28 @@ pub enum DiscoveryMode {
 }
 
 /// Map the config `models.discovery_mode` string to a [`DiscoveryMode`].
-/// `"strict"` / `"legacy"` → `Strict`; anything else (including the default
-/// `"prop_firm"`) → `PropFirm`. Config-driven replacement for the env-only
+/// `"strict"` / `"legacy"` → `Some(Strict)`; anything else (including the
+/// shipped `"prop_firm"`) → `None`, meaning "this key decided nothing" — the
+/// caller then resolves from `system.trading_mode` and says so.
+/// Config-driven replacement for the env-only
 /// `resolve_discovery_mode` that read `NEOETHOS_BOT_DISCOVERY_MODE` and the
 /// legacy `NEOETHOS_BOT_DISCOVERY_PERMISSIVE` back-compat toggle. The
 /// permissive-toggle path is retired with the env var — operators select the
 /// regime through `config.yaml` / the UI now.
-fn discovery_mode_from_config(value: &str) -> DiscoveryMode {
+///
+/// RESTRICTED, NOT MERGED (2026-08-10). `models.discovery_mode` accepts exactly
+/// two values — `strict` and `legacy`, both meaning [`DiscoveryMode::Strict`].
+/// It is NOT a duplicate of `system.trading_mode` and must not be merged into
+/// it: it reaches `Strict`, which `trading_mode` structurally cannot express.
+/// Any other value is a NO-OP that falls through to `system.trading_mode`, and
+/// that fall-through is now named in the log instead of happening in silence.
+/// The values a UI or TUI may offer for this key are therefore `strict` and
+/// `legacy` only; the regime (risky vs prop-firm) is chosen with
+/// `system.trading_mode`.
+fn discovery_mode_from_config(value: &str) -> Option<DiscoveryMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "strict" | "legacy" => DiscoveryMode::Strict,
-        _ => DiscoveryMode::PropFirm,
+        "strict" | "legacy" => Some(DiscoveryMode::Strict),
+        _ => None,
     }
 }
 
@@ -4143,16 +6145,50 @@ fn discovery_mode_from_config(value: &str) -> DiscoveryMode {
 ///     [`DiscoveryMode::Risky`]; anything else (incl. the `"prop_firm"`
 ///     default) → [`DiscoveryMode::PropFirm`].
 fn resolve_discovery_mode(trading_mode: &str, discovery_mode: &str) -> DiscoveryMode {
-    if matches!(
-        discovery_mode_from_config(discovery_mode),
-        DiscoveryMode::Strict
-    ) {
-        return DiscoveryMode::Strict;
+    if let Some(forced) = discovery_mode_from_config(discovery_mode) {
+        tracing::info!(
+            target: "neoethos_search::config_resolution",
+            winner = "models.discovery_mode",
+            models_discovery_mode = %discovery_mode,
+            system_trading_mode = %trading_mode,
+            resolved_mode = ?forced,
+            "discovery regime forced to Strict by models.discovery_mode — \
+             system.trading_mode is not consulted"
+        );
+        return forced;
     }
-    match trading_mode.trim().to_ascii_lowercase().as_str() {
+    let resolved = match trading_mode.trim().to_ascii_lowercase().as_str() {
         "risky" | "growth" => DiscoveryMode::Risky,
         _ => DiscoveryMode::PropFirm,
+    };
+    // The fall-through, said out loud. `models.discovery_mode: risky` and
+    // `: prop_firm` are both NO-OPS here — the engine maps neither — and the
+    // CLI TUI has been offering exactly those two while rejecting `legacy`, the
+    // one value the engine honours. An operator who set `discovery_mode` and
+    // watched nothing change was reading a knob that does nothing at that value.
+    let value = discovery_mode.trim();
+    if !value.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::config_resolution",
+            key = "models.discovery_mode",
+            configured = %value,
+            winner = "system.trading_mode",
+            system_trading_mode = %trading_mode,
+            resolved_mode = ?resolved,
+            "models.discovery_mode IS NOT SET TO A RECOGNISED VALUE and decided nothing. \
+             It accepts only 'strict' or 'legacy' (both = Strict). The regime was decided \
+             by system.trading_mode. To pick risky vs prop-firm, set system.trading_mode."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::config_resolution",
+            winner = "system.trading_mode",
+            system_trading_mode = %trading_mode,
+            resolved_mode = ?resolved,
+            "discovery regime resolved from system.trading_mode"
+        );
     }
+    resolved
 }
 
 /// Pick a window count that scales with how many full window-spans the
@@ -4803,6 +6839,9 @@ where
     // Filled by the quality screen below; stays all-zero when the screen is
     // skipped, so the funnel never reports invented rejections.
     let mut quality_rejects = QualityScreenRejects::default();
+    // Same contract: all-zero when the screen is skipped, so an absent band is
+    // never reported as a band that everything passed.
+    let mut cost_band_census = CostBandCensus::default();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -4812,7 +6851,19 @@ where
                  perturbations each) — silent but active"
             ),
         });
-        type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
+        /// `.6` is the COST-BAND VERDICT — see [`CostBandVerdict`]. It rides on
+        /// the survivor so the report cannot lose it between the screen and the
+        /// export, which is how "we measured the band" becomes "we mentioned
+        /// the band once in a log".
+        type QualityCandidate = (
+            usize,
+            Gene,
+            Vec<i8>,
+            StrategyMetrics,
+            bool,
+            Vec<Trade>,
+            CostBandVerdict,
+        );
         let analyzer = quality_analyzer_for_config(config);
         let initial_balance = config.initial_balance;
 
@@ -4862,10 +6913,55 @@ where
         // unchanged.
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         let rejected_base_quality = AtomicUsize::new(0);
+        // MEASUREMENT SLICE (2026-08-09): the eight criteria the single
+        // `rejected_base_quality` counter used to collapse. Indexed by
+        // `BaseQualityReject` in `base_quality_index` order below, so adding a
+        // variant without adding a counter is a compile error at the match.
+        let bq_account_wiped = AtomicUsize::new(0);
+        let bq_profile_net_expectancy = AtomicUsize::new(0);
+        let bq_profile_expectancy_significance = AtomicUsize::new(0);
+        let bq_profile_win_rate = AtomicUsize::new(0);
+        let bq_profile_payoff_ratio = AtomicUsize::new(0);
+        let bq_profile_in_market = AtomicUsize::new(0);
+        let bq_opportunistic_lane_closed = AtomicUsize::new(0);
+        let bq_positive_months = AtomicUsize::new(0);
+        let bq_trades_per_month = AtomicUsize::new(0);
+        let bq_monthly_return = AtomicUsize::new(0);
         let rejected_regime = AtomicUsize::new(0);
         let rejected_mc_error = AtomicUsize::new(0);
+        // Split from `rejected_mc_error` (2026-08-09): a failed sensitivity
+        // launch is an infrastructure failure in a different subsystem and must
+        // not be reported as a Monte-Carlo problem.
+        let rejected_sensitivity_error = AtomicUsize::new(0);
         let rejected_mc_floor = AtomicUsize::new(0);
         let rejected_sensitivity = AtomicUsize::new(0);
+        // Cost-band census. These do NOT reject: they classify what the run is
+        // entitled to claim. `optimistic_only` is the one that matters — a
+        // candidate profitable at 1.6 pips and not at 2.4 is not a result, and
+        // without this counter it is indistinguishable from one that is.
+        let cost_band_survived = AtomicUsize::new(0);
+        let cost_band_optimistic_only = AtomicUsize::new(0);
+        let cost_band_failed = AtomicUsize::new(0);
+        let cost_band_unmeasured = AtomicUsize::new(0);
+        let cost_band_not_discriminating = AtomicUsize::new(0);
+        // PER-SESSION TRADE CENSUS. While `session_spread_pips` is unset the run
+        // charges a FLAT spread at 03:00 Tokyo and at the London open alike, so
+        // a gene that concentrates its entries in the Asian session is priced on
+        // a subsidy. The curve is wired end to end and simply unpopulated; until
+        // it is measured, the size of that exposure should be a NUMBER in the
+        // log rather than a caveat in a report. Counted over every screened
+        // candidate, before any gate — the honest denominator. Pnl is summed in
+        // cents so it can live in an atomic.
+        let session_trade_counts = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        let session_pnl_cents = [
+            std::sync::atomic::AtomicI64::new(0),
+            std::sync::atomic::AtomicI64::new(0),
+            std::sync::atomic::AtomicI64::new(0),
+        ];
         // Monte-Carlo pass counts of the candidates the floor rejected, so the
         // floor can be judged against the distribution it is cutting rather
         // than in the abstract: "7 000 rejects that scored 68/100" and "7 000
@@ -4889,6 +6985,18 @@ where
         )?;
         let screen_templates = PopulationTemplateResolver::new(config, ohlcv.close.last().copied());
 
+        // The bar-derived half of validation host prep, built ONCE for the whole
+        // screen.
+        //
+        // This was rebuilt on every call: the transposed indicator matrix, the
+        // month/day indices and eleven lookback-heavy SMC series, over the full
+        // history, seven times. None of it depends on which genes are being
+        // evaluated. `validation_genes_population`'s own in-tree measurement
+        // reads "eighteen of these calls take 413.6 s of a 452.4 s run — 23 s
+        // each — while the device stage timing inside one adds up to 0.30 s";
+        // this is a large part of the 22.7 s nobody could account for.
+        let screen_prep = crate::genetic::search_engine::ValidationPrep::build(features, ohlcv)?;
+
         // ── Monte-Carlo perturbations, batched ────────────────────────────
         //
         // The screen below used to call the evaluator once per candidate: a
@@ -4905,80 +7013,173 @@ where
         //
         // `None` marks a candidate whose batch failed to evaluate: a real bug,
         // reported as such below, never silently counted as "zero profitable".
-        const MC_CANDIDATES_PER_BATCH: usize = 256;
         // Verbatim, NOT `.max(1)`-ed: `mc_runs == 0` is a degenerate config
         // whose behaviour (zero perturbation runs per candidate) must not be
-        // changed by a batching edit. Only the chunk-size division guards it.
+        // changed by a batching edit.
         let mc_runs = config.mc_runs as usize;
-        // Size the submissions to the card instead of to the constant. The 256
-        // was a host-memory guess, and it half-loads the device: a 256-gene
-        // launch measured 42 M candidate-bars/s where a launch at the card's
-        // own fits ceiling (~17 k at H1 bar counts on 24 GB) sustains
-        // 843-966 M. This changes ONLY launch geometry: the MC perturbations
-        // are seeded per (combo, candidate, run) and genes are independent, so
-        // every per-candidate result is bit-identical for any chunking — the
-        // engine's internal splitter still guards a stale ceiling.
+        // ── ONE WORK LIST, ONE LAUNCH ─────────────────────────────────────
         //
-        // The clamps are host-memory bounds: a chunk is `candidates × mc_runs`
-        // cloned genes (~1.3 KB each measured), so 1 024 candidates × 100 runs
-        // ≈ 130 MB of host clones is the most this will stage at once. No
-        // ceiling (no card / gate closed / CPU build) keeps the old constant,
-        // where chunking only bounds host memory.
+        // This screen used to be SEVEN launches over the same bars: six chunks
+        // of Monte-Carlo perturbations plus a sensitivity pass. Each chunk
+        // cloned its own genes, re-transposed the whole indicator matrix,
+        // rebuilt the month/day indices and re-derived eleven lookback-heavy SMC
+        // series — on 843 456 bars — to evaluate genes that had changed and bars
+        // that had not.
+        //
+        // It is one array and one submission now, because the descriptor carries
+        // what used to force a separate launch:
+        //
+        //   * a Monte-Carlo run is a scenario naming its perturbed gene (host
+        //     lane) or its perturbation counter (device lane);
+        //   * a sensitivity run is a scenario naming the SAME gene with its own
+        //     spread and commission — no second settings struct, no second
+        //     launch;
+        //   * and the bar-derived prep is built ONCE, above, for all of it.
+        //
+        // The DEVICE chunking is gone rather than resized. It existed to stay
+        // under the card's scenario ceiling, and that is the evaluator's own
+        // business: it queries free VRAM, sizes the launch and splits the
+        // DESCRIPTOR array itself, so a caller guessing a chunk size can only
+        // get it wrong. Whatever `screen_chunk` is below, the per-candidate
+        // results are identical — genes and scenarios are independent.
+        //
+        // What remains is a HOST-memory bound, and it is a different quantity
+        // for a different reason. See `MAX_STAGED_CLONES`.
+        // REPORTED, NOT USED. This queries free VRAM through `submission_ceiling`
+        // and the screen sizes nothing from it — the evaluator asks the card
+        // itself and splits the descriptor array. It is logged so an operator can
+        // compare what the card would host against what the launch actually
+        // asked for; a caller that SIZED from it could only get it wrong, which
+        // is what the six-chunk device loop was.
         let gpu_ceiling =
             crate::eval::gpu_submission_ceiling(ohlcv.close.len(), features.n_features());
-        let mc_chunk_candidates = gpu_ceiling
-            .map(|fits| (fits / mc_runs.max(1)).clamp(1, 1_024))
-            .unwrap_or(MC_CANDIDATES_PER_BATCH);
-        let sensitivity_chunk = gpu_ceiling
-            .map(|fits| fits.clamp(MC_CANDIDATES_PER_BATCH, 65_536))
-            .unwrap_or(MC_CANDIDATES_PER_BATCH);
+        let bars = ohlcv.close.len();
+        let candidates = pairs.len();
+        let device_mc = crate::gpu_native::scenario::device_monte_carlo();
+
+        // How many perturbed gene CLONES may exist in RAM at once.
+        //
+        // The host Monte-Carlo lane materialises one `Gene` per (candidate, run)
+        // — ~1.3 KB measured — and `candidates * mc_runs` is a pure function of
+        // USER PARAMETERS. A 7 793-candidate screen at 100 runs is 779 300 clones,
+        // about a gigabyte, and the never-OOM invariant is explicit that peak
+        // memory must follow the hardware and never the parameters. Staging the
+        // whole screen at once would have made it follow `mc_runs`.
+        //
+        // So the screen walks candidates in chunks sized by this budget. Note
+        // what that is NOT: it is not the old six-chunk device loop. Each chunk
+        // is still ONE launch covering its Monte-Carlo AND its cost scenarios,
+        // and the bar-derived prep is built once for all of them. At the measured
+        // 174 candidates x 100 runs this is a single chunk.
+        //
+        // The device Monte-Carlo lane removes this entirely — no clone exists
+        // there, the counter is in the descriptor — which is the second thing it
+        // buys after the launch count.
+        const MAX_STAGED_CLONES: usize = 131_072;
+        // The clamp FLOOR defeated the budget when `mc_runs` exceeded it.
+        //
+        // `MAX_STAGED_CLONES / mc_runs` is 0 for `mc_runs > 131 072`, and
+        // `.clamp(1, ..)` lifted that to 1 — so one chunk staged `mc_runs`
+        // clones and peak host memory became exactly f(mc_runs), which is the
+        // invariant the comment above invokes by name. Refuse instead: the
+        // number is the operator's and the machine's limit is not, so this is a
+        // configuration to fix rather than a memory to gamble.
+        if !device_mc && mc_runs > MAX_STAGED_CLONES {
+            anyhow::bail!(
+                "mc_runs = {mc_runs} exceeds the host staging budget of {MAX_STAGED_CLONES} \
+                 perturbed gene clones (~1.3 KB each). The host Monte-Carlo lane materialises \
+                 one clone per (candidate, run), so this would make peak host memory a function \
+                 of a user parameter. Lower mc_runs, or turn on the device Monte-Carlo lane, \
+                 where the counter travels in the descriptor and no clone exists at all."
+            );
+        }
+        let screen_chunk = if device_mc || mc_runs == 0 {
+            candidates.max(1)
+        } else {
+            (MAX_STAGED_CLONES / mc_runs).clamp(1, candidates.max(1))
+        };
+
+        // Can the sensitivity costs be carried in a descriptor EXACTLY?
+        //
+        // The fields are integers, so the answer is "only if they round-trip
+        // through the same division the device performs". When they do not, this
+        // does NOT round them — a spread quietly moved by 0.4 % is a screen
+        // reporting that strategies survive costs they never paid. It falls back
+        // to a second launch carrying the exact f64 in the settings struct,
+        // which is what the code did before scenarios existed, and says so.
+        let sensitivity_spread =
+            crate::gpu_native::scenario::spread_ticks_exact(config.sensitivity_spread_pips);
+        let sensitivity_commission = crate::gpu_native::scenario::commission_micros_exact(
+            config.sensitivity_commission_per_lot,
+        );
+        let fuse_costs = sensitivity_spread.is_some() && sensitivity_commission.is_some();
+        if !fuse_costs {
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                spread_pips = config.sensitivity_spread_pips,
+                commission_per_lot = config.sensitivity_commission_per_lot,
+                "sensitivity costs cannot be carried in a scenario descriptor without \
+                 changing them — running the sensitivity pass as its own launch with the \
+                 exact values rather than quantising what the screen measures"
+            );
+        }
+
         tracing::info!(
             target: "neoethos_search::discovery",
-            candidates = pairs.len(),
+            candidates,
             mc_runs,
-            gpu_ceiling = gpu_ceiling.unwrap_or(0),
-            mc_chunk_candidates,
-            sensitivity_chunk,
-            "quality-screen submission sizes — batching only; per-candidate \
-             results are chunk-invariant"
+            device_monte_carlo = device_mc,
+            screen_chunk,
+            launches = candidates.div_ceil(screen_chunk.max(1)),
+            scenarios_per_chunk = screen_chunk * (mc_runs + usize::from(fuse_costs)),
+            fused_cost_pass = fuse_costs,
+            // For comparison only — nothing here is sized from it.
+            gpu_ceiling_reported = gpu_ceiling.unwrap_or(0),
+            "quality screen — ONE work list per chunk, Monte-Carlo and costs together; \
+             the evaluator sizes and splits it against free VRAM, and per-candidate \
+             results are split-invariant"
         );
-        let mc_profitable_runs: Vec<Option<usize>> = {
-            let mut out: Vec<Option<usize>> = Vec::with_capacity(pairs.len());
-            for chunk in pairs.chunks(mc_chunk_candidates) {
-                // Building the perturbed clones is CPU work — every core does
-                // it while the device is busy with the previous chunk. Only the
-                // launch itself is serialized, because there is one card.
+
+        let mut mc_profitable_runs: Vec<Option<usize>> = Vec::with_capacity(candidates);
+        let mut fused_sensitivity: Option<Vec<Option<f64>>> =
+            fuse_costs.then(|| Vec::with_capacity(candidates));
+
+        for chunk in pairs.chunks(screen_chunk) {
+            let chunk_len = chunk.len();
+
+            // ── Genes ─────────────────────────────────────────────────────
+            //
+            // The base candidates first, at indices 0..chunk_len, because every
+            // cost scenario and (in the device lane) every perturbation names one
+            // of them. The host lane appends the perturbed clones after them.
+            let mut screen_genes: Vec<Gene> =
+                chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
+            let clone_base = screen_genes.len();
+            if !device_mc && mc_runs > 0 {
+                // THE DEFAULT AND THE REFERENCE. ChaCha8, host-side, in the exact
+                // draw order the serial screen used, seeded per (combo,
+                // candidate, run) — see `host_monte_carlo_perturbation`, which
+                // both this and the pinning test call so the pin covers the code
+                // rather than a copy of it.
                 //
                 // `map` over an indexed parallel iterator collects in order, so
-                // the batch stays candidate-major with runs ascending, which is
-                // what the per-candidate slicing below relies on. The RNG is
-                // seeded per (combo, candidate, run) and never shared, so
-                // parallel construction is bit-identical to the serial one.
-                let batch: Vec<Gene> = chunk
+                // the array stays candidate-major with runs ascending, which is
+                // what the descriptor indices below rely on. The RNG is seeded
+                // per (combo, candidate, run) and never shared, so parallel
+                // construction is bit-identical to the serial one — and the seed
+                // uses the candidate's ORIGINAL index, not its position in this
+                // chunk, so chunking cannot change a single draw.
+                let clones: Vec<Gene> = chunk
                     .par_iter()
                     .map(|((candidate_idx, gene), _)| {
-                        use rand::Rng;
-                        use rand::SeedableRng;
                         (0..mc_runs as u64)
                             .map(|run_idx| {
-                                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-                                    combo_seed ^ ((*candidate_idx as u64) << 20) ^ run_idx,
-                                );
-                                let mut perturbed = gene.clone();
-                                perturbed.long_threshold *=
-                                    1.0 + rng.random_range(-0.15..=0.15);
-                                perturbed.short_threshold *=
-                                    1.0 + rng.random_range(-0.15..=0.15);
-                                for w in &mut perturbed.weights {
-                                    *w *= 1.0 + rng.random_range(-0.20..=0.20);
-                                }
-                                if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
-                                    perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                                }
-                                if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
-                                    perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                                }
-                                perturbed
+                                host_monte_carlo_perturbation(
+                                    gene,
+                                    combo_seed,
+                                    *candidate_idx,
+                                    run_idx,
+                                )
                             })
                             .collect::<Vec<Gene>>()
                     })
@@ -4986,116 +7187,471 @@ where
                         acc.append(&mut part);
                         acc
                     });
-                // Cost/pip configuration is shared: the helper takes a gene only
-                // for the price hint, and each perturbed gene's own SL/TP AND
-                // adaptive stop regime are re-resolved inside
-                // `validation_genes_population`.
-                let settings = screen_templates.template(&chunk[0].0.1);
-                let evaluated = {
-                    #[cfg(feature = "gpu")]
-                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    crate::genetic::validation_genes_population(
-                        features,
-                        ohlcv,
-                        &batch,
-                        &eval_config_for_signals,
-                        &settings,
-                    )
-                };
-                match evaluated {
-                    Ok(metrics) if metrics.len() == batch.len() => {
-                        for candidate in 0..chunk.len() {
+                screen_genes.extend(clones);
+            }
+
+            // ── The work list ─────────────────────────────────────────────
+            //
+            // Monte-Carlo scenarios first, candidate-major with runs ascending,
+            // then the cost scenarios — ONE array, ONE call. `scenario_id` is
+            // the position, so the evaluator's positional check against the
+            // returned rows is self-describing: a permuted result names the
+            // position it should have been at.
+            let mut work: Vec<neoethos_gpu_contracts::device::ScenarioDescriptor> =
+                Vec::with_capacity(chunk_len * (mc_runs + 1));
+            for (position, ((candidate_idx, _), _)) in chunk.iter().enumerate() {
+                for run in 0..mc_runs as u64 {
+                    let id = work.len() as u64;
+                    work.push(if device_mc {
+                        // The gene is the unperturbed candidate; the counter is
+                        // what makes this run different. No clone exists on the
+                        // host at all — that is what the device lane buys.
+                        crate::gpu_native::scenario::perturb_scenario(
+                            position as u64,
+                            id,
+                            bars,
+                            combo_seed ^ ((*candidate_idx as u64) << 20) ^ run,
+                        )
+                    } else {
+                        // The perturbation is already in the gene, so this is an
+                        // ordinary full-series evaluation of clone
+                        // `clone_base + position * mc_runs + run`.
+                        crate::gpu_native::scenario::base_scenario(
+                            (clone_base + position * mc_runs + run as usize) as u64,
+                            id,
+                            bars,
+                        )
+                    });
+                }
+            }
+            let mc_total = work.len();
+            if fuse_costs {
+                for position in 0..chunk_len {
+                    let id = work.len() as u64;
+                    work.push(crate::gpu_native::scenario::cost_scenario(
+                        position as u64,
+                        id,
+                        bars,
+                        sensitivity_spread,
+                        sensitivity_commission,
+                    ));
+                }
+            }
+
+            // ── The launch ────────────────────────────────────────────────
+            //
+            // Cost/pip configuration is shared: the template helper takes a gene
+            // only for the price hint, and each gene's own SL/TP and
+            // adaptive-stop regime are re-resolved inside the prep.
+            //
+            // GPU_LAUNCH_LOCK COVERS THE DEVICE CALL AND NOTHING ELSE. It exists
+            // so a rayon `par_iter` cannot create one ~16 GB session per worker;
+            // holding it across the gene pack and the adaptive-stop resolution —
+            // which is where it used to sit, inside
+            // `validation_genes_population` — serialises CPU work that no other
+            // thread's device access could conflict with.
+            let fused = if work.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let screen_settings = screen_templates.template(&chunk[0].0.1);
+                match crate::genetic::search_engine::prepare_validation_population(
+                    ohlcv,
+                    &screen_genes,
+                    &eval_config_for_signals,
+                    &screen_settings,
+                ) {
+                    Ok(prepared) => {
+                        #[cfg(feature = "gpu")]
+                        let _gpu_guard =
+                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios(
+                            features,
+                            ohlcv,
+                            &screen_prep,
+                            &prepared,
+                            &work,
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+
+            // ── Demultiplex ───────────────────────────────────────────────
+            //
+            // `None` marks a candidate whose evaluation failed: a real bug,
+            // reported as such below, never silently counted as "zero
+            // profitable".
+            match fused {
+                Ok(rows) if rows.len() == work.len() => {
+                    for candidate in 0..chunk_len {
+                        mc_profitable_runs.push(if mc_runs == 0 {
+                            // A degenerate config asks for no perturbation runs;
+                            // zero profitable out of zero is the honest answer
+                            // and not a failure.
+                            Some(0)
+                        } else {
                             let start = candidate * mc_runs;
-                            out.push(Some(
-                                metrics[start..start + mc_runs]
+                            Some(
+                                rows[start..start + mc_runs]
                                     .iter()
                                     .filter(|m| m[0] > 0.0)
                                     .count(),
-                            ));
+                            )
+                        });
+                    }
+                    if let Some(sensitivity) = fused_sensitivity.as_mut() {
+                        for candidate in 0..chunk_len {
+                            sensitivity.push(Some(rows[mc_total + candidate][0]));
                         }
                     }
-                    Ok(metrics) => {
-                        tracing::warn!(
-                            target: "neoethos_search::discovery",
-                            expected = batch.len(),
-                            returned = metrics.len(),
-                            "Monte-Carlo batch returned the wrong number of rows — rejecting its candidates"
-                        );
-                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                }
+                Ok(rows) => {
+                    tracing::warn!(
+                        target: "neoethos_search::discovery",
+                        expected = work.len(),
+                        returned = rows.len(),
+                        candidates = chunk_len,
+                        "quality-screen launch returned the wrong number of rows — rejecting its candidates"
+                    );
+                    mc_profitable_runs.extend(std::iter::repeat_n(None, chunk_len));
+                    if let Some(sensitivity) = fused_sensitivity.as_mut() {
+                        sensitivity.extend(std::iter::repeat_n(None, chunk_len));
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "neoethos_search::discovery",
-                            error = %error,
-                            candidates = chunk.len(),
-                            "Monte-Carlo batched eval failed — rejecting its candidates"
-                        );
-                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "neoethos_search::discovery",
+                        error = %error,
+                        candidates = chunk_len,
+                        scenarios = work.len(),
+                        "quality-screen launch failed — rejecting its candidates"
+                    );
+                    mc_profitable_runs.extend(std::iter::repeat_n(None, chunk_len));
+                    if let Some(sensitivity) = fused_sensitivity.as_mut() {
+                        sensitivity.extend(std::iter::repeat_n(None, chunk_len));
                     }
                 }
             }
-            out
-        };
+        }
 
-        // ── Spread/slippage sensitivity, batched ──────────────────────────
+        // ── Spread/slippage sensitivity ───────────────────────────────────
         //
         // The stress test is the same backtest over the same bars with a wider
         // spread and a higher commission, and its verdict is a single number:
-        // does net profit survive? That is metric slot 0, so there is nothing
-        // here the card cannot produce — it was running per candidate on the
-        // CPU only because it was written before the population path existed.
+        // does net profit survive? That is metric slot 0.
         //
-        // One launch per chunk of candidates, exactly like the Monte-Carlo pass
-        // above. `None` marks a batch that failed to evaluate, which is
-        // rejected as an error rather than read as "did not survive".
-        let sensitivity_net_profit: Vec<Option<f64>> = {
-            let mut out: Vec<Option<f64>> = Vec::with_capacity(pairs.len());
-            for chunk in pairs.chunks(sensitivity_chunk) {
-                let genes: Vec<Gene> = chunk.iter().map(|((_, gene), _)| gene.clone()).collect();
-                let mut settings = screen_templates.template(&chunk[0].0.1);
+        // Normally it is already answered — the cost scenarios rode along in the
+        // launch above and cost one extra thread each. This arm exists only for
+        // the case the descriptor cannot carry the configured costs EXACTLY, and
+        // its whole point is that the screen keeps measuring the operator's
+        // actual numbers rather than the nearest millipip: one extra launch, the
+        // exact f64 in the settings struct, loudly logged where it was decided.
+        let sensitivity_net_profit: Vec<Option<f64>> = match fused_sensitivity {
+            Some(values) => values,
+            None => {
+                let mut settings = screen_templates.template(&pairs[0].0.1);
                 settings.spread_pips = config.sensitivity_spread_pips;
                 settings.commission_per_trade = config.sensitivity_commission_per_lot;
-                let evaluated = {
-                    #[cfg(feature = "gpu")]
-                    let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    crate::genetic::validation_genes_population(
-                        features,
-                        ohlcv,
-                        &genes,
-                        &eval_config_for_signals,
-                        &settings,
-                    )
+                // A flat sensitivity spread must BYPASS the per-hour resolution,
+                // exactly as the fused path does.
+                //
+                // The device's `spread_ticks` override replaces the whole
+                // per-bar lookup (`has_spread_override ? spread_override_pips :
+                // spread_pips_for_bar(...)`), and the CPU mirror clears the
+                // profile for the same reason (`eval.rs`). This arm set only the
+                // scalar — and `spread_pips_for_bar` returns `settings.spread_pips`
+                // ONLY when `timestamp_ms <= 0`; for every real bar it returns
+                // one of the three profile buckets, which this arm never touched.
+                // With a profile configured the sensitivity test therefore ran at
+                // the ORIGINAL spread and reported that every strategy survives a
+                // cost it was never charged.
+                //
+                // Which arm runs is decided by whether the operator's spread
+                // round-trips through millipips, so a fourth decimal place
+                // silently changed what the screen measured.
+                settings.session_spread_profile = None;
+                // Only the BASE candidates — the perturbed clones are not part
+                // of this test — so this is one gene per candidate and one
+                // full-series scenario each. No `mc_runs` multiplier, so the
+                // staging is bounded by the candidate count alone and needs no
+                // chunking of its own; the evaluator splits the descriptor array
+                // against free VRAM as usual.
+                let base_genes: Vec<Gene> =
+                    pairs.iter().map(|((_, gene), _)| gene.clone()).collect();
+                let base_work: Vec<neoethos_gpu_contracts::device::ScenarioDescriptor> = (0
+                    ..candidates as u64)
+                    .map(|candidate| {
+                        crate::gpu_native::scenario::base_scenario(candidate, candidate, bars)
+                    })
+                    .collect();
+                let evaluated = match crate::genetic::search_engine::prepare_validation_population(
+                    ohlcv,
+                    &base_genes,
+                    &eval_config_for_signals,
+                    &settings,
+                ) {
+                    Ok(prepared) => {
+                        #[cfg(feature = "gpu")]
+                        let _gpu_guard =
+                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios(
+                            features,
+                            ohlcv,
+                            &screen_prep,
+                            &prepared,
+                            &base_work,
+                        )
+                    }
+                    Err(error) => Err(error),
                 };
                 match evaluated {
-                    Ok(metrics) if metrics.len() == genes.len() => {
-                        out.extend(metrics.iter().map(|m| Some(m[0])));
+                    Ok(metrics) if metrics.len() == candidates => {
+                        metrics.iter().map(|m| Some(m[0])).collect()
                     }
                     Ok(metrics) => {
                         tracing::warn!(
                             target: "neoethos_search::discovery",
-                            expected = genes.len(),
+                            expected = candidates,
                             returned = metrics.len(),
-                            "sensitivity batch returned the wrong number of rows — rejecting its candidates"
+                            "sensitivity launch returned the wrong number of rows — rejecting every candidate"
                         );
-                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                        vec![None; candidates]
                     }
                     Err(error) => {
                         tracing::warn!(
                             target: "neoethos_search::discovery",
                             error = %error,
-                            candidates = chunk.len(),
-                            "sensitivity batched eval failed — rejecting its candidates"
+                            candidates,
+                            "sensitivity launch failed — rejecting every candidate"
                         );
-                        out.extend(std::iter::repeat_n(None, chunk.len()));
+                        vec![None; candidates]
                     }
                 }
             }
-            out
         };
-        let screened: Vec<Option<QualityCandidate>> = pairs
+        // ── THE COST BAND ────────────────────────────────────────────────────
+        //
+        // A backtest result is a function of the cost you charged it. Nobody
+        // knows their all-in round-trip cost to better than a few tenths of a
+        // pip: spread moves by hour and by news, commission is quoted per side,
+        // and slippage is not a constant. Reporting ONE number invites the
+        // reader to believe it, which is how a run that only clears at the
+        // optimistic end gets read as a result.
+        //
+        // So every survivor is re-measured at BOTH edges of the operator's band
+        // (`risk.cost_band_{optimistic,pessimistic}_pips`, default 1.6 / 2.4)
+        // and a candidate that is profitable at the optimistic edge but not at
+        // the pessimistic one is FLAGGED. The flag does not reject it — the
+        // existing sensitivity gate still decides that — because the band's job
+        // is to make the fragility visible, not to move a threshold nobody
+        // agreed to move.
+        //
+        // The band is a TOTAL round-trip cost, so it is charged entirely as
+        // spread with commission zeroed; charging both would double-count.
+        // Session profile cleared for the same reason the sensitivity arm
+        // clears it: a flat stress cost must bypass the per-hour lookup or the
+        // pass measures the original spread and reports that everything
+        // survives a cost it was never charged.
+        //
+        // ZERO expected value in money. It changes no strategy. It changes what
+        // a reader is allowed to conclude.
+        //
+        // AND IT MUST BE ABLE TO DISCRIMINATE. Added 2026-08-09 after the review
+        // showed the shipped band is arithmetically incapable of failing anyone:
+        // the edges REPLACE the whole cost, cost is monotone, and both shipped
+        // edges (1.6 / 2.4) sit BELOW the run's own charged cost (spread 1.5 +
+        // slippage 0.5 + doubled commission ~1.4 = ~3.4 pips). Every survivor
+        // would come back `SurvivesBand` on every run. Rather than spend two
+        // population launches producing a guaranteed answer and a census that
+        // reads as evidence, the band is SKIPPED and every candidate is marked
+        // `NotDiscriminating` with the two numbers printed.
+        let baseline_cost_pips = crate::run_identity::cost_pips_round_trip(
+            config.evaluation_spread_pips,
+            config.evaluation_commission_per_trade,
+            eval_config_for_signals.pip_value_per_lot,
+        );
+        let band_discriminates = cost_band_discriminates(config.cost_band_pips, baseline_cost_pips);
+        if config.cost_band_pips.is_some() && !band_discriminates {
+            let (lo, hi) = config.cost_band_pips.unwrap_or((f64::NAN, f64::NAN));
+            tracing::error!(
+                target: "neoethos_search::cost_model",
+                optimistic_pips = lo,
+                pessimistic_pips = hi,
+                baseline_cost_pips,
+                spread_pips = config.evaluation_spread_pips,
+                commission_per_trade = config.evaluation_commission_per_trade,
+                pip_value_per_lot = eval_config_for_signals.pip_value_per_lot,
+                "COST BAND CANNOT DISCRIMINATE: its pessimistic edge ({hi:.2} pips) is at or \
+                 below the cost this run already charged ({baseline_cost_pips:.2} pips round \
+                 trip). Cost is monotone, so every candidate that cleared the screen clears \
+                 both edges BY CONSTRUCTION and the census would read clean on every run. The \
+                 band is SKIPPED and every survivor is marked cost_band_not_discriminating. \
+                 Fix: raise risk.cost_band_pessimistic_pips above {baseline_cost_pips:.2}, or \
+                 lower the charged cost. This is a defect in the measuring instrument, not a \
+                 result about any strategy."
+            );
+        }
+        let cost_band_edges = config.cost_band_pips.filter(|_| band_discriminates);
+        let mut cost_band_optimistic: Vec<Option<f64>> = vec![None; candidates];
+        let mut cost_band_pessimistic: Vec<Option<f64>> = vec![None; candidates];
+        if let Some((optimistic_pips, pessimistic_pips)) = cost_band_edges.filter(|_| candidates > 0)
+        {
+            let base_genes: Vec<Gene> = pairs.iter().map(|((_, gene), _)| gene.clone()).collect();
+            let base_work: Vec<neoethos_gpu_contracts::device::ScenarioDescriptor> = (0..candidates
+                as u64)
+                .map(|candidate| {
+                    crate::gpu_native::scenario::base_scenario(candidate, candidate, bars)
+                })
+                .collect();
+            let evaluate_at_total_cost = |total_pips: f64| -> Vec<Option<f64>> {
+                let mut settings = screen_templates.template(&pairs[0].0.1);
+                settings.spread_pips = total_pips;
+                settings.commission_per_trade = 0.0;
+                settings.session_spread_profile = None;
+                let evaluated = match crate::genetic::search_engine::prepare_validation_population(
+                    ohlcv,
+                    &base_genes,
+                    &eval_config_for_signals,
+                    &settings,
+                ) {
+                    Ok(prepared) => {
+                        #[cfg(feature = "gpu")]
+                        let _gpu_guard =
+                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios(
+                            features,
+                            ohlcv,
+                            &screen_prep,
+                            &prepared,
+                            &base_work,
+                        )
+                    }
+                    Err(error) => Err(error),
+                };
+                match evaluated {
+                    Ok(metrics) if metrics.len() == candidates => {
+                        metrics.iter().map(|m| Some(m[0])).collect()
+                    }
+                    Ok(metrics) => {
+                        tracing::warn!(
+                            target: "neoethos_search::cost_model",
+                            expected = candidates,
+                            returned = metrics.len(),
+                            total_pips,
+                            "cost-band launch returned the wrong number of rows — this edge is \
+                             UNMEASURED for every candidate, so no candidate can be reported \
+                             as having survived it"
+                        );
+                        vec![None; candidates]
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_search::cost_model",
+                            error = %error,
+                            total_pips,
+                            "cost-band launch failed — this edge is UNMEASURED for every \
+                             candidate"
+                        );
+                        vec![None; candidates]
+                    }
+                }
+            };
+            cost_band_optimistic = evaluate_at_total_cost(optimistic_pips);
+            cost_band_pessimistic = evaluate_at_total_cost(pessimistic_pips);
+        }
+
+        // THE PERIOD GRID for the per-trial return matrix, derived once from the
+        // span the screen actually simulates. Every trial gets the same columns,
+        // so the result is a rectangular (trials × periods) matrix — the shape
+        // CSCV/PBO and DSR require. See `trial_returns.rs` for the format and
+        // the byte arithmetic.
+        let trial_period_keys = crate::trial_returns::month_keys_spanning(
+            features.timestamps.first().copied().unwrap_or(0),
+            features.timestamps.last().copied().unwrap_or(0),
+        );
+        if trial_period_keys.is_empty() {
+            tracing::warn!(
+                target: "neoethos_search::trial_returns",
+                first_ts = features.timestamps.first().copied().unwrap_or(0),
+                last_ts = features.timestamps.last().copied().unwrap_or(0),
+                "no usable period grid for this run — the per-trial return series will be \
+                 EMPTY and DSR/PBO stay uncomputable. This is a timestamp problem, not a \
+                 strategy result."
+            );
+        }
+
+        // ── THE TRIAL-RETURNS WRITER, opened BEFORE the screen ────────────
+        //
+        // Review finding (2026-08-09): the first cut collected every row into
+        // RAM and wrote once after the whole parallel screen — Monte-Carlo and
+        // sensitivity launches included — had finished. This project's record
+        // has exit-137 kills and multi-hour runs that ended with no artifact, so
+        // the one file that makes a result falsifiable was being lost in exactly
+        // the failure mode that happens. It is now appended chunk by chunk, with
+        // the header patched after every flush, so a kill leaves a shorter but
+        // valid matrix. Non-fatal either way: a failed write must not lose a
+        // discovery result, but it is reported, never swallowed.
+        let trial_config_hash = crate::run_identity::config_hash_for(
+            config,
+            eval_config_for_signals.pip_value_per_lot,
+            neoethos_data::current_data_runtime_overrides().normalize_features,
+        );
+        let mut trial_writer = if config.discovery_ledger_enabled && !trial_period_keys.is_empty() {
+            match crate::trial_returns::TrialReturnsWriter::open(
+                &config.discovery_ledger_cache_dir,
+                &config.evaluation_symbol,
+                &config.timeframe_label,
+                trial_period_keys.clone(),
+                initial_balance,
+                candidates,
+                trial_config_hash,
+            ) {
+                Ok(w) => Some(w),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "neoethos_search::trial_returns",
+                        error = %err,
+                        "could not OPEN the per-trial return series for writing — DSR and PBO \
+                         are NOT computable for this run and its result is not falsifiable"
+                    );
+                    None
+                }
+            }
+        } else {
+            if !config.discovery_ledger_enabled {
+                tracing::warn!(
+                    target: "neoethos_search::trial_returns",
+                    trials = candidates,
+                    "discovery ledger disabled — the per-trial return series will be computed \
+                     and then DISCARDED. DSR and PBO are not computable for this run."
+                );
+            }
+            None
+        };
+
+        // Chunked so the writer has something to flush before the run ends. The
+        // chunk is an I/O cadence, not a parallelism limit: each chunk is still
+        // evaluated across every core, and `position` is the SAME global index
+        // the batched Monte-Carlo / sensitivity / cost-band vectors are keyed by.
+        const TRIAL_FLUSH_CHUNK: usize = 512;
+        let mut screened: Vec<Option<QualityCandidate>> = Vec::with_capacity(candidates);
+        let mut trial_rows_total = 0usize;
+        let mut pairs_iter = pairs.into_iter();
+        let mut chunk_base = 0usize;
+        loop {
+            let chunk: Vec<((usize, Gene), Vec<i8>)> =
+                pairs_iter.by_ref().take(TRIAL_FLUSH_CHUNK).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk_len = chunk.len();
+            let base = chunk_base;
+        let screened_rows: Vec<(Option<QualityCandidate>, crate::trial_returns::TrialReturnRow)> =
+            chunk
             .into_par_iter()
             .enumerate()
-            .map(|(position, ((candidate_idx, gene), sig))| {
+            .map(|(local_position, ((candidate_idx, gene), sig))| {
+                let position = base + local_position;
                 let trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -5106,18 +7662,69 @@ where
                 );
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
-                let profile_ok = config.target_profile.accepts(&metrics);
-                let strict_quality =
-                    profile_ok && passes_strict_quality(&metrics, &config.filtering);
-                let opportunistic_quality =
-                    profile_ok
-                        && !strict_quality
-                        && passes_opportunistic_quality(&metrics, &config.filtering);
 
-                if !(strict_quality || opportunistic_quality) {
-                    rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                // Per-session exposure, over EVERY screened candidate. Same
+                // bucket boundaries the cost model charges by construction —
+                // `SessionSpreadProfile::bucket_index` is the one definition.
+                for t in &trades {
+                    if t.entry_time <= 0 {
+                        continue;
+                    }
+                    let b = crate::eval::SessionSpreadProfile::bucket_index(t.entry_time);
+                    session_trade_counts[b].fetch_add(1, AtomicOrdering::Relaxed);
+                    if t.pnl.is_finite() {
+                        session_pnl_cents[b]
+                            .fetch_add((t.pnl * 100.0).round() as i64, AtomicOrdering::Relaxed);
+                    }
                 }
+
+                // EVERY trial's per-period return series, captured BEFORE any
+                // gate — that is the whole point. A matrix built only from
+                // survivors is the selected sample, which is exactly what PBO
+                // exists to detect and therefore cannot be computed from.
+                let (returns, trades_outside_grid) = crate::trial_returns::period_returns(
+                    &trades,
+                    &trial_period_keys,
+                    initial_balance,
+                );
+                let trial_row = crate::trial_returns::TrialReturnRow {
+                    candidate_index: candidate_idx,
+                    strategy_id: gene.strategy_id.clone(),
+                    returns,
+                    trades_outside_grid,
+                };
+
+                let verdict =
+                    classify_base_quality(&metrics, &config.target_profile, &config.filtering);
+                let opportunistic_quality = match verdict {
+                    Ok(opportunistic) => opportunistic,
+                    Err(reason) => {
+                        rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
+                        // One counter per criterion. The match is exhaustive, so
+                        // a new `BaseQualityReject` variant cannot be added
+                        // without deciding where it is counted.
+                        let counter = match reason {
+                            BaseQualityReject::AccountWiped => &bq_account_wiped,
+                            BaseQualityReject::ProfileNetExpectancy => {
+                                &bq_profile_net_expectancy
+                            }
+                            BaseQualityReject::ProfileExpectancySignificance => {
+                                &bq_profile_expectancy_significance
+                            }
+                            BaseQualityReject::ProfileWinRate => &bq_profile_win_rate,
+                            BaseQualityReject::ProfilePayoffRatio => &bq_profile_payoff_ratio,
+                            BaseQualityReject::ProfileInMarket => &bq_profile_in_market,
+                            BaseQualityReject::OpportunisticLaneClosed => {
+                                &bq_opportunistic_lane_closed
+                            }
+                            BaseQualityReject::PositiveMonths => &bq_positive_months,
+                            BaseQualityReject::TradesPerMonth => &bq_trades_per_month,
+                            BaseQualityReject::MonthlyReturn => &bq_monthly_return,
+                        };
+                        counter.fetch_add(1, AtomicOrdering::Relaxed);
+                        return (None, trial_row);
+                    }
+                };
 
                 // Regime-Aware Validation (Idea #3.2)
                 let regime_robust = validate_regime_robustness(
@@ -5128,7 +7735,7 @@ where
                 );
                 if !regime_robust {
                     rejected_regime.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return (None, trial_row);
                 }
 
                 // Monte Carlo Parameter Perturbation Test.
@@ -5151,7 +7758,7 @@ where
                 // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
                 let Some(profitable_runs) = mc_profitable_runs[position] else {
                     rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return (None, trial_row);
                 };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
@@ -5162,39 +7769,180 @@ where
                     if profitable_runs as u32 + 10 >= config.mc_min_profitable {
                         mc_near_miss.fetch_add(1, AtomicOrdering::Relaxed);
                     }
-                    return None;
+                    return (None, trial_row);
                 }
 
                 // Spread/Slippage Sensitivity Test — wired from Settings
                 // 2026-05-26 (dual-mode product).
                 let Some(sens_pnl) = sensitivity_net_profit[position] else {
-                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    // Split from `rejected_mc_error` (2026-08-09): this is the
+                    // SENSITIVITY launch failing, not the Monte-Carlo one.
+                    rejected_sensitivity_error.fetch_add(1, AtomicOrdering::Relaxed);
+                    return (None, trial_row);
                 };
                 if sens_pnl < 0.0 {
                     rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return (None, trial_row);
                 }
 
-                Some((
-                    candidate_idx,
-                    gene,
-                    sig,
-                    metrics,
-                    opportunistic_quality,
-                    trades,
-                ))
+                // THE COST BAND. Deliberately AFTER every gate: it classifies,
+                // it does not reject. A candidate that only clears the cheap end
+                // of the band is still a survivor of the screen the operator
+                // configured — it is just not a result.
+                //
+                // HOW FAR THE VERDICT ACTUALLY TRAVELS, corrected 2026-08-09: it
+                // rides on the survivor through this function and is counted
+                // run-level in `CostBandCensus` and on the funnel's
+                // `passed_quality` stage. It does NOT reach the exported
+                // portfolio — the export loop drops it (see the `_cost_band`
+                // bind below). So a reader of `live_portfolio.json` CANNOT see
+                // which genes were optimistic-edge-only; only the run's log and
+                // funnel say so. Carrying it into the portfolio structs is the
+                // follow-up, and until it lands this comment must not claim
+                // otherwise.
+                let cost_band = if config.cost_band_pips.is_some() && !band_discriminates {
+                    CostBandVerdict::NotDiscriminating
+                } else {
+                    CostBandVerdict::from_edges(
+                        cost_band_optimistic[position],
+                        cost_band_pessimistic[position],
+                    )
+                };
+                match cost_band {
+                    CostBandVerdict::NotDiscriminating => {
+                        cost_band_not_discriminating.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    CostBandVerdict::OptimisticEdgeOnly => {
+                        cost_band_optimistic_only.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    CostBandVerdict::FailsBand => {
+                        cost_band_failed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    CostBandVerdict::Unmeasured => {
+                        cost_band_unmeasured.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    CostBandVerdict::SurvivesBand => {
+                        cost_band_survived.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+
+                (
+                    Some((
+                        candidate_idx,
+                        gene,
+                        sig,
+                        metrics,
+                        opportunistic_quality,
+                        trades,
+                        cost_band,
+                    )),
+                    trial_row,
+                )
             })
             .collect();
 
+            // Split the chunk's output: the survivors go on down the funnel, the
+            // return series go to disk NOW. Every screened candidate contributed
+            // a row, gate or no gate.
+            let mut chunk_rows: Vec<crate::trial_returns::TrialReturnRow> =
+                Vec::with_capacity(screened_rows.len());
+            for (candidate, row) in screened_rows {
+                screened.push(candidate);
+                chunk_rows.push(row);
+            }
+            trial_rows_total += chunk_rows.len();
+            if let Some(writer) = trial_writer.as_mut() {
+                if let Err(err) = writer.append(&chunk_rows) {
+                    tracing::warn!(
+                        target: "neoethos_search::trial_returns",
+                        error = %err,
+                        rows = chunk_rows.len(),
+                        "FAILED to append a chunk of the per-trial return series — the matrix \
+                         is now SHORT by this chunk and any DSR/PBO computed from it is over a \
+                         different trial set than the one that ran"
+                    );
+                }
+            }
+            chunk_base += chunk_len;
+        }
+
+        // ── CLOSE THE PER-TRIAL RETURN SERIES ─────────────────────────────
+        //
+        // Not the winner's summary — every trial. Without this matrix the
+        // Deflated Sharpe Ratio and the Probability of Backtest Overfitting are
+        // UNCOMPUTABLE, and no result this project produces is falsifiable.
+        // Size, format and the disk-headroom-derived cap are documented in
+        // `trial_returns.rs`.
+        if let Some(writer) = trial_writer.take() {
+            match writer.finish(Utc::now().timestamp_millis()) {
+                Ok(manifest) => tracing::info!(
+                    target: "neoethos_search::trial_returns",
+                    trials_offered = manifest.trials_offered,
+                    trials_written = manifest.trials_written,
+                    trials_dropped = manifest.trials_dropped,
+                    retention = %manifest.retention_rule,
+                    periods = manifest.period_count,
+                    bytes_written = manifest.bytes_written,
+                    bytes_budget = manifest.bytes_budget,
+                    disk_available_bytes = manifest.disk_available_bytes,
+                    budget_source = %manifest.budget_source,
+                    trades_outside_grid = manifest.trades_outside_grid,
+                    trades_outside_grid_offered = manifest.trades_outside_grid_offered,
+                    config_hash = ?manifest.config_hash,
+                    file = %manifest.binary_file,
+                    "persisted every trial's per-period return series. NOTE: nothing in this \
+                     workspace READS this matrix yet — DSR and PBO are now computable, they are \
+                     not yet computed"
+                ),
+                Err(err) => tracing::warn!(
+                    target: "neoethos_search::trial_returns",
+                    error = %err,
+                    trials = trial_rows_total,
+                    "FAILED to close the per-trial return series — DSR and PBO are NOT \
+                     computable for this run and its result is not falsifiable"
+                ),
+            }
+        }
+
         quality_rejects = QualityScreenRejects {
             base_quality: rejected_base_quality.load(AtomicOrdering::Relaxed),
+            bq_account_wiped: bq_account_wiped.load(AtomicOrdering::Relaxed),
+            bq_profile_net_expectancy: bq_profile_net_expectancy.load(AtomicOrdering::Relaxed),
+            bq_profile_expectancy_significance: bq_profile_expectancy_significance
+                .load(AtomicOrdering::Relaxed),
+            bq_profile_win_rate: bq_profile_win_rate.load(AtomicOrdering::Relaxed),
+            bq_profile_payoff_ratio: bq_profile_payoff_ratio.load(AtomicOrdering::Relaxed),
+            bq_profile_in_market: bq_profile_in_market.load(AtomicOrdering::Relaxed),
+            bq_opportunistic_lane_closed: bq_opportunistic_lane_closed
+                .load(AtomicOrdering::Relaxed),
+            bq_positive_months: bq_positive_months.load(AtomicOrdering::Relaxed),
+            bq_trades_per_month: bq_trades_per_month.load(AtomicOrdering::Relaxed),
+            bq_monthly_return: bq_monthly_return.load(AtomicOrdering::Relaxed),
             regime: rejected_regime.load(AtomicOrdering::Relaxed),
             mc_error: rejected_mc_error.load(AtomicOrdering::Relaxed),
+            sensitivity_error: rejected_sensitivity_error.load(AtomicOrdering::Relaxed),
             mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
             mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
             sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
         };
+        // Arithmetic self-check: the ten criteria must partition the
+        // base-quality rejects exactly. If they ever disagree the breakdown is
+        // lying, which is worse than not having one — say so loudly rather than
+        // publish a number that does not add up.
+        let bq_sum: usize = quality_rejects
+            .base_quality_breakdown()
+            .iter()
+            .map(|(_, n)| *n)
+            .sum();
+        if bq_sum != quality_rejects.base_quality {
+            tracing::error!(
+                target: "neoethos_search::funnel",
+                base_quality_total = quality_rejects.base_quality,
+                criteria_sum = bq_sum,
+                "the per-criterion base-quality counters do not sum to the total — the \
+                 attribution in `classify_base_quality` has a hole"
+            );
+        }
         tracing::info!(
             target: "neoethos_search::funnel",
             rejected_base_quality = quality_rejects.base_quality,
@@ -5204,8 +7952,113 @@ where
             monte_carlo_floor = config.mc_min_profitable,
             monte_carlo_runs = config.mc_runs,
             rejected_monte_carlo_error = quality_rejects.mc_error,
+            rejected_sensitivity_error = quality_rejects.sensitivity_error,
             rejected_spread_sensitivity = quality_rejects.sensitivity,
             "quality screen — which gate rejected the candidates"
+        );
+        // The ten named criteria, at run end. THIS is the line that says
+        // whether "0 survived" was a market verdict or a configuration one: a
+        // run in which `base_quality.profile_payoff_ratio` equals the whole
+        // candidate count did not measure the market at all. Conversely, a run
+        // in which `profile_net_expectancy` is the whole count DID measure the
+        // market, and the market said no.
+        tracing::info!(
+            target: "neoethos_search::funnel",
+            account_wiped = quality_rejects.bq_account_wiped,
+            profile_net_expectancy = quality_rejects.bq_profile_net_expectancy,
+            profile_expectancy_significance =
+                quality_rejects.bq_profile_expectancy_significance,
+            profile_win_rate = quality_rejects.bq_profile_win_rate,
+            profile_payoff_ratio = quality_rejects.bq_profile_payoff_ratio,
+            profile_in_market = quality_rejects.bq_profile_in_market,
+            opportunistic_lane_closed = quality_rejects.bq_opportunistic_lane_closed,
+            positive_months = quality_rejects.bq_positive_months,
+            trades_per_month = quality_rejects.bq_trades_per_month,
+            monthly_return = quality_rejects.bq_monthly_return,
+            net_expectancy_floor = config.target_profile.min_net_expectancy_per_trade,
+            expectancy_t_stat_floor = config.target_profile.min_expectancy_t_stat,
+            payoff_floor = config.target_profile.min_payoff_ratio,
+            min_win_rate_floor = config.target_profile.min_win_rate,
+            max_in_market_floor = config.target_profile.max_in_market,
+            opportunistic_enabled = config.filtering.opportunistic_enabled,
+            use_opportunistic = config.filtering.use_opportunistic_candidates,
+            "base-quality screen — which of the TEN criteria rejected the candidates"
+        );
+        // PER-SESSION EXPOSURE, at run end. When the curve is unset this says
+        // how much of the screen's activity — and how much of its money — was
+        // priced at a spread nobody measured for that hour.
+        {
+            let counts: [usize; 3] =
+                std::array::from_fn(|i| session_trade_counts[i].load(AtomicOrdering::Relaxed));
+            let pnl: [f64; 3] = std::array::from_fn(|i| {
+                session_pnl_cents[i].load(AtomicOrdering::Relaxed) as f64 / 100.0
+            });
+            let total: usize = counts.iter().sum();
+            let share = |i: usize| {
+                if total > 0 {
+                    100.0 * counts[i] as f64 / total as f64
+                } else {
+                    0.0
+                }
+            };
+            if config.session_spread_pips.is_none() {
+                tracing::warn!(
+                    target: "neoethos_search::cost_model",
+                    asian_trades = counts[0],
+                    overlap_trades = counts[1],
+                    late_ny_trades = counts[2],
+                    asian_pct = share(0),
+                    overlap_pct = share(1),
+                    late_ny_pct = share(2),
+                    asian_pnl = pnl[0],
+                    overlap_pnl = pnl[1],
+                    late_ny_pnl = pnl[2],
+                    flat_spread_pips = config.evaluation_spread_pips,
+                    "PER-SESSION EXPOSURE at an UNPRICED spread. Every one of these trades was \
+                     charged the same flat spread regardless of the hour. The Asian share is \
+                     the part of this run's result that depends on a cost nobody measured. \
+                     Fix: average the hourly means already recorded in spread_stats.json over \
+                     22-07 / 07-16 / 16-22 UTC into risk.backtest_spread_pips_{{asian,overlap,\
+                     late_ny}}."
+                );
+            } else {
+                tracing::info!(
+                    target: "neoethos_search::cost_model",
+                    asian_trades = counts[0],
+                    overlap_trades = counts[1],
+                    late_ny_trades = counts[2],
+                    asian_pnl = pnl[0],
+                    overlap_pnl = pnl[1],
+                    late_ny_pnl = pnl[2],
+                    "per-session exposure, priced from the configured curve"
+                );
+            }
+        }
+        // THE COST BAND, at run end. Read `optimistic_edge_only` before reading
+        // any survivor count: those candidates cleared every gate and are still
+        // not results. A run whose survivors are mostly in that bucket has found
+        // strategies that live inside the uncertainty of its own cost estimate.
+        cost_band_census = CostBandCensus {
+            survives: cost_band_survived.load(AtomicOrdering::Relaxed),
+            optimistic_edge_only: cost_band_optimistic_only.load(AtomicOrdering::Relaxed),
+            fails: cost_band_failed.load(AtomicOrdering::Relaxed),
+            unmeasured: cost_band_unmeasured.load(AtomicOrdering::Relaxed),
+            not_discriminating: cost_band_not_discriminating.load(AtomicOrdering::Relaxed),
+        };
+        tracing::info!(
+            target: "neoethos_search::cost_model",
+            baseline_cost_pips,
+            band_discriminates,
+            not_discriminating = cost_band_census.not_discriminating,
+            band_optimistic_pips = cost_band_edges.map(|(lo, _)| lo).unwrap_or(f64::NAN),
+            band_pessimistic_pips = cost_band_edges.map(|(_, hi)| hi).unwrap_or(f64::NAN),
+            survives_band = cost_band_census.survives,
+            optimistic_edge_only = cost_band_census.optimistic_edge_only,
+            fails_band = cost_band_census.fails,
+            unmeasured = cost_band_census.unmeasured,
+            "cost band — every screened candidate re-measured at BOTH edges. \
+             `optimistic_edge_only` counts candidates that are profitable ONLY at the cheap \
+             end of the cost estimate: those are not results."
         );
 
         let mut strict_passed: Vec<QualityCandidate> = Vec::new();
@@ -5266,31 +8119,77 @@ where
 
         let mut screened_genes = Vec::with_capacity(strict_passed.len());
         let mut screened_signals = Vec::with_capacity(strict_passed.len());
-        for (candidate_idx, gene, sig, _, _, _) in strict_passed {
+        // `_cost_band` is bound rather than dropped by a bare `_` so that adding
+        // a tuple slot cannot silently sail past this site. The verdict itself
+        // is already counted in `cost_band_census` and logged; carrying it into
+        // the portfolio structs is the follow-up that belongs with the export
+        // path, not with the screen.
+        for (candidate_idx, gene, sig, _, _, _, _cost_band) in strict_passed {
             screened_genes.push((candidate_idx, gene));
             screened_signals.push(sig);
         }
         filtered = screened_genes;
         signals_map = screened_signals;
     }
-    // 2026-05-26: quality screen (MC perturbation + spread sensitivity +
-    // regime robustness) collapses into a single funnel stage. The
-    // sub-rejection reasons (MC <70/100, sensitivity loss, regime fail)
-    // are visible via the tracing logs but not separately counted here —
-    // adding per-reason buckets would require threading atomics into the
-    // par_iter closure above. If operators report this stage is the
-    // bottleneck, follow-up adds those atomics.
+    // The quality screen collapses into a single funnel stage; the per-gate
+    // breakdown below is what makes the persisted funnel answer "which test cost
+    // us the candidates" without needing the run's logs.
     funnel.record_stage("passed_quality", post_min_trades, filtered.len());
-    // Per-gate breakdown, so the persisted funnel answers "which test cost us
-    // the candidates" without needing the run's logs. Only non-zero reasons are
-    // recorded; a skipped screen therefore adds nothing.
+    // Only non-zero reasons are recorded; a skipped screen therefore adds
+    // nothing.
+    //
+    // HOW TO SUM THIS LIST, because three different kinds of entry share it and
+    // a naive sum is roughly twice the rejections plus the survivor count:
+    //   * entries with NO dot and no prefix are the independent gates. THEY are
+    //     the ones that sum to `count_in - count_out`.
+    //   * `total.base_quality` is the base-quality AGGREGATE, and the ten
+    //     `base_quality.*` entries are its breakdown. Adding either to the gate
+    //     sum double-counts; adding both triple-counts.
+    //   * `cost_band_*` entries are a CLASSIFICATION of the survivors, not
+    //     rejections. Nothing was rejected for them.
+    // The prefixes carry that distinction so a reader does not have to know it.
     if quality_rejects.total() > 0 {
         for (reason, count) in [
-            ("base_quality_metrics", quality_rejects.base_quality),
+            ("total.base_quality", quality_rejects.base_quality),
             ("regime_robustness", quality_rejects.regime),
             ("monte_carlo_perturbation", quality_rejects.mc_floor),
             ("monte_carlo_eval_error", quality_rejects.mc_error),
+            ("sensitivity_eval_error", quality_rejects.sensitivity_error),
             ("spread_slippage_sensitivity", quality_rejects.sensitivity),
+        ] {
+            if count > 0 {
+                funnel.add_reject_reason("passed_quality", reason, count);
+            }
+        }
+        for (reason, count) in quality_rejects.base_quality_breakdown() {
+            if count > 0 {
+                funnel.add_reject_reason("passed_quality", reason, count);
+            }
+        }
+    }
+    // The cost band is NOT a reject reason — nothing was rejected for it — but it
+    // belongs in the persisted funnel next to the rejects, because a reader who
+    // has the survivor count and not this classification will over-read the
+    // survivor count. Recorded whenever the band was evaluated at all.
+    if cost_band_census.total() > 0 {
+        for (reason, count) in [
+            (
+                CostBandVerdict::OptimisticEdgeOnly.label(),
+                cost_band_census.optimistic_edge_only,
+            ),
+            (CostBandVerdict::FailsBand.label(), cost_band_census.fails),
+            (
+                CostBandVerdict::Unmeasured.label(),
+                cost_band_census.unmeasured,
+            ),
+            (
+                CostBandVerdict::NotDiscriminating.label(),
+                cost_band_census.not_discriminating,
+            ),
+            (
+                CostBandVerdict::SurvivesBand.label(),
+                cost_band_census.survives,
+            ),
         ] {
             if count > 0 {
                 funnel.add_reject_reason("passed_quality", reason, count);
@@ -5314,12 +8213,51 @@ where
             pf.n_windows = auto_tune_n_windows(&features.timestamps, pf.window_days);
         }
         // agent 2026-06-05 overfitting fix: enforce a hard pass-rate floor
-        // (default 0.65) ON TOP of the gate's own `pass_rate`. The effective
-        // floor is the max of the two, so a candidate must clear FTMO-style
-        // rules on at least 65% of the random windows. Raising `pf.pass_rate`
-        // here means BOTH the diagnostic bucket below and the survival filter
+        // ON TOP of the gate's own `pass_rate`. The effective floor is the max
+        // of the two, so a candidate must clear FTMO-style rules on at least
+        // that share of the random windows. Raising `pf.pass_rate` here means
+        // BOTH the diagnostic bucket below and the survival filter
         // (`*rate >= pf.pass_rate`) use the floored threshold consistently.
-        pf.pass_rate = pf.pass_rate.max(config.prop_firm_min_pass_rate);
+        //
+        // TWO NAMES, ONE DECISION (2026-08-10). `models.prop_firm_min_pass_rate`
+        // and `models.discovery_runtime.prop_firm_gate.pass_rate` are collapsed
+        // here by `.max()`, and until now no line said so. A silent `.max()`
+        // means RAISING EITHER RAISES THE EFFECTIVE FLOOR — so an operator who
+        // lowered one of them has not lowered the setting, and the 2026-06-06
+        // mandate written into both shipped YAMLs names only the first, which
+        // means raising the second silently overrides that disarm.
+        //
+        // The safer (higher) number wins — that is the existing behaviour and it
+        // is the correct one — but the disagreement is now stated with both
+        // numbers. One of the two fields is scheduled for deletion; until it
+        // goes, this log is the operator's only way to see which one bound.
+        let gate_pass_rate = pf.pass_rate;
+        let floor_pass_rate = config.prop_firm_min_pass_rate;
+        pf.pass_rate = gate_pass_rate.max(floor_pass_rate);
+        if (gate_pass_rate - floor_pass_rate).abs() > f64::EPSILON {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key_a = "models.discovery_runtime.prop_firm_gate.pass_rate",
+                value_a = gate_pass_rate,
+                key_b = "models.prop_firm_min_pass_rate",
+                value_b = floor_pass_rate,
+                effective = pf.pass_rate,
+                winner = if gate_pass_rate >= floor_pass_rate {
+                    "models.discovery_runtime.prop_firm_gate.pass_rate"
+                } else {
+                    "models.prop_firm_min_pass_rate"
+                },
+                "PROP-FIRM PASS RATE IS SET TWICE and the two disagree — the SAFER \
+                 (higher) value binds. Lowering only one of them does not lower the \
+                 gate."
+            );
+        } else {
+            tracing::info!(
+                target: "neoethos_search::config_resolution",
+                effective_prop_firm_pass_rate = pf.pass_rate,
+                "prop-firm window pass-rate floor (both config keys agree)"
+            );
+        }
         let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
             filtered.into_iter().zip(signals_map.into_iter()).collect();
         let timestamps_owned = features.timestamps.clone();
@@ -6792,6 +9730,8 @@ pub fn build_discovery_profile(
         evaluation_account_currency,
         evaluation_spread_pips,
         evaluation_commission_per_trade,
+        session_spread_pips,
+        cost_band_pips,
         swap_long_pips_per_day,
         swap_short_pips_per_day,
         population,
@@ -6952,6 +9892,8 @@ pub fn build_discovery_profile(
         evaluation_account_currency: evaluation_account_currency.clone(),
         evaluation_spread_pips: *evaluation_spread_pips,
         evaluation_commission_per_trade: *evaluation_commission_per_trade,
+        session_spread_pips: *session_spread_pips,
+        cost_band_pips: *cost_band_pips,
         swap_long_pips_per_day: *swap_long_pips_per_day,
         swap_short_pips_per_day: *swap_short_pips_per_day,
         mode: *mode,
@@ -6996,6 +9938,217 @@ pub fn save_discovery_profile_json(
     result: &DiscoveryResult,
 ) -> Result<()> {
     write_json_atomic(path, &build_discovery_profile(config, result))
+}
+
+/// THE Monte-Carlo perturbation the quality screen measures. Host lane, ChaCha8.
+///
+/// Extracted from the screen so it can be PINNED. Turning the device
+/// perturbation on changes which generator draws the numbers — the device cannot
+/// walk a ChaCha8 stream, see `gpu_native::scenario` — and the only defence
+/// against that difference being made silently is a test that fails when this
+/// function's output moves. A test that re-implemented the loop would pin a
+/// copy, not the code, so the screen and the test call the same function.
+///
+/// The draw ORDER is the contract: long_threshold, short_threshold, each weight
+/// ascending, then sl_pips and tp_pips — each only if finite and positive, so a
+/// gene with no fixed stop does not acquire one by being multiplied. Reordering
+/// these, or drawing for a skipped stop, changes every subsequent number.
+fn host_monte_carlo_perturbation(
+    gene: &Gene,
+    combo_seed: u64,
+    candidate_idx: usize,
+    run_idx: u64,
+) -> Gene {
+    use rand::Rng;
+    use rand::SeedableRng;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+        combo_seed ^ ((candidate_idx as u64) << 20) ^ run_idx,
+    );
+    let mut perturbed = gene.clone();
+    perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+    perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+    for w in &mut perturbed.weights {
+        *w *= 1.0 + rng.random_range(-0.20..=0.20);
+    }
+    if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+        perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+    }
+    if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+        perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+    }
+    perturbed
+}
+
+#[cfg(test)]
+mod monte_carlo_reference_tests {
+    use super::*;
+
+    fn seed_gene() -> Gene {
+        Gene {
+            weights: vec![1.0, -0.5, 0.25],
+            long_threshold: 0.60,
+            short_threshold: -0.40,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            ..Gene::default()
+        }
+    }
+
+    /// THE REFERENCE, PINNED TO EXACT BITS.
+    ///
+    /// The Monte-Carlo screen is the gate 7 792 of 7 793 candidates die at in a
+    /// measured run, so what it measures IS the search. Two things could change
+    /// it without anyone noticing: a `rand` upgrade that alters
+    /// `random_range`'s rejection sampling, and turning the device perturbation
+    /// on, which uses a counter-based generator that cannot reproduce ChaCha8
+    /// and is not trying to.
+    ///
+    /// Neither is forbidden. Both must be DELIBERATE, and this is what makes
+    /// them so: the numbers below were produced by this function and any change
+    /// to what the default screen measures now arrives as a failing test with
+    /// the old and new values printed side by side.
+    #[test]
+    fn the_host_monte_carlo_draw_order_is_pinned() {
+        let gene = seed_gene();
+        let perturbed = host_monte_carlo_perturbation(&gene, 0xC0FFEE, 3, 7);
+
+        // Determinism first: same inputs, same gene, every time and from any
+        // thread. This is what makes parallel construction of the clone array
+        // bit-identical to the serial construction it replaced.
+        assert_eq!(
+            perturbed,
+            host_monte_carlo_perturbation(&gene, 0xC0FFEE, 3, 7)
+        );
+
+        // Then the exact values. Written as bit patterns so a printed decimal
+        // that happens to round the same cannot pass.
+        assert_eq!(
+            perturbed.long_threshold.to_bits(),
+            0x3F16_D12E,
+            "long_threshold moved: {} (the reference is 0.5891293)",
+            perturbed.long_threshold
+        );
+        assert_eq!(
+            perturbed.short_threshold.to_bits(),
+            0xBEB3_50F1,
+            "short_threshold moved: {} (the reference is -0.3502269)",
+            perturbed.short_threshold
+        );
+        assert_eq!(
+            perturbed
+                .weights
+                .iter()
+                .map(|w| w.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3F54_84CF_u32, 0xBEEA_F19D, 0x3E6F_AFC8],
+            "the weight draws moved: {:?} (the reference is \
+             [0.8301515, -0.4588746, 0.23406899])",
+            perturbed.weights
+        );
+        assert_eq!(
+            perturbed.sl_pips.to_bits(),
+            0x4032_82A3_D25D_27A8,
+            "sl_pips moved: {} (the reference is 18.510312221281907)",
+            perturbed.sl_pips
+        );
+        assert_eq!(
+            perturbed.tp_pips.to_bits(),
+            0x4041_AC00_D7A2_0C94,
+            "tp_pips moved: {} (the reference is 35.34377570545726)",
+            perturbed.tp_pips
+        );
+    }
+
+    /// Each (candidate, run) must be its OWN perturbation, or 100 Monte-Carlo
+    /// runs are one run counted 100 times and the screen's pass rate is a
+    /// constant.
+    #[test]
+    fn every_candidate_and_run_draws_its_own_perturbation() {
+        let gene = seed_gene();
+        let mut seen = std::collections::HashSet::new();
+        for candidate in 0..8usize {
+            for run in 0..8u64 {
+                let p = host_monte_carlo_perturbation(&gene, 0xC0FFEE, candidate, run);
+                assert!(
+                    seen.insert(p.long_threshold.to_bits()),
+                    "candidate {candidate} run {run} reused a draw"
+                );
+            }
+        }
+    }
+
+    /// A gene with no fixed stop must not acquire one, and the guard must match
+    /// the device mirror's exactly — both lanes skip the draw rather than
+    /// multiplying a zero or a NaN.
+    #[test]
+    fn an_unset_stop_stays_unset_on_both_lanes() {
+        let mut gene = seed_gene();
+        gene.sl_pips = 0.0;
+        gene.tp_pips = f64::NAN;
+        let host = host_monte_carlo_perturbation(&gene, 1, 0, 0);
+        assert_eq!(host.sl_pips, 0.0);
+        assert!(host.tp_pips.is_nan());
+
+        let device = crate::gpu_native::scenario::perturbed_gene(
+            1,
+            gene.long_threshold,
+            gene.short_threshold,
+            &gene.weights,
+            gene.sl_pips,
+            gene.tp_pips,
+        );
+        assert_eq!(device.sl_pips, 0.0);
+        assert!(device.tp_pips.is_nan());
+    }
+
+    /// The two lanes measure the same DISTRIBUTION and not the same DRAWS, and
+    /// that is stated here rather than left to be discovered.
+    ///
+    /// If this ever starts failing because the two agree, something has quietly
+    /// made the device reproduce ChaCha8 — which would be excellent news and
+    /// must still be verified rather than assumed.
+    #[test]
+    fn the_device_lane_is_a_different_sequence_and_says_so() {
+        let gene = seed_gene();
+        let host = host_monte_carlo_perturbation(&gene, 0xC0FFEE, 3, 7);
+        let counter = 0xC0FFEE_u64 ^ ((3_u64) << 20) ^ 7;
+        let device = crate::gpu_native::scenario::perturbed_gene(
+            counter,
+            gene.long_threshold,
+            gene.short_threshold,
+            &gene.weights,
+            gene.sl_pips,
+            gene.tp_pips,
+        );
+        assert_ne!(
+            host.long_threshold, device.long_threshold,
+            "the two Monte-Carlo lanes are not expected to agree draw for draw"
+        );
+
+        // But both must stay inside the SAME amplitude, because that is the
+        // property the screen actually depends on: a 15 % threshold band, a
+        // 20 % weight band and a 25 % stop band.
+        for (value, base, amplitude) in [
+            (
+                f64::from(device.long_threshold),
+                f64::from(gene.long_threshold),
+                0.15,
+            ),
+            (device.sl_pips, gene.sl_pips, 0.25),
+            (device.tp_pips, gene.tp_pips, 0.25),
+        ] {
+            let ratio = value / base;
+            assert!(
+                ratio >= 1.0 - amplitude && ratio <= 1.0 + amplitude,
+                "device perturbation {value} is {ratio}x its base, outside +/-{amplitude}"
+            );
+        }
+
+        // And the host lane must be inside the same bands, which is what makes
+        // "same distribution" a checkable claim rather than a hope.
+        let host_ratio = f64::from(host.long_threshold) / f64::from(gene.long_threshold);
+        assert!(host_ratio >= 0.85 && host_ratio <= 1.15);
+    }
 }
 
 #[cfg(test)]

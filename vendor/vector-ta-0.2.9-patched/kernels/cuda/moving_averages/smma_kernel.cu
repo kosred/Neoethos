@@ -230,3 +230,76 @@ void smma_multi_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[idx] = prev;
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — smma
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/moving_averages/smma.rs:211 `smma_scalar`.
+ *
+ * The f32 file above ships TWO shapes: a serial one and
+ * `smma_batch_warp_scan_f32`, an associative-scan reformulation. The scan is
+ * NOT the CPU's accumulation order — it re-associates the recurrence — so this
+ * lane deliberately mirrors the SERIAL shape, one thread per column.
+ *
+ * Seed: `sum` is accumulated ONE AT A TIME over [first, first+period)
+ * (smma.rs:225-228). smma is the crate's counter-example to `wilders`, whose
+ * seed groups by four; copying either into the other is a whole-series shift.
+ *
+ * `__int_as_float(0x7f...)` x3 in the f32 file is an f32 NaN bit pattern and is
+ * a denormal when reinterpreted at 64 bits.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void smma_neo_batch_f64(const double* __restrict__ prices,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    // smma_with_kernel: warm = first + period - 1  (smma.rs:205)
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (period == 1) {
+        for (int i = first_valid; i < len; ++i) o[i] = prices[i];
+        return;
+    }
+
+    const int end = first_valid + period;
+
+    double sum = 0.0;
+    for (int i = first_valid; i < end; ++i) sum += prices[i];   // one at a time
+
+    const double pf   = (double)period;
+    const double pm1  = pf - 1.0;
+    const double inv_p = 1.0 / pf;
+
+    double prev = sum * inv_p;
+    o[end - 1] = prev;
+
+    // prev = f64::mul_add(prev, pm1, x) * inv_p — TWO roundings (fma, then the
+    // multiply). Writing it as (prev*pm1 + x)*inv_p would be three.
+    for (int i = end; i < len; ++i) {
+        prev = fma(prev, pm1, prices[i]) * inv_p;
+        o[i] = prev;
+    }
+}

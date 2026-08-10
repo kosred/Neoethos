@@ -4,9 +4,11 @@
 //! ## Why this module exists
 //!
 //! Per the Spotware Open API protocol (see
-//! `docs/audits/research/ctrader_api_full_reference.md` §5.14 and the
-//! per-entity `moneyDigits` comments in
-//! `crates/neoethos-app/proto/OpenApiModelMessages.proto`), every monetary
+//! the per-entity `moneyDigits` comments in `OpenApiModelMessages.proto`
+//! upstream at `spotware/openapi-proto-messages` — the vendored copy under
+//! `crates/neoethos-app/proto/` was deleted in batch D2 (2026-08-09), and the
+//! `docs/audits/research/ctrader_api_full_reference.md` this used to cite has
+//! never existed in this repo), every monetary
 //! integer field on a cTrader message is the actual deposit-currency
 //! amount multiplied by `10^moneyDigits`. The exponent is reported as
 //! a `uint32 moneyDigits` field on the *carrying* entity — it varies

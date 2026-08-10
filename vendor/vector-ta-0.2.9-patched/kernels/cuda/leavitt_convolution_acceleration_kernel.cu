@@ -328,3 +328,291 @@ extern "C" __global__ void leavitt_convolution_acceleration_batch_f64(
         bump_source_history(value, &prev_src1, &prev_src2, &have_src1, &have_src2);
     }
 }
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4
+//
+// CPU reference:
+//   * arithmetic  : LeavittConvolutionAccelerationStream::update /
+//                   ::update_clean,
+//                   src/indicators/leavitt_convolution_acceleration.rs:585-673.
+//   * rolling fits: RollingLinRegState (:328-429) and RollingMeanStdState
+//                   (:432-507).
+//   * driver      : leavitt_convolution_acceleration_compute_into (:733-772)
+//                   and _compute_clean (:775-813).
+//   * refusals    : leavitt_convolution_acceleration_prepare, :697-730.
+//   * emitted col : `conv_acceleration`.
+//                   compute_leavitt_convolution_acceleration_batch
+//                   (cpu_batch.rs:13184) maps output_id "value" ->
+//                   out.conv_acceleration.
+//   * PERIOD-INVARIANT: the batch reads `source`, `length` (70),
+//                   `norm_length` (150) and `use_norm_hyperbolic` (true) and
+//                   never `period` (cpu_batch.rs:13196-13210).
+//
+// ONE BODY SERVES BOTH CPU PATHS. _compute_clean runs the stream's update_clean
+// from `first`; _compute_into runs update (reset-on-non-finite) from 0. They
+// are the SAME state machine: a non-finite bar calls reset(), and resetting an
+// untouched stream is a no-op, so starting at 0 with the reset variant
+// reproduces starting at `first` with the clean variant bar for bar. The kernel
+// therefore implements the reset variant only.
+//
+// FIRST-VALID IGNORED: the CPU's `first` (:706) only bounds the leading NaN
+// fill (:776-781), and this kernel starts the row all-NaN, so the index is
+// never read.
+//
+// NaN: `variance.max(0.0)` (:505) is f64::max -- fmax here, so a NaN variance
+// cannot be turned into a spurious 0.0 by a comparison chain that reads false.
+//
+// f64 END TO END: `exp()` and `sqrt()`, never `__expf`/`expf`/`rsqrtf`; `fma()`
+// only where the CPU writes `mul_add` (:414). The file is in
+// build.rs::F64_LANE_SOURCES, so the exp() inside the normaliser is compiled
+// with -prec-div=true and WITHOUT --use_fast_math -- which matters because it
+// feeds a difference of consecutive bars.
+//
+// EPSILON: `denom.abs() > f64::EPSILON` (:346) is an f64-width guard on the
+// host already; DBL_EPSILON is its exact carry-across.
+//
+// SEQUENTIAL, one thread per column: two rolling regressions, a rolling
+// mean/std and four carried scalars all cross bars.
+// ===========================================================================
+
+#include <float.h>
+
+#define LCA_NEO_LENGTH 70
+#define LCA_NEO_NORM_LENGTH 150
+// sqrt_length(70) = floor(sqrt(70)) = 8, :293-296.
+#define LCA_NEO_SLOPE_LENGTH 8
+
+static __device__ __forceinline__ double lca_neo_qnan() {
+  return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// RollingLinRegState, :328-429.
+struct Lca_LinReg {
+  int period;
+  double* buffer;
+  int head;
+  int count;
+  bool filled;
+  double n, sum_x, inv_n, inv_denom, mean_x, forecast_x, sum_y, sum_xy;
+};
+
+static __device__ __forceinline__ void lca_linreg_init(Lca_LinReg* s, int period, double* storage) {
+  const double n = (double)period;
+  const double m = (double)(period > 0 ? period - 1 : 0);
+  const double sum_x = 0.5 * m * n;
+  const double sum_x2 = (m * n) * (2.0 * m + 1.0) / 6.0;
+  const double denom = n * sum_x2 - sum_x * sum_x;
+  s->period = period;
+  s->buffer = storage;
+  for (int k = 0; k < period; ++k) s->buffer[k] = 0.0;
+  s->head = 0; s->count = 0; s->filled = false;
+  s->n = fmax(n, 1.0);
+  s->sum_x = sum_x;
+  s->inv_n = (n > 0.0) ? (1.0 / n) : 0.0;
+  s->inv_denom = (fabs(denom) > DBL_EPSILON) ? (1.0 / denom) : 0.0;
+  s->mean_x = (n > 0.0) ? (sum_x / n) : 0.0;
+  s->forecast_x = (double)period;
+  s->sum_y = 0.0; s->sum_xy = 0.0;
+}
+
+static __device__ __forceinline__ void lca_linreg_reset(Lca_LinReg* s) {
+  for (int k = 0; k < s->period; ++k) s->buffer[k] = 0.0;
+  s->head = 0; s->count = 0; s->filled = false;
+  s->sum_y = 0.0; s->sum_xy = 0.0;
+}
+
+static __device__ __forceinline__ double lca_linreg_slope(const Lca_LinReg* s) {
+  if (s->period <= 1) return 0.0;
+  return fma(s->n, s->sum_xy, -s->sum_x * s->sum_y) * s->inv_denom;  // :414
+}
+
+static __device__ __forceinline__ double lca_linreg_forecast(const Lca_LinReg* s) {
+  if (s->period == 1) return s->buffer[(s->head + s->period - 1) % s->period];
+  const double slope = lca_linreg_slope(s);
+  const double mean_y = s->sum_y * s->inv_n;
+  return mean_y + slope * (s->forecast_x - s->mean_x);
+}
+
+static __device__ __forceinline__ bool lca_linreg_update_clean(Lca_LinReg* s, double value,
+                                                               double* forecast, double* slope) {
+  if (s->period == 1) {
+    s->buffer[0] = value; s->count = 1; s->filled = true;
+    *forecast = value; *slope = 0.0;
+    return true;
+  }
+  if (!s->filled) {
+    const double j = (double)s->count;
+    s->buffer[s->head] = value;
+    s->head += 1; if (s->head == s->period) s->head = 0;
+    s->sum_y += value;
+    s->sum_xy += j * value;
+    s->count += 1;
+    if (s->count < s->period) return false;
+    s->filled = true;
+    *forecast = lca_linreg_forecast(s);
+    *slope = lca_linreg_slope(s);
+    return true;
+  }
+  const double y_old = s->buffer[s->head];
+  s->buffer[s->head] = value;
+  const double new_sum_y = s->sum_y + value - y_old;
+  const double new_sum_xy = s->n * value + s->sum_xy - new_sum_y;
+  s->sum_y = new_sum_y;
+  s->sum_xy = new_sum_xy;
+  s->head += 1; if (s->head == s->period) s->head = 0;
+  *forecast = lca_linreg_forecast(s);
+  *slope = lca_linreg_slope(s);
+  return true;
+}
+
+extern "C" __global__
+void leavitt_convolution_acceleration_neo_batch_f64(const double* __restrict__ prices,
+                                                    int n,
+                                                    const int* __restrict__ periods,
+                                                    int n_combos,
+                                                    int first_valid,
+                                                    double* __restrict__ out) {
+  const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+  if (combo >= n_combos) return;
+  (void)periods;      // PERIOD-INVARIANT -- see the header.
+  (void)first_valid;  // FIRST-VALID IGNORED -- see the header.
+
+  if (n <= 0) return;
+  double* __restrict__ row = out + (size_t)combo * (size_t)n;
+  const double nn = lca_neo_qnan();
+  for (int i = 0; i < n; ++i) row[i] = nn;
+
+  const int length = LCA_NEO_LENGTH;
+  const int norm_length = LCA_NEO_NORM_LENGTH;
+  const int slope_length = LCA_NEO_SLOPE_LENGTH;
+
+  // prepare, :697-730. needed = length + sqrt_length + norm_length - 2, :298-301
+  if (length > n || norm_length > n) return;
+  int first = -1;
+  for (int i = 0; i < n; ++i) { if (isfinite(prices[i])) { first = i; break; } }
+  if (first < 0) return;
+  int valid = 0;
+  for (int i = first; i < n; ++i) if (isfinite(prices[i])) valid += 1;
+  if (valid < length + slope_length + norm_length - 2) return;
+
+  double src_buf[LCA_NEO_LENGTH];
+  double slope_buf[LCA_NEO_SLOPE_LENGTH];
+  double norm_buf[LCA_NEO_NORM_LENGTH];
+  Lca_LinReg src_proj, proj_slope;
+  lca_linreg_init(&src_proj, length, src_buf);
+  lca_linreg_init(&proj_slope, slope_length, slope_buf);
+
+  // RollingMeanStdState, :432-507.
+  int norm_head = 0, norm_count = 0;
+  bool norm_filled = false;
+  double norm_sum = 0.0, norm_sum_sq = 0.0;
+  for (int k = 0; k < norm_length; ++k) norm_buf[k] = 0.0;
+
+  double prev_scaled = 0.0, prev_conv_acceleration = 0.0, prev_slo = 0.0;
+  double prev_src1 = 0.0, prev_src2 = 0.0;
+  bool have_src1 = false, have_src2 = false;
+
+  for (int i = 0; i < n; ++i) {
+    const double value = prices[i];
+
+    if (!isfinite(value)) {
+      // reset(), :571-582.
+      lca_linreg_reset(&src_proj);
+      lca_linreg_reset(&proj_slope);
+      norm_head = 0; norm_count = 0; norm_filled = false;
+      norm_sum = 0.0; norm_sum_sq = 0.0;
+      for (int k = 0; k < norm_length; ++k) norm_buf[k] = 0.0;
+      prev_scaled = 0.0; prev_conv_acceleration = 0.0; prev_slo = 0.0;
+      prev_src1 = 0.0; prev_src2 = 0.0;
+      have_src1 = false; have_src2 = false;
+      continue;
+    }
+
+    const double src1 = have_src1 ? prev_src1 : 0.0;
+    const double src2 = have_src2 ? prev_src2 : 0.0;
+    const bool is_accelerated = (src2 - 2.0 * src1 + value) > 0.0;
+
+    double forecast = 0.0, dummy_slope = 0.0;
+    const bool have_forecast = lca_linreg_update_clean(&src_proj, value, &forecast, &dummy_slope);
+    if (!have_forecast) {
+      // bump_source_history, :679-686
+      if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+      prev_src1 = value; have_src1 = true;
+      continue;
+    }
+    if (!isfinite(forecast)) {
+      lca_linreg_reset(&proj_slope);
+      norm_head = 0; norm_count = 0; norm_filled = false;
+      norm_sum = 0.0; norm_sum_sq = 0.0;
+      for (int k = 0; k < norm_length; ++k) norm_buf[k] = 0.0;
+      prev_scaled = 0.0; prev_conv_acceleration = 0.0; prev_slo = 0.0;
+      if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+      prev_src1 = value; have_src1 = true;
+      continue;
+    }
+
+    double dummy_forecast = 0.0, conv_slope = 0.0;
+    const bool have_slope =
+        lca_linreg_update_clean(&proj_slope, forecast, &dummy_forecast, &conv_slope);
+    if (!have_slope) {
+      if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+      prev_src1 = value; have_src1 = true;
+      continue;
+    }
+    if (!isfinite(conv_slope)) {
+      norm_head = 0; norm_count = 0; norm_filled = false;
+      norm_sum = 0.0; norm_sum_sq = 0.0;
+      for (int k = 0; k < norm_length; ++k) norm_buf[k] = 0.0;
+      prev_scaled = 0.0; prev_conv_acceleration = 0.0; prev_slo = 0.0;
+      if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+      prev_src1 = value; have_src1 = true;
+      continue;
+    }
+
+    // RollingMeanStdState::update_clean, :479-506.
+    bool have_norm = true;
+    if (!norm_filled) {
+      norm_buf[norm_head] = conv_slope;
+      norm_head += 1; if (norm_head == norm_length) norm_head = 0;
+      norm_count += 1;
+      norm_sum += conv_slope;
+      norm_sum_sq += conv_slope * conv_slope;
+      if (norm_count < norm_length) have_norm = false;
+      else norm_filled = true;
+    } else {
+      const double old = norm_buf[norm_head];
+      norm_buf[norm_head] = conv_slope;
+      norm_head += 1; if (norm_head == norm_length) norm_head = 0;
+      norm_sum += conv_slope - old;
+      norm_sum_sq += conv_slope * conv_slope - old * old;
+    }
+    if (!have_norm) {
+      if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+      prev_src1 = value; have_src1 = true;
+      continue;
+    }
+
+    const double nf = (double)norm_length;
+    const double mean = norm_sum / nf;
+    const double variance = fmax(norm_sum_sq / nf - mean * mean, 0.0);
+    const double dev = sqrt(variance);
+
+    const double z = (dev != 0.0) ? ((conv_slope - mean) / dev) : 0.0;
+    // use_norm_hyperbolic is true by default -- hyperbolic(), :565-568.
+    const double e = exp(-z);
+    const double scaled = (1.0 - e) / (1.0 + e);
+
+    const double conv_acceleration = scaled - prev_scaled;
+    const double slo = conv_acceleration;  // hyperbolic branch, :651-655
+
+    prev_scaled = scaled;
+    prev_conv_acceleration = conv_acceleration;
+    prev_slo = slo;
+    if (have_src1) { prev_src2 = prev_src1; have_src2 = true; }
+    prev_src1 = value; have_src1 = true;
+
+    row[i] = conv_acceleration;
+    (void)is_accelerated;  // drives `signal`, which this lane does not emit
+  }
+}

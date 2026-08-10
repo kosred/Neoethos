@@ -88,7 +88,10 @@ pub struct CTraderSymbolsListResult {
 
 // ─── Cycle-3 Phase A — full ProtoOASymbol projection ────────────────────────
 //
-// Reference: proto/OpenApiModelMessages.proto:113-155 (ProtoOASymbol).
+// Reference: upstream `spotware/openapi-proto-messages`,
+// `OpenApiModelMessages.proto` (ProtoOASymbol). The vendored copy under
+// `crates/neoethos-app/proto/` was deleted in batch D2 (2026-08-09) together
+// with the protoc build step; the live wire format here is hand-rolled JSON.
 // All proto field numbers, units, and semantics quoted verbatim from
 // the official cTrader Open API spec at
 // https://help.ctrader.com/open-api/model-messages/#protooasymbol.
@@ -1302,8 +1305,10 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
     // on every connection before any data-bearing request, otherwise
     // the next request comes back as `ProtoOAErrorRes` (payloadType
     // 2142). Re-authenticate at the head of this sequence so the
-    // symbol-by-id call lands on an authenticated socket. Same fix
-    // applies to the trendbars sequence in `ctrader_history.rs`.
+    // symbol-by-id call lands on an authenticated socket. The same fix
+    // applies to the trendbars sequence in `broker_api.rs`
+    // (`download_history_blocking`) — `ctrader_history.rs`, named here until
+    // 2026-08-09, was a never-wired duplicate and was deleted in batch D2.
     let detail_responses = transport.send_sequence(&[
         build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-2"),
         build_account_auth_request(account_id, &request.access_token, "account-auth-2"),
@@ -1755,6 +1760,23 @@ mod tests {
             pnl_conversion_fee_rate: None,
             financials: None,
         };
+        // 2026-08-09: this fixture was FAILING on master before batch D2 touched
+        // anything — `cargo test -p neoethos-app --lib` reproduced it on an
+        // unmodified `ctrader_data.rs`. It was written for the pre-2026-07-18
+        // reading in which every `tick` was an absolute price. The 2026-07-18
+        // deep-audit fix (see `parse_tick_data_response` above) made `tick`
+        // delta-compressed like `timestamp` — decoded as
+        // `value[i] = value[i-1] - delta[i]` per the Spotware spec — but this
+        // hand-crafted payload was never updated, so the second entry decoded to
+        // 110120 - 110100 = 20 → 0.00020 instead of the asserted 1.10100.
+        // The timestamp half of the same fixture WAS updated (250 is a delta),
+        // which is why only the price assertion blew up.
+        //
+        // Fixed here by making the price a delta too: 110120 - 20 = 110100.
+        // The assertions are unchanged — they now describe what the shipped
+        // parser actually does. NOTE the file's own TODO(real-data) still
+        // stands: this is a synthetic payload, and the real gate on using tick
+        // download live is a captured broker response.
         let response = serde_json::json!({
             "clientMsgId": "ticks-1",
             "payloadType": 2146,
@@ -1767,7 +1789,7 @@ mod tests {
                     },
                     {
                         "timestamp": 250,
-                        "tick": 110100
+                        "tick": 20
                     }
                 ]
             }

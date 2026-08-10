@@ -722,7 +722,21 @@ static GLOBAL_TABLE: OnceLock<SymbolMetadataTable> = OnceLock::new();
 /// every reconcile, and the asset version is only used when no
 /// operator file exists yet.
 pub fn metadata_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("NEOETHOS_BOT_SYMBOL_METADATA") {
+    // MIGRATED 2026-08-09 (audit #144). This was a raw
+    // `std::env::var("NEOETHOS_BOT_SYMBOL_METADATA")` string literal
+    // that bypassed both the registry constant `ENV_SYMBOL_METADATA`
+    // and the typed getter. Symbol metadata is the denominator of
+    // every position size, so a registry rename would have silently
+    // stopped the operator's override applying with nothing failing.
+    //
+    // BEHAVIOUR CHANGE, deliberate: the getter trims the value and
+    // treats an empty / whitespace-only value as UNSET. The raw read
+    // accepted `NEOETHOS_BOT_SYMBOL_METADATA=""` and returned an
+    // empty path, which cannot exist, so `global_table()` fell
+    // through to the empty table and every `resolve` returned `None`.
+    // An empty value now falls back to `data/symbol_metadata.json`
+    // and the packaged asset, as an unset variable always did.
+    if let Some(p) = crate::env_overrides::symbol_metadata_path_override() {
         return std::path::PathBuf::from(p);
     }
     let cwd_path = std::path::PathBuf::from("data").join("symbol_metadata.json");

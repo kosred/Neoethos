@@ -535,3 +535,130 @@ void tilson_many_series_one_param_f32(const float* __restrict__ prices_tm,
         ++out_idx;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — tilson (T3)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/tilson.rs
+//   tilson_with_kernel (:242) — warm = first + 6*(period-1), NaN prefix
+//   tilson_scalar (:298)      — validation and the v_factor branch
+//   tilson_scalar_zero_volume (:467) — the path this lane takes
+//
+// WHICH PATH. get_volume_factor defaults to 0.0 (:128) and the batch supplies
+// no volume_factor, so tilson_scalar takes the v_factor == 0.0 branch at :327
+// EVERY TIME. With v = 0 the T3 combination collapses to the third EMA, so
+// c1..c4 are never evaluated and neither are e4/e5/e6. Writing the general T3
+// here and passing v = 0 would produce c4*e3 with c4 == 1.0 — algebraically
+// identical, numerically a further rounding. The zero-volume path is what the
+// reference runs and it is what is written.
+//
+// THE SEED SUM GROUPS BY FOUR. tilson_scalar_zero_volume :485-493 accumulates
+// sum += a + b + c + d in 4-wide chunks and then the remainder one at a time.
+// That association is NOT the same as summing ascending one at a time, and the
+// difference propagates through three EMA cascades. Reproduced exactly.
+//
+// ROUNDING. e1 = k*x + omk*e1 is spelled as two products and one add — THREE
+// roundings — and NOT as fma(k, x, omk*e1), which is two. The CPU does not use
+// mul_add here (:501, :512-513, :524-526) and neither does this kernel.
+//
+// One thread per column: three chained EMAs are a cross-bar recurrence.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_tilson_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // tilson_scalar :309-326 — every Err branch, with v_factor == 0 finite.
+    const long long lookback = (period > 0) ? 6LL * (long long)(period - 1) : 0LL;
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) ||
+        ((long long)(n - first_valid) < (long long)period) ||
+        (lookback + (long long)first_valid >= (long long)n);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int lb = 6 * (period - 1);
+    const int warm = first_valid + lb;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double k = 2.0 / ((double)period + 1.0);
+    const double omk = 1.0 - k;
+    const double inv_p = 1.0 / (double)period;
+
+    const int dp = first_valid;      // base index of the CPU dp pointer
+    int today = 0;
+
+    // Seed SMA, accumulated 4-wide then the tail — tilson.rs:484-493.
+    double sum = 0.0;
+    int i4 = 0;
+    while (i4 + 4 <= period) {
+        const int b = dp + today + i4;
+        sum += data[b] + data[b + 1] + data[b + 2] + data[b + 3];
+        i4 += 4;
+    }
+    while (i4 < period) {
+        sum += data[dp + today + i4];
+        i4 += 1;
+    }
+    double e1 = sum * inv_p;
+    today += period;
+
+    double acc = e1;
+    for (int j = 1; j < period; ++j) {
+        const double x = data[dp + today];
+        e1 = k * x + omk * e1;
+        acc += e1;
+        today += 1;
+    }
+    double e2 = acc * inv_p;
+
+    acc = e2;
+    for (int j = 1; j < period; ++j) {
+        const double x = data[dp + today];
+        e1 = k * x + omk * e1;
+        e2 = k * e1 + omk * e2;
+        acc += e2;
+        today += 1;
+    }
+    double e3 = acc * inv_p;
+
+    const int remaining = 3 * (period - 1);
+    for (int rr = 0; rr < remaining; ++rr) {
+        const double x = data[dp + today];
+        e1 = k * x + omk * e1;
+        e2 = k * e1 + omk * e2;
+        e3 = k * e2 + omk * e3;
+        today += 1;
+    }
+
+    // tilson.rs:531-532 — start_idx == first_valid + lookback_total == warm.
+    row[warm] = e3;
+
+    int o = warm + 1;
+    for (int idx = dp + today; idx < n; ++idx, ++o) {
+        const double x = data[idx];
+        e1 = k * x + omk * e1;
+        e2 = k * e1 + omk * e2;
+        e3 = k * e2 + omk * e3;
+        row[o] = e3;
+    }
+}

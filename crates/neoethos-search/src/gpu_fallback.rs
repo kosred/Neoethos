@@ -133,25 +133,31 @@ pub fn decide(failure: GpuFailure, require_gpu: bool) -> FallbackDecision {
     }
 }
 
-/// Legacy process-env reader. Unlike the old `is_ok()` behaviour, `0`,
-/// `false`, `no`, `off`, empty and unset are all false.
+/// Whether this run refuses a CPU recompute — read from the RESOLVED backend,
+/// not from the process environment.
+///
+/// 2026-08-10 (env→config wave): this was `env::var("NEOETHOS_REQUIRE_GPU")`.
+/// Two things were wrong with that beyond the env read itself. First, the
+/// crate had two different answers to one question — `backend.rs` resolved
+/// `FallbackPolicy` from config while every fallback site here consulted an
+/// env var that config could not set. Second, the env value was read on a hot
+/// path with no record of it in the resolved backend, so `device_summary`
+/// could report `AllowCpu` while this function was failing the run loud.
+///
+/// Now there is one source: the backend installed by
+/// `install_evaluation_backend_from_settings`. `gpu_required()` is
+/// `Gpu + ForbidCpu`, which is exactly what `*_required` in
+/// `system.enable_gpu_preference` / `models.prop_search_device` produces.
+///
+/// The function name is kept because `decide_env` and existing tests call it.
 pub fn require_gpu() -> bool {
-    std::env::var("NEOETHOS_REQUIRE_GPU")
-        .ok()
-        .and_then(|value| parse_bool(&value))
-        .unwrap_or(false)
+    crate::backend::current_evaluation_backend().gpu_required()
 }
 
+/// Name kept for the existing call sites; the `_env` suffix is now a lie about
+/// history, not about behaviour — see [`require_gpu`].
 pub fn decide_env(failure: GpuFailure) -> FallbackDecision {
     decide(failure, require_gpu())
-}
-
-fn parse_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "" | "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -302,15 +308,22 @@ mod tests {
         assert_eq!(sequence, vec![50, 25, 13, 7, 4]);
     }
 
+    /// Replaces `legacy_env_parser_handles_false_values`, deleted 2026-08-10
+    /// with the env parser it tested. The question it was really asking —
+    /// "does a strict-GPU run refuse the CPU?" — is now answered by the
+    /// resolved backend, so that is what is pinned here.
     #[test]
-    fn legacy_env_parser_handles_false_values() {
-        for value in ["", "0", "false", "NO", "off"] {
-            assert_eq!(parse_bool(value), Some(false));
-        }
-        for value in ["1", "true", "YES", "on"] {
-            assert_eq!(parse_bool(value), Some(true));
-        }
-        assert_eq!(parse_bool("maybe"), None);
+    fn the_cpu_refusal_comes_from_the_resolved_backend() {
+        // GPU + ForbidCpu is the only shape that refuses; nothing else does.
+        assert!(EvaluationBackend::GPU_REQUIRED.gpu_required());
+        assert!(!EvaluationBackend::GPU_PREFERRED.gpu_required());
+        assert!(!EvaluationBackend::AUTO.gpu_required());
+        // And `require_gpu()` reports whatever backend is installed for the
+        // process rather than an ambient variable nothing recorded.
+        assert_eq!(
+            require_gpu(),
+            crate::backend::current_evaluation_backend().gpu_required()
+        );
     }
 
     #[test]

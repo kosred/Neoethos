@@ -325,3 +325,136 @@ extern "C" __global__ void sar_many_series_one_param_time_major_f32(
         high_prev = hi;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — sar (Parabolic SAR)
+// ===========================================================================
+// Reference: src/indicators/sar.rs
+//   sar_with_kernel (:201) — first_valid, Err branches,
+//                            alloc_with_nan_prefix(len, first + 1)
+//   sar_scalar (:365)      — the state machine
+// Parameters are NOT swept: acceleration 0.02 and maximum 0.2, the defaults
+// dispatch/cuda.rs:5612-5613 resolves. PERIOD-INVARIANT.
+//
+// FIRST-VALID. The CPU scans high and low TOGETHER
+// (position(|(h,l)| !h.is_nan() && !l.is_nan()), :215) — the first bar at which
+// BOTH are non-NaN. That is exactly F64FirstValidRule::AllInputsNonNan over a
+// HighLow input, and it is why this kernel must not be handed an Ohlc ref:
+// close's first-NaN run would move the seed bar and every reversal after it.
+//
+// WARMUP IS first + 1, NOT first. out[first] is explicitly set to NaN by the
+// scalar itself (:391) and out[first+1] carries the seed SAR (:392).
+//
+// NaN SEMANTICS. min/max here are f64::min / f64::max (:415, :417, :428, :430)
+// and are written fmin/fmax, not comparison chains: with a NaN high or low the
+// CPU keeps the non-NaN operand and the state machine survives, whereas an
+// if-chain lets the NaN into sar and poisons every remaining bar.
+//
+// ROUNDING. acc.mul_add(ep - sar, sar) — one subtract, one fma. Two roundings.
+// acc*(ep-sar) + sar would be three.
+//
+// One thread per column: trend/ep/acc are carried state.
+// ===========================================================================
+
+#define NEO_S3_SAR_ACCELERATION 0.02
+#define NEO_S3_SAR_MAXIMUM      0.2
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_sar_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;   // PERIOD-INVARIANT — sar has no period parameter.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const double acceleration = NEO_S3_SAR_ACCELERATION;
+    const double maximum      = NEO_S3_SAR_MAXIMUM;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < 2);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int prefix = first_valid + 1;
+    for (int i = 0; i < prefix && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const int i0 = first_valid;
+    const int i1 = i0 + 1;
+
+    const double h0 = high[i0];
+    const double h1 = high[i1];
+    const double l0 = low[i0];
+    const double l1 = low[i1];
+
+    bool trend_up = (h1 > h0);
+    double sar = trend_up ? l0 : h0;
+    double ep  = trend_up ? h1 : l1;
+    double acc = acceleration;
+
+    row[i0] = neo_s3_qnan();   // sar.rs:391 — set by the scalar, not the prefix
+    row[i1] = sar;
+
+    double low_prev2  = l0;
+    double low_prev   = l1;
+    double high_prev2 = h0;
+    double high_prev  = h1;
+
+    for (int i = i1 + 1; i < n; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+
+        double next_sar = fma(acc, ep - sar, sar);
+
+        if (trend_up) {
+            if (lo < next_sar) {
+                trend_up = false;
+                next_sar = ep;
+                ep = lo;
+                acc = acceleration;
+            } else {
+                if (hi > ep) {
+                    ep = hi;
+                    acc = fmin(acc + acceleration, maximum);
+                }
+                next_sar = fmin(fmin(next_sar, low_prev), low_prev2);
+            }
+        } else {
+            if (hi > next_sar) {
+                trend_up = true;
+                next_sar = ep;
+                ep = hi;
+                acc = acceleration;
+            } else {
+                if (lo < ep) {
+                    ep = lo;
+                    acc = fmin(acc + acceleration, maximum);
+                }
+                next_sar = fmax(fmax(next_sar, high_prev), high_prev2);
+            }
+        }
+
+        row[i] = next_sar;
+        sar = next_sar;
+
+        low_prev2  = low_prev;
+        low_prev   = lo;
+        high_prev2 = high_prev;
+        high_prev  = hi;
+    }
+}

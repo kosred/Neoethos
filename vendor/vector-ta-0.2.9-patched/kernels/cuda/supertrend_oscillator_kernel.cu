@@ -175,3 +175,201 @@ extern "C" __global__ void supertrend_oscillator_batch_f64(
         have_hist = true;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — supertrend_oscillator
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/supertrend_oscillator.rs:640
+ *   supertrend_oscillator_row_fused_checked — the arm
+ *   supertrend_oscillator_row_fused (:474) takes whenever the frame is not
+ *   all-valid, and the one whose expressions the all-valid twin (:514)
+ *   repeats verbatim. Reproducing the checked form therefore reproduces both.
+ *
+ * Column: output_id "value" resolves to out.oscillator — cpu_batch.rs:12301
+ *   accepts "oscillator"/"value". signal and histogram are separate output
+ *   ids; their two recurrences are still ADVANCED here, because `ama` is
+ *   subtracted from `osc` to form the histogram input and the reset must
+ *   clear a consistent state — but only the oscillator is written.
+ *
+ * PERIOD-INVARIANT: compute_supertrend_oscillator_batch reads source
+ *   ("close"), length (10), mult (2.0) and smooth (72) and NEVER period
+ *   (cpu_batch.rs:12215-12218). Five swept periods give five identical CPU
+ *   columns, so this kernel emits five identical rows.
+ *
+ * FIRST-VALID IGNORED: the row walks EVERY bar from index 0 and RESETS the
+ *   ATR warm-up, both bands, the trend state and both smoothers on a bar that
+ *   fails valid_bar (:292 — all three finite AND high >= low). The caller's
+ *   first-valid index is never read.
+ *
+ * Input: high / low / source, and the CPU default source is close
+ *   (cpu_batch.rs:12215) — F64InputKind::Hlc.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. A Wilder ATR, two bands that
+ *   clamp against their own previous values, a latched trend state and two
+ *   EMA-shaped smoothers all carry across bars.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the true range is built by two COMPARISONS (`>` and `<`) selecting the
+ *     wider of the current bar and the previous close (:701-704), NOT by
+ *     fmax/fmin — the CPU writes it as an if-chain on values it has already
+ *     proved finite, and the tie behaviour is what is preserved.
+ *   * the ATR seed is warm_sum * atr_alpha (:711) — a SUM then ONE multiply
+ *     by the reciprocal, not a divide.
+ *   * the ATR step is atr_alpha.mul_add(true_range - atr, atr) (:720) — ONE
+ *     fma over a pre-formed difference. Two roundings total, and writing it
+ *     as (atr*(1-a) + a*tr) would be three.
+ *   * the band clamps ARE f64::min / f64::max (:730, :736), so fmin/fmax are
+ *     used: they return the non-NaN operand where an if-chain would let a NaN
+ *     through into the next bar's band.
+ *   * clamp_unit is f64::clamp(-1, 1) (:390), which is fmin(fmax(x,-1),1) and
+ *     PANICS on a NaN bound rather than propagating — the value here is a
+ *     finite quotient, and fmin/fmax reproduce the ordered case exactly.
+ *   * the two smoothers are prev + alpha * (x - prev) (:757, :764) — NOT an
+ *     fma, because the CPU line contains none.
+ *   * OUTPUT_SCALE is 100.0 (:33) and multiplies the value last (:770 ->
+ *     write_oscillator_values).
+ *   * there is no epsilon in this column: the only guard is the exact test
+ *     width != 0.0.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:12216-12218 (:30-33). */
+#define NEO_STO_LENGTH        10
+#define NEO_STO_MULT          2.0
+#define NEO_STO_SMOOTH        72
+#define NEO_STO_OUTPUT_SCALE  100.0
+
+extern "C" __global__
+void supertrend_oscillator_neo_batch_f64(const double* __restrict__ high,
+                                         const double* __restrict__ low,
+                                         const double* __restrict__ source,
+                                         int n,
+                                         const int* __restrict__ periods,
+                                         int n_combos,
+                                         int first_valid,
+                                         double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant — see header */
+    (void)first_valid; /* the mid-series reset reproduces it — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int length = NEO_STO_LENGTH;
+    /* validate_params (:865) refuses length > data_len. */
+    if (length > n) return;
+
+    const double mult       = NEO_STO_MULT;
+    const double atr_alpha  = 1.0 / (double)length;
+    const double hist_alpha = 2.0 / ((double)NEO_STO_SMOOTH + 1.0);
+    const double length_f64 = (double)length;
+
+    double prev_close = NEO_F64_NAN;
+    double atr = NEO_F64_NAN;
+    double warm_sum = 0.0;
+    int    warm_count = 0;
+    bool   seeded = false;
+
+    double prev_source = NEO_F64_NAN;
+    double prev_upper  = NEO_F64_NAN;
+    double prev_lower  = NEO_F64_NAN;
+    double prev_trend  = 0.0;
+    bool   ama_seeded = false, hist_seeded = false;
+    double ama_prev = 0.0, hist_prev = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double hi  = high[i];
+        const double lo  = low[i];
+        const double src = source[i];
+
+        if (!(isfinite(hi) && isfinite(lo) && isfinite(src) && hi >= lo)) {
+            o[i] = NEO_F64_NAN;
+            prev_close = NEO_F64_NAN;
+            atr = NEO_F64_NAN;
+            warm_sum = 0.0; warm_count = 0; seeded = false;
+            prev_source = NEO_F64_NAN;
+            prev_upper  = NEO_F64_NAN;
+            prev_lower  = NEO_F64_NAN;
+            prev_trend  = 0.0;
+            ama_seeded = false; hist_seeded = false;
+            ama_prev = 0.0; hist_prev = 0.0;
+            continue;
+        }
+
+        double true_range;
+        if (isnan(prev_close)) {
+            true_range = hi - lo;
+        } else {
+            const double up = (hi > prev_close) ? hi : prev_close;
+            const double dn = (lo < prev_close) ? lo : prev_close;
+            true_range = up - dn;
+        }
+        prev_close = src;
+
+        if (!seeded) {
+            warm_sum += true_range;
+            ++warm_count;
+            if (warm_count == length) {
+                atr = warm_sum * atr_alpha;
+                seeded = true;
+            } else {
+                o[i] = NEO_F64_NAN;
+                prev_source = src;
+                continue;
+            }
+        } else {
+            atr = fma(atr_alpha, true_range - atr, atr);
+        }
+
+        const double mid  = 0.5 * (hi + lo);
+        const double band = atr * mult;
+        const double up_b = mid + band;
+        const double dn_b = mid - band;
+
+        const double upper =
+            (isfinite(prev_source) && isfinite(prev_upper) && prev_source < prev_upper)
+                ? fmin(up_b, prev_upper) : up_b;
+        const double lower =
+            (isfinite(prev_source) && isfinite(prev_lower) && prev_source > prev_lower)
+                ? fmax(dn_b, prev_lower) : dn_b;
+
+        double trend;
+        if      (isfinite(prev_upper) && src > prev_upper) trend = 1.0;
+        else if (isfinite(prev_lower) && src < prev_lower) trend = 0.0;
+        else                                               trend = prev_trend;
+
+        const double supertrend = trend * lower + (1.0 - trend) * upper;
+        const double width = upper - lower;
+        double osc;
+        if (isfinite(width) && width != 0.0) {
+            const double raw = (src - supertrend) / width;
+            osc = fmin(fmax(raw, -1.0), 1.0);   /* clamp_unit (:390) */
+        } else {
+            osc = 0.0;
+        }
+
+        const double alpha = (osc * osc) / length_f64;
+        double ama;
+        if (ama_seeded) ama = ama_prev + alpha * (osc - ama_prev);
+        else            { ama = osc; ama_seeded = true; }
+
+        const double diff = osc - ama;
+        double hist;
+        if (hist_seeded) hist = hist_prev + hist_alpha * (diff - hist_prev);
+        else             { hist = diff; hist_seeded = true; }
+
+        o[i] = osc * NEO_STO_OUTPUT_SCALE;
+
+        prev_source = src;
+        prev_upper  = upper;
+        prev_lower  = lower;
+        prev_trend  = trend;
+        ama_prev    = ama;
+        hist_prev   = hist;
+    }
+}

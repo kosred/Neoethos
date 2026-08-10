@@ -51,6 +51,11 @@ impl SignalEngine for MomentumStubSignal {
             dir,
             confidence: self.confidence,
             source: SignalSource::Strategy,
+            // A stub momentum rule has no strategy bracket to offer. The
+            // DecisionEngine therefore falls back to its synthetic
+            // stop_frac bracket AND says so — see audit #226 / #224.
+            sl_pips: 0.0,
+            tp_pips: 0.0,
         }
     }
 }

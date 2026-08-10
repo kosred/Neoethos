@@ -65,10 +65,16 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Audit #119: this banner used to send the operator to a credentials
+          form that had never existed anywhere in `desktop/src`. The form now
+          exists — Settings → "cTrader API credentials" — so the instruction is
+          true for the first time. Keep the two steps in the order the backend
+          requires: credentials first, then the one-time OAuth. */}
       {!status?.configured && (
         <div className="banner warn">
-          Broker not configured yet — go to <b>Settings</b> and add cTrader credentials, then
-          Re-authenticate once.
+          Broker not configured yet — open <b>Settings → cTrader API credentials</b>, paste the
+          Client ID and Secret from your cTrader Open API application, save, then press{" "}
+          <b>Authenticate cTrader</b> once.
         </div>
       )}
       {status?.configured && err && (

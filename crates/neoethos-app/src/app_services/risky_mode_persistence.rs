@@ -284,8 +284,24 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
 }
 
 /// **F-231/F-501/F-630 closure (2026-05-25)** — record a kill-switch
-/// trip on the persistent state file. Called from the trading order
-/// path when `RiskyModeManager::check_trade_allowed` returns `Err`.
+/// trip on the persistent state file.
+///
+/// **Two producers as of 2026-08-09** (this list was "one" until #238 landed;
+/// keep it accurate — a reader who believes there is only one will reason
+/// wrongly about why a cooldown appeared):
+/// 1. `live_trading::run` (`:1967-1985`) — an account-level tier of
+///    `RiskyModeManager::check_trade_allowed` returned `Err`
+///    (`PerDay` / `PerStage` / `PerMonth`), i.e. the bankroll is in trouble.
+/// 2. `app_services::margin_call::arm` — the broker reports a MARGIN CALL, or
+///    has been unreachable long enough that the account's margin level is
+///    unknown. This is the `HardwareConnLoss`-class halt that
+///    `live_trading.rs:263` recorded as having "no producer".
+///
+/// Note the asymmetry, deliberately stated: the cooldown this writes is read
+/// by `live_trading` only under `trading_mode_risky` (`:1597`). Producer (2)
+/// therefore ALSO holds a mode-independent, process-local halt at the broker
+/// boundary (`broker_api::prepare_new_order`), because a margin call must stop
+/// prop-firm-mode entries too.
 ///
 /// Effect:
 /// - `armed = false` (kill-switch active)
@@ -295,10 +311,17 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
 /// `auto_rearm_ready` every 5 s; once the 24 h cooldown elapses it
 /// calls `auto_re_arm_if_ready` (below) to flip `armed = true` and
 /// clear `last_killed_at_utc_ms` automatically.
-// `dead_code` because it's called only by the autonomous risk gate
-// (`RiskyModeManager::check_trade_allowed` on the live auto-trade path), which is
-// Phase 2-5 pending. The 24h auto-rearm reader (`auto_re_arm_if_ready`) is live.
-#[allow(dead_code)]
+///
+/// **2026-08-09 (W3) — the `#[allow(dead_code)]` is GONE, and that is the
+/// point.** The attribute used to read "called only by the autonomous risk
+/// gate ... which is Phase 2-5 pending", and it was the compiler-verified
+/// proof that nothing could ever set `armed = false` or start the cooldown
+/// clock. Meanwhile `bridge.rs:240` re-armed every 5 s and `server/risk.rs`
+/// rendered a cooldown the operator could never see move. The writer is now
+/// wired: `live_trading::run` calls this on the account-level `Err` branch of
+/// `RiskyModeManager::check_trade_allowed`. Do NOT re-add the attribute to
+/// silence a warning — if this ever goes callerless again, that is a defect
+/// to fix, not a lint to suppress.
 pub fn record_kill_switch_trip() -> Result<()> {
     let mut state = load_risky_mode_state()
         .context("load risky mode state before kill-switch trip")?
@@ -351,6 +374,48 @@ pub fn auto_re_arm_if_ready() -> Result<bool> {
     Ok(true)
 }
 
+/// Seconds still to run on the Risky Mode kill-switch cooldown, or `None` when
+/// there is no kill on record / the 24 h has already elapsed.
+///
+/// **2026-08-09 (W3)**: this is the read side of the halt that
+/// [`record_kill_switch_trip`] writes, and it is what makes the trip survive an
+/// app restart. The in-process [`neoethos_core::domain::risky_mode::RiskyModeManager`]
+/// loses its accumulators and its sticky halt when the process dies; the
+/// persisted timestamp does not. `live_trading::run` consults this before every
+/// Risky-Mode entry, so a tripped kill switch keeps refusing entries across
+/// restarts until `auto_re_arm_if_ready` (bridge poll, 5 s) clears it 24 h later.
+///
+/// Deliberately reads ONLY `last_killed_at_utc_ms`, never `armed`: `armed` is
+/// the wizard's arm flag and is `false` for an operator who never ran the
+/// (now-deleted Flutter) wizard, so gating on it would refuse every Risky-Mode
+/// entry forever for a reason that has nothing to do with risk.
+/// **FAIL-CLOSED (2026-08-09 correction).** This used to be
+/// `load_risky_mode_state().ok().flatten()`, and `.ok()` decided in favour of
+/// trading: a corrupt, truncated, permission-denied or unparseable
+/// `risky_mode_state.json` turned an ACTIVE 24 h halt into `None`, which
+/// `live_trading` reads as "not halted" and lets the entry through. It was the
+/// only place in this wave that resolved an error toward SEND.
+///
+/// "We cannot tell whether the kill switch is tripped" now means REFUSE: an
+/// unreadable state file reports a full cooldown remaining, loudly. `Ok(None)`
+/// — genuinely no file, the first-run case — still permits trading, which is
+/// the only path that should.
+pub fn kill_switch_cooldown_remaining_secs() -> Option<u64> {
+    match load_risky_mode_state() {
+        Ok(state) => state.and_then(|s| s.cooldown_remaining_secs(current_unix_ms())),
+        Err(e) => {
+            tracing::error!(
+                target: "neoethos_app::risky_mode_persistence",
+                error = %e,
+                "the Risky Mode state file could not be read, so it is UNKNOWN whether \
+                 the kill switch is tripped — treating it as TRIPPED and refusing \
+                 Risky-Mode entries. Fix or delete the file to clear this."
+            );
+            Some(RISKY_MODE_AUTO_REARM_COOLDOWN_MS as u64 / 1000)
+        }
+    }
+}
+
 /// Load the Risky Mode arm state from disk.
 ///
 /// Returns `Ok(None)` when no file exists yet — the safe default is
@@ -398,8 +463,9 @@ pub fn load_risky_mode_state() -> Result<Option<RiskyModeStateFile>> {
     Ok(Some(state))
 }
 
-// Used by save_risky_mode_state to stamp last_updated_utc_ms.
-#[allow(dead_code)]
+// Used by save_risky_mode_state to stamp last_updated_utc_ms, by
+// record_kill_switch_trip / auto_re_arm_if_ready, and by
+// kill_switch_cooldown_remaining_secs.
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -344,3 +344,248 @@ extern "C" __global__ void grover_llorens_cycle_oscillator_batch_f64(
         valid_src_count = i - segment_start + 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/grover_llorens_cycle_oscillator.rs:659
+// (grover_llorens_cycle_oscillator_with_kernel). SINGLE OUTPUT --
+// compute_grover_llorens_cycle_oscillator_batch calls expect_value_output
+// (cpu_batch.rs:9063) -- so the column below IS the value column.
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential, and this one
+// is a stack of four carried machines: a Wilder ATR, a trailing-stop ratchet
+// whose step size is frozen at the last EVENT bar and then paid out per bar
+// since, an EMA smoother, and a streaming Wilder RSI over the smoothed
+// oscillator. The CPU clears all four at a non-finite bar and restarts the
+// segment.
+//
+// PERIOD-INVARIANT. compute_grover_llorens_cycle_oscillator_batch
+// (cpu_batch.rs:9073-9088) reads length, mult, source, smooth and rsi_period
+// and NEVER period, so five swept periods give five identical CPU columns and
+// this kernel emits five identical rows. Every CPU default is pinned below,
+// including source "close" (SOURCE_CLOSE) and smooth = true.
+//
+// INPUT SHAPE: at the pinned source, open is never read -- source_needs_open
+// is false for SOURCE_CLOSE. The lane row still declares F64InputKind::Ohlc4
+// so the four-pointer launch arm hands source_value the argument list it
+// declares, rather than a three-pointer arm leaving the fourth to whatever
+// followed on the stack. That is the same reason the shard-3 aso variant is
+// Ohlc4.
+//
+// FIRST VALID IS NOT READ: the CPU walks from bar 0 and restarts the segment
+// at every invalid bar; valid_src_count is measured from the segment start,
+// not from a global index. The lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fmax/fmin/fabs, `fma` for the two
+// recurrences the CPU writes with mul_add (the RSI averages and the EMA), and
+// no fast-math intrinsic. FLOAT_TOL is 1e-12 -- an f64-sized tie tolerance on
+// a price comparison, not an f32 epsilon carried forward (rule 2).
+// ---------------------------------------------------------------------------
+
+#define NEO_GLCO_LENGTH 100
+#define NEO_GLCO_MULT 10.0
+#define NEO_GLCO_SOURCE SOURCE_CLOSE
+#define NEO_GLCO_SMOOTH 1
+#define NEO_GLCO_RSI_PERIOD 20
+
+extern "C" __global__ void grover_llorens_cycle_oscillator_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int length = NEO_GLCO_LENGTH;
+    const double mult = NEO_GLCO_MULT;
+    const int source_kind = NEO_GLCO_SOURCE;
+    const int smooth = NEO_GLCO_SMOOTH;
+    const int rsi_period = NEO_GLCO_RSI_PERIOD;
+
+    if (length <= 0 || !isfinite(mult) || rsi_period <= 0 || source_kind < SOURCE_OPEN ||
+        source_kind > SOURCE_HLCC4) {
+        return;
+    }
+
+    const double ema_alpha = 2.0 / (static_cast<double>(rsi_period) + 1.0);
+
+    RsiStreamState rsi;
+    rsi.init(rsi_period);
+
+    int segment_start = 0;
+    int valid_src_count = 0;
+    bool have_prev_src = false;
+    double prev_src = NAN;
+    bool have_prev_close = false;
+    double prev_close = NAN;
+    int atr_seed_count = 0;
+    double atr_seed_sum = 0.0;
+    bool have_atr = false;
+    double atr_value = NAN;
+    int os = 0;
+    bool have_prev_diff = false;
+    double prev_diff = NAN;
+    bool have_prev_ts = false;
+    double prev_ts = NAN;
+    bool have_last_event_step = false;
+    double last_event_step = NAN;
+    int bars_since_event = 0;
+    bool have_ema_value = false;
+    double ema_value = NAN;
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!valid_bar(source_kind, o, h, l, c)) {
+            rsi.reset();
+            segment_start = i + 1;
+            valid_src_count = 0;
+            have_prev_src = false;
+            prev_src = NAN;
+            have_prev_close = false;
+            prev_close = NAN;
+            atr_seed_count = 0;
+            atr_seed_sum = 0.0;
+            have_atr = false;
+            atr_value = NAN;
+            os = 0;
+            have_prev_diff = false;
+            prev_diff = NAN;
+            have_prev_ts = false;
+            prev_ts = NAN;
+            have_last_event_step = false;
+            last_event_step = NAN;
+            bars_since_event = 0;
+            have_ema_value = false;
+            ema_value = NAN;
+            continue;
+        }
+
+        const double src = source_value(source_kind, o, h, l, c);
+        const double diff = have_prev_src ? (src - (have_prev_ts ? prev_ts : prev_src)) : NAN;
+
+        const double tr = have_prev_close
+            ? fmax(h - l, fmax(fabs(h - prev_close), fabs(l - prev_close)))
+            : (h - l);
+        prev_close = c;
+        have_prev_close = true;
+        if (atr_seed_count < length) {
+            atr_seed_count += 1;
+            atr_seed_sum += tr;
+            if (atr_seed_count == length) {
+                atr_value = atr_seed_sum / static_cast<double>(length);
+                have_atr = true;
+            }
+        } else if (have_atr) {
+            atr_value = ((static_cast<double>(length - 1) * atr_value) + tr) /
+                static_cast<double>(length);
+        }
+
+        bool rising = false;
+        bool falling = false;
+        if (valid_src_count >= length) {
+            double max_prev = open[0];
+            double min_prev = open[0];
+            bool first_prev = true;
+            const int start = i - length;
+            for (int j = start; j < i; ++j) {
+                const double prior_src =
+                    source_value(source_kind, open[j], high[j], low[j], close[j]);
+                if (first_prev) {
+                    max_prev = prior_src;
+                    min_prev = prior_src;
+                    first_prev = false;
+                } else {
+                    max_prev = fmax(max_prev, prior_src);
+                    min_prev = fmin(min_prev, prior_src);
+                }
+            }
+            if (!first_prev) {
+                rising = src > max_prev + FLOAT_TOL;
+                falling = src < min_prev - FLOAT_TOL;
+            }
+        }
+
+        const int prev_os = os;
+        const int new_os = rising ? 1 : (falling ? -1 : prev_os);
+        const double prev_diff_value = have_prev_diff ? prev_diff : NAN;
+        const bool rise =
+            (new_os - prev_os == 2) && isfinite(prev_diff_value) && prev_diff_value < 0.0;
+        const bool fall =
+            (new_os - prev_os == -2) && isfinite(prev_diff_value) && prev_diff_value > 0.0;
+        const bool up =
+            isfinite(prev_diff_value) && prev_diff_value <= 0.0 && isfinite(diff) && diff > 0.0;
+        const bool dn =
+            isfinite(prev_diff_value) && prev_diff_value >= 0.0 && isfinite(diff) && diff < 0.0;
+        const bool event = up || dn || rise || fall;
+
+        double ts = NAN;
+        if (have_atr) {
+            const double step = atr_value / static_cast<double>(length);
+            if (event) {
+                last_event_step = step;
+                have_last_event_step = true;
+                bars_since_event = 0;
+            } else if (have_last_event_step) {
+                bars_since_event += 1;
+            }
+
+            const double prev_ts_or_src = have_prev_ts ? prev_ts : src;
+            if (up) {
+                ts = prev_ts_or_src - atr_value * mult;
+            } else if (dn) {
+                ts = prev_ts_or_src + atr_value * mult;
+            } else if (rise) {
+                ts = src - atr_value * mult;
+            } else if (fall) {
+                ts = src + atr_value * mult;
+            } else if (have_last_event_step) {
+                ts = prev_ts_or_src + signum_with_tol(diff) * last_event_step *
+                    static_cast<double>(bars_since_event);
+            }
+        }
+
+        if (isfinite(ts)) {
+            const double osc = src - ts;
+            const double smoothed = smooth != 0
+                ? (have_ema_value ? fma(ema_alpha, osc, (1.0 - ema_alpha) * ema_value) : osc)
+                : osc;
+            ema_value = smoothed;
+            have_ema_value = true;
+
+            bool rsi_ready = false;
+            row[i] = rsi.update(smoothed, &rsi_ready);
+            if (!rsi_ready) {
+                row[i] = NAN;
+            }
+        }
+
+        prev_src = src;
+        have_prev_src = true;
+        prev_diff = diff;
+        have_prev_diff = isfinite(diff);
+        prev_ts = ts;
+        have_prev_ts = isfinite(ts);
+        os = new_os;
+        valid_src_count = i - segment_start + 1;
+    }
+}

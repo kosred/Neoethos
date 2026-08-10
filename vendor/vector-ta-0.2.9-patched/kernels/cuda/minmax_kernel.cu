@@ -445,3 +445,103 @@ void forward_fill_two_streams_f32(const float* __restrict__ in_is_min,
         __syncthreads();
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — minmax  (local extrema of order `order`)
+// ===========================================================================
+// Reference: src/indicators/minmax.rs
+//   `minmax_into_slice` (:182) — first_valid_pair(high, low), refusals, prefix
+//   `minmax_scalar`     (:675) — the small-order direct predicate AND the
+//                                 block-decomposition path for order > 8
+//   Batch route: `cpu_batch.rs:15426` sweeps `order`; the "value" output is
+//   `is_min` (`:15442`), which is what this kernel emits.
+//
+// INPUT IS (high, low) WITH NO CLOSE, and `first_valid_pair` scans exactly
+// those two — so the registry row is `HighLow`, not `Hlc`. Handing it an Ohlc
+// ref would adopt close's first-valid and shift the series.
+//
+// WHY ONE IMPLEMENTATION IS ENOUGH FOR ALL ORDERS, AND WHY THAT IS NOT A
+// SHORTCUT. `minmax` performs NO ARITHMETIC. Every value it writes is either
+// NaN or a copy of an input, and every decision is a comparison or an
+// `is_finite` test. The CPU's three paths — the `order <= 8` direct scan
+// (:726), the `order == 3 && len >= 50_000` specialisation (:711) and the
+// block decomposition (:790) — therefore produce BIT-IDENTICAL output; they
+// differ only in how many comparisons they perform. So the direct O(order)
+// predicate below is exact for every order, not an approximation of the fast
+// path. (Contrast every other kernel in this shard, where a different
+// algorithm means different roundings and the CPU's order is the spec.)
+//
+// THE PREDICATE, exactly as the CPU writes it:
+//   * a bar is a candidate only when `i >= order && i + order < len` —
+//     STRICTLY less, so the last `order` bars can never be extrema;
+//   * both the current high and low must be FINITE (not merely non-NaN: an
+//     infinity is rejected too);
+//   * min: for every o in 1..=order, low[i-o] and low[i+o] finite AND
+//     low[i] < both — STRICT on both sides, so a flat bottom is not a min;
+//   * max: the mirror, on `high`.
+//
+// `last_min` / `last_max` carry the last FINITE extremum forward and start as
+// NaN. Not emitted by the "value" output but computed here anyway would be
+// dead code, so they are not computed.
+//
+// f32 hazards fixed: `fmaxf`x5 / `fminf`x5 -> comparisons (the CPU's local
+// `fmin`/`fmax` helpers at :685 and :694 are IF-CHAINS, not `f64::min`, and
+// this kernel does not need them at all); 26 f32-bit-pattern NaNs -> the f64
+// quiet NaN.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_minmax_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int order = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (order <= 0) || (order > n) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < order);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    for (int i = 0; i < first_valid; ++i) row[i] = neo_s2_qnan();
+
+    for (int i = first_valid; i < n; ++i) {
+        double min_here = neo_s2_qnan();
+
+        if (i >= order && (i + order) < n) {
+            const double cl = low[i];
+            const double ch = high[i];
+            if (isfinite(ch) && isfinite(cl)) {
+                bool less_than_neighbors = true;
+                for (int o = 1; o <= order; ++o) {
+                    const double ll = low[i - o];
+                    const double rl = low[i + o];
+                    if (!(isfinite(ll) && isfinite(rl)) || !(cl < ll && cl < rl)) {
+                        less_than_neighbors = false;
+                        break;
+                    }
+                }
+                if (less_than_neighbors) min_here = cl;
+            }
+        }
+
+        row[i] = min_here;
+    }
+}

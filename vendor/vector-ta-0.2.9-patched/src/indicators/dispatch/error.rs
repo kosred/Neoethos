@@ -29,4 +29,24 @@ pub enum IndicatorDispatchError {
     KernelUnavailable { details: String },
     #[error("compute failed for indicator '{indicator}': {details}")]
     ComputeFailed { indicator: String, details: String },
+    /// An f64 CUDA request named an indicator that has no f64 kernel.
+    ///
+    /// This is deliberately a HARD failure with the indicator named. The two
+    /// tempting alternatives are both already present in this crate and both
+    /// are wrong here:
+    ///
+    /// * serving the f32 kernel — indicator values feed a
+    ///   `combined >= long_threshold` comparison, so a one-ULP move flips a
+    ///   trade, and the f32 lane was measured 54% wrong at 200k bars;
+    /// * computing on the host and returning it as device work — which is
+    ///   exactly what the nine empty `*_f64` stub kernels and their wrappers do
+    ///   today (`possible_rsi_wrapper.rs:104-152`).
+    #[error(
+        "no f64 CUDA kernel for indicator '{indicator}'. The f64 lane does not fall back to f32 \
+         and does not fall back to the CPU. Indicators with an f64 kernel: {available}"
+    )]
+    CudaF64KernelMissing {
+        indicator: String,
+        available: String,
+    },
 }

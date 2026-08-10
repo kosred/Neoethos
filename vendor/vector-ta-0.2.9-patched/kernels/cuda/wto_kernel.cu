@@ -336,3 +336,157 @@ void wto_many_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — wto (WaveTrend Oscillator, wt1)
+// ===========================================================================
+// Reference: src/indicators/wto.rs
+//   wto_prepare (:363)      — first_valid + the Err branches
+//   wto_with_kernel (:244)  — ci_start, warm_wt1 == ci_start
+//   wto_scalar (:771)       — the arithmetic
+//
+// WHICH OUTPUT. wto is multi-output (wavetrend1 / wavetrend2 / histogram).
+// compute_wto_batch maps output_id "value" — what this lane requests — to
+// wavetrend1, so this kernel is wt1 and its warmup is warm_wt1 == ci_start,
+// NOT the ci_start + 3 that wt2 and the histogram use.
+//
+// PERIOD-INVARIANT. compute_wto_batch reads channel_length (10) and
+// average_length (21); it never reads `period`.
+//
+// THE RECURRENCE IS GUARDED BY is_finite, AND THE GUARD IS THE POINT.
+// esa, d and tci are only updated when the sample is finite (:806, :860-864,
+// :876-878). A non-finite bar therefore FREEZES the filter state and re-emits
+// the previous tci rather than poisoning it — the opposite of what a naive
+// recursion does. This is the NaN-survival rule of the brief seen from the
+// other side: matching the reference means matching where it refuses to update,
+// not only where it uses fmax.
+//
+// fast_abs (:782) is a bit mask, not fabs: from_bits(bits & 0x7FFF_FFFF_FFFF_FFFF).
+// For every input these agree bit for bit — including on NaN, where both clear
+// the sign and preserve the payload — so fabs() is used and the equivalence is
+// stated rather than assumed.
+//
+// ROUNDING.
+//   esa = beta_e.mul_add(esa, alpha_e * x)   → product, then ONE fma
+//   d   = beta_e.mul_add(d,   alpha_e * ad)  → same
+//   tci = beta_t.mul_add(tci, alpha_t * ci)  → same
+// Two roundings each, not three. The 0.015 constant and the 0.25 signal divisor
+// are copied from the reference (:820-821) unchanged; both are exact in binary
+// only for 0.25, and 0.015 is a repeating fraction whose f32 and f64 nearest
+// values differ in the 8th significant digit — one more reason the f32 lane
+// cannot be a rounding of this one.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_WTO_CHANNEL 10
+#define NEO_S3_WTO_AVERAGE 21
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_wto_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;   // PERIOD-INVARIANT — see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const int channel_length = NEO_S3_WTO_CHANNEL;
+    const int average_length = NEO_S3_WTO_AVERAGE;
+
+    const int needed_a = channel_length + 3;
+    const int needed_b = average_length + 3;
+    const int needed = (needed_a > needed_b) ? needed_a : needed_b;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (channel_length == 0) || (channel_length > n) ||
+        (average_length == 0) || (average_length > n) ||
+        ((n - first_valid) < needed);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int ci_start = first_valid + (channel_length - 1);
+    const int warm_wt1 = ci_start;
+    for (int i = 0; i < warm_wt1 && i < n; ++i) row[i] = neo_s3_qnan();
+    if (ci_start >= n) return;
+
+    const double alpha_e = 2.0 / ((double)channel_length + 1.0);
+    const double beta_e  = 1.0 - alpha_e;
+    const double alpha_t = 2.0 / ((double)average_length + 1.0);
+    const double beta_t  = 1.0 - alpha_t;
+
+    const double k015 = 0.015;
+
+    double esa = data[first_valid];
+
+    for (int i = first_valid + 1; i < ci_start; ++i) {
+        const double x = data[i];
+        if (isfinite(x)) {
+            esa = fma(beta_e, esa, alpha_e * x);
+        }
+    }
+
+    double d = 0.0;
+    double tci = 0.0;
+
+    {
+        const double x = data[ci_start];
+        if (isfinite(x)) {
+            esa = fma(beta_e, esa, alpha_e * x);
+        }
+        const double abs_diff = isfinite(x) ? fabs(x - esa) : neo_s3_qnan();
+        d = abs_diff;
+
+        const double denom = k015 * d;
+        double ci;
+        if (denom != 0.0 && isfinite(denom)) {
+            ci = isfinite(x) ? ((x - esa) / denom) : neo_s3_qnan();
+        } else {
+            ci = 0.0;
+        }
+
+        tci = ci;
+        row[ci_start] = tci;
+    }
+
+    for (int i = ci_start + 1; i < n; ++i) {
+        const double x = data[i];
+        const bool x_fin = isfinite(x);
+
+        if (x_fin) {
+            esa = fma(beta_e, esa, alpha_e * x);
+            const double ad = fabs(x - esa);
+            d = fma(beta_e, d, alpha_e * ad);
+        }
+
+        double ci = 0.0;
+        if (x_fin) {
+            const double denom = k015 * d;
+            if (denom != 0.0 && isfinite(denom)) {
+                ci = (x - esa) / denom;
+            }
+        } else {
+            ci = neo_s3_qnan();
+        }
+
+        if (isfinite(ci)) {
+            tci = fma(beta_t, tci, alpha_t * ci);
+        }
+
+        row[i] = tci;
+    }
+}

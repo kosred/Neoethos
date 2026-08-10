@@ -315,3 +315,65 @@ extern "C" __global__ void obv_many_series_one_param_time_major_f32(
         prev_close = c;
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — obv
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/obv.rs:197 `obv_scalar`.
+ *
+ * PERIOD-INVARIANT: `compute_obv_batch` takes `|_params|`, so every row of a
+ * period sweep is byte-identical. Faithful, not a defect — reported rather
+ * than silently deduplicated.
+ *
+ * The f32 file above is a three-pass block scan (`pass1_tilescan` ->
+ * `scan_block_sums` -> `add_offsets`). A block scan RE-ASSOCIATES the running
+ * sum, which is exactly what must not happen to a value fed to a threshold
+ * comparison, so this lane uses the serial shape the CPU uses.
+ *
+ * sign is `((c > prev) as i32 - (c < prev) as i32) as f64` — at c == prev, and
+ * at NaN, BOTH comparisons are false and the sign is 0.0, so the running total
+ * is carried unchanged. A `c > prev ? 1 : -1` chain would push volume on a NaN
+ * bar instead.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void obv_neo_batch_f64(const double* __restrict__ close,
+                       const double* __restrict__ volume,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;                       // period-invariant, see above
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+
+    if (first_valid < 0 || first_valid >= len) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    for (int i = 0; i < first_valid; ++i) o[i] = NEO_F64_NAN;
+
+    double prev_obv = 0.0;
+    double prev_close = close[first_valid];
+    o[first_valid] = 0.0;
+
+    for (int i = first_valid + 1; i < len; ++i) {
+        const double c = close[i];
+        const double v = volume[i];
+        const double s = (double)((int)(c > prev_close) - (int)(c < prev_close));
+        prev_obv = fma(v, s, prev_obv);      // v.mul_add(s, prev_obv)
+        o[i] = prev_obv;
+        prev_close = c;
+    }
+}

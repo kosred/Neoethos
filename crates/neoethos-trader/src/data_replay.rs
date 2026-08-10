@@ -9,12 +9,79 @@
 use std::path::Path;
 
 use crate::contracts::{LiveBar, PortfolioEntry, StrategySource, TradeMode};
-use crate::decision::DecisionEngine;
-use crate::engine::{AutonomousEngine, EngineConfig, EngineStats};
+use crate::decision::{DecisionConfig, DecisionEngine};
+use crate::engine::{AutonomousEngine, DEFAULT_REPLAY_STARTING_BALANCE, EngineConfig, EngineStats};
 use crate::execution::MockExecutionAdapter;
 use crate::portfolio::PortfolioRegistry;
 use crate::risk::PermissiveRiskGate;
 use crate::signal::MomentumStubSignal;
+
+/// Enumerate every way THIS replay is not the operator's strategy, attach the
+/// list to the stats, and shout it into the log (audit #220–#231).
+///
+/// A diagnostic that gives wrong diagnostics is worse than no diagnostic. Until
+/// this list is empty, the numbers below it may not be compared with live
+/// results, and the operator should be able to see that without reading the
+/// source.
+fn disclose(mut stats: EngineStats, path: &str, symbol: &str, warnings: Vec<String>) -> EngineStats {
+    if warnings.is_empty() {
+        tracing::info!(
+            target: "neoethos_trader::replay",
+            replay_path = path,
+            symbol = %symbol,
+            "replay fidelity: no known stubs on this path"
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_trader::replay",
+            replay_path = path,
+            symbol = %symbol,
+            stub_count = warnings.len(),
+            stubs = ?warnings,
+            "REPLAY IS NOT YOUR STRATEGY — the numbers this run reports were produced with \
+             the listed stubs / synthetic inputs in the path. Do NOT compare them with live \
+             results until this list is empty (audit #220-#231)."
+        );
+    }
+    stats.fidelity_warnings = warnings;
+    stats
+}
+
+/// Warnings common to every replay path: nothing here depends on which signal
+/// engine was used.
+fn common_warnings(cfg: &EngineConfig) -> Vec<String> {
+    let mut w = Vec::new();
+    if cfg.costs.is_zero() {
+        w.push(
+            "COSTS: zero spread, zero commission, zero slippage — every fill is at the mark. \
+             Pass EngineConfig::costs (ReplayCostModel::from_pips) with the operator's real \
+             broker costs to remove this."
+                .to_string(),
+        );
+    }
+    if (cfg.starting_balance - DEFAULT_REPLAY_STARTING_BALANCE).abs() < f64::EPSILON {
+        w.push(format!(
+            "BALANCE: synthetic {DEFAULT_REPLAY_STARTING_BALANCE:.0} starting balance, not the \
+             operator's account. Every percentage figure below is against that number."
+        ));
+    }
+    w.push(
+        "RISK GATE: PermissiveRiskGate — no daily-loss, drawdown, exposure or kill-switch \
+         rule is applied. No trade in this run was ever refused for risk."
+            .to_string(),
+    );
+    w.push(
+        "EXECUTION: MockExecutionAdapter — simulated fills, no broker, no partial fills, \
+         no rejections, no requotes."
+            .to_string(),
+    );
+    w.push(
+        "TRAILING: the replay has no trailing stop or break-even move at all. The live loop \
+         and the GA evaluator both have exit geometry this path does not model."
+            .to_string(),
+    );
+    w
+}
 
 /// Load `(symbol, base_tf)` OHLCV from the data directory and map each bar to a
 /// [`LiveBar`]. Bars come back in ascending-timestamp order (the loader
@@ -51,6 +118,12 @@ pub fn load_bars_from_dir(
 /// (momentum stub signal + permissive risk gate + mock execution). Returns the
 /// resulting [`EngineStats`].
 ///
+/// **THIS PATH DOES NOT TRADE THE OPERATOR'S STRATEGIES.** It runs a
+/// three-bar momentum rule with a synthetic 0.5 %-of-price bracket. Every run
+/// returns its own disclaimer in [`EngineStats::fidelity_warnings`] and logs it
+/// at `warn` (audit #224/#225/#226/#229). Use
+/// [`replay_portfolio_from_dir`] for real genes.
+///
 /// Phase 1.5 wires only the base timeframe; the higher-TF cube + the real Gene /
 /// ensemble signal arrive in Phases 3–4 (the registry entry already carries the
 /// `higher_tfs` slot for when they do).
@@ -77,16 +150,34 @@ pub fn replay_symbol_from_dir(
         mode: TradeMode::PropFirm,
     }]);
 
+    let mut warnings = common_warnings(&cfg);
+    warnings.insert(
+        0,
+        "SIGNAL: MomentumStubSignal — a 3-bar close-vs-close momentum rule. This is NOT any \
+         strategy discovery produced. Nothing about the entries below reflects a gene."
+            .to_string(),
+    );
+    warnings.push(
+        "BRACKET: synthetic stop of 0.5 % of price (DecisionConfig::stop_frac). On EURUSD at \
+         1.08 that is a ~54-pip stop against a GA population whose stops are 6-20 pips."
+            .to_string(),
+    );
+    warnings.push(
+        "EXITS: closes on a Flat signal and on a reversal; the GA evaluator does neither."
+            .to_string(),
+    );
+
     let mut engine = AutonomousEngine::new(
         registry,
         MomentumStubSignal::default(),
         PermissiveRiskGate,
-        MockExecutionAdapter::new(),
+        MockExecutionAdapter::with_costs(cfg.costs),
         DecisionEngine::default(),
         cfg,
     );
 
-    Ok(crate::replay::replay(&mut engine, &bars))
+    let stats = crate::replay::replay(&mut engine, &bars);
+    Ok(disclose(stats, "replay_symbol_from_dir", symbol, warnings))
 }
 
 /// Phase 4: offline dry-run of a DISCOVERED PORTFOLIO (real genes) over real
@@ -150,10 +241,22 @@ pub fn replay_portfolio_from_dir(
         );
     }
 
-    // Net the portfolio's genes into one per-bar direction (precomputed once,
-    // parity with the GA's batch evaluation).
-    let directions =
-        crate::gene_signal::combine_gene_signals(&artifact.genes, &aligned, &base_ohlcv);
+    // Net the portfolio's genes into one per-bar direction AND carry each
+    // bar's own bracket (audit #226). Until 2026-08-09 this path called
+    // `combine_gene_signals`, threw the genes' stops away, and replayed them
+    // behind a 0.5 %-of-price synthetic stop.
+    let pip_size = neoethos_search::default_pip_size(&symbol);
+    let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
+        &artifact.genes,
+        &aligned,
+        &base_ohlcv,
+        pip_size,
+    );
+    let bracketless_bars = directions
+        .iter()
+        .zip(sl_pips.iter())
+        .filter(|(d, sl)| **d != crate::contracts::Direction::Flat && **sl <= 0.0)
+        .count();
     let bars = ohlcv_to_livebars(&base_ohlcv, &symbol, &base_tf);
 
     let registry = PortfolioRegistry::from_entries(vec![PortfolioEntry {
@@ -165,15 +268,42 @@ pub fn replay_portfolio_from_dir(
         },
         mode: TradeMode::PropFirm,
     }]);
+
+    // Exit parity with the GA evaluator (audit #228): stop, target, time stop —
+    // and NOT "the signal went flat" or "the signal reversed", neither of which
+    // the evaluator has.
+    let eval_defaults = neoethos_search::EvaluationConfig::default();
+    let mut cfg = cfg;
+    if cfg.max_hold_bars.is_none() && eval_defaults.max_hold_bars > 0 {
+        cfg.max_hold_bars = Some(eval_defaults.max_hold_bars as u64);
+    }
+    let mut warnings = common_warnings(&cfg);
+    if bracketless_bars > 0 {
+        warnings.push(format!(
+            "BRACKET: {bracketless_bars} directional bars had NO gene stop, so those entries \
+             fell back to the synthetic 0.5 %-of-price bracket. Counted, not dropped."
+        ));
+    }
+    if cfg.max_hold_bars.is_none() {
+        warnings.push(
+            "EXITS: no max_hold_bars time stop is armed (EvaluationConfig::default is 0), so a \
+             position exits only on its stop or target."
+                .to_string(),
+        );
+    }
+
     let mut engine = AutonomousEngine::new(
         registry,
-        crate::gene_signal::PrecomputedSignalEngine::new(&symbol, directions),
+        crate::gene_signal::PrecomputedSignalEngine::with_brackets(
+            &symbol, directions, sl_pips, tp_pips,
+        ),
         PermissiveRiskGate,
-        MockExecutionAdapter::new(),
-        DecisionEngine::default(),
+        MockExecutionAdapter::with_costs(cfg.costs),
+        DecisionEngine::new(DecisionConfig::gene_parity(pip_size)),
         cfg,
     );
-    Ok(crate::replay::replay(&mut engine, &bars))
+    let stats = crate::replay::replay(&mut engine, &bars);
+    Ok(disclose(stats, "replay_portfolio_from_dir", &symbol, warnings))
 }
 
 /// v0.5 ML-integration Stage 3 — offline dry-run of a discovered portfolio with
@@ -238,8 +368,20 @@ pub fn replay_blend_from_dir(
         );
     }
 
-    let directions =
-        crate::gene_signal::combine_gene_signals(&artifact.genes, &aligned, &base_ohlcv);
+    // Same bracket correction as the gene-only path (audit #226): the ML gate
+    // may shrink or veto SIZE, it never touches the stop.
+    let pip_size = neoethos_search::default_pip_size(&symbol);
+    let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
+        &artifact.genes,
+        &aligned,
+        &base_ohlcv,
+        pip_size,
+    );
+    let bracketless_bars = directions
+        .iter()
+        .zip(sl_pips.iter())
+        .filter(|(d, sl)| **d != crate::contracts::Direction::Flat && **sl <= 0.0)
+        .count();
     let bars = ohlcv_to_livebars(&base_ohlcv, &symbol, &base_tf);
 
     // Build the ML decisions (skipped entirely in GenesOnly). On ANY error or
@@ -289,6 +431,8 @@ pub fn replay_blend_from_dir(
         }
     };
 
+    let signal_engine = signal_engine.with_brackets(&symbol, sl_pips, tp_pips);
+
     let registry = PortfolioRegistry::from_entries(vec![PortfolioEntry {
         symbol: symbol.clone(),
         base_tf: base_tf.clone(),
@@ -299,13 +443,36 @@ pub fn replay_blend_from_dir(
         },
         mode: TradeMode::PropFirm,
     }]);
+
+    let eval_defaults = neoethos_search::EvaluationConfig::default();
+    let mut cfg = cfg;
+    if cfg.max_hold_bars.is_none() && eval_defaults.max_hold_bars > 0 {
+        cfg.max_hold_bars = Some(eval_defaults.max_hold_bars as u64);
+    }
+    let mut warnings = common_warnings(&cfg);
+    if bracketless_bars > 0 {
+        warnings.push(format!(
+            "BRACKET: {bracketless_bars} directional bars had NO gene stop and fell back to the \
+             synthetic 0.5 %-of-price bracket. Counted, not dropped."
+        ));
+    }
+    if !matches!(blend.mode, BlendMode::GenesOnly) {
+        warnings.push(format!(
+            "ML BLEND ACTIVE (mode {:?}, gate_floor {:.2}, veto_below {:.2}) — position size is \
+             scaled by the ensemble. The live default is GenesOnly, so this run does not \
+             describe the live sizing path.",
+            blend.mode, blend.gate_floor, blend.veto_below
+        ));
+    }
+
     let mut engine = AutonomousEngine::new(
         registry,
         signal_engine,
         PermissiveRiskGate,
-        MockExecutionAdapter::new(),
-        DecisionEngine::default(),
+        MockExecutionAdapter::with_costs(cfg.costs),
+        DecisionEngine::new(DecisionConfig::gene_parity(pip_size)),
         cfg,
     );
-    Ok(crate::replay::replay(&mut engine, &bars))
+    let stats = crate::replay::replay(&mut engine, &bars);
+    Ok(disclose(stats, "replay_blend_from_dir", &symbol, warnings))
 }

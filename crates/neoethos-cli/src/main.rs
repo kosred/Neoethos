@@ -23,9 +23,79 @@ fn main() -> Result<()> {
     // the precondition for retiring these in favour of the single config.
     neoethos_core::env_overrides::log_active_overrides_at_startup();
     // Config-consolidation: search runtime overrides come from the single
-    // config (canonical user config.yaml), not the environment. Falls back
-    // to defaults if it can't be loaded. (S2a: genetic search; rest staged.)
-    let mut startup_settings = neoethos_core::Settings::load().unwrap_or_default();
+    // config (canonical user config.yaml), not the environment. (S2a:
+    // genetic search; rest staged.)
+    //
+    // ⚠ AUDIT #125/#289, CLI HALF — this line read
+    // `Settings::load().unwrap_or_default()` and its own comment admitted
+    // "Falls back to defaults if it can't be loaded". `Settings::default()` is
+    // NOT the shipped configuration: `ModelsConfig::default()` still encodes
+    // the pre-2026-06-06 posture and re-arms `require_walkforward_for_export`
+    // and `prop_firm_min_pass_rate`, so a config that failed to load silently
+    // changed WHICH STRATEGIES MAY REACH LIVE — on the binary that actually
+    // runs discovery. The same defect was recorded for the desktop shell
+    // (#125, `desktop/src-tauri/src/lib.rs:65`) and closed there; nothing in
+    // the 323 items noticed this one.
+    //
+    // Now: a failed load is fatal for every subcommand that decides money or
+    // spends hours, and survivable ONLY for the diagnostic commands you would
+    // reach for to fix it (`config`, `credentials`, `setup`, `wizard`,
+    // `--help`, `--version`). Those run on built-in defaults with an
+    // unmissable banner, never quietly.
+    let raw_args: Vec<String> = std::env::args().collect();
+    // Owned, so the `raw_args` vector can be moved into `args` further down.
+    let subcommand: String = raw_args.get(1).cloned().unwrap_or_default();
+    let mut startup_settings = match neoethos_core::Settings::load() {
+        Ok(s) => s,
+        Err(err) => {
+            let path = neoethos_core::config::user_config_path();
+            let diagnostic = matches!(
+                subcommand.as_str(),
+                // NOT the empty subcommand: a bare `neoethos-cli` opens the
+                // TUI, which can START ENGINES. It takes over the terminal, so
+                // the banner above scrolls away unread. `config` is the way in.
+                "config"
+                    | "credentials"
+                    | "setup"
+                    | "wizard"
+                    | "--help"
+                    | "-h"
+                    | "help"
+                    | "--version"
+                    | "-V"
+                    | "version"
+            );
+            eprintln!("──────────────────────────────────────────────────────────────");
+            eprintln!("CONFIG NOT LOADED");
+            eprintln!("  tried: $CONFIG_FILE, then {}, then ./config.yaml", path.display());
+            eprintln!("  {err:#}");
+            eprintln!("  Built-in defaults are NOT your settings: they re-arm the export");
+            eprintln!("  gates and risk limits you set deliberately, and they decide which");
+            eprintln!("  strategies may reach live money.");
+            eprintln!("──────────────────────────────────────────────────────────────");
+            tracing::error!(
+                target: "neoethos_cli",
+                config = %path.display(),
+                error = %format!("{err:#}"),
+                subcommand = %subcommand,
+                diagnostic_command = diagnostic,
+                "config.yaml could not be loaded"
+            );
+            if !diagnostic {
+                anyhow::bail!(
+                    "refusing to run `{subcommand}` without a readable config.\n\
+                     Put a valid config.yaml at {} (or in the working directory, or point \
+                     $CONFIG_FILE at one) and re-run. `neoethos-cli config` still works \
+                     without it.",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "Continuing on built-in defaults because `{subcommand}` is a diagnostic command."
+            );
+            neoethos_core::Settings::default()
+        }
+    };
     let process_cpu_assignment = std::env::var("NEOETHOS_BOT_CPU_BUDGET")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok());
@@ -44,7 +114,8 @@ fn main() -> Result<()> {
             .data_runtime
             .rebuild_stale_higher_tfs,
     );
-    let args: Vec<String> = std::env::args().collect();
+    // Same vector the config-load guard above already collected.
+    let args: Vec<String> = raw_args;
     if args.len() < 2 {
         // No subcommand → launch interactive TUI. Use `--help` for
         // legacy bare help; explicit subcommands keep working
@@ -2110,7 +2181,6 @@ fn cmd_wizard(_args: &[String]) -> Result<()> {
 ///   `neoethos-cli setup`             — same as `setup show`
 ///   `neoethos-cli setup show`        — list expected paths + existence
 ///   `neoethos-cli setup ctrader`     — print broker_credentials.toml template
-///   `neoethos-cli setup news`        — print news API key template
 ///   `neoethos-cli setup paths`       — print just the canonical directories
 ///
 /// We intentionally do NOT write binary state here — the on-disk
@@ -2124,7 +2194,6 @@ fn cmd_setup(args: &[String]) -> Result<()> {
     match mode {
         "show" => setup_show(),
         "ctrader" => setup_ctrader_template(),
-        "news" => setup_news_template(),
         "paths" => setup_paths(),
         "--help" | "-h" | "help" => {
             setup_help();
@@ -2151,7 +2220,6 @@ fn setup_help() {
     println!("    show       List expected config paths + which already exist (default)");
     println!("    paths      Print just the canonical directories, one per line (scripting)");
     println!("    ctrader    Emit a broker_credentials.toml template for the cTrader broker");
-    println!("    news       Emit a TOML snippet for the news API key");
     println!();
     println!("    The CLI does NOT write binary state — paste the template into the canonical");
     println!("    path printed by `setup paths`. Drive the egui wizard once on a desktop if you");
@@ -2220,7 +2288,6 @@ fn setup_show() -> Result<()> {
     }
     println!();
     println!("Run `neoethos-cli setup ctrader` for a paste-ready cTrader template.");
-    println!("Run `neoethos-cli setup news` for the news API key snippet.");
     Ok(())
 }
 
@@ -2251,19 +2318,18 @@ fn setup_ctrader_template() -> Result<()> {
     Ok(())
 }
 
-fn setup_news_template() -> Result<()> {
-    let dir = canonical_user_config_dir();
-    let path = dir.join("news_api.toml");
-    println!("# Paste this into:");
-    println!("#   {}", path.display());
-    println!("# The news API key drives Step 8 of the wizard (LLM-curated news +");
-    println!("# blackout filter). Perplexity is the default provider; keep the key");
-    println!("# OUT of shell history — `chmod 600` the file after pasting.");
-    println!();
-    println!("provider = \"perplexity\"");
-    println!("api_key = \"<your Perplexity API key>\"");
-    Ok(())
-}
+// REMOVED 2026-08-09: `setup news` printed a `news_api.toml` template and told
+// the operator that "the news API key drives ... [the] blackout filter".
+// Nothing in this repo has ever read `news_api.toml`, and batch D3 deleted
+// `neoethos_core::domain::news_filter` — the only type that ever held a news
+// API key — together with the `news.perplexity_enabled`,
+// `news.news_lookahead_minutes` and `news.news_kill_window_min` knobs.
+//
+// The LIVE news gate is `neoethos_app::app_services::news_calendar`, whose
+// blackout window is HARDCODED (15 min before / 10 min after) and whose only
+// operator knob is `news.news_trading_mode`. If that window should become
+// settable, add ONE knob and give it a reader in `news_calendar` — do not
+// restore a command that advertises a capability with no implementation.
 
 fn parse_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
     let root = resolve_root(args, settings);
@@ -2735,7 +2801,7 @@ fn print_help() {
     );
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
-    println!("  setup [show|paths|ctrader|news]  Headless credentials helper (Task #61).");
+    println!("  setup [show|paths|ctrader]  Headless credentials helper (Task #61).");
     println!("                               Prints canonical paths + ready-to-paste templates.");
     println!("  credentials show             Show on-disk broker_credentials.toml (redacted).");
     println!("  credentials set --client-id X --client-secret Y [--redirect-uri Z]");

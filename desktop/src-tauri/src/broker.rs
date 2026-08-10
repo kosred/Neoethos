@@ -388,6 +388,8 @@ pub async fn place_order(
             stop_loss_pips,
             take_profit_pips,
             Some("NeoEthos".to_string()),
+            // Manual Buy/Sell from the Trade screen — no admission decision to honour.
+            None,
         )
         .map_err(|e| e.to_string())?;
         Ok::<ExecResult, String>(ExecResult {
@@ -409,7 +411,8 @@ pub async fn place_order(
 pub async fn close_position(position_id: i64, volume: i64) -> Result<ExecResult, String> {
     spawn_blocking(move || {
         let outcome =
-            broker_api::close_position_blocking(position_id, volume).map_err(|e| e.to_string())?;
+            broker_api::close_position_blocking(position_id, volume, None)
+                .map_err(|e| e.to_string())?;
         Ok::<ExecResult, String>(ExecResult {
             status: format!("{:?}", outcome.status),
             order_id: outcome.order_id,

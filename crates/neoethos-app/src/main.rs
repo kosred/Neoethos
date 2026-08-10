@@ -90,24 +90,18 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     validation_min_generations: usize,
 
-    /// Suppress the orphan-launch help dialog. Set by the Flutter shell's
-    /// BackendSupervisor when it spawns the backend.
-    ///
-    /// Previously we used the `NEOETHOS_LAUNCHED_BY_FLUTTER=1` env var,
-    /// but `Process.start(mode: ProcessStartMode.detached)` on Windows
-    /// (Dart 3.x) does NOT propagate the `environment` map to the child
-    /// process even with `includeParentEnvironment: true` — verified
-    /// live: the spawned backend showed the orphan dialog and blocked
-    /// the HTTP server from binding port 7423. CLI flags survive the
-    /// detached spawn cleanly. See task #179.
-    #[arg(long, default_value_t = false)]
-    launched_by_flutter: bool,
+    // REMOVED 2026-08-09 (dead-code purge, batch D2): `--launched-by-flutter`.
+    // Nothing in the workspace ever passed it — grep for `launched-by-flutter`
+    // across crates/, desktop/, mesh/, mcp/, scripts/ and .github/ found only
+    // doc comments. Flutter died 2026-06-22. Because the flag defaulted to
+    // false and no spawner set it, removing it does NOT change behaviour: the
+    // orphan help dialog was already unconditional on this path.
 
-    /// PID of the parent Flutter GUI. When set, the backend self-terminates
+    /// PID of the parent GUI process. When set, the backend self-terminates
     /// within ~2s of that process exiting, so it never lingers as a windowless
-    /// orphan holding port 7423 (the bug where the next app launch sees a live
-    /// `launched_by_flutter` backend and silently exits → "the app won't
-    /// open"). Set by the Flutter shell's BackendSupervisor detached spawn.
+    /// orphan holding port 7423 (the "app won't open" bug: the next launch
+    /// sees a live backend and silently exits). Still honoured — any
+    /// supervisor that spawns this binary detached should pass it.
     #[arg(long)]
     parent_pid: Option<u32>,
 
@@ -192,23 +186,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // #101 follow-up + #179: the help dialog must fire BEFORE the
     // config-load step below, otherwise an orphaned double-click whose
     // CWD lacks `config.yaml` exits silently with `windows_subsystem =
-    // "windows"`. We pass the CLI flag (set by the Flutter shell's
-    // BackendSupervisor) so the dialog is suppressed in the
-    // supervised-spawn path. The previous env-var signal didn't
-    // survive `Process.start(mode: detached)` on Windows — verified
-    // live with PID 21224 showing "NeoEthos backend" dialog while the
-    // HTTP server was stuck behind the modal. Skip in debug builds /
-    // non-Windows (the helper already handles those internally).
-    if !args.launched_by_flutter {
-        show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
-    }
+    // "windows"`. Skipped in debug builds / non-Windows (the helper
+    // handles both internally).
+    //
+    // 2026-08-09 (dead-code purge D2): this used to be gated on
+    // `!args.launched_by_flutter`, a CLI flag no spawner ever passed. Both
+    // that flag and the older `NEOETHOS_LAUNCHED_BY_FLUTTER` env fallback are
+    // gone. The call is now unconditional, which is exactly what it already
+    // was at runtime — nothing set either signal after Flutter died 2026-06-22.
+    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
 
     // Tie this backend's lifetime to the GUI that spawned it (#179 follow-up).
-    // The Flutter shell spawns us with `ProcessStartMode.detached`, so on a GUI
-    // close/crash we would otherwise linger as a windowless orphan holding port
-    // 7423 — which makes the NEXT app launch see a live `launched_by_flutter`
-    // backend and silently exit, i.e. "the app won't open". The watchdog
-    // self-terminates this process within ~2s of the parent exiting.
+    // A detached spawn would otherwise linger as a windowless orphan holding
+    // port 7423 — which makes the NEXT app launch see a live backend and
+    // silently exit, i.e. "the app won't open". The watchdog self-terminates
+    // this process within ~2s of the parent exiting.
     if let Some(parent_pid) = args.parent_pid {
         spawn_parent_watchdog(parent_pid);
     }
@@ -409,13 +401,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AppApiState construction so state.config_path() reads the
     // resolved value.
     server::state::install_config_path(args.config.clone());
-    // F-270 (2026-05-28): record whether THIS backend was spawned by
-    // a Flutter supervisor. The /healthz response exposes this so a
-    // second Flutter shell launching against a stale backend (api-test
-    // orphan, manually-started server) can tell "the existing port
-    // holder is a sibling UI's backend → refuse second launch" apart
-    // from "the port is held by a zombie → attach instead of exiting".
-    server::state::install_launched_by_flutter(args.launched_by_flutter);
+    // REMOVED 2026-08-09 (dead-code purge, batch D2): the F-270
+    // `install_launched_by_flutter` call. Flutter's BackendSupervisor — the
+    // only reader of the /healthz field it fed — died 2026-06-22.
     let state = server::state::AppApiState::new();
     // F-231-related closure (2026-05-25): install the process-wide
     // account-refresh trigger so the deep cTrader execution-event
@@ -458,8 +446,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Spawn a background thread that self-terminates this backend within ~2s of
 /// the parent GUI (`parent_pid`) exiting. Without this, the detached spawn
 /// would leave a windowless backend holding port 7423 after the GUI
-/// closes/crashes, which makes the next app launch see a live
-/// `launched_by_flutter` backend and silently exit — the "app won't open" bug.
+/// closes/crashes, which makes the next app launch see a live backend and
+/// silently exit — the "app won't open" bug.
 /// Captures the parent's start time so OS PID reuse can't masquerade as the
 /// parent still being alive; fail-safe (keeps the backend running) if the
 /// parent can't be located at startup.

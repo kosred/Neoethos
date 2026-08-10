@@ -116,6 +116,19 @@ pub fn cpu_threads_hint() -> usize {
     {
         return n;
     }
+    // ⚠ AUDIT #279 — DO NOT DELETE THIS READ.
+    //
+    // A refuter pass concluded `RAYON_NUM_THREADS` is dead because the only
+    // site it found was an orphaned `from_env` constructor in
+    // `neoethos-search/src/.../eval.rs:535`. That conclusion is wrong as
+    // stated: the variable is LIVE right here, on a production path — this
+    // function is called from `parallel_trainer.rs:19`, `catboost.rs:414` and
+    // `catboost.rs:702`, i.e. on every tree train. The situation is an
+    // asymmetry (dead on the search side, live on the models side), not a
+    // silence. Removing the var on the strength of the eval.rs finding takes
+    // away the only thread control the tree trainers have when
+    // `hardware.cpu_budget` is unset. Read the code here before acting on that
+    // item anywhere else in the tree.
     if let Ok(val) = env::var("RAYON_NUM_THREADS")
         && let Ok(parsed) = val.trim().parse::<usize>()
         && parsed > 0
@@ -227,16 +240,10 @@ pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
 }
 
 pub fn gpu_count() -> usize {
-    #[cfg(feature = "tch")]
-    {
-        if tch::Cuda::is_available() {
-            let detected = tch::Cuda::device_count() as usize;
-            if detected > 0 {
-                return detected;
-            }
-        }
-    }
-
+    // The libtorch (`tch`) probe that used to sit here was removed 2026-08-09
+    // (batch D4) with the `tch` feature itself — no build ever enabled it, so
+    // this function has always fallen straight through to the env / nvidia-smi
+    // probe below. Nothing about the returned count changes.
     fn parse_visible_devices(devices: &str) -> Option<usize> {
         let trimmed = devices.trim();
         if trimmed.is_empty() || trimmed == "-1" || trimmed.eq_ignore_ascii_case("void") {

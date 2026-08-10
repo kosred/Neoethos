@@ -167,3 +167,125 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_batch_f64(
         row_extremity[i] = next_state >= 0.5 ? row_upper[i] : row_lower[i];
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/adjustable_ma_alternating_extremities.rs:318
+// (`adjustable_ma_alternating_extremities_with_kernel`), whose `ma` column is
+// what `output_id == "value"` resolves to
+// (dispatch/cpu_batch.rs:6385-6386). The prepare that sets the warmup is
+// :600-650; the weight build is `build_weights` :655; the convolution is
+// `weighted_filter_into` :722-737.
+//
+// SHAPE: one thread per combo, bars ascending. The convolution itself is
+// bar-parallel, but the lane launches one thread per column and the bar loop
+// is the thread body.
+//
+// PERIOD-INVARIANT. `compute_adjustable_ma_alternating_extremities_batch`
+// (cpu_batch.rs:6417-6430) reads `length`, `mult`, `alpha` and `beta` and
+// NEVER `period`, so a sweep of five periods produces five identical CPU
+// columns and this kernel emits five identical rows. The four CPU defaults are
+// pinned below.
+//
+// FIRST VALID IS DERIVED HERE, not taken from the caller: the CPU scans for
+// the first bar at which high, low AND close are all `is_finite` (:600-602),
+// which is stricter than `AllInputsNonNan` (an INFINITE high is skipped by the
+// CPU and accepted by that rule). The lane row therefore declares
+// `F64FirstValidRule::Ignored`, the same contract
+// `garman_klass_volatility_neo_batch_f64` carries.
+//
+// f64 END TO END: no float literal, no f32-suffixed math function, no
+// fast-math intrinsic. `WEIGHT_SUM_EPS` above is 1e-12, which is an f64-sized
+// guard on a sum of O(length) terms and is NOT an f32 epsilon copied forward.
+// ---------------------------------------------------------------------------
+
+#define NEO_AMAE_LENGTH 50
+#define NEO_AMAE_MULT 2.0
+#define NEO_AMAE_ALPHA 1.0
+#define NEO_AMAE_BETA 0.5
+// The weight vector is materialised in a per-thread array because the CPU
+// builds it ONCE and then multiplies by it (`build_weights` normalises with
+// `*weight *= inv_sum`, one rounding), so recomputing the raw weight inside the
+// bar loop would be the same bits but O(length) transcendentals per bar. The
+// bound is a property of this COMPILED kernel; `length` is pinned at the CPU
+// default 50, so it can never be approached, and it is checked rather than
+// assumed.
+#define NEO_AMAE_MAX_LENGTH 512
+
+extern "C" __global__ void adjustable_ma_alternating_extremities_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    // Period-invariant, and first-valid derived below. Both are read so the
+    // signature stays the lane ABI and neither is silently ignored.
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int length = NEO_AMAE_LENGTH;
+    const double mult = NEO_AMAE_MULT;
+    const double alpha = NEO_AMAE_ALPHA;
+    const double beta = NEO_AMAE_BETA;
+
+    if (length < 2 || length > n || length > NEO_AMAE_MAX_LENGTH) {
+        return;
+    }
+    if (!isfinite(mult) || mult < 1.0 || !isfinite(alpha) || alpha < 0.0 ||
+        !isfinite(beta) || beta < 0.0) {
+        return;
+    }
+
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (valid_bar(high[i], low[i], close[i])) {
+            first = i;
+            break;
+        }
+    }
+    if (first < 0) {
+        return;
+    }
+
+    const int needed = (length * 2) - 1;
+    if (n - first < needed) {
+        return;
+    }
+
+    double w[NEO_AMAE_MAX_LENGTH];
+    double weight_sum = 0.0;
+    for (int j = 0; j < length; ++j) {
+        w[j] = raw_weight(j, length, alpha, beta);
+        weight_sum += w[j];
+    }
+    if (!isfinite(weight_sum) || fabs(weight_sum) <= WEIGHT_SUM_EPS) {
+        return;
+    }
+    const double inv_weight_sum = 1.0 / weight_sum;
+    for (int j = 0; j < length; ++j) {
+        w[j] *= inv_weight_sum;
+    }
+
+    const int ma_start = first + length - 1;
+    for (int i = ma_start; i < n; ++i) {
+        double acc = 0.0;
+        for (int j = 0; j < length; ++j) {
+            acc += close[i - j] * w[j];
+        }
+        row[i] = acc;
+    }
+}

@@ -515,3 +515,122 @@ void ehlers_kama_fix_first_row_nan_tm_f32(int period,
         out_tm[series_idx] = nan_f;
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — ehlers_kama
+// ===========================================================================
+// Reference: src/indicators/moving_averages/ehlers_kama.rs
+//   `ehlers_kama_prepare`      (:551) — first_valid + refusals
+//   `ehlers_kama_with_kernel`  (:584) — warmup_end = first + period - 1
+//   `ehlers_kama_compute_into` (:214) — the `period == 1` passthrough
+//   `ehlers_kama_scalar`       (:243) — the rolling |delta| sum, the
+//                                        efficiency ratio and the recurrence
+//   Batch route: `ma_batch.rs:1131` sweeps `period` and takes nothing else.
+//
+// THE HAZARD THIS FILE WAS BUILT ON: `__saturatef` x6.
+//   The CPU clamps the efficiency ratio with `(direction / delta_sum).min(1.0)`
+//   — `f64::min`, which has NO lower bound and which returns the NON-NaN
+//   operand when one side is NaN. The f32 kernels above use `__saturatef`,
+//   which is a completely different function: it clamps to [0, 1] AND maps NaN
+//   to 0. Three divergences in one intrinsic —
+//     * a lower clamp the CPU does not have (harmless here, since
+//       `direction/delta_sum` is a ratio of absolute values, but it is still
+//       not the specified function),
+//     * NaN -> 0 instead of NaN -> the other operand,
+//     * f32 rounding on the divide before the clamp.
+//   This kernel uses `fmin(direction / delta_sum, 1.0)`, which IS `f64::min`.
+//
+// 0.6667 IS A LITERAL, NOT 2/3. The CPU writes `0.6667f64.mul_add(ef, 0.0645)`.
+// Writing `2.0/3.0` here would be a different number in the sixth decimal and
+// it multiplies the smoothing constant of every bar. Carried across verbatim.
+// `0.0645` likewise. Neither is an f32-sized epsilon; both are Ehlers'
+// published constants and are correct unchanged in f64.
+//
+// ROUNDINGS.
+//   ef      = fmin(direction / delta_sum, 1.0)   -> div            (1)
+//   s_term  = fma(0.6667, ef, 0.0645)            -> fma            (1)
+//   s       = s_term * s_term                    -> mul            (1)
+//   kama    = s.mul_add(a - kama, kama)          -> sub + fma      (2)
+//
+// THE ROLLING SUM'S DROP GUARD. `if drop_idx > first_valid` — strictly
+// greater. At `drop_idx == first_valid` nothing is subtracted, because the
+// warmup sum started at `first_valid + 1` and never contained that term. Off
+// by one here and `delta_sum` drifts for the rest of the series.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_ehlers_kama_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    const int warmup_end = first_valid + period - 1;
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+
+    if (period == 1) {
+        // `ehlers_kama_compute_into` passes the series straight through, and
+        // `warmup_end == first_valid` so nothing is masked afterwards.
+        for (int i = first_valid; i < n; ++i) row[i] = prices[i];
+        return;
+    }
+
+    const int start = warmup_end;
+    if (start >= n) return;
+
+    double delta_sum = 0.0;
+    for (int k = first_valid + 1; k <= start; ++k) {
+        delta_sum += fabs(prices[k] - prices[k - 1]);
+    }
+
+    double prev_kama = prices[start - 1];
+
+    const double a0 = prices[start];
+    double direction = fabs(a0 - prices[start - (period - 1)]);
+    double ef = (delta_sum == 0.0) ? 0.0 : fmin(direction / delta_sum, 1.0);
+
+    double s_term = fma(0.6667, ef, 0.0645);
+    double s = s_term * s_term;
+    prev_kama = fma(s, a0 - prev_kama, prev_kama);
+    row[start] = prev_kama;
+
+    for (int i = start + 1; i < n; ++i) {
+        const int drop_idx = i - period;
+        if (drop_idx > first_valid) {
+            delta_sum -= fabs(prices[drop_idx] - prices[drop_idx - 1]);
+        }
+        const double a = prices[i];
+        delta_sum += fabs(a - prices[i - 1]);
+
+        direction = fabs(a - prices[i - (period - 1)]);
+        ef = (delta_sum == 0.0) ? 0.0 : fmin(direction / delta_sum, 1.0);
+
+        s_term = fma(0.6667, ef, 0.0645);
+        s = s_term * s_term;
+
+        prev_kama = fma(s, a - prev_kama, prev_kama);
+        row[i] = prev_kama;
+    }
+}

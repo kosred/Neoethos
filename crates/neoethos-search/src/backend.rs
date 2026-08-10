@@ -210,9 +210,26 @@ impl EvaluationBackend {
         )
     }
 
+    /// Resolve the backend from the operator's Settings ALONE.
+    ///
+    /// 2026-08-10 (env→config wave): this used to read `NEOETHOS_REQUIRE_GPU`
+    /// out of the process environment and hand it to `from_settings` as a
+    /// third input. It no longer does, and the name is kept only because
+    /// `install_evaluation_backend_from_settings` and its tests call it.
+    ///
+    /// WHAT THIS NOW PERMITS: nothing new.
+    /// WHAT IT NOW REFUSES: an exported `NEOETHOS_REQUIRE_GPU=1` can no longer
+    /// escalate the run to GPU-required. ⚠ THIS IS A BEHAVIOUR CHANGE, and it
+    /// is a LOOSENING, so it is reported at ERROR by
+    /// `execution_profile::report_retired_env_vars()` whenever the variable is
+    /// still exported. The replacement is a config value —
+    /// `system.enable_gpu_preference: cuda_required` (or `models
+    /// .prop_search_device`) — and note that `resolve_with_probe` already
+    /// escalates every non-`cpu_forced` value to GPU-preferred whenever a card
+    /// is present, which is what the env var was being used for on rented
+    /// boxes.
     pub fn from_settings_and_process_env(settings: &Settings) -> Result<Self, BackendConfigError> {
-        let env_value = std::env::var("NEOETHOS_REQUIRE_GPU").ok();
-        Self::from_settings(settings, env_value.as_deref())
+        Self::from_settings(settings, None)
     }
 
     pub fn cpu_fallback_allowed(self) -> bool {
@@ -294,6 +311,23 @@ pub fn install_evaluation_backend_from_settings(
 ) -> Result<EvaluationBackend, BackendConfigError> {
     let backend = EvaluationBackend::from_settings_and_process_env(settings)?;
     install_evaluation_backend(backend)?;
+    // The indicator lane in `neoethos-data` has the SAME question to answer —
+    // "may this run silently compute on the CPU?" — and until now it answered
+    // it from `NEOETHOS_REQUIRE_GPU` while this crate answered it from config.
+    // `set_indicator_compute_policy` existed for exactly this and had ZERO
+    // callers (`hpc_ta.rs:93`), so the seam the module documents as "where the
+    // operator's Settings plug in" was never plugged in. It is now, from the
+    // one place that already holds the resolved backend, so the two crates
+    // cannot disagree about the same run.
+    let policy = if backend.gpu_required() {
+        neoethos_data::core::hpc_ta::IndicatorComputePolicy::RequireGpu
+    } else {
+        neoethos_data::core::hpc_ta::IndicatorComputePolicy::Auto
+    };
+    // A second install returning the value already in force is not an error
+    // here: the first one wins by that module's own contract, and both callers
+    // would be installing the same resolved policy.
+    let _ = neoethos_data::core::hpc_ta::set_indicator_compute_policy(policy);
     Ok(backend)
 }
 
@@ -456,6 +490,11 @@ fn evaluate_gpu_required_population(
                 .to_string(),
         );
     }
+
+    // The third launch site for the same engine. It already records its device
+    // under `population_eval`; the per-launch anatomy has to land in the same
+    // row or the retry loop's launches appear under no caller at all.
+    let _lane = crate::eval_telemetry::LaneScope::enter("population_eval");
 
     let retry_policy = GpuRetryPolicy::default();
     let mut attempt = GpuAttempt::first(n_genes);

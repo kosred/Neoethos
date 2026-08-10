@@ -25,6 +25,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How many named reject reasons one stage may keep.
+///
+/// The widest stage today is `passed_quality` at fourteen (six gate-level
+/// reasons plus the eight base-quality criteria). 32 leaves room for the next
+/// split without a silent drop, and a stage that ever reaches it is a stage
+/// whose reasons need grouping, not truncating.
+pub const MAX_REJECT_REASONS_PER_STAGE: usize = 32;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunnelStage {
     pub name: String,
@@ -44,6 +52,14 @@ pub struct FunnelStage {
     /// `default` so profiles written before this existed still deserialize.
     #[serde(default)]
     pub elapsed_ms: u64,
+    /// Reject reasons DISCARDED by the `MAX_REJECT_REASONS_PER_STAGE` cap.
+    ///
+    /// Raising the cap from 10 to 32 fixed the incidence, not the class:
+    /// truncation still drops the SMALLEST counts, which are exactly the rare
+    /// causes a funnel exists to surface. A drop on a decision path that nobody
+    /// counts is a silent drop, so it is counted here.
+    #[serde(default)]
+    pub reasons_truncated: usize,
 }
 
 impl FunnelStage {
@@ -55,6 +71,7 @@ impl FunnelStage {
             rejected: 0,
             top_reasons: Vec::new(),
             elapsed_ms: 0,
+            reasons_truncated: 0,
         }
     }
 
@@ -66,6 +83,7 @@ impl FunnelStage {
             rejected: 0,
             top_reasons: Vec::new(),
             elapsed_ms: 0,
+            reasons_truncated: 0,
         }
     }
 
@@ -140,15 +158,25 @@ impl FunnelProfile {
         }
     }
 
-    /// Add a reject-reason bucket to a stage's top-reasons list. The
-    /// caller is responsible for keeping the list bounded.
+    /// Add a reject-reason bucket to a stage's top-reasons list.
+    ///
+    /// The cap was 10 until 2026-08-09. The quality screen now records six
+    /// gate-level reasons PLUS the eight named base-quality criteria — fourteen
+    /// buckets — so a 10-entry cap would have SILENTLY DISCARDED four of them,
+    /// and the ones discarded would be the smallest counts, i.e. exactly the
+    /// rare causes a funnel exists to surface. A truncation that drops evidence
+    /// without saying so is the same defect the per-criterion split was landed
+    /// to fix, so the cap is raised to a number no stage approaches rather than
+    /// left to bite the next stage that grows.
     pub fn add_reject_reason(&mut self, stage_name: &str, reason: impl Into<String>, count: usize) {
         if let Some(s) = self.stages.iter_mut().find(|s| s.name == stage_name) {
             s.top_reasons.push((reason.into(), count));
-            // Keep only the top 10, descending by count.
+            // Descending by count, ties broken by name so the list is stable.
             s.top_reasons
                 .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            s.top_reasons.truncate(10);
+            let before = s.top_reasons.len();
+            s.top_reasons.truncate(MAX_REJECT_REASONS_PER_STAGE);
+            s.reasons_truncated += before - s.top_reasons.len();
         }
     }
 
@@ -312,9 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn add_reject_reason_keeps_top_10_descending() {
+    fn add_reject_reason_keeps_the_cap_descending() {
+        // The cap was 10 when this test was written. It is now
+        // MAX_REJECT_REASONS_PER_STAGE = 32, because the quality screen alone
+        // records fourteen reasons and truncation drops the SMALLEST counts —
+        // i.e. exactly the rare causes a funnel exists to surface. The test now
+        // asserts against the constant rather than a literal, so raising the cap
+        // again cannot leave a stale number behind.
         let mut f = FunnelProfile::new("EURJPY", "D1");
-        for i in 0..20 {
+        let offered = MAX_REJECT_REASONS_PER_STAGE + 10;
+        for i in 0..offered {
             f.add_reject_reason("passed_base_filter", format!("reason_{}", i), i);
         }
         let s = f
@@ -322,8 +357,8 @@ mod tests {
             .iter()
             .find(|s| s.name == "passed_base_filter")
             .unwrap();
-        assert_eq!(s.top_reasons.len(), 10);
-        // First entry = highest count.
-        assert!(s.top_reasons[0].1 >= s.top_reasons[9].1);
+        assert_eq!(s.top_reasons.len(), MAX_REJECT_REASONS_PER_STAGE);
+        // First entry = highest count, last = lowest kept.
+        assert!(s.top_reasons[0].1 >= s.top_reasons[MAX_REJECT_REASONS_PER_STAGE - 1].1);
     }
 }

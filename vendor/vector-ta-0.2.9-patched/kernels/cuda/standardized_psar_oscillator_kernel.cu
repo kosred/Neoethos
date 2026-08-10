@@ -441,3 +441,189 @@ extern "C" __global__ void standardized_psar_oscillator_batch_f64(
         segment_count += 1;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — standardized_psar_oscillator
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/standardized_psar_oscillator.rs:987
+ *   StandardizedPsarOscillatorState::update_finite, reached through update
+ *   (:977) and compute_row (:1601), with PsarState::update (:825) and
+ *   EmaState::update (:704).
+ *
+ * Column: output_id "value" resolves to out.oscillator — cpu_batch.rs:5010
+ *   matches "oscillator" | "value".
+ *
+ *   THE OSCILLATOR IS A CLOSED SUB-EXPRESSION and that is why this kernel is
+ *   short. update_finite computes it from the PSAR and the range EMA ONLY
+ *   (:991-998); the WMA, the pivot detector, the two history rings and the
+ *   six signal columns that follow are all fed BY the oscillator and none of
+ *   them feeds back into it. The only coupling left is the final gate:
+ *   update_finite returns None — i.e. every column is NaN for that bar — when
+ *   the oscillator is not finite (:1123-1136), which this kernel reproduces by
+ *   writing NaN in exactly that case.
+ *
+ * PERIOD-INVARIANT: compute_standardized_psar_oscillator_batch reads start
+ *   (0.02), increment (0.0005), maximum (0.2), standardization_length (21),
+ *   wma_length (40), wma_lag (3), pivot_left (15), pivot_right (1),
+ *   plot_bullish and plot_bearish — and NEVER period
+ *   (cpu_batch.rs:4966-4986). Of those, only the first four reach this column.
+ *
+ * FIRST-VALID IGNORED: update RESETS the whole state on any non-finite bar
+ *   (:978-981) and compute_row walks EVERY bar from index 0.
+ *
+ * Input: high / low / close — extract_ohlc_input (cpu_batch.rs:4958) —
+ *   F64InputKind::Hlc.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. The PSAR is a state machine
+ *   carrying trend, extreme point, acceleration and TWO bars of previous
+ *   high/low; the range EMA is a mean-seeded recurrence.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the EMA seeds on the FIRST value, then runs a RUNNING MEAN for bars
+ *     2..period as (value - mean).mul_add(1/count, mean) — ONE fma — and only
+ *     then switches to beta.mul_add(mean, alpha * value) (:704-718). Three
+ *     distinct regimes; collapsing any of them changes the seed.
+ *   * the SAR step is acc.mul_add(ep - sar, sar) (:850) — ONE fma over a
+ *     pre-formed difference.
+ *   * the acceleration cap is (acc + increment).min(maximum) (:860, :876) and
+ *     the SAR clamps are min/max of the two previous extremes (:863, :879) —
+ *     all f64::min / f64::max, hence fmin/fmax: they return the non-NaN
+ *     operand where an if-chain would let a NaN through into the next bar.
+ *   * the oscillator is (close - sar) / ema_range * 100.0 (:994) — divide
+ *     first, scale second.
+ *   * there is no epsilon: the guard is the exact test ema_range != 0.0.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:4966-4970 (:82-85). */
+#define NEO_SPO_START                  0.02
+#define NEO_SPO_INCREMENT              0.0005
+#define NEO_SPO_MAXIMUM                0.2
+#define NEO_SPO_STANDARDIZATION_LENGTH 21
+
+extern "C" __global__
+void standardized_psar_oscillator_neo_batch_f64(const double* __restrict__ high,
+                                                const double* __restrict__ low,
+                                                const double* __restrict__ close,
+                                                int n,
+                                                const int* __restrict__ periods,
+                                                int n_combos,
+                                                int first_valid,
+                                                double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant — see header */
+    (void)first_valid; /* the mid-series reset reproduces it — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const double p_start     = NEO_SPO_START;
+    const double p_increment = NEO_SPO_INCREMENT;
+    const double p_maximum   = NEO_SPO_MAXIMUM;
+    const int    ema_period  = NEO_SPO_STANDARDIZATION_LENGTH;
+    const double ema_alpha   = 2.0 / ((double)ema_period + 1.0);
+    const double ema_beta    = 1.0 - ema_alpha;
+
+    /* PsarState */
+    int    psar_idx    = 0;      /* 0 = no state yet */
+    bool   trend_up    = false;
+    double sar = NEO_F64_NAN, ep = NEO_F64_NAN, acc = p_start;
+    double prev_high = 0.0, prev_high2 = 0.0, prev_low = 0.0, prev_low2 = 0.0;
+
+    /* EmaState */
+    int    ema_count = 0;
+    double ema_mean  = NEO_F64_NAN;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i], l = low[i], c = close[i];
+
+        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
+            psar_idx = 0; trend_up = false;
+            sar = NEO_F64_NAN; ep = NEO_F64_NAN; acc = p_start;
+            prev_high = 0.0; prev_high2 = 0.0; prev_low = 0.0; prev_low2 = 0.0;
+            ema_count = 0; ema_mean = NEO_F64_NAN;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        /* PsarState::update (:825) */
+        bool   have_sar = false;
+        double sar_out  = NEO_F64_NAN;
+        if (psar_idx == 0) {
+            trend_up = false;
+            sar = NEO_F64_NAN; ep = NEO_F64_NAN; acc = p_start;
+            prev_high = h; prev_high2 = h; prev_low = l; prev_low2 = l;
+            psar_idx = 1;
+        } else if (psar_idx == 1) {
+            const bool tu = (h > prev_high);
+            const double s = tu ? prev_low : prev_high;
+            const double e = tu ? h : l;
+            prev_high2 = prev_high; prev_low2 = prev_low;
+            prev_high = h; prev_low = l;
+            trend_up = tu; sar = s; ep = e; acc = p_start;
+            psar_idx = 2;
+            have_sar = true; sar_out = s;
+        } else {
+            double next_sar = fma(acc, ep - sar, sar);
+            if (trend_up) {
+                if (l < next_sar) {
+                    trend_up = false;
+                    next_sar = ep;
+                    ep = l;
+                    acc = p_start;
+                } else {
+                    if (h > ep) {
+                        ep = h;
+                        acc = fmin(acc + p_increment, p_maximum);
+                    }
+                    next_sar = fmin(next_sar, fmin(prev_low, prev_low2));
+                }
+            } else if (h > next_sar) {
+                trend_up = true;
+                next_sar = ep;
+                ep = h;
+                acc = p_start;
+            } else {
+                if (l < ep) {
+                    ep = l;
+                    acc = fmin(acc + p_increment, p_maximum);
+                }
+                next_sar = fmax(next_sar, fmax(prev_high, prev_high2));
+            }
+            prev_high2 = prev_high; prev_low2 = prev_low;
+            prev_high = h; prev_low = l;
+            sar = next_sar;
+            ++psar_idx;
+            have_sar = true; sar_out = next_sar;
+        }
+
+        /* EmaState::update (:704) over the bar range */
+        const double range_in = h - l;
+        bool   have_range = false;
+        double ema_range  = NEO_F64_NAN;
+        ++ema_count;
+        if (ema_count == 1) {
+            ema_mean = range_in;
+        } else if (ema_count <= ema_period) {
+            const double inv = 1.0 / (double)ema_count;
+            ema_mean = fma(range_in - ema_mean, inv, ema_mean);
+        } else {
+            ema_mean = fma(ema_beta, ema_mean, ema_alpha * range_in);
+        }
+        if (ema_count >= ema_period) { have_range = true; ema_range = ema_mean; }
+
+        double oscillator = NEO_F64_NAN;
+        if (have_sar && have_range && isfinite(ema_range) && ema_range != 0.0) {
+            oscillator = (c - sar_out) / ema_range * 100.0;
+        }
+
+        /* update_finite returns None — every column NaN — unless the
+         * oscillator itself is finite (:1123-1136). */
+        o[i] = isfinite(oscillator) ? oscillator : NEO_F64_NAN;
+    }
+}

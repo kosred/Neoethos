@@ -318,3 +318,170 @@ extern "C" __global__ void keltner_channel_width_oscillator_batch_f64(
         row_kbw_sma[i] = kbw_sma;
     }
 }
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4
+//
+// CPU reference:
+//   * arithmetic  : keltner_channel_width_oscillator_default_ema_atr_into,
+//                   src/indicators/keltner_channel_width_oscillator.rs:872-1008.
+//                   keltner_channel_width_oscillator_compute_into (:819-869)
+//                   selects that body when use_exponential is true,
+//                   bands_style is AverageTrueRange, length is 20 and
+//                   atr_length is 10 -- which is EXACTLY the CPU default set
+//                   (cpu_batch.rs:13077-13092), and this lane is
+//                   PERIOD-INVARIANT, so it is the only body reachable here.
+//   * refusals    : keltner_channel_width_oscillator_prepare, :744-815.
+//   * warmup      : kbw_warmup = first + max(length, atr_length) - 1 (:422-430).
+//   * emitted col : `kbw`. compute_keltner_channel_width_oscillator_batch
+//                   (cpu_batch.rs:13065) maps output_id "value" -> out.kbw.
+//   * PERIOD-INVARIANT: the batch reads source, length (20), multiplier (2.0),
+//                   use_exponential (true), bands_style ("Average True Range")
+//                   and atr_length (10) -- never `period`
+//                   (cpu_batch.rs:13077-13092).
+//
+// SOURCE: the CPU default source is `close` (cpu_batch.rs:13080), so the Hlc
+// triple carries every series this kernel reads. `is_valid_bar` (:400-402)
+// tests high, low, close AND source, and with source == close that is three
+// finiteness tests plus `high >= low`.
+//
+// FIRST-VALID IGNORED: that `high >= low` half is an ORDERING condition no
+// F64FirstValidRule variant expresses, and it names a different bar on any
+// frame with a crossed quote. Rather than add a variant every consumer would
+// have to grow a field for, the kernel derives its own index -- exactly as
+// `garman_klass_volatility` already does in this lane -- and the row starts
+// all-NaN, so the CPU prefix is reproduced without reading the caller's value.
+//
+// f64 END TO END: `fma()` for the two `mul_add` lines (:934 and :969), plain
+// `*`/`+` everywhere the CPU writes them separately. The `>`/`<` in the true
+// range (:945-955) are transliterated as comparisons because the CPU writes
+// them as comparisons and the branch is unreachable for a non-finite bar --
+// is_valid_bar has already rejected it.
+// ===========================================================================
+
+#define KCWO_NEO_LENGTH 20
+#define KCWO_NEO_ATR_LENGTH 10
+#define KCWO_NEO_MULTIPLIER 2.0
+
+static __device__ __forceinline__ double kcwo_neo_qnan() {
+  return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// is_valid_bar, :400-402, with source == close.
+static __device__ __forceinline__ bool kcwo_neo_valid(double h, double l, double c) {
+  return isfinite(h) && isfinite(l) && isfinite(c) && h >= l;
+}
+
+extern "C" __global__
+void keltner_channel_width_oscillator_neo_batch_f64(const double* __restrict__ high,
+                                                    const double* __restrict__ low,
+                                                    const double* __restrict__ close,
+                                                    int n,
+                                                    const int* __restrict__ periods,
+                                                    int n_combos,
+                                                    int first_valid,
+                                                    double* __restrict__ out) {
+  const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+  if (combo >= n_combos) return;
+  (void)periods;      // PERIOD-INVARIANT -- see the header.
+  (void)first_valid;  // FIRST-VALID IGNORED -- see the header.
+
+  if (n <= 0) return;
+  double* __restrict__ row = out + (size_t)combo * (size_t)n;
+  const double nn = kcwo_neo_qnan();
+  for (int i = 0; i < n; ++i) row[i] = nn;
+
+  const int length = KCWO_NEO_LENGTH;
+  const int atr_length = KCWO_NEO_ATR_LENGTH;
+  const double multiplier = KCWO_NEO_MULTIPLIER;
+
+  // prepare, :744-815.
+  if (length > n) return;
+  if (atr_length > n) return;
+  int first = -1;
+  for (int i = 0; i < n; ++i) {
+    if (kcwo_neo_valid(high[i], low[i], close[i])) { first = i; break; }
+  }
+  if (first < 0) return;
+  // width_needed_bars for AverageTrueRange = max(length, atr_length), :410-420.
+  const int needed = (length > atr_length) ? length : atr_length;
+  if (n - first < needed) return;
+
+  // :874-877 -- the constants the default path hard-codes.
+  const double ema_alpha = 2.0 / 21.0;
+  const double rma_alpha = 0.1;
+  const double width_scale = 2.0 * multiplier;
+
+  int ema_count = 0;
+  double ema_sum = 0.0, ema_value = nn;
+  bool ema_seeded = false;
+
+  int atr_count = 0;
+  double atr_sum = 0.0, atr_value = nn;
+  bool atr_seeded = false;
+
+  double prev_close = nn;
+  bool has_prev_close = false;
+
+  for (int i = 0; i < n; ++i) {
+    const double h = high[i], l = low[i], c = close[i];
+    const double src = c;  // source == close
+
+    if (!kcwo_neo_valid(h, l, c)) {
+      // :909-926 -- the reset.
+      ema_count = 0; ema_sum = 0.0; ema_value = nn; ema_seeded = false;
+      atr_count = 0; atr_sum = 0.0; atr_value = nn; atr_seeded = false;
+      prev_close = nn; has_prev_close = false;
+      continue;
+    }
+
+    bool have_middle = false;
+    double middle = 0.0;
+    if (!ema_seeded) {
+      ema_sum += src;
+      ema_count += 1;
+      if (ema_count == length) {
+        ema_value = ema_sum / (double)length;
+        ema_seeded = true;
+        middle = ema_value; have_middle = true;
+      }
+    } else {
+      ema_value = fma(ema_alpha, src - ema_value, ema_value);  // :934
+      middle = ema_value; have_middle = true;
+    }
+
+    double tr;
+    if (has_prev_close) {
+      const double up = (h > prev_close) ? h : prev_close;
+      const double dn = (l < prev_close) ? l : prev_close;
+      tr = up - dn;
+    } else {
+      tr = h - l;
+    }
+    prev_close = c;
+    has_prev_close = true;
+
+    bool have_range = false;
+    double range = 0.0;
+    if (!atr_seeded) {
+      atr_sum += tr;
+      atr_count += 1;
+      if (atr_count == atr_length) {
+        atr_value = atr_sum / (double)atr_length;
+        atr_seeded = true;
+        range = atr_value; have_range = true;
+      }
+    } else {
+      atr_value = fma(rma_alpha, tr - atr_value, atr_value);  // :969
+      range = atr_value; have_range = true;
+    }
+
+    if (have_middle && have_range) {
+      // :974-980. The CPU also folds kbw into a 20-deep SMA for the second
+      // output; this lane emits kbw, so that ring is dead work here.
+      row[i] = (isfinite(middle) && isfinite(range) && middle != 0.0)
+                   ? ((width_scale * range) / middle)
+                   : nn;
+    }
+  }
+}

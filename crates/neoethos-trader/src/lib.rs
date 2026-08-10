@@ -14,12 +14,29 @@
 //! | Seam ([`contracts`]) | Phase 1 stub | Wired later |
 //! |---|---|---|
 //! | [`SignalEngine`] | [`signal::MomentumStubSignal`] | Gene + `SoftVotingEnsemble` blend (P4) |
-//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | core `RiskManager` / `RiskyModeManager` (P5) |
+//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | `RiskyModeManager` (P5). NOT the core `RiskManager` — it has no production constructor; see [`risk`] |
 //! | [`ExecutionAdapter`] | [`execution::MockExecutionAdapter`] | cTrader `broker_api` (P5; demo vs live = the account) |
 //! | [`portfolio::PortfolioRegistry`] | explicit list / JSON manifest | promotion-artifact scan + hot-reload (P2) |
 //!
 //! Live market data (P2) and the rolling multi-TF feature cube (P3) feed
 //! [`contracts::LiveBar`]s and the SignalEngine respectively.
+//!
+//! ## Read this before believing a replay number (2026-08-09, audit #220–#231)
+//!
+//! Several of the seams above are STILL stubbed, and the replay screen has been
+//! reporting their output as if it were the operator's strategy. Every
+//! `data_replay::replay_*` entry point now returns
+//! [`engine::EngineStats::fidelity_warnings`] — an explicit list of every stub,
+//! synthetic input and divergence-from-the-GA-evaluator in the path that
+//! produced the numbers — and logs the same list at `warn`. **A run whose list
+//! is non-empty must not be compared with live results.**
+//!
+//! What changed with it: the real-gene replay paths now place the GENE'S OWN
+//! bracket instead of a 0.5 %-of-price synthetic stop, exit on stop / target /
+//! `max_hold_bars` like the evaluator rather than on a flat or reversed signal,
+//! and charge whatever [`execution::ReplayCostModel`] the caller supplies. That
+//! model still defaults to zero — inventing a spread would be a different lie —
+//! so the zero case is the first line of the fidelity report.
 
 pub mod blend_signal;
 pub mod contracts;
@@ -40,7 +57,10 @@ pub use contracts::{
     KillSwitchTier, LiveBar, PortfolioEntry, RiskGate, Signal, SignalEngine, SignalSource,
     StrategySource, TradeIntent, TradeMode,
 };
-pub use blend_signal::{BlendConfig, BlendMode, BlendedSignalEngine, MlDecision, blend_decision};
+pub use blend_signal::{
+    BlendConfig, BlendMode, BlendedSignalEngine, DEFAULT_BLEND_GATE_FLOOR,
+    DEFAULT_BLEND_VETO_BELOW, MlDecision, blend_decision,
+};
 pub use data_replay::{
     load_bars_from_dir, ohlcv_to_livebars, replay_portfolio_from_dir, replay_symbol_from_dir,
 };
@@ -50,9 +70,11 @@ pub use gene_signal::{
     PrecomputedSignalEngine, combine_gene_signals, combine_gene_signals_with_brackets,
     combine_gene_signals_with_confidence,
 };
-pub use decision::{DecisionConfig, DecisionEngine};
-pub use engine::{AutonomousEngine, EngineConfig, EngineStats};
-pub use execution::MockExecutionAdapter;
+pub use decision::{DEFAULT_SYNTHETIC_STOP_FRAC, DecisionConfig, DecisionEngine};
+pub use engine::{
+    AutonomousEngine, DEFAULT_REPLAY_STARTING_BALANCE, EngineConfig, EngineStats,
+};
+pub use execution::{MockExecutionAdapter, ReplayCostModel};
 pub use portfolio::PortfolioRegistry;
 pub use position::{Position, PositionManager};
 pub use replay::replay;

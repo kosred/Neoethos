@@ -9,6 +9,15 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/ptx");
     println!("cargo:rerun-if-changed=kernels/cubin");
 
+    // Sentinels first. `target_archs()` re-emits both with the real values
+    // when kernels are compiled from source, and a later `cargo:rustc-env`
+    // overrides an earlier one — so these are what remains when the fatbin
+    // path did not run (no `cuda` feature, or prebuilt staging). The runtime
+    // loader treats "unknown" as "we cannot name what was compiled" rather
+    // than inventing an architecture.
+    println!("cargo:rustc-env=VECTOR_TA_CUDA_ARCHS=unknown");
+    println!("cargo:rustc-env=VECTOR_TA_CUDA_PTX_ARCH=unknown");
+
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         if env::var("CARGO_FEATURE_CUDA_BUILD_PTX").is_ok() {
             compile_cuda_kernels();
@@ -33,12 +42,718 @@ fn is_nightly() -> bool {
     false
 }
 
-fn sm89_cubin_name_for_ptx(ptx_name: &str) -> String {
+// ── NeoEthos patch 2026-08-09 — ARCH-AGNOSTIC BINARY ARTIFACT ─────────────
+// Upstream emitted `<stem>_sm89.cubin`: a SINGLE-architecture cubin for Ada,
+// which `module_loader.rs` would only load when the running device reported
+// compute capability exactly 8.9. That is the arch trap in its binary form —
+// the artifact names one card in its FILENAME.
+//
+// The replacement is `<stem>.fatbin`: one container carrying SASS for every
+// architecture in `target_archs()` PLUS embedded PTX at the highest of them,
+// so the driver picks the exact SASS for the present card and JITs the PTX
+// forward onto anything newer. See `compile_kernel`.
+fn fatbin_name_for_ptx(ptx_name: &str) -> String {
     if let Some(stem) = ptx_name.strip_suffix(".ptx") {
-        format!("{stem}_sm89.cubin")
+        format!("{stem}.fatbin")
     } else {
-        format!("{ptx_name}_sm89.cubin")
+        format!("{ptx_name}.fatbin")
     }
+}
+
+/// The architectures a stock build targets when the operator names none.
+///
+/// These are the four cards the project actually runs on — A100 (8.0),
+/// RTX 3090 / A10 (8.6), RTX 4090 / L40S (8.9), H100 (9.0). A device NEWER
+/// than the highest entry is served by the PTX that `compile_kernel` embeds
+/// in the same fatbin, so "a card we have not compiled for" is a JIT, not a
+/// failure. A device OLDER than 8.0 is not covered and is refused loudly by
+/// `module_loader.rs` rather than silently mis-run.
+const DEFAULT_TARGET_ARCHS: &[u32] = &[80, 86, 89, 90];
+
+/// Kernel sources whose entry points feed the NeoEthos f64 indicator lane.
+///
+/// NON-NEGOTIABLE: these are NEVER compiled with `--use_fast_math`, whatever
+/// `CUDA_FAST_MATH` says. The shipped PTX proves this is not a hypothetical —
+/// it carries 23 `rcp.approx.ftz.f64` instructions across 17 files, i.e. fast
+/// math already degrades f64 results in this crate today. Our lane opts out
+/// positively (`-prec-div=true -prec-sqrt=true -fmad=false`) instead of
+/// relying on an env var being spelled correctly at the call site.
+///
+/// `-fmad=false` forbids the COMPILER from contracting a separate multiply and
+/// add. It does NOT disable an explicit `fma()` call — which is exactly what
+/// the kernels use where the CPU reference uses `f64::mul_add`, so the two
+/// stay bit-identical on the fused steps and unfused everywhere else.
+const F64_LANE_SOURCES: &[&str] = &[
+    "neoethos_f64_kernels.cu",
+    "kernels/cuda/oscillators/adosc_kernel.cu",
+    // ------------------------------------------------------ closer 5, round 2
+    // Each of these now carries a lane-shaped f64 entry point (search the
+    // file for "NEOETHOS f64 LANE"). Listing the file here opts its WHOLE
+    // compilation out of `--use_fast_math`, which is the only way the opt-out
+    // can be correct: the f32 and f64 entry points share one translation
+    // unit, so a per-entry flag does not exist.
+    "kernels/cuda/smoothed_gaussian_trend_filter_kernel.cu",
+    "kernels/cuda/spearman_correlation_kernel.cu",
+    "kernels/cuda/squeeze_index_kernel.cu",
+    "kernels/cuda/standardized_psar_oscillator_kernel.cu",
+    "kernels/cuda/statistical_trailing_stop_kernel.cu",
+    "kernels/cuda/stochastic_adaptive_d_kernel.cu",
+    "kernels/cuda/stochastic_connors_rsi_kernel.cu",
+    "kernels/cuda/stochastic_distance_kernel.cu",
+    "kernels/cuda/stochastic_money_flow_index_kernel.cu",
+    "kernels/cuda/supertrend_oscillator_kernel.cu",
+    "kernels/cuda/supertrend_recovery_kernel.cu",
+    "kernels/cuda/trend_flow_trail_kernel.cu",
+    "kernels/cuda/twiggs_money_flow_kernel.cu",
+    "kernels/cuda/volatility_quality_index_kernel.cu",
+    "kernels/cuda/vwap_deviation_oscillator_kernel.cu",
+    "kernels/cuda/vwap_zscore_with_signals_kernel.cu",
+    // ------------------------------------------------------------- shard S5
+    // Each of these now carries an f64 section (search the file for
+    // "f64 LANE  --  shard S5") whose entry points are what the f64 lane
+    // launches. Listing the file here opts its WHOLE compilation out of
+    // `--use_fast_math`, which is the only way the opt-out can be correct:
+    // the f32 and f64 entry points share one translation unit, so a per-entry
+    // flag does not exist. The measured reason this matters is in the doc
+    // comment above -- the shipped PTX already carries 23 `rcp.approx.ftz.f64`
+    // instructions, i.e. fast math is degrading f64 in this crate TODAY.
+    "kernels/cuda/atr_kernel.cu",
+    "kernels/cuda/dm_kernel.cu",
+    "kernels/cuda/eri_kernel.cu",
+    "kernels/cuda/garman_klass_volatility_kernel.cu",
+    "kernels/cuda/gopalakrishnan_range_index_kernel.cu",
+    "kernels/cuda/kaufmanstop_kernel.cu",
+    "kernels/cuda/keltner_kernel.cu",
+    "kernels/cuda/marketefi_kernel.cu",
+    "kernels/cuda/medium_ad_kernel.cu",
+    "kernels/cuda/medprice_kernel.cu",
+    "kernels/cuda/moving_averages/ehlers_pma_kernel.cu",
+    "kernels/cuda/moving_averages/epma_kernel.cu",
+    "kernels/cuda/moving_averages/mab_kernel.cu",
+    "kernels/cuda/moving_averages/mwdx_kernel.cu",
+    "kernels/cuda/moving_averages/sgf_kernel.cu",
+    "kernels/cuda/moving_averages/sinwma_kernel.cu",
+    "kernels/cuda/moving_averages/srwma_kernel.cu",
+    "kernels/cuda/moving_averages/trima_kernel.cu",
+    "kernels/cuda/moving_averages/vwmacd_kernel.cu",
+    "kernels/cuda/moving_averages/wclprice_kernel.cu",
+    "kernels/cuda/oscillators/cg_kernel.cu",
+    "kernels/cuda/oscillators/coppock_kernel.cu",
+    "kernels/cuda/oscillators/dpo_kernel.cu",
+    "kernels/cuda/oscillators/fosc_kernel.cu",
+    "kernels/cuda/oscillators/kst_kernel.cu",
+    "kernels/cuda/oscillators/lrsi_kernel.cu",
+    "kernels/cuda/oscillators/mom_kernel.cu",
+    "kernels/cuda/oscillators/roc_kernel.cu",
+    "kernels/cuda/oscillators/ultosc_kernel.cu",
+    "kernels/cuda/pattern_recognition_kernel.cu",
+    "kernels/cuda/pivot_kernel.cu",
+    "kernels/cuda/psychological_line_kernel.cu",
+    "kernels/cuda/supertrend_kernel.cu",
+    "kernels/cuda/vosc_kernel.cu",
+    // ------------------------------------------------------------- shard S2
+    // Same contract as the S5 block above: the f64 entry point the lane
+    // launches lives in the indicator's OWN file, beside the f32 entry points
+    // the 180 f32 wrappers still call, so the whole translation unit opts out
+    // of fast math. Search these files for "S2 f64 LANE".
+    "kernels/cuda/moving_averages/sqwma_kernel.cu",
+    // ------------------------------------------------------------- shard S3
+    // Same contract as the blocks above: the f64 entry point the lane
+    // launches lives in the indicator's OWN file, beside the f32 entry points
+    // the f32 wrappers still call, so the WHOLE translation unit opts out of
+    // fast math -- including the f32 kernels, which is the only way to be sure
+    // no `--use_fast_math` reaches an f64 instruction in the same object.
+    // Search these files for "S3 f64 LANE".
+    "kernels/cuda/deviation_kernel.cu",
+    "kernels/cuda/mean_ad_kernel.cu",
+    "kernels/cuda/oscillators/ao_kernel.cu",
+    "kernels/cuda/moving_averages/linearreg_slope_kernel.cu",
+    "kernels/cuda/moving_averages/tsf_kernel.cu",
+    "kernels/cuda/moving_averages/highpass_kernel.cu",
+    // `is_f64_lane_source` matches with `ends_with`, so the path here must be
+    // the one `compile_kernel` is actually handed. This entry used to read
+    // "kernels/cuda/decycler_kernel.cu" -- a file at the kernels ROOT that no
+    // `compile_kernel` call ever named. The compiled translation unit is the
+    // moving_averages one (build.rs:920), and it did NOT end with the old
+    // needle, so `neoethos_decycler_batch_f64` was built WITH `--use_fast_math`
+    // while the entry claimed it was exempt. The root duplicate is deleted.
+    "kernels/cuda/moving_averages/decycler_kernel.cu",
+    "kernels/cuda/moving_averages/supersmoother_kernel.cu",
+    "kernels/cuda/moving_averages/tilson_kernel.cu",
+    "kernels/cuda/wad_kernel.cu",
+    "kernels/cuda/sar_kernel.cu",
+    "kernels/cuda/oscillators/dti_kernel.cu",
+    "kernels/cuda/zscore_kernel.cu",
+    "kernels/cuda/pfe_kernel.cu",
+    "kernels/cuda/chande_kernel.cu",
+    "kernels/cuda/di_kernel.cu",
+    "kernels/cuda/oscillators/kdj_kernel.cu",
+    "kernels/cuda/oscillators/aso_kernel.cu",
+    "kernels/cuda/wto_kernel.cu",
+    "kernels/cuda/range_filter_kernel.cu",
+    "kernels/cuda/moving_averages/correlation_cycle_kernel.cu",
+    "kernels/cuda/moving_averages/mama_kernel.cu",
+    "kernels/cuda/moving_averages/volume_adjusted_ma_kernel.cu",
+    "kernels/cuda/oscillators/reverse_rsi_kernel.cu",
+    "kernels/cuda/moving_averages/ehlers_ecema_kernel.cu",
+    "kernels/cuda/pvi_kernel.cu",
+    "kernels/cuda/vpt_kernel.cu",
+    // ------------------------------------------------------------- shard S6
+    // Same contract as the S5 and S2 blocks above. Each of these files now
+    // carries an f64 section -- search it for "f64 LANE  --  shard S6" -- and
+    // listing it opts its WHOLE translation unit out of `--use_fast_math`,
+    // because the f32 and f64 entry points share one compilation and a
+    // per-entry flag does not exist.
+    //
+    // This DOES change the f32 entry points in these files: they stop being
+    // compiled with fast math. Deliberate, and an accuracy improvement rather
+    // than a regression -- the measured reason is in the doc comment above,
+    // where the shipped PTX is shown carrying 23 `rcp.approx.ftz.f64`
+    // instructions, i.e. the flag is degrading f64 in this crate today and has
+    // been degrading the f32 divides and square roots all along.
+    // ------------------------------------------------------- closer 6 (C6)
+    // Same contract as every block above: the f64 entry point the lane
+    // launches lives in the indicator's OWN file, beside the f32 entry points
+    // the f32 wrappers still call, so listing it opts the WHOLE translation
+    // unit out of `--use_fast_math`. Search these files for
+    // "f64 LANE  --  closer 6".
+    //
+    // `emd_kernel.cu`, `keltner_kernel.cu`, `lpc_kernel.cu`,
+    // `fvg_trailing_stop_kernel.cu`, `macz_kernel.cu`, `msw_kernel.cu`,
+    // `rvi_kernel.cu` and `yang_zhang_volatility_kernel.cu` are ALREADY in
+    // this list from the S5/S6 blocks below -- those shards listed the file
+    // without landing its f64 section -- so only the files this closer adds
+    // for the first time appear here.
+    "kernels/cuda/oscillators/stoch_kernel.cu",
+    "kernels/cuda/nadaraya_watson_envelope_kernel.cu",
+    "kernels/cuda/alphatrend_kernel.cu",
+    "kernels/cuda/bollinger_bands_width_kernel.cu",
+    "kernels/cuda/correl_hl_kernel.cu",
+    "kernels/cuda/cvi_kernel.cu",
+    "kernels/cuda/donchian_kernel.cu",
+    "kernels/cuda/emd_kernel.cu",
+    "kernels/cuda/fvg_trailing_stop_kernel.cu",
+    "kernels/cuda/historical_volatility_kernel.cu",
+    "kernels/cuda/lpc_kernel.cu",
+    "kernels/cuda/moving_averages/buff_averages_kernel.cu",
+    "kernels/cuda/moving_averages/cora_wave_kernel.cu",
+    "kernels/cuda/moving_averages/fwma_kernel.cu",
+    "kernels/cuda/moving_averages/hwma_kernel.cu",
+    "kernels/cuda/moving_averages/jsa_kernel.cu",
+    "kernels/cuda/moving_averages/macz_kernel.cu",
+    "kernels/cuda/moving_averages/nma_kernel.cu",
+    "kernels/cuda/moving_averages/qstick_kernel.cu",
+    "kernels/cuda/moving_averages/swma_kernel.cu",
+    "kernels/cuda/moving_averages/trendflex_kernel.cu",
+    "kernels/cuda/moving_averages/vpwma_kernel.cu",
+    "kernels/cuda/moving_averages/vwap_kernel.cu",
+    "kernels/cuda/moving_averages/vwma_kernel.cu",
+    "kernels/cuda/oscillators/aroonosc_kernel.cu",
+    "kernels/cuda/oscillators/bop_kernel.cu",
+    "kernels/cuda/oscillators/cfo_kernel.cu",
+    "kernels/cuda/oscillators/dec_osc_kernel.cu",
+    "kernels/cuda/oscillators/msw_kernel.cu",
+    "kernels/cuda/oscillators/rocp_kernel.cu",
+    "kernels/cuda/oscillators/rvi_kernel.cu",
+    "kernels/cuda/oscillators/willr_kernel.cu",
+    "kernels/cuda/parkinson_volatility_kernel.cu",
+    "kernels/cuda/percentile_nearest_rank_kernel.cu",
+    "kernels/cuda/ttm_trend_kernel.cu",
+    "kernels/cuda/var_kernel.cu",
+    "kernels/cuda/vertical_horizontal_filter_kernel.cu",
+    "kernels/cuda/vi_kernel.cu",
+    "kernels/cuda/voss_kernel.cu",
+    "kernels/cuda/yang_zhang_volatility_kernel.cu",
+    // --------------------------------------------------- closer 6, round 2
+    // Five more files that gained a "NEOETHOS f64 LANE  --  closer 6" section
+    // in this round and were NOT already opted out by an earlier shard. Each
+    // one must be here or nvcc compiles its WHOLE translation unit --
+    // including the new f64 entry point -- with `--use_fast_math`, which is
+    // how 23 `rcp.approx.ftz.f64` instructions reached the shipped PTX in the
+    // first place.
+    "kernels/cuda/oscillators/qqe_kernel.cu",
+    "kernels/cuda/oscillators/srsi_kernel.cu",
+    "kernels/cuda/oscillators/stc_kernel.cu",
+    "kernels/cuda/net_myrsi_kernel.cu",
+    "kernels/cuda/moving_averages/vlma_kernel.cu",
+    // ------------------------------------------------------------- shard S1
+    // Same contract as the blocks above. Each of these files now carries an
+    // f64 section -- search it for "S1 f64 LANE" -- and listing it opts its
+    // WHOLE translation unit out of `--use_fast_math`, because the f32 and f64
+    // entry points share one compilation and nvcc has no per-entry flag.
+    "kernels/cuda/kurtosis_kernel.cu",
+    "kernels/cuda/nvi_kernel.cu",
+    "kernels/cuda/safezonestop_kernel.cu",
+    "kernels/cuda/moving_averages/alligator_kernel.cu",
+    "kernels/cuda/moving_averages/alma_kernel.cu",
+    "kernels/cuda/moving_averages/apo_kernel.cu",
+    "kernels/cuda/moving_averages/edcf_kernel.cu",
+    "kernels/cuda/moving_averages/hma_kernel.cu",
+    "kernels/cuda/moving_averages/kama_kernel.cu",
+    "kernels/cuda/moving_averages/linreg_kernel.cu",
+    "kernels/cuda/moving_averages/pma_kernel.cu",
+    "kernels/cuda/moving_averages/vidya_kernel.cu",
+    "kernels/cuda/oscillators/chop_kernel.cu",
+    "kernels/cuda/oscillators/emv_kernel.cu",
+    "kernels/cuda/oscillators/fisher_kernel.cu",
+    "kernels/cuda/oscillators/gatorosc_kernel.cu",
+    "kernels/cuda/oscillators/kvo_kernel.cu",
+    "kernels/cuda/oscillators/ppo_kernel.cu",
+    "kernels/cuda/oscillators/stochf_kernel.cu",
+    // ------------------------------------------------------------- shard S4
+    // Same contract as the blocks above. Each of these carries an
+    // `<id>_neo_batch_f64` entry point (search the file for "S4 f64 LANE" or
+    // "NEOETHOS f64 LANE") beside the f32 entry points the f32 wrappers still
+    // call, so opting the WHOLE translation unit out of `--use_fast_math` is
+    // the only correct granularity — a per-entry flag does not exist.
+    //
+    // One of these is listed for a reason that is NOT its f64 section:
+    // `damiani_volatmeter_kernel.cu:68` hardcodes
+    // `const float EPS = 1.1920929e-7f`, f32 machine epsilon, which fast math
+    // is entitled to fold away entirely.
+    "kernels/cuda/ad_kernel.cu",
+    "kernels/cuda/aroon_kernel.cu",
+    "kernels/cuda/bollinger_bands_kernel.cu",
+    "kernels/cuda/cksp_kernel.cu",
+    "kernels/cuda/damiani_volatmeter_kernel.cu",
+    "kernels/cuda/dx_kernel.cu",
+    "kernels/cuda/er_kernel.cu",
+    "kernels/cuda/linearreg_angle_kernel.cu",
+    "kernels/cuda/mass_kernel.cu",
+    "kernels/cuda/moving_averages/cwma_kernel.cu",
+    "kernels/cuda/moving_averages/ehma_kernel.cu",
+    "kernels/cuda/moving_averages/frama_kernel.cu",
+    "kernels/cuda/moving_averages/highpass2_kernel.cu",
+    "kernels/cuda/moving_averages/linearreg_intercept_kernel.cu",
+    "kernels/cuda/moving_averages/smma_kernel.cu",
+    "kernels/cuda/moving_averages/supersmoother_3_pole_kernel.cu",
+    "kernels/cuda/natr_kernel.cu",
+    "kernels/cuda/obv_kernel.cu",
+    "kernels/cuda/oscillators/acosc_kernel.cu",
+    "kernels/cuda/oscillators/cmo_kernel.cu",
+    "kernels/cuda/oscillators/ift_rsi_kernel.cu",
+    "kernels/cuda/oscillators/macd_kernel.cu",
+    "kernels/cuda/oscillators/rsi_kernel.cu",
+    "kernels/cuda/oscillators/ttm_squeeze_kernel.cu",
+    "kernels/cuda/stddev_kernel.cu",
+    "kernels/cuda/ui_kernel.cu",
+    "kernels/cuda/vpci_kernel.cu",
+    "kernels/cuda/wavetrend_kernel.cu",
+    "kernels/cuda/dvdiqqe_kernel.cu",
+    "kernels/cuda/oscillators/cci_cycle_kernel.cu",
+    // ---------------------------------------------- from-scratch f64 kernels
+    //
+    // The nine files that shipped as one-line EMPTY stubs
+    // (`extern "C" __global__ void possible_rsi_batch_f64() {}`) and now carry
+    // real kernels written against the CPU reference, plus
+    // `rogers_satchell_volatility_kernel.cu`, which had no `.cu` at all.
+    //
+    // Unlike the shard blocks above, these are f64-ONLY translation units —
+    // there is no f32 entry point in them to be affected. Listing them is
+    // still the only way to opt out of `--use_fast_math`, and it matters:
+    // several of them run `log`, `exp`, `atan`, `acosh`, `asinh` and `sqrt`
+    // inside a RECURRENCE, where an approximate reciprocal does not perturb one
+    // bar, it walks forward through every later bar of the series.
+    "kernels/cuda/goertzel_cycle_composite_wave_kernel.cu",
+    "kernels/cuda/ichimoku_oscillator_kernel.cu",
+    "kernels/cuda/ict_propulsion_block_kernel.cu",
+    "kernels/cuda/insync_index_kernel.cu",
+    "kernels/cuda/kase_peak_oscillator_with_divergences_kernel.cu",
+    "kernels/cuda/market_structure_confluence_kernel.cu",
+    "kernels/cuda/possible_rsi_kernel.cu",
+    "kernels/cuda/rogers_satchell_volatility_kernel.cu",
+    "kernels/cuda/smooth_theil_sen_kernel.cu",
+    "kernels/cuda/vdubus_divergence_wave_pattern_generator_kernel.cu",
+    // ------------------------------------------------------------- closer 3
+    // Same contract as the blocks above: the f64 entry point the lane launches
+    // lives in the indicator's OWN file, beside the f32 entry points the f32
+    // wrappers still call, so the WHOLE translation unit opts out of fast
+    // math -- a per-entry flag does not exist. Search these files for
+    // "f64 LANE  --  closer C3". `marketefi_kernel.cu` and `medium_ad_kernel.cu`
+    // are already listed above by shard S5 and are not repeated.
+    "kernels/cuda/l1_ehlers_phasor_kernel.cu",
+    "kernels/cuda/l2_ehlers_signal_to_noise_kernel.cu",
+    "kernels/cuda/kairi_relative_index_kernel.cu",
+    "kernels/cuda/linear_correlation_oscillator_kernel.cu",
+    // ------------------------------------------------------------- closer 4
+    // Same contract as the blocks above: the f64 entry point the lane launches
+    // lives in the indicator's OWN file, beside the f32 entry points the f32
+    // wrappers still call, so the WHOLE translation unit opts out of fast
+    // math -- nvcc has no per-entry flag. Search these files for
+    // "f64 LANE  --  closer 4".
+    //
+    // `psychological_line_kernel.cu`, `moving_averages/sinwma_kernel.cu`,
+    // `moving_averages/srwma_kernel.cu` and `moving_averages/qstick_kernel.cu`
+    // are already listed by shard S5/S6 above and are NOT repeated. The three
+    // below were not listed by any earlier block, so without them the closer-4
+    // kernels in them would be built with `--use_fast_math` whenever the env
+    // var is set -- and `random_walk_index` runs `sqrt` and a reciprocal
+    // INSIDE a Wilder recurrence, where an approximate reciprocal does not
+    // perturb one bar, it walks forward through every later bar of the series.
+    "kernels/cuda/rank_correlation_index_kernel.cu",
+    "kernels/cuda/random_walk_index_kernel.cu",
+    "kernels/cuda/rolling_z_score_trend_kernel.cu",
+
+    // ------------------------------------------------------------ closer 5
+    // Same contract as the blocks above: each of these carries an
+    // <id>_neo_batch_f64 entry point (search the file for NEOETHOS f64 LANE)
+    // beside the f32 and crate-shaped f64 entry points its own wrappers still
+    // call, so opting the WHOLE translation unit out of --use_fast_math is the
+    // only correct granularity -- nvcc has no per-entry flag.
+    //
+    // trima, vosc and ultosc are NOT repeated here: they are already listed in
+    // the shard S5 block above, and listing a file twice would be a second
+    // claim about the same translation unit rather than a stronger one.
+    "kernels/cuda/trend_continuation_factor_kernel.cu",
+    "kernels/cuda/trend_direction_force_index_kernel.cu",
+    "kernels/cuda/trend_trigger_factor_kernel.cu",
+    "kernels/cuda/velocity_kernel.cu",
+    "kernels/cuda/velocity_acceleration_convergence_divergence_indicator_kernel.cu",
+    "kernels/cuda/velocity_acceleration_indicator_kernel.cu",
+    "kernels/cuda/volume_weighted_rsi_kernel.cu",
+    "kernels/cuda/volume_zone_oscillator_kernel.cu",
+    "kernels/cuda/momentum_ratio_oscillator_kernel.cu",
+    "kernels/cuda/on_balance_volume_oscillator_kernel.cu",
+    // ------------------------------------------------------------- closer 1
+    // Each of these now carries an `<id>_neo_batch_f64` entry point (search
+    // the file for "NEOETHOS f64 LANE") beside the entry points the
+    // per-indicator wrappers still call. Listing the file here opts its WHOLE
+    // compilation out of `--use_fast_math`, which is the only correct
+    // granularity: the f32 and f64 entry points share one translation unit,
+    // so a per-entry flag does not exist.
+    //
+    // `oscillators/cg_kernel.cu` is listed for a second reason as well: its
+    // f32 lane hardcodes `1.1920929e-7f` at :22, f32 MACHINE EPSILON, which
+    // fast math is entitled to fold away entirely. The f64 entry point uses
+    // `f64::EPSILON` instead, as the CPU does (cg.rs:339).
+    "kernels/cuda/absolute_strength_index_oscillator_kernel.cu",
+    "kernels/cuda/accumulation_swing_index_kernel.cu",
+    "kernels/cuda/adaptive_bandpass_trigger_oscillator_kernel.cu",
+    "kernels/cuda/adaptive_bounds_rsi_kernel.cu",
+    "kernels/cuda/adaptive_macd_kernel.cu",
+    "kernels/cuda/adaptive_momentum_oscillator_kernel.cu",
+    "kernels/cuda/advance_decline_line_kernel.cu",
+    "kernels/cuda/andean_oscillator_kernel.cu",
+    "kernels/cuda/atr_percentile_kernel.cu",
+    "kernels/cuda/bull_power_vs_bear_power_kernel.cu",
+    "kernels/cuda/daily_factor_kernel.cu",
+    "kernels/cuda/decisionpoint_breadth_swenlin_trading_oscillator_kernel.cu",
+    "kernels/cuda/didi_index_kernel.cu",
+    "kernels/cuda/disparity_index_kernel.cu",
+    "kernels/cuda/donchian_channel_width_kernel.cu",
+    // ------------------------------------------------------- closer 2, round 2
+    //
+    // TWENTY-TWO FILES THAT WERE ALREADY REGISTERED IN `F64_KERNELS` AND WERE
+    // STILL BEING BUILT WITH `--use_fast_math`.
+    //
+    // This is not a new claim about a new kernel. Every file below already
+    // carries the f64 entry point its `F64Kernel` variant launches -- verified
+    // by `F64Kernel::module_stem` naming this file's stem and
+    // `F64Kernel::entry_point` naming a symbol that `grep -n __global__` finds
+    // in it. What was missing is the ONE thing that makes such a registration
+    // honest: the translation unit was never opted out of fast math, so the
+    // lane was launching an f64 kernel whose divides and square roots nvcc was
+    // free to lower to `rcp.approx.ftz.f64`. That is precisely the
+    // contamination the doc comment at the top of this list measures in the
+    // shipped PTX (23 `rcp.approx.ftz.f64` across 17 files) -- these files were
+    // part of the reason the number was not zero.
+    //
+    // Several of them run that divide INSIDE A RECURRENCE, where an
+    // approximate reciprocal does not perturb one bar, it walks forward
+    // through every later bar of the series: `rsx` (six cascaded EMAs),
+    // `trix` (three cascaded EMAs), `ehlers_kama` / `ehlers_itrend` /
+    // `ehlers_smoothed_adaptive_momentum` (IIR filters), `ewma_volatility`
+    // (an EWMA of squared log returns), `emd_trend` and `impulse_macd`.
+    //
+    // As everywhere else in this list, the granularity is the WHOLE file
+    // because nvcc has no per-entry flag and the f32 entry points these files
+    // still carry share the translation unit.
+    "kernels/cuda/moving_averages/pwma_kernel.cu",
+    "kernels/cuda/moving_averages/nama_kernel.cu",
+    "kernels/cuda/moving_averages/sama_kernel.cu",
+    // --------------------------------------------------------- closer 1
+    // Five more that were converted and REGISTERED but never listed, so
+    // `is_f64_lane_source` answered false and nvcc built them WITH
+    // `--use_fast_math`. Each carries exactly one `__global__ ..._f64`
+    // (`neoethos_{gaussian,reflex,jma,maaq,tradjema}_batch_f64`), and each of
+    // those five bodies is already free of f32 literals, f32-suffixed
+    // functions and fast-math intrinsics -- the ONLY thing still degrading
+    // them was this omission. All five are `is_sequential` IIR/adaptive
+    // recurrences, which is the worst place to accept an approximate
+    // reciprocal: the error is carried into every subsequent bar.
+    "kernels/cuda/moving_averages/gaussian_kernel.cu",
+    "kernels/cuda/moving_averages/reflex_kernel.cu",
+    "kernels/cuda/moving_averages/jma_kernel.cu",
+    "kernels/cuda/moving_averages/maaq_kernel.cu",
+    "kernels/cuda/moving_averages/tradjema_kernel.cu",
+    "kernels/cuda/moving_averages/ehlers_kama_kernel.cu",
+    "kernels/cuda/moving_averages/ehlers_itrend_kernel.cu",
+    "kernels/cuda/moving_averages/trix_kernel.cu",
+    "kernels/cuda/oscillators/rsx_kernel.cu",
+    "kernels/cuda/minmax_kernel.cu",
+    "kernels/cuda/chandelier_exit_kernel.cu",
+    "kernels/cuda/devstop_kernel.cu",
+    "kernels/cuda/ehlers_detrending_filter_kernel.cu",
+    "kernels/cuda/ehlers_simple_cycle_indicator_kernel.cu",
+    "kernels/cuda/ehlers_smoothed_adaptive_momentum_kernel.cu",
+    "kernels/cuda/ewma_volatility_kernel.cu",
+    "kernels/cuda/fractal_dimension_index_kernel.cu",
+    "kernels/cuda/impulse_macd_kernel.cu",
+    "kernels/cuda/hypertrend_kernel.cu",
+    "kernels/cuda/emd_trend_kernel.cu",
+    "kernels/cuda/ehlers_fm_demodulator_kernel.cu",
+    "kernels/cuda/forward_backward_exponential_oscillator_kernel.cu",
+    "kernels/cuda/gmma_oscillator_kernel.cu",
+    "kernels/cuda/evasive_supertrend_kernel.cu",
+    //
+    // FIVE MORE that now carry a `<id>_neo_batch_f64` entry point written by
+    // this closer (search each file for "f64 LANE  --  closer 2, round 2").
+    // `kaufmanstop_kernel.cu`, `oscillators/lrsi_kernel.cu`,
+    // `moving_averages/mwdx_kernel.cu`, `pivot_kernel.cu` and
+    // `moving_averages/sgf_kernel.cu` also received one but are already listed
+    // by the shard S5 block above and are NOT repeated -- listing a file twice
+    // would be a second claim about the same translation unit rather than a
+    // stronger one.
+    "kernels/cuda/dual_ulcer_index_kernel.cu",
+    "kernels/cuda/hull_butterfly_oscillator_kernel.cu",
+    "kernels/cuda/market_structure_trailing_stop_kernel.cu",
+    "kernels/cuda/polynomial_regression_extrapolation_kernel.cu",
+    "kernels/cuda/range_oscillator_kernel.cu",
+    // ---------------------------------------------- closer 4, round 2
+    // The f64 entry point this lane launches lives in the indicator's
+    // OWN file, beside the entry points that file already had, so the
+    // WHOLE translation unit has to opt out of fast math -- nvcc has no
+    // per-entry flag. Search these files for
+    // "NEOETHOS f64 LANE  --  closer 4".
+    "kernels/cuda/keltner_channel_width_oscillator_kernel.cu",
+    "kernels/cuda/leavitt_convolution_acceleration_kernel.cu",
+    "kernels/cuda/market_meanness_index_kernel.cu",
+    "kernels/cuda/monotonicity_index_kernel.cu",
+    "kernels/cuda/premier_rsi_oscillator_kernel.cu",
+    "kernels/cuda/pretty_good_oscillator_kernel.cu",
+    "kernels/cuda/price_density_market_noise_kernel.cu",
+    "kernels/cuda/projection_oscillator_kernel.cu",
+    "kernels/cuda/qqe_weighted_oscillator_kernel.cu",
+    "kernels/cuda/rolling_skewness_kurtosis_kernel.cu",
+    // ------------------------------------------------ closer 3, round 2
+    // Each of these now carries an f64 lane section (search the file for
+    // "NEOETHOS f64 LANE  --  closer 3") whose `*_neo_batch_f64` entry point
+    // is what the f64 lane launches. Listing the FILE here opts its WHOLE
+    // compilation out of `--use_fast_math`, which is the only way the opt-out
+    // can be correct: the existing entry points and the new f64 one share one
+    // translation unit, so a per-entry flag does not exist. Without this the
+    // shipped PTX carries `rcp.approx.ftz.f64` -- fast math degrading f64 --
+    // which is the measured defect this list exists to remove.
+    "kernels/cuda/adjustable_ma_alternating_extremities_kernel.cu",
+    "kernels/cuda/autocorrelation_indicator_kernel.cu",
+    "kernels/cuda/historical_volatility_rank_kernel.cu",
+    "kernels/cuda/historical_volatility_percentile_kernel.cu",
+    "kernels/cuda/directional_imbalance_index_kernel.cu",
+    "kernels/cuda/cycle_channel_oscillator_kernel.cu",
+    "kernels/cuda/dynamic_momentum_index_kernel.cu",
+    "kernels/cuda/ehlers_adaptive_cg_kernel.cu",
+    "kernels/cuda/ehlers_adaptive_cyber_cycle_kernel.cu",
+    "kernels/cuda/ehlers_data_sampling_relative_strength_indicator_kernel.cu",
+    "kernels/cuda/exponential_trend_kernel.cu",
+    "kernels/cuda/geometric_bias_oscillator_kernel.cu",
+    "kernels/cuda/intraday_momentum_index_kernel.cu",
+    "kernels/cuda/bulls_v_bears_kernel.cu",
+    "kernels/cuda/candle_strength_oscillator_kernel.cu",
+    "kernels/cuda/cyberpunk_value_trend_analyzer_kernel.cu",
+    "kernels/cuda/fvg_positioning_average_kernel.cu",
+    "kernels/cuda/hema_trend_levels_kernel.cu",
+    "kernels/cuda/fibonacci_trailing_stop_kernel.cu",
+    "kernels/cuda/grover_llorens_cycle_oscillator_kernel.cu",
+    "kernels/cuda/demand_index_kernel.cu",
+    "kernels/cuda/adaptive_schaff_trend_cycle_kernel.cu",
+    "kernels/cuda/ehlers_linear_extrapolation_predictor_kernel.cu",
+    "kernels/cuda/ehlers_autocorrelation_periodogram_kernel.cu",
+];
+
+fn is_f64_lane_source(rel_src: &str) -> bool {
+    F64_LANE_SOURCES
+        .iter()
+        .any(|needle| rel_src.ends_with(needle))
+}
+
+/// `sm_86` / `compute_86` / `8.6` / `86` → `86`. `None` when it is not an arch.
+fn parse_arch(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    // `90a` / `100f` architecture-specific variants collapse to their base.
+    digits[..digits.len().min(3)].parse::<u32>().ok().map(|v| {
+        // "8.6" -> "86"; "100" stays 100 (Blackwell).
+        v
+    })
+}
+
+/// Which real-SASS architectures this nvcc can emit, e.g. `[70, 75, 80, 86,
+/// 89, 90]`. Parsed from `nvcc --list-gpu-arch`, which prints one
+/// `compute_XY` per line.
+///
+/// Computed once — `compile_kernel` runs ~330 times per build and this must
+/// not spawn a process each time.
+fn nvcc_supported_archs(nvcc: &str) -> &'static Vec<u32> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let out = Command::new(nvcc).arg("--list-gpu-arch").output();
+        let mut archs: Vec<u32> = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("compute_"))
+                .filter_map(|d| d.trim().parse::<u32>().ok())
+                .collect(),
+            _ => {
+                // Old nvcc without `--list-gpu-arch`. Do not guess narrow and
+                // do not fail: assume the requested set is servable and let
+                // nvcc reject it with its own message if not.
+                println!(
+                    "cargo:warning=vector-ta: `nvcc --list-gpu-arch` unavailable; cannot verify \
+                     which architectures this toolkit supports. Proceeding with the requested set."
+                );
+                Vec::new()
+            }
+        };
+        archs.sort_unstable();
+        archs.dedup();
+        archs
+    })
+}
+
+/// The architectures the fatbin will carry, ascending, always non-empty.
+///
+/// Precedence:
+///   1. `CUDA_ARCHS` — a comma/space separated LIST, all of which are built
+///   2. `CUDA_ARCH`  — a single architecture (narrow, deliberate build)
+///   3. [`DEFAULT_TARGET_ARCHS`] — the portable default, no card named at the
+///      call site and no auto-detection of the build host
+///
+/// Then intersected with [`nvcc_supported_archs`] so an older or newer toolkit
+/// produces a working narrower fatbin instead of failing the whole build.
+fn target_archs(nvcc: &str) -> &'static Vec<u32> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let requested: Vec<u32> = if let Ok(list) = env::var("CUDA_ARCHS") {
+            let v: Vec<u32> = list
+                .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                .filter_map(parse_arch)
+                .collect();
+            if v.is_empty() {
+                panic!("vector-ta: CUDA_ARCHS={list:?} contains no parseable architecture");
+            }
+            v
+        } else if let Ok(one) = env::var("CUDA_ARCH") {
+            let a = parse_arch(&one).unwrap_or_else(|| {
+                panic!("vector-ta: CUDA_ARCH={one:?} does not parse as an architecture")
+            });
+            println!(
+                "cargo:warning=vector-ta: CUDA_ARCH={one} builds a SINGLE-architecture fatbin. \
+                 The resulting binary runs on sm_{a} and (via embedded PTX) newer cards only. \
+                 Unset it — or use CUDA_ARCHS — for the portable default {DEFAULT_TARGET_ARCHS:?}."
+            );
+            vec![a]
+        } else {
+            DEFAULT_TARGET_ARCHS.to_vec()
+        };
+
+        let supported = nvcc_supported_archs(nvcc);
+        let mut archs: Vec<u32> = if supported.is_empty() {
+            requested.clone()
+        } else {
+            requested
+                .iter()
+                .copied()
+                .filter(|a| supported.contains(a))
+                .collect()
+        };
+        archs.sort_unstable();
+        archs.dedup();
+
+        if archs.is_empty() {
+            panic!(
+                "vector-ta: none of the requested CUDA architectures {requested:?} are supported \
+                 by this nvcc (it offers {supported:?}). Set CUDA_ARCHS to a subset it can build, \
+                 or install a CUDA toolkit that covers the cards you intend to run on. Refusing \
+                 to silently substitute a different architecture."
+            );
+        }
+
+        if archs.len() != requested.len() {
+            let dropped: Vec<u32> = requested
+                .iter()
+                .copied()
+                .filter(|a| !archs.contains(a))
+                .collect();
+            println!(
+                "cargo:warning=vector-ta: this nvcc cannot emit SASS for {dropped:?}; the fatbin \
+                 will carry {archs:?} plus forward PTX. Cards matching the dropped architectures \
+                 will NOT run this build."
+            );
+        }
+
+        // Recorded so the runtime loader's error can say what was compiled.
+        let joined: Vec<String> = archs.iter().map(|a| format!("sm_{a}")).collect();
+        println!("cargo:rustc-env=VECTOR_TA_CUDA_ARCHS={}", joined.join(","));
+        println!(
+            "cargo:rustc-env=VECTOR_TA_CUDA_PTX_ARCH=compute_{}",
+            archs.last().expect("non-empty")
+        );
+        println!(
+            "cargo:warning=vector-ta: building multi-arch fatbins for {archs:?} + forward PTX at \
+             compute_{}",
+            archs.last().expect("non-empty")
+        );
+        archs
+    })
+}
+
+/// Is `--use_fast_math` wanted for this source? OFF unless asked for by name.
+///
+/// ── NeoEthos patch 2026-08-09 — the default was backwards ─────────────────
+/// This read `match env::var("CUDA_FAST_MATH") { Ok("0") => {} _ => on }` at
+/// three sites: fast math was ON for an unset variable, i.e. for every normal
+/// build. `--use_fast_math` implies `-fmad=true` (FMA contraction), `-ftz=true`
+/// (denormals flushed to zero) and approximate div/rcp/sqrt — precisely the
+/// three things `crates/neoethos-gpu-cuda/build.rs` spends a measured paragraph
+/// forbidding with `-fmad=false`, because ONE contracted multiply-add moved a
+/// stop/target boundary and diverged a candidate by 0.62 %.
+///
+/// These kernels are not merely nearby. `neoethos-data`'s GPU indicator lane
+/// (`core::gpu_indicators`, policy `Auto` = "use the card whenever one is
+/// present") computes the indicator columns from them, those columns become
+/// `dataset.indicators`, and the fused Prototype B walk multiplies them by the
+/// gene weights: `combined += weights[term] * indicator`. A changed indicator
+/// flips `combined >= long_threshold` and therefore flips trades.
+///
+/// The 147 GPU parity fixtures hand the indicator matrix in directly, so they
+/// never exercise this lane and would have stayed green while a real EURUSD M5
+/// run computed different numbers — the exact shape of "numbers that are not
+/// real in the end".
+///
+/// So: OFF unless `CUDA_FAST_MATH=1` is spelled out, and never at all for the
+/// f64 lane, which until now declared itself NON-NEGOTIABLE in a comment that
+/// no code read (`is_f64_lane_source` had no caller).
+fn fast_math_requested(rel_src: &str) -> bool {
+    if is_f64_lane_source(rel_src) {
+        return false;
+    }
+    let on = env::var("CUDA_FAST_MATH").ok().as_deref() == Some("1");
+    if on {
+        println!(
+            "cargo:warning=vector-ta: CUDA_FAST_MATH=1 — compiling {rel_src} with \
+             --use_fast_math, which enables FMA contraction, flush-to-zero denormals and \
+             approximate div/rcp/sqrt. Any parity claim made against this build is void."
+        );
+    }
+    on
 }
 
 fn stage_prebuilt_ptx() {
@@ -48,16 +763,51 @@ fn stage_prebuilt_ptx() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    let ptx_dir = if let Ok(dir) = env::var("VECTOR_TA_PREBUILT_PTX_DIR") {
-        PathBuf::from(dir)
-    } else {
-        manifest_dir.join("kernels/ptx/compute_89")
+    // ── NeoEthos patch 2026-08-09 — no default architecture, ever ─────────
+    // Upstream defaulted to `kernels/ptx/compute_89`. Every one of the 329
+    // files in that directory declares a literal `.target sm_89`, and PTX is
+    // FORWARD-compatible only: none of them load on an A100 (sm_80) or an
+    // RTX 3090 (sm_86). Defaulting to it means a build that names no
+    // architecture silently produces an Ada-only binary.
+    //
+    // There is no safe default here, because a prebuilt directory IS one
+    // architecture by construction. So: refuse, and name the two ways out.
+    // The arch-agnostic lane is `--features cuda-build-ptx`, which compiles a
+    // multi-arch fatbin (see `compile_kernel`). Staging a single-arch PTX tree
+    // is still allowed, but only when the operator asks for it BY NAME.
+    let ptx_dir = match env::var("VECTOR_TA_PREBUILT_PTX_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => panic!(
+            "vector-ta: `cuda` is enabled without `cuda-build-ptx`, so the build wants a PREBUILT \
+             PTX directory — and there is no architecture-neutral one to default to.\n\
+             \n\
+             Every file under `kernels/ptx/compute_89` declares `.target sm_89` (Ada / RTX 4090). \
+             PTX runs FORWARD only, so those modules do not load on sm_80 (A100) or sm_86 \
+             (RTX 3090); defaulting to them is how a build silently becomes 4090-only.\n\
+             \n\
+             Pick one:\n\
+             \n\
+               1. RECOMMENDED — build the arch-agnostic fatbin from source:\n\
+                    cargo build -p vector-ta --features cuda-build-ptx\n\
+                  This emits SASS for {DEFAULT_TARGET_ARCHS:?} plus embedded PTX for forward JIT, \
+                  in ONE artifact that runs unchanged on all of them.\n\
+             \n\
+               2. Deliberately stage a single-architecture PTX tree, accepting that the \
+                  resulting binary runs on that architecture and newer only:\n\
+                    VECTOR_TA_PREBUILT_PTX_DIR=<dir> cargo build -p vector-ta --features cuda\n\
+                  (the shipped Ada tree is `kernels/ptx/compute_89`)",
+        ),
     };
 
-    let cubin_dir = if let Ok(dir) = env::var("VECTOR_TA_PREBUILT_CUBIN_DIR") {
-        PathBuf::from(dir)
-    } else {
-        manifest_dir.join("kernels/cubin/sm_89")
+    // The binary artifact is a multi-arch fatbin now, not an sm_89 cubin.
+    // A prebuilt tree may supply one; when it does not, zero-byte placeholders
+    // are written so `include_bytes!` still resolves and `module_loader.rs`
+    // falls through to the staged PTX.
+    let cubin_dir = match env::var("VECTOR_TA_PREBUILT_FATBIN_DIR")
+        .or_else(|_| env::var("VECTOR_TA_PREBUILT_CUBIN_DIR"))
+    {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => manifest_dir.join("kernels/fatbin"),
     };
 
     if !ptx_dir.is_dir() {
@@ -82,7 +832,7 @@ Enable `--features cuda-build-ptx` to compile PTX and cubin artifacts with nvcc,
         for entry in std::fs::read_dir(&cubin_dir).expect("read prebuilt cubin dir") {
             let entry = entry.expect("read prebuilt cubin dir entry");
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("cubin") {
+            if path.extension().and_then(|e| e.to_str()) == Some("fatbin") {
                 cubin_files.push(path);
             }
         }
@@ -148,7 +898,7 @@ Enable `--features cuda-build-ptx` to compile PTX artifacts with nvcc.",
             .expect("PTX file name")
             .to_string_lossy()
             .to_string();
-        let cubin_name = sm89_cubin_name_for_ptx(&ptx_name);
+        let cubin_name = fatbin_name_for_ptx(&ptx_name);
         if staged_cubins.contains(&cubin_name) {
             continue;
         }
@@ -186,6 +936,15 @@ fn compile_cuda_kernels() {
     compile_volume_adjusted_ma_kernel(&cuda_path);
     compile_supersmoother_3_pole_kernel(&cuda_path);
     compile_wto_kernel(&cuda_path);
+
+    // The NeoEthos f64 indicator lane. Listed in `F64_LANE_SOURCES`, so this
+    // one is compiled with `-prec-div=true -prec-sqrt=true -fmad=false
+    // -ftz=false` and never with `--use_fast_math` — see `compile_kernel`.
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/neoethos_f64_kernels.cu",
+        "neoethos_f64_kernels.ptx",
+    );
 
     compile_kernel(
         &cuda_path,
@@ -1641,6 +2400,16 @@ fn compile_cuda_kernels() {
         "kernels/cuda/possible_rsi_kernel.cu",
         "possible_rsi_kernel.ptx",
     );
+    // ------------------------------------------------------------- closer 4
+    // `rogers_satchell_volatility_kernel.cu` was listed in `F64_LANE_SOURCES`
+    // (so it opts out of fast math) but had NO `compile_kernel` call, so it
+    // produced no PTX and no fatbin and `load_cuda_embedded_module!` could
+    // never find it. Added here rather than left for a launch to discover.
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/rogers_satchell_volatility_kernel.cu",
+        "rogers_satchell_volatility_kernel.ptx",
+    );
     compile_kernel(
         &cuda_path,
         "kernels/cuda/smooth_theil_sen_kernel.cu",
@@ -1882,7 +2651,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
 
     println!("cargo:rerun-if-changed={}", src_path);
 
-    let cubin_name = sm89_cubin_name_for_ptx(ptx_name);
+    let cubin_name = fatbin_name_for_ptx(ptx_name);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let ptx_path = out_dir.join(ptx_name);
@@ -1925,50 +2694,90 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         format!("{}/bin/nvcc", cuda_path)
     };
 
-    fn normalize_arch(s: &str) -> String {
-        let t = s.trim();
-        if t.is_empty() {
-            return String::new();
-        }
+    // ── NeoEthos patch 2026-08-09 — THE ARCH TRAP, CLOSED ─────────────────
+    //
+    // WHAT WAS WRONG
+    //
+    // Upstream compiled ONE architecture per build and defaulted it to
+    // `compute_89` (Ada / RTX 4090). PTX and SASS are both FORWARD-compatible
+    // only, so an sm_89 module does not run on an sm_86 (RTX 3090) or an
+    // sm_80 (A100): it fails to load, per indicator, at first use, deep inside
+    // a run and far from the build that caused it. An earlier patch replaced
+    // the hardcoded default with auto-detection of the BUILD HOST's card —
+    // which removed the silent degradation but still emitted a single-arch
+    // artifact, so moving the same binary between a 3090 and an A100 still
+    // required a rebuild with a different `CUDA_ARCH`.
+    //
+    // WHAT IT DOES NOW
+    //
+    // One `-fatbin` per kernel source, carrying:
+    //   * `-gencode arch=compute_X,code=sm_X` — real SASS for every X in
+    //     `target_archs()`, so each of those cards runs precompiled code with
+    //     no JIT at all; and
+    //   * `-gencode arch=compute_MAX,code=compute_MAX` — embedded PTX at the
+    //     highest architecture, so a card NEWER than anything we compiled for
+    //     JITs forward instead of failing.
+    // plus a standalone `<stem>.ptx` at the LOWEST architecture, used by
+    // `module_loader.rs` only if the fatbin itself cannot be loaded. Lowest,
+    // not highest, because a fallback is worthless if it is narrower than the
+    // artifact it is backing up.
+    //
+    // HOW THE FOUR REQUIRED CARDS ARE SATISFIED, from ONE build with NO source
+    // change and NO rebuild flag change:
+    //   A100  sm_80 → SASS from `-gencode arch=compute_80,code=sm_80`
+    //   3090  sm_86 → SASS from `-gencode arch=compute_86,code=sm_86`
+    //   4090  sm_89 → SASS from `-gencode arch=compute_89,code=sm_89`
+    //   H100  sm_90 → SASS from `-gencode arch=compute_90,code=sm_90`
+    //   newer       → driver JITs the embedded compute_90 PTX
+    //
+    // `CUDA_ARCHS` still overrides the set (accepts a comma/space list now,
+    // not just a first entry), and `CUDA_ARCH` still names a single one — both
+    // for operators who want a faster, narrower build. Neither is required,
+    // and neither silently narrows: whatever is compiled is recorded in
+    // `VECTOR_TA_CUDA_ARCHS` and quoted back by the runtime error in
+    // `module_loader.rs` when a device is not covered.
+    //
+    // The set is INTERSECTED with what this nvcc actually supports
+    // (`nvcc --list-gpu-arch`), so CUDA 11 (no sm_90) and CUDA 13 (no sm_80)
+    // both produce a working narrower fatbin instead of failing the build on
+    // an "unsupported gpu architecture" for one entry of the list.
+    let archs = target_archs(&nvcc);
+    let arch_min = *archs.first().expect("target_archs is never empty");
+    let arch_max = *archs.last().expect("target_archs is never empty");
+    let ptx_arch = format!("compute_{arch_min}");
 
-        if t.starts_with("sm_") {
-            return t.replacen("sm_", "compute_", 1);
+    // NON-NEGOTIABLE: the f64 lane never sees `--use_fast_math`, whatever
+    // `CUDA_FAST_MATH` says. See `F64_LANE_SOURCES`.
+    let f64_lane = is_f64_lane_source(rel_src);
+    // OFF unless `CUDA_FAST_MATH=1` is spelled out — see `fast_math_requested`.
+    // This arm read `Ok("0") => {} _ => --use_fast_math`, so an UNSET variable
+    // (every normal build) compiled the f32 indicator kernels with FMA
+    // contraction, flush-to-zero denormals and approximate div/rcp/sqrt. Those
+    // kernels produce the indicator columns the fused Prototype B walk
+    // multiplies by the gene weights, and the GPU parity fixtures supply that
+    // matrix directly — so they would have stayed green while a real run
+    // computed different numbers.
+    let fast_math = fast_math_requested(rel_src);
+    let apply_precision_flags = move |cmd: &mut Command| {
+        if f64_lane {
+            cmd.args([
+                "-prec-div=true",
+                "-prec-sqrt=true",
+                "-fmad=false",
+                "-ftz=false",
+            ]);
+            return;
         }
-        if t.starts_with("compute_") {
-            return t.to_string();
-        }
-        let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.len() >= 2 {
-            return format!("compute_{}{}", &digits[0..1], &digits[1..2]);
-        }
-
-        t.to_string()
-    }
-
-    let arch = {
-        if let Ok(list) = env::var("CUDA_ARCHS") {
-            let first = list
-                .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                .find(|t| !t.trim().is_empty())
-                .map(|s| normalize_arch(s));
-            first
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "compute_89".to_string())
-        } else if let Ok(a) = env::var("CUDA_ARCH") {
-            let n = normalize_arch(&a);
-            if n.is_empty() {
-                "compute_89".to_string()
-            } else {
-                n
-            }
-        } else {
-            "compute_89".to_string()
+        if fast_math {
+            cmd.arg("--use_fast_math");
         }
     };
 
+    // ---- 1. standalone PTX at the LOWEST target arch (loader fallback) ----
+
     let mut cmd = Command::new(&nvcc);
 
-    cmd.args(&[
+    cmd.args([
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "--extended-lambda",
@@ -1976,23 +2785,18 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         "-O3",
     ]);
 
-    match env::var("CUDA_FAST_MATH").as_deref() {
-        Ok("0") => {}
-        _ => {
-            cmd.arg("--use_fast_math");
-        }
-    }
+    apply_precision_flags(&mut cmd);
 
     if env::var("CUDA_DEBUG").ok().as_deref() == Some("1") {
         cmd.arg("-lineinfo");
     }
 
-    cmd.args(&[
+    cmd.args([
         "-arch",
-        &arch,
+        ptx_arch.as_str(),
         "-o",
         ptx_path.to_str().expect("ptx path"),
-        &src_path,
+        src_path.as_str(),
     ]);
 
     if let Ok(extra) = env::var("NVCC_ARGS") {
@@ -2009,56 +2813,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
 
     eprintln!("Running nvcc command: {:?}", cmd);
 
-    let mut output = cmd.output().expect("Failed to execute nvcc");
-
-    if !output.status.success() {
-        let out_s = String::from_utf8_lossy(&output.stdout);
-        let err_s = String::from_utf8_lossy(&output.stderr);
-        let maybe_arch_fail = err_s.contains("unsupported gpu architecture")
-            || err_s.contains("Value 'compute_")
-            || out_s.contains("unsupported gpu architecture");
-
-        if arch != "compute_80" && maybe_arch_fail {
-            eprintln!(
-                "Falling back to -arch=compute_80 for {rel_src} (nvcc doesn't support {})",
-                arch
-            );
-            let mut cmd2 = Command::new(&nvcc);
-            cmd2.args(&[
-                "-std=c++17",
-                "--expt-relaxed-constexpr",
-                "--extended-lambda",
-                "-ptx",
-                "-O3",
-            ]);
-            if env::var("CUDA_FAST_MATH").ok().as_deref() != Some("0") {
-                cmd2.arg("--use_fast_math");
-            }
-            if env::var("CUDA_DEBUG").ok().as_deref() == Some("1") {
-                cmd2.arg("-lineinfo");
-            }
-
-            cmd2.args(&[
-                "-arch",
-                "compute_80",
-                "-o",
-                ptx_path.to_str().expect("ptx path"),
-                &src_path,
-            ]);
-            if let Ok(extra) = env::var("NVCC_ARGS") {
-                for tok in extra.split_whitespace() {
-                    if !tok.is_empty() {
-                        cmd2.arg(tok);
-                    }
-                }
-            }
-            if cfg!(target_os = "windows") {
-                append_windows_nvcc_host_args(&mut cmd2);
-            }
-            eprintln!("Running nvcc command: {:?}", cmd2);
-            output = cmd2.output().expect("Failed to execute nvcc (fallback)");
-        }
-    }
+    let output = cmd.output().expect("Failed to execute nvcc");
 
     if !output.status.success() {
         eprintln!("CUDA compilation failed for {rel_src}!");
@@ -2068,84 +2823,91 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         if cfg!(target_os = "windows")
             && String::from_utf8_lossy(&output.stderr).contains("Cannot find compiler 'cl.exe'")
         {
-            eprintln!(
-                "
-=== CUDA Build Error: Missing Visual Studio C++ Compiler ==="
-            );
+            eprintln!("\n=== CUDA Build Error: Missing Visual Studio C++ Compiler ===");
             eprintln!("nvcc requires the Microsoft Visual C++ compiler (cl.exe) to be available.");
-            eprintln!("Install Visual Studio Build Tools 2022 or run cargo from a Developer Command Prompt.");
             eprintln!(
-                "===========================================================
-"
+                "Install Visual Studio Build Tools 2022 or run cargo from a Developer Command Prompt."
             );
+            eprintln!("===========================================================\n");
         }
 
-        panic!("nvcc compilation failed");
+        panic!("nvcc PTX compilation failed for {rel_src} at -arch {ptx_arch}");
     }
 
     println!(
-        "Successfully compiled {} to {}",
+        "Successfully compiled {} to {} (PTX fallback, {})",
         src_path,
-        ptx_path.display()
+        ptx_path.display(),
+        ptx_arch
     );
 
-    let mut cubin_cmd = Command::new(&nvcc);
-    cubin_cmd.args(&[
+    // ---- 2. multi-arch fatbin: SASS for every target + forward PTX --------
+
+    let mut fat_cmd = Command::new(&nvcc);
+    fat_cmd.args([
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "--extended-lambda",
-        "-cubin",
+        "-fatbin",
         "-O3",
     ]);
 
-    match env::var("CUDA_FAST_MATH").as_deref() {
-        Ok("0") => {}
-        _ => {
-            cubin_cmd.arg("--use_fast_math");
-        }
-    }
+    apply_precision_flags(&mut fat_cmd);
 
     if env::var("CUDA_DEBUG").ok().as_deref() == Some("1") {
-        cubin_cmd.arg("-lineinfo");
+        fat_cmd.arg("-lineinfo");
     }
 
-    cubin_cmd.args(&[
-        "-arch",
-        "sm_89",
+    for arch in archs {
+        fat_cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
+    }
+    // Forward compatibility: keep PTX for the newest architecture we know
+    // about inside the same container, so an unreleased card JITs rather than
+    // failing to load.
+    fat_cmd.arg(format!(
+        "-gencode=arch=compute_{arch_max},code=compute_{arch_max}"
+    ));
+
+    fat_cmd.args([
         "-o",
-        cubin_path.to_str().expect("cubin path"),
-        &src_path,
+        cubin_path.to_str().expect("fatbin path"),
+        src_path.as_str(),
     ]);
 
     if let Ok(extra) = env::var("NVCC_ARGS") {
         for tok in extra.split_whitespace() {
             if !tok.is_empty() {
-                cubin_cmd.arg(tok);
+                fat_cmd.arg(tok);
             }
         }
     }
 
     if cfg!(target_os = "windows") {
-        append_windows_nvcc_host_args(&mut cubin_cmd);
+        append_windows_nvcc_host_args(&mut fat_cmd);
     }
 
-    eprintln!("Running nvcc command: {:?}", cubin_cmd);
+    eprintln!("Running nvcc command: {:?}", fat_cmd);
 
-    let cubin_output = cubin_cmd
-        .output()
-        .expect("Failed to execute nvcc for cubin");
+    let fat_output = fat_cmd.output().expect("Failed to execute nvcc (fatbin)");
 
-    if !cubin_output.status.success() {
-        eprintln!("CUDA cubin compilation failed for {rel_src}!");
-        eprintln!("stdout: {}", String::from_utf8_lossy(&cubin_output.stdout));
-        eprintln!("stderr: {}", String::from_utf8_lossy(&cubin_output.stderr));
-        panic!("nvcc cubin compilation failed");
+    if !fat_output.status.success() {
+        eprintln!("CUDA fatbin compilation failed for {rel_src}!");
+        eprintln!("stdout: {}", String::from_utf8_lossy(&fat_output.stdout));
+        eprintln!("stderr: {}", String::from_utf8_lossy(&fat_output.stderr));
+        panic!(
+            "nvcc fatbin compilation failed for {rel_src} (archs {archs:?}). \
+             Refusing to emit a single-architecture artifact instead: that is the arch trap this \
+             build exists to close. Narrow the set explicitly with CUDA_ARCHS if this toolkit \
+             cannot serve all of them."
+        );
     }
 
     println!(
-        "Successfully compiled {} to {}",
+        "Successfully compiled {} to {} (fatbin, sm {:?} + compute_{} PTX)",
         src_path,
-        cubin_path.display()
+        cubin_path.display(),
+        archs,
+        arch_max
     );
 
     if let Ok(prebuild_dir) = env::var("VECTOR_TA_PREBUILD_PTX_DIR") {

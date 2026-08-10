@@ -1,3 +1,34 @@
+# ============================================================================
+# THIS FILE IS A GENERATED ARTIFACT AS OF 2026-08-10. DO NOT EDIT BY HAND.
+# ============================================================================
+#
+# It is produced from `neoethos_core::config::Settings::default()` by
+#   crates/neoethos-core/tests/generated_seed_is_current.rs
+# which rewrites it and FAILS the build whenever it has drifted, naming every
+# key whose value changed. A Default that is not mirrored here therefore cannot
+# ship, and this file can never again carry an opinion of its own.
+#
+# WHY: this seed had 233 keys against the repo root's 383 — 150 keys missing,
+# zero the other way — and five of the shared keys disagreed, ALL FIVE on the
+# money path (discovery_mode, daily_drawdown_limit, total_drawdown_limit,
+# prop_firm_rules, account_currency). Two of those carried f32-widened
+# fingerprints, proving they were machine-written rather than chosen. Fixing
+# those five once would have left the mechanism that produced them intact.
+# Generating the file removes the mechanism.
+#
+# ⚠ STATE RIGHT NOW: the body below is still the LAST HAND-WRITTEN VERSION.
+# The first `cargo test -p neoethos-core --test generated_seed_is_current`
+# replaces it with the serialised defaults and fails once, printing the full
+# list of keys whose shipped value changes. Read that list — it is the record
+# of what a fresh desktop install stops doing and starts doing — and commit the
+# regenerated file. The migration tool (scripts/migrate_live_config.ps1) will
+# not use this file as a defaults source until it carries the marker line the
+# generator writes.
+#
+# TO CHANGE A SHIPPED DEFAULT: change the Rust `Default` impl in
+# crates/neoethos-core/src/config.rs and re-run the generator. There is no
+# other supported edit to this file.
+# ============================================================================
 system:
   symbol: EURUSD
   # F-304 (2026-05-28): account currency for the backtest cost model.
@@ -45,12 +76,34 @@ risk:
   atr_period: 14
   atr_stop_multiplier: 1.5
   triple_barrier_max_bars: 35
+  # ⚠ UNWIRED — these three reach nothing (see
+  # crates/neoethos-core/tests/config_has_recipient.rs). The LIVE exit policy is
+  # models.exit_policy, where trailing_enabled is false. Editing these changes
+  # no behaviour.
   trailing_enabled: true
   trailing_atr_multiplier: 1.0
   trailing_be_trigger_r: 1.0
   slippage_pips: 0.5
   commission_per_lot: 7.0
+  # Per SIDE, which is how a broker quotes it. Every evaluator subtracts
+  # commission_per_trade once per closed trade, so true doubles this once at
+  # the resolvers and downstream means ROUND TRIP. 2026-08-09 behaviour
+  # change: charged commission goes $7 -> $14 per lot per closed trade.
+  # Mirrors the repo-root config.yaml.
+  commission_per_lot_is_per_side: true
   backtest_spread_pips: 1.5
+  # Session-aware backtest spread (pips): Asian 22-07 UTC, Overlap 07-16,
+  # Late NY 16-22. The per-bar lookup exists on the CPU path AND in the CUDA
+  # kernel and was populated only under #[cfg(test)] until 2026-08-09 — a flat
+  # spread was charged at 03:00 and at the London open alike. Set all three or
+  # none (a partial curve is a config error). Left null: measure your broker.
+  backtest_spread_pips_asian: null
+  backtest_spread_pips_overlap: null
+  backtest_spread_pips_late_ny: null
+  # Round-trip cost band (pips). Results are reported at BOTH edges; one that
+  # survives only at the optimistic edge is flagged, not exported as a win.
+  cost_band_optimistic_pips: 1.6
+  cost_band_pessimistic_pips: 2.4
   conformal_enabled: true
   conformal_alpha: 0.10
   conformal_abstain_min_set_size: 3
@@ -112,9 +165,34 @@ models:
   # the regime_* force-keep) so multi-TF context actually reaches the GA.
   # 0 = legacy base-only behaviour. (root-caused + fixed 2026-06-08)
   discovery_runtime:
-    prefilter_top_k: 50
+    # 240, matching the repo-root config.yaml AND the code default in
+    # neoethos-core::config::DiscoveryRuntimeConfig. These three had drifted
+    # (code 50 / root 240 / this file 50) and the drift is now pinned by
+    # crates/neoethos-core/tests/shipped_config_matches_defaults.rs.
+    prefilter_top_k: 240
     prefilter_insample_frac: 0.80   # automatic 80/20 in-sample/out-of-sample validation split
     prefilter_min_per_timeframe: 6
+    # true (2026-08-09), matching the repo-root config.yaml AND the code
+    # default. The static ladder [0.10 .. 0.90] documents itself as
+    # "Calibrated for z-score-normalised features" (evolution_math.rs:560)
+    # while raw feature magnitudes span ~1e5:1, so a 0.35 threshold is
+    # unreachable for an ATR term and always-on for an RSI term. The adaptive
+    # ladder places the rungs at percentile points of THIS dataset's own
+    # magnitude distribution. Changes WHAT IS SEARCHED — runs before and after
+    # are not comparable. Fixes the threshold side only; see
+    # models.data_runtime.normalize_features for the weight-ladder half.
+    adaptive_thresholds: true
+  # Data-layer knobs. This block was ABSENT from this file, so the desktop
+  # bundle silently took whatever the code default was — the same class of
+  # drift that shipped prefilter_top_k at 50 here and 240 in the root config.
+  data_runtime:
+    # true (2026-08-09), matching the root config and the code default. The
+    # GA's 5:1 weight ladder cannot reorder feature terms that differ by 1e5,
+    # so a multi-indicator gene equalled its single largest-magnitude term.
+    # Non-finite cells become 0.0 (including higher-TF alignment NaN), and
+    # anything fitted on the raw cube must be retrained.
+    normalize_features: true
+    rebuild_stale_higher_tfs: false
   prop_search_population: 200  # 2026-06-06 operator: 100->200 per-island (200 × 8 islands = 1600 total) — MORE breadth/diversity per generation → finds more of the rare low-DD regime-specialist genes (the deep experiment found maxDD 2.7-4.5% vs 7-9.5% shallow).
   prop_search_population_auto: false  # SEARCH-MORE knob (2026-08-08): true + CUDA card => GA population is raised to the card's fits ceiling (min prop_search_population, max 16384), loudly logged. Changes what is searched — flip only after scripts/population-experiment.sh has settled that bigger finds better.
   prop_search_generations: 20000  # 2026-06-06 operator: 1000->20000 — deep GA. Time-bounded by max_hours (binds first on big TFs); on small/fast TFs lets the GA search far deeper than the old 1000 cap.
@@ -147,6 +225,57 @@ models:
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
+  # Decision A (2026-08-09), matching the repo-root config.yaml AND the code
+  # default. This key was ABSENT from this file, so the desktop bundle took
+  # whatever the code default happened to be — the same class of drift that
+  # shipped prefilter_top_k at 50 here and 240 in the root config.
+  prop_search_min_payoff_ratio: 2.0
+  # THE PRIMARY SURVIVAL GATE (2026-08-09). Cost-charged net expectancy per
+  # trade, in account currency. 0.0 does NOT mean "off" — it means "must be
+  # strictly greater than zero", and no value admits a money-loser.
+  #
+  # The payoff floor above cannot do this job. Measured on real EURUSD bars
+  # while sweeping the trailing stop: payoff 0.91 at expectancy -4.15
+  # pips/trade, payoff 2.53 at expectancy -4.18 pips/trade. The payoff moved
+  # 2.8x; the money did not move. A 2.0 payoff floor accepts the second and
+  # rejects the first, and the second loses slightly faster.
+  prop_search_min_net_expectancy_per_trade: 0.0
+  # Standard errors above zero the expectancy must sit. 0.0 = sign only.
+  # ~2.0 refuses candidates whose positive expectancy is inside its own noise.
+  prop_search_min_expectancy_t_stat: 0.0
+  # Discovery exit geometry (2026-08-09) — see the repo-root config.yaml for
+  # the full measurement. Short version: these were three literals in
+  # strategy_gene.rs with no config recipient. The trail is applied BEFORE the
+  # take-profit check every bar, and the multiplier is a multiple of the
+  # position's own stop, not of ATR, so at trigger 1.0 / multiplier 1.0 the
+  # stop sits at entry the instant a trade touches +1R. Measured payoff was
+  # 0.87 at tp 45 AND 0.87 at tp 300 — the take-profit was dead code, and the
+  # 2.0 payoff floor was unreachable by construction.
+  #
+  # Turning it off buys NO expected profit (expectancy was -4.15 pips/trade in
+  # every configuration). It is diagnostic. What it refuses is the automatic
+  # move-to-break-even at +1R; set it back to true to get that.
+  exit_policy:
+    trailing_enabled: false
+    trailing_be_trigger_r: 1.0
+    trailing_stop_multiplier: 1.0
+    trailing_min_lock_pips: 2.0
+  # The stop/target band the GA may draw and mutate within (2026-08-09), in
+  # multiples of THIS dataset's median ATR instead of absolute pips. The old
+  # literals (sl [6,20], tp [12,45], rr [1.5,2.5]) are M5 numbers: on H1
+  # (ATR ~12 pips) the whole stop band sits inside one bar's range, so higher
+  # timeframes were literally inexpressible. They also excluded the reward:risk
+  # the 2.0 payoff floor demands (tp >= 2*sl + 3*c = 48.67 at sl 20, c 2.89).
+  gene_stop_bounds:
+    atr_scaled: true
+    sl_min_atr: 1.0
+    sl_max_atr: 4.0
+    rr_min: 1.5
+    rr_max: 4.0
+    sl_min_pips: 6.0
+    sl_max_pips: 20.0
+    tp_min_pips: 12.0
+    tp_max_pips: 45.0
   prop_search_opportunistic_enabled: true
   prop_search_opportunistic_min_positive_months: 3
   prop_search_opportunistic_min_trades_per_month: 10
@@ -204,7 +333,6 @@ models:
     tabnet: 200
     tide: 200
   ray_tune_max_concurrency: 8
-  export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   phase5_filter_meta_blender: true
   phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
   calibration_enabled: true
@@ -268,10 +396,8 @@ models:
   cpcv_max_rows: 200000  # agent 2026-06-05: was 0 (=full rows) → CPCV (combinatorial purged CV, the single heaviest serial validation) ran on 1.05M rows. 200k bounds it on every TF; CPCV stays enabled (López de Prado overfitting check, kept per "stats are the authority") but capped. Informational in PropFirm mode.
 
 news:
-  news_kill_window_min: 30
   news_calendar_enabled: true
   news_calendar_source: forexfactory
-  news_lookahead_minutes: 60
   rss_feeds:
     - https://www.investing.com/rss/news.rss
     - https://www.fxstreet.com/rss/news

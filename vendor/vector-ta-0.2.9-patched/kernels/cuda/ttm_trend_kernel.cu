@@ -209,3 +209,103 @@ void ttm_trend_many_series_one_param_time_major_f32(
             (close_tm[(size_t)t * stride + series] > avg) ? 1.0f : 0.0f;
     }
 }
+
+
+// ===========================================================================
+// f64 LANE  --  shard S6
+//
+// CPU reference: `ttm_trend_scalar` (src/indicators/ttm_trend.rs:325), reached
+// from `ttm_trend_with_kernel` (:290).
+//
+// SOURCE IS hl2, NOT close. `TtmTrendInput::with_default_candles` (:166) uses
+// `"hl2"`, and `Candles::compute_hl2` is `(h + l) / 2.0`
+// (utilities/data_loader.rs:168). The kernel therefore takes high/low/close
+// and forms hl2 itself, so the caller cannot hand it close by accident.
+//
+// first_valid: `source` and `close` both non-NaN (:52-55). hl2 is NaN exactly
+// when high or low is, so over (high, low, close) that is the common rule,
+// `F64FirstValidRule::AllInputsNonNan`.
+//
+// OUTPUT IS A BOOLEAN, emitted as 1.0 / 0.0. `OUTPUTS_VALUE_BOOL`
+// (registry.rs:1051) and `TtmTrendOutput { values: Vec<bool> }`. NOTE THE
+// WARMUP IS `false`, NOT NaN: `ttm_trend_scalar` writes `out[i] = false` for
+// every bar before `warmup_end` (:346-352, :359-361, :372) because the output
+// vector is `vec![false; len]`, not a NaN prefix. Emitting NaN there would be
+// a different series -- a consumer comparing `> 0.5` would see the same thing,
+// but a consumer counting non-NaN bars would not. 0.0 is what the CPU says.
+//
+// The whole indicator is a running mean of hl2 compared with close, so it is
+// ONE THREAD PER COLUMN walking bars ascending: the sum is carried and the
+// O(1) update `sum += source[i] - source[i-period]` is the CPU's, which a
+// recomputed window sum would not reproduce bit for bit.
+//
+// f32 -> f64 audit: pointers and locals widened; the four f32 literals
+// (`0.0f`, `1.0f`, `0.5f`, `2.0f`) widened; no f32-suffixed math function and
+// no fast-math intrinsic is used below. `sum * inv_period` is kept as a
+// RECIPROCAL MULTIPLY because that is what :368 and :374 write -- turning it
+// into `sum / period` would be a different rounding. There is no epsilon and
+// no min/max chain in this indicator; the only comparison, `close > mean`, is
+// the indicator's definition and is false against NaN in Rust and in C alike.
+// ===========================================================================
+
+extern "C" __global__
+void ttm_trend_batch_f64(const double* __restrict__ high,
+                         const double* __restrict__ low,
+                         const double* __restrict__ close,
+                         int n,
+                         const int* __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const int first  = (first_valid < 0) ? 0 : first_valid;
+
+    // `ttm_prepare` rejects period == 0 / period > len; the CPU's own
+    // `warmup_end >= n` arm (:337-342) writes all-false, which is what the
+    // invalid-parameter column becomes here too.
+    if (period <= 0 || period > n || first >= n) {
+        for (int t = 0; t < n; ++t) row[t] = 0.0;
+        return;
+    }
+
+    const int warmup_end = first + period - 1;
+    if (warmup_end >= n) {
+        for (int t = 0; t < n; ++t) row[t] = 0.0;   // :337-342
+        return;
+    }
+
+    for (int t = 0; t < first; ++t) row[t] = 0.0;   // :344-346
+
+    if (period == 1) {                              // :348-355
+        for (int i = first; i < n; ++i) {
+            const double src = (high[i] + low[i]) / 2.0;
+            row[i] = (close[i] > src) ? 1.0 : 0.0;
+        }
+        return;
+    }
+
+    double sum = 0.0;
+    for (int k = first; k < warmup_end; ++k) {      // :358-362
+        sum += (high[k] + low[k]) / 2.0;
+        row[k] = 0.0;
+    }
+    sum += (high[warmup_end] + low[warmup_end]) / 2.0;   // :363
+
+    const double inv_period = 1.0 / static_cast<double>(period);   // :365
+
+    int idx = warmup_end;
+    row[idx] = (close[idx] > sum * inv_period) ? 1.0 : 0.0;        // :367-368
+    ++idx;
+    for (; idx < n; ++idx) {                                       // :370-374
+        const double enter = (high[idx] + low[idx]) / 2.0;
+        const double leave = (high[idx - period] + low[idx - period]) / 2.0;
+        sum += enter - leave;
+        row[idx] = (close[idx] > sum * inv_period) ? 1.0 : 0.0;
+    }
+}

@@ -1,8 +1,10 @@
-//! `/journal/trades` + `/journal/stats` — the trade-journal read API.
+//! `/journal/trades` + `/journal/stats` + `/journal/analytics` — the
+//! trade-journal read API.
 //!
-//! Serves the JSONL closed-trade store ([`crate::app_services::journal_store`])
-//! plus the computed professional stats
-//! ([`crate::app_services::journal_stats`]). The data dir is resolved from
+//! Serves the JSONL closed-trade store ([`crate::app_services::journal_store`]),
+//! the computed professional stats ([`crate::app_services::journal_stats`]) and
+//! the per-trade breakdown ([`crate::app_services::journal_analytics`] —
+//! pips, R, MFE/MAE and the by-hour/by-symbol slices). The data dir is resolved from
 //! the live `config.yaml` — the same source the rest of the server uses,
 //! so it honours the operator's `--config` / user-data path.
 //!
@@ -27,6 +29,25 @@ pub struct JournalQuery {
     pub to_ms: Option<i64>,
     /// Max closed trades to return (most-recent first). Default 500.
     pub limit: Option<usize>,
+    /// Optional instrument filter, case-insensitive. Absent = every symbol,
+    /// which is the behaviour every caller had before this existed.
+    ///
+    /// Applied AFTER [`heal_row`], because 97 of the operator's stored rows
+    /// carry placeholder symbols (`#1`, `#5`, `#41`) written before the broker
+    /// catalog populated — filtering on the raw value would silently drop them.
+    pub symbol: Option<String>,
+}
+
+/// Keep only rows for `symbol` when one was asked for. Returns how many rows
+/// were dropped, so the caller can say so rather than serving a short list
+/// that looks like a short history.
+fn apply_symbol_filter(rows: &mut Vec<journal_store::ClosedTrade>, symbol: Option<&str>) -> usize {
+    let Some(wanted) = symbol.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    let before = rows.len();
+    rows.retain(|r| r.symbol.eq_ignore_ascii_case(wanted));
+    before - rows.len()
 }
 
 /// Resolve the data dir from the live `config.yaml`, or a 500 Response
@@ -80,7 +101,7 @@ fn heal_row(t: &mut journal_store::ClosedTrade, names: &std::collections::HashMa
     }
 }
 
-/// `GET /journal/trades?fromMs&toMs&limit` — closed trades of the ACTIVE
+/// `GET /journal/trades?fromMs&toMs&limit&symbol` — closed trades of the ACTIVE
 /// account only (automatic — same account selection as the execution path),
 /// most-recent first. Legacy rows written before per-account scoping carry no
 /// account id (unattributable mixed history) and are hidden once an active
@@ -98,14 +119,21 @@ pub async fn trades(State(state): State<AppApiState>, Query(q): Query<JournalQue
     for row in &mut rows {
         heal_row(row, &names);
     }
+    apply_symbol_filter(&mut rows, q.symbol.as_deref());
     rows.reverse(); // most-recent first
     rows.truncate(q.limit.unwrap_or(500));
     Json(rows).into_response()
 }
 
-/// `GET /journal/stats?fromMs&toMs` — computed performance stats, scoped to
-/// the ACTIVE account (automatic — mirrors `/journal/trades`).
-pub async fn stats(State(_state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
+/// `GET /journal/stats?fromMs&toMs&symbol` — computed performance stats, scoped
+/// to the ACTIVE account (automatic — mirrors `/journal/trades`).
+///
+/// **`symbol` narrows the TRADE-derived figures only.** An `EquitySample` is an
+/// account-level row with no symbol on it, so max drawdown, recovery factor and
+/// Sharpe still describe the whole account even when one instrument is asked
+/// for. That asymmetry is the same one that made the demo forward-test gate
+/// measure the wrong drawdown (#197); it is logged here rather than hidden.
+pub async fn stats(State(state): State<AppApiState>, Query(q): Query<JournalQuery>) -> Response {
     let data_dir = match resolve_data_dir() {
         Ok(d) => d,
         Err(resp) => return resp,
@@ -115,6 +143,29 @@ pub async fn stats(State(_state): State<AppApiState>, Query(q): Query<JournalQue
     if let Some(active) = journal_store::active_account_id() {
         trades.retain(|r| r.account_id.as_deref() == Some(active.as_str()));
         equity.retain(|e| e.account_id.as_deref() == Some(active.as_str()));
+    }
+    if q.symbol.is_some() {
+        // Placeholder symbols must resolve before they can be filtered on.
+        let names = state.symbol_catalog_snapshot().await;
+        for row in &mut trades {
+            heal_row(row, &names);
+        }
+        apply_symbol_filter(&mut trades, q.symbol.as_deref());
+        // NOTE, and it is the same fact `live_gate` had to be repaired for
+        // (#197): an `EquitySample` is an ACCOUNT-level row. It cannot be
+        // filtered to one instrument, so with `symbol` set the equity-derived
+        // figures below — max drawdown, recovery factor, Sharpe — still
+        // describe the whole account. Only the trade-derived figures narrow.
+        // `journal_stats::max_drawdown_from_trade_pnl` is the symbol-scoped
+        // drawdown when that is what is wanted.
+        tracing::debug!(
+            target: "neoethos_app::journal",
+            symbol = %q.symbol.as_deref().unwrap_or(""),
+            trades_in_scope = trades.len(),
+            equity_samples = equity.len(),
+            "journal stats: trades narrowed to one symbol; equity-derived \
+             metrics remain account-wide (an equity sample has no symbol)"
+        );
     }
     Json(journal_stats::compute_stats(&trades, &equity)).into_response()
 }
@@ -164,14 +215,34 @@ impl journal_analytics::PriceWindow for StorePrices {
     }
 }
 
-/// `GET /journal/analytics?fromMs&toMs` — the same closed trades, in units that
-/// compare and sliced the ways that locate a problem.
+/// `GET /journal/analytics?fromMs&toMs&symbol` — the same closed trades, in
+/// units that compare and sliced the ways that locate a problem.
 ///
 /// `/journal/stats` reports the totals. This reports where they came from: per
 /// trade in pips and R with the excursion recovered from the price series, and
 /// grouped by symbol, hour, weekday and direction. A total says the account
 /// lost money; these say which hour, which symbol, and whether the profit was
 /// ever there to begin with.
+///
+/// Response shape (camelCase), for a client rendering it:
+/// * `trades[]` — one [`journal_analytics::DerivedTrade`] per closed trade:
+///   `pips`, `rMultiple`, `mfePips`, `maePips`, `captureRatio`,
+///   `durationHours`, `entryHourUtc`, `entryWeekday`, plus `riskPerLot` and
+///   `riskBasis` (`"symbol"` / `"all_symbols"` / `"none"`) so an R is never
+///   shown without its denominator.
+/// * `bySymbol[]`, `byHourUtc[]`, `byWeekday[]`, `bySide[]` — `BucketSummary`:
+///   `bucket`, `trades`, `wins`, `winRatePct`, `netProfit`, `expectancy`,
+///   `netPips`.
+/// * `avgMfePips`, `avgCaptureRatio`, `inactiveHoursUtc[]`.
+/// * `coverage` — how many rows each derived figure could be computed for, and
+///   why the rest could not: `tradesTotal`, `withPips`, `withExcursion`,
+///   `withRMultiple`, `withDuration`, `missingEntryTime`,
+///   `missingPriceSeries`, `riskPerLotBySymbol`, `riskPerLotAllSymbols`,
+///   `symbolsUsingFallbackRisk[]`, `minLossesForSymbolRisk`. **Render it.** A
+///   blank cell with no reason is how a missing price store gets read as "the
+///   trade never went anywhere".
+///
+/// Every optional field is `null` when it could not be derived, never `0`.
 pub async fn analytics(
     State(state): State<AppApiState>,
     Query(q): Query<JournalQuery>,
@@ -193,9 +264,20 @@ pub async fn analytics(
     for row in &mut trades {
         heal_row(row, &names);
     }
+    let dropped_other_symbols = apply_symbol_filter(&mut trades, q.symbol.as_deref());
+    if dropped_other_symbols > 0 {
+        tracing::debug!(
+            target: "neoethos_app::journal",
+            symbol = %q.symbol.as_deref().unwrap_or(""),
+            dropped_other_symbols,
+            kept = trades.len(),
+            "journal analytics: narrowed to one instrument"
+        );
+    }
     // Excursion needs the price store. When it is absent the analytics still
     // return — with the excursion fields empty rather than zeroed, so a missing
-    // series never reads as "the trades never went anywhere".
+    // series never reads as "the trades never went anywhere". `coverage` on the
+    // response says exactly how many rows each derived figure was available for.
     let prices = StorePrices { root: data_dir };
     Json(journal_analytics::analyse(&trades, Some(&prices))).into_response()
 }

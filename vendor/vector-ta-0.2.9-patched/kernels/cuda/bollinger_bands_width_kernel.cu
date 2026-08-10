@@ -451,3 +451,103 @@ extern "C" __global__ void bbw_multi_series_one_param_tm_streaming_f64(
         }
     }
 }
+
+
+// ===========================================================================
+// f64 LANE  --  shard S6
+//
+// CPU reference: `bollinger_bands_width_scalar_classic_sma`
+// (src/indicators/bollinger_bands_width.rs:679), which is the branch
+// `bollinger_bands_width_scalar_into` (:610) takes for the DEFAULT parameters:
+// `matype = "sma"` (:261-266) and `devtype = 0` (:268-270). devup and devdn
+// both default to 2.0 (:253-259), so `u_plus_d = 4.0`. A caller who overrides
+// matype to "ema" or devtype to a non-zero deviation gets a different CPU
+// branch; this kernel serves the default sweep, which is what the f64 lane
+// requests (`periods` only, every other parameter defaulted).
+//
+// first_valid: `data.iter().position(|x| !x.is_nan())` (:408) over the single
+// source series (default "close", :246) -> `F64FirstValidRule::AllInputsNonNan`.
+//
+// warm = first + period - 1 (:603, :690). Everything before it is NaN.
+//
+// ONE THREAD PER COLUMN, ascending bars. `sum` and `sq_sum` are carried, and
+// the sq_sum update is a SINGLE fused multiply-add over an already-formed
+// difference: `sq_sum = new_v.mul_add(new_v, sq_sum - old_v * old_v)` (:716)
+// -- ONE rounding from the fma plus one from `old_v * old_v` and one from the
+// subtraction. Written as `fma(new_v, new_v, sq_sum - old_v * old_v)`, which
+// is the same three. The seed loop uses `x.mul_add(x, sq_sum)` (:698), also
+// one fma per bar, in ascending order. A parallel scan over squares would give
+// a different sq_sum and therefore a different band width.
+//
+// `mean = sum * inv_n` and `var = (sq_sum * inv_n) - mean * mean` are
+// RECIPROCAL MULTIPLIES (:701-702, :717-718), not divisions -- preserved,
+// because `sum / n` rounds differently from `sum * (1/n)` for any n that is
+// not a power of two.
+//
+// THE VARIANCE FLOOR IS A COMPARISON, NOT fmax, AND THAT IS THE CPU'S CHOICE.
+// :703-705 writes `if var < 0.0 { var = 0.0 }`. Against a NaN variance the
+// comparison is false, so NaN survives into `sqrt` and out to the caller.
+// `fmax(var, 0.0)` would return 0.0 instead and invent a zero-width band on a
+// gapped bar. Kept as the comparison.
+//
+// f32 -> f64 audit: the f32 lane above uses `sqrtf` x3 and `__int_as_float`
+// x1. Below: `sqrt`, `fma`, and the f64 quiet-NaN bit pattern. No f32 literal,
+// no fast-math intrinsic. This indicator has no epsilon: the final division by
+// `mid` is left unguarded exactly as :708 and :724 leave it.
+// ===========================================================================
+
+static __device__ __forceinline__ double bbw_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void bollinger_bands_width_batch_f64(const double* __restrict__ data,
+                                     int n,
+                                     const int* __restrict__ periods,
+                                     int n_combos,
+                                     int first_valid,
+                                     double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = bbw_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const int first  = (first_valid < 0) ? 0 : first_valid;
+
+    if (period <= 0 || period > n || first >= n || (first + period - 1) >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+
+    const int    start   = first + period - 1;            // :690
+    const double inv_n   = 1.0 / static_cast<double>(period);
+    const double u_plus_d = 2.0 + 2.0;                    // devup + devdn defaults
+
+    for (int t = 0; t < start; ++t) row[t] = nan_d;
+
+    double sum = 0.0, sq_sum = 0.0;
+    for (int i = 0; i < period; ++i) {                    // :695-699
+        const double x = data[first + i];
+        sum    += x;
+        sq_sum  = fma(x, x, sq_sum);
+    }
+
+    double mean = sum * inv_n;                            // :701
+    double var  = (sq_sum * inv_n) - mean * mean;         // :702
+    if (var < 0.0) { var = 0.0; }                         // :703-705
+    row[start] = (u_plus_d * sqrt(var)) / mean;           // :706-708
+
+    for (int i = start + 1; i < n; ++i) {                 // :711-726
+        const double new_v = data[i];
+        const double old_v = data[i - period];
+        sum   += new_v - old_v;
+        sq_sum = fma(new_v, new_v, sq_sum - old_v * old_v);
+        mean   = sum * inv_n;
+        var    = (sq_sum * inv_n) - mean * mean;
+        if (var < 0.0) { var = 0.0; }
+        row[i] = (u_plus_d * sqrt(var)) / mean;
+    }
+}

@@ -239,3 +239,99 @@ void rsi_many_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[t * cols + s] = clamp_rsi(rsi);
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — rsi
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/rsi.rs:327 `rsi_compute_into_scalar` (Kernel::Auto
+ * resolves to Scalar for rsi at rsi.rs:219, so this IS the reference on every
+ * host).
+ *
+ * Differences from `rsi_batch_f32` above, all of them bugs in the f32 lane:
+ *   * f32 clamps the result into [0,100] via `clamp_rsi`. The CPU does NOT
+ *     clamp. Clamping hides a wrong value instead of showing it.
+ *   * f32 seeds with `sum_g * beta` where `beta = inv_p`; the CPU multiplies
+ *     the accumulated sums by `inv_p` in the same place but then recurses with
+ *     `beta = 1 - inv_p`. Names collide, meanings do not.
+ *   * `RSI_NAN` was `__int_as_float(0x7fffffff)` — an f32 bit pattern. In f64
+ *     that is a denormal, not a NaN.
+ *
+ * ABI: the neoethos sequential lane
+ *   (prices, n, periods, n_combos, first_valid, out) — one thread per column,
+ *   bars ascending, so the accumulation order is the CPU's exactly.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void rsi_neo_batch_f64(const double* __restrict__ prices,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    // rsi_with_kernel (rsi.rs:189-215): period == 0 || period > len -> Err,
+    // and (len - first) < period -> Err. An Err row is all-NaN here rather
+    // than a partial series, because the CPU produces no series at all.
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int idx0 = first_valid + period;          // alloc_with_nan_prefix(len, first + period)
+    const int warm = idx0 < len ? idx0 : len;
+    for (int i = 0; i < warm; ++i) o[i] = NEO_F64_NAN;
+
+    const double inv_p = 1.0 / (double)period;
+    const double beta  = 1.0 - inv_p;               // rsi.rs:330
+
+    double avg_gain = 0.0;
+    double avg_loss = 0.0;
+    bool has_nan = false;
+
+    // warm_last = min(first + period, len - 1)  (rsi.rs:336)
+    const int warm_last = (idx0 < len - 1) ? idx0 : (len - 1);
+    for (int i = first_valid + 1; i <= warm_last; ++i) {
+        const double delta = prices[i] - prices[i - 1];
+        if (!isfinite(delta)) { has_nan = true; break; }
+        if (delta > 0.0)      avg_gain += delta;
+        else if (delta < 0.0) avg_loss -= delta;
+    }
+
+    if (has_nan) {
+        avg_gain = NEO_F64_NAN;
+        avg_loss = NEO_F64_NAN;
+        if (idx0 < len) o[idx0] = NEO_F64_NAN;
+    } else {
+        avg_gain *= inv_p;
+        avg_loss *= inv_p;
+        if (idx0 < len) {
+            const double denom = avg_gain + avg_loss;
+            o[idx0] = (denom == 0.0) ? 50.0 : (100.0 * avg_gain / denom);
+        }
+    }
+
+    // rsi.rs:372-413. The CPU unrolls by two; the arithmetic per bar is
+    // identical and strictly sequential, so a plain loop is bit-equal.
+    for (int j = idx0 + 1; j < len; ++j) {
+        const double d = prices[j] - prices[j - 1];
+        const double g = (d > 0.0) ? d : 0.0;
+        const double l = (d < 0.0) ? -d : 0.0;
+        avg_gain = fma(avg_gain, beta, inv_p * g);   // avg_gain.mul_add(beta, inv_p * g)
+        avg_loss = fma(avg_loss, beta, inv_p * l);
+        const double denom = avg_gain + avg_loss;
+        o[j] = (denom == 0.0) ? 50.0 : (100.0 * avg_gain / denom);
+    }
+}

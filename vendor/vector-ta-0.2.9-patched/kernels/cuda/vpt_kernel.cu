@@ -291,3 +291,122 @@ extern "C" __global__ void vpt_many_series_one_param_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — vpt  (volume price trend)
+// ===========================================================================
+// Reference: src/indicators/vpt.rs
+//   `vpt_first_valid`     (:148) — the start rule
+//   `vpt_with_kernel`     (:165) — alloc_with_nan_prefix(len, first + 1)
+//   `vpt_row_scalar_from` (:1103) — the seed and the running sum
+//
+// PERIOD-INVARIANT: `vpt` has no period parameter.
+//
+// ITS FIRST-VALID RULE IS ITS OWN, AND THE HOST'S VALUE IS NOT IT.
+//   `vpt_first_valid` returns the first i >= 1 for which
+//       price[i-1] is finite AND price[i-1] != 0 AND
+//       price[i]   is finite AND volume[i] is finite
+//   — three differences from the lane's common rule: it starts at 1, it
+//   requires FINITE (so an infinity is rejected, not just a NaN), and it
+//   rejects a ZERO previous price because that price is the divisor. The host
+//   cannot express that in `F64FirstValidRule`, so this kernel DERIVES it
+//   from the arrays it already has and uses the passed `first_valid` only as
+//   a bounds sanity check. The registry row says `AllInputsNonNan` because
+//   that is what the host computes and hands over; the value does not select
+//   the window here, and this comment is the record of that.
+//
+// THE SEED IS NOT ZERO. `prev` starts as the ONE-BAR vpt term at index
+// `start_i - 1` when `start_i >= 2`, and 0.0 only when `start_i == 1`. A
+// kernel that seeded with 0.0 unconditionally would be off by one whole term
+// for the entire series — a constant offset, which is exactly the kind of
+// error a relative-tolerance parity check waves through.
+//
+// THE UNROLL BY FOUR IN THE CPU CHANGES NOTHING: the four bodies are
+// identical and each depends on the one before, so a single loop reproduces
+// the association exactly.
+//
+// ROUNDINGS: cur = v1 * ((p1 - p_prev) / p_prev) -> sub + div + mul (3);
+//            val = cur + prev                    -> add             (1).
+// The f32 kernels above compute the same thing with `__fmaf_rn`, which fuses
+// the last multiply and add into ONE rounding — a different number even
+// before the width changes.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_vpt_batch_f64(
+    const double* __restrict__ price,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;
+    (void)first_valid;   // see the header: vpt derives its own start.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    if (n <= 0) return;
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+
+    // `valid_count < 2` refusal.
+    int valid_count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!(isnan(price[i]) || isnan(volume[i]))) valid_count += 1;
+        if (valid_count >= 2) break;
+    }
+    if (valid_count < 2) return;
+
+    // `vpt_first_valid`.
+    int first = -1;
+    for (int i = 1; i < n; ++i) {
+        const double p0 = price[i - 1];
+        const double p1 = price[i];
+        const double v1 = volume[i];
+        if (isfinite(p0) && p0 != 0.0 && isfinite(p1) && isfinite(v1)) { first = i; break; }
+    }
+    if (first < 0) return;
+
+    const int start_i = first + 1;
+    if (start_i >= n) return;
+
+    double prev;
+    if (start_i >= 2) {
+        const int k = start_i - 1;
+        const double p0 = price[k - 1];
+        const double p1 = price[k];
+        const double v1 = volume[k];
+        // The CPU tests `p0 != p0` (NaN) and `p0 == 0.0` — NOT `is_finite`.
+        // An infinite p0 reaches the divide here, deliberately.
+        if ((p0 != p0) || (p0 == 0.0) || (p1 != p1) || (v1 != v1)) {
+            prev = neo_s2_qnan();
+        } else {
+            prev = v1 * ((p1 - p0) / p0);
+        }
+    } else {
+        prev = 0.0;
+    }
+
+    double p_prev = price[start_i - 1];
+    for (int i = start_i; i < n; ++i) {
+        const double p1 = price[i];
+        const double v1 = volume[i];
+        double cur;
+        if ((p_prev != p_prev) || (p_prev == 0.0) || (p1 != p1) || (v1 != v1)) {
+            cur = neo_s2_qnan();
+        } else {
+            cur = v1 * ((p1 - p_prev) / p_prev);
+        }
+        const double val = cur + prev;
+        row[i] = val;
+        prev = val;
+        p_prev = p1;
+    }
+}

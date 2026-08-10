@@ -394,3 +394,195 @@ void safezonestop_many_series_one_param_time_major_f32(
         prev_h_i = h; prev_l_i = l;
     }
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  safezonestop
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/safezonestop.rs -- `safezonestop_scalar` (:459), `warm_len` (:39), `safezonestop_with_kernel` (:237)
+//
+// INPUT SHAPE: high and low ONLY. `compute_safezonestop_batch`
+// (cpu_batch.rs:15008) calls `extract_high_low_input`, and first_valid is
+// `first_valid_pair(high, low)`. Declared `HighLow`; an Ohlc ref would adopt
+// close's first-valid and shift the series.
+//
+// PERIOD-BASED: `period` (default 22) is the swept parameter. `mult` (2.5),
+// `max_lookback` (3) and `direction` ("long") are the CPU defaults.
+//
+// `safezonestop_with_kernel` maps `Auto` to `Kernel::Scalar` (:284-287).
+//
+// max_lookback DEFAULTS TO 3, AND THE CPU'S THRESHOLD IS ZERO
+// (`LB_DEQUE_THRESHOLD = 0`), so `max_lookback > 0` always holds and the
+// DEQUE branch is the only reachable one. The other branch (a pre-materialised
+// `dm_smooth` vector) is dead at the defaults and is not written here; if a
+// caller ever passes `max_lookback == 0` this kernel declines by name rather
+// than quietly taking a branch it was not checked against.
+//
+// ARITHMETIC ORDER -- two `mul_add`s, ONE rounding each:
+//   `dm_prev = alpha.mul_add(dm_prev, dm_raw)` with
+//   `alpha = 1.0 - 1.0/period`. NOT `dm_prev*alpha + dm_raw` as two roundings,
+//   and NOT the Wilder `(x - y).mul_add(1/p, y)` form -- this is the
+//   accumulate-then-decay variant and the CPU spells it that way.
+//   `cand = (-mult).mul_add(dm_prev, prev_low)` for the long direction. The
+//   negation is folded into the MULTIPLIER, not applied to the product, which
+//   matters for the sign of the rounding.
+//   The seed is a plain ascending `boot_sum += dm_raw` over `period` bars and
+//   is used UNDIVIDED (`dm_prev = boot_sum`) -- it is a sum, not a mean, and
+//   dividing it here would be the obvious and wrong "correction".
+//
+// NaN / COMPARISON SEMANTICS: `up_pos`/`dn_pos` use `if up > 0.0 { up } else
+// { 0.0 }`, which maps NaN to 0.0 -- that is NOT `fmax(up, 0.0)`, which would
+// return NaN. The CPU's if-chain is reproduced literally; substituting fmax
+// here would change the value at every gapped bar. This is the mirror image of
+// the adx bug the brief names, and it is why the rule is "match the CPU", not
+// "always use fmax".
+//
+// THE MONOTONIC DEQUE over the candidate stops is reproduced with the same
+// ring, the same capacity (`max_lookback + 1`), the same expiry test
+// (`idx_front < i + 1 - max_lookback`) and the same pop predicate
+// (`back <= cand` for long). It is small by construction, so it is simulated
+// directly rather than rescanned.
+//
+// WARMUP: `warm_len` gives `first + max(period, max_lookback - 1)` for the
+// allocation, while the compute uses `first + max(period, max_lookback) - 1`
+// as its emission gate. Those two are NOT the same expression; the emission
+// gate is what decides which bars carry a value, and it is what is used here.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+#define NEO_S1_SZS_MAX_LOOKBACK 64
+
+extern "C" __global__ void neoethos_safezonestop_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // `SafeZoneStopParams` defaults as read by cpu_batch.rs:15016-15019.
+    const double mult = 2.5;
+    const int max_lookback = 3;
+    const bool dir_long = true;
+
+    const int needed_a = period + 1;
+    const int needed = (needed_a > max_lookback) ? needed_a : max_lookback;
+    const int cap = ((max_lookback > 1) ? max_lookback : 1) + 1;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        (max_lookback <= 0) ||
+        (cap > NEO_S1_SZS_MAX_LOOKBACK) ||
+        ((n - first_valid) < needed);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + ((period > max_lookback) ? period : max_lookback) - 1;
+    const int warm_end = (warm < n) ? warm : n;
+    for (int k = 0; k < warm_end; ++k) row[k] = neo_s1_qnan();
+    if (warm >= n) return;
+
+    int   q_idx[NEO_S1_SZS_MAX_LOOKBACK];
+    double q_val[NEO_S1_SZS_MAX_LOOKBACK];
+    int q_head = 0, q_tail = 0, q_len = 0;
+
+    double prev_high = high[first_valid];
+    double prev_low = low[first_valid];
+    double dm_prev = 0.0;
+    bool dm_ready = false;
+    int boot_n = 0;
+    double boot_sum = 0.0;
+    const double alpha = 1.0 - 1.0 / (double)period;
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double up = h - prev_high;
+        const double dn = prev_low - l;
+        // Deliberately an if-chain, not fmax: a NaN must become 0.0 here.
+        const double up_pos = (up > 0.0) ? up : 0.0;
+        const double dn_pos = (dn > 0.0) ? dn : 0.0;
+        double dm_raw;
+        if (dir_long) {
+            dm_raw = (dn_pos > up_pos) ? dn_pos : 0.0;
+        } else {
+            dm_raw = (up_pos > dn_pos) ? up_pos : 0.0;
+        }
+
+        if (!dm_ready) {
+            boot_n += 1;
+            boot_sum += dm_raw;
+            if (boot_n == period) {
+                dm_prev = boot_sum;
+                dm_ready = true;
+            }
+        } else {
+            dm_prev = fma(alpha, dm_prev, dm_raw);
+        }
+
+        if (dm_ready) {
+            const double cand = dir_long ? fma(-mult, dm_prev, prev_low)
+                                         : fma(mult, dm_prev, prev_high);
+
+            const int start = (i + 1 >= max_lookback) ? (i + 1 - max_lookback) : 0;
+            while (q_len > 0) {
+                const int idx_front = q_idx[q_head];
+                if (idx_front < start) {
+                    q_head = (q_head + 1 == cap) ? 0 : (q_head + 1);
+                    q_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            while (q_len > 0) {
+                const int last = (q_tail == 0) ? (cap - 1) : (q_tail - 1);
+                const double back_val = q_val[last];
+                const bool pop = dir_long ? (back_val <= cand) : (back_val >= cand);
+                if (pop) {
+                    q_tail = last;
+                    q_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            q_idx[q_tail] = i;
+            q_val[q_tail] = cand;
+            q_tail = (q_tail + 1 == cap) ? 0 : (q_tail + 1);
+            q_len += 1;
+        }
+
+        if (i >= warm) {
+            row[i] = (q_len > 0) ? q_val[q_head] : neo_s1_qnan();
+        }
+
+        prev_high = h;
+        prev_low = l;
+    }
+}

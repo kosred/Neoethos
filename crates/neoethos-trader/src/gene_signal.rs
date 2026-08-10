@@ -243,6 +243,11 @@ pub fn combine_gene_signals_with_confidence(
 /// order, so `cursor` tracks the bar index.
 pub struct PrecomputedSignalEngine {
     per_symbol: HashMap<String, Vec<Direction>>,
+    /// Per-bar STRATEGY brackets in pips, aligned 1:1 with `per_symbol`.
+    /// Empty ⇒ the engine serves no bracket and the DecisionEngine falls back
+    /// to its synthetic stop (audit #226).
+    per_symbol_sl: HashMap<String, Vec<f64>>,
+    per_symbol_tp: HashMap<String, Vec<f64>>,
     cursors: HashMap<String, usize>,
 }
 
@@ -252,14 +257,40 @@ impl PrecomputedSignalEngine {
         per_symbol.insert(symbol.to_string(), signals);
         Self {
             per_symbol,
+            per_symbol_sl: HashMap::new(),
+            per_symbol_tp: HashMap::new(),
             cursors: HashMap::new(),
         }
+    }
+
+    /// Serve the genes' OWN per-bar brackets alongside the direction, so the
+    /// replay places the stop the gene was SCORED on instead of an arbitrary
+    /// fraction of price. `sl_pips`/`tp_pips` come from
+    /// [`combine_gene_signals_with_brackets`] and are `0.0` on bars where no
+    /// agreeing gene carries a stop — the DecisionEngine treats that as
+    /// "no bracket" exactly as the live loop does.
+    pub fn with_brackets(
+        symbol: &str,
+        signals: Vec<Direction>,
+        sl_pips: Vec<f64>,
+        tp_pips: Vec<f64>,
+    ) -> Self {
+        let mut engine = Self::new(symbol, signals);
+        engine
+            .per_symbol_sl
+            .insert(symbol.to_string(), sl_pips);
+        engine
+            .per_symbol_tp
+            .insert(symbol.to_string(), tp_pips);
+        engine
     }
 
     /// Multi-symbol constructor (Phase 6 — a precomputed vector per symbol).
     pub fn from_map(per_symbol: HashMap<String, Vec<Direction>>) -> Self {
         Self {
             per_symbol,
+            per_symbol_sl: HashMap::new(),
+            per_symbol_tp: HashMap::new(),
             cursors: HashMap::new(),
         }
     }
@@ -268,12 +299,23 @@ impl PrecomputedSignalEngine {
 impl SignalEngine for PrecomputedSignalEngine {
     fn evaluate(&mut self, entry: &PortfolioEntry, _window: &[LiveBar]) -> Signal {
         let cursor = self.cursors.entry(entry.symbol.clone()).or_insert(0);
+        let cur = *cursor;
         let dir = self
             .per_symbol
             .get(&entry.symbol)
-            .and_then(|v| v.get(*cursor).copied())
+            .and_then(|v| v.get(cur).copied())
             .unwrap_or(Direction::Flat);
         *cursor += 1;
+        let sl_pips = self
+            .per_symbol_sl
+            .get(&entry.symbol)
+            .and_then(|v| v.get(cur).copied())
+            .unwrap_or(0.0);
+        let tp_pips = self
+            .per_symbol_tp
+            .get(&entry.symbol)
+            .and_then(|v| v.get(cur).copied())
+            .unwrap_or(0.0);
         // Confidence 1.0 when the net is directional, 0 when flat — the
         // DecisionEngine floors sizing so a flat call simply yields no trade.
         let confidence = if dir == Direction::Flat { 0.0 } else { 1.0 };
@@ -282,6 +324,8 @@ impl SignalEngine for PrecomputedSignalEngine {
             dir,
             confidence,
             source: SignalSource::Strategy,
+            sl_pips,
+            tp_pips,
         }
     }
 }

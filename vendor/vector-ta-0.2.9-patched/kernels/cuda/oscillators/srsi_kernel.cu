@@ -401,3 +401,219 @@ void srsi_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `srsi_scalar` (src/indicators/srsi.rs:335). SINGLE oracle by
+ * construction -- `srsi_avx2` (:554), `srsi_avx512_short` (:585) and
+ * `srsi_avx512_long` (:596) all delegate straight back to `srsi_scalar`, so
+ * unlike wilders/vwap there is no seed-order disagreement to settle here.
+ *
+ * PERIOD-INVARIANT. `compute_srsi_batch` reads `rsi_period` (14),
+ * `stoch_period` (14), `k` (3) and `d` (3) -- NEVER `period`
+ * (cpu_batch.rs:6308-6311). Five swept periods give five identical CPU
+ * columns, so the kernel writes five identical rows.
+ *
+ * MULTI-OUTPUT: emits K, which is what `output_id == "value"` resolves to
+ * (cpu_batch.rs:6329). Never `d` silently.
+ *
+ * THE FLT_MIN THAT WAS HERE IS GONE. The f32 lane in this file guarded the
+ * stochastic denominator with `FLT_MIN` (~1.18e-38). That constant is sized
+ * for f32 and copying it into an f64 kernel is the exact bug the brief names.
+ * It is not RE-SIZED, it is REMOVED: the CPU has no epsilon at all -- it tests
+ * `hi > lo` (:511) and substitutes 50.0 otherwise. An epsilon of any magnitude
+ * would answer differently from the CPU on a flat window.
+ *
+ * WARMUPS, four of them, each one exactly the CPU's (:364-367):
+ *   rsi_warmup   = first + rsi_period
+ *   stoch_warmup = rsi_warmup + stoch_period - 1
+ *   k_warmup     = stoch_warmup + k_period - 1
+ *   d_warmup     = k_warmup + d_period - 1
+ * `n <= d_warmup` is NotEnoughValidData (:370) -- the whole column stays NaN
+ * even though only the D series needs that many bars, because the CPU errors
+ * out before writing anything.
+ *
+ * THE SLIDING EXTREME IS THE CPU'S BLOCK DECOMPOSITION, NOT A DEQUE. The CPU
+ * builds per-block prefix and suffix max/min arrays (:441-490) and combines
+ * max(suff[t+1-sp], pref[t]). Its comparison is the ternary form, NOT `fmax`,
+ * so a NaN entering the running accumulator STICKS while a NaN arriving as the
+ * new value is ignored, and which of the two happens depends on the scan
+ * direction. A monotone deque would agree on clean data and disagree the
+ * moment a hole appears. The kernel therefore re-folds both block scans per
+ * bar in the CPU's directions: O(stoch_period) per bar, 14 operations at the
+ * default, and ZERO global scratch -- the alternative was two m-wide arrays
+ * per combo, which at 100k bars is 1.6 MB of local memory per thread.
+ *
+ * WHY A RING OF EXACTLY `stoch_period` IS SUFFICIENT. Because the block size
+ * equals the window length, the suffix block always ENDS at or before the
+ * current bar: if t and t+1-sp share a block then that block ends at t; if
+ * they do not, the suffix block ends exactly where t's block begins. So the
+ * two folds together read precisely the sp bars [t+1-sp, t] and never a
+ * future one.
+ *
+ * NaN. Rule 4 of the brief says use fmax/fmin where the CPU uses `f64::max`.
+ * The CPU here does NOT use `f64::max`; it uses a ternary chain, and
+ * reproducing that chain is what matches it. fmax would DISAGREE.
+ *
+ * ONE DELIBERATE DEPARTURE, RECORDED. When a bar is non-finite the CPU
+ * SKIPS the RSI store (:415-427) and leaves that slot at whatever
+ * `alloc_with_nan_prefix` left there -- which, in release, is UNINITIALIZED
+ * memory (helpers.rs:110-118). There is no value to match. The kernel carries
+ * the previous RSI forward, which is the only defined behaviour available;
+ * the CPU's is a crate defect and is reported as one.
+ *
+ * SEQUENTIAL, one thread per combo column. Three fixed rings, 20 doubles.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define SRSI_NEO_RSI_PERIOD   14   /* cpu_batch.rs:6308 */
+#define SRSI_NEO_STOCH_PERIOD 14   /* :6309 */
+#define SRSI_NEO_K            3    /* :6310 */
+#define SRSI_NEO_D            3    /* :6311 */
+
+extern "C" __global__
+void srsi_neo_batch_f64(const double* __restrict__ data,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;                       /* PERIOD-INVARIANT -- see header. */
+
+    const int n = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    if (first_valid < 0 || first_valid >= n) return;
+
+    const int rp_i  = SRSI_NEO_RSI_PERIOD;
+    const int sp    = SRSI_NEO_STOCH_PERIOD;
+    const int kp    = SRSI_NEO_K;
+    const int dp    = SRSI_NEO_D;
+    const int first = first_valid;
+
+    int max_need = rp_i;
+    if (sp > max_need) max_need = sp;
+    if (kp > max_need) max_need = kp;
+    if (dp > max_need) max_need = dp;
+    if (n - first < max_need) return;                    /* :357 */
+
+    const int rsi_warmup   = first + rp_i;               /* :364 */
+    const int stoch_warmup = rsi_warmup + sp - 1;        /* :365 */
+    const int k_warmup     = stoch_warmup + kp - 1;      /* :366 */
+    const int d_warmup     = k_warmup + dp - 1;          /* :367 */
+    if (n <= d_warmup) return;                           /* :370 */
+
+    const int base = rsi_warmup;
+
+    /* ---- RSI seed, :383-400 -------------------------------------------- */
+    double avg_gain = 0.0, avg_loss = 0.0;
+    double prev = data[first];
+    const int end_init = min(first + rp_i, n - 1);
+    for (int i = first + 1; i <= end_init; ++i) {
+        const double cur = data[i];
+        if (isfinite(cur) && isfinite(prev)) {
+            const double ch = cur - prev;
+            if (ch > 0.0) avg_gain += ch; else avg_loss += -ch;
+        }
+        prev = cur;
+    }
+
+    const double rpf = (double)rp_i;
+    avg_gain /= rpf;
+    avg_loss /= rpf;
+    const double alpha = 1.0 / rpf;
+
+    double rsi_ring[SRSI_NEO_STOCH_PERIOD];
+    for (int j = 0; j < sp; ++j) rsi_ring[j] = NEO_F64_NAN;
+
+    double rsi_v = (avg_loss == 0.0)
+        ? 100.0
+        : (100.0 - 100.0 / (1.0 + avg_gain / avg_loss));     /* :403 */
+    rsi_ring[0] = rsi_v;
+
+    double sum_k = 0.0, sum_d = 0.0;
+    double fk_ring[SRSI_NEO_K];
+    double sk_ring[SRSI_NEO_D];
+    for (int j = 0; j < kp; ++j) fk_ring[j] = 0.0;
+    for (int j = 0; j < dp; ++j) sk_ring[j] = 0.0;
+    int fk_pos = 0, sk_pos = 0;
+
+    const int i0 = stoch_warmup;
+    prev = data[rsi_warmup];
+
+    for (int i = base; i < n; ++i) {
+        if (i > base) {
+            const double cur = data[i];
+            if (isfinite(cur) && isfinite(prev)) {
+                const double ch   = cur - prev;
+                const double gain = (ch > 0.0) ?  ch : 0.0;
+                const double loss = (ch < 0.0) ? -ch : 0.0;
+                avg_gain = fma(gain - avg_gain, alpha, avg_gain);   /* :417 */
+                avg_loss = fma(loss - avg_loss, alpha, avg_loss);   /* :418 */
+                rsi_v = (avg_loss == 0.0)
+                    ? 100.0
+                    : (100.0 - 100.0 / (1.0 + avg_gain / avg_loss));
+            }
+            prev = cur;
+            rsi_ring[(i - base) % SRSI_NEO_STOCH_PERIOD] = rsi_v;
+        }
+
+        if (i < i0) continue;
+
+        const int t       = i - base;
+        const int t_start = t + 1 - sp;
+
+        const int pref_start   = (t / sp) * sp;
+        const int b_suff       = t_start / sp;
+        const int block_end_ex = (b_suff + 1) * sp;
+
+        /* pref over [pref_start .. t], ASCENDING -- :455-464 */
+        double pmx = rsi_ring[pref_start % SRSI_NEO_STOCH_PERIOD];
+        double pmn = pmx;
+        for (int j = pref_start + 1; j <= t; ++j) {
+            const double v = rsi_ring[j % SRSI_NEO_STOCH_PERIOD];
+            pmx = (v > pmx) ? v : pmx;
+            pmn = (v < pmn) ? v : pmn;
+        }
+
+        /* suff over [t_start .. block_end_ex-1], DESCENDING -- :477-487 */
+        const int last = block_end_ex - 1;
+        double smx = rsi_ring[last % SRSI_NEO_STOCH_PERIOD];
+        double smn = smx;
+        for (int j = last - 1; j >= t_start; --j) {
+            const double v = rsi_ring[j % SRSI_NEO_STOCH_PERIOD];
+            smx = (v > smx) ? v : smx;
+            smn = (v < smn) ? v : smn;
+        }
+
+        const double hi = (smx > pmx) ? smx : pmx;         /* :508 */
+        const double lo = (smn < pmn) ? smn : pmn;         /* :509 */
+        const double x  = rsi_ring[t % SRSI_NEO_STOCH_PERIOD];
+
+        /* No epsilon -- :511-515. */
+        const double fk = (hi > lo) ? (((x - lo) * 100.0) / (hi - lo)) : 50.0;
+
+        sum_k += fk;
+        if (i >= i0 + kp) sum_k -= fk_ring[fk_pos];
+        fk_ring[fk_pos] = fk;
+        fk_pos += 1; if (fk_pos == kp) fk_pos = 0;
+
+        if (i >= k_warmup) {
+            const double sk = sum_k / (double)kp;
+            o[i] = sk;                                     /* :532 -- K */
+
+            sum_d += sk;
+            if (i >= k_warmup + dp) sum_d -= sk_ring[sk_pos];
+            sk_ring[sk_pos] = sk;
+            sk_pos += 1; if (sk_pos == dp) sk_pos = 0;
+        }
+    }
+}

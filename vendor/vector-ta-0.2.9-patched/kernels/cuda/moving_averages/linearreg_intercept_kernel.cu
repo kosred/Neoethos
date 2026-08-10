@@ -285,3 +285,94 @@ void linearreg_intercept_many_series_one_param_f32(const float* __restrict__ pri
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — linearreg_intercept
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/linearreg_intercept.rs:400
+ * `linearreg_intercept_scalar`.
+ *
+ * The two `*_f64` entry points already in this file are NOT an f64 API:
+ * `linearreg_intercept_exclusive_prefix_y_yi_f64` takes `const float*` and
+ * writes `double*`, and `..._batch_from_prefix_f64` takes `const double*` and
+ * writes `float*`. They are f64 ACCUMULATOR STAGES inside an f32 pipeline —
+ * the input and the answer are both single precision. This entry point is
+ * double from end to end.
+ *
+ * PREFIX SUMS ARE NOT THE REFERENCE. The prefix-scan shape above computes the
+ * window sums by SUBTRACTING two prefix totals, which for a long series
+ * cancels catastrophically and is a different number from the CPU's running
+ * update. The CPU carries `sum_y` and `sum_xy` forward with
+ *      sum_xy = (sum_xy - prev_sum_y) + n * y_in
+ * and that identity — not a prefix difference — is what is reproduced.
+ *
+ * x is 1-based (`x = j + 1`, linearreg_intercept.rs:429), which is why
+ * sum_x uses n(n+1)/2 rather than the 0-based n(n-1)/2 that
+ * `linearreg_angle` uses. Getting that wrong shifts the intercept by a slope.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void linearreg_intercept_neo_batch_f64(const double* __restrict__ data,
+                                       int series_len,
+                                       const int* __restrict__ periods,
+                                       int n_combos,
+                                       int first_valid,
+                                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) return;
+
+    if (period == 1) {
+        for (int i = first_valid; i < len; ++i) o[i] = data[i];
+        return;
+    }
+
+    const double n = (double)period;
+    const double inv_n = 1.0 / n;
+
+    const double sum_x  = 0.5 * n * (n + 1.0);
+    const double sum_x2 = (n * (n + 1.0) * (2.0 * n + 1.0)) / 6.0;
+    const double denom  = n * sum_x2 - sum_x * sum_x;
+    const double bd     = 1.0 / denom;
+    const double k      = 1.0 - sum_x * inv_n;
+    const double xy_coeff = n * bd * k;
+    const double y_coeff  = inv_n - sum_x * bd * k;
+
+    const int start = first_valid;
+    if (len < start + period) return;
+
+    double sum_y = 0.0, sum_xy = 0.0;
+    for (int j = 0; j < period; ++j) {
+        const double y = data[start + j];
+        const double x = (double)j + 1.0;
+        sum_y  += y;
+        sum_xy += y * x;
+    }
+
+    int i = start + period - 1;
+    o[i] = sum_xy * xy_coeff + sum_y * y_coeff;
+
+    while (i + 1 < len) {
+        const double y_in  = data[i + 1];
+        const double y_out = data[i + 1 - period];
+
+        const double prev_sum_y = sum_y;
+        sum_y  = prev_sum_y + y_in - y_out;
+        sum_xy = (sum_xy - prev_sum_y) + n * y_in;
+
+        i += 1;
+        o[i] = sum_xy * xy_coeff + sum_y * y_coeff;
+    }
+}

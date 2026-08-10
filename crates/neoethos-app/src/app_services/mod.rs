@@ -14,13 +14,23 @@ pub mod ctrader_bootstrap;
 pub mod ctrader_data;
 pub mod ctrader_errors;
 pub mod ctrader_execution;
-pub mod ctrader_history;
+// 2026-08-09 dead-code purge (batch D2): `ctrader_history` (1,164 lines) was
+// deleted. Every one of its public items had zero callers; the production
+// history path is `broker_api::download_history_blocking` (POST /data/fetch,
+// `server/data_control.rs:254`) and `broker_api::fetch_broker_order_history_blocking`
+// (`data_control.rs:441`), both of which chunk the request — which
+// `ctrader_history` never did.
 #[cfg(test)]
 mod ctrader_integration_tests;
 pub mod ctrader_live_auth;
 pub mod ctrader_messages;
 pub mod ctrader_money;
-pub mod ctrader_openapi;
+// 2026-08-09 dead-code purge (batch D2): `ctrader_openapi` (the four
+// protoc-generated `include!` blocks) was deleted along with the
+// `crates/neoethos-app/proto/` directory, the codegen in `build.rs` and the
+// `protobuf` / `protoc-bin-vendored` / `cc` build dependencies. Not one
+// generated type was ever referenced — the cTrader wire format is hand-rolled
+// JSON in `ctrader_messages.rs`.
 pub mod ctrader_tls;
 pub mod discovery;
 pub mod broker_api;
@@ -48,6 +58,14 @@ pub mod experience_train;
 pub mod federation;
 pub mod live_parity;
 pub mod live_trading;
+// 2026-08-09 (#238, audit §2.11): the reader the broker's margin-call feed
+// never had. `ctrader_messages::build_margin_call_list_request` had zero
+// callers outside its own test, so an UNREALISED margin emergency reached the
+// operator only through cTrader's own platform. This module polls the account's
+// margin level, halts every order-OPENING route at
+// `broker_api::prepare_new_order`, and starts the persisted 24h kill-switch
+// cooldown. Spawned from `main.rs` alongside the other background services.
+pub mod margin_call;
 pub mod news_calendar;
 pub mod news_research;
 pub mod pending_actions;

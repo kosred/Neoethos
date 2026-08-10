@@ -1507,7 +1507,12 @@ fn axis_f64(
     Ok(out)
 }
 
-fn expand_grid_kpo(
+/// Public so the CUDA wrapper can expand the SAME grid the CPU expands.
+///
+/// The wrapper must not re-derive the parameter list: a second implementation
+/// of the cross product is a second place for it to drift, and a row-order
+/// difference would silently pair every combo with the wrong output row.
+pub fn expand_grid_kpo(
     sweep: &KasePeakOscillatorWithDivergencesBatchRange,
 ) -> Result<Vec<KasePeakOscillatorWithDivergencesParams>, KasePeakOscillatorWithDivergencesError> {
     let deviations = axis_f64(sweep.deviations.0, sweep.deviations.1, sweep.deviations.2)?;

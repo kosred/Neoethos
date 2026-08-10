@@ -125,3 +125,100 @@ extern "C" __global__ void autocorrelation_indicator_batch_f64(
         seg_start = seg_end;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/autocorrelation_indicator.rs:743
+// (`autocorrelation_indicator_with_kernel`). The column this emits is
+// `filtered`, which is what `output_id == "value"` resolves to
+// (dispatch/cpu_batch.rs:7779). The arithmetic is `filter_series` :588-603
+// driving `UltimateSmootherState::update` :328-345.
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- the
+// ultimate smoother is a two-pole IIR whose state (`prev_src1`, `prev_src2`,
+// `prev_us1`, `prev_us2`, `count`) is carried bar to bar, and the CPU RESETS
+// all five on a non-finite bar. A bar-parallel form cannot see the reset
+// history.
+//
+// PERIOD-INVARIANT. `compute_autocorrelation_indicator_batch`
+// (cpu_batch.rs:7798-7800) reads `length`, `lag` and `use_test_signal` and
+// NEVER `period`, so five swept periods give five identical CPU columns and
+// this kernel emits five identical rows. `length` is pinned at the CPU default
+// 20; `lag` and `use_test_signal` do not enter the `filtered` column at all.
+//
+// FIRST VALID IS NOT READ: `filter_series` fills the whole output with NaN and
+// then walks from index 0, emitting a value at EVERY finite bar (:592-602), so
+// there is no warmup index to consult. The lane row declares
+// `F64FirstValidRule::Ignored`.
+//
+// f64 END TO END: every constant is a double literal, `exp`/`cos`/`sin` are
+// the double overloads, and there is no fast-math intrinsic. The five-term
+// combination is written in the CPU's term order so the additions round the
+// same way.
+// ---------------------------------------------------------------------------
+
+#define NEO_ACI_LENGTH 20
+
+extern "C" __global__ void autocorrelation_indicator_neo_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int length = NEO_ACI_LENGTH;
+    if (length <= 0) {
+        return;
+    }
+
+    const double pi_d = 3.14159265358979323846;
+    const double period_f = static_cast<double>(length);
+    const double a1 = exp(-1.414 * pi_d / period_f);
+    const double c2 = 2.0 * a1 * cos(1.414 * pi_d / period_f);
+    const double c3 = -a1 * a1;
+    const double c1 = (1.0 + c2 - c3) * 0.25;
+
+    int count = 0;
+    double prev_src1 = NAN;
+    double prev_src2 = NAN;
+    double prev_us1 = NAN;
+    double prev_us2 = NAN;
+
+    for (int i = 0; i < n; ++i) {
+        const double raw = data[i];
+        if (!isfinite(raw)) {
+            count = 0;
+            prev_src1 = NAN;
+            prev_src2 = NAN;
+            prev_us1 = NAN;
+            prev_us2 = NAN;
+            continue;
+        }
+
+        const double value = (count >= 4)
+            ? ((1.0 - c1) * raw + (2.0 * c1 - c2) * prev_src1 - (c1 + c3) * prev_src2 +
+               c2 * prev_us1 + c3 * prev_us2)
+            : raw;
+
+        prev_src2 = prev_src1;
+        prev_src1 = raw;
+        prev_us2 = prev_us1;
+        prev_us1 = value;
+        count += 1;
+        row[i] = value;
+    }
+}

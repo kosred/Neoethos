@@ -328,3 +328,126 @@ extern "C" __global__ void smoothed_gaussian_trend_filter_batch_f64(
 
     delete[] linreg_buffer;
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — smoothed_gaussian_trend_filter
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/smoothed_gaussian_trend_filter.rs:744
+ *   `smoothed_gaussian_trend_filter_filter_row_scalar`, which is what
+ *   `smoothed_gaussian_trend_filter_filter_with_kernel` (:773) drives.
+ *
+ * Column: output_id "value" resolves to the FILTER series — cpu_batch.rs:12028
+ *   takes the `filter`/`value` branch BEFORE the four-output path, so "value"
+ *   never reaches `out.supertrend`/`trend`/`ranging`. The lane therefore emits
+ *   the filter and nothing else, and the ATR / Pine-supertrend cascade the
+ *   older `smoothed_gaussian_trend_filter_batch_f64` entry point runs is not
+ *   part of this column at all.
+ *
+ * PERIOD-INVARIANT: `compute_smoothed_gaussian_trend_filter_batch`
+ *   (cpu_batch.rs:12001-12016) reads `gaussian_length` (15), `poles` (3),
+ *   `smoothing_length` (22) and `linreg_offset` (7) and NEVER `period`. A sweep
+ *   of five periods therefore produces five identical CPU columns, so this
+ *   kernel emits five identical rows.
+ *
+ * FIRST-VALID IGNORED: the row scalar fills the whole output with NaN and then
+ *   walks EVERY bar from index 0, resetting the Gaussian history and the
+ *   linreg window on any bar that fails `valid_bar` (:308 — all three finite
+ *   AND high >= low). The caller's first-valid index is never consulted, and
+ *   the mid-series reset is what reproduces it, so declaring `AllInputsNonNan`
+ *   here would be a claim this kernel does not honour.
+ *
+ * Input: high / low / close — F64InputKind::Hlc. High and low are read ONLY by
+ *   `valid_bar`; the filter itself is built from close.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. The 3-pole Gaussian is an IIR
+ *   whose state is the last four outputs, and the linreg window is a FIFO that
+ *   is CLEARED on an invalid bar — neither survives a bar-parallel form.
+ *
+ * Arithmetic taken verbatim rather than tidied:
+ *   * `sg_gaussian_update` reproduces the CPU expression term for term,
+ *     including its left-to-right association
+ *     (((a^3*x) + 3*oma*h0) - 3*oma2*h1) + oma3*h2 — no fma is introduced,
+ *     because the CPU line contains none.
+ *   * `sg_linreg_update` recomputes `x_sum`/`x2_sum` by the same 1..=period
+ *     loop the CPU constructor uses (:441-447) and divides by the same
+ *     `denom`; the CPU stores `1/denom` and multiplies, which is ONE rounding
+ *     either way for the same value, and the reciprocal is formed once from
+ *     the identical operands.
+ *   * The window is walked front-to-back (oldest first), matching
+ *     `self.buffer.iter().enumerate()` (:465).
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:12001-12016. `smoothing_length` bounds a
+ * per-thread FIFO, so the bound belongs to the COMPILED kernel; it is pinned
+ * at the CPU default because this lane is period-invariant and the batch never
+ * varies it from a swept `period`. */
+#define NEO_SGTF_GAUSSIAN_LENGTH  15
+#define NEO_SGTF_POLES             3
+#define NEO_SGTF_SMOOTHING_LENGTH 22
+#define NEO_SGTF_LINREG_OFFSET     7
+
+extern "C" __global__
+void smoothed_gaussian_trend_filter_neo_batch_f64(const double* __restrict__ high,
+                                                  const double* __restrict__ low,
+                                                  const double* __restrict__ close,
+                                                  int n,
+                                                  const int* __restrict__ periods,
+                                                  int n_combos,
+                                                  int first_valid,
+                                                  double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;      /* period-invariant — see header */
+    (void)first_valid;  /* the mid-series reset reproduces it — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int gaussian_length = NEO_SGTF_GAUSSIAN_LENGTH;
+    const int poles           = NEO_SGTF_POLES;
+    const int smoothing       = NEO_SGTF_SMOOTHING_LENGTH;
+    const int linreg_offset   = NEO_SGTF_LINREG_OFFSET;
+
+    /* `validate_params` (:344) refuses a window longer than the series before
+     * any value is produced; the CPU returns an error there and the caller
+     * gets no column at all, so an all-NaN row is the faithful answer. */
+    if (gaussian_length > n || smoothing > n) return;
+
+    const double alpha = sg_gaussian_alpha(gaussian_length, poles);
+    double gaussian_history[4] = {0.0, 0.0, 0.0, 0.0};
+
+    double linreg_buffer[NEO_SGTF_SMOOTHING_LENGTH];
+    int linreg_count = 0;
+    int linreg_head  = 0;
+
+    for (int i = 0; i < n; ++i) {
+        if (!sg_valid_bar(high[i], low[i], close[i])) {
+            gaussian_history[0] = 0.0;
+            gaussian_history[1] = 0.0;
+            gaussian_history[2] = 0.0;
+            gaussian_history[3] = 0.0;
+            linreg_count = 0;
+            linreg_head  = 0;
+            continue;
+        }
+
+        const double gaussian_value =
+            sg_gaussian_update(poles, alpha, close[i], gaussian_history);
+
+        double final_value = NEO_F64_NAN;
+        if (sg_linreg_update(gaussian_value,
+                             smoothing,
+                             linreg_offset,
+                             linreg_buffer,
+                             &linreg_count,
+                             &linreg_head,
+                             &final_value)) {
+            o[i] = final_value;
+        }
+    }
+}

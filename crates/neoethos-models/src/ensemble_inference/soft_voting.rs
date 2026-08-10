@@ -1,12 +1,19 @@
-//! `SoftVotingEnsemble` — first concrete [`super::EnsemblePredictor`].
+//! `SoftVotingEnsemble` — the ensemble aggregator.
 //!
-//! Phase D1.3. This aggregator runs every loaded expert's
+//! Phase D1.3, Stage 2. This aggregator runs every loaded expert's
 //! [`super::ExpertModel::predict`] in turn and combines their
 //! Classification3 outputs by **weighted-average** of the
 //! `[p_neutral, p_buy, p_sell]` vectors (canonical order — see
-//! `base.rs` lines 128-135). The result is one
-//! `[p_neutral, p_buy, p_sell]` per input row, ready for the
-//! producer's `dispatch_auto_trade_signal` gate chain.
+//! `base.rs` lines 128-135), through [`SoftVotingEnsemble::predict_with_roles`].
+//! The result is one [`super::EnsembleDecision`] per input row — a direction
+//! vote plus two bounded gate factors — ready for the producer's
+//! `dispatch_auto_trade_signal` gate chain.
+//!
+//! **2026-08-09 (batch D4)**: the earlier flat average over EVERY
+//! Classification3 expert is gone. It let `hmm_regime` and
+//! `isolation_forest` vote on direction, which is exactly what
+//! `predict_with_roles` was written to stop, and no production caller
+//! had used it since. See the note on [`super::EnsemblePredictor`].
 //!
 //! ## Why "soft voting" and not "MoE"
 //!
@@ -48,14 +55,17 @@
 //!   prop-firm gates and the operator's confidence floor handle
 //!   the rest.
 //! - **No abstention gate**: unlike `MetaDecisionStack`'s conformal
-//!   prediction layer, SoftVoting always votes. If you need
-//!   "predict only when confident enough", set
-//!   [`SoftVotingEnsembleConfig::abstain_below_confidence`].
+//!   prediction layer, SoftVoting always votes. There used to be a
+//!   `SoftVotingEnsembleConfig::abstain_below_confidence` knob here;
+//!   it was removed 2026-08-09 (batch D4) because it was doubly
+//!   unreachable — its only reader was `maybe_abstain`, called only
+//!   from the flat-average `EnsemblePredictor::predict`, which no
+//!   production path ever invoked. Restoring abstention means adding
+//!   it to `predict_with_roles`, the combiner that actually runs.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
-use ndarray::Array2;
 use polars::prelude::DataFrame;
 
 use super::{
@@ -76,14 +86,6 @@ pub struct SoftVotingEnsembleConfig {
     /// Useful when the operator has validation accuracy data and
     /// wants to bias the average toward better-performing experts.
     pub expert_weights: std::collections::HashMap<String, f32>,
-    /// Optional minimum-confidence abstention threshold in `[0, 1]`.
-    /// When set, predictions whose max-class probability is below
-    /// this threshold are flattened to a uniform `[1/3, 1/3, 1/3]`
-    /// so the downstream gate chain interprets them as "no signal"
-    /// (the producer's [`super::ExpertOutputKind`] mapping treats
-    /// uniform outputs as Flat). When `None`, every prediction
-    /// passes through verbatim.
-    pub abstain_below_confidence: Option<f32>,
     /// Expert canonical names that must NOT participate in voting
     /// even when present in the load outcome.
     ///
@@ -112,7 +114,6 @@ impl Default for SoftVotingEnsembleConfig {
     fn default() -> Self {
         Self {
             expert_weights: std::collections::HashMap::new(),
-            abstain_below_confidence: None,
             excluded_names: std::collections::HashSet::new(),
             anomaly_lo: 0.5,
             anomaly_hi: 0.9,
@@ -174,11 +175,6 @@ impl SoftVotingEnsemble {
         })
     }
 
-    /// Convenience: build with default config.
-    pub fn with_default_config(outcome: ExpertLoadOutcome) -> Result<Self> {
-        Self::new(outcome, SoftVotingEnsembleConfig::default())
-    }
-
     /// Names of loaded experts whose `output_kind` is not
     /// Classification3 — they're held in the outcome (so the
     /// chrome can list them) but the soft-voting layer doesn't use
@@ -192,12 +188,14 @@ impl SoftVotingEnsemble {
         self.outcome.loaded.len() - self.unused_for_voting.len()
     }
 
-    /// v0.5 ML-integration Stage 2 — role-aware combiner.
+    /// v0.5 ML-integration Stage 2 — role-aware combiner. THE aggregator:
+    /// both production consumers (`bootstrap.rs:246` replay, `bootstrap.rs:275`
+    /// live) call this, and since 2026-08-09 it is the only one that exists.
     ///
-    /// Unlike [`EnsemblePredictor::predict`] (a flat average of EVERY
-    /// Classification3 expert, which lets `hmm_regime`/`isolation_forest`
-    /// pollute the direction vote), this partitions the loaded experts by
-    /// [`ExpertRole`] and returns one [`EnsembleDecision`] per row:
+    /// It replaced a flat average over EVERY Classification3 expert, which let
+    /// `hmm_regime`/`isolation_forest` pollute the direction vote. This
+    /// partitions the loaded experts by [`ExpertRole`] and returns one
+    /// [`EnsembleDecision`] per row:
     /// - direction vote = weighted average of the genuine directional
     ///   classifiers + `dqn` (confirm), with `hmm_regime` / `isolation_forest`
     ///   REMOVED from the vote;
@@ -338,109 +336,22 @@ impl SoftVotingEnsemble {
         }
         Ok(out)
     }
-
-    /// Apply the per-row probability vector through the optional
-    /// abstention threshold. Returns a (possibly flattened) vector.
-    fn maybe_abstain(&self, row: [f32; 3]) -> [f32; 3] {
-        let Some(threshold) = self.config.abstain_below_confidence else {
-            return row;
-        };
-        let max_p = row[0].max(row[1]).max(row[2]);
-        if max_p < threshold {
-            // Flat / "no signal" → uniform.
-            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-        } else {
-            row
-        }
-    }
 }
 
 impl EnsemblePredictor for SoftVotingEnsemble {
-    fn predict(&self, df: &DataFrame) -> Result<Array2<f32>> {
-        let n_rows = df.height();
-        if n_rows == 0 {
-            return Ok(Array2::<f32>::zeros((0, 3)));
-        }
-        // Per-row accumulator: sum of (weight × probabilities) and
-        // total weight (for normalisation if some experts emit NaN
-        // or fail mid-batch).
-        let mut sums: Vec<[f32; 3]> = vec![[0.0; 3]; n_rows];
-        let mut weight_totals: Vec<f32> = vec![0.0; n_rows];
-
-        for expert in &self.outcome.loaded {
-            if expert.output_kind() != ExpertOutputKind::Classification3 {
-                continue;
-            }
-            // Skip strategy-discovery / operator-excluded experts.
-            // They're in the load outcome (so the chrome can render
-            // them) but don't contribute to the direction vote.
-            if self.config.excluded_names.contains(expert.name()) {
-                continue;
-            }
-            let weight = self
-                .config
-                .expert_weights
-                .get(expert.name())
-                .copied()
-                .unwrap_or(1.0);
-            if weight <= 0.0 {
-                continue;
-            }
-            let preds: Vec<ExpertPrediction> = expert.predict(df)?;
-            if preds.len() != n_rows {
-                anyhow::bail!(
-                    "expert '{}' returned {} predictions for a {}-row DataFrame",
-                    expert.name(),
-                    preds.len(),
-                    n_rows
-                );
-            }
-            for (row_idx, p) in preds.iter().enumerate() {
-                if p.kind != ExpertOutputKind::Classification3 || p.values.len() != 3 {
-                    // Skip — defensive; output_kind says Classification3
-                    // but the prediction itself doesn't match. This
-                    // is a programmer error in the adapter; the
-                    // tree adapters' validator should have caught it.
-                    continue;
-                }
-                sums[row_idx][0] += weight * p.values[0];
-                sums[row_idx][1] += weight * p.values[1];
-                sums[row_idx][2] += weight * p.values[2];
-                weight_totals[row_idx] += weight;
-            }
-        }
-
-        // Normalise + apply abstention.
-        let mut out = Array2::<f32>::zeros((n_rows, 3));
-        for row_idx in 0..n_rows {
-            let total = weight_totals[row_idx];
-            if total <= 0.0 {
-                // No expert contributed — flat output. This can
-                // happen if every expert errored or all weights were
-                // zero. The producer treats uniform output as Flat
-                // (no signal), which is the correct safe default.
-                out[(row_idx, 0)] = 1.0 / 3.0;
-                out[(row_idx, 1)] = 1.0 / 3.0;
-                out[(row_idx, 2)] = 1.0 / 3.0;
-                continue;
-            }
-            let row = [
-                sums[row_idx][0] / total,
-                sums[row_idx][1] / total,
-                sums[row_idx][2] / total,
-            ];
-            let row = self.maybe_abstain(row);
-            out[(row_idx, 0)] = row[0];
-            out[(row_idx, 1)] = row[1];
-            out[(row_idx, 2)] = row[2];
-        }
-        Ok(out)
-    }
-
+    // NOTE (2026-08-09, batch D4): the flat-average `predict` that used to live
+    // here — a weighted mean over EVERY Classification3 expert — is gone, and
+    // so is the trait method it implemented. It had no production caller:
+    // `bootstrap.rs:246` (replay) and `bootstrap.rs:275` (live) both call
+    // `predict_with_roles`, which exists precisely because the flat average let
+    // `hmm_regime` and `isolation_forest` vote on DIRECTION. It went with
+    // `maybe_abstain` and `SoftVotingEnsembleConfig::abstain_below_confidence`,
+    // which were reachable only through it.
     fn load_outcome(&self) -> &ExpertLoadOutcome {
         &self.outcome
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -527,14 +438,20 @@ mod tests {
         df!("f1" => v).expect("df")
     }
 
+    /// Replaces the deleted `SoftVotingEnsemble::with_default_config`, which
+    /// existed only for these tests.
+    fn default_ensemble(outcome: ExpertLoadOutcome) -> Result<SoftVotingEnsemble> {
+        SoftVotingEnsemble::new(outcome, SoftVotingEnsembleConfig::default())
+    }
+
     // -- Construction invariants ---------------------------------------
 
     #[test]
     fn new_rejects_empty_classification3_set() {
         let outcome = outcome_with(vec![Box::new(ForecastEmitter)]);
-        // Can't expect_err — SoftVotingEnsemble holds Box<dyn ExpertModel>
-        // which doesn't implement Debug. Match on the result instead.
-        match SoftVotingEnsemble::with_default_config(outcome) {
+        // Cannot use expect_err — SoftVotingEnsemble holds Box<dyn ExpertModel>
+        // which does not implement Debug. Match on the result instead.
+        match default_ensemble(outcome) {
             Ok(_) => panic!("must reject empty Classification3 set"),
             Err(err) => assert!(err.to_string().contains("Classification3")),
         }
@@ -544,12 +461,12 @@ mod tests {
     fn new_accepts_when_at_least_one_classification3() {
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
-                name: "a".into(),
+                name: "xgboost".into(),
                 probs: [0.2, 0.6, 0.2],
             }),
             Box::new(ForecastEmitter),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let ens = default_ensemble(outcome).expect("ok");
         assert_eq!(ens.voting_expert_count(), 1);
         assert_eq!(ens.experts_unused_for_voting(), vec!["forecaster"]);
     }
@@ -613,7 +530,7 @@ mod tests {
                 probs: [0.3, 0.35, 0.35], // col0=anomaly score 0.3 (< lo)
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let ens = default_ensemble(outcome).expect("ok");
         let decisions = ens.predict_with_roles(&small_df(2)).expect("roles");
         assert_eq!(decisions.len(), 2);
         for d in &decisions {
@@ -638,7 +555,7 @@ mod tests {
                 probs: [0.1, 0.45, 0.45],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let ens = default_ensemble(outcome).expect("ok");
         match ens.predict_with_roles(&small_df(1)) {
             Ok(_) => panic!("must bail when no directional voter remains"),
             Err(err) => assert!(err.to_string().contains("no directional voters")),
@@ -657,7 +574,7 @@ mod tests {
                 probs: [0.3, 0.4, 0.3],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let ens = default_ensemble(outcome).expect("ok");
         match ens.predict_with_roles(&small_df(1)) {
             Ok(_) => panic!("must fail loud on an unmapped expert"),
             Err(err) => assert!(err.to_string().contains("no role mapping")),
@@ -665,20 +582,30 @@ mod tests {
     }
 
     // -- Vote arithmetic ----------------------------------------------
+    //
+    // 2026-08-09 (batch D4): these used to exercise the flat-average
+    // `EnsemblePredictor::predict`, which production never called. They now
+    // exercise `predict_with_roles` — the combiner that actually runs — so the
+    // weighting / exclusion / skipping mechanisms stay pinned on the live path
+    // instead of on a dead one. Expert names must carry a role mapping, hence
+    // `xgboost` / `lightgbm` rather than `a` / `b`.
 
     #[test]
     fn single_expert_pass_through() {
         let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "a".into(),
+            name: "xgboost".into(),
             probs: [0.1, 0.7, 0.2],
         })]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
-        let probs = ens.predict(&small_df(3)).expect("predict");
-        assert_eq!(probs.shape(), &[3, 3]);
-        for row in probs.outer_iter() {
-            assert!((row[0] - 0.1).abs() < 1e-6);
-            assert!((row[1] - 0.7).abs() < 1e-6);
-            assert!((row[2] - 0.2).abs() < 1e-6);
+        let ens = default_ensemble(outcome).expect("ok");
+        let decisions = ens.predict_with_roles(&small_df(3)).expect("roles");
+        assert_eq!(decisions.len(), 3);
+        for d in &decisions {
+            assert!((d.dir_probs[0] - 0.1).abs() < 1e-6);
+            assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
+            assert!((d.dir_probs[2] - 0.2).abs() < 1e-6);
+            // No hmm_regime / isolation_forest loaded -> both gates neutral.
+            assert_eq!(d.regime_gate, 1.0);
+            assert_eq!(d.anomaly_scale, 1.0);
         }
     }
 
@@ -686,21 +613,21 @@ mod tests {
     fn two_experts_equal_weight_averaged() {
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
-                name: "a".into(),
+                name: "xgboost".into(),
                 probs: [0.8, 0.1, 0.1],
             }),
             Box::new(ConstantClassifier {
-                name: "b".into(),
+                name: "lightgbm".into(),
                 probs: [0.2, 0.6, 0.2],
             }),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
-        let probs = ens.predict(&small_df(2)).expect("predict");
+        let ens = default_ensemble(outcome).expect("ok");
+        let decisions = ens.predict_with_roles(&small_df(2)).expect("roles");
         // Average of (0.8,0.1,0.1) + (0.2,0.6,0.2) = (0.5,0.35,0.15)
-        for row in probs.outer_iter() {
-            assert!((row[0] - 0.5).abs() < 1e-5);
-            assert!((row[1] - 0.35).abs() < 1e-5);
-            assert!((row[2] - 0.15).abs() < 1e-5);
+        for d in &decisions {
+            assert!((d.dir_probs[0] - 0.5).abs() < 1e-5);
+            assert!((d.dir_probs[1] - 0.35).abs() < 1e-5);
+            assert!((d.dir_probs[2] - 0.15).abs() < 1e-5);
         }
     }
 
@@ -708,80 +635,44 @@ mod tests {
     fn per_expert_weights_bias_average() {
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
-                name: "strong".into(),
+                name: "xgboost".into(),
                 probs: [0.8, 0.1, 0.1],
             }),
             Box::new(ConstantClassifier {
-                name: "weak".into(),
+                name: "lightgbm".into(),
                 probs: [0.2, 0.6, 0.2],
             }),
         ]);
         let mut cfg = SoftVotingEnsembleConfig::default();
-        cfg.expert_weights.insert("strong".into(), 3.0);
-        cfg.expert_weights.insert("weak".into(), 1.0);
+        cfg.expert_weights.insert("xgboost".into(), 3.0);
+        cfg.expert_weights.insert("lightgbm".into(), 1.0);
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        let probs = ens.predict(&small_df(1)).expect("predict");
+        let decisions = ens.predict_with_roles(&small_df(1)).expect("roles");
         // Weighted: (3*0.8 + 1*0.2)/4, (3*0.1+1*0.6)/4, (3*0.1+1*0.2)/4
-        //         = (2.6/4, 0.9/4, 0.5/4)
         //         = (0.65, 0.225, 0.125)
-        let row = probs.row(0);
-        assert!((row[0] - 0.65).abs() < 1e-5);
-        assert!((row[1] - 0.225).abs() < 1e-5);
-        assert!((row[2] - 0.125).abs() < 1e-5);
+        let d = decisions[0];
+        assert!((d.dir_probs[0] - 0.65).abs() < 1e-5);
+        assert!((d.dir_probs[1] - 0.225).abs() < 1e-5);
+        assert!((d.dir_probs[2] - 0.125).abs() < 1e-5);
     }
 
     #[test]
     fn forecast_experts_are_skipped() {
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
-                name: "a".into(),
+                name: "xgboost".into(),
                 probs: [0.1, 0.7, 0.2],
             }),
             Box::new(ForecastEmitter),
         ]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        // ForecastEmitter must not have contributed.
-        let row = probs.row(0);
-        assert!((row[0] - 0.1).abs() < 1e-6);
-        assert!((row[1] - 0.7).abs() < 1e-6);
-        assert!((row[2] - 0.2).abs() < 1e-6);
-    }
-
-    // -- Abstention ---------------------------------------------------
-
-    #[test]
-    fn abstain_threshold_flattens_low_confidence() {
-        let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "a".into(),
-            probs: [0.4, 0.35, 0.25],
-        })]);
-        let mut cfg = SoftVotingEnsembleConfig::default();
-        cfg.abstain_below_confidence = Some(0.5);
-        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        let row = probs.row(0);
-        // Max=0.4 < 0.5 → flatten.
-        assert!((row[0] - 1.0 / 3.0).abs() < 1e-5);
-        assert!((row[1] - 1.0 / 3.0).abs() < 1e-5);
-        assert!((row[2] - 1.0 / 3.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn abstain_threshold_passes_high_confidence() {
-        let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "a".into(),
-            probs: [0.7, 0.2, 0.1],
-        })]);
-        let mut cfg = SoftVotingEnsembleConfig::default();
-        cfg.abstain_below_confidence = Some(0.5);
-        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        let row = probs.row(0);
-        // Max=0.7 >= 0.5 → pass through.
-        assert!((row[0] - 0.7).abs() < 1e-6);
-        assert!((row[1] - 0.2).abs() < 1e-6);
-        assert!((row[2] - 0.1).abs() < 1e-6);
+        let ens = default_ensemble(outcome).expect("ok");
+        let decisions = ens.predict_with_roles(&small_df(1)).expect("roles");
+        // ForecastEmitter must not have contributed — and must not have
+        // tripped the unmapped-expert bail either.
+        let d = decisions[0];
+        assert!((d.dir_probs[0] - 0.1).abs() < 1e-6);
+        assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
+        assert!((d.dir_probs[2] - 0.2).abs() < 1e-6);
     }
 
     // -- Load outcome surfacing --------------------------------------
@@ -790,17 +681,17 @@ mod tests {
     fn load_outcome_round_trips_through_trait() {
         let outcome = ExpertLoadOutcome {
             loaded: vec![Box::new(ConstantClassifier {
-                name: "a".into(),
+                name: "xgboost".into(),
                 probs: [0.2, 0.6, 0.2],
             })],
-            missing: vec!["xgboost".into(), "transformer".into()],
+            missing: vec!["lightgbm".into(), "transformer".into()],
             degraded: vec![],
         };
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        let ens = default_ensemble(outcome).expect("ok");
         let lo = ens.load_outcome();
         assert_eq!(lo.loaded_count(), 1);
         assert_eq!(lo.missing_count(), 2);
-        assert_eq!(lo.loaded_names(), vec!["a"]);
+        assert_eq!(lo.loaded_names(), vec!["xgboost"]);
     }
 
     #[test]
@@ -816,94 +707,82 @@ mod tests {
     }
 
     #[test]
-    fn genetic_expert_is_skipped_at_voting_layer() {
-        // Construct an outcome with a regular voter + a "genetic"
-        // expert. When the operator excludes "genetic" by name, that
-        // expert must not contribute to the average even though its
-        // output_kind is Classification3.
-        //
-        // F-319: the default exclusion set is now empty (genetic /
-        // neuro_evo adapters were removed from inference), so the
-        // exclusion is driven explicitly via config here — this pins
-        // that the name-based exclusion MECHANISM still works.
+    fn excluded_expert_is_skipped_at_voting_layer() {
+        // A regular voter plus a second one the operator excludes by name. The
+        // excluded expert must not contribute to the direction vote even though
+        // its output_kind is Classification3.
         let outcome = outcome_with(vec![
             Box::new(ConstantClassifier {
-                name: "regular".into(),
+                name: "xgboost".into(),
                 probs: [0.1, 0.7, 0.2],
             }),
             Box::new(ConstantClassifier {
-                name: "genetic".into(),
-                probs: [0.8, 0.1, 0.1],
-            }),
-        ]);
-        let mut cfg = SoftVotingEnsembleConfig::default();
-        cfg.excluded_names.insert("genetic".to_string());
-        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        // 2 loaded but only 1 votes — genetic excluded.
-        assert_eq!(ens.voting_expert_count(), 1);
-        assert!(ens.experts_unused_for_voting().contains(&"genetic"));
-        // The output must reflect ONLY the regular expert, not an
-        // average of the two.
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        let row = probs.row(0);
-        assert!((row[0] - 0.1).abs() < 1e-6);
-        assert!((row[1] - 0.7).abs() < 1e-6);
-        assert!((row[2] - 0.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn neuro_evo_expert_is_also_skipped_when_excluded() {
-        // As with `genetic`, an operator-supplied exclusion of
-        // "neuro_evo" must drop it from the vote. (F-319: not excluded
-        // by default any more — the adapter was removed from inference.)
-        let outcome = outcome_with(vec![
-            Box::new(ConstantClassifier {
-                name: "voter".into(),
-                probs: [0.2, 0.6, 0.2],
-            }),
-            Box::new(ConstantClassifier {
                 name: "neuro_evo".into(),
-                probs: [0.9, 0.05, 0.05],
+                probs: [0.8, 0.1, 0.1],
             }),
         ]);
         let mut cfg = SoftVotingEnsembleConfig::default();
         cfg.excluded_names.insert("neuro_evo".to_string());
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        // 2 loaded but only 1 votes — neuro_evo excluded.
         assert_eq!(ens.voting_expert_count(), 1);
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        let row = probs.row(0);
-        assert!(
-            (row[1] - 0.6).abs() < 1e-6,
-            "neuro_evo must not pull p_neutral toward 0.9"
-        );
+        assert!(ens.experts_unused_for_voting().contains(&"neuro_evo"));
+        // The vote must reflect ONLY the regular expert, not an average.
+        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        assert!((d.dir_probs[0] - 0.1).abs() < 1e-6);
+        assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
+        assert!((d.dir_probs[2] - 0.2).abs() < 1e-6);
     }
 
     #[test]
     fn operator_can_clear_exclusion_to_include_strategy_discoverers() {
-        // Operator override: someone WANTS to vote on genetic
-        // outputs (e.g. for sanity-check during validation). They
-        // clear the exclusion list and genetic participates.
+        // Operator override: someone WANTS neuro_evo in the vote (e.g. a
+        // sanity check during validation). They clear the exclusion list and
+        // it participates.
         let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "genetic".into(),
+            name: "neuro_evo".into(),
             probs: [0.1, 0.7, 0.2],
         })]);
         let mut cfg = SoftVotingEnsembleConfig::default();
         cfg.excluded_names.clear();
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         assert_eq!(ens.voting_expert_count(), 1);
-        let probs = ens.predict(&small_df(1)).expect("predict");
-        let row = probs.row(0);
-        assert!((row[1] - 0.7).abs() < 1e-6);
+        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_weight_expert_drops_out_of_the_vote() {
+        // Weight 0 is the operator's "load it but do not let it vote" lever.
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantClassifier {
+                name: "lightgbm".into(),
+                probs: [0.9, 0.05, 0.05],
+            }),
+        ]);
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.expert_weights.insert("lightgbm".into(), 0.0);
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        assert!(
+            (d.dir_probs[1] - 0.7).abs() < 1e-6,
+            "a zero-weight expert must not pull the vote, got {:?}",
+            d.dir_probs
+        );
     }
 
     #[test]
     fn empty_dataframe_returns_empty_predictions() {
         let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "a".into(),
+            name: "xgboost".into(),
             probs: [0.2, 0.6, 0.2],
         })]);
-        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
-        let probs = ens.predict(&small_df(0)).expect("predict");
-        assert_eq!(probs.shape(), &[0, 3]);
+        let ens = default_ensemble(outcome).expect("ok");
+        let decisions = ens.predict_with_roles(&small_df(0)).expect("roles");
+        assert!(decisions.is_empty());
     }
 }

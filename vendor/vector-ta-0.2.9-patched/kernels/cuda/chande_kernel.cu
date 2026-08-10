@@ -503,3 +503,171 @@ void chande_one_series_many_params_from_tr_f32(const float* __restrict__ high,
         }
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — chande (Chandelier Exit)
+// ===========================================================================
+// Reference: src/indicators/chande.rs
+//   first_valid3 (:242)          — the first-valid rule
+//   chande_with_kernel (:252)    — Err branches, warmup = first + period - 1
+//   chande_scalar (:442)         — the general path
+//   chande_scalar_default_long (:575) — the period==22 && mult==3 && long path
+// Batch defaults: period 22, mult 3.0, direction "long" (get_direction :116).
+//
+// ONE KERNEL SERVES BOTH CPU PATHS. chande_scalar dispatches to
+// chande_scalar_default_long for exactly the default triple. That fast path is
+// the SAME arithmetic — same tr, same rma recurrence, same mul_add structure —
+// with the VecDeque replaced by a fixed 32-slot ring. Nothing numeric differs,
+// so no special case is written here and none is needed.
+//
+// FIRST-VALID IS THE SIMULTANEOUS RULE. first_valid3 scans high, low and close
+// TOGETHER — !h.is_nan() && !l.is_nan() && !c.is_nan() at the same i — which is
+// F64FirstValidRule::AllInputsNonNan, NOT the max-of-independent-firsts rule
+// adx/natr use. Feeding this kernel adx's index would move the seed bar.
+//
+// THE MONOTONE DEQUE, REPRODUCED WITHOUT AN ARRAY
+//
+// The CPU keeps a deque of candidate indices for the rolling max of `high`
+// (rolling min of `low` for direction "short"). A device thread cannot hold a
+// period-length array. It does not have to: the deque contents are a PURE
+// FUNCTION of the window, and its front can be recovered by one backward scan.
+//
+// An index j is popped from the back the first time a later k arrives with
+// high[j] <= high[k] (:497). So j is still in the deque at bar i exactly when
+//     for all k in (j, i]:  NOT (high[j] <= high[k])
+// and the front is the SMALLEST such j inside the window. Front-pruning
+// (:487-493) only ever removes indices below window_start, and window_start is
+// non-decreasing, so no index at or above it was pruned earlier.
+//
+// NaN MATTERS HERE AND IS WHY THIS IS NOT JUST "the rolling max".
+//   * If high[j] is NaN, `high[j] <= high[k]` is false for every k, so j is
+//     NEVER popped and can reach the front — the CPU then emits a NaN-derived
+//     value. A plain fmax scan would skip it and emit a number instead.
+//   * If high[k] is NaN, it never pops anything either — which is exactly what
+//     an fmax running maximum does, since fmax returns the non-NaN operand.
+// The scan below encodes both: j survives iff isnan(high[j]) OR
+// high[j] > (fmax over k in (j,i]). That is the deque, exactly, in O(period).
+//
+// ROUNDING.
+//   tr        = fmax(fmax(hl, hc), lc)          — f64::max semantics, not a chain
+//   rma       = fma(alpha, tr - rma, rma)       — ONE fma (CPU :514)
+//   out long  = fma(-rma, mult, max_h)          — ONE fma (CPU :512)
+//   out short = fma( rma, mult, min_l)          — ONE fma (CPU :562)
+//
+// The f32 file above carries FLT_MAX as its sentinel; there is no sentinel here
+// because there is no separate max accumulator to seed.
+//
+// One thread per column: rma is a Wilder recurrence.
+// ===========================================================================
+
+#define NEO_S3_CHANDE_MULT      3.0
+#define NEO_S3_CHANDE_DIR_LONG  1
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// The deque front for the rolling MAX of `v` over [window_start, i].
+// See the header: smallest j with (isnan(v[j]) || v[j] > max of v over (j,i]).
+__device__ __forceinline__ int neo_s3_dq_front_max(
+    const double* __restrict__ v, int window_start, int i)
+{
+    int front = i;
+    double run = -INFINITY;   // fmax identity; NaNs are skipped exactly as
+                              // f64::max would skip them
+    for (int j = i - 1; j >= window_start; --j) {
+        run = fmax(run, v[j + 1]);
+        const double vj = v[j];
+        if (isnan(vj) || vj > run) front = j;
+    }
+    return front;
+}
+
+// The same, for the rolling MIN of `v`: popped when v[back] >= lo (:547).
+__device__ __forceinline__ int neo_s3_dq_front_min(
+    const double* __restrict__ v, int window_start, int i)
+{
+    int front = i;
+    double run = INFINITY;
+    for (int j = i - 1; j >= window_start; --j) {
+        run = fmin(run, v[j + 1]);
+        const double vj = v[j];
+        if (isnan(vj) || vj < run) front = j;
+    }
+    return front;
+}
+
+extern "C" __global__ void neoethos_chande_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+    const double mult = NEO_S3_CHANDE_MULT;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warmup = first_valid + period - 1;
+    for (int i = 0; i < warmup && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double alpha = 1.0 / (double)period;
+    double sum_tr = 0.0;
+    double rma = 0.0;
+    double prev_close = close[first_valid];
+
+    for (int i = first_valid; i < n; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+
+        double tr;
+        if (i == first_valid) {
+            tr = hi - lo;
+        } else {
+            const double hl = hi - lo;
+            const double hc = fabs(hi - prev_close);
+            const double lc = fabs(lo - prev_close);
+            tr = fmax(fmax(hl, hc), lc);
+        }
+
+        if (i < warmup) {
+            sum_tr += tr;
+        } else {
+            const int window_start = (i >= warmup) ? (i + 1 - period) : first_valid;
+            const int ws = window_start < first_valid ? first_valid : window_start;
+
+            if (i == warmup) {
+                sum_tr += tr;
+                rma = sum_tr / (double)period;
+            } else {
+                rma = fma(alpha, tr - rma, rma);
+            }
+
+#if NEO_S3_CHANDE_DIR_LONG
+            const int f = neo_s3_dq_front_max(high, ws, i);
+            row[i] = fma(-rma, mult, high[f]);
+#else
+            const int f = neo_s3_dq_front_min(low, ws, i);
+            row[i] = fma(rma, mult, low[f]);
+#endif
+        }
+
+        prev_close = close[i];
+    }
+}

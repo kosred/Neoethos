@@ -169,49 +169,16 @@ fn subscribe_spots_request_uses_documented_symbol_ids_and_timestamp_flag() {
 }
 
 #[test]
-fn subscribe_live_trendbar_request_uses_documented_period_and_symbol_id() {
-    let message = build_subscribe_live_trendbar_request(7001, 14, 7, "live-bars-1");
-
-    assert_eq!(message.client_msg_id, "live-bars-1");
-    assert_eq!(
-        message.payload_type,
-        CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(
-        message
-            .payload
-            .get("ctidTraderAccountId")
-            .and_then(serde_json::Value::as_i64),
-        Some(7001)
-    );
-    assert_eq!(
-        message
-            .payload
-            .get("symbolId")
-            .and_then(serde_json::Value::as_i64),
-        Some(14)
-    );
-    assert_eq!(
-        message
-            .payload
-            .get("period")
-            .and_then(serde_json::Value::as_i64),
-        Some(7)
-    );
-}
-
-#[test]
 fn unsubscribe_requests_use_documented_payload_types() {
+    // 2026-08-09 (D2): the live-trendbar half went with
+    // `build_unsubscribe_live_trendbar_request`. Spot unsubscribe stays — that
+    // builder is a KEEP-and-WIRE item (the streamer subscribes and never
+    // unsubscribes).
     let spots = build_unsubscribe_spots_request(7001, &[14], "spots-off-1");
-    let bars = build_unsubscribe_live_trendbar_request(7001, 14, 7, "bars-off-1");
 
     assert_eq!(
         spots.payload_type,
         CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(
-        bars.payload_type,
-        CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
     );
 }
 
@@ -663,47 +630,10 @@ fn auth_token_error_classifier_rejects_unrelated_codes() {
 // non-test consumer; the live transport is JSON-WSS.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn transport_selector_picks_json_wss_by_default() {
-    // The env var must be unset (or unrecognised) for the default
-    // JSON-WSS path. Save & restore so we don't leak state between
-    // tests if they share the same process.
-    let prior = std::env::var(CTRADER_TRANSPORT_ENV_VAR).ok();
-    // Safety: tests are single-threaded by default within the cargo
-    // test harness for the same binary; we restore on every exit path
-    // below to avoid cross-test bleed.
-    unsafe {
-        std::env::remove_var(CTRADER_TRANSPORT_ENV_VAR);
-    }
-    let selected = select_ctrader_transport_from_env();
-    if let Some(p) = prior {
-        unsafe {
-            std::env::set_var(CTRADER_TRANSPORT_ENV_VAR, p);
-        }
-    }
-    assert_eq!(selected, CTraderTransportKind::JsonWss);
-    assert_eq!(selected.label(), "json_wss");
-}
-
-#[test]
-fn transport_selector_picks_protobuf_when_env_set() {
-    let prior = std::env::var(CTRADER_TRANSPORT_ENV_VAR).ok();
-    unsafe {
-        std::env::set_var(CTRADER_TRANSPORT_ENV_VAR, "protobuf");
-    }
-    let selected = select_ctrader_transport_from_env();
-    if let Some(p) = prior {
-        unsafe {
-            std::env::set_var(CTRADER_TRANSPORT_ENV_VAR, p);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var(CTRADER_TRANSPORT_ENV_VAR);
-        }
-    }
-    assert_eq!(selected, CTraderTransportKind::Protobuf);
-    assert_eq!(selected.label(), "protobuf");
-}
+// (2026-08-09 batch D2b: the two transport-selector tests were deleted with the
+// selector itself. They pinned `NEOETHOS_BOT_CTRADER_TRANSPORT=protobuf` to a
+// `CTraderTransportKind::Protobuf` whose codec batch D2 had already removed —
+// a green assertion about a wire format this binary can no longer speak.)
 
 // ─────────────────────────────────────────────────────────────────────────
 // 2026-06-10 — full ProtoOAPayloadType API-completeness pass. Each builder
@@ -877,17 +807,10 @@ fn order_list_and_cash_flow_history_carry_time_window() {
 }
 
 #[test]
-fn refresh_token_and_ctid_profile_requests_carry_tokens() {
-    let refresh = build_refresh_token_request("refresh-abc", "rt-1");
-    assert_eq!(
-        refresh.payload_type,
-        CTRADER_OA_REFRESH_TOKEN_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(
-        refresh.payload.get("refreshToken").and_then(Value::as_str),
-        Some("refresh-abc")
-    );
-
+fn ctid_profile_request_carries_access_token() {
+    // 2026-08-09 (D2): the `build_refresh_token_request` half was deleted with
+    // the builder — OAuth refresh goes over HTTPS (`ctrader_live_auth.rs:845`),
+    // never over the Open API socket.
     let profile = build_get_ctid_profile_by_token_request("access-xyz", "pr-1");
     assert_eq!(
         profile.payload_type,
@@ -900,71 +823,120 @@ fn refresh_token_and_ctid_profile_requests_carry_tokens() {
 }
 
 #[test]
-fn account_logout_and_dynamic_leverage_and_conversion_and_offset_requests() {
-    let logout = build_account_logout_request(7001, "lo-1");
-    assert_eq!(
-        logout.payload_type,
-        CTRADER_OA_ACCOUNT_LOGOUT_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(
-        logout
-            .payload
-            .get("ctidTraderAccountId")
-            .and_then(Value::as_i64),
-        Some(7001)
-    );
-
-    let lev = build_get_dynamic_leverage_request(7001, 88, "dl-1");
-    assert_eq!(
-        lev.payload_type,
-        CTRADER_OA_GET_DYNAMIC_LEVERAGE_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(lev.payload.get("leverageId").and_then(Value::as_i64), Some(88));
-
-    let conv = build_symbols_for_conversion_request(7001, 3, 5, "sc-1");
-    assert_eq!(
-        conv.payload_type,
-        CTRADER_OA_SYMBOLS_FOR_CONVERSION_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(conv.payload.get("firstAssetId").and_then(Value::as_i64), Some(3));
-    assert_eq!(conv.payload.get("lastAssetId").and_then(Value::as_i64), Some(5));
-
-    let offset = build_deal_offset_list_request(7001, 999, "do-1");
-    assert_eq!(
-        offset.payload_type,
-        CTRADER_OA_DEAL_OFFSET_LIST_REQUEST_PAYLOAD_TYPE
-    );
-    assert_eq!(offset.payload.get("dealId").and_then(Value::as_i64), Some(999));
-}
-
-#[test]
-fn margin_call_and_depth_quote_requests_use_documented_payloads() {
+fn margin_call_request_uses_documented_payload() {
+    // 2026-08-09 (D2): the depth-quote half went with
+    // `build_{,un}subscribe_depth_quotes_request`.
+    // 2026-08-09 (#238): `build_margin_call_list_request` is no longer a WIRE
+    // item — `broker_api::fetch_margin_status_blocking` calls it and
+    // `app_services::margin_call` polls that. The comment that used to say
+    // "nothing reads yet" was true this morning and is false now.
     let mc = build_margin_call_list_request(7001, "mc-1");
     assert_eq!(
         mc.payload_type,
         CTRADER_OA_MARGIN_CALL_LIST_REQUEST_PAYLOAD_TYPE
     );
+    assert_eq!(
+        mc.payload
+            .get("ctidTraderAccountId")
+            .and_then(Value::as_i64),
+        Some(7001)
+    );
+}
 
-    let sub = build_subscribe_depth_quotes_request(7001, &[1, 2, 3], "dq-1");
+#[test]
+fn margin_call_list_response_parses_thresholds_and_reports_the_tightest() {
+    // The tightest threshold is the LARGEST percentage, because margin level
+    // falls toward a call. Getting this backwards would halt on the loosest
+    // threshold only — i.e. far too late.
+    let json = r#"{
+        "payloadType": 2168,
+        "payload": {
+            "ctidTraderAccountId": 7001,
+            "marginCall": [
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_1","marginLevelThreshold":60.0,
+                 "utcLastUpdateTimestamp":1700000000000},
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_2","marginLevelThreshold":100.0},
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_3","marginLevelThreshold":80.0}
+            ]
+        }
+    }"#;
+    let snap = parse_margin_call_list_response(json).expect("must parse");
+    assert_eq!(snap.account_id, 7001);
+    assert_eq!(snap.thresholds.len(), 3);
+    assert_eq!(snap.unusable_rows, 0);
+    assert!(snap.unusable_reasons.is_empty());
+    assert_eq!(snap.tightest_threshold_pct(), Some(100.0));
     assert_eq!(
-        sub.payload_type,
-        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE
+        snap.thresholds[0].utc_last_update_timestamp_ms,
+        Some(1700000000000)
     );
-    let ids = sub
-        .payload
-        .get("symbolId")
-        .and_then(Value::as_array)
-        .expect("symbolId array");
-    assert_eq!(ids.len(), 3);
-    assert_eq!(
-        expected_response_payload_type(CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE)
-            .unwrap(),
-        CTRADER_OA_SUBSCRIBE_DEPTH_QUOTES_RESPONSE_PAYLOAD_TYPE
-    );
+}
 
-    let unsub = build_unsubscribe_depth_quotes_request(7001, &[1], "dq-2");
-    assert_eq!(
-        unsub.payload_type,
-        CTRADER_OA_UNSUBSCRIBE_DEPTH_QUOTES_REQUEST_PAYLOAD_TYPE
-    );
+#[test]
+fn margin_call_list_response_counts_rows_it_cannot_use_instead_of_dropping_them() {
+    // NO SILENT DROPS. A row the broker sent whose threshold we could not read
+    // must be COUNTED, with a reason — otherwise the watchdog silently behaves
+    // as though the broker configured fewer thresholds than it did, which is
+    // the optimistic (dangerous) direction.
+    let json = r#"{
+        "payloadType": 2168,
+        "payload": {
+            "ctidTraderAccountId": 7001,
+            "marginCall": [
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_1","marginLevelThreshold":50.0},
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_2"},
+                {"marginCallType":"MARGIN_CALL_THRESHOLD_3","marginLevelThreshold":0.0}
+            ]
+        }
+    }"#;
+    let snap = parse_margin_call_list_response(json).expect("must parse");
+    assert_eq!(snap.thresholds.len(), 1);
+    assert_eq!(snap.unusable_rows, 2);
+    assert_eq!(snap.unusable_reasons.len(), 2);
+    assert_eq!(snap.tightest_threshold_pct(), Some(50.0));
+}
+
+#[test]
+fn margin_call_list_response_keeps_a_threshold_whose_type_label_is_unreadable() {
+    // A missing/odd `marginCallType` degrades the LABEL, not the threshold.
+    // Discarding a real threshold because its name did not parse would be a
+    // silent loss of protection.
+    let json = r#"{
+        "payloadType": 2168,
+        "payload": {
+            "ctidTraderAccountId": 7001,
+            "marginCall": [
+                {"marginLevelThreshold": 120.0},
+                {"marginCallType": 2, "marginLevelThreshold": 90.0}
+            ]
+        }
+    }"#;
+    let snap = parse_margin_call_list_response(json).expect("must parse");
+    assert_eq!(snap.thresholds.len(), 2);
+    assert_eq!(snap.unusable_rows, 0);
+    assert_eq!(snap.thresholds[0].margin_call_type, "UNKNOWN");
+    assert_eq!(snap.thresholds[1].margin_call_type, "MARGIN_CALL_TYPE_2");
+    // The unreadable label is still REPORTED even though nothing was dropped.
+    assert_eq!(snap.unusable_reasons.len(), 1);
+    assert_eq!(snap.tightest_threshold_pct(), Some(120.0));
+}
+
+#[test]
+fn margin_call_list_response_with_no_rows_has_no_threshold_to_compare_against() {
+    // An account with no configured margin call yields `None`, which the
+    // watchdog logs loudly and does NOT treat as a breach.
+    let json = r#"{"payloadType":2168,"payload":{"ctidTraderAccountId":7001}}"#;
+    let snap = parse_margin_call_list_response(json).expect("must parse");
+    assert!(snap.thresholds.is_empty());
+    assert_eq!(snap.unusable_rows, 0);
+    assert_eq!(snap.tightest_threshold_pct(), None);
+}
+
+#[test]
+fn margin_call_list_response_rejects_the_wrong_payload_type() {
+    let json = r#"{"payloadType":2122,"payload":{"ctidTraderAccountId":7001}}"#;
+    let err = parse_margin_call_list_response(json)
+        .expect_err("a non-2168 envelope must not be read as a margin-call list")
+        .to_string();
+    assert!(err.contains("2122"), "{err}");
 }

@@ -223,3 +223,113 @@ void sqwma_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — sqwma
+// ===========================================================================
+// Reference: src/indicators/moving_averages/sqwma.rs
+//   `sqwma_scalar` (:286) + `build_sqwma_weights` (:129)
+//   + `sqwma_with_kernel` (:228) + `sqwma_scalar_default_14` (:339)
+//
+// WHAT THE f32 KERNEL ABOVE GETS WRONG, AND IS FIXED HERE
+//
+//   1. A DIFFERENT ALGORITHM, NOT A LOWER PRECISION. `sqwma_batch_f32` keeps
+//      three rolling moments S0/S1/S2 and rebuilds the weighted sum from them
+//      (`sqwma_eval_f32`: `P^2*S0 - 2P*S1 + S2`). That is the square weight
+//      expanded algebraically and slid forward incrementally. The CPU computes
+//      the dot product afresh at every bar, in one order, with `mul_add`. The
+//      two agree in exact arithmetic and disagree at every bar in floating
+//      point — and the moment recurrence additionally accumulates cancellation
+//      error across the whole series, which is why it is not merely an ULP.
+//      This kernel does the CPU's dot product.
+//   2. WEIGHT SUM. `sqwma_weight_sum` used the closed form
+//      `p(p+1)(2p+1)/6 - 1` in double and then NARROWED TO FLOAT. The CPU
+//      accumulates `sum += (period - i)^2` ascending. Both are exact in f64
+//      for every period below ~2^17, but the accumulation is reproduced
+//      literally here rather than assumed equal.
+//   3. `sqwma_scalar_default_14` (the period == 14 fast path) unrolls the same
+//      13 `mul_add`s with the same integer weights in the same order, and
+//      DEFAULT_WEIGHT_SUM == 1015 exactly, so ONE kernel serves both CPU
+//      paths. No special case is needed and none is written.
+//
+// WARMUP: `warm = first_valid + period + 1` — note the `+ 1`, which is one bar
+// LATER than the `first + period - 1` most of this crate's moving averages
+// use, because the CPU's emit loop is `for j in (first + period + 1)..n`.
+// Getting this wrong shifts the whole series rather than perturbing it.
+//
+// One thread per column. The dot product itself is embarrassingly parallel
+// across bars, but the row is walked serially so the launch geometry matches
+// the rest of the lane and the weights are built once per row.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_sqwma_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // `sqwma_with_kernel` — every branch that returns Err.
+    const bool declined =
+        (n <= 0) ||
+        (period < 2) || (period > n) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    // `build_sqwma_weights`: weight[i] = (period - i)^2 for i in 0..period-1,
+    // accumulated ascending. Integers, so exact — but summed in the CPU's
+    // order regardless, because "exact" is an argument, not a guarantee.
+    const int p_minus_1 = period - 1;
+    double weight_sum = 0.0;
+    for (int i = 0; i < p_minus_1; ++i) {
+        const double w = (double)(period - i);
+        weight_sum += w * w;
+    }
+    const double inv_ws = 1.0 / weight_sum;
+
+    const int warm = first_valid + period + 1;
+    const int stop = warm < n ? warm : n;
+    for (int i = 0; i < stop; ++i) row[i] = neo_s2_qnan();
+    if (warm >= n) return;
+
+    const int p4 = p_minus_1 & ~3;
+
+    for (int j = warm; j < n; ++j) {
+        double sum = 0.0;
+        int k = 0;
+        // The CPU's 4-at-a-time unroll. Unrolling does not change the order:
+        // d[j-k] is folded in with ascending k either way, so this loop and
+        // the tail below reproduce it exactly.
+        for (; k < p4; k += 4) {
+            const double w0 = (double)(period - (k + 0));
+            const double w1 = (double)(period - (k + 1));
+            const double w2 = (double)(period - (k + 2));
+            const double w3 = (double)(period - (k + 3));
+            sum = fma(prices[j - (k + 0)], w0 * w0, sum);
+            sum = fma(prices[j - (k + 1)], w1 * w1, sum);
+            sum = fma(prices[j - (k + 2)], w2 * w2, sum);
+            sum = fma(prices[j - (k + 3)], w3 * w3, sum);
+        }
+        for (; k < p_minus_1; ++k) {
+            const double w = (double)(period - k);
+            sum = fma(prices[j - k], w * w, sum);
+        }
+        row[j] = sum * inv_ws;
+    }
+}

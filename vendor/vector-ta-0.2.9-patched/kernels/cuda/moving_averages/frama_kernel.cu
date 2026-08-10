@@ -530,3 +530,170 @@ extern "C" __global__ void frama_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — frama (fractal adaptive moving average)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/moving_averages/frama.rs
+ *   `frama_prepare`      (:253) — first_valid over the TRIPLE, the win parity
+ *                                 fix-up, and every Err branch
+ *   `frama_compute_into` (:320) — the seed, `mean(close[first .. first+win])`
+ *   `frama_small_scan`   (:648) — the fractal-dimension scan and the EMA step
+ *
+ * The four `frama_small_scan_const::<10|14|20|32>` specialisations and
+ * `frama_scalar_deque` (win > 32) are the SAME arithmetic: a const generic and
+ * a monotonic deque change how the window max/min is found, not what it is —
+ * max/min are exact — and the alpha/EMA lines are byte-identical in all three.
+ * One kernel therefore serves every win, and no special case is written.
+ *
+ * WHAT THE f32 KERNEL ABOVE GETS WRONG, AND IS FIXED HERE
+ *
+ *  1. `__int_as_float(0x7f...)` is an f32 NaN bit pattern; here the prefix is
+ *     `__longlong_as_double(0x7ff8...)`.
+ *  2. `f64::MIN` / `f64::MAX` seeds. The CPU seeds max with `f64::MIN` —
+ *     -1.797e308, the most negative FINITE double — NOT -infinity. `-DBL_MAX`
+ *     is the f64 spelling. An f32 kernel that seeded with `-FLT_MAX` is an
+ *     epsilon-class constant sized for the wrong type; this is the same bug
+ *     in its largest form.
+ *  3. `fmaxf`/`fminf` x1 each -> `fmax`/`fmin`. These MUST stay max/min and
+ *     not become comparison chains: the CPU uses `f64::max`, which returns the
+ *     NON-NaN operand, so one NaN bar inside the window is absorbed rather
+ *     than poisoning `d_prev` for the rest of the series.
+ *  4. `.clamp(0.1, 1.0)` IS NOT `fmin(fmax(x, 0.1), 1.0)`. Rust's `f64::clamp`
+ *     is `if self < min {min} else if self > max {max} else {self}`, so a NaN
+ *     PASSES THROUGH. `fmax`/`fmin` would replace it with a bound. Both clamps
+ *     below are written as the CPU's comparison chain deliberately — this is
+ *     the one place in this shard where the NaN rule inverts, and getting it
+ *     "right" the usual way would be wrong here.
+ *  5. `exp`/`ln` replace `expf`/`logf`. Two of these are unavoidable
+ *     sub-ulp divergence sources between CUDA's libdevice and the host libm;
+ *     declared, not discovered.
+ *
+ * `w_ln`, `sc_floor` and the parity fix-up `if (win & 1) win += 1` are hoisted
+ * exactly where the CPU hoists them. `d_prev` seeds at 1.0 and CARRIES across
+ * bars, and `out[i]` reads `out[i-1]`: two carried scalars, so one thread per
+ * column walking ascending, never a scan.
+ *
+ * PARAMETERS: the swept int is `window` (CPU default 10). `sc` and `fc` are
+ * held at the CPU batch defaults 300 and 1 (frama.rs:114,118) because the
+ * sweep carries one integer and `window` is the length this indicator is
+ * swept over.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_FRAMA_SC_DEFAULT 300
+#define NEO_FRAMA_FC_DEFAULT 1
+
+extern "C" __global__
+void frama_neo_batch_f64(const double* __restrict__ high,
+                         const double* __restrict__ low,
+                         const double* __restrict__ close,
+                         int series_len,
+                         const int* __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int window = periods[combo];
+
+    const int sc = NEO_FRAMA_SC_DEFAULT;
+    const int fc = NEO_FRAMA_FC_DEFAULT;
+
+    int win = window;
+    if (win & 1) win += 1;
+
+    if (len <= 0 || window <= 0 || window > len ||
+        first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < win) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warm = first_valid + win - 1;
+    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+
+    // frama.rs:337 — plain ascending sum of `win` closes, then one divide.
+    double seed = 0.0;
+    for (int j = first_valid; j < first_valid + win; ++j) seed += close[j];
+    seed = seed / (double)win;
+    o[warm] = seed;
+
+    const int half = win >> 1;
+    const double win_f = (double)win;
+    const double half_f = (double)half;
+    const double w_ln = log(2.0 / ((double)sc + 1.0));
+    const double sc_floor = 2.0 / ((double)sc + 1.0);
+    const double LN_2 = 0.693147180559945309417232121458176568;
+    const double DBL_MIN_FINITE = -1.7976931348623157e308;  // f64::MIN
+    const double DBL_MAX_FINITE =  1.7976931348623157e308;  // f64::MAX
+
+    double d_prev = 1.0;
+
+    for (int i = first_valid + win; i < len; ++i) {
+        const int seg_start = i - win;
+        const int mid = seg_start + half;
+
+        double max1 = DBL_MIN_FINITE, min1 = DBL_MAX_FINITE;
+        double max2 = DBL_MIN_FINITE, min2 = DBL_MAX_FINITE;
+
+        int j = seg_start;
+        while (j + 1 < mid) {
+            max2 = fmax(max2, fmax(high[j], high[j + 1]));
+            min2 = fmin(min2, fmin(low[j],  low[j + 1]));
+            j += 2;
+        }
+        if (j < mid) {
+            max2 = fmax(max2, high[j]);
+            min2 = fmin(min2, low[j]);
+        }
+
+        j = mid;
+        while (j + 1 < i) {
+            max1 = fmax(max1, fmax(high[j], high[j + 1]));
+            min1 = fmin(min1, fmin(low[j],  low[j + 1]));
+            j += 2;
+        }
+        if (j < i) {
+            max1 = fmax(max1, high[j]);
+            min1 = fmin(min1, low[j]);
+        }
+
+        const double max3 = fmax(max1, max2);
+        const double min3 = fmin(min1, min2);
+
+        const double n1 = (max1 - min1) / half_f;
+        const double n2 = (max2 - min2) / half_f;
+        const double n3 = (max3 - min3) / win_f;
+
+        double d_cur;
+        if (n1 > 0.0 && n2 > 0.0 && n3 > 0.0) {
+            d_cur = (log(n1 + n2) - log(n3)) / LN_2;
+        } else {
+            d_cur = d_prev;
+        }
+        d_prev = d_cur;
+
+        // Rust `clamp`: NaN passes through. NOT fmin/fmax. frama.rs:719.
+        double alpha0 = exp(w_ln * (d_cur - 1.0));
+        if (alpha0 < 0.1) alpha0 = 0.1; else if (alpha0 > 1.0) alpha0 = 1.0;
+
+        const double old_n = (2.0 - alpha0) / alpha0;
+        const double new_n =
+            (double)(sc - fc) * ((old_n - 1.0) / ((double)sc - 1.0)) + (double)fc;
+
+        double alpha = 2.0 / (new_n + 1.0);
+        if (alpha < sc_floor) alpha = sc_floor; else if (alpha > 1.0) alpha = 1.0;
+
+        // frama.rs:724 — ONE fused rounding on the close term, a plain product
+        // on the carry term. Not `alpha*c + (1-alpha)*prev`.
+        o[i] = fma(close[i], alpha, (1.0 - alpha) * o[i - 1]);
+    }
+}

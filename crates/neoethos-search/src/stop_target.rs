@@ -53,13 +53,25 @@ impl std::error::Error for StopDistanceError {}
 
 /// Process-wide adaptive-stop cost caps — the typed mirror of
 /// `neoethos_core::config::StopTargetRuntimeConfig`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+// `Eq` dropped 2026-08-10: `atr_stop_multiplier` is an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct StopTargetRuntimeOverrides {
     /// `0` = no cap. See [`StopDistanceError::TailCapExceeded`].
     pub tail_max_bars: usize,
     /// `1` = sample the tail every bar (position-invariant). See
     /// [`StopTargetSettings::tail_step`].
     pub tail_step: usize,
+    /// The ATR multiple the stop falls back to when the vol/structure blend
+    /// cannot produce a distance.
+    ///
+    /// 2026-08-10: this is `risk.atr_stop_multiplier`, read here so that
+    /// `StopTargetSettings::default()` stops carrying a THIRD independent copy
+    /// of the same number. The other two are `risk.atr_stop_multiplier`
+    /// (config, default 1.5) and `models.label_stop_atr_multiplier`, which are
+    /// merged by a `.max()` in the training orchestrator. Same number, three
+    /// owners, one of them invisible — that is how raising the configured
+    /// value left the adaptive stop engine at the literal.
+    pub atr_stop_multiplier: f64,
 }
 
 impl Default for StopTargetRuntimeOverrides {
@@ -67,6 +79,10 @@ impl Default for StopTargetRuntimeOverrides {
         Self {
             tail_max_bars: 0,
             tail_step: 1,
+            // Matches `RiskConfig::default().atr_stop_multiplier` (config.rs:585).
+            // The `stop_target_from_settings_default_matches_default` test is
+            // what keeps the two from drifting apart again.
+            atr_stop_multiplier: 1.5,
         }
     }
 }
@@ -76,11 +92,38 @@ impl StopTargetRuntimeOverrides {
     /// `stop_target_from_settings_default_matches_default` test guarantees a
     /// fresh `Settings` reproduces [`Self::default`].
     pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let d = Self::default();
+        let configured_atr = s.risk.atr_stop_multiplier;
+        let atr_stop_multiplier = if configured_atr.is_finite() && configured_atr > 0.0 {
+            if (configured_atr - d.atr_stop_multiplier).abs() > f64::EPSILON {
+                // 💰 A money-path substitution, so it is named with both
+                // values rather than applied quietly. Before today the
+                // adaptive stop engine ignored this field entirely and used
+                // its own 1.5.
+                tracing::info!(
+                    target: "neoethos_search::stop_target",
+                    previous_hardcoded = d.atr_stop_multiplier,
+                    configured = configured_atr,
+                    "adaptive stop-target engine now honours risk.atr_stop_multiplier; it \
+                     previously used a hardcoded 1.5 regardless of this setting"
+                );
+            }
+            configured_atr
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::stop_target",
+                configured = configured_atr,
+                fallback = d.atr_stop_multiplier,
+                "risk.atr_stop_multiplier is not a positive finite number; using the default"
+            );
+            d.atr_stop_multiplier
+        };
         Self {
             tail_max_bars: s.models.stop_target_runtime.tail_max_bars,
             // `0` is meaningless for a stride; fall back to the exact default
             // rather than silently dividing by zero downstream.
             tail_step: s.models.stop_target_runtime.tail_step.max(1),
+            atr_stop_multiplier,
         }
     }
 }
@@ -223,7 +266,12 @@ impl Default for StopTargetSettings {
             rr_range,
             rr_neutral: (rr_trend + rr_range) / 2.0,
             min_risk_reward: 2.0,
-            atr_stop_multiplier: 1.5,
+            // 2026-08-10: was a bare `1.5` literal — the third copy of
+            // `risk.atr_stop_multiplier`. It now comes from the installed
+            // overrides, so raising the configured value moves this engine too.
+            // With nothing installed the override struct's own default is 1.5,
+            // so a test fixture is unchanged.
+            atr_stop_multiplier: current_stop_target_runtime_overrides().atr_stop_multiplier,
             stop_target_mode: "blend".to_string(),
             structure_lookback_bars: 120,
             structure_swing_window: 2,
@@ -1228,34 +1276,80 @@ pub fn adaptive_base_pips_series(
     Ok(dist.iter().map(|d| (d / pip_size).max(1e-9)).collect())
 }
 
-/// Whether adaptive volatility-scaled stops are enabled for this process — the
-/// Stage-2c dev gate. `NEOETHOS_ADAPTIVE_STOPS=1|true|on`. Default off. When on,
-/// gene generation seeds a searchable `stop_vol_mult` and the discovery backtest
-/// scales each entry's stop by the bar's volatility. Stage 5 productionizes this
-/// to a `Settings` field + auto-enable (mirrors the fused-eval rollout).
-pub fn adaptive_stops_enabled() -> bool {
-    // Default ON: the operator wants the stop to scale with volatility
-    // automatically — no toggle, no env var to remember. `NEOETHOS_ADAPTIVE_STOPS`
-    // is now only an emergency ESCAPE HATCH: set it to 0/false/off to fall back to
-    // the old fixed-pip stops (e.g. to reproduce a pre-adaptive run). Any other
-    // value, or unset, keeps adaptive on.
-    match std::env::var("NEOETHOS_ADAPTIVE_STOPS") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
+/// Median ATR of a dataset, in PIPS — the scale unit for the gene stop/target
+/// band (`evolution_math::current_gene_stop_bounds`).
+///
+/// Median rather than last: the band is a property of the whole dataset the GA
+/// searches, not of its final bar, and one volatile week must not redefine what
+/// "a normal stop" means for the run. Median rather than mean for the same
+/// reason the stop-distance series uses it — the 14 240 zero-price bars this
+/// repo has already been bitten by move a mean and barely touch a median.
+///
+/// `None` when there are too few bars, or the ATR is non-finite / non-positive
+/// (a constant series). Callers must then keep the absolute pip band; there is
+/// no zero-ATR band that means anything.
+pub fn median_atr_pips(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    pip_size: f64,
+    period: usize,
+) -> Option<f64> {
+    if !(pip_size.is_finite() && pip_size > 0.0) {
+        return None;
     }
+    let period = period.max(2);
+    if close.len() < period + 2 || high.len() != close.len() || low.len() != close.len() {
+        return None;
+    }
+    let atr = compute_atr(high, low, close, period);
+    // Drop the warm-up: `compute_ema` seeds from element 0, so the first
+    // `period` values are the seed decaying, not an ATR. Including them would
+    // bias the median down on short series and by a different amount on long
+    // ones — a scale that depends on the row budget is not a scale.
+    let warm = period.min(atr.len());
+    let usable: Vec<f64> = atr[warm..]
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let median = median_ignore_nan(&usable);
+    let pips = median / pip_size;
+    (pips.is_finite() && pips > 0.0).then_some(pips)
 }
 
-/// Reward:risk multiple for adaptive stops (`TP = rr × stop`). The operator wants
-/// ~2R kept out of the stop. `NEOETHOS_ADAPTIVE_STOP_RR`, default 2.0.
+/// Whether adaptive volatility-scaled stops are enabled for this process.
+///
+/// ON. When on, gene generation seeds a searchable `stop_vol_mult` and the
+/// discovery backtest scales each entry's stop by the bar's volatility.
+///
+/// 2026-08-10: `NEOETHOS_ADAPTIVE_STOPS=0` was the escape hatch that turned it
+/// back off. ⚠ THAT ESCAPE HATCH IS GONE and its replacement has not landed
+/// yet: `models.stop_target_runtime.adaptive_stops_enabled` is routed to
+/// `config.rs` in the handoff, and until it lands this returns the shipped
+/// value unconditionally. What that REFUSES today is reproducing a
+/// pre-adaptive run by export. What it PERMITS is that two runs of the same
+/// config now use the same stop geometry, which they previously did not.
+pub fn adaptive_stops_enabled() -> bool {
+    true
+}
+
+/// Reward:risk multiple for adaptive stops (`TP = rr × stop`). The operator
+/// wants ~2R kept out of the stop.
+///
+/// 2026-08-10: was `NEOETHOS_ADAPTIVE_STOP_RR`, default 2.0. Deliberately NOT
+/// pointed at `risk.min_risk_reward` even though both ship 2.0 and both are a
+/// reward:risk multiple: one is a POLICY FLOOR ("refuse a trade below this")
+/// and this one is a TARGET CONSTRUCTOR ("place the TP here"). Merging them is
+/// a money decision with a measurement attached, not a cleanup — it belongs
+/// with the wider stop/target promotion (§5, 33 of 35 `StopTargetSettings`
+/// fields have no config recipient). The field
+/// `models.stop_target_runtime.adaptive_stops_rr` is routed to `config.rs`.
 pub fn adaptive_stops_rr() -> f64 {
-    std::env::var("NEOETHOS_ADAPTIVE_STOP_RR")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|r| r.is_finite() && *r > 0.0)
-        .unwrap_or(2.0)
+    2.0
 }
 
 #[cfg(test)]

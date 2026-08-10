@@ -67,7 +67,17 @@ pub mod scoring;
 // to consume `regime::infer_regime_canonical` + the typed `Regime`
 // enum. See `regime/mod.rs` for the migration plan.
 pub mod regime;
+// MEASUREMENT SLICE (2026-08-09). Two modules whose value does not depend on any
+// other change landing:
+//   `run_identity`  — the resolved-config stamp + the config-identity gate that
+//                     refuses a run whose payoff floor is unreachable under its
+//                     own trailing settings, clamps and cost.
+//   `trial_returns` — every trial's per-period return series, persisted. Without
+//                     it DSR and PBO are uncomputable and no result this project
+//                     produces is falsifiable.
+pub mod run_identity;
 pub mod stop_target;
+pub mod trial_returns;
 #[cfg(feature = "strategy-db")]
 pub mod strategy_db;
 pub mod validation;
@@ -100,6 +110,15 @@ pub use discovery_ledger::{
     save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use execution_profile::{ExecutionEnvironmentProfile, GpuLaneProfile};
+pub use run_identity::{
+    BindingConstraint, MEASURED_TRAILING_PAYOFF_CEILING, PayoffCeiling, PayoffCeilingInputs,
+    ResolvedConfigStamp, assert_payoff_floor_reachable, cost_pips_round_trip,
+    max_achievable_payoff, payoff_inputs_for_config, stamp_resolved_config,
+};
+pub use trial_returns::{
+    TrialReturnMatrix, TrialReturnRow, TrialReturnsManifest, month_keys_spanning, period_returns,
+    write_trial_returns,
+};
 
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
@@ -209,4 +228,5 @@ pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Setting
     install_smc_search_config_from_settings(s); // ✓ S2e config
     install_seen_signature_memory_runtime_overrides_from_settings(s); // ✓ S2f config
     install_stop_target_runtime_overrides_from_settings(s); // ✓ S2g config (2026-08-04)
+    crate::genetic::install_gene_stop_bounds_overrides_from_settings(s); // ✓ S2h config (2026-08-09)
 }

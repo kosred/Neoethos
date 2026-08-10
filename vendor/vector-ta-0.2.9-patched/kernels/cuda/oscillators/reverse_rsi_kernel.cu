@@ -375,3 +375,141 @@ extern "C" __global__ void reverse_rsi_many_series_one_param_f32(
         prevd = cf;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — reverse_rsi
+// ===========================================================================
+// Reference: src/indicators/reverse_rsi.rs
+//   reverse_rsi_prepare (:346)                    — first_valid + Err branches
+//   reverse_rsi_compute_into_scalar_safe (:387)   — the arithmetic
+// Batch defaults: rsi_length 14 (the SWEPT parameter), rsi_level 50.0, source
+// close. ema_len = 2*rsi_length - 1, and the warmup is first + ema_len — NOT
+// first + rsi_length - 1.
+//
+// THE all_finite FLAG IS COMPUTED ONCE AND USED AS A PREDICATE (:408, :415).
+// When the tail is fully finite the difference is taken unconditionally; when
+// it is not, each bar re-tests cur and prev and substitutes 0.0 for the
+// difference. The two are the same on clean data and different on the first bar
+// after a gap, so the scan is reproduced rather than assumed away.
+//
+// prev SEEDS TO 0.0, NOT TO data[first] (:412). So the very first difference is
+// data[first] - 0.0 — the whole price, not a return. That looks like a bug and
+// is not this kernel's to fix: it sets sum_up for the seed window and therefore
+// every subsequent EMA value.
+//
+// NaN SEMANTICS. d.max(0.0) and (-d).max(0.0) are f64::max, which RETURNS THE
+// NON-NaN OPERAND — a NaN d yields 0.0, not NaN. fmax below has exactly that
+// behaviour; an if-chain would let the NaN into the EMA and poison every
+// remaining bar. This is the adx-class bug, and it is why fmax is correct here
+// and the if-chain was correct in di.
+//
+// THE OUTPUT GUARD IS NOT A CLAMP (:434, :454):
+//     out = if v.is_finite() || x >= 0.0 { v } else { 0.0 }
+// A non-finite v is kept when x >= 0 and replaced by 0.0 only when x < 0.
+//
+// ROUNDING.
+//   x      = rs_coeff.mul_add(dn_ema, -n_minus_1 * up_ema)  — ONE fma
+//   up_ema = beta.mul_add(up_ema, alpha * up)               — product then fma
+//   scale  = neg_scale + m * (1.0 - neg_scale)              — a BRANCHLESS
+//            lerp on the 0/1 mask m, not an if. Written the same way so the
+//            rounding matches even where the two agree algebraically.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_RRSI_LEVEL 50.0
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_reverse_rsi_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int rsi_length = periods[r];
+    const double rsi_level = NEO_S3_RRSI_LEVEL;
+
+    const long long ema_len_ll = 2LL * (long long)rsi_length - 1LL;
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (rsi_length == 0) || (rsi_length > n) ||
+        !(0.0 < rsi_level && rsi_level < 100.0) ||
+        (ema_len_ll < 1) ||
+        ((long long)(n - first_valid) < ema_len_ll);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int ema_len = (int)ema_len_ll;
+    const int warm_end = first_valid + ema_len;
+    const int warm_idx = warm_end - 1;
+
+    for (int i = 0; i < warm_idx && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double l = rsi_level;
+    const double inv = 100.0 - l;
+    const double n_minus_1 = (double)(rsi_length - 1);
+    const double rs_target = l / inv;
+    const double neg_scale = inv / l;
+    const double rs_coeff = n_minus_1 * rs_target;
+
+    const double alpha = 2.0 / ((double)ema_len + 1.0);
+    const double beta = 1.0 - alpha;
+
+    bool all_finite = true;
+    for (int i = first_valid; i < n; ++i) {
+        if (!isfinite(data[i])) { all_finite = false; break; }
+    }
+
+    double sum_up = 0.0, sum_dn = 0.0;
+    double prev = 0.0;                    // reverse_rsi.rs:412 — seeds to ZERO
+    for (int i = first_valid; i < warm_end; ++i) {
+        const double cur = data[i];
+        const double d = (all_finite || (isfinite(cur) && isfinite(prev)))
+            ? (cur - prev) : 0.0;
+        sum_up += fmax(d, 0.0);           // f64::max — NaN yields the 0.0 side
+        sum_dn += fmax(-d, 0.0);
+        prev = cur;
+    }
+
+    double up_ema = sum_up / (double)ema_len;
+    double dn_ema = sum_dn / (double)ema_len;
+
+    const double base = data[warm_idx];
+    const double x0 = fma(rs_coeff, dn_ema, -n_minus_1 * up_ema);
+    const double m0 = (x0 >= 0.0) ? 1.0 : 0.0;
+    const double scale0 = neg_scale + m0 * (1.0 - neg_scale);
+    const double v0 = base + x0 * scale0;
+    row[warm_idx] = (isfinite(v0) || x0 >= 0.0) ? v0 : 0.0;
+
+    prev = base;
+    for (int i = warm_end; i < n; ++i) {
+        const double cur = data[i];
+        const double d = (all_finite || (isfinite(cur) && isfinite(prev)))
+            ? (cur - prev) : 0.0;
+        const double up = fmax(d, 0.0);
+        const double dn = fmax(-d, 0.0);
+
+        up_ema = fma(beta, up_ema, alpha * up);
+        dn_ema = fma(beta, dn_ema, alpha * dn);
+
+        const double x = fma(rs_coeff, dn_ema, -n_minus_1 * up_ema);
+        const double m = (x >= 0.0) ? 1.0 : 0.0;
+        const double scale = neg_scale + m * (1.0 - neg_scale);
+        const double v = cur + x * scale;
+        row[i] = (isfinite(v) || x >= 0.0) ? v : 0.0;
+        prev = cur;
+    }
+}

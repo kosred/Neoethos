@@ -53,14 +53,17 @@ This combination is deliberate (see "Why this exact feature combo"):
    backend on `#[cfg(feature = "burn-wgpu-backend")]` only). So **`gpu-cuda`
    alone leaves every deep model on CPU.** You need `gpu-vulkan` for them.
 
-2. **Keep `search` on Vulkan to avoid libtorch.** `neoethos-search/gpu-cuda`
-   pulls `dep:tch` (libtorch, for CUDA device enumeration) — a ~2 GB dependency
-   that is NOT set up to auto-download (no `download-libtorch` feature). The
-   `cli` `gpu-vulkan` feature routes `neoethos-search` to `gpu-vulkan`
-   (cubecl-wgpu), so the GA kernel runs on the A6000 via Vulkan **without
-   libtorch**. We then add `neoethos-models/gpu-cuda` directly (which does NOT
-   pull `tch`) for the CUDA boosters. Hence `--features
-   "gpu-vulkan,neoethos-models/gpu-cuda"` rather than the bundled cli `gpu-cuda`.
+2. **~~Keep `search` on Vulkan to avoid libtorch.~~ OBSOLETE — no crate in this
+   workspace depends on libtorch any more.** This section used to say that
+   `neoethos-search/gpu-cuda` pulls `dep:tch` (~2 GB, no auto-download) and that
+   you should therefore build `--features "gpu-vulkan,neoethos-models/gpu-cuda"`
+   instead of the bundled `gpu-cuda`. Commit `d4df966a` dropped the `dep:tch`
+   from `neoethos-search`, and batch D4 (2026-08-09) removed the `tch` feature
+   and dependency from `neoethos-models`, so the workaround now steers a CUDA
+   operator onto a Vulkan search lane for a reason that no longer exists.
+   `gpu-cuda` can be used directly for search. (`tch` / `torch-sys` survive in
+   `Cargo.lock` only as optional deps of `burn-tch`, a burn backend no feature
+   in this workspace enables — they are never built or linked.)
 
 3. **Drop lightgbm's OpenCL path — keep CUDA.** `neoethos-models/gpu-cuda`
    originally pulled BOTH `lightgbm3/gpu` (OpenCL) and `lightgbm3/cuda`. The

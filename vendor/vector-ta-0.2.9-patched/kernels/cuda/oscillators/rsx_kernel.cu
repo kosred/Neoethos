@@ -326,3 +326,143 @@ void rsx_many_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[t * cols + s] = y;
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — rsx  (Jurik relative strength)
+// ===========================================================================
+// Reference: src/indicators/rsx.rs
+//   `rsx_prepare`     (:193) — first_valid + refusals
+//   `rsx_with_kernel` (:233) — alloc_with_nan_prefix(len, first + period - 1)
+//   `rsx_scalar`      (:305) — six cascaded one-pole pairs
+//
+// SIX COUPLED RECURRENCES, TWELVE CARRIED SCALARS. f28/f30, f38/f40, f48/f50,
+// f58/f60, f68/f70, f78/f80 each form a two-pole stage, and each stage's
+// output feeds the next. There is no parallel reformulation of this that
+// preserves the arithmetic: one thread per column, bars ascending.
+//
+// TWO EPSILONS, AND BOTH ARE f64-SIZED ON THE CPU — DO NOT COPY AN f32 ONE.
+//   * `(f88 - f90).abs() < f64::EPSILON` — 2.220446049250313e-16. `f88` and
+//     `f90` are small integers held in doubles, so this is an equality test
+//     written as a tolerance; with `FLT_EPSILON` (1.19e-7) it would still test
+//     equality here, but the constant would be wrong by nine orders of
+//     magnitude and would be copied onward by the next person.
+//   * `v20_ > 1e-10` — a genuine magnitude floor on a smoothed absolute
+//     change. 1e-10 is representable and meaningful in f64; in f32 it is only
+//     three decimal digits above the subnormal boundary for typical `v20_`
+//     scales, which is why the f32 kernel's branch flips on bars the CPU's
+//     does not. Carried across unchanged, because it is the CPU's number.
+//
+// THE CLAMPS ARE IFs, NOT fmin/fmax. `if v4 > 100.0 { v4 = 100.0 }` then
+// `if v4 < 0.0 { v4 = 0.0 }`: a NaN `v4` passes BOTH and is written out as
+// NaN. `fmin(fmax(v4, 0.0), 100.0)` would emit 0.0 instead — a plausible-
+// looking number where the CPU says "no answer".
+//
+// f90's UPDATE IS A COUNTER WITH A CEILING, expressed as a comparison on
+// doubles (`if f88 <= f90 { f88 + 1.0 } else { f90 + 1.0 }`). Reproduced as
+// written rather than as integer arithmetic.
+//
+// out[start] IS EXPLICITLY NaN — one bar past the warmup prefix, set by the
+// compute itself, not by the allocator.
+// ===========================================================================
+
+#define NEO_RSX_F64_EPSILON 2.220446049250313e-16
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_rsx_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+
+    const int start = first_valid + period - 1;
+    if (start >= n) return;
+
+    double f0 = 0.0;
+    double f28 = 0.0, f30 = 0.0;
+    double f38 = 0.0, f40 = 0.0;
+    double f48 = 0.0, f50 = 0.0;
+    double f58 = 0.0, f60 = 0.0;
+    double f68 = 0.0, f70 = 0.0;
+    double f78 = 0.0, f80 = 0.0;
+
+    double f90 = 1.0;
+    const double f88 = (period >= 6) ? (double)(period - 1) : 5.0;
+    double f8 = 100.0 * prices[start];
+    const double f18 = 3.0 / ((double)period + 2.0);
+    const double f20 = 1.0 - f18;
+
+    row[start] = neo_s2_qnan();
+
+    for (int i = start + 1; i < n; ++i) {
+        f90 = (f88 <= f90) ? (f88 + 1.0) : (f90 + 1.0);
+
+        const double prev = f8;
+        f8 = 100.0 * prices[i];
+        const double v8 = f8 - prev;
+
+        f28 = f20 * f28 + f18 * v8;
+        f30 = f18 * f28 + f20 * f30;
+        const double v_c = f28 * 1.5 - f30 * 0.5;
+
+        f38 = f20 * f38 + f18 * v_c;
+        f40 = f18 * f38 + f20 * f40;
+        const double v10 = f38 * 1.5 - f40 * 0.5;
+
+        f48 = f20 * f48 + f18 * v10;
+        f50 = f18 * f48 + f20 * f50;
+        const double v14 = f48 * 1.5 - f50 * 0.5;
+
+        const double av = fabs(v8);
+        f58 = f20 * f58 + f18 * av;
+        f60 = f18 * f58 + f20 * f60;
+        const double v18 = f58 * 1.5 - f60 * 0.5;
+
+        f68 = f20 * f68 + f18 * v18;
+        f70 = f18 * f68 + f20 * f70;
+        const double v1c = f68 * 1.5 - f70 * 0.5;
+
+        f78 = f20 * f78 + f18 * v1c;
+        f80 = f18 * f78 + f20 * f80;
+        const double v20_ = f78 * 1.5 - f80 * 0.5;
+
+        if (f88 >= f90 && f8 != prev) {
+            f0 = 1.0;
+        }
+        if (fabs(f88 - f90) < NEO_RSX_F64_EPSILON && f0 == 0.0) {
+            f90 = 0.0;
+        }
+
+        if (f88 < f90 && v20_ > 1e-10) {
+            double v4 = (v14 / v20_ + 1.0) * 50.0;
+            if (v4 > 100.0) v4 = 100.0;
+            if (v4 < 0.0) v4 = 0.0;
+            row[i] = v4;
+        } else {
+            row[i] = 50.0;
+        }
+    }
+}

@@ -415,3 +415,223 @@ void dvdiqqe_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — dvdiqqe
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/dvdiqqe.rs
+ *   `dvdiqqe_prepare`      (:333) — first_valid scans CLOSE for `is_finite`
+ *                                   (NOT `!is_nan`), plus every Err branch
+ *   `dvdiqqe_with_kernel`  (:847) — warmup = first + (period * 2 - 1)
+ *   `dvdiqqe_compute_into` (:445) — the PVI/NVI accumulator and the four
+ *                                   chained EMAs that produce the dvdi line
+ * and `ema_scalar_into` (moving_averages/ema.rs:461) for every EMA stage —
+ * seed at the first non-NaN, incremental mean for `period` bars, then
+ * `beta.mul_add(prev, alpha * x)`.
+ *
+ * WHICH SERIES THIS EMITS. `dvdi`, the indicator's primary line. `fast_tl`,
+ * `slow_tl` and `center_line` are separate outputs; none of them feeds `dvdi`,
+ * so the `ranges` / `smooth_range` chain (:559-576) and the trailing-stop
+ * ratchet (:588-623) are not computed here. That is not an omission — they are
+ * downstream of `dvdi` and read nothing this matrix needs.
+ *
+ * INPUT IS (open, close, volume). `dvdiqqe_compute_into` takes high and low as
+ * `_high` and `_low` — it never reads them (:447-448). Declaring an Hlc or
+ * Ohlc shape would hand this kernel two series it does not use and, worse,
+ * would not hand it `open`, which the tick-range term needs at every bar.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_dvdiqqe_batch`
+ * (cpu_batch.rs:14490-14496) reads `period` (13), `smoothing_period` (6),
+ * two multipliers, `volume_type` ("default"), `center_type` ("dynamic") and
+ * `tick_size` (0.01). It DOES read a parameter literally named `period` — but
+ * the f64 lane's swept int is fed to `periods[combo]`, and this kernel uses it
+ * as that `period`, so this one is genuinely SWEPT, not invariant.
+ *
+ * FIRST-VALID USES `is_finite`, NOT `!is_nan`. dvdiqqe.rs:385 is
+ * `c.iter().position(|x| x.is_finite())`, so a leading +inf is SKIPPED where
+ * every other indicator in this shard would accept it. Declared as its own
+ * rule rather than folded into `AllInputsNonNan`.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. PVI AND NVI ARE UNBOUNDED RUNNING SUMS OF CLOSE DIFFERENCES over the
+ *     WHOLE series, started at index 0 and never reset. Over 100k bars they
+ *     drift to a magnitude where an f32 accumulator's ulp exceeds a single
+ *     bar's `d_close` on an FX series, and the accumulator FREEZES. The f32
+ *     kernel's dvdi line therefore flattens on long series — not by a
+ *     tolerance, by construction.
+ *  2. FOUR CHAINED EMAs, and the last stage is a DIFFERENCE of two of them
+ *     (`pdiv - ndiv`). Cancellation on top of a frozen accumulator.
+ *  3. `__fmaf_rn` x15 -> `fma`, matching `f64::mul_add` one-for-one on each
+ *     EMA step: ONE rounding on the fused pair, a separate rounding on
+ *     `alpha * x`. Two per step, not three.
+ *  4. `fabsf` x4 -> `fabs`.
+ *  5. `__int_as_float(0x7f...)` -> `__longlong_as_double(0x7ff8...)`.
+ *  6. `tick` DEFAULTS TO 0.01 AND IS A DIVISOR (`|tickrng| / tick`). In f32
+ *     0.01f is 0.00999999977648258; the quotient it produces is a different
+ *     number from the f64 one at every bar, and `tick_vol` is then COMPARED
+ *     against volume, so the difference is not a rounding — it flips which
+ *     branch of `sel_vol > prev_vol` runs and therefore which bars contribute
+ *     to PVI at all. A discrete, compounding divergence.
+ *  7. `(tickrng.abs() / tick).max(0.0)` is `f64::max`, so `fmax` — a NaN
+ *     quotient becomes 0.0, not NaN.
+ *
+ * THE INITIAL STATE IS NOT ZERO EVERYWHERE. `tickrng_prev` starts at `tick`
+ * (:485), while `prev_close`, `prev_vol`, `pvi_prev` and `nvi_prev` start at
+ * 0.0. So bar 0 has `d_close = close[0] - 0.0`, a full price, and it enters
+ * PVI whenever `sel_vol > 0`. Copied, because it sets the level of the entire
+ * PVI series.
+ *
+ * ONE THREAD PER COLUMN. Carried: pvi, nvi, prev_close, prev_vol, tickrng_prev
+ * and four EMA states. Every stage is fused into ONE ascending pass — each EMA
+ * at bar i needs only bar i's input and its own carry, so the reference's four
+ * O(n) intermediate vectors collapse to eight scalars without moving a single
+ * rounding.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_DVDIQQE_SMOOTHING 6
+#define NEO_DVDIQQE_TICK      0.01
+
+/* `is_finite_fast` in ema.rs / cci_cycle.rs: tests the EXPONENT FIELD, so it
+ * rejects infinities as well as NaN. A bare `!isnan` would not. */
+__device__ __forceinline__ bool neo_dvdi_finite_fast(double x) {
+    const long long EXP_MASK = (long long)0x7ff0000000000000ULL;
+    return (__double_as_longlong(x) & EXP_MASK) != EXP_MASK;
+}
+
+/* One EMA stage, stepped one bar at a time. Mirrors `ema_scalar_into`
+ * (ema.rs:461) exactly: seed at the first non-NaN, incremental mean for
+ * `period` bars, then the fused step. `out` is NaN before the seed. */
+struct NeoDvdiEma {
+    double mean;
+    double prev;
+    int    first;        /* index of the seed bar, -1 until seeded          */
+    int    warmup_end;   /* first + period                                  */
+    int    valid_count;
+    double alpha, beta;
+    int    period;
+};
+
+__device__ __forceinline__ void neo_dvdi_ema_init(NeoDvdiEma* e, int period) {
+    e->mean = 0.0;
+    e->prev = 0.0;
+    e->first = -1;
+    e->warmup_end = 0;
+    e->valid_count = 0;
+    e->alpha = 2.0 / ((double)period + 1.0);
+    e->beta = 1.0 - e->alpha;
+    e->period = period;
+}
+
+__device__ __forceinline__ double neo_dvdi_ema_step(NeoDvdiEma* e, int i, double x, int len) {
+    if (e->first < 0) {
+        if (isnan(x)) return NEO_F64_NAN;      /* ema_prepare's `!is_nan` scan */
+        e->first = i;
+        e->warmup_end = i + e->period;
+        if (e->warmup_end > len) e->warmup_end = len;
+        e->mean = x;
+        e->valid_count = 1;
+        e->prev = e->mean;
+        return e->mean;
+    }
+    if (i < e->warmup_end) {
+        if (neo_dvdi_finite_fast(x)) {
+            e->valid_count += 1;
+            const double vc = (double)e->valid_count;
+            e->mean = ((vc - 1.0) * e->mean + x) / vc;
+        }
+        e->prev = e->mean;
+        return e->mean;
+    }
+    if (neo_dvdi_finite_fast(x)) {
+        e->prev = fma(e->beta, e->prev, e->alpha * x);
+    }
+    return e->prev;
+}
+
+extern "C" __global__
+void dvdiqqe_neo_batch_f64(const double* __restrict__ open,
+                           const double* __restrict__ close,
+                           const double* __restrict__ volume,
+                           int series_len,
+                           const int* __restrict__ periods,
+                           int n_combos,
+                           int first_valid,
+                           double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    const int smoothing = NEO_DVDIQQE_SMOOTHING;
+    const double tick = NEO_DVDIQQE_TICK;
+
+    /* dvdiqqe_prepare:388-425 */
+    if (len <= 0 || period <= 0 || period > len ||
+        first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int wper = (period * 2) - 1;
+    const int warmup = first_valid + wper;
+
+    double pvi_prev = 0.0, nvi_prev = 0.0;
+    double prev_vol = 0.0, prev_close = 0.0;
+    double tickrng_prev = tick;
+
+    NeoDvdiEma ema_p, ema_n, ema_pd, ema_nd;
+    neo_dvdi_ema_init(&ema_p,  period);
+    neo_dvdi_ema_init(&ema_n,  period);
+    neo_dvdi_ema_init(&ema_pd, smoothing);
+    neo_dvdi_ema_init(&ema_nd, smoothing);
+
+    for (int i = 0; i < len; ++i) {
+        const double oi = open[i];
+        const double ci = close[i];
+
+        /* :492-507 */
+        const double rng = ci - oi;
+        const double tickrng = (fabs(rng) < tick) ? tickrng_prev : rng;
+        const double tick_vol = fmax(fabs(tickrng) / tick, 0.0);
+
+        const double vv = volume[i];
+        const double sel_vol = isfinite(vv) ? vv : tick_vol;
+
+        const double d_close = ci - prev_close;
+        if (sel_vol > prev_vol) pvi_prev += d_close;
+        if (sel_vol < prev_vol) nvi_prev -= d_close;
+
+        const double pvi_i = pvi_prev;
+        const double nvi_i = nvi_prev;
+
+        prev_close = ci;
+        prev_vol = sel_vol;
+        tickrng_prev = tickrng;
+
+        /* :524-542 — EMA(period) of pvi / nvi, then the difference. */
+        const double ep = neo_dvdi_ema_step(&ema_p, i, pvi_i, len);
+        const double en = neo_dvdi_ema_step(&ema_n, i, nvi_i, len);
+        const double dp = pvi_i - ep;
+        const double dn = nvi_i - en;
+
+        /* :544-557 — EMA(smoothing) of each difference. */
+        const double pd = neo_dvdi_ema_step(&ema_pd, i, dp, len);
+        const double nd = neo_dvdi_ema_step(&ema_nd, i, dn, len);
+
+        /* :560-565 */
+        o[i] = pd - nd;
+    }
+
+    /* :578-582 — the warm-up blank happens AFTER the whole series is built. */
+    const int cut = (warmup < len) ? warmup : len;
+    for (int i = 0; i < cut; ++i) o[i] = NEO_F64_NAN;
+}

@@ -35,7 +35,8 @@ use crate::app_services::ctrader_account::{
     CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle, CTraderOrderHistoryBundle,
     CTraderServerVersionSnapshot, ensure_success_payload_type, load_account_runtime,
     parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
-    parse_order_list_response, parse_version_response,
+    parse_order_list_response, parse_reconcile_response, parse_trader_response,
+    parse_version_response,
 };
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
@@ -43,12 +44,18 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_asset_class_list_request,
+    CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE,
+    CTraderMarginCallListSnapshot, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    build_account_auth_request, build_application_auth_request, build_asset_class_list_request,
     build_cash_flow_history_list_request, build_expected_margin_request,
-    build_get_ctid_profile_by_token_request, build_order_list_request,
-    build_symbol_category_list_request, build_symbols_list_request, build_version_request,
+    build_get_ctid_profile_by_token_request, build_get_position_unrealized_pnl_request,
+    build_margin_call_list_request, build_order_list_request, build_reconcile_request,
+    build_symbol_category_list_request, build_symbols_list_request, build_trader_request,
+    build_version_request, parse_get_position_unrealized_pnl_response,
+    parse_margin_call_list_response,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
 use crate::app_services::ctrader_live_auth::{
@@ -214,9 +221,48 @@ pub(crate) fn ensure_fresh_token_bundle(
     }
 }
 
-fn resolve_creds() -> Result<ResolvedCreds> {
+/// The error a caller sees when the cTrader environment on disk no longer
+/// matches the one it was admitted against. Shared by every refusal so the
+/// operator sees ONE recognisable message in the log.
+fn environment_changed_error(expected_is_live: bool, now_is_live: bool) -> anyhow::Error {
+    anyhow!(
+        "REFUSING to contact the broker: the cTrader environment changed from {} to {} \
+         since this engine was admitted by the demo forward-test gate. No order is sent. \
+         Restart the engine to re-run the gate against the environment now selected.",
+        if expected_is_live { "Live" } else { "Demo" },
+        if now_is_live { "Live" } else { "Demo" },
+    )
+}
+
+/// Resolve the cTrader credentials, optionally refusing unless the environment
+/// on disk still matches the one the caller was admitted against.
+///
+/// **2026-08-09, and the reason this parameter exists.** `live_trading::run`
+/// samples the environment once at the top of each bar iteration. The first
+/// repair added a separate `assert_environment()` call immediately before the
+/// broker call — better, but still two reads of `broker_credentials.toml` with a
+/// gap between them, so a flip landing inside that gap was checked against the
+/// OLD file and routed with the NEW one. That is a narrowing, not a guarantee,
+/// and the previous version of this comment said so.
+///
+/// It is closed here instead: the comparison happens against `settings` — the
+/// SAME read that produces `environment` on the returned [`ResolvedCreds`]. The
+/// environment that is checked is by construction the environment the request is
+/// sent to; there is no window between them at all.
+///
+/// `expected_is_live: None` means "no admission decision to honour" — the
+/// read-only account/chart/history calls and the operator's own manual orders,
+/// which are deliberately not gated (the operator ruled that manual trading
+/// respects the operator).
+fn resolve_creds_expecting(expected_is_live: Option<bool>) -> Result<ResolvedCreds> {
     let settings = load_broker_settings();
     let ct = &settings.ctrader;
+    if let Some(expected) = expected_is_live {
+        let now_is_live = matches!(ct.environment, CTraderBrokerEnvironment::Live);
+        if now_is_live != expected {
+            return Err(environment_changed_error(expected, now_is_live));
+        }
+    }
     if ct.client_id.is_empty() || ct.client_secret.is_empty() {
         return Err(anyhow!(
             "cTrader client_id / client_secret are empty in \
@@ -249,6 +295,13 @@ fn resolve_creds() -> Result<ResolvedCreds> {
         environment: env,
         env_label,
     })
+}
+
+/// Resolve credentials with no admission decision to honour — read-only broker
+/// calls (account runtime, chart bars, symbol catalogue, history) and the
+/// operator's own manual orders.
+fn resolve_creds() -> Result<ResolvedCreds> {
+    resolve_creds_expecting(None)
 }
 
 /// Hit `ProtoOAGetAccountListByAccessTokenReq` (payload 2149/2150) and
@@ -541,6 +594,73 @@ pub fn download_history_blocking(
     all_bars.sort_by_key(|b| b.timestamp_ms);
     all_bars.dedup_by_key(|b| b.timestamp_ms);
 
+    // ── Integrity guards on the ONLY path that writes broker history to the
+    // local store (2026-08-09) ───────────────────────────────────────────────
+    //
+    // Neither of these existed. `bars_to_normalized` and
+    // `bootstrap_writer::normalized_bars_to_ohlcv` are plain field copies with
+    // no validation, so whatever the broker returned was written verbatim.
+    // The only out-of-window filter that ever existed in this repo lived in
+    // `ctrader_history.rs`, which was never on this path and was deleted in
+    // batch D2 — so the tree had zero implementations of either guard at the
+    // moment a 14-year, 28-symbol M1 re-download is about to run through here.
+    //
+    // 1. WINDOW. A broker page can carry bars outside [from_ms, to_ms].
+    let before_window = all_bars.len();
+    all_bars.retain(|b| b.timestamp_ms >= from_ms && b.timestamp_ms <= to_ms);
+    let dropped_out_of_window = before_window - all_bars.len();
+    if dropped_out_of_window > 0 {
+        tracing::warn!(
+            target: "neoethos_app::broker_api",
+            symbol, timeframe, from_ms, to_ms,
+            dropped = dropped_out_of_window,
+            "broker returned bars outside the requested window; dropped before write"
+        );
+    }
+
+    // 2. PRICE SANITY. On 2026-07-30 a single zero-price bar was attributed
+    //    GBP 77,211 of P&L; 14,240 corrupt bars were found in the store. Those
+    //    came from the broker and were written here unchallenged.
+    //
+    //    These bars are DROPPED, not written, and the drop is logged at ERROR
+    //    with the count and the first/last bad timestamp — never silent. It is
+    //    deliberately not a hard abort: broker history is known to contain such
+    //    bars (2014-12-08 onward), so aborting would make those symbols
+    //    permanently un-importable, trading one failure mode for a worse one.
+    //    Poisoning the store is the outcome being prevented, and dropping
+    //    prevents it.
+    let bad_bar = |b: &HistoricalBar| {
+        [b.open, b.high, b.low, b.close]
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0)
+    };
+    let bad: Vec<i64> = all_bars
+        .iter()
+        .filter(|b| bad_bar(b))
+        .map(|b| b.timestamp_ms)
+        .collect();
+    if !bad.is_empty() {
+        tracing::error!(
+            target: "neoethos_app::broker_api",
+            symbol, timeframe,
+            dropped = bad.len(),
+            first_bad_ts_ms = bad.first().copied(),
+            last_bad_ts_ms = bad.last().copied(),
+            kept = all_bars.len() - bad.len(),
+            "REFUSED to write bars with a non-finite or non-positive price — the broker \
+             returned corrupt OHLC. These bars are DROPPED, not stored. A zero price in \
+             the store produces fabricated P&L (2026-07-30: GBP 77,211 on one bar)."
+        );
+        all_bars.retain(|b| !bad_bar(b));
+    }
+    if all_bars.is_empty() && before_window > 0 {
+        return Err(anyhow!(
+            "every bar the broker returned for {symbol} {timeframe} was outside the \
+             requested window or had a corrupt price ({before_window} received, 0 usable). \
+             Refusing to write an empty dataset over the existing one."
+        ));
+    }
+
     // Oldest bar actually returned (sorted ascending above) — surfaced so the UI
     // can show how deep the broker really went vs the requested range.
     let oldest_ms = all_bars.first().map(|b| b.timestamp_ms);
@@ -779,7 +899,40 @@ fn prepare_new_order(
     volume_lots: f64,
     stop_loss_pips: Option<f64>,
     take_profit_pips: Option<f64>,
+    expected_is_live: Option<bool>,
 ) -> Result<PreparedNewOrder> {
+    // ── #238: the margin-call halt, applied at the single choke point ──────
+    // Both order-OPENING paths (`submit_market_order_blocking` and
+    // `submit_pending_order_blocking`) pass through here, so one check covers
+    // the autopilot, the manual route and the MCP sidecar alike.
+    //
+    // BEHAVIOUR CHANGE, stated plainly: while the broker says this account is
+    // in (or at) margin call, NO new position may be opened by ANY route.
+    // Closing a position, cancelling a resting order and amending an existing
+    // SL/TP are all deliberately still permitted — those reduce exposure, and
+    // taking them away during a margin call would be the opposite of safe.
+    //
+    // This does NOT contradict the operator's #190 ruling that the manual path
+    // respects the operator. That ruling is about POLICY — sizing, brackets,
+    // daily slots. A margin call is not a policy opinion; it is the broker
+    // stating that it is about to liquidate. The halt is cleared by restarting
+    // the backend (see `margin_call::clear_halt`), which is deliberate: it can
+    // never leave the operator permanently locked out.
+    // Stopgap start (see `margin_call::ensure_spawned`): the watchdog belongs
+    // in `main.rs` next to the other background services, which is outside the
+    // scope of this change. Starting it here guarantees that any process which
+    // actually opens a position is being watched. Idempotent and cheap — one
+    // relaxed atomic swap after the first call.
+    crate::app_services::margin_call::ensure_spawned();
+    if let Some(halt) = crate::app_services::margin_call::active_halt() {
+        return Err(anyhow!(
+            "REFUSING to open a position: {}. No order is sent. Reduce exposure \
+             (closing positions and amending stops are still allowed) and restart \
+             the backend to clear the halt once the account is healthy.",
+            halt.describe()
+        ));
+    }
+
     if !(volume_lots.is_finite() && volume_lots > 0.0) {
         return Err(anyhow!(
             "volume_lots must be a finite positive number (got {volume_lots})"
@@ -797,7 +950,11 @@ fn prepare_new_order(
             }
         }
     }
-    let creds = resolve_creds()?;
+    // THE LAST READ BEFORE REAL MONEY. `creds.environment` — the environment
+    // this order is actually sent to — comes out of the same
+    // `broker_credentials.toml` read that validates `expected_is_live`, so a
+    // Demo→Live flip cannot land between the check and the send.
+    let creds = resolve_creds_expecting(expected_is_live)?;
 
     // Resolve the symbol so we know its id + lot_size for volume
     // conversion.
@@ -915,6 +1072,12 @@ fn prepare_new_order(
     })
 }
 
+///
+/// `expected_is_live` is the broker environment the CALLER was admitted
+/// against. `Some(false)`/`Some(true)` refuses the order outright if the
+/// environment on disk has since changed; `None` means the caller has no
+/// admission decision to honour (the operator's manual Buy/Sell button).
+#[allow(clippy::too_many_arguments)]
 pub fn submit_market_order_blocking(
     symbol: &str,
     side: OrderSide,
@@ -922,8 +1085,15 @@ pub fn submit_market_order_blocking(
     stop_loss_pips: Option<f64>,
     take_profit_pips: Option<f64>,
     comment: Option<String>,
+    expected_is_live: Option<bool>,
 ) -> Result<CTraderExecutionOutcome> {
-    let prep = prepare_new_order(symbol, volume_lots, stop_loss_pips, take_profit_pips)?;
+    let prep = prepare_new_order(
+        symbol,
+        volume_lots,
+        stop_loss_pips,
+        take_profit_pips,
+        expected_is_live,
+    )?;
 
     let new_order = CTraderNewOrderRequest {
         account_id: prep.account_id,
@@ -991,6 +1161,7 @@ pub fn submit_pending_order_blocking(
     take_profit_pips: Option<f64>,
     expiry_unix_ms: Option<i64>,
     comment: Option<String>,
+    expected_is_live: Option<bool>,
 ) -> Result<CTraderExecutionOutcome> {
     if !matches!(order_type, CTraderOrderType::Limit | CTraderOrderType::Stop) {
         return Err(anyhow!(
@@ -1004,7 +1175,13 @@ pub fn submit_pending_order_blocking(
         ));
     }
 
-    let prep = prepare_new_order(symbol, volume_lots, stop_loss_pips, take_profit_pips)?;
+    let prep = prepare_new_order(
+        symbol,
+        volume_lots,
+        stop_loss_pips,
+        take_profit_pips,
+        expected_is_live,
+    )?;
 
     // Limit orders carry `limit_price`; stop orders carry `stop_price`.
     let (limit_price, stop_price) = match order_type {
@@ -1061,8 +1238,17 @@ pub fn submit_pending_order_blocking(
 
 /// Close an open position (full close — pass the position's own
 /// volume). Used by the Trade Watch screen's per-row close button.
-pub fn close_position_blocking(position_id: i64, volume: i64) -> Result<CTraderExecutionOutcome> {
-    let creds = resolve_creds()?;
+///
+/// `expected_is_live` — see [`submit_market_order_blocking`]. An engine's
+/// weekend force-close and auto-cull flatten pass the environment they were
+/// admitted against, so they can never close a position on an account this
+/// engine was never admitted to; the Trade Watch button passes `None`.
+pub fn close_position_blocking(
+    position_id: i64,
+    volume: i64,
+    expected_is_live: Option<bool>,
+) -> Result<CTraderExecutionOutcome> {
+    let creds = resolve_creds_expecting(expected_is_live)?;
     let account_id: i64 = creds
         .account_id_str
         .parse()
@@ -1129,18 +1315,96 @@ pub fn cancel_order_blocking(order_id: i64) -> Result<CTraderExecutionOutcome> {
 ///
 /// This is the capability that lets the bot trail a winner or pull a stop to
 /// breakeven without closing and re-opening the position.
+///
+/// **UNBOUND to any admission decision — that is what this name now means.**
+/// This is the operator's own manual amend (`POST /positions/protection`),
+/// which the operator ruled is his. Anything that was ADMITTED against a
+/// specific broker environment — the autopilot's trailing stop above all —
+/// must call [`amend_position_sltp_expecting`] instead and pass the
+/// environment it was admitted against.
+///
+/// See #199: this was the one order-path call still resolving credentials
+/// without the environment check that `resolve_creds_expecting` added to the
+/// other four paths, so a Demo→Live flip mid-iteration could send a
+/// stop-modification to the environment the caller was never admitted to.
 pub fn amend_position_sltp_blocking(
     position_id: i64,
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
     trailing_stop_loss: Option<bool>,
 ) -> Result<CTraderExecutionOutcome> {
+    amend_position_sltp_expecting(position_id, stop_loss, take_profit, trailing_stop_loss, None)
+}
+
+/// [`amend_position_sltp_blocking`] bound to the broker environment the caller
+/// was admitted against.
+///
+/// `expected_is_live: Some(_)` REFUSES the amend outright — no request leaves
+/// the process — when `broker_credentials.toml` now names the other
+/// environment. `None` reproduces the old, unbound behaviour and is correct
+/// only for the operator's manual route.
+///
+/// **This function logs its own failure at `error`.** The autopilot's trailing
+/// block in `live_trading::run` calls the amend as `let _ = …`, so a rejection
+/// — an environment flip, an expired token, a broker refusal — was dropped
+/// twice over: once by the missing check and once by the discarded `Result`.
+/// Logging here means the operator sees the refusal regardless of what the
+/// caller does with the return value.
+pub fn amend_position_sltp_expecting(
+    position_id: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_stop_loss: Option<bool>,
+    expected_is_live: Option<bool>,
+) -> Result<CTraderExecutionOutcome> {
+    let result = amend_position_sltp_inner(
+        position_id,
+        stop_loss,
+        take_profit,
+        trailing_stop_loss,
+        expected_is_live,
+    );
+    match &result {
+        Ok(outcome) => {
+            tracing::debug!(
+                target: "neoethos_app::broker_api",
+                position_id,
+                ?stop_loss,
+                ?take_profit,
+                status = ?outcome.status,
+                "position SL/TP amend returned"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "neoethos_app::broker_api",
+                position_id,
+                ?stop_loss,
+                ?take_profit,
+                ?expected_is_live,
+                error = %e,
+                "POSITION SL/TP AMEND FAILED — the stop on this open position was NOT \
+                 moved. If a trailing/break-even stop was expected, it is not where the \
+                 engine believes it is."
+            );
+        }
+    }
+    result
+}
+
+fn amend_position_sltp_inner(
+    position_id: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_stop_loss: Option<bool>,
+    expected_is_live: Option<bool>,
+) -> Result<CTraderExecutionOutcome> {
     if stop_loss.is_none() && take_profit.is_none() {
         return Err(anyhow!(
             "amend_position_sltp requires at least one of stopLoss / takeProfit"
         ));
     }
-    let creds = resolve_creds()?;
+    let creds = resolve_creds_expecting(expected_is_live)?;
     let account_id: i64 = creds
         .account_id_str
         .parse()
@@ -1162,6 +1426,197 @@ pub fn amend_position_sltp_blocking(
         }),
     };
     ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+// ─── #238: the margin-call feed finally has a reader ───────────────────────
+//
+// `ctrader_messages::build_margin_call_list_request` shipped in the 2026-06-10
+// API-completeness pass and had ZERO callers outside its own unit test until
+// today. Every breaker in `live_trading` keys off balance and REALISED P&L, so
+// an UNREALISED margin emergency — the one that ends with the broker
+// liquidating the account — reached the operator only if he happened to be
+// watching cTrader's own platform.
+//
+// What is polled, and why it takes four RPCs on one session:
+//   * `ProtoOAMarginCallListReq` (2167) gives the CONFIGURED thresholds. It
+//     does NOT say whether one is breached.
+//   * `ProtoOATraderReq` (2121) gives the balance.
+//   * `ProtoOAReconcileReq` (2124) gives the open positions, each carrying its
+//     own `usedMargin`.
+//   * `ProtoOAGetPositionUnrealizedPnLReq` (2187) gives the broker's own
+//     unrealised P&L, because `trader.unrealized_pnl` is 0.0 out of the
+//     runtime loader (`ctrader_account.rs:402`) and the whole point of this
+//     poll is the unrealised half.
+// Margin level = equity / used_margin * 100, equity = balance + unrealised.
+// A breach is `margin_level_pct <= threshold`.
+
+/// A single margin-level reading, with everything needed to explain it.
+#[derive(Debug, Clone)]
+pub struct MarginStatus {
+    pub account_id: i64,
+    pub environment_label: &'static str,
+    pub balance: f64,
+    pub unrealized_pnl: f64,
+    pub equity: f64,
+    /// Sum of `usedMargin` across open positions, account currency.
+    pub used_margin: f64,
+    /// `equity / used_margin * 100`. `None` when `used_margin` is zero — with
+    /// no position open there is no margin level and no margin call.
+    pub margin_level_pct: Option<f64>,
+    pub thresholds: CTraderMarginCallListSnapshot,
+    /// The tightest configured threshold the current level has fallen to or
+    /// below. `Some` means MARGIN CALL.
+    pub breached_threshold_pct: Option<f64>,
+    /// Positions whose `usedMargin` the broker omitted. Counted, never
+    /// silently treated as zero — a missing denominator makes the computed
+    /// margin level OPTIMISTIC, which is the dangerous direction.
+    pub positions_missing_used_margin: usize,
+    pub open_position_count: usize,
+}
+
+impl MarginStatus {
+    pub fn is_margin_call(&self) -> bool {
+        self.breached_threshold_pct.is_some()
+    }
+}
+
+/// Marker prefix on the error returned when the broker ANSWERED but this build
+/// could not read the answer — as opposed to not reaching the broker at all.
+///
+/// The two must be told apart because they get different treatment:
+/// "unreachable" spends a failure budget before halting (network blips are
+/// routine), while "we asked, it replied, and we do not understand the reply"
+/// halts on the FIRST occurrence. A wire-format change is not transient, and
+/// resolving it toward "keep trading" is exactly the fail-open this system
+/// keeps being bitten by.
+pub const MARGIN_STATUS_UNREADABLE_SENTINEL: &str = "MARGIN_STATUS_UNREADABLE";
+
+/// Is there a broker account configured at all?
+///
+/// The margin-call watchdog needs this to tell "the broker is unreachable"
+/// (an emergency — there may be open positions nobody can see) apart from
+/// "no broker has ever been set up on this machine" (a fresh install, where
+/// there is nothing to protect and halting would be nonsense). Cheap: one
+/// `broker_credentials.toml` read, no network, no token refresh.
+pub fn broker_credentials_configured() -> bool {
+    let settings = load_broker_settings();
+    let ct = &settings.ctrader;
+    !ct.client_id.trim().is_empty()
+        && !ct.client_secret.trim().is_empty()
+        && !ct.accounts.is_empty()
+}
+
+/// Poll the broker for the account's margin-call thresholds and its current
+/// margin level, in ONE authenticated session.
+///
+/// Blocking (sync WSS); callers must wrap in `spawn_blocking` or run on a
+/// dedicated thread. Read-only — resolves credentials with `resolve_creds()`
+/// (no admission decision to honour, exactly like every other read path).
+///
+/// **Fail-closed contract for the caller.** Two different failures come back,
+/// and `app_services::margin_call` treats them differently:
+///   * A transport / broker error means "we could not ask". The poller counts
+///     it and halts after [`margin_call::MAX_CONSECUTIVE_POLL_FAILURES`]
+///     consecutive occurrences — never treats it as "everything is fine".
+///   * A parse failure AFTER the broker answered is tagged with
+///     [`MARGIN_STATUS_UNREADABLE_SENTINEL`] and halts on the FIRST
+///     occurrence, because a wire-format change does not heal on retry.
+///
+/// [`margin_call::MAX_CONSECUTIVE_POLL_FAILURES`]: crate::app_services::margin_call::MAX_CONSECUTIVE_POLL_FAILURES
+pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let responses = crate::app_services::ctrader_messages::send_sequence_resilient(
+        &transport,
+        &[
+            build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+            build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+            build_margin_call_list_request(account_id, "margin-call-list-1"),
+            build_trader_request(account_id, "trader-1"),
+            build_reconcile_request(account_id, false, "reconcile-1"),
+            build_get_position_unrealized_pnl_request(account_id, "unrealized-pnl-1"),
+        ],
+        // All six are REQUIRED. `min_ok` is not "how many we would like" — a
+        // margin level computed without the reconcile snapshot or without the
+        // unrealised P&L would be wrong in the optimistic direction, which is
+        // the one that gets an account liquidated.
+        6,
+        "cTrader margin-call status",
+    )?;
+
+    if responses.len() != 6 {
+        return Err(anyhow!(
+            "expected 6 cTrader margin-status responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[2], CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[3], CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[4], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[5],
+        CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
+    )?;
+
+    // The broker answered. From here on, a failure means the WIRE FORMAT
+    // changed under us — tag it so `margin_call::poll_once` halts immediately
+    // instead of spending its unreachable-budget on a defect that will not
+    // resolve itself.
+    let unreadable = |what: &str, e: anyhow::Error| {
+        anyhow!("{MARGIN_STATUS_UNREADABLE_SENTINEL}: could not read the {what} — {e}")
+    };
+    let thresholds = parse_margin_call_list_response(&responses[2])
+        .map_err(|e| unreadable("margin-call threshold list", e))?;
+    let trader =
+        parse_trader_response(&responses[3]).map_err(|e| unreadable("trader balance", e))?;
+    let reconcile = parse_reconcile_response(&responses[4])
+        .map_err(|e| unreadable("open-position reconcile snapshot", e))?;
+    let pnl = parse_get_position_unrealized_pnl_response(&responses[5])
+        .map_err(|e| unreadable("unrealised P&L snapshot", e))?;
+
+    let unrealized_pnl: f64 = pnl.positions.iter().map(|p| p.net_unrealized_pnl).sum();
+    let equity = trader.balance + unrealized_pnl;
+
+    let mut used_margin = 0.0_f64;
+    let mut positions_missing_used_margin = 0_usize;
+    for p in &reconcile.positions {
+        match p.used_margin {
+            Some(m) if m.is_finite() && m >= 0.0 => used_margin += m,
+            _ => positions_missing_used_margin += 1,
+        }
+    }
+
+    let margin_level_pct = if used_margin > 0.0 {
+        Some(equity / used_margin * 100.0)
+    } else {
+        None
+    };
+
+    let breached_threshold_pct = match (margin_level_pct, thresholds.tightest_threshold_pct()) {
+        (Some(level), Some(tightest)) if level <= tightest => Some(tightest),
+        _ => None,
+    };
+
+    Ok(MarginStatus {
+        account_id: trader.account_id,
+        environment_label: creds.env_label,
+        balance: trader.balance,
+        unrealized_pnl,
+        equity,
+        used_margin,
+        margin_level_pct,
+        thresholds,
+        breached_threshold_pct,
+        positions_missing_used_margin,
+        open_position_count: reconcile.positions.len(),
+    })
 }
 
 /// Maximum cTrader history window for the order-list / cash-flow RPCs.

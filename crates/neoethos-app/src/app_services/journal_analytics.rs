@@ -58,6 +58,12 @@ pub struct DerivedTrade {
     /// UTC hour and weekday of entry, for the breakdowns.
     pub entry_hour_utc: Option<u32>,
     pub entry_weekday: Option<String>,
+    /// The denominator [`r_multiple`](Self::r_multiple) was divided by, and
+    /// where it came from — `"symbol"`, `"all_symbols"` or `"none"`. R is an
+    /// ESTIMATE (see [`estimate_risk_per_lot`]); a reader shown a number with
+    /// no denominator cannot tell a measured R from an inferred one.
+    pub risk_per_lot: Option<f64>,
+    pub risk_basis: String,
 }
 
 /// A group of trades and what they did, for one breakdown bucket.
@@ -75,6 +81,40 @@ pub struct BucketSummary {
     pub net_pips: f64,
 }
 
+/// How much of the journal each derived figure could actually be computed for.
+///
+/// Every optional field on a [`DerivedTrade`] is `None` for a reason — no price
+/// series for that symbol, no entry timestamp on the row, no losses to infer a
+/// stop from. A reader shown a column of blanks cannot tell "the trades never
+/// went anywhere" from "the excursion could not be recovered", and those two
+/// readings lead to opposite decisions. This counts every one of them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsCoverage {
+    pub trades_total: usize,
+    /// Trades with a pip figure — needs entry price, exit price and a pip size.
+    pub with_pips: usize,
+    /// Trades whose MFE/MAE was recovered from the stored price series.
+    pub with_excursion: usize,
+    pub with_r_multiple: usize,
+    pub with_duration: usize,
+    /// Rows the broker record left without an entry timestamp: no holding time,
+    /// no entry-hour bucket, and no window to replay prices over.
+    pub missing_entry_time: usize,
+    /// Rows that had everything the excursion replay needs EXCEPT bars covering
+    /// the window — i.e. the price store, not the journal, is what is missing.
+    pub missing_price_series: usize,
+    /// The R denominator per symbol, and the fallback used where a symbol had
+    /// too few losses of its own to infer one.
+    pub risk_per_lot_by_symbol: BTreeMap<String, f64>,
+    pub risk_per_lot_all_symbols: Option<f64>,
+    /// Symbols that fell back to the all-symbol estimate, and why it matters:
+    /// a stop on XAUUSD and a stop on EURUSD are not the same money per lot.
+    pub symbols_using_fallback_risk: Vec<String>,
+    /// Minimum losing trades a symbol needs before its own estimate is trusted.
+    pub min_losses_for_symbol_risk: usize,
+}
+
 /// The whole journal, sliced the ways that locate a problem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +130,8 @@ pub struct JournalAnalytics {
     /// Hours in which the account never traded. Directly answers "is it only
     /// active in one session" without inferring it from config.
     pub inactive_hours_utc: Vec<u32>,
+    /// What could and could not be computed, and why — see [`AnalyticsCoverage`].
+    pub coverage: AnalyticsCoverage,
 }
 
 /// Bars covering a trade window, supplied by the caller so this module stays
@@ -143,6 +185,45 @@ pub fn estimate_risk_per_lot(trades: &[ClosedTrade]) -> Option<f64> {
     (estimate > 1e-6).then_some(estimate)
 }
 
+/// Losing trades a symbol must have of its own before its stop estimate is
+/// trusted over the all-symbol one. Below this the quantile is reading noise.
+pub const MIN_LOSSES_FOR_SYMBOL_RISK: usize = 5;
+
+/// The stop estimate PER SYMBOL.
+///
+/// [`estimate_risk_per_lot`] over a mixed journal divides every trade by one
+/// number, and a stop is money-per-lot: on the operator's instruments a
+/// one-lot XAUUSD stop and a one-lot EURUSD stop differ by more than an order
+/// of magnitude. Pooling them makes every R on the smaller instrument look
+/// tiny and every R on the larger one look enormous — in the one view built to
+/// compare trades across instruments.
+///
+/// Only symbols with at least [`MIN_LOSSES_FOR_SYMBOL_RISK`] losses of their
+/// own appear; the caller falls back to the pooled estimate for the rest and
+/// records which symbols those were.
+pub fn estimate_risk_per_lot_by_symbol(trades: &[ClosedTrade]) -> BTreeMap<String, f64> {
+    let mut by_symbol: BTreeMap<String, Vec<ClosedTrade>> = BTreeMap::new();
+    for trade in trades {
+        by_symbol
+            .entry(trade.symbol.clone())
+            .or_default()
+            .push(trade.clone());
+    }
+    by_symbol
+        .into_iter()
+        .filter_map(|(symbol, rows)| {
+            let losses = rows
+                .iter()
+                .filter(|t| t.net_profit < 0.0 && t.lots > 0.0)
+                .count();
+            if losses < MIN_LOSSES_FOR_SYMBOL_RISK {
+                return None;
+            }
+            estimate_risk_per_lot(&rows).map(|risk| (symbol, risk))
+        })
+        .collect()
+}
+
 fn is_long(side: &str) -> bool {
     side.trim().eq_ignore_ascii_case("BUY")
 }
@@ -155,6 +236,16 @@ fn weekday_name(ts_ms: i64) -> Option<String> {
 pub fn derive_trade(
     trade: &ClosedTrade,
     risk_per_lot: Option<f64>,
+    prices: Option<&dyn PriceWindow>,
+) -> DerivedTrade {
+    derive_trade_with_basis(trade, risk_per_lot, "all_symbols", prices)
+}
+
+/// As [`derive_trade`], but records WHERE the R denominator came from.
+pub fn derive_trade_with_basis(
+    trade: &ClosedTrade,
+    risk_per_lot: Option<f64>,
+    risk_basis: &'static str,
     prices: Option<&dyn PriceWindow>,
 ) -> DerivedTrade {
     let duration_hours = match (trade.entry_ts_ms, trade.exit_ts_ms) {
@@ -232,6 +323,8 @@ pub fn derive_trade(
         capture_ratio,
         entry_hour_utc,
         entry_weekday: trade.entry_ts_ms.and_then(weekday_name),
+        risk_per_lot: r_multiple.and(risk_per_lot),
+        risk_basis: if r_multiple.is_some() { risk_basis } else { "none" }.to_string(),
     }
 }
 
@@ -277,12 +370,56 @@ where
 }
 
 /// Derive every trade and slice the result.
+///
+/// The R denominator is estimated PER SYMBOL where a symbol has enough losses
+/// of its own ([`MIN_LOSSES_FOR_SYMBOL_RISK`]), falling back to the pooled
+/// estimate elsewhere — a stop is money-per-lot, and pooling XAUUSD with EURUSD
+/// makes every R on both wrong. Which basis each trade used is on the trade, and
+/// the fallbacks are named in [`JournalAnalytics::coverage`].
 pub fn analyse(trades: &[ClosedTrade], prices: Option<&dyn PriceWindow>) -> JournalAnalytics {
-    let risk_per_lot = estimate_risk_per_lot(trades);
+    let pooled_risk = estimate_risk_per_lot(trades);
+    let per_symbol_risk = estimate_risk_per_lot_by_symbol(trades);
+
+    let mut fallback_symbols: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let derived: Vec<DerivedTrade> = trades
         .iter()
-        .map(|t| derive_trade(t, risk_per_lot, prices))
+        .map(|t| match per_symbol_risk.get(&t.symbol) {
+            Some(risk) => derive_trade_with_basis(t, Some(*risk), "symbol", prices),
+            None => {
+                if pooled_risk.is_some() {
+                    fallback_symbols.insert(t.symbol.clone());
+                }
+                derive_trade_with_basis(t, pooled_risk, "all_symbols", prices)
+            }
+        })
         .collect();
+
+    // Every blank, counted and attributed. `missing_price_series` is the case
+    // where the journal row had everything the replay needs and the price store
+    // did not cover the window — the difference between "the trade never went
+    // anywhere" and "we could not see where it went".
+    let coverage = AnalyticsCoverage {
+        trades_total: derived.len(),
+        with_pips: derived.iter().filter(|t| t.pips.is_some()).count(),
+        with_excursion: derived.iter().filter(|t| t.mfe_pips.is_some()).count(),
+        with_r_multiple: derived.iter().filter(|t| t.r_multiple.is_some()).count(),
+        with_duration: derived.iter().filter(|t| t.duration_hours.is_some()).count(),
+        missing_entry_time: trades.iter().filter(|t| t.entry_ts_ms.is_none()).count(),
+        missing_price_series: trades
+            .iter()
+            .zip(derived.iter())
+            .filter(|(raw, d)| {
+                raw.entry_ts_ms.is_some()
+                    && raw.exit_ts_ms.is_some()
+                    && raw.entry_price.is_some()
+                    && d.mfe_pips.is_none()
+            })
+            .count(),
+        risk_per_lot_by_symbol: per_symbol_risk,
+        risk_per_lot_all_symbols: pooled_risk,
+        symbols_using_fallback_risk: fallback_symbols.into_iter().collect(),
+        min_losses_for_symbol_risk: MIN_LOSSES_FOR_SYMBOL_RISK,
+    };
 
     let mean = |values: Vec<f64>| -> Option<f64> {
         if values.is_empty() {
@@ -311,6 +448,7 @@ pub fn analyse(trades: &[ClosedTrade], prices: Option<&dyn PriceWindow>) -> Jour
         avg_mfe_pips,
         avg_capture_ratio,
         inactive_hours_utc,
+        coverage,
         trades: derived,
     }
 }
@@ -343,6 +481,7 @@ mod tests {
             side: side.to_string(),
             lots: 1.0,
             account_id: Some("acct".to_string()),
+            environment: Some("Demo".to_string()),
             entry_ts_ms: Some(entry_ts),
             entry_price: Some(entry),
             exit_ts_ms: Some(entry_ts + 3_600_000),
@@ -478,6 +617,96 @@ mod tests {
 
         assert_eq!(analytics.by_side.len(), 2);
         assert_eq!(analytics.by_symbol.len(), 1);
+    }
+
+    fn trade_on(symbol: &str, net: f64, lots: f64) -> ClosedTrade {
+        let mut t = trade(0, "BUY", 1.1, 1.1, net, 1_700_000_000_000);
+        t.symbol = symbol.to_string();
+        t.lots = lots;
+        t
+    }
+
+    /// A stop is money-per-lot. Pooling a 1-lot XAUUSD stop with a 1-lot
+    /// EURUSD stop divides every trade by a denominator that belongs to
+    /// neither — in the one view built to compare trades ACROSS instruments.
+    #[test]
+    fn r_uses_each_symbols_own_stop_where_there_is_one() {
+        let mut trades: Vec<ClosedTrade> = Vec::new();
+        // EURUSD: stop costs ~200 per lot.
+        trades.extend((0..8).map(|_| trade_on("EURUSD", -200.0, 1.0)));
+        // XAUUSD: stop costs ~4000 per lot — twenty times the money.
+        trades.extend((0..8).map(|_| trade_on("XAUUSD", -4000.0, 1.0)));
+        // One winner on each, same size as its own stop → R should be ~+1.
+        trades.push(trade_on("EURUSD", 200.0, 1.0));
+        trades.push(trade_on("XAUUSD", 4000.0, 1.0));
+
+        let per_symbol = estimate_risk_per_lot_by_symbol(&trades);
+        assert!((per_symbol["EURUSD"] - 200.0).abs() < 1.0);
+        assert!((per_symbol["XAUUSD"] - 4000.0).abs() < 1.0);
+
+        let analytics = analyse(&trades, None);
+        let winners: Vec<&DerivedTrade> = analytics
+            .trades
+            .iter()
+            .filter(|t| t.net_profit > 0.0)
+            .collect();
+        assert_eq!(winners.len(), 2);
+        for w in winners {
+            assert_eq!(w.risk_basis, "symbol");
+            assert!(
+                (w.r_multiple.expect("R") - 1.0).abs() < 0.05,
+                "{} won exactly one stop's worth, R = {:?}",
+                w.symbol,
+                w.r_multiple
+            );
+        }
+    }
+
+    /// A symbol with too few losses of its own must borrow the pooled estimate
+    /// AND say so, rather than quietly presenting a borrowed denominator as its
+    /// own measurement.
+    #[test]
+    fn a_thin_symbol_falls_back_and_the_fallback_is_named() {
+        let mut trades: Vec<ClosedTrade> = (0..8).map(|_| trade_on("EURUSD", -200.0, 1.0)).collect();
+        trades.push(trade_on("GBPJPY", -180.0, 1.0)); // one loss: not enough
+        trades.push(trade_on("GBPJPY", 90.0, 1.0));
+
+        let analytics = analyse(&trades, None);
+        assert_eq!(
+            analytics.coverage.symbols_using_fallback_risk,
+            vec!["GBPJPY".to_string()]
+        );
+        assert!(analytics.coverage.risk_per_lot_by_symbol.contains_key("EURUSD"));
+        assert!(!analytics.coverage.risk_per_lot_by_symbol.contains_key("GBPJPY"));
+        let gbp = analytics
+            .trades
+            .iter()
+            .find(|t| t.symbol == "GBPJPY" && t.net_profit > 0.0)
+            .expect("the GBPJPY winner");
+        assert_eq!(gbp.risk_basis, "all_symbols");
+    }
+
+    /// A column of blanks must be distinguishable from a column of zeros, and
+    /// "the price store has no bars" from "the journal has no entry time".
+    #[test]
+    fn coverage_separates_a_missing_row_field_from_a_missing_price_series() {
+        let mut with_everything = trade(1, "BUY", 1.1000, 1.1010, 100.0, 1_700_000_000_000);
+        with_everything.lots = 1.0;
+        let mut no_entry_time = trade(2, "BUY", 1.1000, 1.0990, -100.0, 1_700_000_000_000);
+        no_entry_time.entry_ts_ms = None;
+        no_entry_time.lots = 1.0;
+
+        // No price source at all: everything excursion-shaped is unavailable.
+        let analytics = analyse(&[with_everything, no_entry_time], None);
+        assert_eq!(analytics.coverage.trades_total, 2);
+        assert_eq!(analytics.coverage.with_excursion, 0);
+        assert_eq!(analytics.coverage.missing_entry_time, 1);
+        assert_eq!(
+            analytics.coverage.missing_price_series, 1,
+            "one row had everything the replay needs and still got no bars"
+        );
+        assert_eq!(analytics.coverage.with_duration, 1);
+        assert_eq!(analytics.coverage.min_losses_for_symbol_risk, MIN_LOSSES_FOR_SYMBOL_RISK);
     }
 
     /// Without a price source the journal still works; it simply reports less,

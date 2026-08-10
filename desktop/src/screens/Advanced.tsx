@@ -189,6 +189,24 @@ type Field = {
 };
 type Group = { title: string; fields: Field[] };
 
+// Render a knob-catalog entry's TYPE the way the backend describes it. The
+// wire shape is flat: `{ kind: "Int", min, max }`, `{ kind: "Enum",
+// enumChoices: [...] }`, `{ kind: "Bool" }`, … (`knob_catalog.rs:139-175`).
+// Audit #113: every one of these fields was already on the wire and the table
+// showed none of them, so a knob's legal range was invisible to the operator.
+function knobTypeLabel(k: any): string {
+  const kind = String(k?.kind ?? "Text");
+  if (kind === "Enum") return `enum: ${(k.enumChoices ?? []).join(" | ")}`;
+  if (kind === "Int" || kind === "Float") {
+    const lo = k.min ?? null;
+    const hi = k.max ?? null;
+    const range =
+      lo != null && hi != null ? `${lo} … ${hi}` : lo != null ? `≥ ${lo}` : hi != null ? `≤ ${hi}` : "unbounded";
+    return `${kind.toLowerCase()} (${range})`;
+  }
+  return kind.toLowerCase();
+}
+
 const GROUPS: Group[] = [
   {
     title: "Mode & risk",
@@ -373,7 +391,12 @@ export default function Advanced() {
   return (
     <div className="screen">
       <h1>Advanced</h1>
-      <p className="sub">Every engine setting as a form — no raw YAML needed · diagnostics · raw fallback</p>
+      {/* Audit #113/#114: the old subtitle claimed "Every engine setting as a
+          form — no raw YAML needed". That was false by two orders of magnitude
+          — the form below carries ~24 controls against ~390 knobs, and the
+          catalog is read-only. A UI that overstates its own coverage is how the
+          operator concludes a knob he set is in force when it never was. */}
+      <p className="sub">The common engine settings as a form · full knob catalog (read-only) · diagnostics · raw YAML fallback</p>
 
       <HelpPanel id="advanced">
         <p>Power-user configuration. The common knobs are grouped below as friendly controls (each writes <code>config.yaml</code> safely, validated + clamped by the backend). The raw YAML editor + full knob catalog are kept as a fallback.</p>
@@ -413,18 +436,60 @@ export default function Advanced() {
           <div className="btn-row"><button className="primary" disabled={busy} onClick={saveYaml}>Save config.yaml</button></div>
 
           <h2>Knob catalog ({knobs.length})</h2>
+          {/* Audit #113/#114. The backend has always emitted the full widget
+              schema for every knob — `kind`, `min`, `max`, `enumChoices`,
+              `helpLong`, `envVar` and three preset values, flattened to
+              top-level JSON keys (`knob_catalog.rs:85-100`). This table rendered
+              exactly four of them and threw the rest away, so the operator could
+              not even SEE a knob's legal range.
+              It now shows the whole schema. It is still READ-ONLY, and that is
+              a backend gap, not a UI choice: THERE IS NO WRITE ENDPOINT. The
+              catalog module says so in its own doc — "Write path (future):
+              POST /settings/knobs will write the operator's changes to
+              config.yaml" (`knob_catalog.rs:34-38`) — and the ids here
+              (`ga.seed`, `cost.spread_pips`) are catalog names, not config.yaml
+              paths, so no client can map them to a key on its own. Rendering
+              editable inputs against a missing endpoint would produce 53
+              controls that move nothing, which is the exact failure this
+              codebase keeps repeating (see the deleted Language picker above).
+              The raw YAML editor is the honest write path until the endpoint
+              lands. DO NOT make these inputs before then. */}
+          <div className="banner info">
+            <b>Read-only.</b> These {knobs.length} knobs are documented here with their type, legal
+            range and presets, but the backend has no knob write endpoint yet
+            (<code>POST /settings/knobs</code>). Change them in the raw <code>config.yaml</code>{" "}
+            editor above, or use the typed form at the top of this screen for the common ones.
+          </div>
           {sections.map((sec) => (
             <details key={sec} className="knob-section">
               <summary>{sec}</summary>
               <table className="tbl">
-                <thead><tr><th>Knob</th><th>Current</th><th>Default</th><th>Help</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>Knob</th>
+                    <th>Type / range</th>
+                    <th>Current</th>
+                    <th>Default</th>
+                    <th>Conservative</th>
+                    <th>Balanced</th>
+                    <th>Aggressive</th>
+                    <th>Help</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {knobs.filter((k) => k.section === sec).map((k) => (
                     <tr key={k.id}>
-                      <td title={k.id}>{k.label}</td>
+                      <td title={k.id}>
+                        {k.label}
+                        <div className="muted small"><code>{k.id}</code></div>
+                      </td>
+                      <td className="muted small">{knobTypeLabel(k)}</td>
                       <td><b>{k.current}</b></td>
                       <td className="muted">{k.default}</td>
-                      <td className="muted small">{k.helpShort}</td>
+                      <td className="muted small">{k.presetConservative || "—"}</td>
+                      <td className="muted small">{k.presetBalanced || "—"}</td>
+                      <td className="muted small">{k.presetAggressive || "—"}</td>
+                      <td className="muted small" title={k.helpLong}>{k.helpShort}</td>
                     </tr>
                   ))}
                 </tbody>

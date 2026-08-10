@@ -1,5 +1,15 @@
 // Integration test for neoethos-models crate
-// Tests all ported models can be instantiated
+//
+// 2026-08-09 (batch D4): the registry-catalogue tests (`list_models_by_category`,
+// `get_model_info`, `is_valid_model`) and the `tch`-gated hardware test were
+// removed with the code they exercised. They were the ONLY callers of that API,
+// which is what made it dead: a test suite is not a consumer. The `tch` test
+// additionally referenced `logical_cores` / `ram_gb` / `gpu_list`, fields
+// `HardwareInfo` has never had — it could not have compiled even with the
+// feature on.
+//
+// The surviving capability surface is covered by the unit tests in
+// `src/registry.rs` and `src/hardware.rs`.
 
 #[test]
 fn test_compilation() {
@@ -8,64 +18,12 @@ fn test_compilation() {
 }
 
 #[test]
-fn test_registry() {
-    use neoethos_models::registry::*;
-
-    // Test available models
-    let available_models = list_models_by_category()
-        .into_values()
-        .flatten()
-        .collect::<Vec<_>>();
-    assert!(!available_models.is_empty(), "Should have available models");
-    println!("Available models: {:?}", available_models);
-
-    // Test model info
-    let lgbm_info = get_model_info("lightgbm").expect("LightGBM should be in registry");
-    assert_eq!(lgbm_info.name, "lightgbm");
-    println!("LightGBM info: {:?}", lgbm_info);
-
-    // Test valid model check
-    assert!(is_valid_model("lightgbm"));
-    assert!(is_valid_model("mlp"));
-    assert!(!is_valid_model("nonexistent"));
-
-    println!("✓ Registry tests passed");
-}
-
-#[test]
-fn test_model_categories() {
-    use neoethos_models::registry::*;
-
-    let categories = list_models_by_category();
-    println!("Models by category:");
-    for (category, models) in categories.iter() {
-        println!("  {:?}: {} models", category, models.len());
-    }
-
-    assert!(!categories.is_empty(), "Should have model categories");
-    println!("✓ Model category tests passed");
-}
-
-#[test]
-#[cfg(feature = "tch")]
-fn test_hardware_detection() {
-    use neoethos_models::hardware::*;
-
-    let hw = HardwareInfo::detect();
-    println!("Hardware detected:");
-    println!(
-        "  CPU cores: {} (logical: {})",
-        hw.cpu_cores, hw.logical_cores
-    );
-    println!("  RAM: {:.2} GB", hw.ram_gb);
-    println!("  GPUs: {}", hw.gpu_count);
-
-    for (i, gpu) in hw.gpu_list.iter().enumerate() {
-        println!("    GPU {}: {}", i, gpu);
-    }
-
-    assert!(hw.cpu_cores > 0, "Should detect CPU cores");
-    assert!(hw.ram_gb > 0.0, "Should detect RAM");
-
-    println!("✓ Hardware detection tests passed");
+fn capability_lookup_is_reachable_from_outside_the_crate() {
+    // `get_model_capability` is the one live export of `registry`; it is on the
+    // train path via `runtime::dispatch::build_dispatch_plan`. Pin that it stays
+    // publicly reachable.
+    let capability =
+        neoethos_models::registry::get_model_capability("lightgbm").expect("lightgbm capability");
+    assert_eq!(capability.name, "lightgbm");
+    assert!(neoethos_models::registry::get_model_capability("nonexistent").is_none());
 }

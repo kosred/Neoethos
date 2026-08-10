@@ -22,10 +22,17 @@
 //!   (LightGBM, XGBoost, MLP, Transformer, …) gets an
 //!   [`ExpertModel`] impl that exposes its existing predict
 //!   behaviour through the uniform trait.
-//! - **D1.3** — `SoftVotingEnsemble` — the first concrete
-//!   [`EnsemblePredictor`] (weighted average of loaded experts'
-//!   3-class probabilities). Useable from day one against existing
-//!   trained artifacts.
+//! - **D1.3** — `SoftVotingEnsemble` — the aggregator, reached through
+//!   [`SoftVotingEnsemble::predict_with_roles`] (weighted average of loaded
+//!   experts' 3-class probabilities, role-aware). Useable from day one
+//!   against existing trained artifacts.
+//!
+//!   **2026-08-09 (batch D4):** [`EnsemblePredictor`] is NO LONGER a
+//!   prediction trait — its `predict` method (a role-blind flat average with
+//!   no production caller) was deleted; what remains is the load-reporting
+//!   contract (`load_outcome` + `experts`). Inference is
+//!   `predict_with_roles`. If the MoE gating network (D1.6) arrives, give it
+//!   `predict_with_roles` — do NOT resurrect a flat average alongside it.
 //! - **D1.4** — diversity enforcement during training (random
 //!   seeds + regime feature; NOT feature subsets — operator
 //!   directive 2026-05-17 rejected the random-subspace approach
@@ -898,7 +905,24 @@ impl ExpertRegistry {
                 // exit-pipeline-only (F-318). (`swarm_forecaster` votes
                 // since D1.2.8 — no longer exempt.)
                 let by_design = matches!(dir_name, "genetic" | "exit_agent");
-                if by_design {
+                if dir_name == "exit_agent" {
+                    // Audit #173/#175 — MAKE THE WASTE VISIBLE, do not decide it.
+                    // `exit_agent` is pushed into the training plan on EVERY run
+                    // (`training_orchestrator.rs:547`), is absent from
+                    // DEFAULT_BOOTSTRAP_EXPERT_NAMES (`bootstrap.rs:102-149`),
+                    // and is whitelisted here as a non-voter. So it trains every
+                    // run and NOTHING consumes its `ExitDecision3` output. That
+                    // is either an unshipped exit-side loop or wasted training
+                    // time, and only the operator can say which — but until he
+                    // does it must not read as a benign `info!` line.
+                    tracing::warn!(
+                        target: "neoethos_models::ensemble",
+                        artifact = %dir_name,
+                        "exit_agent was TRAINED and has NO CONSUMER — it emits ExitDecision3 and \
+                         no production path reads it (audit #173/#175, decision pending: ship the \
+                         exit-side loop or stop training it). Its training time is spent every run."
+                    );
+                } else if by_design {
                     tracing::info!(
                         target: "neoethos_models::ensemble",
                         artifact = %dir_name,
@@ -915,7 +939,200 @@ impl ExpertRegistry {
             }
         }
 
+        // ── 3. Numerical sanity: on disk ≠ fit to vote ──────────────────
+        numeric_sanity_screen(root, &mut outcome);
+
         outcome
+    }
+}
+
+/// Peer-relative ceiling for a recorded training loss. An artifact whose
+/// `best_loss` is more than this many times the peer median is refused.
+///
+/// **Three orders of magnitude**, deliberately loose: the point is to catch a
+/// model that diverged, not to rank models. The measured case (2026-08-09) is
+/// `tide` at **1,308,811.5** and `tide_nf` at **51,699,690** against healthy
+/// peers in the units of a cross-entropy — six to eight orders out, not three.
+const PEER_LOSS_DIVERGENCE_FACTOR: f64 = 1_000.0;
+
+/// Fewest peers that make a median meaningful. Below this the screen does not
+/// run — and says so, rather than silently passing everything.
+const MIN_PEERS_FOR_LOSS_SCREEN: usize = 3;
+
+/// Absolute ceiling on a SAC entropy temperature (`final_alpha`).
+///
+/// SAC's temperature is an O(0.1–10) quantity by construction — the healthy
+/// peers in the operator's store sit at ~0.48. There is exactly ONE sac
+/// artifact per symbol, so no peer median exists for it and the bound has to be
+/// absolute. `1e3` is two orders above any healthy value and six orders below
+/// the measured divergence (**5.69e9**), so it cannot refuse a working model.
+const MAX_SAC_FINAL_ALPHA: f64 = 1_000.0;
+
+/// Refuse to let a numerically divergent artifact vote (audit #299 + #310).
+///
+/// **The gap this closes.** Nothing anywhere connected "an artifact is on disk"
+/// to "an artifact may vote". Three artifacts in the operator's own store are
+/// numerically broken — `tide` (best_loss 1,308,811.5), `tide_nf`
+/// (51,699,690) and `sac` (final_alpha 5.69e9) — and all three are in
+/// [`DEFAULT_BOOTSTRAP_EXPERT_NAMES`], i.e. all three load and all three would
+/// vote. That is harmless *today* only because `live_ml_gate` is false and
+/// `expert_weights` is empty, which is a configuration, not a guarantee. The
+/// moment the gate is flipped, `tide`'s vote scales real position size.
+///
+/// **This does not flip any gate.** It only removes divergent artifacts from
+/// the voter set, loudly. Refusals become `degraded` entries, exactly like a
+/// corrupt file — so the existing "no Classification3 voter loaded ⇒ refuse to
+/// start auto-trade" contract keeps working and the trader falls back to
+/// gene-only rather than voting on garbage. Fail-closed.
+///
+/// **No silent drops.** Every artifact is accounted for: screened, refused, or
+/// `unscreened` because it records no number this can read (tree models, meta
+/// learners). The counts are logged once per load.
+///
+/// **Call site.** Only [`ExpertRegistry::load_with_partial_replica_aware`],
+/// which is the one production ensembles use (`bootstrap.rs:223`). The plain
+/// `load_with_partial` is a lower-level primitive used by tests and is left
+/// unscreened deliberately, so a test can assert on an unfiltered outcome.
+fn numeric_sanity_screen(root: &Path, outcome: &mut ExpertLoadOutcome) {
+    let names: Vec<String> = outcome.loaded.iter().map(|e| e.name().to_string()).collect();
+
+    // Collect what each artifact recorded about its own training.
+    let mut losses: Vec<(String, f64)> = Vec::new();
+    let mut alphas: Vec<(String, f64)> = Vec::new();
+    let mut unscreened: Vec<String> = Vec::new();
+    for name in &names {
+        let report = read_recorded_training_numbers(&root.join(name));
+        match report {
+            RecordedNumbers {
+                best_loss: Some(l), ..
+            } => losses.push((name.clone(), l)),
+            RecordedNumbers {
+                final_alpha: Some(a),
+                ..
+            } => alphas.push((name.clone(), a)),
+            _ => unscreened.push(name.clone()),
+        }
+    }
+
+    let mut refusals: Vec<(String, String)> = Vec::new();
+
+    // ── Screen A: peer-relative loss ────────────────────────────────────
+    let finite: Vec<f64> = losses
+        .iter()
+        .map(|(_, l)| *l)
+        .filter(|l| l.is_finite() && *l > 0.0)
+        .collect();
+    if finite.len() >= MIN_PEERS_FOR_LOSS_SCREEN {
+        let median = median_of(&finite);
+        let ceiling = median * PEER_LOSS_DIVERGENCE_FACTOR;
+        for (name, loss) in &losses {
+            if !loss.is_finite() {
+                refusals.push((
+                    name.clone(),
+                    format!("recorded training loss is not finite ({loss})"),
+                ));
+            } else if *loss > ceiling {
+                refusals.push((
+                    name.clone(),
+                    format!(
+                        "recorded training loss {loss:.3} exceeds {PEER_LOSS_DIVERGENCE_FACTOR:.0}× \
+                         the peer median {median:.6} (ceiling {ceiling:.3}) — this artifact \
+                         diverged during training and must not vote"
+                    ),
+                ));
+            }
+        }
+    } else if !losses.is_empty() {
+        tracing::warn!(
+            target: "neoethos_models::ensemble",
+            peers = finite.len(),
+            required = MIN_PEERS_FOR_LOSS_SCREEN,
+            "numeric sanity: too few peers to compute a loss median — the divergence screen \
+             did NOT run for this symbol/timeframe"
+        );
+    }
+
+    // ── Screen B: absolute SAC temperature ──────────────────────────────
+    for (name, alpha) in &alphas {
+        if !alpha.is_finite() || alpha.abs() > MAX_SAC_FINAL_ALPHA {
+            refusals.push((
+                name.clone(),
+                format!(
+                    "recorded final_alpha {alpha:e} is outside the sane entropy-temperature \
+                     range (|alpha| ≤ {MAX_SAC_FINAL_ALPHA}) — this artifact diverged during \
+                     training and must not vote"
+                ),
+            ));
+        }
+    }
+
+    // ── Apply ───────────────────────────────────────────────────────────
+    if !refusals.is_empty() {
+        let refused: std::collections::HashSet<&str> =
+            refusals.iter().map(|(n, _)| n.as_str()).collect();
+        outcome.loaded.retain(|e| !refused.contains(e.name()));
+        for (name, reason) in refusals.iter() {
+            tracing::error!(
+                target: "neoethos_models::ensemble",
+                expert = %name,
+                reason = %reason,
+                "REFUSED numerically divergent artifact — it will NOT vote"
+            );
+            outcome.degraded.push(ExpertLoadError::InvalidArtifact {
+                name: name.clone(),
+                reason: reason.clone(),
+            });
+        }
+    }
+
+    tracing::info!(
+        target: "neoethos_models::ensemble",
+        screened_loss = losses.len(),
+        screened_alpha = alphas.len(),
+        unscreened = unscreened.len(),
+        refused = refusals.len(),
+        "numeric sanity screen complete (unscreened artifacts record no comparable number)"
+    );
+}
+
+/// What an artifact wrote down about its own training, as far as it can be read
+/// back from `<artifact_dir>/config.json`.
+#[derive(Default)]
+struct RecordedNumbers {
+    /// `burn_training_report.best_loss` — every burn-trained deep model.
+    best_loss: Option<f64>,
+    /// `final_alpha` — the SAC entropy temperature.
+    final_alpha: Option<f64>,
+}
+
+/// Read the recorded training numbers without deserialising the whole config
+/// (each model kind writes a different shape). A missing/unreadable file is not
+/// an error: it means "no number to screen", counted as `unscreened`.
+fn read_recorded_training_numbers(dir: &Path) -> RecordedNumbers {
+    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
+        return RecordedNumbers::default();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return RecordedNumbers::default();
+    };
+    RecordedNumbers {
+        best_loss: json
+            .get("burn_training_report")
+            .and_then(|r| r.get("best_loss"))
+            .and_then(|v| v.as_f64()),
+        final_alpha: json.get("final_alpha").and_then(|v| v.as_f64()),
+    }
+}
+
+/// Median of a non-empty slice. Callers guarantee non-empty.
+fn median_of(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
     }
 }
 
@@ -956,33 +1173,30 @@ impl Default for ExpertRegistry {
 // EnsemblePredictor trait
 // ---------------------------------------------------------------------------
 
-/// Aggregator contract over a set of loaded experts.
+/// Load-reporting contract over a set of loaded experts.
 ///
-/// The concrete implementations are:
-/// - `SoftVotingEnsemble` (D1.3) — weighted average of every
-///   loaded expert's `Classification3` / `ActionValues3` outputs.
-/// - `MoeEnsemble` (D1.6) — gating network that learns which
-///   experts to trust under which conditions, trained jointly
-///   (operator directive 2026-05-17 — diversity from
-///   specialization, not artificial feature restrictions).
+/// **2026-08-09 (batch D4): this trait no longer produces predictions.** It
+/// used to require `fn predict(&self, df) -> Array2<f32>`, a flat
+/// `[p_neutral, p_buy, p_sell]` average over every Classification3 expert.
+/// That method had exactly one implementation and zero production callers —
+/// the live loop and the replay loop both call
+/// [`super::soft_voting::SoftVotingEnsemble::predict_with_roles`], which
+/// returns [`EnsembleDecision`] and keeps `hmm_regime` / `isolation_forest`
+/// OUT of the direction vote instead of averaging them into it. Inference is
+/// therefore an inherent method on the concrete aggregator, not a trait
+/// method; what the trait carries is the load snapshot the app reads at
+/// `live_trading.rs:541`.
 ///
-/// Output is a `(n_rows, 3)` `ndarray::Array2<f32>` of
-/// `[p_neutral, p_buy, p_sell]` probabilities (canonical mapping —
-/// see `base.rs` lines 128-135). Downstream callers (the
-/// auto-trade producer's `ModelPredictor` adapter — D1.3 also)
-/// pick the argmax + confidence and map to `AutoTradeSide`.
+/// If a second aggregator ever arrives (the MoE gating network, D1.6), give it
+/// `predict_with_roles` — do not resurrect a flat average alongside it.
 pub trait EnsemblePredictor: Send + Sync {
-    /// Run inference on every row of `df`. Returns a `(n_rows, 3)`
-    /// matrix of `[p_neutral, p_buy, p_sell]` (canonical order;
-    /// col 0 = neutral, col 1 = buy, col 2 = sell).
-    fn predict(&self, df: &DataFrame) -> Result<ndarray::Array2<f32>>;
     /// Snapshot of which experts loaded / missed / degraded at
     /// construction time. Used by the chrome to render the
     /// "running ensemble: X/Y experts active" banner.
     fn load_outcome(&self) -> &ExpertLoadOutcome;
     /// Read-only handle to the loaded experts. Useful for
-    /// diagnostics + tests; production code should go through
-    /// [`Self::predict`].
+    /// diagnostics + tests; production code should go through the
+    /// concrete aggregator's `predict_with_roles`.
     fn experts(&self) -> &[Box<dyn ExpertModel>] {
         &self.load_outcome().loaded
     }
@@ -995,7 +1209,6 @@ pub trait EnsemblePredictor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
     use polars::prelude::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1169,6 +1382,128 @@ mod tests {
             .join(format!("{label}-{nanos}-{n}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    // -- numeric sanity screen (#299 + #310) ------------------------------
+
+    fn write_config(root: &std::path::Path, name: &str, json: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).expect("artifact dir");
+        fs::write(dir.join("config.json"), json).expect("config.json");
+    }
+
+    fn burn_loss(loss: f64) -> String {
+        format!("{{\"burn_training_report\":{{\"best_loss\":{loss}}}}}")
+    }
+
+    fn mock_expert(name: &str) -> Box<dyn ExpertModel> {
+        Box::new(MockExpert {
+            name: name.to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            constant_probs: [0.2, 0.6, 0.2],
+        })
+    }
+
+    #[test]
+    fn median_of_handles_even_and_odd_lengths() {
+        assert_eq!(median_of(&[1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(median_of(&[1.0, 2.0, 3.0, 5.0]), 2.5);
+        assert_eq!(median_of(&[7.0]), 7.0);
+    }
+
+    #[test]
+    fn recorded_numbers_read_both_shapes_and_tolerate_absence() {
+        let root = tempdir("recorded-numbers");
+        write_config(&root, "tide", &burn_loss(1308811.5));
+        write_config(&root, "sac", "{\"final_alpha\":5693284000.0}");
+        write_config(&root, "lightgbm", "{\"num_leaves\":31}");
+        assert_eq!(
+            read_recorded_training_numbers(&root.join("tide")).best_loss,
+            Some(1308811.5)
+        );
+        assert_eq!(
+            read_recorded_training_numbers(&root.join("sac")).final_alpha,
+            Some(5693284000.0)
+        );
+        let none = read_recorded_training_numbers(&root.join("lightgbm"));
+        assert!(none.best_loss.is_none() && none.final_alpha.is_none());
+        // A directory with no config.json at all must not panic — it is
+        // "nothing to screen", not an error.
+        let absent = read_recorded_training_numbers(&root.join("does_not_exist"));
+        assert!(absent.best_loss.is_none() && absent.final_alpha.is_none());
+    }
+
+    /// The exact numbers measured in the operator's store on 2026-08-09:
+    /// eleven burn artifacts at ~0.48 plus `tide` at 1,308,811.5 and `tide_nf`
+    /// at 51,699,690, and one `sac` at final_alpha 5.69e9. The screen must
+    /// refuse exactly those three and keep every healthy peer.
+    #[test]
+    fn divergent_artifacts_are_refused_and_healthy_peers_kept() {
+        let root = tempdir("numeric-sanity");
+        let healthy = [
+            ("nbeats", 0.48608416),
+            ("timesnet", 0.48188955),
+            ("mlp", 0.48186147),
+            ("nbeatsx_nf", 0.480542),
+            ("kan", 0.48044226),
+            ("patchtst", 0.47902533),
+            ("tabnet", 0.47879004),
+        ];
+        for (n, l) in healthy {
+            write_config(&root, n, &burn_loss(l));
+        }
+        write_config(&root, "tide", &burn_loss(1308811.5));
+        write_config(&root, "tide_nf", &burn_loss(51699690.0));
+        write_config(&root, "sac", "{\"final_alpha\":5693284000.0}");
+        // `lightgbm` records no comparable number — it must survive untouched
+        // rather than being refused for lack of evidence.
+        write_config(&root, "lightgbm", "{\"num_leaves\":31}");
+
+        let mut outcome = ExpertLoadOutcome {
+            loaded: healthy
+                .iter()
+                .map(|(n, _)| mock_expert(n))
+                .chain(
+                    ["tide", "tide_nf", "sac", "lightgbm"]
+                        .into_iter()
+                        .map(mock_expert),
+                )
+                .collect(),
+            missing: Vec::new(),
+            degraded: Vec::new(),
+        };
+
+        numeric_sanity_screen(&root, &mut outcome);
+
+        let kept: Vec<&str> = outcome.loaded.iter().map(|e| e.name()).collect();
+        for (n, _) in healthy {
+            assert!(kept.contains(&n), "healthy peer {n} must keep voting");
+        }
+        assert!(kept.contains(&"lightgbm"), "unscreened artifact must survive");
+        for bad in ["tide", "tide_nf", "sac"] {
+            assert!(!kept.contains(&bad), "{bad} must be refused");
+            assert!(
+                outcome.degraded.iter().any(|d| d.name() == bad),
+                "{bad} must be recorded as degraded, not silently dropped"
+            );
+        }
+    }
+
+    /// Fail-SAFE, not fail-loud-and-wrong: with fewer than three peers a median
+    /// means nothing, so the screen must refuse NOTHING rather than guess.
+    #[test]
+    fn too_few_peers_refuses_nothing() {
+        let root = tempdir("numeric-sanity-few");
+        write_config(&root, "mlp", &burn_loss(0.48));
+        write_config(&root, "tide", &burn_loss(1308811.5));
+        let mut outcome = ExpertLoadOutcome {
+            loaded: ["mlp", "tide"].into_iter().map(mock_expert).collect(),
+            missing: Vec::new(),
+            degraded: Vec::new(),
+        };
+        numeric_sanity_screen(&root, &mut outcome);
+        assert_eq!(outcome.loaded.len(), 2);
+        assert!(outcome.degraded.is_empty());
     }
 
     #[test]
@@ -1383,20 +1718,13 @@ mod tests {
 
     // -- EnsemblePredictor trait round-trip -----------------------------
 
-    /// Minimal in-test EnsemblePredictor that returns a fixed
-    /// probability vector regardless of input. Used only to pin
-    /// the trait's shape.
+    /// Minimal in-test EnsemblePredictor. Used only to pin the
+    /// trait's shape now that it carries the load snapshot alone.
     struct StubEnsemble {
         outcome: ExpertLoadOutcome,
-        constant: [f32; 3],
     }
 
     impl EnsemblePredictor for StubEnsemble {
-        fn predict(&self, df: &DataFrame) -> Result<Array2<f32>> {
-            let n = df.height();
-            let flat: Vec<f32> = (0..n).flat_map(|_| self.constant.iter().copied()).collect();
-            Ok(Array2::from_shape_vec((n, 3), flat)?)
-        }
         fn load_outcome(&self) -> &ExpertLoadOutcome {
             &self.outcome
         }
@@ -1413,19 +1741,7 @@ mod tests {
             missing: vec!["xgboost".to_string()],
             degraded: vec![],
         };
-        let ens: Box<dyn EnsemblePredictor> = Box::new(StubEnsemble {
-            outcome,
-            constant: [0.1, 0.7, 0.2],
-        });
-        // Build a 4-row DataFrame.
-        let df = df!("f1" => &[1.0_f32, 2.0, 3.0, 4.0]).expect("df");
-        let probs = ens.predict(&df).expect("predict");
-        assert_eq!(probs.shape(), &[4, 3]);
-        for row in probs.outer_iter() {
-            assert!((row[0] - 0.1).abs() < 1e-6);
-            assert!((row[1] - 0.7).abs() < 1e-6);
-            assert!((row[2] - 0.2).abs() < 1e-6);
-        }
+        let ens: Box<dyn EnsemblePredictor> = Box::new(StubEnsemble { outcome });
         assert_eq!(ens.load_outcome().loaded_count(), 1);
         assert_eq!(ens.load_outcome().missing_count(), 1);
         assert_eq!(ens.experts().len(), 1);

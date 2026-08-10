@@ -285,3 +285,92 @@ extern "C" __global__ void broadcast_row_f32(
     out[idx] = row[j];
   }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — wad (Williams Accumulation/Distribution)
+// ===========================================================================
+// Reference: src/indicators/wad.rs
+//   wad_with_kernel (:148) — alloc_with_nan_prefix(len, 0): NO warmup at all
+//   wad_scalar (:194)      — the arithmetic
+//   wad_prepare (:1416)    — the Err branches
+//
+// FIRST-VALID IS NOT READ. The CPU never computes a first-non-NaN index for
+// wad; it starts at bar 0 with out[0] = 0.0 and accumulates. The lane still
+// passes first_valid because the ABI is uniform; this kernel ignores it, which
+// is why its registry row declares F64FirstValidRule::Ignored rather than
+// silently adopting a prefix the reference does not have.
+//
+// PERIOD-INVARIANT. compute_wad_batch takes no period parameter at all.
+//
+// NaN SEMANTICS — THIS IS THE adx-CLASS BUG, AND IT IS LIVE HERE.
+// The CPU writes pc.max(h) and pc.min(l), i.e. f64::max / f64::min, which
+// RETURN THE NON-NaN OPERAND. The f32 kernels above use comparison chains; a
+// comparison against NaN is false, so the NaN survives, enters acc, and every
+// subsequent bar of the accumulation is NaN. fmax/fmin below have exactly
+// f64::max/min semantics.
+//
+// ROUNDING. gt.mul_add(c - trl, lt * (c - trh)) is: one subtract, one
+// subtract, one multiply, one fma — and the fma rounds ONCE. Written as
+// gt*(c-trl) + lt*(c-trh) it rounds twice more. fma() below matches.
+//
+// One thread per column: acc is a running total across bars.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_wad_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;      // PERIOD-INVARIANT — compute_wad_batch reads no period.
+    (void)first_valid;  // see the header: the CPU reference has no warmup.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    if (n <= 0) return;
+
+    // wad_prepare :1441 — an all-NaN series in any of the three is Err, so the
+    // CPU produces nothing.
+    bool h_all_nan = true, l_all_nan = true, c_all_nan = true;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(high[i]))  { h_all_nan = false; }
+        if (!isnan(low[i]))   { l_all_nan = false; }
+        if (!isnan(close[i])) { c_all_nan = false; }
+        if (!h_all_nan && !l_all_nan && !c_all_nan) break;
+    }
+    if (h_all_nan || l_all_nan || c_all_nan) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    row[0] = 0.0;
+    double acc = 0.0;
+    double pc = close[0];
+
+    for (int i = 1; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        const double trh = fmax(pc, h);   // f64::max — returns the non-NaN side
+        const double trl = fmin(pc, l);   // f64::min — likewise
+
+        const double gt = (c > pc) ? 1.0 : 0.0;
+        const double lt = (c < pc) ? 1.0 : 0.0;
+
+        const double ad = fma(gt, c - trl, lt * (c - trh));
+        acc += ad;
+        row[i] = acc;
+        pc = c;
+    }
+}

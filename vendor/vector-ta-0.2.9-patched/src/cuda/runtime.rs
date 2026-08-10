@@ -5,6 +5,7 @@ use super::device_types::{
     CudaDeviceOhlc, CudaDeviceOhlcv, CudaDeviceVectorF32, CudaDeviceVectorI32, CudaDeviceVectorI64,
     CudaDeviceViewError,
 };
+use super::device_types_f64::{CudaDeviceMatrixF64, CudaDeviceOhlcvF64, CudaDeviceVectorF64};
 use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
@@ -143,6 +144,89 @@ impl CudaRuntime {
             self.context_arc(),
             self.device_id(),
         ))
+    }
+
+    // ── f64 lane ──────────────────────────────────────────────────────────
+    //
+    // ADDITIVE. `upload_f32` above is untouched — 180 f32 wrappers and the
+    // generated f32 dispatcher still use it. What is NEW is that a caller
+    // holding `f64` host data no longer has to narrow it to reach the device:
+    // narrowing on upload was the first of the two documented divergence
+    // sources between this lane and the f64 CPU reference (the other being
+    // `--use_fast_math`, now off for the f64 kernels by construction).
+
+    pub fn upload_f64(&self, values: &[f64]) -> Result<CudaDeviceVectorF64, CudaRuntimeError> {
+        let buf = DeviceBuffer::from_slice(values)?;
+        Ok(CudaDeviceVectorF64::from_buffer(
+            buf,
+            values.len(),
+            self.context_arc(),
+            self.device_id(),
+        ))
+    }
+
+    pub fn upload_matrix_f64(
+        &self,
+        values: &[f64],
+        rows: usize,
+        cols: usize,
+    ) -> Result<CudaDeviceMatrixF64, CudaRuntimeError> {
+        Ok(CudaDeviceMatrixF64::from_buffer(
+            DeviceBuffer::from_slice(values)?,
+            rows,
+            cols,
+            self.context_arc(),
+            self.device_id(),
+        )?)
+    }
+
+    /// Upload a whole frame in f64 and keep it resident.
+    ///
+    /// `source` is the explicit price series when the indicator's CPU default
+    /// is not `close` (e.g. `hlc3` for `cci` / `mfi`). Passing `None` makes
+    /// `prices()` resolve to `close`, matching `source_type(candles, None)`.
+    pub fn upload_ohlcv_f64(
+        &self,
+        open: &[f64],
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+        source: Option<&[f64]>,
+    ) -> Result<CudaDeviceOhlcvF64, CudaRuntimeError> {
+        let open = self.upload_f64(open)?;
+        let high = self.upload_f64(high)?;
+        let low = self.upload_f64(low)?;
+        let close = self.upload_f64(close)?;
+        let volume = self.upload_f64(volume)?;
+        let source = match source {
+            Some(values) => Some(self.upload_f64(values)?),
+            None => None,
+        };
+        Ok(CudaDeviceOhlcvF64::new(
+            open, high, low, close, volume, source,
+        )?)
+    }
+
+    pub fn download_f64(&self, values: &CudaDeviceVectorF64) -> Result<Vec<f64>, CudaRuntimeError> {
+        ensure_same_device("runtime.download_f64", self.device_id(), values.device_id())?;
+        let mut host = vec![0.0f64; values.len()];
+        values.buffer().copy_to(host.as_mut_slice())?;
+        Ok(host)
+    }
+
+    pub fn download_matrix_f64(
+        &self,
+        values: &CudaDeviceMatrixF64,
+    ) -> Result<Vec<f64>, CudaRuntimeError> {
+        ensure_same_device(
+            "runtime.download_matrix_f64",
+            self.device_id(),
+            values.device_id(),
+        )?;
+        let mut host = vec![0.0f64; values.len()];
+        values.buffer().copy_to(host.as_mut_slice())?;
+        Ok(host)
     }
 
     pub fn upload_i32(&self, values: &[i32]) -> Result<CudaDeviceVectorI32, CudaRuntimeError> {

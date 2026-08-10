@@ -1692,7 +1692,6 @@ mod tests {
     };
     use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
     use ndarray::ArrayView2;
-    use neoethos_gpu_contracts::device::ScenarioDescriptor;
 
     const BARS: usize = 5;
 
@@ -1722,16 +1721,29 @@ mod tests {
             adaptive_rr: 2.0,
         };
         let candidate_ids = vec![101, 202, 303];
+        // Built through the ONE builder. A hand-written descriptor with
+        // `..ScenarioDescriptor::default()` wrote `spread_ticks: 0,
+        // commission_micros: 0`, which stopped meaning "use the settings' costs"
+        // and started meaning "charge NOTHING" when the sentinel became -1 — and
+        // this fixture prices trades at `spread_pips: 2.0,
+        // commission_per_trade: 10.0`, so the device would have traded for free
+        // while the CPU oracle charged both.
+        //
+        // `base_candidate_id` here carries the gene's own id, not its index:
+        // this workload is validated by `validate_uploads`, which is Prototype
+        // A's VALUE-equality contract. The Prototype B population lane reads the
+        // same field as an INDEX. Both hold wherever genes are numbered
+        // `0..population`, which is every producer in the tree; see the note at
+        // the `ScenarioCandidateMismatch` check in `prototype_a.rs`.
         let scenarios = candidate_ids
             .iter()
             .copied()
-            .map(|candidate_id| ScenarioDescriptor {
-                base_candidate_id: candidate_id,
-                scenario_id: candidate_id + 900,
-                window_offset: 0,
-                window_len: BARS as u32,
-                scenario_type: 0,
-                ..ScenarioDescriptor::default()
+            .map(|candidate_id| {
+                crate::gpu_native::scenario::base_scenario(
+                    candidate_id,
+                    candidate_id + 900,
+                    BARS,
+                )
             })
             .collect();
 
@@ -1806,14 +1818,11 @@ mod tests {
         workload.genes.target_pips = vec![10_000.0];
         workload.genes.stop_vol_multipliers = vec![0.0];
         workload.genes.smc_flags = vec![[0; 11]];
-        workload.scenarios.scenarios = vec![ScenarioDescriptor {
-            base_candidate_id: 101,
-            scenario_id: 1001,
-            window_offset: 0,
-            window_len: 6,
-            scenario_type: 0,
-            ..ScenarioDescriptor::default()
-        }];
+        // Gene id 101, matching `candidate_ids` above — `validate_uploads` is
+        // Prototype A's value-equality contract. Through the builder so the cost
+        // sentinels are the "use the settings' costs" ones.
+        workload.scenarios.scenarios =
+            vec![crate::gpu_native::scenario::base_scenario(101, 1001, 6)];
         workload
     }
 

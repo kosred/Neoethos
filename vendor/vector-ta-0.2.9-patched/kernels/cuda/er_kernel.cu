@@ -219,3 +219,70 @@ extern "C" __global__ void er_many_series_one_param_time_major_f32(
         ++start;
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — er (Kaufman efficiency ratio)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/er.rs:322 `er_scalar`.
+ *
+ * The CPU's `period == 5` fast path (er.rs:363) seeds `roll` as
+ * `a + b + c + d` — left-associative, i.e. `(((a+b)+c)+d)`, which is exactly
+ * what the generic loop `roll = 0; roll += a; ...` produces because `0.0 + a`
+ * is exact. So ONE kernel serves both and no special case is needed. Stated
+ * because the opposite is true for `wilders` in this same crate, where the
+ * chunked seed genuinely changes the answer.
+ *
+ * The f32 file above carries a `two_sumf` Dekker compensation helper. That
+ * exists to claw back f32 precision on the rolling |diff| sum; at f64 the
+ * CPU does a PLAIN `roll = roll + add - sub` (er.rs:356) and compensating
+ * would produce a DIFFERENT number from the reference, not a better one.
+ * Deliberately not carried over.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void er_neo_batch_f64(const double* __restrict__ data,
+                      int series_len,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+    if (warm >= len) { for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN; return; }
+
+    double roll = 0.0;
+    for (int j = first_valid; j < warm; ++j) roll += fabs(data[j + 1] - data[j]);
+
+    int start = first_valid;
+    for (int i = warm; i < len; ++i) {
+        const double delta = fabs(data[i] - data[start]);
+        // (delta / roll).min(1.0) — f64::min returns the NON-NaN operand, so a
+        // NaN ratio yields 1.0 on the CPU. `fmin` matches; `r < 1 ? r : 1`
+        // would yield the NaN.
+        o[i] = (roll > 0.0) ? fmin(delta / roll, 1.0) : 0.0;
+
+        if (i + 1 == len) break;
+        const double add = fabs(data[i + 1] - data[i]);
+        const double sub = fabs(data[start + 1] - data[start]);
+        roll = roll + add - sub;
+        start += 1;
+    }
+}

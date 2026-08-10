@@ -117,8 +117,18 @@ pub mod device {
         pub reserved: u64,
     }
 
+    /// "No override — use the settings' own spread." Mirrors `kNoTickOverride`.
+    ///
+    /// A sentinel rather than 0 because ZERO IS A LEGITIMATE OVERRIDE: "what
+    /// does this strategy look like with no spread at all" is a question the
+    /// sensitivity screen may reasonably ask, and a zero that means "unset"
+    /// makes it unaskable.
+    pub const NO_TICK_OVERRIDE: i32 = -1;
+    /// As [`NO_TICK_OVERRIDE`], for `commission_micros`.
+    pub const NO_MICRO_OVERRIDE: i64 = -1;
+
     #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ScenarioDescriptor {
         pub base_candidate_id: u64,
         pub scenario_id: u64,
@@ -132,6 +142,41 @@ pub mod device {
         pub perturbation_offset: u32,
         pub perturbation_count: u32,
         pub reserved: u64,
+    }
+
+    /// A HAND-WRITTEN `Default`, because the derived one was a FREE-TRADING
+    /// BACKTEST.
+    ///
+    /// `spread_ticks` and `commission_micros` used to mean "0 = use the
+    /// settings' value". They now mean "-1 = use the settings' value, 0 = charge
+    /// NOTHING". `#[derive(Default)]` writes zeros, so every
+    /// `..ScenarioDescriptor::default()` construction silently became "no
+    /// spread, no commission" the moment the sentinel changed — and three
+    /// fixture sites did exactly that, one of them a cost fixture that sets
+    /// `spread_pips: 2.0, commission_per_trade: 10.0` and would have had the
+    /// device price its trades at zero while the CPU oracle charged both.
+    ///
+    /// The default is now the identity: a full-series base scenario over gene 0
+    /// with the settings' own costs. It cannot express "charge nothing" by
+    /// accident, only on purpose.
+    impl Default for ScenarioDescriptor {
+        fn default() -> Self {
+            Self {
+                base_candidate_id: 0,
+                scenario_id: 0,
+                rng_counter: 0,
+                window_offset: 0,
+                // 0 means "to the end of the series" on both sides.
+                window_len: 0,
+                scenario_type: 0,
+                spread_ticks: NO_TICK_OVERRIDE,
+                slippage_ticks: 0,
+                commission_micros: NO_MICRO_OVERRIDE,
+                perturbation_offset: 0,
+                perturbation_count: 0,
+                reserved: 0,
+            }
+        }
     }
 
     #[repr(C)]

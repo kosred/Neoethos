@@ -261,3 +261,209 @@ extern "C" __global__ void stochastic_money_flow_index_batch_f64(
             : d_sum / static_cast<double>(stoch_d_smooth);
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — stochastic_money_flow_index
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/stochastic_money_flow_index.rs:671
+ *   compute_row_default_14_3_3_14::<true>. That specialisation — NOT the
+ *   generic stream — is the oracle because compute_row (:876-885) dispatches
+ *   to it whenever the four windows are 14/3/3/14, and those are exactly the
+ *   defaults this period-invariant lane pins. CHECK_FINITE is true: it is the
+ *   branch compute_row takes when the frame is not all-finite, and on an
+ *   all-finite frame the two branches compute the same expressions.
+ *
+ * Column: output_id "value" resolves to out.k — cpu_batch.rs:5692 accepts
+ *   "k"/"value". The D series is a separate output id; its SMA is still
+ *   advanced here because the CPU advances it from K inside the same loop and
+ *   a reset must clear both consistently.
+ *
+ * PERIOD-INVARIANT: compute_stochastic_money_flow_index_batch reads
+ *   stoch_k_length (14), stoch_k_smooth (3), stoch_d_smooth (3) and
+ *   mfi_length (14) and NEVER period (cpu_batch.rs:5668-5675).
+ *
+ * FIRST-VALID IGNORED: the row walks EVERY bar from index 0 and RESETS every
+ *   accumulator on a non-finite source OR volume (:709-731), writing NaN for
+ *   that bar. The caller's first-valid index is never read.
+ *
+ * Input: (close, volume) — extract_close_volume_input(.., "close")
+ *   (cpu_batch.rs:5659) — F64InputKind::CloseVolume.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. A 13-deep signed money-flow
+ *   ring with running positive/negative sums, two MONOTONE DEQUES over the MFI
+ *   series, and two sliding-sum SMAs all carry state.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the flow sums SUBTRACT THE OUTGOING ENTRY FIRST and only then add the
+ *     new one (:748-761) — pos_sum -= old; ...; pos_sum += new. Reversing
+ *     those two roundings drifts.
+ *   * the K SMA adds then subtracts (k_sum += raw_k; k_sum -= old, :839-840)
+ *     while the ring is full, and accumulates plainly while warming.
+ *   * the MFI guard is total <= 1e-14 (:767) — already an f64-sized
+ *     tolerance, carried across unchanged.
+ *   * the stochastic guard is highest - lowest > f64::EPSILON (:815), i.e.
+ *     DBL_EPSILON = 2.220446049250313e-16. This is the f64 machine epsilon and
+ *     is CORRECT here; it is not an f32 epsilon copied across.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:5668-5675, which are what selects the
+ * 14/3/3/14 specialisation. Every ring below is sized by them, so the bounds
+ * belong to the COMPILED kernel. */
+#define NEO_SMFI_FLOW_LEN   13
+#define NEO_SMFI_DEQUE_CAP  15
+#define NEO_SMFI_STOCH_LEN  14
+#define NEO_SMFI_SMOOTH     3
+#define NEO_SMFI_DBL_EPS    2.2204460492503131e-16
+
+extern "C" __global__
+void stochastic_money_flow_index_neo_batch_f64(const double* __restrict__ price,
+                                               const double* __restrict__ volume,
+                                               int n,
+                                               const int* __restrict__ periods,
+                                               int n_combos,
+                                               int first_valid,
+                                               double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant — see header */
+    (void)first_valid; /* the mid-series reset reproduces it — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    double pos_buf[NEO_SMFI_FLOW_LEN], neg_buf[NEO_SMFI_FLOW_LEN];
+    int    flow_head = 0, flow_count = 0;
+    double pos_sum = 0.0, neg_sum = 0.0;
+    double prev_source = NEO_F64_NAN;
+    bool   has_prev = false;
+
+    int    max_idx[NEO_SMFI_DEQUE_CAP]; double max_val[NEO_SMFI_DEQUE_CAP];
+    int    min_idx[NEO_SMFI_DEQUE_CAP]; double min_val[NEO_SMFI_DEQUE_CAP];
+    int    max_head = 0, max_len = 0, min_head = 0, min_len = 0;
+    int    mfi_index = 0;
+
+    double k_buf[NEO_SMFI_SMOOTH]; int k_head = 0, k_len = 0; double k_sum = 0.0;
+    double d_buf[NEO_SMFI_SMOOTH]; int d_head = 0, d_len = 0; double d_sum = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double src = price[i];
+        const double vol = volume[i];
+
+        if (!isfinite(src) || !isfinite(vol)) {
+            flow_head = 0; flow_count = 0; pos_sum = 0.0; neg_sum = 0.0;
+            prev_source = NEO_F64_NAN; has_prev = false;
+            max_head = 0; max_len = 0; min_head = 0; min_len = 0; mfi_index = 0;
+            k_head = 0; k_len = 0; k_sum = 0.0;
+            d_head = 0; d_len = 0; d_sum = 0.0;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        if (!has_prev) {
+            prev_source = src; has_prev = true;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        const double diff = src - prev_source;
+        prev_source = src;
+        const double flow    = src * vol;
+        const double pos_new = (diff > 0.0) ? flow : 0.0;
+        const double neg_new = (diff < 0.0) ? flow : 0.0;
+
+        if (flow_count == NEO_SMFI_FLOW_LEN) {
+            pos_sum -= pos_buf[flow_head];
+            neg_sum -= neg_buf[flow_head];
+        } else {
+            ++flow_count;
+        }
+
+        pos_buf[flow_head] = pos_new;
+        neg_buf[flow_head] = neg_new;
+        pos_sum += pos_new;
+        neg_sum += neg_new;
+        ++flow_head;
+        if (flow_head == NEO_SMFI_FLOW_LEN) flow_head = 0;
+
+        if (flow_count < NEO_SMFI_FLOW_LEN) { o[i] = NEO_F64_NAN; continue; }
+
+        const double total = pos_sum + neg_sum;
+        const double mfi   = (total <= 1e-14) ? 0.0 : (100.0 * pos_sum / total);
+
+        while (max_len > 0) {
+            const int back = (max_head + max_len - 1) % NEO_SMFI_DEQUE_CAP;
+            if (max_val[back] > mfi) break;
+            --max_len;
+        }
+        {
+            const int tail = (max_head + max_len) % NEO_SMFI_DEQUE_CAP;
+            max_idx[tail] = mfi_index; max_val[tail] = mfi; ++max_len;
+        }
+
+        while (min_len > 0) {
+            const int back = (min_head + min_len - 1) % NEO_SMFI_DEQUE_CAP;
+            if (min_val[back] < mfi) break;
+            --min_len;
+        }
+        {
+            const int tail = (min_head + min_len) % NEO_SMFI_DEQUE_CAP;
+            min_idx[tail] = mfi_index; min_val[tail] = mfi; ++min_len;
+        }
+
+        const int window_start =
+            (mfi_index + 1 >= NEO_SMFI_STOCH_LEN) ? (mfi_index + 1 - NEO_SMFI_STOCH_LEN) : 0;
+        while (max_len > 0 && max_idx[max_head] < window_start) {
+            max_head = (max_head + 1) % NEO_SMFI_DEQUE_CAP; --max_len;
+        }
+        while (min_len > 0 && min_idx[min_head] < window_start) {
+            min_head = (min_head + 1) % NEO_SMFI_DEQUE_CAP; --min_len;
+        }
+        ++mfi_index;
+
+        if (mfi_index < NEO_SMFI_STOCH_LEN) { o[i] = NEO_F64_NAN; continue; }
+
+        const double highest = max_val[max_head];
+        const double lowest  = min_val[min_head];
+        const double raw_k   = (highest - lowest > NEO_SMFI_DBL_EPS)
+            ? (100.0 * (mfi - lowest) / (highest - lowest))
+            : 0.0;
+
+        double k;
+        if (k_len < NEO_SMFI_SMOOTH) {
+            k_buf[k_head] = raw_k;
+            ++k_head; if (k_head == NEO_SMFI_SMOOTH) k_head = 0;
+            ++k_len;
+            k_sum += raw_k;
+            if (k_len < NEO_SMFI_SMOOTH) { o[i] = NEO_F64_NAN; continue; }
+            k = k_sum / 3.0;
+        } else {
+            k_sum += raw_k;
+            k_sum -= k_buf[k_head];
+            k_buf[k_head] = raw_k;
+            ++k_head; if (k_head == NEO_SMFI_SMOOTH) k_head = 0;
+            k = k_sum / 3.0;
+        }
+
+        o[i] = k;
+
+        /* The D SMA is advanced from K exactly as the CPU advances it, so a
+         * later reset clears a consistent state. Its value is a different
+         * output id and is not written here. */
+        if (d_len < NEO_SMFI_SMOOTH) {
+            d_buf[d_head] = k;
+            ++d_head; if (d_head == NEO_SMFI_SMOOTH) d_head = 0;
+            ++d_len;
+            d_sum += k;
+        } else {
+            d_sum += k;
+            d_sum -= d_buf[d_head];
+            d_buf[d_head] = k;
+            ++d_head; if (d_head == NEO_SMFI_SMOOTH) d_head = 0;
+        }
+    }
+}

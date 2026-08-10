@@ -56,10 +56,25 @@
 //! or [`crate::domain::prop_firm::PropFirmConstraints`]. When a
 //! `RiskyModeManager` is bound on a `TradingSession`, it is the
 //! STRICTER outer gate: `RiskyModeManager::check_trade_allowed`
-//! runs BEFORE `risk_gate::prop_firm_pre_trade_check`, so a Risky
-//! Mode rejection blocks the order before it ever reaches the prop-
-//! firm rules. The prop-firm constraints stay in place for the
-//! manual-trading (non-Risky-Mode) path.
+//! runs first, so a Risky Mode rejection blocks the order before
+//! anything downstream sees it.
+//!
+//! **CORRECTION 2026-08-09 (audit #142/#137).** This paragraph used
+//! to say the gate ran *"BEFORE `risk_gate::prop_firm_pre_trade_check`"*
+//! and that *"the prop-firm constraints stay in place for the
+//! manual-trading path"*. Both halves are false and were false when
+//! written:
+//!
+//! - `risk_gate::prop_firm_pre_trade_check` **does not exist**
+//!   anywhere in `crates/`, `desktop/`, `mesh/` or `mcp/`.
+//! - [`crate::domain::risk::RiskManager`], which owns the prop-firm
+//!   tiers, has **no production constructor** — see the warning on
+//!   that struct. Nothing downstream of this manager applies them.
+//!
+//! So `RiskyModeManager` is not the outer of two gates. On the live
+//! path it is, together with the breakers in
+//! `neoethos-app/src/app_services/live_trading.rs`, the ONLY gate.
+//! Read it that way.
 //!
 //! ## Numeric convention (operator directive §7.2)
 //!
@@ -283,7 +298,24 @@ pub struct RiskyModeConfig {
     pub stages: Vec<RiskyStage>,
     /// Operator-acknowledged tail-risk ceiling. Default
     /// [`MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY`] (0.99).
+    ///
+    /// **This is a PROBABILITY and feeds the ruin model only.** Until
+    /// 2026-08-09 [`RiskyModeManager::check_trade_allowed`] also used it as the
+    /// per-month LOSS FRACTION, so re-tuning the ruin model would silently have
+    /// moved the monthly kill switch. That is now
+    /// [`Self::monthly_loss_cap_fraction`].
     pub acknowledged_ruin_probability_ceiling: f64,
+    /// Cumulative realized loss over the calendar month, as a fraction of the
+    /// CURRENT bankroll, above which [`KillSwitchTier::PerMonth`] trips.
+    ///
+    /// **Split out 2026-08-09 from `acknowledged_ruin_probability_ceiling`,
+    /// with the identical default value, so this change permits and refuses
+    /// exactly what it did before** — the defect fixed here is the type
+    /// confusion, not the threshold. At the default
+    /// [`MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY`] (0.99) this tier is
+    /// effectively inert: the per-day cap (0.80 → 0.50 of bankroll) always
+    /// binds first. Lower it to make the monthly tier actually bite.
+    pub monthly_loss_cap_fraction: f64,
     /// Pre-broker-send sanity check fraction. No single order's
     /// implied risk may exceed this fraction of the current
     /// bankroll, regardless of stage sizing.
@@ -348,6 +380,7 @@ impl Default for RiskyModeConfig {
             stage_doubling_factor: DEFAULT_DOUBLING_FACTOR,
             stages,
             acknowledged_ruin_probability_ceiling: MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+            monthly_loss_cap_fraction: MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
             presend_sanity_ceiling_fraction: DEFAULT_PRESEND_SANITY_CEILING_FRACTION,
             autonomous_only_contract_accepted: false,
             allow_live_broker: false,
@@ -486,6 +519,15 @@ impl RiskyModeConfig {
                 self.acknowledged_ruin_probability_ceiling
             );
         }
+        if !self.monthly_loss_cap_fraction.is_finite()
+            || self.monthly_loss_cap_fraction <= 0.0
+            || self.monthly_loss_cap_fraction > 1.0
+        {
+            bail!(
+                "monthly_loss_cap_fraction must be in (0, 1.0], got {}",
+                self.monthly_loss_cap_fraction
+            );
+        }
         if !self.presend_sanity_ceiling_fraction.is_finite()
             || self.presend_sanity_ceiling_fraction <= 0.0
             || self.presend_sanity_ceiling_fraction > 1.0
@@ -584,6 +626,10 @@ pub enum KillSwitchTier {
 pub struct RiskyModeManager {
     config: RiskyModeConfig,
     current_stage_idx: u8,
+    /// Highest stage this manager has ever occupied. Only ever advances.
+    /// The per-stage retreat trigger measures against THIS, not the live
+    /// cursor — see [`RiskyModeManager::check_trade_allowed`].
+    high_water_stage_idx: u8,
     current_bankroll_usd: f64,
     daily_loss_accumulated_usd: f64,
     weekly_loss_accumulated_usd: f64,
@@ -615,6 +661,7 @@ impl RiskyModeManager {
         Ok(Self {
             config,
             current_stage_idx: stage_idx,
+            high_water_stage_idx: stage_idx,
             current_bankroll_usd: initial_bankroll_usd,
             daily_loss_accumulated_usd: 0.0,
             weekly_loss_accumulated_usd: 0.0,
@@ -717,16 +764,30 @@ impl RiskyModeManager {
         }
 
         // Per-stage retreat trigger (research §5.3).
-        if self.current_stage_idx > 0 {
-            let prev = &self.config.stages[(self.current_stage_idx as usize) - 1];
+        //
+        // **Fixed 2026-08-09 — this tier was unreachable.** It used to compare
+        // against `self.current_stage_idx`, but EVERY write to that cursor is
+        // `locate_stage_idx(stages, bankroll)` (`new`, `sync_bankroll`,
+        // `record_trade_outcome`), which by construction returns an index whose
+        // `bankroll_lower_usd` is <= the bankroll. The predecessor's lower bound
+        // is lower still, so `bankroll < prev.lower` could never hold and
+        // `PerStage` could never fire — while the ARMED banner advertised it.
+        //
+        // A retreat is measured against the HIGH-WATER stage, which only ever
+        // advances. Reaching stage N and then falling below stage N-1's floor
+        // is the event this tier was written for.
+        if self.high_water_stage_idx > 0 {
+            let prev = &self.config.stages[(self.high_water_stage_idx as usize) - 1];
             if self.current_bankroll_usd < prev.bankroll_lower_usd {
                 return Err(KillSwitchTier::PerStage);
             }
         }
 
-        // Per-month cap (research §5.4).
-        let monthly_cap_usd =
-            self.config.acknowledged_ruin_probability_ceiling * self.current_bankroll_usd;
+        // Per-month cap (research §5.4). See `monthly_loss_cap_fraction` — this
+        // read used `acknowledged_ruin_probability_ceiling`, a PROBABILITY, as a
+        // loss FRACTION until 2026-08-09. Same default value, so the threshold
+        // is unchanged; the coupling to the ruin model is gone.
+        let monthly_cap_usd = self.config.monthly_loss_cap_fraction * self.current_bankroll_usd;
         if self.monthly_loss_accumulated_usd >= monthly_cap_usd {
             return Err(KillSwitchTier::PerMonth);
         }
@@ -757,9 +818,86 @@ impl RiskyModeManager {
         capped * self.current_bankroll_usd
     }
 
+    /// Reconcile the bankroll cursor to an externally observed balance,
+    /// WITHOUT touching the loss accumulators or the kill-switch history.
+    ///
+    /// **Added 2026-08-09 (W3) because wiring the gate without it produces
+    /// false refusals.** [`Self::record_trade_outcome`] only sees the trades
+    /// THIS engine opened. The real account also moves from manual orders,
+    /// other concurrently running engines, deposits, withdrawals and swap — so
+    /// `current_bankroll_usd` drifts away from the balance the live sizing
+    /// actually multiplies. Left unreconciled, an account that grew from
+    /// another engine's wins would size at `0.50 × new_balance` and be measured
+    /// against a pre-send ceiling of `0.55 × stale_bankroll`, and
+    /// [`Self::check_trade_allowed`] would return
+    /// [`KillSwitchTier::PreSendSanity`] on a perfectly correctly sized order.
+    ///
+    /// Callers should call this with the broker's fresh balance immediately
+    /// before `check_trade_allowed`, so every tier is evaluated against the
+    /// money that actually exists.
+    ///
+    /// Deliberately does NOT reset the accumulators: a day's losses are a day's
+    /// losses regardless of where the balance came from, and the day cap
+    /// (`daily_loss_cap_fraction × bankroll`) correctly tightens as the
+    /// bankroll falls and loosens as it recovers.
+    ///
+    /// Non-finite or non-positive input is ignored — a failed balance fetch
+    /// must never silently move the cursor to zero and trip `PerStage`.
+    pub fn sync_bankroll(&mut self, bankroll_usd: f64) {
+        if !bankroll_usd.is_finite() || bankroll_usd <= 0.0 {
+            return;
+        }
+        self.current_bankroll_usd = bankroll_usd;
+        self.current_stage_idx = locate_stage_idx(&self.config.stages, bankroll_usd);
+        self.high_water_stage_idx = self.high_water_stage_idx.max(self.current_stage_idx);
+    }
+
+    /// Raise the period loss accumulators to AT LEAST the supplied values,
+    /// never lowering them.
+    ///
+    /// **Added 2026-08-09 because the ledger was per-ENGINE while the money is
+    /// per-ACCOUNT.** [`Self::record_trade_outcome`] only ever sees the trades
+    /// the engine holding this manager opened, but `POST /autonomous/start`
+    /// spawns one engine per portfolio and they all trade the SAME cTrader
+    /// account. With N engines the account could lose roughly N × the intended
+    /// daily cap before any single engine's `daily_loss_accumulated_usd`
+    /// reached its own. The same gap made the ledger evaporate on restart,
+    /// while the halt it produces is persisted.
+    ///
+    /// The caller supplies the ACCOUNT's realized losses for the current UTC
+    /// day / ISO week / calendar month — the trade journal is the durable,
+    /// account-wide record of exactly that. `max` rather than `=` is what makes
+    /// the two sources safe to combine: a trade this engine already booked and
+    /// the journal has also recorded counts once, not twice, and a close the
+    /// journal has not caught up with yet is not forgotten.
+    ///
+    /// Non-finite or negative inputs are ignored — an unreadable journal must
+    /// never be able to LOWER a loss already counted.
+    pub fn raise_period_losses(&mut self, day_usd: f64, week_usd: f64, month_usd: f64) {
+        let raise = |slot: &mut f64, v: f64| {
+            if v.is_finite() && v > *slot {
+                *slot = v;
+            }
+        };
+        raise(&mut self.daily_loss_accumulated_usd, day_usd);
+        raise(&mut self.weekly_loss_accumulated_usd, week_usd);
+        raise(&mut self.monthly_loss_accumulated_usd, month_usd);
+    }
+
+    /// Highest stage index this manager has ever occupied (for logging).
+    pub fn high_water_stage_idx(&self) -> u8 {
+        self.high_water_stage_idx
+    }
+
     /// Update bankroll after a closed trade. Advances or retreats
     /// the stage cursor as needed. Positive `pnl_usd` increases
     /// bankroll, negative decreases.
+    ///
+    /// The bankroll it computes is a running estimate from THIS engine's
+    /// trades; [`Self::sync_bankroll`] overwrites it with the broker's truth at
+    /// the next entry. The part that only this method can provide, and the
+    /// reason it must be called on every closed trade, is the daily / weekly /
+    /// monthly loss ledger the kill switch trips on.
     pub fn record_trade_outcome(&mut self, pnl_usd: f64) {
         if !pnl_usd.is_finite() {
             return;
@@ -775,6 +913,7 @@ impl RiskyModeManager {
             self.consecutive_losses = 0;
         }
         self.current_stage_idx = locate_stage_idx(&self.config.stages, self.current_bankroll_usd);
+        self.high_water_stage_idx = self.high_water_stage_idx.max(self.current_stage_idx);
     }
 
     /// Reset the daily-loss accumulator (caller decides when —
@@ -1267,6 +1406,46 @@ mod tests {
         let mut cfg = RiskyModeConfig::default();
         cfg.autonomous_only_contract_accepted = true;
         cfg
+    }
+
+    #[test]
+    fn sync_bankroll_relocates_the_stage_without_touching_the_ledgers() {
+        // W3 (2026-08-09). `sync_bankroll` exists so the live gate measures a
+        // proposed order against the balance that actually exists, not against
+        // a cursor that only ever saw one engine's trades.
+        let mut m = RiskyModeManager::new(signed_default_config(), 20.0).expect("manager");
+        assert_eq!(m.current_stage().stage_idx, 0);
+        m.record_trade_outcome(-5.0);
+        let ledger = m.daily_loss_accumulated_usd();
+        assert!((ledger - 5.0).abs() < 1e-9);
+
+        m.sync_bankroll(1_000.0);
+        assert!((m.current_bankroll_usd() - 1_000.0).abs() < 1e-9);
+        assert!(
+            m.current_stage().stage_idx > 0,
+            "a 50x bankroll must advance the stage cursor"
+        );
+        assert!(
+            (m.daily_loss_accumulated_usd() - ledger).abs() < 1e-9,
+            "reconciling the balance must not launder the day's losses"
+        );
+        assert!(m.last_kill_switch_trip().is_none());
+    }
+
+    #[test]
+    fn sync_bankroll_ignores_a_failed_balance_read() {
+        // 0.0 is what `fetch_account_runtime_blocking` yields on failure.
+        // Accepting it would zero the bankroll and trip PerStage on the next
+        // entry of every running engine.
+        let mut m = RiskyModeManager::new(signed_default_config(), 640.0).expect("manager");
+        let before = m.current_bankroll_usd();
+        let stage_before = m.current_stage().stage_idx;
+        m.sync_bankroll(0.0);
+        m.sync_bankroll(-12.0);
+        m.sync_bankroll(f64::NAN);
+        m.sync_bankroll(f64::INFINITY);
+        assert!((m.current_bankroll_usd() - before).abs() < 1e-9);
+        assert_eq!(m.current_stage().stage_idx, stage_before);
     }
 
     #[test]
@@ -1844,5 +2023,112 @@ mod tests {
         assert!(stage_risk_fraction_for_bankroll(0.0, 50_000.0, 2.0, 100.0).is_none());
         assert!(stage_risk_fraction_for_bankroll(100.0, 50_000.0, 1.0, 100.0).is_none());
         assert!(stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 0.0).is_none());
+    }
+
+    // ── 2026-08-09: the three tiers the review proved were dead ──────────────
+
+    /// `PerStage` could never fire. Every write to `current_stage_idx` is
+    /// `locate_stage_idx(stages, bankroll)`, which guarantees
+    /// `bankroll >= stages[idx].lower`, and the predecessor's lower bound is
+    /// lower still — so the old `bankroll < prev.lower` test was unsatisfiable.
+    /// This pins the corrected rule: the trigger is a retreat from the
+    /// HIGH-WATER stage.
+    #[test]
+    fn per_stage_fires_on_a_retreat_below_the_previous_rung_of_the_high_water_stage() {
+        let mut cfg = signed_default_config();
+        cfg.starting_capital_usd = 100.0;
+        cfg.target_capital_usd = 50_000.0;
+        cfg.stages = build_logarithmic_stages(100.0, 50_000.0, DEFAULT_DOUBLING_FACTOR);
+        // Start ON the first rung: no stage has been left behind, so a retreat
+        // is not yet definable and the tier must stay silent.
+        let mut m = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        assert_eq!(m.high_water_stage_idx(), 0);
+        m.sync_bankroll(40.0);
+        assert!(
+            m.check_trade_allowed(1.0, 20.0, 40.0).is_ok(),
+            "no stage was ever cleared — PerStage must not fire"
+        );
+
+        // Climb to stage 1 (>= 200), then fall back below stage 0's floor.
+        m.sync_bankroll(250.0);
+        assert_eq!(m.high_water_stage_idx(), 1);
+        m.sync_bankroll(150.0);
+        assert!(
+            m.check_trade_allowed(1.0, 20.0, 40.0).is_ok(),
+            "150 is still above stage 0's floor of 100 — not a retreat"
+        );
+        m.sync_bankroll(90.0);
+        assert_eq!(
+            m.check_trade_allowed(1.0, 20.0, 40.0),
+            Err(KillSwitchTier::PerStage),
+            "climbed to stage 1 then fell below stage 0's floor — retreat"
+        );
+    }
+
+    /// The high-water cursor only advances; a falling balance must not reset it
+    /// (that is precisely how the old cursor erased the retreat).
+    #[test]
+    fn the_high_water_stage_never_walks_back_down() {
+        let mut cfg = signed_default_config();
+        cfg.stages = build_logarithmic_stages(100.0, 50_000.0, DEFAULT_DOUBLING_FACTOR);
+        cfg.starting_capital_usd = 100.0;
+        cfg.target_capital_usd = 50_000.0;
+        let mut m = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        m.sync_bankroll(1_700.0);
+        let peak = m.high_water_stage_idx();
+        assert!(peak >= 4, "1700 should sit on stage 4 of the 100->50k ladder");
+        m.record_trade_outcome(-1_600.0);
+        assert_eq!(m.high_water_stage_idx(), peak);
+        assert!(m.current_stage().stage_idx < peak);
+    }
+
+    /// The monthly cap must no longer be driven by the ruin PROBABILITY, and
+    /// splitting it must not have moved the threshold.
+    #[test]
+    fn the_monthly_cap_is_its_own_knob_and_defaults_to_the_previous_value() {
+        let cfg = RiskyModeConfig::default();
+        assert_eq!(
+            cfg.monthly_loss_cap_fraction, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+            "behaviour must be identical to before the split"
+        );
+        // Re-tuning the ruin model must not move the kill switch any more.
+        let mut cfg = signed_default_config();
+        cfg.acknowledged_ruin_probability_ceiling = 0.10;
+        cfg.monthly_loss_cap_fraction = 0.50;
+        let mut m = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        m.raise_period_losses(0.0, 0.0, 40.0);
+        assert!(
+            m.check_trade_allowed(1.0, 20.0, 40.0).is_ok(),
+            "40 < 0.50 * 100 — under the monthly cap"
+        );
+        m.raise_period_losses(0.0, 0.0, 60.0);
+        assert_eq!(
+            m.check_trade_allowed(1.0, 20.0, 40.0),
+            Err(KillSwitchTier::PerMonth)
+        );
+        // Rejected by the validator, not silently clamped.
+        let mut bad = signed_default_config();
+        bad.monthly_loss_cap_fraction = 0.0;
+        assert!(RiskyModeManager::new(bad, 100.0).is_err());
+    }
+
+    /// The account-wide ledger hook: another engine's loss must be able to
+    /// close this engine's day, and it must never double-count or subtract.
+    #[test]
+    fn raise_period_losses_takes_the_max_and_never_lowers() {
+        let mut m = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        m.record_trade_outcome(-10.0); // this engine's own loss
+        assert!((m.daily_loss_accumulated_usd() - 10.0).abs() < 1e-9);
+        // The journal reports the same trade — must count ONCE, not twice.
+        m.raise_period_losses(10.0, 10.0, 10.0);
+        assert!((m.daily_loss_accumulated_usd() - 10.0).abs() < 1e-9);
+        // A sibling engine lost 25 more on the same account.
+        m.raise_period_losses(35.0, 35.0, 35.0);
+        assert!((m.daily_loss_accumulated_usd() - 35.0).abs() < 1e-9);
+        // An unreadable / stale journal must never lower a booked loss.
+        m.raise_period_losses(0.0, 0.0, 0.0);
+        m.raise_period_losses(f64::NAN, -5.0, f64::INFINITY);
+        assert!((m.daily_loss_accumulated_usd() - 35.0).abs() < 1e-9);
+        assert!((m.weekly_loss_accumulated_usd() - 35.0).abs() < 1e-9);
     }
 }

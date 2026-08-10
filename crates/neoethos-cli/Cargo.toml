@@ -18,7 +18,14 @@ default = []
 # builds the CLI with the SAME cubecl-wgpu / CUDA GPU eval the app uses; the
 # headless/VPS path is no longer silently CPU-only.
 gpu = ["gpu-nvidia"]
-gpu-nvidia = ["neoethos-models/gpu-cuda", "neoethos-search/gpu-cuda"]
+# `neoethos-data/gpu-cuda` added 2026-08-09 — it had been declared and named by
+# nothing, so vector-ta's CUDA indicator kernels were never in a binary. MIRRORS
+# neoethos-app exactly, per the parity rule above.
+gpu-nvidia = [
+    "neoethos-data/gpu-cuda",
+    "neoethos-models/gpu-cuda",
+    "neoethos-search/gpu-cuda",
+]
 # Minimal native-CUDA build: Prototype B only, no CubeCL and no libtorch. Used
 # by the rented-GPU kit to prove the B kernel before provisioning anything else.
 gpu-b-native = ["neoethos-search/gpu-b-native"]

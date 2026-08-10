@@ -323,3 +323,126 @@ extern "C" __global__ void linearreg_angle_many_series_one_param_f32(
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — linearreg_angle
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/linearreg_angle.rs:287 `linearreg_angle_scalar`.
+ *
+ * THE 4-WIDE SEED IS LOAD-BEARING. The window sums are accumulated in groups
+ * of four (linearreg_angle.rs:310-321):
+ *      sum_y  += y0 + y1 + y2 + y3;
+ *      sum_kd += jf*y0 + (jf+1)*y1 + (jf+2)*y2 + (jf+3)*y3;
+ * with a scalar tail. That association is a DIFFERENT number from four
+ * separate `+=` steps, and it is the reference. Reproduced exactly, including
+ * the tail. (This is the same class of thing that makes `wilders` and `smma`
+ * disagree about their seeds elsewhere in this crate.)
+ *
+ * `atanf` x4 in the f32 kernel above is the single-precision arctangent —
+ * about 2 decimal digits short of what an angle threshold needs. `atan` here.
+ *
+ * The CPU has two otherwise-identical loops selected by whether ANY value from
+ * `first` onward is NaN; the NaN loop rebuilds the window sums from scratch
+ * whenever a NaN enters or leaves. Both are reproduced, selected by the same
+ * predicate, because the rebuild changes the association of the sums.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void linearreg_angle_neo_batch_f64(const double* __restrict__ data,
+                                   int series_len,
+                                   const int* __restrict__ periods,
+                                   int n_combos,
+                                   int first_valid,
+                                   double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) return;
+
+    const double p = (double)period;
+    // The CPU forms these in usize and casts once, so the products are exact
+    // integers before they reach f64. Computed the same way here (the operands
+    // are far below 2^53 for any real period).
+    const double sum_x     = (double)((long long)period * (long long)(period - 1)) * 0.5;
+    const double sum_x_sqr = (double)((long long)period * (long long)(period - 1) *
+                                      (long long)(2 * period - 1)) / 6.0;
+    const double divisor = sum_x * sum_x - p * sum_x_sqr;
+    const double inv_div = 1.0 / divisor;
+    const double rad2deg = 180.0 / 3.14159265358979323846;
+
+    int i = first_valid + period - 1;
+    if (i >= len) return;
+
+    int start = i + 1 - period;
+    double sum_y = 0.0, sum_kd = 0.0;
+
+    bool has_nan = false;
+    for (int t = first_valid; t < len; ++t) { if (isnan(data[t])) { has_nan = true; break; } }
+
+    {   // 4-wide seed, then scalar tail — linearreg_angle.rs:308-327
+        int j = start;
+        const int end = i + 1;
+        while (j + 3 < end) {
+            const double y0 = data[j], y1 = data[j + 1], y2 = data[j + 2], y3 = data[j + 3];
+            sum_y += y0 + y1 + y2 + y3;
+            const double jf = (double)j;
+            sum_kd += jf * y0 + (jf + 1.0) * y1 + (jf + 2.0) * y2 + (jf + 3.0) * y3;
+            j += 4;
+        }
+        while (j < end) {
+            const double y = data[j];
+            sum_y  += y;
+            sum_kd += (double)j * y;
+            j += 1;
+        }
+    }
+
+    for (;;) {
+        const double i_f = (double)i;
+        const double sum_xy = i_f * sum_y - sum_kd;
+        const double num = fma(p, sum_xy, -sum_x * sum_y);     // p.mul_add(sum_xy, -sum_x*sum_y)
+        const double slope = num * inv_div;
+        o[i] = atan(slope) * rad2deg;
+
+        i += 1;
+        if (i >= len) break;
+
+        const double enter = data[i];
+        const double leave = data[start];
+        start += 1;
+
+        if (has_nan && (isnan(enter) || isnan(leave))) {
+            sum_y = 0.0; sum_kd = 0.0;
+            const int ws = i + 1 - period;
+            int jj = ws;
+            const int ee = i + 1;
+            while (jj + 3 < ee) {
+                const double y0 = data[jj], y1 = data[jj + 1], y2 = data[jj + 2], y3 = data[jj + 3];
+                sum_y += y0 + y1 + y2 + y3;
+                const double jf = (double)jj;
+                sum_kd += jf * y0 + (jf + 1.0) * y1 + (jf + 2.0) * y2 + (jf + 3.0) * y3;
+                jj += 4;
+            }
+            while (jj < ee) {
+                const double y = data[jj];
+                sum_y  += y;
+                sum_kd += (double)jj * y;
+                jj += 1;
+            }
+        } else {
+            sum_y  += enter - leave;
+            sum_kd += (double)i * enter - (double)(i - period) * leave;
+        }
+    }
+}

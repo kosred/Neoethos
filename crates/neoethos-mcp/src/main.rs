@@ -1,21 +1,25 @@
-//! `neoethos-mcp` — the Codex control plane binary.
+//! `neoethos-control-plane` — the Codex control plane binary.
 //!
 //! stdio MCP server. stdout carries JSON-RPC exclusively; all logging goes
 //! to stderr (a CI test spawns this binary and asserts stdout stays
 //! protocol-clean). Configuration is CLI flags only — no env vars, per the
 //! one-config directive:
 //!
-//!   neoethos-mcp [--base-url http://127.0.0.1:7423] [--token <bearer>]
+//!   neoethos-control-plane [--base-url http://127.0.0.1:7423] [--token <bearer>]
+//!
+//! The binary was called `neoethos-mcp` until 2026-08-10, which collided with
+//! the unrelated outbound sidecar built from the top-level `mcp/` workspace —
+//! the one the installer places next to the desktop app and spawns by name.
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7423";
 
-const USAGE: &str = "neoethos-mcp — NeoEthos Codex control plane (MCP server over stdio)\n\
+const USAGE: &str = "neoethos-control-plane — NeoEthos Codex control plane (MCP server over stdio)\n\
                      \n\
                      USAGE:\n\
-                     \x20 neoethos-mcp [--base-url <url>] [--token <bearer>]\n\
+                     \x20 neoethos-control-plane [--base-url <url>] [--token <bearer>]\n\
                      \n\
                      OPTIONS:\n\
                      \x20 --base-url <url>   Backend API base URL (default http://127.0.0.1:7423)\n\

@@ -247,3 +247,180 @@ extern "C" __global__ void vlma_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `vlma_scalar_sma_stddev_into` (src/indicators/vlma.rs:451). That is
+ * the arm `vlma_compute_into` (:398) takes when `matype == "sma"` and
+ * `devtype == 0`, which are exactly the batch defaults
+ * (cpu_batch.rs:15736-15737); `vlma_prepare` maps `Kernel::Auto` onto
+ * `Kernel::Scalar` (:381), so there is one CPU answer.
+ *
+ * NOT `vlma_scalar_into` (:580). That generic arm calls out to `ma()` and
+ * `deviation()` and is a DIFFERENT accumulation. It is unreachable at the
+ * defaults, and transcribing it would have produced a plausible series that
+ * matched nothing.
+ *
+ * PERIOD-INVARIANT. `compute_vlma_batch` reads `min_period` (5),
+ * `max_period` (50), `matype` and `devtype` -- NEVER `period`
+ * (cpu_batch.rs:15734-15737). Five swept periods give five identical CPU
+ * columns, so the kernel writes five identical rows.
+ *
+ * SINGLE OUTPUT: "value" is the only column (cpu_batch.rs:15753).
+ *
+ * THE WARMUP HAS A HOLE IN IT, DELIBERATELY. `alloc_with_nan_prefix` blanks
+ * [0, first + max_period - 1), and then the compute writes `out[first] = x0`
+ * (:466) back INSIDE that prefix -- `vlma_into_slice` re-blanks the prefix but
+ * explicitly skips `i == first` (:334). So the emitted series is: NaN before
+ * `first`, the raw price AT `first`, NaN from `first+1` to `warm_end`, values
+ * from `warm_end` on. A kernel that blanked the whole prefix would drop one
+ * real bar.
+ *
+ * THE EMA RUNS THROUGH THE WARMUP. Between `first+1` and `warm_end` the CPU
+ * still advances `last_val` (:484-491) without emitting it. Skipping that loop
+ * would start the emitted series from a different seed.
+ *
+ * ONE ROUNDING: `fast_ema_update` is `(x - last).mul_add(sc, last)` (:74) --
+ * ONE rounding, so `fma(x - last, sc, last)`, not `last + sc*(x-last)`.
+ *
+ * THE ADAPTIVE PERIOD IS AN INTEGER STATE MACHINE. `delta = inc_slow -
+ * inc_fast` where both are 0/1 from four band comparisons (:536-538), then
+ * clamped to [min_period, max_period]. Reproduced as ints; the smoothing
+ * constant `2 / (p + 1)` is formed from that int exactly as `sc_lut` was
+ * (:474), so no table is needed.
+ *
+ * THE VARIANCE WINDOW IS ROLLED with an explicit `nan_count`, and the roll
+ * happens AFTER the emit, for the NEXT bar (:555-572). Rolling first would
+ * use tomorrow's window today.
+ *
+ * `var < 0.0 ? 0.0 : sqrt(var)` is the CPU's `if`, not an fmax -- NaN must
+ * reach `sqrt` the way it does on the CPU.
+ *
+ * NO PER-THREAD ARRAY: the `sc_lut` is replaced by the closed form and the
+ * window is read from the resident input, so no `max_period` bound.
+ *
+ * SEQUENTIAL, one thread per combo column.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define VLMA_NEO_MIN_PERIOD 5    /* cpu_batch.rs:15734 */
+#define VLMA_NEO_MAX_PERIOD 50   /* :15735 */
+
+/* fast_ema_update, vlma.rs:74 -- ONE rounding. */
+__device__ __forceinline__ double vlma_neo_ema_update(double last, double x, double sc)
+{
+    return fma(x - last, sc, last);
+}
+
+extern "C" __global__
+void vlma_neo_batch_f64(const double* __restrict__ data,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;                       /* PERIOD-INVARIANT -- see header. */
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (len == 0) return;
+    if (first_valid < 0 || first_valid >= len) return;
+
+    const int min_p_raw = VLMA_NEO_MIN_PERIOD;
+    const int max_p     = VLMA_NEO_MAX_PERIOD;
+    if (min_p_raw > max_p) return;                       /* :349 */
+    if (max_p <= 0 || max_p > len) return;               /* :356 */
+    if (len - first_valid < max_p) return;               /* :369 */
+
+    const int min_pi = (min_p_raw == 0) ? 1 : min_p_raw; /* :468 */
+    const int max_pi = (max_p > min_pi) ? max_p : min_pi;
+
+    const int warm_end = first_valid + max_p - 1;        /* :464 */
+
+    const double x0 = data[first_valid];
+    o[first_valid] = x0;                                 /* :466 -- inside the prefix */
+
+    int    last_p   = max_pi;
+    double last_val = x0;
+
+    /* Advance the EMA through the warmup without emitting -- :484-491. */
+    for (int i = first_valid + 1; i < len && i < warm_end; ++i) {
+        const double x = data[i];
+        if (!isnan(x)) {
+            const double sc = 2.0 / ((double)last_p + 1.0);   /* sc_lut[last_p], :474 */
+            last_val = vlma_neo_ema_update(last_val, x, sc);
+        }
+    }
+
+    if (warm_end >= len) return;                          /* :493 */
+
+    /* Seed the variance window -- :497-508. */
+    double sum = 0.0, sumsq = 0.0;
+    int    nan_count = 0;
+    for (int k = 0; k < max_p; ++k) {
+        const double v = data[first_valid + k];
+        if (isfinite(v)) { sum += v; sumsq += v * v; }
+        else             { nan_count += 1; }
+    }
+    const double inv_n = 1.0 / (double)max_p;
+
+    for (int i = warm_end; i < len; ++i) {
+        const double x = data[i];
+
+        if (isnan(x)) {
+            o[i] = NEO_F64_NAN;
+        } else {
+            double m, dv;
+            if (nan_count == 0) {
+                m = sum * inv_n;
+                const double var = (sumsq * inv_n) - m * m;
+                dv = (var < 0.0) ? 0.0 : sqrt(var);       /* the CPU's `if`, not fmax */
+            } else {
+                m = NEO_F64_NAN;
+                dv = NEO_F64_NAN;
+            }
+
+            const int prev_p = (last_p == 0) ? max_pi : last_p;
+            int next_p = prev_p;
+            if (isfinite(m) && isfinite(dv)) {
+                const double d175 = dv * 1.75;
+                const double d025 = dv * 0.25;
+                const double a = m - d175;
+                const double b = m - d025;
+                const double c = m + d025;
+                const double d = m + d175;
+                const int inc_fast = ((x < a) ? 1 : 0) | ((x > d) ? 1 : 0);
+                const int inc_slow = ((x >= b) ? 1 : 0) & ((x <= c) ? 1 : 0);
+                const int delta = inc_slow - inc_fast;
+                const int p_tmp = prev_p + delta;
+                next_p = (p_tmp < min_pi) ? min_pi : ((p_tmp > max_pi) ? max_pi : p_tmp);
+            }
+
+            const double sc = 2.0 / ((double)next_p + 1.0);
+            last_val = vlma_neo_ema_update(last_val, x, sc);
+            last_p = next_p;
+            o[i] = last_val;
+        }
+
+        /* Roll AFTER the emit, for the next bar -- :555-572. */
+        const int next = i + 1;
+        if (next < len) {
+            const int out_idx = next - max_p;
+            const double v_out = data[out_idx];
+            if (isfinite(v_out)) { sum -= v_out; sumsq -= v_out * v_out; }
+            else if (nan_count > 0) { nan_count -= 1; }   /* saturating_sub */
+            const double v_in = data[next];
+            if (isfinite(v_in)) { sum += v_in; sumsq += v_in * v_in; }
+            else                { nan_count += 1; }
+        }
+    }
+}

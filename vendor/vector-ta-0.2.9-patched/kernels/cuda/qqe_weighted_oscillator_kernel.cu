@@ -183,3 +183,171 @@ extern "C" __global__ void qqe_weighted_oscillator_batch_f64(
         has_prev_ts = true;
     }
 }
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4
+//
+// CPU reference:
+//   * arithmetic  : compute_into_slices,
+//                   src/indicators/qqe_weighted_oscillator.rs:486-594 -- the
+//                   only compute body this indicator has.
+//   * RMA / EMA   : RmaState::update (:322-341) and EmaState::update (:358-369).
+//   * refusals    : prepare_input, :417-484.
+//   * warmup      : first + length (:481).
+//   * emitted col : `rsi`. compute_qqe_weighted_oscillator_batch
+//                   (cpu_batch.rs:15909) maps output_id "value" -> out.rsi
+//                   (:15932).
+//   * PERIOD-INVARIANT: the batch reads `length` (14), `factor` (4.236),
+//                   `smooth` (5) and `weight` (2.0) and never `period`
+//                   (cpu_batch.rs:15917-15920).
+//   * FIRST-VALID  : data.iter().position(|v| v.is_finite()) (:428-431) -- ONE
+//                   price series scanned with is_finite, which is exactly
+//                   F64FirstValidRule::CloseFinite. The value is LOAD-BEARING
+//                   here: the loop starts at first + 1 and seeds prev_src from
+//                   data[first] (:512-516), so a different index shifts the
+//                   whole series rather than perturbing it.
+//
+// NaN: `.max(last_ts)` / `.min(last_ts)` (:570, :572) are f64::max / f64::min,
+// which return the NON-NaN operand. fmax/fmin are their exact twins; an
+// if-chain would let a NaN survive into prev_ts and poison every later bar.
+//
+// The `>`/`<`/`>=`/`<=` comparisons in the crossover tests are transliterated
+// as comparisons because the CPU writes them as comparisons -- a NaN there
+// makes the guard false on BOTH sides, which is the behaviour being copied.
+//
+// SEQUENTIAL, one thread per column: three Wilder RMAs, one EMA and the
+// carried (prev_rsi, prev_ts) pair all cross bars.
+// ===========================================================================
+
+#define QWO_NEO_LENGTH 14
+#define QWO_NEO_SMOOTH 5
+#define QWO_NEO_FACTOR 4.236
+#define QWO_NEO_WEIGHT 2.0
+
+static __device__ __forceinline__ double qwo_neo_qnan() {
+  return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// RmaState, :322-341. Returns false while the seed window is still filling.
+struct Qwo_Rma { int period; int count; double sum; double value; bool has; };
+
+static __device__ __forceinline__ bool qwo_rma_update(Qwo_Rma* s, double input, double* outv) {
+  if (!isfinite(input)) return false;
+  if (s->has) {
+    const double next = (s->value * ((double)s->period - 1.0) + input) / (double)s->period;
+    s->value = next;
+    *outv = next;
+    return true;
+  }
+  s->count += 1;
+  s->sum += input;
+  if (s->count == s->period) {
+    const double seeded = s->sum / (double)s->period;
+    s->value = seeded; s->has = true;
+    *outv = seeded;
+    return true;
+  }
+  return false;
+}
+
+extern "C" __global__
+void qqe_weighted_oscillator_neo_batch_f64(const double* __restrict__ prices,
+                                           int n,
+                                           const int* __restrict__ periods,
+                                           int n_combos,
+                                           int first_valid,
+                                           double* __restrict__ out) {
+  const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+  if (combo >= n_combos) return;
+  (void)periods;  // PERIOD-INVARIANT -- see the header.
+
+  if (n <= 0) return;
+  double* __restrict__ row = out + (size_t)combo * (size_t)n;
+  const double nn = qwo_neo_qnan();
+  for (int i = 0; i < n; ++i) row[i] = nn;
+
+  const int length = QWO_NEO_LENGTH;
+  const int smooth = QWO_NEO_SMOOTH;
+  const double factor = QWO_NEO_FACTOR;
+  const double weight = QWO_NEO_WEIGHT;
+
+  int first = first_valid;
+  if (first < 0) first = 0;
+
+  // prepare_input, :417-484. Every branch is an Err, and an Err is no column.
+  if (first >= n) return;
+  if (length > n) return;
+  int valid = 0;
+  for (int i = first; i < n; ++i) if (isfinite(prices[i])) valid += 1;
+  if (valid < length + 1) return;
+
+  Qwo_Rma num_state = { length, 0, 0.0, 0.0, false };
+  Qwo_Rma den_state = { length, 0, 0.0, 0.0, false };
+  Qwo_Rma diff_state = { length, 0, 0.0, 0.0, false };
+  const double alpha = 2.0 / ((double)smooth + 1.0);
+  double ema_val = 0.0; bool ema_has = false;
+
+  bool has_prev_src = true;
+  double prev_src = prices[first];
+  bool has_prev_rsi = false, has_prev_ts = false;
+  double prev_rsi = 0.0, prev_ts = 0.0;
+
+  for (int i = first + 1; i < n; ++i) {
+    const double current = prices[i];
+    if (!isfinite(current)) { has_prev_src = false; continue; }
+    if (!has_prev_src) { prev_src = current; has_prev_src = true; continue; }
+
+    const double delta = current - prev_src;
+    double w = 1.0;
+    if (has_prev_rsi && has_prev_ts && (delta * (prev_rsi - prev_ts)) > 0.0) w = weight;
+    const double weighted_delta = delta * w;
+
+    double num = 0.0, den = 0.0;
+    const bool have_num = qwo_rma_update(&num_state, weighted_delta, &num);
+    const bool have_den = qwo_rma_update(&den_state, fabs(weighted_delta), &den);
+
+    if (have_num && have_den && den != 0.0) {
+      // EmaState::update, :358-369. TWO roundings (a*b + c*d), NOT an fma --
+      // the CPU writes it that way.
+      const double ratio = num / den;
+      if (isfinite(ratio)) {
+        const double smoothed = ema_has ? (alpha * ratio + (1.0 - alpha) * ema_val) : ratio;
+        ema_val = smoothed; ema_has = true;
+
+        const double rsi = 50.0 * smoothed + 50.0;
+        row[i] = rsi;
+
+        double diff = 0.0;
+        bool have_diff = false;
+        if (has_prev_rsi) {
+          have_diff = qwo_rma_update(&diff_state, fabs(rsi - prev_rsi), &diff);
+        }
+
+        double trailing_stop;
+        if (have_diff) {
+          const bool crossover =
+              has_prev_rsi && has_prev_ts && (rsi > prev_ts) && (prev_rsi <= prev_ts);
+          const bool crossunder =
+              has_prev_rsi && has_prev_ts && (rsi < prev_ts) && (prev_rsi >= prev_ts);
+          if (crossover) {
+            trailing_stop = rsi - diff * factor;
+          } else if (crossunder) {
+            trailing_stop = rsi + diff * factor;
+          } else if (has_prev_ts) {
+            trailing_stop = (rsi > prev_ts) ? fmax(rsi - diff * factor, prev_ts)
+                                            : fmin(rsi + diff * factor, prev_ts);
+          } else {
+            trailing_stop = rsi;
+          }
+        } else {
+          trailing_stop = rsi;
+        }
+
+        prev_rsi = rsi; has_prev_rsi = true;
+        prev_ts = trailing_stop; has_prev_ts = true;
+      }
+    }
+
+    prev_src = current;
+  }
+}

@@ -191,3 +191,152 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/bulls_v_bears.rs:852
+// (bulls_v_bears_with_kernel). The column this emits is value
+// (dispatch/cpu_batch.rs:11121-11122).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- the moving
+// average at the default ma_type is an EMA whose state is carried and RESET to
+// NaN on a non-finite close, and the normalisation window is a rolling
+// min/max over the bull and bear series the same pass produces.
+//
+// PERIOD-SWEPT, unlike most of this closer's kernels: compute_bulls_v_bears_
+// batch (cpu_batch.rs:11153) reads a parameter literally named period
+// (default 14), so periods[combo] binds to it. The other six parameters --
+// ma_type "ema", calculation_method "normalized", normalized_bars_back 120,
+// raw_rolling_period 50, raw_threshold_percentile 95.0, threshold_level 80.0
+// (:11154-11175) -- are not swept and are pinned at their CPU defaults.
+//
+// ONLY THE NORMALIZED BRANCH IS REACHABLE AT THE DEFAULTS, and it is the only
+// one written here: calculation_method is pinned to "normalized", so the raw
+// branch could not run. It is named rather than silently dropped so a later
+// reader knows this kernel serves the default configuration and not the
+// indicator's whole parameter space -- exactly the contract the ten
+// period-invariant shard-4 variants carry.
+//
+// THE TWO RINGS ARE PER-THREAD, so their depth is a property of THIS COMPILED
+// KERNEL. The CPU rescans the last normalized_bars_back values of bull and
+// bear at every bar; a ring of that depth holds exactly what is reachable, and
+// nothing older is ever read. At the pinned 120 the bound below cannot be
+// approached; it is checked rather than assumed.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0, seeds the EMA at the
+// first finite close and resets it at every non-finite one, so there is no
+// warmup index. The lane row declares F64FirstValidRule::Ignored.
+//
+// NaN CANNOT SURVIVE: every min/max update is guarded by isfinite on BOTH the
+// incoming value and the running extreme before fmin/fmax is called, which is
+// what the CPU does -- a bare comparison chain would let a NaN bull value sit
+// in bull_min forever and poison every later bar.
+//
+// f64 END TO END: double literals, double fmin/fmax, no f32-suffixed math
+// function, no fast-math intrinsic, and no epsilon -- the range test is the
+// CPU's exact > 0.0.
+// ---------------------------------------------------------------------------
+
+#define NEO_BVB_NORMALIZED_BARS_BACK 120
+#define NEO_BVB_RAW_ROLLING_PERIOD 50
+#define NEO_BVB_RAW_THRESHOLD_PERCENTILE 95.0
+#define NEO_BVB_THRESHOLD_LEVEL 80.0
+#define NEO_BVB_MAX_BARS_BACK 512
+
+extern "C" __global__ void bulls_v_bears_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int period = periods[row_idx];
+    const int normalized_bars_back = NEO_BVB_NORMALIZED_BARS_BACK;
+    const int raw_rolling_period = NEO_BVB_RAW_ROLLING_PERIOD;
+    const double raw_threshold_percentile = NEO_BVB_RAW_THRESHOLD_PERCENTILE;
+    const double threshold_level = NEO_BVB_THRESHOLD_LEVEL;
+
+    if (period <= 0 || normalized_bars_back <= 0 || raw_rolling_period <= 0 ||
+        !isfinite(raw_threshold_percentile) || raw_threshold_percentile < 80.0 ||
+        raw_threshold_percentile > 99.0 || !isfinite(threshold_level) ||
+        threshold_level < 0.0 || threshold_level > 100.0 ||
+        normalized_bars_back > NEO_BVB_MAX_BARS_BACK) {
+        return;
+    }
+
+    double bull_ring[NEO_BVB_MAX_BARS_BACK];
+    double bear_ring[NEO_BVB_MAX_BARS_BACK];
+    for (int j = 0; j < normalized_bars_back; ++j) {
+        bull_ring[j] = NAN;
+        bear_ring[j] = NAN;
+    }
+
+    const double ema_alpha = 2.0 / (static_cast<double>(period) + 1.0);
+    double ema_prev = NAN;
+
+    for (int i = 0; i < n; ++i) {
+        const double c = close[i];
+
+        double ma_value = NAN;
+        if (!isfinite(c)) {
+            ema_prev = NAN;
+        } else {
+            ema_prev = isfinite(ema_prev) ? (ema_prev + ema_alpha * (c - ema_prev)) : c;
+            ma_value = ema_prev;
+        }
+
+        double bull = NAN;
+        double bear = NAN;
+        if (finite3(high[i], low[i], ma_value)) {
+            bull = high[i] - ma_value;
+            bear = ma_value - low[i];
+        }
+        bull_ring[i % normalized_bars_back] = bull;
+        bear_ring[i % normalized_bars_back] = bear;
+
+        if (!(isfinite(bull) && isfinite(bear))) {
+            continue;
+        }
+
+        const int start = (i + 1 > normalized_bars_back) ? (i + 1 - normalized_bars_back) : 0;
+        double bull_min = NAN;
+        double bull_max = NAN;
+        double bear_min = NAN;
+        double bear_max = NAN;
+        for (int j = start; j <= i; ++j) {
+            const double b = bull_ring[j % normalized_bars_back];
+            const double s = bear_ring[j % normalized_bars_back];
+            if (isfinite(b)) {
+                bull_min = isfinite(bull_min) ? fmin(bull_min, b) : b;
+                bull_max = isfinite(bull_max) ? fmax(bull_max, b) : b;
+            }
+            if (isfinite(s)) {
+                bear_min = isfinite(bear_min) ? fmin(bear_min, s) : s;
+                bear_max = isfinite(bear_max) ? fmax(bear_max, s) : s;
+            }
+        }
+
+        const double bull_range = bull_max - bull_min;
+        const double bear_range = bear_max - bear_min;
+        if (bull_range > 0.0 && bear_range > 0.0) {
+            const double norm_bull = ((bull - bull_min) / bull_range - 0.5) * 100.0;
+            const double norm_bear = ((bear - bear_min) / bear_range - 0.5) * 100.0;
+            row[i] = norm_bull - norm_bear;
+        }
+    }
+}

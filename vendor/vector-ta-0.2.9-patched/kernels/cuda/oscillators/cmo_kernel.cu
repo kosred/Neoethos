@@ -224,3 +224,88 @@ extern "C" __global__ void cmo_many_series_one_param_f32(
         *(out_tm + (size_t)r * num_series + series) = cmo_from_avgs(avg_g, avg_l);
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — cmo
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/cmo.rs:298 `cmo_scalar`.
+ *
+ * ROUNDING COUNT — the f32 kernel above is wrong here, not merely imprecise.
+ * It carries `__fmaf_rn(alpha, avg_g, beta * g)`: ONE rounding for the whole
+ * update. The CPU carries FOUR separate operations (cmo.rs:333-338):
+ *     avg_gain *= period_m1;   avg_gain += gain;   avg_gain *= inv_period;
+ * i.e. three roundings and a different value. Reproduced literally below.
+ *
+ * gain/loss are NOT branches on the CPU: `0.5*(diff+|diff|)` and
+ * `0.5*(|diff|-diff)` (cmo.rs:316-317). A branch would agree except at -0.0
+ * and at NaN, where the branch keeps the NaN and the arithmetic propagates it
+ * the way the CPU does.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void cmo_neo_batch_f64(const double* __restrict__ prices,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    // The CPU writes out[i] only from i == init_end = first + period onward.
+    const int init_end = first_valid + period;
+    for (int i = 0; i < init_end && i < len; ++i) o[i] = NEO_F64_NAN;
+
+    double avg_gain = 0.0;
+    double avg_loss = 0.0;
+    double prev_price = prices[first_valid];
+
+    const double period_m1  = (double)(period - 1);
+    const double inv_period = 1.0 / (double)period;
+
+    for (int i = first_valid + 1; i < len; ++i) {
+        const double curr = prices[i];
+        const double diff = curr - prev_price;
+        prev_price = curr;
+
+        const double abs_diff = fabs(diff);
+        const double gain = 0.5 * (diff + abs_diff);
+        const double loss = 0.5 * (abs_diff - diff);
+
+        if (i <= init_end) {
+            avg_gain += gain;
+            avg_loss += loss;
+            if (i == init_end) {
+                avg_gain *= inv_period;
+                avg_loss *= inv_period;
+                const double sum_gl = avg_gain + avg_loss;
+                o[i] = (sum_gl != 0.0) ? 100.0 * ((avg_gain - avg_loss) / sum_gl) : 0.0;
+            }
+        } else {
+            avg_gain *= period_m1;      // three roundings, exactly as cmo.rs
+            avg_loss *= period_m1;
+            avg_gain += gain;
+            avg_loss += loss;
+            avg_gain *= inv_period;
+            avg_loss *= inv_period;
+            const double sum_gl = avg_gain + avg_loss;
+            o[i] = (sum_gl != 0.0) ? 100.0 * ((avg_gain - avg_loss) / sum_gl) : 0.0;
+        }
+    }
+}

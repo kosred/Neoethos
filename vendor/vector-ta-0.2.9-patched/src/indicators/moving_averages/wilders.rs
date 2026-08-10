@@ -25,6 +25,7 @@ use crate::utilities::helpers::{
 #[cfg(feature = "python")]
 use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[allow(unused_imports)]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -265,6 +266,61 @@ pub fn wilders_into(input: &WildersInput, out: &mut [f64]) -> Result<(), Wilders
 }
 
 #[inline]
+/// THE seed sum for `wilders`, and the ONLY one.
+///
+/// # Why this function exists
+///
+/// `wilders_scalar`, `wilders_avx2`, `wilders_avx512_short` and
+/// `wilders_avx512_long` all run the identical recurrence
+/// `y = (x - y).mul_add(alpha, y)` — one rounding, same order, no
+/// disagreement. The 1-ULP divergence between the CPU paths that blocked an
+/// f64 `wilders` kernel from being written was entirely HERE: the seed summed
+/// the first `period` values in 4-wide chunks (scalar), 8-wide (avx512_short)
+/// and 16-wide (avx512_long) — three different summation TREES, three
+/// different roundings of `sum`, and then `y = sum * inv_n` inherits the
+/// difference and the recurrence carries it to the end of the series.
+///
+/// # Which association is correct, and why
+///
+/// The 4-wide scalar association wins, for three reasons that all point the
+/// same way:
+///
+/// * It is what `Kernel::ScalarBatch` runs, which is the path `hpc_ta` takes
+///   and therefore the path every existing GPU parity fixture in this crate
+///   was recorded against — the 27 kernels already registered in
+///   `F64_KERNELS` were validated against scalar seeds.
+/// * It is the association a reader of `wilders_scalar` would predict from
+///   the published definition ("the average of the first n values"), summed
+///   left to right in small groups.
+/// * The vector versions' association is an artefact of the register width
+///   the author happened to use, not a decision: `vacc` accumulates lanes
+///   VERTICALLY (stride 4/8/16) and reduces horizontally at the end, so the
+///   pairing depends on the ISA the binary was compiled for. An indicator
+///   whose value changes with `-C target-cpu` is a bug, not a tolerance.
+///
+/// So the vector paths now call this and are bit-identical to scalar through
+/// the seed. The vectorisation they still carry is in the loads, not in the
+/// accumulation order, so nothing is lost but the divergence.
+#[inline(always)]
+unsafe fn wilders_seed_sum(data: &[f64], period: usize, first_valid: usize) -> f64 {
+    let mut sum = 0.0f64;
+    let mut p = data.as_ptr().add(first_valid);
+
+    let chunks4 = period / 4;
+    for _ in 0..chunks4 {
+        sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3);
+        p = p.add(4);
+    }
+    match period - (chunks4 * 4) {
+        3 => sum += *p.add(0) + *p.add(1) + *p.add(2),
+        2 => sum += *p.add(0) + *p.add(1),
+        1 => sum += *p.add(0),
+        0 => {}
+        _ => core::hint::unreachable_unchecked(),
+    }
+    sum
+}
+
 pub fn wilders_scalar(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
     debug_assert!(period > 0);
     debug_assert_eq!(data.len(), out.len());
@@ -277,21 +333,7 @@ pub fn wilders_scalar(data: &[f64], period: usize, first_valid: usize, out: &mut
     let wma_start = first_valid + period - 1;
 
     unsafe {
-        let mut sum = 0.0f64;
-        let mut p = data.as_ptr().add(first_valid);
-
-        let chunks4 = period / 4;
-        for _ in 0..chunks4 {
-            sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3);
-            p = p.add(4);
-        }
-        match period - (chunks4 * 4) {
-            3 => sum += *p.add(0) + *p.add(1) + *p.add(2),
-            2 => sum += *p.add(0) + *p.add(1),
-            1 => sum += *p.add(0),
-            0 => {}
-            _ => core::hint::unreachable_unchecked(),
-        }
+        let sum = wilders_seed_sum(data, period, first_valid);
 
         let inv_n = 1.0 / (period as f64);
         let mut y = sum * inv_n;
@@ -405,7 +447,6 @@ pub fn wilders_into_slice(
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn wilders_avx2(data: &[f64], period: usize, first_valid: usize, out: &mut [f64]) {
-    use core::arch::x86_64::*;
 
     debug_assert!(period > 0);
     debug_assert_eq!(data.len(), out.len());
@@ -416,29 +457,11 @@ pub unsafe fn wilders_avx2(data: &[f64], period: usize, first_valid: usize, out:
 
     let wma_start = first_valid + period - 1;
 
-    let mut vacc = _mm256_setzero_pd();
-    let mut p = data.as_ptr().add(first_valid);
-    let chunks4 = period / 4;
-    for _ in 0..chunks4 {
-        let v = _mm256_loadu_pd(p);
-        vacc = _mm256_add_pd(vacc, v);
-        p = p.add(4);
-    }
-
-    let hi = _mm256_extractf128_pd(vacc, 1);
-    let lo = _mm256_castpd256_pd128(vacc);
-    let v2 = _mm_add_pd(lo, hi);
-    let sh = _mm_permute_pd(v2, 0b01);
-    let v1 = _mm_add_sd(v2, sh);
-    let mut sum = _mm_cvtsd_f64(v1);
-
-    match period - (chunks4 * 4) {
-        3 => sum += *p.add(0) + *p.add(1) + *p.add(2),
-        2 => sum += *p.add(0) + *p.add(1),
-        1 => sum += *p.add(0),
-        0 => {}
-        _ => core::hint::unreachable_unchecked(),
-    }
+    // Seed via the ONE association — see `wilders_seed_sum`. The vertical
+    // 4-lane accumulate + horizontal reduce that stood here produced a
+    // different `sum` from `wilders_scalar`, and the recurrence carried the
+    // difference to the last bar.
+    let sum = wilders_seed_sum(data, period, first_valid);
 
     let inv_n = 1.0 / (period as f64);
     let mut y = sum * inv_n;
@@ -493,8 +516,6 @@ pub unsafe fn wilders_avx512_short(
     first_valid: usize,
     out: &mut [f64],
 ) {
-    use core::arch::x86_64::*;
-
     debug_assert!(period > 0);
     debug_assert_eq!(data.len(), out.len());
     let len = data.len();
@@ -504,38 +525,9 @@ pub unsafe fn wilders_avx512_short(
 
     let wma_start = first_valid + period - 1;
 
-    let mut vacc = _mm512_setzero_pd();
-    let mut p = data.as_ptr().add(first_valid);
-    let chunks8 = period / 8;
-    for _ in 0..chunks8 {
-        let v = _mm512_loadu_pd(p);
-        vacc = _mm512_add_pd(vacc, v);
-        p = p.add(8);
-    }
-
-    let vhi256 = _mm512_extractf64x4_pd(vacc, 1);
-    let vlo256 = _mm512_castpd512_pd256(vacc);
-    let v256 = _mm256_add_pd(vlo256, vhi256);
-    let hi = _mm256_extractf128_pd(v256, 1);
-    let lo = _mm256_castpd256_pd128(v256);
-    let v2 = _mm_add_pd(lo, hi);
-    let sh = _mm_permute_pd(v2, 0b01);
-    let v1 = _mm_add_sd(v2, sh);
-    let mut sum = _mm_cvtsd_f64(v1);
-
-    match period - (chunks8 * 8) {
-        7 => {
-            sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4) + *p.add(5) + *p.add(6)
-        }
-        6 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4) + *p.add(5),
-        5 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4),
-        4 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3),
-        3 => sum += *p.add(0) + *p.add(1) + *p.add(2),
-        2 => sum += *p.add(0) + *p.add(1),
-        1 => sum += *p.add(0),
-        0 => {}
-        _ => core::hint::unreachable_unchecked(),
-    }
+    // 8-wide vertical accumulate replaced by the ONE association — see
+    // `wilders_seed_sum`.
+    let sum = wilders_seed_sum(data, period, first_valid);
 
     let inv_n = 1.0 / (period as f64);
     let mut y = sum * inv_n;
@@ -579,8 +571,6 @@ pub unsafe fn wilders_avx512_long(
     first_valid: usize,
     out: &mut [f64],
 ) {
-    use core::arch::x86_64::*;
-
     debug_assert!(period > 0);
     debug_assert_eq!(data.len(), out.len());
     let len = data.len();
@@ -590,49 +580,9 @@ pub unsafe fn wilders_avx512_long(
 
     let wma_start = first_valid + period - 1;
 
-    let mut vacc0 = _mm512_setzero_pd();
-    let mut vacc1 = _mm512_setzero_pd();
-    let mut p = data.as_ptr().add(first_valid);
-    let chunks16 = period / 16;
-    for _ in 0..chunks16 {
-        let v0 = _mm512_loadu_pd(p);
-        let v1 = _mm512_loadu_pd(p.add(8));
-        vacc0 = _mm512_add_pd(vacc0, v0);
-        vacc1 = _mm512_add_pd(vacc1, v1);
-        p = p.add(16);
-    }
-    let mut vacc = _mm512_add_pd(vacc0, vacc1);
-
-    let rem = period - (chunks16 * 16);
-    if rem >= 8 {
-        let v = _mm512_loadu_pd(p);
-        vacc = _mm512_add_pd(vacc, v);
-        p = p.add(8);
-    }
-
-    let vhi256 = _mm512_extractf64x4_pd(vacc, 1);
-    let vlo256 = _mm512_castpd512_pd256(vacc);
-    let v256 = _mm256_add_pd(vlo256, vhi256);
-    let hi = _mm256_extractf128_pd(v256, 1);
-    let lo = _mm256_castpd256_pd128(v256);
-    let v2 = _mm_add_pd(lo, hi);
-    let sh = _mm_permute_pd(v2, 0b01);
-    let v1 = _mm_add_sd(v2, sh);
-    let mut sum = _mm_cvtsd_f64(v1);
-
-    match period - (chunks16 * 16) - (rem / 8) * 8 {
-        7 => {
-            sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4) + *p.add(5) + *p.add(6)
-        }
-        6 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4) + *p.add(5),
-        5 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3) + *p.add(4),
-        4 => sum += *p.add(0) + *p.add(1) + *p.add(2) + *p.add(3),
-        3 => sum += *p.add(0) + *p.add(1) + *p.add(2),
-        2 => sum += *p.add(0) + *p.add(1),
-        1 => sum += *p.add(0),
-        0 => {}
-        _ => core::hint::unreachable_unchecked(),
-    }
+    // 16-wide dual-accumulator vertical sum replaced by the ONE association —
+    // see `wilders_seed_sum`.
+    let sum = wilders_seed_sum(data, period, first_valid);
 
     let inv_n = 1.0 / (period as f64);
     let mut y = sum * inv_n;

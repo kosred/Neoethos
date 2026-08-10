@@ -101,14 +101,33 @@ pub struct Signal {
     /// `0.0..=1.0` strategy/model confidence; sizing scales with this.
     pub confidence: f64,
     pub source: SignalSource,
+    /// The STRATEGY'S OWN stop distance for this bar, in pips (audit #226).
+    ///
+    /// `0.0` means "the signal source carries no bracket" — only then does the
+    /// [`crate::decision::DecisionEngine`] fall back to its
+    /// `stop_frac`-of-price synthetic bracket, and it says so in the log. A
+    /// gene-driven replay always populates these from
+    /// [`crate::gene_signal::combine_gene_signals_with_brackets`], which is the
+    /// same adaptive-or-fixed bracket the GA scored the gene on.
+    #[serde(default)]
+    pub sl_pips: f64,
+    /// Take-profit distance in pips for this bar. `0.0` ⇒ no strategy bracket.
+    #[serde(default)]
+    pub tp_pips: f64,
 }
 
 /// Why a position is being closed (for the journal + attribution).
+///
+/// `MaxHold` (added 2026-08-09, audit #228) is the backtest's time stop:
+/// `EvaluationConfig::max_hold_bars` closes a trade that has been open too
+/// long. The replay had no such exit, so a replayed position could outlive
+/// every trade the GA scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CloseReason {
     StopLoss,
     TakeProfit,
     Signal,
+    MaxHold,
     Manual,
 }
 
@@ -216,4 +235,17 @@ pub trait RiskGate {
 /// path — demo vs live is the connected ACCOUNT, not separate code.
 pub trait ExecutionAdapter {
     fn execute(&mut self, intent: &TradeIntent, mark_price: f64) -> anyhow::Result<ExecReport>;
+
+    /// Total per-trade cost this adapter has charged so far, in ACCOUNT
+    /// currency, that is NOT already expressed in the fill prices it returned
+    /// — i.e. commission. Spread and slippage are charged INSIDE the fill
+    /// price, so they must not be counted here or they would be double-charged.
+    ///
+    /// Defaults to `0.0` so a real broker adapter (where the broker's
+    /// statement is authoritative) needs no implementation. The Phase-1
+    /// [`crate::execution::MockExecutionAdapter`] overrides it; audit #227
+    /// found the replay charging NOTHING at all.
+    fn charged_costs(&self) -> f64 {
+        0.0
+    }
 }

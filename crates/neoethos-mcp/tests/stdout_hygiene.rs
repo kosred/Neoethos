@@ -9,13 +9,13 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn stdout_carries_json_rpc_exclusively() {
-    let exe = env!("CARGO_BIN_EXE_neoethos-mcp");
+    let exe = env!("CARGO_BIN_EXE_neoethos-control-plane");
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn the neoethos-mcp binary");
+        .expect("spawn the neoethos-control-plane binary");
 
     // Watchdog: if the server never answers or never exits, kill it so the
     // test fails with an assertion instead of hanging CI.

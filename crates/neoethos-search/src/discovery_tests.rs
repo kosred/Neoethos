@@ -575,7 +575,12 @@ fn artifact_filename_strips_invalid_characters() {
 #[test]
 fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
     let defaults = DiscoveryRuntimeOverrides::default();
-    assert_eq!(defaults.prefilter_top_k, 50);
+    // 240, not the legacy 50. The three copies of this number had drifted
+    // (code 50 / root yaml 240 / desktop yaml 50) and the run artifact did not
+    // record which one it had used, so "the indicator pool" meant two
+    // different searches. All three now agree; see
+    // `docs/pending-edits-forbidden-territory.md` §2.
+    assert_eq!(defaults.prefilter_top_k, 240);
     assert!((defaults.prefilter_insample_frac - 0.80).abs() < 1e-9);
     assert_eq!(defaults.prefilter_min_per_timeframe, 6);
     assert!((defaults.funnel_stage1_pct - 0.25).abs() < 1e-9);
@@ -723,8 +728,28 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         data: neoethos_data::FeatureData::InMemory(data),
     };
 
+    // This fixture's bars are a pure ±1% alternation with no intrabar range, so
+    // nothing ever reaches a 2-ATR barrier and the first-passage label is
+    // degenerate. The prefilter's degenerate-label guard therefore falls back to
+    // the 1-bar forward return, which is exactly the target this test was
+    // written against — so the quota assertions below still measure the quota
+    // and nothing else. The first-passage target has its own tests.
+    let spec = |top_k: usize, min_per_tf: usize| PrefilterSpec {
+        top_k,
+        insample_frac: 1.0,
+        min_per_tf,
+        max_hold_bars: 8,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: 0.0,
+        // No CPCV: this fixture is 200-odd rows and the point of the test is the
+        // per-timeframe quota, not the fold refit.
+        cpcv: None,
+    };
+
     // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
-    let legacy = prefilter_features(&frame, &ohlcv, 3, 1.0, 0);
+    let (legacy, _) = prefilter_features(&frame, &ohlcv, &spec(3, 0));
     assert!(
         !legacy.names.iter().any(|n| timeframe_group(n).is_some()),
         "legacy prefilter should keep only base features, got {:?}",
@@ -732,7 +757,7 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     );
 
     // With quota: each present higher-TF group gets at least 1 representative.
-    let quota = prefilter_features(&frame, &ohlcv, 3, 1.0, 1);
+    let (quota, _) = prefilter_features(&frame, &ohlcv, &spec(3, 1));
     assert!(
         quota.names.iter().any(|n| n.starts_with("H1_")),
         "quota prefilter must keep an H1_ feature, got {:?}",
@@ -751,6 +776,247 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
             .filter(|n| n.starts_with("base_"))
             .count()
             >= 3
+    );
+}
+
+/// A trending series with real intrabar range must produce DECIDED
+/// first-passage labels — otherwise the prefilter's new target carries no
+/// information and the degenerate-label guard would silently take the run back
+/// to the 1-bar forward return.
+#[test]
+fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
+    let n = 600usize;
+    let mut close = Vec::with_capacity(n);
+    let mut high = Vec::with_capacity(n);
+    let mut low = Vec::with_capacity(n);
+    for i in 0..n {
+        // Slow uptrend with a small oscillation, and a real high/low range so
+        // the ATR is non-degenerate and the upper barrier is reachable.
+        let c = 1.1000 + (i as f64) * 0.00005 + 0.0002 * ((i as f64) * 0.3).sin();
+        close.push(c);
+        high.push(c + 0.0004);
+        low.push(c - 0.0004);
+    }
+    let ohlcv = Ohlcv {
+        timestamp: Some((0..n as i64).collect()),
+        open: close.clone(),
+        high,
+        low,
+        close,
+        volume: Some(vec![1.0; n]),
+    };
+    let spec = PrefilterSpec {
+        top_k: 4,
+        insample_frac: 0.8,
+        min_per_tf: 0,
+        max_hold_bars: 40,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: 0.0,
+        cpcv: None,
+    };
+    let (labels, census) = first_passage_labels(&ohlcv, &spec);
+    assert_eq!(labels.long.len(), n);
+    assert_eq!(labels.short.len(), n);
+    // Each direction's four buckets, plus the shared undefined count, must cover
+    // every bar exactly once. An uncounted bar is a silent drop.
+    let counted_long = census.label_up
+        + census.label_down
+        + census.label_vertical
+        + census.label_ambiguous
+        + census.label_undefined;
+    let counted_short = census.label_short_win
+        + census.label_short_loss
+        + census.label_vertical_short
+        + census.label_ambiguous_short
+        + census.label_undefined;
+    assert_eq!(counted_long, n, "long census does not cover every bar ({census:?})");
+    assert_eq!(counted_short, n, "short census does not cover every bar ({census:?})");
+    assert!(
+        census.label_up > 0,
+        "an uptrending series with a reachable 2-ATR target must produce upper-barrier hits, \
+         got {census:?}"
+    );
+    // The SHORT label is a different question and must be answered separately —
+    // the defect this replaced ranked features by a long-only label while the GA
+    // trades both directions. On an uptrend the short trade mostly stops out.
+    assert!(
+        census.label_short_loss > 0,
+        "the short direction must be labelled at all, got {census:?}"
+    );
+    assert!(
+        census.label_short_loss > census.label_short_win,
+        "on an uptrend a short's stop should be reached more often than its target, got \
+         {census:?}"
+    );
+}
+
+/// The cost is charged so that a LOSS costs exactly one stop distance NET.
+///
+/// The barrier that used to sit at `entry - stop - cost` made a loss rarer than
+/// the cost model implies; it belongs at `entry - stop + cost`, i.e. BOTH of a
+/// long's barriers move up by the cost, and both of a short's move down.
+#[test]
+fn the_round_trip_cost_moves_both_barriers_the_same_way() {
+    // Flat series: only the cost decides where the barriers sit, so a series
+    // that drifts by exactly one stop-plus-cost must resolve, and one that
+    // drifts by one stop-minus-cost must not.
+    let n = 400usize;
+    let close: Vec<f64> = (0..n).map(|i| 1.1000 - (i as f64) * 0.000_01).collect();
+    let ohlcv = Ohlcv {
+        timestamp: Some((0..n as i64).collect()),
+        open: close.clone(),
+        high: close.iter().map(|c| c + 0.000_05).collect(),
+        low: close.iter().map(|c| c - 0.000_05).collect(),
+        close,
+        volume: Some(vec![1.0; n]),
+    };
+    let spec = |cost: f64| PrefilterSpec {
+        top_k: 4,
+        insample_frac: 0.8,
+        min_per_tf: 0,
+        max_hold_bars: 60,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: cost,
+        cpcv: None,
+    };
+    let (_, free) = first_passage_labels(&ohlcv, &spec(0.0));
+    let (_, charged) = first_passage_labels(&ohlcv, &spec(0.0005));
+    // Charging cost pulls a long's STOP up (closer to a falling price), so on a
+    // downtrend the long stops out at least as often as it did for free.
+    assert!(
+        charged.label_down >= free.label_down,
+        "charging the round trip must not make a long's stop HARDER to reach: free={free:?} \
+         charged={charged:?}"
+    );
+}
+
+/// The refit must actually produce several fit windows when CPCV is configured,
+/// and exactly one (the legacy prefix) when it is not. This is the difference
+/// between a contaminated CPCV number and an honest one.
+#[test]
+fn prefilter_refits_inside_cpcv_folds_and_falls_back_to_a_single_prefix() {
+    let base = PrefilterSpec {
+        top_k: 4,
+        insample_frac: 0.8,
+        min_per_tf: 0,
+        max_hold_bars: 40,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: 0.0,
+        cpcv: None,
+    };
+    let (prefix_windows, available) = prefilter_fit_windows(10_000, &base);
+    assert_eq!(
+        prefix_windows.len(),
+        1,
+        "no CPCV configured means the OLD behaviour: one leading prefix, fit once"
+    );
+    assert_eq!(available, 0);
+
+    let with_cpcv = PrefilterSpec {
+        cpcv: Some((8, 2, 0.01, 0.01, 0)),
+        ..base
+    };
+    let (fold_windows, available) = prefilter_fit_windows(10_000, &with_cpcv);
+    assert!(
+        fold_windows.len() > 1,
+        "the ranking must be refit inside SEVERAL fold train sets, got {}",
+        fold_windows.len()
+    );
+    assert!(
+        fold_windows.len() <= PREFILTER_MAX_REFIT_FOLDS,
+        "the refit is capped at {PREFILTER_MAX_REFIT_FOLDS} folds, got {}",
+        fold_windows.len()
+    );
+    assert_eq!(
+        available, 28,
+        "C(8,2) = 28 folds are available; the run must report how many of them it used"
+    );
+    for window in &fold_windows {
+        assert!(!window.is_empty(), "an empty fit window must not be kept");
+        assert!(window.iter().all(|&i| i < 10_000));
+    }
+}
+
+/// The whole point of the f64 pairwise rewrite: a column whose leading rows are
+/// NaN must be RANKED on its finite rows, not scored 0.0 and swept aside by a
+/// stable-sort tie-break. Here the NaN-prefixed column is the ONLY informative
+/// one, so the old code would have discarded it.
+#[test]
+fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
+    let n = 800usize;
+    let mut close = Vec::with_capacity(n);
+    for i in 0..n {
+        close.push(1.1000 + (i as f64) * 0.00005 + 0.0002 * ((i as f64) * 0.3).sin());
+    }
+    let ohlcv = Ohlcv {
+        timestamp: Some((0..n as i64).collect()),
+        open: close.clone(),
+        high: close.iter().map(|c| c + 0.0004).collect(),
+        low: close.iter().map(|c| c - 0.0004).collect(),
+        close: close.clone(),
+        volume: Some(vec![1.0; n]),
+    };
+    let spec = PrefilterSpec {
+        top_k: 1,
+        insample_frac: 1.0,
+        min_per_tf: 0,
+        max_hold_bars: 40,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: 0.0,
+        cpcv: None,
+    };
+    let (labels, _) = first_passage_labels(&ohlcv, &spec);
+
+    // Column 0: the LONG label itself, with the leading-NaN prefix every aligned
+    // higher-timeframe column carries. Column 1: pure noise.
+    //
+    // `.long` is named explicitly because the label is no longer one series. It
+    // used to be a single long-only vector, which ranked features by what
+    // predicted a one-ATR DECLINE while the GA trades both directions; it is now
+    // one series per direction and a column is scored against both, keeping
+    // whichever it predicts better. This test copies the long lane, so it still
+    // asserts exactly what it always did — a column that IS the target must
+    // survive the prefilter — and it can no longer pass by accident on a lane it
+    // did not mean to name.
+    let names = vec!["H1_informative".to_string(), "base_noise".to_string()];
+    let data = ndarray::Array2::from_shape_fn((n, 2), |(i, j)| match j {
+        0 => {
+            if i < 60 {
+                f32::NAN
+            } else {
+                labels.long[i]
+            }
+        }
+        _ => ((i % 7) as f32) - 3.0,
+    });
+    let frame = FeatureFrame {
+        timestamps: (0..n as i64).collect(),
+        names,
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+
+    let (kept, census) = prefilter_features(&frame, &ohlcv, &spec);
+    assert!(
+        !census.label_fell_back_to_forward_return,
+        "the fixture must exercise the first-passage target, not the fallback ({census:?})"
+    );
+    assert!(
+        kept.names.iter().any(|n| n == "H1_informative"),
+        "the NaN-prefixed informative column must survive the prefilter; the pre-2026-08-09 \
+         f32 code scored it exactly 0.0 and dropped it. kept = {:?}, census = {census:?}",
+        kept.names
+    );
+    assert!(
+        census.columns_with_nonfinite_rows >= 1,
+        "the skipped rows must be COUNTED, not hidden ({census:?})"
     );
 }
 
@@ -1571,12 +1837,16 @@ fn propfirm_mode_leaves_m1_min_trades_per_month_unchanged() {
 }
 
 #[test]
-fn discovery_runtime_from_settings_default_matches_env_default() {
-    // Stage A config-consolidation behaviour lock: with config at its
-    // defaults, `DiscoveryRuntimeOverrides::from_settings` reproduces the
-    // env-absent `default()` (== `from_env()` with no NEOETHOS_BOT_* set)
-    // exactly — so existing deployments are unaffected by the env→config move
-    // of prefilter / funnel / stage1-window / min-history knobs.
+fn discovery_runtime_from_settings_default_matches_struct_default() {
+    // Behaviour lock: with config at its defaults,
+    // `DiscoveryRuntimeOverrides::from_settings` reproduces `default()` exactly.
+    //
+    // 2026-08-10: `from_env()` — the six-name `NEOETHOS_BOT_PREFILTER_*` /
+    // `_FUNNEL_*` / `_MIN_HISTORY_YEARS` reader this test used to compare
+    // against — is DELETED. It had zero production callers and was kept "for
+    // reference", which is another way of saying there were two ways to set the
+    // same knob and only one of them was visible. `from_settings` is now the
+    // only constructor that reads operator input.
     let s = neoethos_core::Settings::default();
     assert_eq!(
         DiscoveryRuntimeOverrides::from_settings(&s),
@@ -2025,10 +2295,159 @@ fn risky_mode_keeps_the_operators_activity_floor() {
     );
 }
 
+/// A candidate that makes money after costs — the baseline every shape test
+/// below starts from, because since 2026-08-09 nothing reaches a shape check
+/// until it has cleared the expectancy floor.
+fn profitable_metrics(id: &str) -> crate::quality::StrategyMetrics {
+    let mut m = crate::quality::empty_metrics(id);
+    m.total_trades = 500;
+    m.profit_per_trade = 12.0;
+    m.net_expectancy_stderr = 3.0;
+    m.net_expectancy_t_stat = 4.0;
+    m
+}
+
+/// THE GUARD AGAINST THE REWARD HACK RETURNING.
+///
+/// The trailing stop became searchable in the same change that added this test.
+/// Under a payoff-floor objective that is a free win for the GA: widening the
+/// trail raises the payoff ratio without touching the money. Measured on real
+/// EURUSD bars while sweeping exactly that knob —
+///
+///   trail multiplier 1.0 → payoff 0.91, expectancy -4.15 pips/trade
+///   trail multiplier 3.0 → payoff 2.53, expectancy -4.18 pips/trade
+///
+/// — the payoff moved by a factor of 2.8 and the expectancy did not move at all.
+/// On a driftless price, exit geometry redistributes the (win-rate, payoff)
+/// split and their product stays pinned at minus the cost.
+///
+/// So a 2.0 payoff floor ACCEPTS the second row and REJECTS the first, and the
+/// second row empties the account marginally faster. If this test ever fails,
+/// the payoff floor has become sufficient on its own again and the search is
+/// once more selecting for a number that is not money.
+#[test]
+fn a_high_payoff_money_loser_is_refused_by_name() {
+    use super::{TargetProfile, TargetProfileRejection};
+    use crate::quality::empty_metrics;
+
+    let profile = TargetProfile {
+        min_payoff_ratio: 2.0,
+        ..TargetProfile::default()
+    };
+
+    // The measured reward hack, in the analyzer's own units. Payoff 2.53 clears
+    // the 2.0 floor outright; the average trade still loses money after costs.
+    let mut hacked = empty_metrics("trail_mult_3");
+    hacked.total_trades = 4_000;
+    hacked.payoff_ratio = 2.53;
+    hacked.win_rate = 0.24;
+    hacked.profit_per_trade = -4.18; // pips, net of spread + commission
+    hacked.net_expectancy_stderr = 0.35;
+    hacked.net_expectancy_t_stat = -11.9;
+
+    assert_eq!(
+        profile.evaluate(&hacked),
+        Err(TargetProfileRejection::NegativeNetExpectancy),
+        "a payoff of {} must not survive an expectancy of {} per trade",
+        hacked.payoff_ratio,
+        hacked.profit_per_trade
+    );
+    assert!(!profile.accepts(&hacked));
+
+    // And the refusal is NOT something a configuration can switch off. There is
+    // no `min_net_expectancy_per_trade` that admits a money-loser: the field is
+    // a floor, `0.0` already means "strictly positive", and the loader clamps
+    // negatives away. Assert on the type directly so a future edit that adds an
+    // `if self.min_net_expectancy_per_trade > 0.0` guard — turning it into an
+    // opt-in preference like its neighbours — fails here.
+    let all_gates_off = TargetProfile::default();
+    assert_eq!(
+        all_gates_off.evaluate(&hacked),
+        Err(TargetProfileRejection::NegativeNetExpectancy),
+        "an empty target profile must still refuse a money-loser"
+    );
+
+    // The mirror case, which is the whole reason the payoff floor is demoted
+    // rather than deleted: the SAME strategy family at trail multiplier 1.0 has
+    // a payoff of 0.91 and the same losing expectancy. Both must be refused, and
+    // for the same named reason — the payoff ratio must not be what decides.
+    let mut unhacked = hacked.clone();
+    unhacked.payoff_ratio = 0.91;
+    unhacked.win_rate = 0.52;
+    unhacked.profit_per_trade = -4.15;
+    assert_eq!(
+        profile.evaluate(&unhacked),
+        Err(TargetProfileRejection::NegativeNetExpectancy)
+    );
+
+    // A money-MAKER with a modest payoff survives the expectancy floor and is
+    // then refused by the payoff preference, by that name. That is what
+    // "secondary filter" means: it can only narrow, never admit.
+    let mut modest = profitable_metrics("modest_but_profitable");
+    modest.payoff_ratio = 1.10;
+    modest.win_rate = 0.62;
+    assert_eq!(
+        profile.evaluate(&modest),
+        Err(TargetProfileRejection::PayoffTooLow)
+    );
+    assert!(
+        TargetProfile::default().accepts(&modest),
+        "with no shape preference configured, a profitable candidate survives"
+    );
+}
+
+/// Positive expectancy is necessary, not sufficient, once a significance bar is
+/// configured — and the bar must be opt-in, because choosing it is an operator
+/// decision rather than a correctness bound.
+#[test]
+fn the_expectancy_significance_bar_is_opt_in_and_binds_when_set() {
+    use super::{TargetProfile, TargetProfileRejection};
+
+    // +20 per trade over 30 trades with a per-trade sd of ~197: the standard
+    // error is 36, so the point estimate is well inside its own noise.
+    let mut noisy = profitable_metrics("thirty_trades");
+    noisy.total_trades = 30;
+    noisy.profit_per_trade = 20.0;
+    noisy.net_expectancy_stderr = 36.0;
+    noisy.net_expectancy_t_stat = 20.0 / 36.0;
+
+    // Sign only (the default): it survives, and the run reports the standard
+    // error next to the number so the operator can see what it is worth.
+    assert!(TargetProfile::default().accepts(&noisy));
+
+    let strict = TargetProfile {
+        min_expectancy_t_stat: 2.0,
+        ..TargetProfile::default()
+    };
+    assert_eq!(
+        strict.evaluate(&noisy),
+        Err(TargetProfileRejection::ExpectancyNotSignificant)
+    );
+
+    // The same expectancy measured over enough trades clears it.
+    let mut solid = noisy.clone();
+    solid.total_trades = 5_000;
+    solid.net_expectancy_stderr = 2.8;
+    solid.net_expectancy_t_stat = 20.0 / 2.8;
+    assert!(strict.accepts(&solid));
+}
+
+/// A candidate that never traded reports an expectancy of exactly 0.0. Nothing
+/// traded is not an edge, and the strict `>` in the gate is what says so.
+#[test]
+fn a_candidate_with_no_trades_is_not_an_edge() {
+    use super::{TargetProfile, TargetProfileRejection};
+    use crate::quality::empty_metrics;
+
+    assert_eq!(
+        TargetProfile::default().evaluate(&empty_metrics("silent")),
+        Err(TargetProfileRejection::NegativeNetExpectancy)
+    );
+}
+
 #[test]
 fn the_target_profile_separates_win_rate_from_payoff() {
     use super::TargetProfile;
-    use crate::quality::empty_metrics;
 
     // The operator's stated target: 57-65 % of trades win, each winner worth
     // about 2.2 losers.
@@ -2036,9 +2455,14 @@ fn the_target_profile_separates_win_rate_from_payoff() {
         min_win_rate: 0.57,
         min_payoff_ratio: 2.2,
         max_in_market: 0.35,
+        ..TargetProfile::default()
     };
 
-    let mut wanted = empty_metrics("wanted");
+    // Every fixture below starts PROFITABLE. Before 2026-08-09 these fixtures
+    // were built from `empty_metrics`, i.e. zero expectancy, and still passed —
+    // because the profile had no opinion about money at all. That is exactly the
+    // hole this file now guards.
+    let mut wanted = profitable_metrics("wanted");
     wanted.win_rate = 0.60;
     wanted.payoff_ratio = 2.21;
     wanted.in_market_pct = 0.20;
@@ -2070,9 +2494,19 @@ fn the_target_profile_separates_win_rate_from_payoff() {
     unknown_exposure.in_market_pct = 0.0;
     assert!(profile.accepts(&unknown_exposure));
 
-    // And an empty profile is the default: no preference, no rejection.
+    // An empty profile states no SHAPE preference, so both survive — but note
+    // what changed: "empty" is no longer "vacuous". Both of these are profitable
+    // fixtures. Strip the profit and the empty profile refuses them, which is
+    // the one opinion the profile is not allowed to drop.
     assert!(TargetProfile::default().accepts(&trend));
     assert!(TargetProfile::default().accepts(&scalper));
+
+    let mut broke = trend.clone();
+    broke.profit_per_trade = -0.01;
+    assert!(
+        !TargetProfile::default().accepts(&broke),
+        "no configuration admits a candidate that loses money on the average trade"
+    );
 }
 
 /// The report must name the mode the engine actually runs.
@@ -2126,6 +2560,135 @@ fn display_mode_matches_the_engine_mode() {
             displayed.search.mode, engine.mode
         );
     }
+}
+
+/// `models.discovery_mode` is RESTRICTED, not merged into `system.trading_mode`.
+///
+/// It reaches `Strict`, which `trading_mode` structurally cannot express, so
+/// merging the two would delete a regime. What it must NOT do is silently
+/// accept `risky` / `prop_firm` — the two values the CLI TUI has been offering
+/// — and decide nothing with them, which is what "the knob I set changed
+/// nothing" looked like from the operator's chair.
+///
+/// This locks the accepted set at exactly `strict | legacy`. Everything else
+/// returns `None`, which is what makes the fall-through to `system.trading_mode`
+/// nameable in the log instead of invisible.
+#[test]
+fn discovery_mode_accepts_only_strict_and_legacy() {
+    for accepted in ["strict", "legacy", "  STRICT  ", "Legacy"] {
+        assert_eq!(
+            discovery_mode_from_config(accepted),
+            Some(DiscoveryMode::Strict),
+            "models.discovery_mode = {accepted:?} must select the Strict pipeline"
+        );
+    }
+    for no_op in ["", "  ", "risky", "prop_firm", "growth", "permissive", "nonsense"] {
+        assert_eq!(
+            discovery_mode_from_config(no_op),
+            None,
+            "models.discovery_mode = {no_op:?} decides NOTHING and must report so, not \
+             masquerade as a selected regime"
+        );
+    }
+
+    // The fall-through itself: a no-op value leaves `system.trading_mode` in
+    // charge, in both directions.
+    assert_eq!(
+        resolve_discovery_mode("risky", "prop_firm"),
+        DiscoveryMode::Risky,
+        "discovery_mode='prop_firm' must not override trading_mode='risky'"
+    );
+    assert_eq!(
+        resolve_discovery_mode("prop_firm", "risky"),
+        DiscoveryMode::PropFirm,
+        "discovery_mode='risky' is a no-op — the regime comes from trading_mode"
+    );
+}
+
+/// The duplicate knobs resolve to the winner this wave documented, and the
+/// loser is genuinely ignored.
+///
+/// Three knobs exist twice under different section names. This test sets the
+/// LOSING copy to a value that would be unmistakable if it ever bound, and
+/// asserts the winner's number came through. Without it, "which copy wins" is a
+/// claim in a comment; with it, changing the precedence fails a test that names
+/// the money at stake.
+#[test]
+fn duplicate_knobs_resolve_to_the_documented_winner() {
+    let mut settings = neoethos_core::Settings::default();
+
+    // Winners.
+    settings.system.symbol = "EURUSD".to_string();
+    settings.system.account_currency = "GBP".to_string();
+    settings.risk.backtest_spread_pips = 1.25;
+    settings.risk.slippage_pips = 0.25;
+    settings.risk.commission_per_lot = 7.0;
+    settings.risk.commission_per_lot_is_per_side = false;
+
+    // Losers — deliberately absurd, so binding them would be obvious.
+    settings.models.eval_runtime.symbol = Some("XAUUSD".to_string());
+    settings.models.eval_runtime.account_currency = Some("JPY".to_string());
+    settings.models.eval_runtime.spread_pips = Some(99.0);
+    settings.models.eval_runtime.commission_per_trade = Some(999.0);
+
+    let cfg = DiscoveryConfig::from_settings(&settings);
+
+    assert_eq!(
+        cfg.evaluation_symbol, "EURUSD",
+        "system.symbol wins; models.eval_runtime.symbol must not reach discovery"
+    );
+    assert_eq!(
+        cfg.evaluation_account_currency, "GBP",
+        "system.account_currency wins; a wrong currency silently rescales every result"
+    );
+    assert!(
+        (cfg.evaluation_spread_pips - 1.5).abs() < 1e-9,
+        "risk.backtest_spread_pips + risk.slippage_pips wins (expected 1.5, got {}); \
+         models.eval_runtime.spread_pips is what the Settings screen calls \
+         cost.spread_pips and it must not bind in discovery",
+        cfg.evaluation_spread_pips
+    );
+    assert!(
+        cfg.evaluation_commission_per_trade < 100.0,
+        "risk.commission_per_lot wins (got {}); models.eval_runtime.commission_per_trade \
+         must not bind in discovery",
+        cfg.evaluation_commission_per_trade
+    );
+}
+
+/// `models.discovery_runtime` is the ONLY operator input for the discovery
+/// runtime knobs, and an out-of-range value keeps the default.
+///
+/// The six `NEOETHOS_BOT_PREFILTER_*` / `_FUNNEL_*` / `_MIN_HISTORY_YEARS`
+/// names were deleted on 2026-08-10. `prefilter_top_k` is the exact key
+/// `shipped_config_matches_defaults.rs` exists to protect — at 50 the base
+/// feature set collapses from 217 columns to roughly 64, with the SMC, session
+/// and footprint families dying first — so a second, invisible way to set it
+/// was the highest-cost env var in the crate.
+#[test]
+fn discovery_runtime_reads_config_and_keeps_the_default_on_garbage() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.discovery_runtime.prefilter_top_k = 240;
+    settings.models.discovery_runtime.prefilter_insample_frac = f64::NAN;
+    settings.models.discovery_runtime.funnel_stage1_pct = 5.0;
+    settings.models.discovery_runtime.stage1_window = "sideways".to_string();
+
+    let resolved = DiscoveryRuntimeOverrides::from_settings(&settings);
+    let default = DiscoveryRuntimeOverrides::default();
+
+    assert_eq!(resolved.prefilter_top_k, 240);
+    assert_eq!(
+        resolved.prefilter_insample_frac, default.prefilter_insample_frac,
+        "a non-finite fraction must keep the default, and say so"
+    );
+    assert!(
+        (resolved.funnel_stage1_pct - 1.0).abs() < 1e-9,
+        "an out-of-range funnel fraction is clamped to 1.0, not accepted"
+    );
+    assert_eq!(
+        resolved.stage1_window, default.stage1_window,
+        "an unrecognised stage1_window keeps the OOS-safe default"
+    );
 }
 
 /// The report must describe the engine it reports on — for EVERY mode, and by
@@ -2724,6 +3287,20 @@ enum KnobClass {
     /// The string is the justification, kept next to the exemption (read by
     /// humans reviewing the exemption, not by the assertions).
     DiagnosticOnly(#[allow(dead_code)] &'static str),
+    /// The knob is RETIRED: nothing reads it to decide anything. It appears in
+    /// this crate's sources ONLY inside the retired-name announcement tables,
+    /// which read it solely to log at ERROR that a value found in the shell was
+    /// IGNORED. It therefore has no resolved value to record in the run profile
+    /// — recording one would imply it still reached the run.
+    ///
+    /// This is NOT a free pass: the assertion below requires every name
+    /// classified here to be present in `RETIRED_ENV_VARS` or
+    /// `RETIRED_SEARCH_ENV_VARS`, so a knob that is still live cannot be parked
+    /// in this variant without also being declared retired in the shipped table
+    /// that shouts about it.
+    ///
+    /// The string names what decides the behaviour instead.
+    Retired(#[allow(dead_code)] &'static str),
 }
 
 fn collect_env_knob_names_in_crate_sources() -> std::collections::BTreeSet<String> {
@@ -3019,4 +3596,325 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         "two profile builds from the same config+environment serialized \
          differently — the profile artifact itself is non-deterministic"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// MEASUREMENT SLICE (2026-08-09): the eight named base-quality criteria.
+//
+// `rejected_base_quality` was ONE counter standing in for at least eight
+// independent gates, so a run could report "174 screened, 0 survived" with
+// nobody able to say which condition did it — and the answer, in that run, was
+// a single one: the payoff floor. These tests pin the attribution: every
+// criterion is reachable, and the split does not change which candidates
+// survive.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Metrics that clear every base-quality criterion under `strict_only_filters`.
+fn base_quality_passing_metrics() -> StrategyMetrics {
+    let mut m = crate::quality::empty_metrics("gene_ok");
+    m.max_drawdown_pct = 0.10;
+    m.win_rate = 0.55;
+    m.payoff_ratio = 2.5;
+    m.in_market_pct = 0.10;
+    m.positive_months = 12;
+    m.trades_per_month = 20.0;
+    m.avg_monthly_return_pct = 0.10;
+    m.avg_win_pct = 0.02; // → avg_trade_return_pct 2.0
+    // The net-expectancy criterion is UNCONDITIONAL — `TargetProfile::default()`
+    // means "must be strictly positive", not "no preference". A fixture that
+    // left this at 0.0 described a candidate that does not make money, which is
+    // no longer a passing candidate on any lane. Added when the objective moved
+    // from a payoff floor to cost-charged net expectancy per trade.
+    m.profit_per_trade = 4.0;
+    m.net_expectancy_stderr = 1.0;
+    m.net_expectancy_t_stat = 4.0;
+    m
+}
+
+/// Strict floors the metrics above clear, with the opportunistic lane BOTH
+/// switched off AND floored so high it could not rescue anything even if it
+/// were open. That isolates the strict criteria for attribution.
+fn strict_only_filters() -> FilteringConfig {
+    FilteringConfig {
+        min_positive_months: 3,
+        min_trades_per_month: 5.0,
+        min_monthly_return_pct: 0.01,
+        opportunistic_enabled: false,
+        use_opportunistic_candidates: false,
+        opportunistic_min_positive_months: 3,
+        opportunistic_min_trades_per_month: 5.0,
+        opportunistic_min_trade_return_pct: 5.0,
+        opportunistic_max_dd: 0.50,
+        ..FilteringConfig::default()
+    }
+}
+
+#[test]
+fn base_quality_attribution_names_each_of_the_ten_criteria() {
+    let filters = strict_only_filters();
+    let no_profile = TargetProfile::default();
+
+    // Baseline: passes, on the strict lane (not the opportunistic one).
+    assert_eq!(
+        classify_base_quality(&base_quality_passing_metrics(), &no_profile, &filters),
+        Ok(false)
+    );
+
+    // 1. Total loss beats everything else, including a profile it satisfies.
+    let mut wiped = base_quality_passing_metrics();
+    wiped.max_drawdown_pct = 1.0;
+    assert_eq!(
+        classify_base_quality(&wiped, &no_profile, &filters),
+        Err(BaseQualityReject::AccountWiped)
+    );
+
+    // 2/3/4/5/6. The five TargetProfile criteria, each on its own.
+    //
+    // The classifier DELEGATES to `TargetProfile::evaluate` rather than
+    // restating its criteria, so these cases also pin that the delegation is
+    // complete: a criterion added to the profile and not mapped here is a
+    // non-exhaustive-match compile error, not a silent hole in the census.
+    let profile = TargetProfile {
+        min_net_expectancy_per_trade: 0.0,
+        min_expectancy_t_stat: 0.0,
+        // 0.50, BELOW the fixture's 0.55. It was 0.60, which the fixture fails,
+        // so every case after the win-rate one short-circuited on win rate and
+        // the payoff/in-market criteria were never actually exercised. Each
+        // criterion here must be reachable with only its own field perturbed.
+        min_win_rate: 0.50,
+        min_payoff_ratio: 2.0,
+        max_in_market: 0.20,
+    };
+
+    // THE primary criterion, and the only unconditional one: a money-loser is
+    // refused before any shape question is asked, even under a default profile
+    // that expresses no other preference. Payoff 2.53 at expectancy -4.18 pips
+    // is the measured case this exists to refuse.
+    let mut loses_money = base_quality_passing_metrics();
+    loses_money.profit_per_trade = -4.18;
+    loses_money.payoff_ratio = 2.53;
+    assert_eq!(
+        classify_base_quality(&loses_money, &no_profile, &filters),
+        Err(BaseQualityReject::ProfileNetExpectancy)
+    );
+
+    // Positive, but inside its own sampling noise. Opt-in, and it binds when set.
+    let mut noisy = base_quality_passing_metrics();
+    noisy.net_expectancy_t_stat = 0.4;
+    let significance_profile = TargetProfile {
+        min_expectancy_t_stat: 2.0,
+        ..TargetProfile::default()
+    };
+    assert_eq!(
+        classify_base_quality(&noisy, &significance_profile, &filters),
+        Err(BaseQualityReject::ProfileExpectancySignificance)
+    );
+
+    let mut low_wr = base_quality_passing_metrics();
+    low_wr.win_rate = 0.40;
+    assert_eq!(
+        classify_base_quality(&low_wr, &profile, &filters),
+        Err(BaseQualityReject::ProfileWinRate)
+    );
+
+    // The gate that decided the 0-of-174 run all by itself: a realised payoff
+    // of 1.08 (the best cell measured anywhere in the real-bar grid) against a
+    // configured floor of 2.0.
+    let mut low_payoff = base_quality_passing_metrics();
+    low_payoff.payoff_ratio = 1.08;
+    assert_eq!(
+        classify_base_quality(&low_payoff, &profile, &filters),
+        Err(BaseQualityReject::ProfilePayoffRatio)
+    );
+
+    let mut always_in = base_quality_passing_metrics();
+    always_in.in_market_pct = 0.90;
+    assert_eq!(
+        classify_base_quality(&always_in, &profile, &filters),
+        Err(BaseQualityReject::ProfileInMarket)
+    );
+
+    // 8/9/10. The strict-quality criteria, with the opportunistic lane unable to
+    // rescue any of them.
+    let mut few_months = base_quality_passing_metrics();
+    few_months.positive_months = 1;
+    assert_eq!(
+        classify_base_quality(&few_months, &no_profile, &filters),
+        Err(BaseQualityReject::PositiveMonths)
+    );
+
+    let mut thin = base_quality_passing_metrics();
+    thin.trades_per_month = 1.0;
+    assert_eq!(
+        classify_base_quality(&thin, &no_profile, &filters),
+        Err(BaseQualityReject::TradesPerMonth)
+    );
+
+    let mut flat = base_quality_passing_metrics();
+    flat.avg_monthly_return_pct = 0.0001;
+    assert_eq!(
+        classify_base_quality(&flat, &no_profile, &filters),
+        Err(BaseQualityReject::MonthlyReturn)
+    );
+}
+
+#[test]
+fn a_candidate_killed_by_the_opportunistic_switch_is_not_reported_as_a_metric_failure() {
+    // "N candidates were killed by a config switch" and "N candidates missed a
+    // measurement" call for opposite decisions. The old single counter said
+    // neither.
+    let mut filters = strict_only_filters();
+    filters.min_monthly_return_pct = 0.50; // strict lane unreachable
+    filters.opportunistic_min_positive_months = 1;
+    filters.opportunistic_min_trades_per_month = 1.0;
+    filters.opportunistic_min_trade_return_pct = 0.0;
+    filters.opportunistic_max_dd = 0.90;
+
+    let metrics = base_quality_passing_metrics();
+    let no_profile = TargetProfile::default();
+
+    // Lane closed → attributed to the switch, not to a metric.
+    assert_eq!(
+        classify_base_quality(&metrics, &no_profile, &filters),
+        Err(BaseQualityReject::OpportunisticLaneClosed)
+    );
+
+    // Lane open → the same candidate survives, on the opportunistic lane.
+    filters.opportunistic_enabled = true;
+    filters.use_opportunistic_candidates = true;
+    assert_eq!(
+        classify_base_quality(&metrics, &no_profile, &filters),
+        Ok(true)
+    );
+}
+
+#[test]
+fn attribution_reproduces_the_original_pass_fail_decision_exactly() {
+    // The split is INSTRUMENTATION: it must not change which candidates
+    // survive. Sweep the grid and assert the classifier agrees with the
+    // original `profile_ok && (strict || opportunistic)` expression on every
+    // cell, and that the lane it reports matches too.
+    let profile = TargetProfile {
+        min_net_expectancy_per_trade: 0.0,
+        min_expectancy_t_stat: 0.0,
+        min_win_rate: 0.35,
+        min_payoff_ratio: 1.5,
+        max_in_market: 0.50,
+    };
+    let mut checked = 0usize;
+    for lane_open in [false, true] {
+        for dd in [0.05_f64, 1.0] {
+            for wr in [0.20_f64, 0.60] {
+                for payoff in [0.9_f64, 2.4] {
+                    for in_market in [0.10_f64, 0.80] {
+                        for months in [0_usize, 12] {
+                            for tpm in [0.5_f64, 20.0] {
+                                for ret in [0.0001_f64, 0.10] {
+                                    let mut m = base_quality_passing_metrics();
+                                    m.max_drawdown_pct = dd;
+                                    m.win_rate = wr;
+                                    m.payoff_ratio = payoff;
+                                    m.in_market_pct = in_market;
+                                    m.positive_months = months;
+                                    m.trades_per_month = tpm;
+                                    m.avg_monthly_return_pct = ret;
+
+                                    let mut f = strict_only_filters();
+                                    f.opportunistic_enabled = lane_open;
+                                    f.use_opportunistic_candidates = lane_open;
+                                    f.opportunistic_min_positive_months = 1;
+                                    f.opportunistic_min_trades_per_month = 1.0;
+                                    f.opportunistic_min_trade_return_pct = 0.0;
+                                    f.opportunistic_max_dd = 0.90;
+
+                                    let profile_ok = profile.accepts(&m);
+                                    let strict = profile_ok && passes_strict_quality(&m, &f);
+                                    let opportunistic = profile_ok
+                                        && !strict
+                                        && passes_opportunistic_quality(&m, &f);
+                                    let legacy_survives = strict || opportunistic;
+
+                                    let verdict = classify_base_quality(&m, &profile, &f);
+                                    assert_eq!(
+                                        verdict.is_ok(),
+                                        legacy_survives,
+                                        "attribution changed the survival decision at \
+                                         dd={dd} wr={wr} payoff={payoff} in_market={in_market} \
+                                         months={months} tpm={tpm} ret={ret} open={lane_open}"
+                                    );
+                                    if let Ok(lane) = verdict {
+                                        assert_eq!(lane, opportunistic);
+                                    }
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 256);
+}
+
+#[test]
+fn the_funnel_keeps_every_reject_reason_the_quality_screen_records() {
+    // The quality screen records six gate-level reasons plus the eight named
+    // base-quality criteria — fourteen. A 10-entry cap would have silently
+    // dropped four, and the dropped ones would be the smallest counts, i.e.
+    // exactly the rare causes a funnel exists to surface.
+    let mut funnel = crate::funnel_profile::FunnelProfile::new("EURUSD", "M5");
+    funnel.record_stage("passed_quality", 100, 0);
+    for i in 0..14 {
+        funnel.add_reject_reason("passed_quality", format!("reason_{i}"), i + 1);
+    }
+    let stage = funnel
+        .stages
+        .iter()
+        .find(|s| s.name == "passed_quality")
+        .expect("passed_quality stage");
+    assert_eq!(
+        stage.top_reasons.len(),
+        14,
+        "the funnel truncated reject reasons — a silent drop on a diagnostics path"
+    );
+    assert!(crate::funnel_profile::MAX_REJECT_REASONS_PER_STAGE >= 14);
+}
+
+/// A cost band that sits BELOW the cost the run already charges cannot fail
+/// anybody: the edges replace the whole cost, cost is monotone, so every
+/// screened survivor clears both edges by construction and the census reads
+/// clean on every run. That is worse than no census, because a reader takes it
+/// as evidence.
+///
+/// The shipped numbers are exactly this case, which is why the arithmetic is
+/// pinned here rather than left as prose: spread 1.5 + slippage 0.5 +
+/// commission 14 USD/lot ÷ 10 USD/pip = 3.4 pips, against edges 1.6 / 2.4.
+#[test]
+fn a_cost_band_below_the_charged_cost_cannot_discriminate() {
+    let baseline = crate::run_identity::cost_pips_round_trip(2.0, 14.0, 10.0);
+    assert!((baseline - 3.4).abs() < 1e-12, "shipped baseline is 3.4 pips");
+
+    assert!(
+        !crate::discovery::cost_band_discriminates(Some((1.6, 2.4)), baseline),
+        "the shipped band is entirely below the shipped baseline and must be refused"
+    );
+    // Bracketing the baseline is what makes the band able to say anything.
+    assert!(crate::discovery::cost_band_discriminates(
+        Some((2.8, 4.4)),
+        baseline
+    ));
+    // Exactly equal is still not discriminating: a candidate that cleared the
+    // baseline clears an identical cost trivially.
+    assert!(!crate::discovery::cost_band_discriminates(
+        Some((1.6, 3.4)),
+        baseline
+    ));
+    // No band configured is not "discriminating"; it is unmeasured.
+    assert!(!crate::discovery::cost_band_discriminates(None, baseline));
+    // A non-finite baseline must never be read as a pass.
+    assert!(!crate::discovery::cost_band_discriminates(
+        Some((2.8, 4.4)),
+        f64::NAN
+    ));
 }

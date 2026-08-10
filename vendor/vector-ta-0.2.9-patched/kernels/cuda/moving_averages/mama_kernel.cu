@@ -758,3 +758,214 @@ void mama_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — mama (MESA Adaptive Moving Average, MAMA line)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/mama.rs
+//   mama_prepare (:196)        — the Err branches (len < 10, limit validation)
+//   mama_with_kernel (:240)    — const WARM: usize = 10, NaN prefix
+//   mama_scalar_inplace (:793) — the arithmetic
+//   src/utilities/math_functions.rs:6 — atan_fast
+// Defaults: fast_limit 0.5 (:95), slow_limit 0.05 (:99). PERIOD-INVARIANT and
+// FIRST-VALID-INDEPENDENT: the reference starts at bar 0 and its warmup is the
+// literal 10, not first + anything.
+//
+// WHICH OUTPUT: mama (the fast line); fama is a separate entry point.
+//
+// THIS KERNEL CAN BE BIT-EXACT, AND THAT IS WORTH SAYING.
+// mama never calls a transcendental. Its arctangent is `atan_fast`, a rational
+// approximation built from mul_add, abs and one divide:
+//     a = |z|
+//     a <= 1 : PIO4.mul_add(z, z.mul_add(a - 1.0, C1.mul_add(a, C0)))
+//     else   : inv = 1/z, base = PIO4.mul_add(inv, inv.mul_add(|inv|-1, t)),
+//              result = ±PIO2 - base   by z.is_sign_positive()
+// Every step is an IEEE-754 operation CUDA reproduces exactly, so unlike
+// correlation_cycle this transcription carries no libm-parity caveat.
+// NOTE the sign test is is_sign_positive(), which is TRUE for +0.0 and FALSE
+// for -0.0 — signbit() below, not `z > 0.0`, which would misroute -0.0.
+//
+// THE RING BUFFERS ARE 8 DEEP AND COMPILE-TIME (RING = 8, MASK = 7), so all
+// four fit in registers. No scratch, no dynamic array.
+//
+// ROUNDING — every one of these is a mul_add on the CPU and an fma() here:
+//   hilbert4  = H0.mul_add(x0, H1.mul_add(x2, H2.mul_add(x4, H3 * x6)))
+//               — right-nested, three fmas over one product
+//   smooth    = 0.1 * (4.0.mul_add(p, 3.0.mul_add(s1, 2.0.mul_add(s2, s3))))
+//   amp       = 0.075.mul_add(prev_mesa, 0.54)
+//   i2s/q2s   = 0.2.mul_add(i2, 0.8 * prev_i2)
+//   re/im     = 0.2.mul_add(<product sum>, 0.8 * prev_re)
+//   mama      = alpha.mul_add(price, (1.0 - alpha) * prev_mama)
+//   fama      = (0.5*alpha).mul_add(mama, (1.0 - 0.5*alpha) * prev_fama)
+// The f32 kernel above spells the same chain with six __fmaf_rn — exact to f32,
+// which is the error.
+//
+// THE CLAMPS ARE if-CHAINS, NOT fmin/fmax, AND THAT IS DELIBERATE (:901-912,
+// :922-932). Under a NaN `mesa` every comparison is false and the NaN survives
+// into prev_mesa — which is what the reference does. Substituting fmin/fmax
+// here would silently repair it.
+//
+// The mesa guard `re != 0.0 && im != 0.0` is an exact test, not a tolerance.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_MAMA_FAST_LIMIT 0.5
+#define NEO_S3_MAMA_SLOW_LIMIT 0.05
+#define NEO_S3_MAMA_RING 8
+#define NEO_S3_MAMA_MASK 7
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// src/utilities/math_functions.rs:6 — transcribed operation for operation.
+__device__ __forceinline__ double neo_s3_atan_fast(double z) {
+    const double C0 = 0.2447;
+    const double C1 = 0.0663;
+    const double PIO4 = 0.78539816339744830961566084581988;
+    const double PIO2 = 1.5707963267948966192313216916398;
+
+    const double a = fabs(z);
+    if (a <= 1.0) {
+        const double t = fma(C1, a, C0);
+        return fma(PIO4, z, fma(z, a - 1.0, t));
+    } else {
+        const double inv = 1.0 / z;
+        const double t = fma(C1, fabs(inv), C0);
+        const double base = fma(PIO4, inv, fma(inv, fabs(inv) - 1.0, t));
+        // is_sign_positive(): true for +0.0, false for -0.0 — signbit, not > 0.
+        return (!signbit(z)) ? (PIO2 - base) : (-PIO2 - base);
+    }
+}
+
+__device__ __forceinline__ double neo_s3_hilbert4(double x0, double x2, double x4, double x6) {
+    const double H0 =  0.0962;
+    const double H1 =  0.5769;
+    const double H2 = -0.5769;
+    const double H3 = -0.0962;
+    return fma(H0, x0, fma(H1, x2, fma(H2, x4, H3 * x6)));
+}
+
+__device__ __forceinline__ double neo_s3_lag(const double* buf, int pos, int k) {
+    return buf[(pos - k) & NEO_S3_MAMA_MASK];
+}
+
+extern "C" __global__ void neoethos_mama_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;      // PERIOD-INVARIANT
+    (void)first_valid;  // the reference starts at bar 0; WARM is the literal 10
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const double fast_limit = NEO_S3_MAMA_FAST_LIMIT;
+    const double slow_limit = NEO_S3_MAMA_SLOW_LIMIT;
+
+    if (n <= 0) return;
+    if (n < 10) {                     // mama_prepare :201
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int WARM = 10;
+    for (int i = 0; i < WARM && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double DEG_PER_RAD = 180.0 / 3.14159265358979323846;
+    const double TWO_PI = 2.0 * 3.14159265358979323846;
+
+    const double firstv = data[0];
+
+    double smooth[NEO_S3_MAMA_RING];
+    double detrender[NEO_S3_MAMA_RING];
+    double i1_buf[NEO_S3_MAMA_RING];
+    double q1_buf[NEO_S3_MAMA_RING];
+    for (int q = 0; q < NEO_S3_MAMA_RING; ++q) {
+        smooth[q] = firstv; detrender[q] = firstv;
+        i1_buf[q] = firstv; q1_buf[q] = firstv;
+    }
+
+    int idx = 0;
+    double prev_mesa = 0.0, prev_phase = 0.0;
+    double prev_mama = firstv, prev_fama = firstv;
+    double prev_i2 = 0.0, prev_q2 = 0.0, prev_re = 0.0, prev_im = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double price = data[i];
+        const double s1 = (i >= 1) ? data[i - 1] : price;
+        const double s2 = (i >= 2) ? data[i - 2] : price;
+        const double s3 = (i >= 3) ? data[i - 3] : price;
+        const double smooth_val = 0.1 * fma(4.0, price, fma(3.0, s1, fma(2.0, s2, s3)));
+        smooth[idx] = smooth_val;
+
+        const double amp = fma(0.075, prev_mesa, 0.54);
+
+        const double dt = amp * neo_s3_hilbert4(
+            smooth[idx], neo_s3_lag(smooth, idx, 2),
+            neo_s3_lag(smooth, idx, 4), neo_s3_lag(smooth, idx, 6));
+        detrender[idx] = dt;
+
+        const double i1 = neo_s3_lag(detrender, idx, 3);
+        i1_buf[idx] = i1;
+        const double q1 = amp * neo_s3_hilbert4(
+            detrender[idx], neo_s3_lag(detrender, idx, 2),
+            neo_s3_lag(detrender, idx, 4), neo_s3_lag(detrender, idx, 6));
+        q1_buf[idx] = q1;
+
+        const double j_i = amp * neo_s3_hilbert4(
+            i1_buf[idx], neo_s3_lag(i1_buf, idx, 2),
+            neo_s3_lag(i1_buf, idx, 4), neo_s3_lag(i1_buf, idx, 6));
+        const double j_q = amp * neo_s3_hilbert4(
+            q1_buf[idx], neo_s3_lag(q1_buf, idx, 2),
+            neo_s3_lag(q1_buf, idx, 4), neo_s3_lag(q1_buf, idx, 6));
+
+        const double i2 = i1 - j_q;
+        const double q2 = q1 + j_i;
+        const double i2s = fma(0.2, i2, 0.8 * prev_i2);
+        const double q2s = fma(0.2, q2, 0.8 * prev_q2);
+        const double re = fma(0.2, i2s * prev_i2 + q2s * prev_q2, 0.8 * prev_re);
+        const double im = fma(0.2, i2s * prev_q2 - q2s * prev_i2, 0.8 * prev_im);
+        prev_i2 = i2s;
+        prev_q2 = q2s;
+        prev_re = re;
+        prev_im = im;
+
+        double mesa = (re != 0.0 && im != 0.0)
+            ? (TWO_PI / neo_s3_atan_fast(im / re))
+            : prev_mesa;
+        if (mesa > 1.5 * prev_mesa)  mesa = 1.5 * prev_mesa;
+        if (mesa < 0.67 * prev_mesa) mesa = 0.67 * prev_mesa;
+        if (mesa < 6.0)  mesa = 6.0;
+        if (mesa > 50.0) mesa = 50.0;
+        mesa = fma(0.2, mesa, 0.8 * prev_mesa);
+        prev_mesa = mesa;
+
+        const double phase = (i1 != 0.0)
+            ? (neo_s3_atan_fast(q1 / i1) * DEG_PER_RAD)
+            : prev_phase;
+        double dphi = prev_phase - phase;
+        if (dphi < 1.0) dphi = 1.0;
+        prev_phase = phase;
+
+        double alpha = fast_limit / dphi;
+        if (alpha < slow_limit) alpha = slow_limit;
+        if (alpha > fast_limit) alpha = fast_limit;
+
+        const double mama = fma(alpha, price, (1.0 - alpha) * prev_mama);
+        const double fama = fma(0.5 * alpha, mama, (1.0 - 0.5 * alpha) * prev_fama);
+        prev_mama = mama;
+        prev_fama = fama;
+
+        if (i >= WARM) row[i] = mama;
+
+        idx = (idx + 1) & NEO_S3_MAMA_MASK;
+    }
+}

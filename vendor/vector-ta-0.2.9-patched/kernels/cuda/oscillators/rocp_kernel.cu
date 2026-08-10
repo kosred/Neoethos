@@ -174,3 +174,52 @@ void rocp_many_series_one_param_f32(const float* __restrict__ data_tm,
         out[t * cols + s] = (c - p) / p;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `rocp.rs::rocp_scalar` (l.320) —
+//   `for i in (first_val + period)..len { out[i] = (data[i] - data[i-period]) / data[i-period] }`
+//
+// f32 -> f64 audit: pointers/locals widened; the f32 file's
+// `__int_as_float(0x7fc00000)` NaN becomes the f64 quiet-NaN bit pattern; no
+// fast-math divide (`__fdividef`) survives — this is a plain IEEE divide, one
+// rounding, matching the single rounding in the CPU line. No epsilon: a zero
+// `prev` divides to +/-Inf on both sides, which is what the CPU produces, and
+// substituting a guard here would make the device disagree with the reference.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double rocp_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void rocp_batch_f64(const double* __restrict__ prices,
+                    int n,
+                    const int*   __restrict__ periods,
+                    int n_combos,
+                    int first_valid,
+                    double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = rocp_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    if (period <= 0) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+
+    const long long start_ll = static_cast<long long>(first_valid) + static_cast<long long>(period);
+    const int start = (start_ll >= n) ? n : static_cast<int>(start_ll);
+
+    for (int t = 0; t < start; ++t) row[t] = nan_d;
+    for (int t = start; t < n; ++t) {
+        const double p = prices[t - period];
+        row[t] = (prices[t] - p) / p;
+    }
+}

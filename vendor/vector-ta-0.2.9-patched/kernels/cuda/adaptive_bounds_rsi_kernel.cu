@@ -254,3 +254,128 @@ extern "C" __global__ void adaptive_bounds_rsi_batch_f64(
         has_prev_regime = true;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE - adaptive_bounds_rsi
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/adaptive_bounds_rsi.rs:670
+ *             `adaptive_bounds_rsi_output_into_slice`, driving
+ *             `RsiState::update` (:301) and `rsi_value` (:331).
+ *
+ * COLUMN: `rsi`. `adaptive_bounds_rsi_field` (cpu_batch.rs:12552) maps
+ * output_id "value" onto `OutputField::Rsi`, so the value column IS the RSI
+ * series. The five adaptive bounds c1..c5, the regime and the four signal
+ * flags are OTHER columns and do not enter this one at all - which is why
+ * `alpha` never appears below. Emitting a bound here instead would pass every
+ * length and shape check and be a different indicator.
+ *
+ * PERIOD-INVARIANT. The CPU batch reads `rsi_length` (14) and `alpha` (0.1)
+ * and never `period`.
+ *
+ * FIRST-VALID IGNORED. The output row builds a fresh stream and walks from
+ * index 0, filling NaN first (:679). A non-finite bar RESETS the RSI state
+ * (:579) - `prev_price`, the seed sums, the seed count and both Wilder
+ * averages - so the 14-bar seed restarts after every hole rather than
+ * bridging it.
+ *
+ * ROUNDING: `avg_gain.mul_add(beta, inv_p * gain)` is ONE fused rounding on
+ * the outer multiply-add over a separately rounded `inv_p * gain`. Written as
+ * `fma(avg_gain, beta, inv_p * gain)` for exactly that count - two roundings,
+ * not three. `-fmad=false` in build.rs forbids the COMPILER contracting a
+ * separate `*` and `+`, and does not touch this explicit `fma`.
+ *
+ * SEED: `avg = sum * inv_p`, where `sum` was accumulated one bar at a time
+ * from 0.0 in ascending order (:312). NOT a chunked or pairwise sum - the
+ * association is the CPU loop and is reproduced literally.
+ *
+ * NaN SEMANTICS: `delta.max(0.0)` and `(-delta).max(0.0)` are `f64::max`,
+ * which returns the NON-NaN operand. `fmax` matches; `delta > 0 ? delta : 0`
+ * would return 0.0 for a NaN delta on one side and NaN on the other,
+ * silently changing the seed.
+ *
+ * SEQUENTIAL, one thread per combo column: a Wilder recurrence.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void adaptive_bounds_rsi_neo_batch_f64(
+    const double* __restrict__ data,
+    int series_len,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods; (void)first_valid;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+
+    const int    period = 14;                    /* adaptive_bounds_rsi.rs default */
+    const double inv_p  = 1.0 / (double)period;  /* RsiState::new, :274 */
+    const double beta   = 1.0 - inv_p;
+
+    bool   have_prev = false;
+    double prev_price = 0.0;
+    int    seed_count = 0;
+    double sum_gain = 0.0, sum_loss = 0.0;
+    double avg_gain = 0.0, avg_loss = 0.0;
+    bool   seeded = false;
+
+    for (int i = 0; i < len; ++i) {
+        const double v = data[i];
+        if (!isfinite(v)) {
+            have_prev = false; prev_price = 0.0;
+            seed_count = 0;
+            sum_gain = 0.0; sum_loss = 0.0;
+            avg_gain = 0.0; avg_loss = 0.0;
+            seeded = false;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+        if (!have_prev) {
+            have_prev = true;
+            prev_price = v;
+            o[i] = NEO_F64_NAN;   /* RsiState::update returns None, :302 */
+            continue;
+        }
+
+        const double delta = v - prev_price;
+        prev_price = v;
+        const double gain = fmax(delta, 0.0);
+        const double loss = fmax(-delta, 0.0);
+
+        double rsi;
+        bool   emit;
+        if (!seeded) {
+            sum_gain += gain;
+            sum_loss += loss;
+            seed_count += 1;
+            if (seed_count == period) {
+                seeded = true;
+                avg_gain = sum_gain * inv_p;
+                avg_loss = sum_loss * inv_p;
+                emit = true;
+            } else {
+                emit = false;
+            }
+        } else {
+            avg_gain = fma(avg_gain, beta, inv_p * gain);
+            avg_loss = fma(avg_loss, beta, inv_p * loss);
+            emit = true;
+        }
+
+        if (emit) {
+            const double denom = avg_gain + avg_loss;
+            rsi = (denom == 0.0) ? 50.0 : 100.0 * avg_gain / denom;
+            o[i] = rsi;
+        } else {
+            o[i] = NEO_F64_NAN;
+        }
+    }
+}

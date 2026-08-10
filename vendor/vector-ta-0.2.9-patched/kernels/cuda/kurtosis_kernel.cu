@@ -328,3 +328,267 @@ extern "C" __global__ void kurtosis_many_series_one_param_f32(
         }
     }
 }
+
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/kurtosis.rs
+//   * `kurtosis_scalar`            (:372) — the general window path
+//   * `kurtosis_period5_value`     (:464) — the period == 5 CLOSED FORM, which
+//     multiplies by 0.2 instead of dividing by 5.0. `x * 0.2` and `x / 5.0` are
+//     NOT the same double (0.2 is not representable), so the branch is
+//     reproduced rather than folded into the general path.
+//   * warmup prefix: `alloc_with_nan_prefix(len, first + period - 1)` (:238).
+//
+// Windowed, not recursive: every bar reads its own [i+1-period, i] window and
+// nothing carries across bars, so this is parallel over (combo, bar).
+//
+// The epsilon is `f64::EPSILON` = 2^-52 = 2.220446049250313e-16 — DERIVED for
+// f64, not the f32 1.1920929e-7 that the legacy lane would have used.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_kurt() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__
+void neoethos_kurtosis_f64(const double* __restrict__ prices,
+                           int n,
+                           const int* __restrict__ periods,
+                           int n_combos,
+                           int first_valid,
+                           double* __restrict__ out)
+{
+    const int combo = blockIdx.y;
+    if (combo >= n_combos) return;
+    const int bar = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bar >= n || n <= 0) return;
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double QNAN = nef_qnan_kurt();
+
+    const int period = periods[combo];
+    if (period <= 0 || first_valid < 0 || first_valid >= n) { row[bar] = QNAN; return; }
+
+    // warm = first + period - 1; everything before it is the CPU's NaN prefix.
+    const int first_out = first_valid + period - 1;
+    if (bar < first_out) { row[bar] = QNAN; return; }
+
+    const int start = bar + 1 - period;
+
+    // f64::EPSILON, exactly. NOT the f32 epsilon.
+    const double EPS_F64 = 2.220446049250313e-16;
+
+    if (period == 5) {
+        // kurtosis_period5_value — association order preserved literally.
+        const double a = prices[start];
+        const double b = prices[start + 1];
+        const double c = prices[start + 2];
+        const double d = prices[start + 3];
+        const double e = prices[start + 4];
+        if (isnan(a) || isnan(b) || isnan(c) || isnan(d) || isnan(e)) { row[bar] = QNAN; return; }
+
+        const double mean = ((((a + b) + c) + d) + e) * 0.2;
+        const double da = a - mean;
+        const double db = b - mean;
+        const double dc = c - mean;
+        const double dd = d - mean;
+        const double de = e - mean;
+
+        const double da2 = da * da;
+        const double db2 = db * db;
+        const double dc2 = dc * dc;
+        const double dd2 = dd * dd;
+        const double de2 = de * de;
+
+        const double m2 = ((((da2 + db2) + dc2) + dd2) + de2) * 0.2;
+        if (fabs(m2) < EPS_F64) { row[bar] = QNAN; return; }
+        const double m4 =
+            (((((da2 * da2) + (db2 * db2)) + (dc2 * dc2)) + (dd2 * dd2)) + (de2 * de2)) * 0.2;
+        row[bar] = (m4 / (m2 * m2)) - 3.0;
+        return;
+    }
+
+    // General path: forward sum, then a second forward pass for m2/m4.
+    double sum = 0.0;
+    for (int k = 0; k < period; ++k) {
+        const double v = prices[start + k];
+        if (isnan(v)) { row[bar] = QNAN; return; }
+        sum += v;
+    }
+    const double nn = (double)period;
+    const double mean = sum / nn;
+    double m2 = 0.0;
+    double m4 = 0.0;
+    for (int k = 0; k < period; ++k) {
+        const double diff = prices[start + k] - mean;
+        const double d2 = diff * diff;
+        m2 += d2;
+        m4 += d2 * d2;
+    }
+    m2 /= nn;
+    m4 /= nn;
+
+    if (fabs(m2) < EPS_F64) { row[bar] = QNAN; return; }
+    row[bar] = (m4 / (m2 * m2)) - 3.0;
+}
+
+
+// ===========================================================================
+// S1 f64 LANE  --  kurtosis
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/kurtosis.rs -- `kurtosis_scalar` (:372), `kurtosis_period5_value` (:463), `kurtosis_with_kernel` (:207)
+//
+// SOURCE SERIES IS hl2, NOT close. `compute_kurtosis_batch`
+// (cpu_batch.rs:3522) calls `extract_slice_input("kurtosis", req.data, "hl2")`.
+// Feeding this kernel close computes a different indicator and passes every
+// shape check on the way, which is why the lane declares `Hl2Slice` for it --
+// the same reason `cci`/`mfi` declare hlc3.
+//
+// PERIOD-BASED: `period` (default 5) is the swept parameter.
+//
+// TWO CPU PATHS, BOTH REPRODUCED, BECAUSE THEY ARE NOT THE SAME ARITHMETIC.
+// `kurtosis_scalar` branches at period == 5 to a closed form whose mean is
+// `sum * 0.2` where the general path computes `sum / n`. 0.2 is NOT
+// representable in binary, so `sum * 0.2` and `sum / 5.0` differ in the last
+// place for most inputs -- this is a genuine fork, not a fast path that
+// happens to agree, and the default period IS 5, so it is the branch this lane
+// will actually take. Both are written out below.
+// The `_clean` variant (kurtosis.rs:421) differs from `kurtosis_scalar_period5`
+// (:440) only by skipping the per-bar NaN guard; with a NaN input the guarded
+// path stores NaN explicitly and the unguarded one propagates NaN through the
+// arithmetic to the same NaN, so one body serves both.
+//
+// EPSILON: the CPU compares `m2.abs() < f64::EPSILON`. That is ALREADY an
+// f64-sized constant (2^-52 = 2.220446049250313e-16) and is carried over
+// unchanged -- unlike an f32 epsilon, which would have had to be re-derived.
+// It is written as the literal rather than as `DBL_EPSILON` so the value is
+// visible at the comparison.
+//
+// SUMMATION ORDER: the general path accumulates `sum += v` over the window
+// ascending, then a second ascending pass for m2/m4. The period-5 path is an
+// explicit left-nested tree `((((a+b)+c)+d)+e)`, which is the SAME association
+// as an ascending loop -- but it is written out literally rather than looped,
+// because "the same" is an argument and this is a fixed five-term expression.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + period - 1)`.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+__device__ __forceinline__ double neo_s1_kurtosis_p5(double a, double b, double c,
+                                                     double d, double e) {
+    const double mean = ((((a + b) + c) + d) + e) * 0.2;
+    const double da = a - mean;
+    const double db = b - mean;
+    const double dc = c - mean;
+    const double dd = d - mean;
+    const double de = e - mean;
+
+    const double da2 = da * da;
+    const double db2 = db * db;
+    const double dc2 = dc * dc;
+    const double dd2 = dd * dd;
+    const double de2 = de * de;
+
+    const double m2 = ((((da2 + db2) + dc2) + dd2) + de2) * 0.2;
+    // f64::EPSILON, spelled out.
+    if (fabs(m2) < 2.220446049250313e-16) return neo_s1_qnan();
+    const double m4 =
+        (((((da2 * da2) + (db2 * db2)) + (dc2 * dc2)) + (dd2 * dd2)) + (de2 * de2)) * 0.2;
+    return (m4 / (m2 * m2)) - 3.0;
+}
+
+extern "C" __global__ void neoethos_kurtosis_batch_f64(
+    const double* __restrict__ hl2,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+    if (warm >= n) return;
+
+    if (period == 5) {
+        for (int i = first_valid + 4; i < n; ++i) {
+            const double a = hl2[i - 4];
+            const double b = hl2[i - 3];
+            const double c = hl2[i - 2];
+            const double d = hl2[i - 1];
+            const double e = hl2[i];
+            if (neo_s1_isnan(a) || neo_s1_isnan(b) || neo_s1_isnan(c) ||
+                neo_s1_isnan(d) || neo_s1_isnan(e)) {
+                row[i] = neo_s1_qnan();
+                continue;
+            }
+            row[i] = neo_s1_kurtosis_p5(a, b, c, d, e);
+        }
+        return;
+    }
+
+    const double nf = (double)period;
+    for (int i = warm; i < n; ++i) {
+        const int start = i + 1 - period;
+
+        bool has_nan = false;
+        double sum = 0.0;
+        for (int k = 0; k < period; ++k) {
+            const double v = hl2[start + k];
+            if (neo_s1_isnan(v)) { has_nan = true; break; }
+            sum += v;
+        }
+        if (has_nan) { row[i] = neo_s1_qnan(); continue; }
+
+        const double mean = sum / nf;
+        double m2 = 0.0;
+        double m4 = 0.0;
+        for (int k = 0; k < period; ++k) {
+            const double diff = hl2[start + k] - mean;
+            const double d2 = diff * diff;
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        m2 /= nf;
+        m4 /= nf;
+
+        if (fabs(m2) < 2.220446049250313e-16) {
+            row[i] = neo_s1_qnan();
+        } else {
+            row[i] = (m4 / (m2 * m2)) - 3.0;
+        }
+    }
+}

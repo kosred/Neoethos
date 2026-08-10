@@ -300,3 +300,184 @@ extern "C" __global__ void wavetrend_many_series_one_param_time_major_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — wavetrend
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/wavetrend.rs
+ *   `wavetrend_with_kernel`     (:269) — first_valid, `needed`, Err branches
+ *   `wavetrend_kernel_dispatch` (:336) — warmup = first + ch + avg + ma - 3
+ *   `wavetrend_compute_into`    (:668-765) — THE SCALAR BRANCH, which is what
+ *                                            this kernel mirrors
+ *
+ * SOURCE IS hlc3, NOT close. `compute_wavetrend_batch` (cpu_batch.rs:6490)
+ * calls `extract_slice_input("wavetrend", req.data, "hlc3")`. Handing this
+ * kernel `close` computes a different indicator that passes every shape check,
+ * which is why the spec declares `F64InputKind::Hlc3Slice`.
+ *
+ * WHICH SERIES THIS EMITS. cpu_batch.rs:6492 maps "value" -> `Wt1`.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. The batch reads `channel_length` (9),
+ * `average_length` (12), `ma_length` (3) and `factor` (0.015) —
+ * cpu_batch.rs:6516-6519 — never `period`. Identical CPU columns, identical
+ * rows here. `ma_length` fixed at 3 makes the SMA ring a compile-time 3 slots,
+ * so no `max_period` is needed.
+ *
+ * ------------------------------------------------------------------------
+ * A CRATE SELF-INCONSISTENCY, NAMED RATHER THAN PAPERED OVER
+ * ------------------------------------------------------------------------
+ * `wavetrend` has TWO CPU implementations that are not the same function:
+ *
+ *   * the SCALAR branch (:668-765) seeds each EMA at the FIRST FINITE INPUT
+ *     (`esa_state = x`, `de_state = abs_diff`, `wt1_state = ci`) and steps it
+ *     with `alpha*x + beta*state` — three roundings;
+ *   * the AVX branch (:768-843) calls `wavetrend_core_computation` (:1007),
+ *     which runs `ema_compute_into` over the whole slice — a different seed
+ *     (an SMA of the first `channel_len` bars) and a different step.
+ *
+ * `wavetrend_with_kernel:312` resolves `Kernel::Auto` through
+ * `detect_best_kernel()`, so on an x86 host with AVX the DEFAULT CPU answer is
+ * the second one. This is the same class of defect the crate already records
+ * for `vwap` in `cuda_f64::WITHHELD_PENDING_CPU_SELF_CONSISTENCY`, but with a
+ * larger mechanism: the two disagree in the SEED, not in the last place, so
+ * they differ visibly over the whole warm-up and asymptotically thereafter.
+ *
+ * THIS KERNEL MIRRORS THE SCALAR BRANCH, for the same reason the Inventory
+ * settled `wilders_scalar` / `vwap_scalar` as the oracles: `Kernel::Scalar` is
+ * the path with the explicit, readable definition, it is the one
+ * `Kernel::ScalarBatch` routes to, and it is host-independent — the AVX answer
+ * is not even stable across machines, since `detect_best_kernel` picks AVX2 or
+ * AVX-512 by CPU. A device kernel cannot be parity-checked against an answer
+ * that changes with the host. The remaining work is to make
+ * `wavetrend_core_computation` seed the way the scalar branch does so the
+ * crate agrees with itself; that is a CPU-side edit, it is NOT this shard's
+ * territory, and it is reported rather than silently absorbed.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. THREE STACKED EMAs AND A DIVISION BY A SMOOTHED ABSOLUTE DEVIATION.
+ *     `ci = (x - esa) / (0.015 * de)`: the numerator is a difference of nearly
+ *     equal quantities and the denominator is 1.5% of a small number. In f32
+ *     the numerator keeps ~2 significant digits and the quotient is noise
+ *     multiplied by ~67. This is the worst-conditioned expression in the
+ *     shard.
+ *  2. `fabsf` x1 -> `fabs`.
+ *  3. `__int_as_float(0x7f...)` x21 NaN patterns -> `__longlong_as_double`.
+ *  4. `0.015f` is NOT `0.015`. It is the literal that divides the numerator.
+ *  5. THE EMA STEPS ARE `alpha*x + beta*state` — THREE roundings — NOT
+ *     `fma(alpha, x, beta*state)` and NOT the Wilder single-rounding form. The
+ *     reference writes it out at :703, :711 and :722 and it is copied as
+ *     written.
+ *
+ * THE SMA RING COUNTS ONLY FINITE ENTRIES. `sma_count` is incremented only for
+ * a finite `wt1_i` and `wt2` is emitted only when the ring is FULL of finite
+ * values (:749). A plain `sum / ma_len` would emit a value during the warm-up
+ * that the reference leaves NaN.
+ *
+ * ONE THREAD PER COLUMN. Carried: esa, de, wt1 states plus the 3-slot ring.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_WT_CHANNEL 9
+#define NEO_WT_AVERAGE 12
+#define NEO_WT_MALEN   3
+#define NEO_WT_FACTOR  0.015
+
+extern "C" __global__
+void wavetrend_neo_batch_f64(const double* __restrict__ data,
+                             int series_len,
+                             const int* __restrict__ periods,
+                             int n_combos,
+                             int first_valid,
+                             double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;   /* period-invariant — see the header. */
+
+    const int channel_len = NEO_WT_CHANNEL;
+    const int average_len = NEO_WT_AVERAGE;
+    const int ma_len      = NEO_WT_MALEN;
+    const double factor   = NEO_WT_FACTOR;
+
+    int needed = channel_len;
+    if (average_len > needed) needed = average_len;
+    if (ma_len > needed) needed = ma_len;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        channel_len > len || average_len > len || ma_len > len ||
+        (len - first_valid) < needed) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warmup = first_valid + channel_len - 1 + average_len - 1 + ma_len - 1;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (warmup >= len) return;
+
+    const double alpha_ch  = 2.0 / ((double)channel_len + 1.0);
+    const double beta_ch   = 1.0 - alpha_ch;
+    const double alpha_avg = 2.0 / ((double)average_len + 1.0);
+    const double beta_avg  = 1.0 - alpha_avg;
+
+    double esa_state = NEO_F64_NAN;
+    double de_state  = NEO_F64_NAN;
+    double wt1_state = NEO_F64_NAN;
+    bool esa_seeded = false, de_seeded = false, wt1_seeded = false;
+
+    double ring_vals[NEO_WT_MALEN];
+    unsigned char ring_mask[NEO_WT_MALEN];
+    for (int k = 0; k < ma_len; ++k) { ring_vals[k] = NEO_F64_NAN; ring_mask[k] = 0; }
+    int head = 0;
+    double sma_sum = 0.0;
+    int sma_count = 0;
+
+    for (int idx = first_valid; idx < len; ++idx) {
+        const double x = data[idx];
+
+        double wt1_i = NEO_F64_NAN;
+
+        if (isfinite(x)) {
+            if (!esa_seeded) { esa_state = x; esa_seeded = true; }
+            else             { esa_state = alpha_ch * x + beta_ch * esa_state; }
+
+            const double abs_diff = fabs(x - esa_state);
+            if (!de_seeded) { de_state = abs_diff; de_seeded = true; }
+            else            { de_state = alpha_ch * abs_diff + beta_ch * de_state; }
+
+            const double den = factor * de_state;
+            if (den != 0.0 && isfinite(den) && isfinite(esa_state)) {
+                const double ci = (x - esa_state) / den;
+                if (isfinite(ci)) {
+                    if (!wt1_seeded) { wt1_state = ci; wt1_seeded = true; }
+                    else             { wt1_state = alpha_avg * ci + beta_avg * wt1_state; }
+                    wt1_i = wt1_state;
+                }
+            }
+        }
+
+        /* The ring is maintained even though only wt1 is emitted: `head`,
+         * `sma_sum` and `sma_count` are pure carried state for wt2, and the
+         * loop is kept a line-for-line mirror so the wt2 entry point this file
+         * may gain reads the same state machine. */
+        if (ring_mask[head] != 0) { sma_sum -= ring_vals[head]; sma_count -= 1; }
+        if (isfinite(wt1_i)) {
+            ring_vals[head] = wt1_i;
+            ring_mask[head] = 1;
+            sma_sum += wt1_i;
+            sma_count += 1;
+        } else {
+            ring_vals[head] = NEO_F64_NAN;
+            ring_mask[head] = 0;
+        }
+        head += 1; if (head == ma_len) head = 0;
+
+        if (idx >= warmup) o[idx] = wt1_i;
+    }
+}

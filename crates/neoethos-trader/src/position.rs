@@ -20,6 +20,12 @@ pub struct Position {
     pub sl: Option<f64>,
     pub tp: Option<f64>,
     pub source: SignalSource,
+    /// Engine bar index at which this position was opened. Drives the
+    /// `max_hold_bars` time stop — the GA evaluator's third exit, which the
+    /// replay did not have at all (audit #228). `serde(default)` so manifests
+    /// written before 2026-08-09 still load.
+    #[serde(default)]
+    pub opened_at_bar: u64,
 }
 
 impl Position {
@@ -74,11 +80,37 @@ pub struct PositionManager {
     realized_pnl: f64,
     opened_count: usize,
     closed_count: usize,
+    /// Bar index of the bar currently being processed. Stamped onto every
+    /// position opened on it.
+    current_bar: u64,
+    /// The GA evaluator's time stop. `None` ⇒ no time stop (the Phase-1
+    /// behaviour); the real-gene replay paths set it from
+    /// `EvaluationConfig::max_hold_bars` so a replayed trade cannot outlive
+    /// every trade the backtest scored (audit #228).
+    max_hold_bars: Option<u64>,
+    /// Count of time-stop closes emitted, for the run report.
+    max_hold_exits: usize,
 }
 
 impl PositionManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tell the manager which bar index is being processed. The engine calls
+    /// this once per bar, BEFORE managing exits and before applying fills.
+    pub fn set_bar(&mut self, bar_index: u64) {
+        self.current_bar = bar_index;
+    }
+
+    /// Arm the `max_hold_bars` time stop. `None` disables it.
+    pub fn set_max_hold_bars(&mut self, bars: Option<u64>) {
+        self.max_hold_bars = bars;
+    }
+
+    /// How many positions were closed by the time stop.
+    pub fn max_hold_exits(&self) -> usize {
+        self.max_hold_exits
     }
 
     pub fn open_positions(&self) -> &[Position] {
@@ -151,6 +183,7 @@ impl PositionManager {
                     sl: *sl,
                     tp: *tp,
                     source: *source,
+                    opened_at_bar: self.current_bar,
                 });
                 self.opened_count += 1;
             }
@@ -193,25 +226,47 @@ impl PositionManager {
     }
 
     /// On each bar, produce `(Close intent, fill price)` pairs for every position
-    /// of this symbol whose SL/TP the bar crossed. The engine executes each at
-    /// the returned level so realised P&L reflects the stop/target, not the
-    /// bar close.
-    pub fn manage_on_bar(&self, bar: &LiveBar) -> Vec<(TradeIntent, f64)> {
-        self.open
-            .iter()
-            .filter(|p| p.symbol == bar.symbol)
-            .filter_map(|p| {
-                p.exit_hit(bar).map(|(reason, price)| {
-                    (
+    /// of this symbol whose SL/TP the bar crossed — or whose `max_hold_bars`
+    /// time stop has expired. The engine executes each at the returned level so
+    /// realised P&L reflects the stop/target, not the bar close.
+    ///
+    /// ORDER OF PRECEDENCE: stop, then target, then the time stop. A bar that
+    /// straddles both stop and target is already resolved adversely by
+    /// [`Position::exit_hit`]; the time stop only fires on a bar where neither
+    /// level was touched, and it fills at the bar CLOSE (the same price the GA
+    /// evaluator uses for a `max_hold` exit).
+    pub fn manage_on_bar(&mut self, bar: &LiveBar) -> Vec<(TradeIntent, f64)> {
+        let max_hold = self.max_hold_bars;
+        let current_bar = self.current_bar;
+        let mut out = Vec::new();
+        let mut timed_out = 0usize;
+        for p in self.open.iter().filter(|p| p.symbol == bar.symbol) {
+            if let Some((reason, price)) = p.exit_hit(bar) {
+                out.push((
+                    TradeIntent::Close {
+                        position_id: p.id.clone(),
+                        volume: None,
+                        reason,
+                    },
+                    price,
+                ));
+                continue;
+            }
+            if let Some(limit) = max_hold {
+                if current_bar.saturating_sub(p.opened_at_bar) >= limit {
+                    timed_out += 1;
+                    out.push((
                         TradeIntent::Close {
                             position_id: p.id.clone(),
                             volume: None,
-                            reason,
+                            reason: CloseReason::MaxHold,
                         },
-                        price,
-                    )
-                })
-            })
-            .collect()
+                        bar.c,
+                    ));
+                }
+            }
+        }
+        self.max_hold_exits += timed_out;
+        out
     }
 }

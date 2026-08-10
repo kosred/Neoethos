@@ -548,3 +548,161 @@ void nama_many_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — nama  (noise adaptive moving average)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/nama.rs
+//   `nama_prepare`      (:303) — first_valid + refusals
+//   `nama_with_kernel`  (:989) — alloc_with_nan_prefix(len, first+period-1)
+//   `nama_compute_into` (:526) — the two monotonic deques, the TR ring and the
+//                                 adaptive-alpha recurrence
+//   Batch route: `ma_batch.rs:1184` calls `nama_batch_with_kernel(prices, ..)`
+//   with a PRICE SLICE and no candles, so the oracle for this lane is the
+//   `None` arm of the `match ohlc` (:652-706) — the one whose noise term is
+//   `|src[j] - src[j-1]|`, not the true range. The OHLC arm and the
+//   `period == 30` fast path are unreachable from the batch API and are NOT
+//   reproduced here; writing them would be writing a second, untested
+//   indicator.
+//
+// WHAT IS FIXED
+//   * f32 -> f64 everywhere. `eff_sum` is a rolling sum that is ADDED TO and
+//     SUBTRACTED FROM for the whole series (`eff_sum = eff_sum + add - old`),
+//     so it accumulates cancellation error without bound; in f32 that error
+//     reaches the same magnitude as the sum itself on a long series, and it is
+//     the DENOMINATOR of alpha.
+//   * `fmaxf`x8 / `fabsf`x12 in the f32 kernels above become `fmax` / `fabs`.
+//   * The CPU's `hl.max(hc).max(lc)` IS `f64::max`, which returns the non-NaN
+//     operand — so that one becomes `fmax(fmax(...))`, unlike tradjema's
+//     if-chain `max3`. The difference is visible only on a NaN bar, which is
+//     exactly when it matters. (Unreachable from the batch route, which takes
+//     the `None` arm, but written correctly so the OHLC arm is not a trap for
+//     whoever wires it.)
+//
+// ROUNDINGS.
+//   alpha  = (hi - lo) / eff_sum          -> sub + div        (2)
+//   seed   = alpha * src[i0]              -> mul              (1)   NOT an fma
+//   step   = (src - prev).mul_add(alpha, prev) -> sub + fma   (2)
+//
+// THE DEQUES hold indices, and the comparison is on the VALUE at that index.
+// `push_max` pops while `a[k] <= a[j]` — non-strict, so equal values keep the
+// LATER index, which is what makes `pop_old` correct. Reproduced exactly;
+// flipping it to `<` would keep a stale index alive past its window.
+// ===========================================================================
+
+#define NAMA_MAX_PERIOD 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_nama_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) || (period > NAMA_MAX_PERIOD) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    const int i0 = first_valid + period - 1;
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    if (i0 >= n) return;
+
+    // Monotone index deques. Capacity is period + 1: the warmup pushes exactly
+    // `period` indices, and each later bar pushes before it expires.
+    int dq_max[NAMA_MAX_PERIOD + 1];
+    int dq_min[NAMA_MAX_PERIOD + 1];
+    int max_h = 0, max_len = 0;
+    int min_h = 0, min_len = 0;
+    const int dcap = NAMA_MAX_PERIOD + 1;
+
+    double tr_ring[NAMA_MAX_PERIOD];
+    for (int k = 0; k < period; ++k) tr_ring[k] = 0.0;
+    int wr = 0;
+    double eff_sum = 0.0;
+
+    for (int j = first_valid; j <= i0; ++j) {
+        // push_max: pop while prices[back] <= prices[j]
+        while (max_len > 0 && prices[dq_max[(max_h + max_len - 1) % dcap]] <= prices[j]) {
+            max_len -= 1;
+        }
+        dq_max[(max_h + max_len) % dcap] = j;
+        max_len += 1;
+
+        // push_min: pop while prices[back] >= prices[j]
+        while (min_len > 0 && prices[dq_min[(min_h + min_len - 1) % dcap]] >= prices[j]) {
+            min_len -= 1;
+        }
+        dq_min[(min_h + min_len) % dcap] = j;
+        min_len += 1;
+
+        const double trj = (j == first_valid) ? 0.0 : fabs(prices[j] - prices[j - 1]);
+        tr_ring[wr] = trj;
+        wr += 1;
+        eff_sum += trj;
+    }
+    wr = 0;
+
+    {
+        const double hi = prices[dq_max[max_h]];
+        const double lo = prices[dq_min[min_h]];
+        const double alpha = (eff_sum != 0.0) ? ((hi - lo) / eff_sum) : 0.0;
+        row[i0] = alpha * prices[i0];
+    }
+
+    for (int i = i0 + 1; i < n; ++i) {
+        const int j = i;
+
+        while (max_len > 0 && prices[dq_max[(max_h + max_len - 1) % dcap]] <= prices[j]) {
+            max_len -= 1;
+        }
+        dq_max[(max_h + max_len) % dcap] = j;
+        max_len += 1;
+
+        while (min_len > 0 && prices[dq_min[(min_h + min_len - 1) % dcap]] >= prices[j]) {
+            min_len -= 1;
+        }
+        dq_min[(min_h + min_len) % dcap] = j;
+        min_len += 1;
+
+        const int win_start = j + 1 - period;
+        while (max_len > 0 && dq_max[max_h] < win_start) {
+            max_h = (max_h + 1) % dcap;
+            max_len -= 1;
+        }
+        while (min_len > 0 && dq_min[min_h] < win_start) {
+            min_h = (min_h + 1) % dcap;
+            min_len -= 1;
+        }
+
+        const double old = tr_ring[wr];
+        const double add = fabs(prices[j] - prices[j - 1]);
+        eff_sum = eff_sum + add - old;
+        tr_ring[wr] = add;
+        wr += 1;
+        if (wr == period) wr = 0;
+
+        const double hi = prices[dq_max[max_h]];
+        const double lo = prices[dq_min[min_h]];
+        const double alpha = (eff_sum != 0.0) ? ((hi - lo) / eff_sum) : 0.0;
+        const double prev_y = row[i - 1];
+        row[i] = fma(prices[j] - prev_y, alpha, prev_y);
+    }
+}

@@ -370,3 +370,140 @@ void pwma_ms1p_const_f32(const float* __restrict__ prices_tm,
         t += stride;
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — pwma  (Pascal weighted moving average)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/pwma.rs
+//   `pwma_prepare`          (:248) — first_valid, refusal, weight choice
+//   `pwma_with_kernel`      (:327) — warm = first + period - 1
+//   `pwma_scalar_dispatch`  (:384) — period == 5 takes a DIFFERENT path
+//   `pwma_scalar_period5`   (:399) — hardcoded weights, hardcoded association
+//   `pwma_scalar`           (:425) — 4 partial sums, then (s0+s1)+(s2+s3)
+//   `pascal_weights`        (:1447) + `combination_f64` (:1471)
+//   Batch route: `ma_batch.rs:1234` sweeps `period` and takes nothing else.
+//
+// THE ASSOCIATION IS THE SPECIFICATION, TWICE OVER.
+//  1. `pwma_scalar` does NOT accumulate one running sum. It keeps FOUR
+//     independent accumulators, folds every 4th element into each with
+//     `mul_add`, and combines them as `(s0 + s1) + (s2 + s3)` — a balanced
+//     tree, not a chain. A single-accumulator loop is a different number at
+//     every bar. Reproduced literally.
+//  2. `period == 5` is not the same algorithm with a fixed weight vector: it
+//     computes `((d0*w0 + d1*w1) + (d2*w2 + d3*w3))` with PLAIN multiplies and
+//     then ONE `mul_add` for the last term. Different rounding count, different
+//     tree. It gets its own branch here, exactly as on the CPU.
+//
+// THE WEIGHTS. `combination_f64` alternates multiply-then-divide
+// (`result *= (n-i); result /= (i+1)`) rather than computing a factorial
+// ratio, which keeps the running value small; then the row is summed in order
+// and each entry divided by that sum. Reproduced step for step — a closed-form
+// binomial would agree in exact arithmetic and differ in the last bits, and
+// these weights multiply every bar of the output.
+//
+// NaN. `__int_as_float(0x7fc00000)` in the f32 kernels above is an f32 bit
+// pattern; the f64 quiet NaN is a different 64-bit value.
+// ===========================================================================
+
+#define PWMA_MAX_PERIOD 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// `combination_f64` (pwma.rs:1471), operation for operation.
+__device__ __forceinline__ double neo_s2_combination(int n, int r) {
+    const int rr = (r < (n - r)) ? r : (n - r);
+    if (rr == 0) return 1.0;
+    double result = 1.0;
+    for (int i = 0; i < rr; ++i) {
+        result *= (double)(n - i);
+        result /= (double)(i + 1);
+    }
+    return result;
+}
+
+extern "C" __global__ void neoethos_pwma_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) || (period > PWMA_MAX_PERIOD) ||
+        (first_valid < 0) || (first_valid >= n);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    // `alloc_with_nan_prefix(len, warm)`; the compute writes warm..n-1. Filling
+    // the whole row first also defines the tail when warm >= n.
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    if (warm >= n) return;
+
+    if (period == 5) {
+        // `pwma_scalar_period5` — its own association, not `pwma_scalar` with
+        // PWMA_PERIOD5_WEIGHTS substituted in.
+        for (int i = first_valid + 4; i < n; ++i) {
+            const double d0 = prices[i - 4];
+            const double d1 = prices[i - 3];
+            const double d2 = prices[i - 2];
+            const double d3 = prices[i - 1];
+            const double d4 = prices[i];
+            const double sum = ((d0 * 0.0625) + (d1 * 0.25)) + ((d2 * 0.375) + (d3 * 0.25));
+            row[i] = fma(d4, 0.0625, sum);
+        }
+        return;
+    }
+
+    // `pascal_weights(period)`: the binomial row, summed ascending, then each
+    // entry divided by that sum.
+    double w[PWMA_MAX_PERIOD];
+    const int nn = period - 1;
+    double wsum = 0.0;
+    for (int k = 0; k <= nn; ++k) {
+        w[k] = neo_s2_combination(nn, k);
+    }
+    for (int k = 0; k <= nn; ++k) {
+        wsum += w[k];
+    }
+    if (wsum == 0.0) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+    for (int k = 0; k <= nn; ++k) {
+        w[k] /= wsum;
+    }
+
+    const int k_end = period & ~3;
+
+    for (int i = warm; i < n; ++i) {
+        const int start = i + 1 - period;
+
+        double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+        int k = 0;
+        for (; k < k_end; k += 4) {
+            s0 = fma(prices[start + k + 0], w[k + 0], s0);
+            s1 = fma(prices[start + k + 1], w[k + 1], s1);
+            s2 = fma(prices[start + k + 2], w[k + 2], s2);
+            s3 = fma(prices[start + k + 3], w[k + 3], s3);
+        }
+        double sum = (s0 + s1) + (s2 + s3);
+        for (; k < period; ++k) {
+            sum = fma(prices[start + k], w[k], sum);
+        }
+        row[i] = sum;
+    }
+}

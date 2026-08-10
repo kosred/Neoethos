@@ -1,454 +1,81 @@
 // Model Registry
 //
-// The registry now resolves model names to capability records first and only
-// derives compatibility metadata from those records.
+// SCOPE (2026-08-09, batch D4): name -> capability record, and the per-model
+// GPU-capability table. Nothing else.
+//
+// What was here and is gone: a whole catalogue/recommender API —
+// `get_model_info`, `list_models_by_category`, `is_valid_model`,
+// `register_model` (plus the dynamic `Mutex<HashMap<..>>` registry it was the
+// only writer for), `ModelInfo`, `ModelCategory`, `get_recommended_device`,
+// `get_recommended_device_with_plan`, `get_recommended_precision_with_plan`
+// and their private helpers. Every one of them resolved, outside its own
+// definition, only into `#[cfg(test)]` blocks or `tests/integration_test.rs`.
+// The three `get_recommended_*` functions had no caller at all, test included.
+// The device decision is made by `neoethos_core::HardwareExecutionPlan`
+// (`training_orchestrator.rs` calls it on every train); a second recommender
+// that nothing consulted was a second answer to a settled question.
+//
+// The one live export is [`get_model_capability`], reached from
+// `runtime/dispatch.rs:33` inside `build_dispatch_plan` on every train.
 
-use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use tracing::warn;
-
-use crate::runtime::capabilities::{
-    CapabilityState, KNOWN_MODEL_NAMES, ModelCapability, ModelFamily, model_capability,
-};
-use neoethos_core::{HardwareExecutionPlan, TrainingPrecision, WorkloadKind};
-
-fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, ModelCapability>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn load_registry_settings() -> neoethos_core::Settings {
-    match neoethos_core::Settings::load_with_env() {
-        Ok(settings) => settings,
-        Err(err) => {
-            warn!(
-                "failed to load settings for model registry/runtime device selection: {err}; falling back to defaults"
-            );
-            neoethos_core::Settings::default()
-        }
-    }
-}
-
-fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> Option<ModelFamily> {
-    let haystack = format!(
-        "{} {} {}",
-        name.to_ascii_lowercase(),
-        module_path.to_ascii_lowercase(),
-        class_name.to_ascii_lowercase()
-    );
-    if haystack.contains("lightgbm")
-        || haystack.contains("xgboost")
-        || haystack.contains("catboost")
-        || haystack.contains("tree")
-    {
-        Some(ModelFamily::Tree)
-    } else if haystack.contains("swarm") || haystack.contains("forecast") {
-        Some(ModelFamily::Forecasting)
-    } else if haystack.contains("mlp")
-        || haystack.contains("nbeats")
-        || haystack.contains("tide")
-        || haystack.contains("tabnet")
-        || haystack.contains("transformer")
-        || haystack.contains("patch")
-        || haystack.contains("timesnet")
-        || haystack.contains("kan")
-    {
-        Some(ModelFamily::Deep)
-    } else if haystack.contains("meta")
-        || haystack.contains("calibr")
-        || haystack.contains("conformal")
-        || haystack.contains("bayes")
-        || haystack.contains("logit")
-        || haystack.contains("elastic")
-    {
-        Some(ModelFamily::Meta)
-    } else if haystack.contains("genetic")
-        || haystack.contains("evo")
-        || haystack.contains("crfmnes")
-        || haystack.contains("neat")
-    {
-        Some(ModelFamily::Evolutionary)
-    } else if haystack.contains("exit") {
-        Some(ModelFamily::Exit)
-    } else if haystack.contains("adaptive")
-        || haystack.contains("online")
-        || haystack.contains("hoeffding")
-        || haystack.contains("passive")
-    {
-        Some(ModelFamily::Adaptive)
-    } else if haystack.contains("anomaly")
-        || haystack.contains("forest")
-        || haystack.contains("isolation")
-    {
-        Some(ModelFamily::Anomaly)
-    } else {
-        None
-    }
-}
-
-/// Capability-aware categories used by legacy helpers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModelCategory {
-    Tree,
-    Deep,
-    Forecasting,
-    Meta,
-    Evolutionary,
-    Exit,
-    Adaptive,
-    Anomaly,
-    Rl,
-}
-
-impl From<ModelFamily> for ModelCategory {
-    fn from(family: ModelFamily) -> Self {
-        match family {
-            ModelFamily::Tree => Self::Tree,
-            ModelFamily::Deep => Self::Deep,
-            ModelFamily::Forecasting => Self::Forecasting,
-            ModelFamily::Meta => Self::Meta,
-            ModelFamily::Evolutionary => Self::Evolutionary,
-            ModelFamily::Exit => Self::Exit,
-            ModelFamily::Adaptive => Self::Adaptive,
-            ModelFamily::Anomaly => Self::Anomaly,
-            ModelFamily::Rl => Self::Rl,
-        }
-    }
-}
-
-/// Model metadata resolved from the capability layer.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub name: String,
-    pub capability: ModelCapability,
-    pub category: ModelCategory,
-    pub supports_gpu: bool,
-    pub prefers_gpu: bool,
-    pub description: String,
-}
-
-fn description_for_capability(capability: &ModelCapability) -> String {
-    let kind = match capability.family {
-        ModelFamily::Tree => "tree ensemble",
-        ModelFamily::Deep => "deep sequence model",
-        ModelFamily::Forecasting => "forecasting ensemble",
-        ModelFamily::Meta => "meta/statistical model",
-        ModelFamily::Evolutionary => "evolutionary search model",
-        ModelFamily::Exit => "exit policy model",
-        ModelFamily::Adaptive => "adaptive online model",
-        ModelFamily::Anomaly => "anomaly detector",
-        ModelFamily::Rl => "reinforcement learning policy",
-    };
-
-    format!(
-        "{} capability for {} ({})",
-        capability.name, kind, capability.state
-    )
-}
-
-fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
-    match name {
-        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
-        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
-        _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-            _ => false,
-        },
-    }
-}
-
-fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
-    match name {
-        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
-        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
-        _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-            _ => false,
-        },
-    }
-}
-
-fn default_gpu_device_for_capability(capability: &ModelCapability) -> &'static str {
-    match capability.family {
-        ModelFamily::Tree | ModelFamily::Rl => "cuda:0",
-        ModelFamily::Deep | ModelFamily::Exit => {
-            if cfg!(feature = "burn-wgpu-backend") {
-                "wgpu"
-            } else {
-                "cpu"
-            }
-        }
-        _ => "cpu",
-    }
-}
-
-fn gpu_runtime_available_for_capability(capability: &ModelCapability) -> bool {
-    match capability.family {
-        ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
-        _ => crate::tree_models::config::gpu_count() > 0,
-    }
-}
-
-fn training_workload_for_family(family: ModelFamily) -> WorkloadKind {
-    match family {
-        ModelFamily::Tree => WorkloadKind::TreeTraining,
-        ModelFamily::Deep | ModelFamily::Exit => WorkloadKind::DeepTraining,
-        ModelFamily::Rl => WorkloadKind::RlTraining,
-        ModelFamily::Evolutionary => WorkloadKind::StrategySearch,
-        ModelFamily::Forecasting
-        | ModelFamily::Meta
-        | ModelFamily::Adaptive
-        | ModelFamily::Anomaly => WorkloadKind::FeatureEngineering,
-    }
-}
-
-fn normalize_recommended_gpu_device(
-    configured_device: &str,
-    capability: &ModelCapability,
-) -> Option<String> {
-    let normalized = configured_device.trim().to_ascii_lowercase();
-    if normalized.is_empty() || normalized == "auto" {
-        return None;
-    }
-
-    match capability.family {
-        ModelFamily::Deep | ModelFamily::Exit => {
-            if normalized == "gpu"
-                || normalized == "wgpu"
-                || normalized == "rocm"
-                || normalized == "metal"
-                || normalized == "vulkan"
-                || normalized == "dx12"
-                || normalized == "wgpu_vulkan"
-                || normalized == "wgpu_dx12"
-                || normalized == "wgpu_metal"
-            {
-                Some("wgpu".to_string())
-            } else if let Some((prefix, index)) = normalized.split_once(':') {
-                if matches!(
-                    prefix,
-                    "gpu" | "wgpu" | "rocm" | "metal" | "vulkan" | "dx12" | "cuda"
-                ) && index.parse::<usize>().is_ok()
-                {
-                    Some(format!("gpu:{index}"))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        ModelFamily::Tree | ModelFamily::Rl => {
-            if normalized == "gpu" || normalized == "cuda" {
-                Some("cuda:0".to_string())
-            } else if normalized.starts_with("cuda:") {
-                Some(normalized)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Resolve capability-backed model information.
-pub fn get_model_info(name: &str) -> Option<ModelInfo> {
-    let capability = get_model_capability(name)?;
-    let category = capability.family.into();
-    let supports_gpu = supports_gpu_for_model(&capability.name, capability.family);
-    let prefers_gpu = prefers_gpu_for_model(&capability.name, capability.family);
-    let description = description_for_capability(&capability);
-
-    Some(ModelInfo {
-        name: capability.name.clone(),
-        capability,
-        category,
-        supports_gpu,
-        prefers_gpu,
-        description,
-    })
-}
+use crate::runtime::capabilities::{ModelCapability, ModelFamily, model_capability};
 
 /// Resolve the capability record for a known model name.
-pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
-    model_capability(name).or_else(|| {
-        dynamic_registry()
-            .lock()
-            .ok()
-            .and_then(|registry| registry.get(name).cloned())
-    })
-}
-
-fn default_inventory_names(settings: &neoethos_core::Settings) -> Vec<String> {
-    let mut names = KNOWN_MODEL_NAMES
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-
-    let num_transformers = settings.models.num_transformers.max(1);
-    if num_transformers > 1 {
-        for replica_idx in 1..=num_transformers {
-            names.push(format!("transformer_{replica_idx:02}"));
-        }
-    }
-
-    names
-}
-
-/// List all available models by capability family.
-pub fn list_models_by_category() -> HashMap<ModelCategory, Vec<String>> {
-    let mut result = HashMap::new();
-    let settings = load_registry_settings();
-
-    for model_name in default_inventory_names(&settings) {
-        if let Some(info) = get_model_info(&model_name) {
-            result
-                .entry(info.category)
-                .or_insert_with(Vec::new)
-                .push(info.name);
-        }
-    }
-
-    if let Ok(registry) = dynamic_registry().lock() {
-        for capability in registry.values() {
-            result
-                .entry(capability.family.into())
-                .or_insert_with(Vec::new)
-                .push(capability.name.clone());
-        }
-    }
-
-    result
-}
-
-/// Check if a model name is valid.
-pub fn is_valid_model(name: &str) -> bool {
-    get_model_capability(name).is_some()
-}
-
-/// Get recommended device for a model.
-pub fn get_recommended_device(model_name: &str) -> Result<String> {
-    let capability = get_model_capability(model_name)
-        .context(format!("Model '{}' not found in registry", model_name))?;
-    let settings = load_registry_settings();
-
-    if !settings.system.enable_gpu {
-        return Ok("cpu".to_string());
-    }
-
-    let configured_device = settings.system.device.trim();
-    if configured_device.eq_ignore_ascii_case("cpu") {
-        return Ok("cpu".to_string());
-    }
-
-    if !supports_gpu_for_model(&capability.name, capability.family) {
-        return Ok("cpu".to_string());
-    }
-
-    if prefers_gpu_for_model(&capability.name, capability.family)
-        && gpu_runtime_available_for_capability(&capability)
-    {
-        if let Some(device) = normalize_recommended_gpu_device(configured_device, &capability) {
-            return Ok(device);
-        }
-        if !configured_device.is_empty() && !configured_device.eq_ignore_ascii_case("auto") {
-            return Ok(default_gpu_device_for_capability(&capability).to_string());
-        }
-        return Ok(default_gpu_device_for_capability(&capability).to_string());
-    }
-
-    Ok("cpu".to_string())
-}
-
-/// Resolve the model device from the canonical hardware plan.
 ///
-/// This keeps the older `get_recommended_device` API intact for compatibility,
-/// but gives orchestrators a single source of truth when they already have a
-/// `HardwareExecutionPlan`.
-pub fn get_recommended_device_with_plan(
-    model_name: &str,
-    plan: &HardwareExecutionPlan,
-) -> Result<String> {
-    let capability = get_model_capability(model_name)
-        .context(format!("Model '{}' not found in registry", model_name))?;
-    if !supports_gpu_for_model(&capability.name, capability.family) {
-        return Ok("cpu".to_string());
-    }
-
-    let workload = training_workload_for_family(capability.family);
-    let Some(workload_plan) = plan.workload(workload) else {
-        return Ok("cpu".to_string());
-    };
-    if !workload_plan.backend.is_gpu() {
-        return Ok("cpu".to_string());
-    }
-    Ok(workload_plan.device.clone())
+/// LIVE: `runtime::dispatch::build_dispatch_plan` calls this for every model
+/// in a training run.
+pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
+    model_capability(name)
 }
 
-pub fn get_recommended_precision_with_plan(
-    model_name: &str,
-    plan: &HardwareExecutionPlan,
-) -> Result<TrainingPrecision> {
-    let capability = get_model_capability(model_name)
-        .context(format!("Model '{}' not found in registry", model_name))?;
-    let workload = training_workload_for_family(capability.family);
-    Ok(plan
-        .workload(workload)
-        .map(|workload_plan| workload_plan.precision)
-        .unwrap_or(TrainingPrecision::Fp32))
+/// Whether this build contains a GPU code path that `name` can actually use.
+///
+/// NOT WIRED YET — held deliberately. This is a correct per-model capability
+/// table (it reads the real Cargo features, so it cannot drift from what was
+/// compiled), and task #35's per-model "device self-report" on the training
+/// summary is exactly the consumer it lacks. Until that lands, the operator
+/// has no way to see that e.g. the DQN's CUDA path is compiled but the Deep
+/// models' is not. Deleting the table would delete the answer as well as the
+/// missing question.
+///
+/// Do not add an `#[allow(dead_code)]` here if a caller disappears — either
+/// wire it or delete it.
+pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    match name {
+        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
+        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
+        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
+        "sac" => cfg!(feature = "burn-wgpu-backend"),
+        _ => match family {
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            _ => false,
+        },
+    }
 }
 
-// ============================================================================
-// PYTHON COMPATIBILITY
-// ============================================================================
-
-/// Compatibility hook for dynamic model registration.
-/// Built-in models stay statically registered; custom models are appended here.
-pub fn register_model(name: &str, module_path: &str, class_name: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        anyhow::bail!("model registration requires a non-empty name");
+/// Whether the GPU path is the one this model SHOULD take when a card is
+/// present. Same hold as [`supports_gpu_for_model`] — see its note.
+pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    match name {
+        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
+        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
+        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
+        "sac" => cfg!(feature = "burn-wgpu-backend"),
+        _ => match family {
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            _ => false,
+        },
     }
-
-    if get_model_capability(name).is_some() {
-        return Ok(());
-    }
-
-    let family = infer_dynamic_family(name, module_path, class_name).with_context(|| {
-        format!(
-            "dynamic model registration requires an inferable family for {name} ({module_path}::{class_name})"
-        )
-    })?;
-    let capability = ModelCapability::new(name.trim(), family, CapabilityState::Planned);
-    let mut registry = dynamic_registry()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("dynamic model registry mutex poisoned"))?;
-    registry.insert(name.trim().to_string(), capability);
-    Ok(())
 }
-
-// ============================================================================
-// SUMMARY
-// ============================================================================
-//
-// The registry now resolves every known configured model name to a
-// capability-backed record. Legacy helpers remain available, but they are
-// derived from the runtime capability layer instead of being a loose string
-// table.
-//
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+    use crate::runtime::capabilities::{CapabilityState, KNOWN_MODEL_NAMES};
     use neoethos_core::Settings;
 
     #[test]
@@ -544,47 +171,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_registration_adds_capability_entry() {
-        register_model("custom_patch_router", "custom.models.patch", "PatchRouter")
-            .expect("dynamic model registration should succeed");
-
-        let capability = get_model_capability("custom_patch_router")
-            .expect("dynamic capability should be discoverable");
-        assert_eq!(capability.family, ModelFamily::Deep);
-        assert_eq!(capability.state, CapabilityState::Planned);
-    }
-
-    #[test]
-    fn dynamic_registration_rejects_unknown_family_inference() {
-        let err = register_model("custom_unknown", "custom.models.misc", "Router")
-            .expect_err("unknown dynamic model family must fail");
-        assert!(err.to_string().contains("inferable family"));
-    }
-
-    #[test]
-    fn default_inventory_names_follow_runtime_transformer_replica_settings() {
-        let mut settings = Settings::default();
-        settings.models.num_transformers = 3;
-
-        let names = default_inventory_names(&settings);
-        assert!(names.contains(&"transformer_01".to_string()));
-        assert!(names.contains(&"transformer_02".to_string()));
-        assert!(names.contains(&"transformer_03".to_string()));
-    }
-
-    #[test]
-    fn default_inventory_lists_transformer_replicas() {
-        let listed = list_models_by_category();
-        let deep = listed
-            .get(&ModelCategory::Deep)
-            .expect("deep category should exist");
-        assert!(
-            deep.iter().any(|name| name == "transformer_01"),
-            "default inventory should expose transformer_01"
-        );
-    }
-
-    #[test]
     fn known_model_names_are_unique_and_resolve() {
         let mut seen = std::collections::HashSet::new();
         for name in KNOWN_MODEL_NAMES {
@@ -597,35 +183,46 @@ mod tests {
     }
 
     #[test]
-    fn normalize_recommended_gpu_device_maps_generic_tokens_per_family() {
-        let deep = ModelCapability::new("mlp", ModelFamily::Deep, CapabilityState::Implemented);
-        let tree =
-            ModelCapability::new("lightgbm", ModelFamily::Tree, CapabilityState::Implemented);
-        let rl = ModelCapability::new("dqn", ModelFamily::Rl, CapabilityState::Implemented);
+    fn unknown_model_names_do_not_resolve() {
+        assert!(get_model_capability("nonexistent").is_none());
+        assert!(get_model_capability("").is_none());
+    }
+
+    #[test]
+    fn gpu_capability_table_tracks_the_compiled_features() {
+        // The table must report what THIS build actually contains, not what
+        // some other build might. Pinning it against `cfg!` here is what makes
+        // it usable as a device self-report.
+        for name in KNOWN_MODEL_NAMES {
+            let Some(capability) = get_model_capability(name) else {
+                continue;
+            };
+            let supports = supports_gpu_for_model(&capability.name, capability.family);
+            let prefers = prefers_gpu_for_model(&capability.name, capability.family);
+            assert_eq!(
+                supports, prefers,
+                "{name}: supports/prefers diverged — a model that can use the card but \
+                 should not, or vice versa, needs its own documented reason"
+            );
+        }
 
         assert_eq!(
-            normalize_recommended_gpu_device("gpu", &deep).as_deref(),
-            Some("wgpu")
+            supports_gpu_for_model("lightgbm", ModelFamily::Tree),
+            cfg!(feature = "lightgbm-gpu")
         );
         assert_eq!(
-            normalize_recommended_gpu_device("wgpu_vulkan", &deep).as_deref(),
-            Some("wgpu")
+            supports_gpu_for_model("dqn", ModelFamily::Rl),
+            cfg!(feature = "reinforcement-learning-cuda")
         );
         assert_eq!(
-            normalize_recommended_gpu_device("rocm:2", &deep).as_deref(),
-            Some("gpu:2")
+            supports_gpu_for_model("mlp", ModelFamily::Deep),
+            cfg!(feature = "burn-wgpu-backend")
         );
-        assert_eq!(
-            normalize_recommended_gpu_device("gpu", &tree).as_deref(),
-            Some("cuda:0")
-        );
-        assert_eq!(
-            normalize_recommended_gpu_device("cuda:2", &rl).as_deref(),
-            Some("cuda:2")
-        );
-        assert!(
-            normalize_recommended_gpu_device("wgpu", &tree).is_none(),
-            "tree models should not claim wgpu devices"
-        );
+        // Meta / Adaptive / Anomaly families have no GPU lane in any build.
+        assert!(!supports_gpu_for_model("logistic", ModelFamily::Meta));
+        assert!(!supports_gpu_for_model(
+            "isolation_forest",
+            ModelFamily::Anomaly
+        ));
     }
 }

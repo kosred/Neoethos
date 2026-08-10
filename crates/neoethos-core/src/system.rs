@@ -1,11 +1,15 @@
 use crate::config::Settings;
 use crate::contracts::{DeviceAssignment, RuntimeDegradedReason};
 use serde::{Deserialize, Serialize};
-use std::env;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use std::process::Command;
 use sysinfo::System;
-use tracing::{info, warn};
+
+// NO `use std::env` (2026-08-09). After `AutoTuner` was deleted this file reads
+// and writes zero environment variables — the whole hardware decision now comes
+// from the probe and `Settings`, and nothing else. Adding an `env::var` here
+// re-opens the second resolution path this wave exists to close; add a field to
+// `system.hardware` instead.
 
 mod backends;
 pub use backends::AcceleratorBackend;
@@ -559,13 +563,144 @@ impl HardwareExecutionPlan {
             notes: vec!["UI stays message-channel driven and never owns ML/GPU work.".to_string()],
         });
 
-        Self {
+        // ── Name every configured value this plan is about to override ──────
+        //
+        // Until 2026-08-09 the ONLY code that logged `warnings` was
+        // `AutoTuner::apply`, which had zero callers — so "GPU was requested but
+        // no accelerator device was detected" had never been printed in a real
+        // run. A downgrade nobody is told about is a failure wearing the costume
+        // of a choice.
+        //
+        // Nothing below changes a value. Each entry names the field, the
+        // operator's setting, the computed result and the reason, so a silent
+        // substitution becomes an impossible one.
+        let mut overrides: Vec<String> = Vec::new();
+        if gpu_forced && !gpu_enabled {
+            overrides.push(format!(
+                "system.enable_gpu_preference = {preference:?} (yours) -> GPU DISABLED (computed): {}",
+                if has_gpu {
+                    "devices were detected but no GPU backend could be chosen for them"
+                } else {
+                    "no accelerator device was detected"
+                }
+            ));
+        }
+        if search_gpu_requested && !search_gpu_enabled {
+            overrides.push(format!(
+                "models.prop_search_device = {:?} (yours) -> strategy search planned on \"cpu\" (computed): {}",
+                settings.models.prop_search_device.trim(),
+                if !has_gpu {
+                    "no accelerator device was detected"
+                } else if !gpu_allowed {
+                    "system.enable_gpu_preference forbids the GPU"
+                } else if !primary_backend.is_gpu() {
+                    "the chosen primary backend is CPU"
+                } else {
+                    "the primary backend has no search runtime — search needs CUDA or a wgpu-family backend"
+                }
+            ));
+        }
+        if tree_gpu_requested && !tree_gpu_enabled {
+            overrides.push(format!(
+                "models.tree_device_preference = {:?} (yours) -> tree training planned on \"cpu\" (computed): {}",
+                settings.models.tree_device_preference.trim(),
+                if !gpu_enabled {
+                    "no usable accelerator"
+                } else {
+                    "tree GPU support requires a CUDA device and none was detected"
+                }
+            ));
+        }
+        if settings.models.train_batch_size != train_batch_size {
+            overrides.push(format!(
+                "models.train_batch_size = {} (yours) -> {} (computed from {} and a smallest-VRAM figure of {:.1} GB). \
+                 The training orchestrator applies planned params LAST, so the configured value never reaches the model",
+                settings.models.train_batch_size,
+                train_batch_size,
+                if gpu_enabled { "an accelerator being present" } else { "CPU-only execution" },
+                min_vram_gb
+            ));
+        }
+
+        let plan = Self {
             profile,
             gpu_enabled,
             primary_backend,
             preferred_precision,
             workloads,
             warnings,
+        };
+        plan.announce(&overrides);
+        plan
+    }
+
+    /// Say out loud what the machine decided: the probe, every workload
+    /// assignment, every planner warning, and every configured value the plan
+    /// overrides.
+    ///
+    /// Announced once per DISTINCT outcome. The plan is rebuilt for each
+    /// training run, so an unchanged machine stays quiet; a plan that differs
+    /// from the last one announced always prints, so a machine that changes
+    /// underneath you is never silent.
+    fn announce(&self, overrides: &[String]) {
+        let fingerprint = format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.profile.stable_id(),
+            self.gpu_enabled,
+            self.primary_backend.as_str(),
+            self.preferred_precision.as_str(),
+            self.workloads
+                .iter()
+                .map(|plan| format!(
+                    "{:?}:{}:{}:{}",
+                    plan.workload, plan.device, plan.batch_size, plan.cpu_threads
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            overrides.join(";"),
+        );
+
+        static LAST_ANNOUNCED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        {
+            let mut last = LAST_ANNOUNCED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.as_deref() == Some(fingerprint.as_str()) {
+                return;
+            }
+            *last = Some(fingerprint);
+        }
+
+        tracing::info!(
+            target: "neoethos_core::system",
+            cpu_cores = self.profile.cpu_cores as u64,
+            available_ram_gb = self.profile.available_ram_gb,
+            detected_gpus = self.profile.num_gpus as u64,
+            backend = self.primary_backend.as_str(),
+            precision = self.preferred_precision.as_str(),
+            gpu_enabled = self.gpu_enabled,
+            "hardware execution plan resolved from the probe — these values are COMPUTED, not configured"
+        );
+        for plan in &self.workloads {
+            tracing::info!(
+                target: "neoethos_core::system",
+                workload = ?plan.workload,
+                backend = plan.backend.as_str(),
+                device = %plan.device,
+                cpu_threads = plan.cpu_threads as u64,
+                batch_size = plan.batch_size as u64,
+                memory_budget_gb = plan.memory_budget_gb,
+                "hardware plan workload assignment"
+            );
+        }
+        for warning in &self.warnings {
+            tracing::warn!(target: "neoethos_core::system", "hardware planner: {warning}");
+        }
+        for line in overrides {
+            tracing::warn!(
+                target: "neoethos_core::system",
+                "hardware plan OVERRIDES a value you set: {line}"
+            );
         }
     }
 
@@ -1215,140 +1350,54 @@ impl HardwareProfile {
     }
 }
 
-pub struct AutoTuner<'a> {
-    settings: &'a mut Settings,
-    profile: HardwareProfile,
-}
-
-#[derive(Debug, Clone)]
-pub struct AutoTuneHints {
-    pub enable_gpu: bool,
-    pub num_gpus: usize,
-    pub device: String,
-    pub prop_search_device: String,
-    pub tree_device_preference: String,
-    pub n_jobs: usize,
-    pub train_batch_size: usize,
-    pub inference_batch_size: usize,
-    pub hpo_trials: usize,
-    pub adaptive_training_budget: f64,
-    pub feature_workers: usize,
-    pub is_hpc: bool,
-    pub execution_plan: HardwareExecutionPlan,
-}
-
-impl<'a> AutoTuner<'a> {
-    pub fn new(settings: &'a mut Settings, profile: HardwareProfile) -> Self {
-        Self { settings, profile }
-    }
-
-    pub fn apply(&mut self) -> AutoTuneHints {
-        let hints = self.evaluate_hints();
-
-        self.settings.system.enable_gpu = hints.enable_gpu;
-        self.settings.system.num_gpus = hints.num_gpus;
-        self.settings.system.device = hints.device.clone();
-        self.settings.system.n_jobs = hints.n_jobs;
-        self.settings.models.prop_search_device = hints.prop_search_device.clone();
-        self.settings.models.tree_device_preference = hints.tree_device_preference.clone();
-
-        self.settings.models.train_batch_size = hints.train_batch_size;
-        self.settings.models.inference_batch_size = hints.inference_batch_size;
-        self.settings.models.hpo_trials = hints.hpo_trials;
-
-        self.apply_thread_env_defaults(&hints);
-
-        info!(
-            "Auto-Tuner Applied: GPU={} Device={}",
-            hints.enable_gpu, hints.device
-        );
-        for warning in &hints.execution_plan.warnings {
-            warn!("Hardware planner warning: {}", warning);
-        }
-
-        hints
-    }
-
-    fn evaluate_hints(&self) -> AutoTuneHints {
-        let runtime_overrides = HardwareRuntimeOverrides::from_settings(self.settings);
-        let plan = HardwareExecutionPlan::from_settings_profile_and_overrides(
-            self.settings,
-            self.profile.clone(),
-            &runtime_overrides,
-        );
-        let cpu_cores = self.profile.cpu_cores.max(1);
-        let ram_gb = self.profile.available_ram_gb;
-        let cpu_budget = self.resolve_cpu_budget(cpu_cores);
-        let (
-            train_device,
-            train_batch_size,
-            inference_batch_size,
-            prop_search_device,
-            tree_device_preference,
-        ) = {
-            let train_plan = plan
-                .workload(WorkloadKind::DeepTraining)
-                .expect("hardware planner must include deep-training plan");
-            let infer_plan = plan
-                .workload(WorkloadKind::Inference)
-                .expect("hardware planner must include inference plan");
-            let search_plan = plan
-                .workload(WorkloadKind::StrategySearch)
-                .expect("hardware planner must include search plan");
-            let tree_plan = plan
-                .workload(WorkloadKind::TreeTraining)
-                .expect("hardware planner must include tree-training plan");
-            (
-                train_plan.device.clone(),
-                train_plan.batch_size,
-                infer_plan.batch_size,
-                search_plan.device.clone(),
-                tree_plan.device.clone(),
-            )
-        };
-
-        // Feature workers logic
-        let per_worker_gb = 2.0;
-        let ram_based_workers = (ram_gb / per_worker_gb) as usize;
-        let feature_workers = 1.max(cpu_budget.min(ram_based_workers));
-
-        AutoTuneHints {
-            enable_gpu: plan.gpu_enabled,
-            num_gpus: if plan.gpu_enabled {
-                self.profile.num_gpus
-            } else {
-                0
-            },
-            device: train_device,
-            prop_search_device,
-            tree_device_preference,
-            n_jobs: cpu_budget,
-            train_batch_size,
-            inference_batch_size,
-            hpo_trials: if plan.gpu_enabled { 50 } else { 20 },
-            adaptive_training_budget: if plan.gpu_enabled { 3600.0 } else { 1800.0 },
-            feature_workers,
-            is_hpc: ram_gb > 64.0 && cpu_cores >= 32,
-            execution_plan: plan,
-        }
-    }
-
-    fn resolve_cpu_budget(&self, total_cores: usize) -> usize {
-        resolve_cpu_budget(
-            total_cores,
-            &HardwareRuntimeOverrides::from_settings(self.settings),
-        )
-    }
-
-    fn apply_thread_env_defaults(&self, hints: &AutoTuneHints) {
-        let n_threads = hints.n_jobs.max(1).to_string();
-        unsafe {
-            env::set_var("OMP_NUM_THREADS", &n_threads);
-            env::set_var("MKL_NUM_THREADS", &n_threads);
-            env::set_var("OPENBLAS_NUM_THREADS", &n_threads);
-        }
-    }
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// REMOVED 2026-08-09 (D2): `AutoTuner`, `AutoTuneHints` and
+// `apply_thread_env_defaults` — ~145 lines, zero callers.
+//
+// WHY IT WENT rather than being wired:
+//
+//   1. It had never run. `grep -rn AutoTuner` returned exactly two lines in the
+//      whole workspace, both declarations. No construction, no `.apply()`, not
+//      even a test.
+//
+//   2. Its successor exists AND is called. `HardwareExecutionPlan` (above) is
+//      built by the training orchestrator and computes the identical quantities
+//      from the identical probe — `training_batch_size`, `inference_batch_size`,
+//      `planned_memory_budget_gb`, the per-workload device — and hands them to
+//      the consumer as PARAMS, applied last so no stale setting can survive.
+//      `AutoTuner::apply` did the opposite: it wrote nine derived values BACK
+//      INTO `Settings`, and `Settings::save` then serialises the whole struct.
+//      That is the mechanism that pickles detector output into the operator's
+//      YAML as if he had typed it. Wiring it would have re-frozen the same lie
+//      on a different machine, and would additionally have overwritten
+//      `system.device`, `models.prop_search_device` and
+//      `models.tree_device_preference` — three values the operator sets on
+//      purpose.
+//
+//   3. It let the hardware decide how hard to search. `hpo_trials = if gpu { 50 }
+//      else { 20 }` is not a capacity decision: a different trial count returns a
+//      different answer, not the same answer in a different footprint. The
+//      capacity/preference line is that a knob may be derived only when a machine
+//      with twice the RAM would want a different number AND ONLY because of the
+//      hardware. `hpo_trials`, `prop_search_population`, `_generations`,
+//      `_max_hours` and `_max_rows` all fail that test and stay settable.
+//
+// ⚠ THE OMP/MKL/OPENBLAS THREAD CLAMP WENT WITH IT, DELIBERATELY.
+// `apply_thread_env_defaults` was the only code in the workspace that set
+// `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS`, and its ONLY
+// caller was `AutoTuner::apply`, which had none. So those variables were NOT
+// being set in any run, ever. Re-homing the call would therefore not have
+// preserved behaviour — it would have clamped BLAS/OpenMP for the FIRST TIME,
+// inside the subsystem already identified as the thread-oversubscription
+// bottleneck, in a change presented as a no-op. If a thread clamp is wanted it
+// must land on its own, with its own before/after measurement, and be tracked as
+// its own item. It is recorded as one; it is not silently smuggled in here.
+//
+// The surviving derivation helpers (`resolve_cpu_budget`, `training_batch_size`,
+// `inference_batch_size`, `min_gpu_memory_gb`, `planned_memory_budget_gb`) are
+// below and are now `pub`, so a retired config key can be reported together with
+// the number this machine actually computes for it.
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn stable_hex_hash(value: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -1408,7 +1457,11 @@ fn parse_compute_capability(value: &str) -> Option<(i64, i64)> {
     Some((major, minor))
 }
 
-fn min_gpu_memory_gb(profile: &HardwareProfile) -> f64 {
+/// Smallest usable VRAM figure across the detected accelerators, in GB.
+///
+/// `pub` since 2026-08-09 so a caller reporting a retired, now-derived config
+/// key can name the number this machine computes rather than a guess.
+pub fn min_gpu_memory_gb(profile: &HardwareProfile) -> f64 {
     let min_vram = profile
         .gpu_mem_gb
         .iter()
@@ -1418,7 +1471,10 @@ fn min_gpu_memory_gb(profile: &HardwareProfile) -> f64 {
     if min_vram.is_finite() { min_vram } else { 0.0 }
 }
 
-fn planned_memory_budget_gb(
+/// Memory allowance for a workload — CAPACITY, and the never-OOM invariant in
+/// one function: the figure is a fraction of what the machine reports, never a
+/// number a user typed.
+pub fn planned_memory_budget_gb(
     profile: &HardwareProfile,
     backend: AcceleratorBackend,
     host_fraction: f64,
@@ -1448,7 +1504,10 @@ fn planned_memory_budget_gb(
     capacity_gb * gpu_fraction.clamp(0.0, 1.0)
 }
 
-fn training_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
+/// Deep-training batch size — CAPACITY. Same inputs, same answer, different
+/// footprint: a bigger card does more rows per step, it does not change which
+/// model comes out. Derived, never configured.
+pub fn training_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     if !enable_gpu {
         return 64;
     }
@@ -1463,7 +1522,8 @@ fn training_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     }
 }
 
-fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
+/// Inference batch size — CAPACITY, same argument as [`training_batch_size`].
+pub fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     if !enable_gpu {
         return 128;
     }
@@ -1478,11 +1538,115 @@ fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     }
 }
 
-fn resolve_cpu_budget(total_cores: usize, runtime_overrides: &HardwareRuntimeOverrides) -> usize {
+/// Effective CPU thread budget — CAPACITY, with one operator lever.
+///
+/// The machine supplies the ceiling (`total_cores`); `system.hardware.cpu_budget`
+/// may only narrow it, never raise it above the cores that exist. That is the
+/// shape every hardware knob in this file should have: the probe sets the bound,
+/// the operator may ask for less.
+pub fn resolve_cpu_budget(
+    total_cores: usize,
+    runtime_overrides: &HardwareRuntimeOverrides,
+) -> usize {
     if let Some(n) = runtime_overrides.cpu_budget {
         return n.min(total_cores).max(1);
     }
     total_cores.saturating_sub(1).max(1)
+}
+
+/// A config key that used to be settable and is now computed from the machine.
+///
+/// A stale copy of one of these in the operator's file must not be reported as a
+/// nameless "unknown field": he set it on purpose once, and he is owed the
+/// reason it stopped being his to set plus the number the machine computes
+/// instead. `Settings::load` consults this table when it rejects a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredDerivedKey {
+    /// Dotted config path as it appears in the YAML.
+    pub key: &'static str,
+    /// What the machine computes it from, in words the operator can check.
+    pub derived_from: &'static str,
+    /// The knob that still IS his, when one exists.
+    pub set_instead: Option<&'static str>,
+}
+
+/// Every key retired by the 2026-08-09 derive pass (D2 ⟷ D4).
+///
+/// These are CAPACITY knobs by the test in [`resolve_cpu_budget`]'s doc: a
+/// machine with twice the RAM wants a different number, and only because of the
+/// hardware. Deliberately ABSENT from this table — they change the answer, not
+/// the footprint, and stay settable: `hpo_trials`, `prop_search_population`,
+/// `prop_search_generations`, `prop_search_max_hours`, `prop_search_max_rows`,
+/// `cpcv_max_rows`, `l1_feature_selection_sample_limit`, `global_max_rows`.
+pub const RETIRED_DERIVED_KEYS: &[RetiredDerivedKey] = &[
+    RetiredDerivedKey {
+        key: "system.n_jobs",
+        derived_from: "available_parallelism() minus one, then narrowed by system.hardware.cpu_budget",
+        set_instead: Some("system.hardware.cpu_budget"),
+    },
+    RetiredDerivedKey {
+        key: "system.num_gpus",
+        derived_from: "the accelerator probe (HardwareProfile::num_gpus)",
+        set_instead: Some("system.enable_gpu_preference"),
+    },
+    RetiredDerivedKey {
+        key: "models.inference_batch_size",
+        derived_from: "the Inference workload plan: GPU presence and the smallest detected VRAM",
+        set_instead: None,
+    },
+];
+
+/// Look a retired key up by its full dotted path or by its bare leaf name, so a
+/// loader that only has `"n_jobs"` from a serde error still finds it.
+pub fn retired_derived_key(key: &str) -> Option<&'static RetiredDerivedKey> {
+    let needle = key.trim();
+    RETIRED_DERIVED_KEYS.iter().find(|entry| {
+        entry.key == needle
+            || entry
+                .key
+                .rsplit('.')
+                .next()
+                .is_some_and(|leaf| leaf == needle)
+    })
+}
+
+impl RetiredDerivedKey {
+    /// What this machine computes for the key right now, when it can be had
+    /// without spinning up a full accelerator probe.
+    ///
+    /// `None` means "needs the probe" — report the derivation rather than invent
+    /// a number, because a wrong number in an error message is worse than none.
+    pub fn computed_value(&self, settings: &Settings) -> Option<String> {
+        match self.key {
+            "system.n_jobs" => {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                Some(
+                    resolve_cpu_budget(cores, &HardwareRuntimeOverrides::from_settings(settings))
+                        .to_string(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The whole message, in one place, so every caller says the same thing.
+    pub fn ignored_message(&self, settings: &Settings) -> String {
+        let computed = match self.computed_value(settings) {
+            Some(value) => format!("this machine computes {value}"),
+            None => "the value is computed per run from the hardware plan".to_string(),
+        };
+        let instead = match self.set_instead {
+            Some(knob) => format!(" If you meant to constrain it, set `{knob}`."),
+            None => String::new(),
+        };
+        format!(
+            "`{}` is ignored because it is derived, not configured: {}; {}. \
+             Remove the key from your config.{}",
+            self.key, self.derived_from, computed, instead
+        )
+    }
 }
 
 #[cfg(test)]

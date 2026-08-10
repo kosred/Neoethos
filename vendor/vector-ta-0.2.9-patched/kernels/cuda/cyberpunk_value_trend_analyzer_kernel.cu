@@ -285,3 +285,128 @@ extern "C" __global__ void cyberpunk_value_trend_analyzer_batch_f64(
         prev_value_trend = current_value_trend;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/cyberpunk_value_trend_analyzer.rs:641
+// (cyberpunk_value_trend_analyzer_with_kernel). The column this emits is
+// value_trend, which is what output_id == "value" resolves to
+// (dispatch/cpu_batch.rs:14627-14630).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- two
+// monotone deques carrying the 75-bar low and high, and two chained one-pole
+// filters (alpha 1/20 then alpha 1/5) whose state is carried and RESET by the
+// CPU on a non-finite bar OR on a degenerate zero range. A monotone deque is
+// the classic sliding extreme and is not bar-parallel; nor is the filter pair.
+//
+// PERIOD-INVARIANT. compute_cyberpunk_value_trend_analyzer_batch
+// (cpu_batch.rs:14657-14660) reads entry_level and exit_level and NEVER
+// period, so five swept periods give five identical CPU columns and this
+// kernel emits five identical rows. Both CPU defaults are pinned below --
+// and neither of them enters value_trend at all: they gate the buy and sell
+// signal columns only. They are still validated, because the CPU REFUSES the
+// whole computation for an out-of-range level and this kernel must refuse the
+// same inputs.
+//
+// WHAT IS DELIBERATELY ABSENT: the 13-bar rolling mean and the deviation
+// index it feeds. They are consumed only by deviation_index and
+// overbought_signal, never by value_trend.
+//
+// THE VALID-RUN COUNTER IS NOT THE BAR INDEX: the CPU counts CONSECUTIVE valid
+// OHLC bars and requires 75 of them before it publishes, restarting the count
+// at every invalid bar. Reproduced exactly -- using i >= 74 instead would
+// publish across a gap the CPU refuses to cross.
+//
+// FIRST VALID IS NOT READ: there is no warmup index, only that consecutive
+// run. The lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fabs, no f32-suffixed math function,
+// no fast-math intrinsic, and no epsilon -- the range test is the CPU's exact
+// range > 0.0.
+// ---------------------------------------------------------------------------
+
+#define NEO_CVTA_ENTRY_LEVEL 30
+#define NEO_CVTA_EXIT_LEVEL 75
+
+extern "C" __global__ void cyberpunk_value_trend_analyzer_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int entry_level = NEO_CVTA_ENTRY_LEVEL;
+    const int exit_level = NEO_CVTA_EXIT_LEVEL;
+    if (entry_level < 1 || entry_level > 100 || exit_level < 1 || exit_level > 100) {
+        return;
+    }
+
+    MonotonicQueueDevice lowest75;
+    MonotonicQueueDevice highest75;
+    WeightedSmaDevice close_norm_sma;
+    WeightedSmaDevice smooth5;
+    lowest75.reset();
+    highest75.reset();
+    close_norm_sma.init(1.0 / 20.0);
+    smooth5.init(1.0 / 5.0);
+
+    int valid_run = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!is_valid_ohlc(o, h, l, c)) {
+            lowest75.reset();
+            highest75.reset();
+            close_norm_sma.reset();
+            smooth5.reset();
+            valid_run = 0;
+            continue;
+        }
+
+        valid_run += 1;
+
+        lowest75.push_min(i, l);
+        highest75.push_max(i, h);
+        const int min_index = i >= RANGE75_WINDOW - 1 ? (i - (RANGE75_WINDOW - 1)) : 0;
+        lowest75.prune(min_index);
+        highest75.prune(min_index);
+
+        if (valid_run >= RANGE75_WINDOW) {
+            const double range_low = lowest75.current();
+            const double range_high = highest75.current();
+            const double range = range_high - range_low;
+            if (isfinite(range) && range > 0.0) {
+                const double close_norm = (c - range_low) * 100.0 / range;
+                const double close_norm_avg = close_norm_sma.update(close_norm);
+                const double smooth = smooth5.update(close_norm_avg);
+                if (isfinite(close_norm_avg) && isfinite(smooth)) {
+                    row[i] = 3.0 * close_norm_avg - 2.0 * smooth;
+                }
+            } else {
+                close_norm_sma.reset();
+                smooth5.reset();
+            }
+        }
+    }
+}

@@ -446,3 +446,152 @@ extern "C" __global__ void candle_strength_oscillator_batch_f64(
         has_prev_levels = true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/candle_strength_oscillator.rs:951
+// (candle_strength_oscillator_with_kernel). The column this emits is strength,
+// which is what output_id == "value" resolves to
+// (dispatch/cpu_batch.rs:7490-7491).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- three
+// nested Hull-style weighted moving averages, each maintained INCREMENTALLY
+// (weighted_sum = weighted_sum - old_sum + period*value), and all three RESET
+// by the CPU on a non-finite bar or a zero-range bar. The incremental update
+// is not algebraically re-derivable bar by bar without changing the rounding.
+//
+// PERIOD-SWEPT: compute_candle_strength_oscillator_batch (cpu_batch.rs:7514)
+// reads a parameter literally named period (default 50), so periods[combo]
+// binds to it. atr_enabled false, atr_length 50 and mode "bollinger"
+// (:7516-7519) are not swept and are pinned at their CPU defaults.
+//
+// WHAT IS DELIBERATELY ABSENT: the Bollinger / Donchian level state and the
+// crossover signals. They consume strength, they do not produce it, so a
+// kernel emitting strength does not carry them. The ATR state IS kept, because
+// atr_enabled is a parameter and the reset it performs is part of the state
+// machine even when the factor is 1.0.
+//
+// THE THREE RING BUFFERS ARE PER-THREAD, so their depth is a property of THIS
+// COMPILED KERNEL and an oversized period is refused BY NAME by the host
+// (F64Kernel::max_period) rather than truncating a window into a different
+// indicator. half_period is period/2 and sqrt_period is floor(sqrt(period)),
+// so the two smaller bounds follow from the first and are checked, not
+// assumed.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and restarts every ring at
+// a non-finite or zero-range bar, so there is no warmup index. The lane row
+// declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fmax/fmin/fabs/sqrt/floor, no
+// f32-suffixed math function, no fast-math intrinsic. The degenerate-range
+// test uses DBL_EPSILON -- the DOUBLE machine epsilon, which is the CPU's own
+// f64::EPSILON and NOT an f32 epsilon carried across (rule 2).
+// ---------------------------------------------------------------------------
+
+#define NEO_CSO_ATR_ENABLED 0
+#define NEO_CSO_ATR_LENGTH 50
+#define NEO_CSO_MAX_PERIOD 512
+#define NEO_CSO_MAX_HALF_PERIOD 257
+#define NEO_CSO_MAX_SQRT_PERIOD 32
+
+extern "C" __global__ void candle_strength_oscillator_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int period = periods[row_idx];
+    const int atr_enabled = NEO_CSO_ATR_ENABLED;
+    const int atr_length = NEO_CSO_ATR_LENGTH;
+
+    if (period <= 0 || period > NEO_CSO_MAX_PERIOD || (atr_enabled != 0 && atr_length <= 0)) {
+        return;
+    }
+
+    const int half_period = period / 2 > 0 ? period / 2 : 1;
+    const int sqrt_period_raw = static_cast<int>(floor(sqrt(static_cast<double>(period))));
+    const int sqrt_period = sqrt_period_raw > 0 ? sqrt_period_raw : 1;
+    if (half_period > NEO_CSO_MAX_HALF_PERIOD || sqrt_period > NEO_CSO_MAX_SQRT_PERIOD) {
+        return;
+    }
+
+    double full_buf[NEO_CSO_MAX_PERIOD];
+    double half_buf[NEO_CSO_MAX_HALF_PERIOD];
+    double sqrt_buf[NEO_CSO_MAX_SQRT_PERIOD];
+
+    RingWmaState full_state;
+    RingWmaState half_state;
+    RingWmaState sqrt_state;
+    full_state.init(full_buf, NEO_CSO_MAX_PERIOD, period);
+    half_state.init(half_buf, NEO_CSO_MAX_HALF_PERIOD, half_period);
+    sqrt_state.init(sqrt_buf, NEO_CSO_MAX_SQRT_PERIOD, sqrt_period);
+
+    AtrState atr_state;
+    atr_state.init(atr_length);
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!finite_quad(o, h, l, c)) {
+            atr_state.reset();
+            full_state.reset();
+            half_state.reset();
+            sqrt_state.reset();
+            continue;
+        }
+
+        double atr_factor = 1.0;
+        if (atr_enabled != 0) {
+            if (!atr_state.update(h, l, c, &atr_factor)) {
+                continue;
+            }
+        }
+
+        const double range = h - l;
+        if (!isfinite(range) || fabs(range) <= DBL_EPSILON) {
+            atr_state.reset();
+            full_state.reset();
+            half_state.reset();
+            sqrt_state.reset();
+            continue;
+        }
+
+        const double body = fabs(c - o);
+        const double sign = c > o ? 1.0 : -1.0;
+        const double signed_score = sign * body / range * atr_factor * 100.0;
+
+        double full_value = NAN;
+        double half_value = NAN;
+        double strength = NAN;
+        const bool full_ready = full_state.update(signed_score, &full_value);
+        const bool half_ready = half_state.update(signed_score, &half_value);
+        if (!(full_ready && half_ready)) {
+            continue;
+        }
+        if (!sqrt_state.update(2.0 * half_value - full_value, &strength)) {
+            continue;
+        }
+
+        row[i] = strength;
+    }
+}

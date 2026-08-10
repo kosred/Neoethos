@@ -287,3 +287,150 @@ extern "C" __global__ void kvo_many_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  kvo
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/kvo.rs -- `kvo_scalar` (:469), `kvo_scalar_default_2_5` (:575), `kvo_with_kernel` (:279)
+//
+// PERIOD-INVARIANT. `compute_kvo_batch` (cpu_batch.rs:2985) reads
+// `short_period` (default 2) and `long_period` (default 5); there is no
+// `period` parameter, so a sweep's rows are byte-identical.
+//
+// ONE KERNEL SERVES BOTH CPU PATHS. `kvo_scalar` branches to
+// `kvo_scalar_default_2_5` when (short, long) == (2, 5), which is the default
+// pair. The two bodies are identical except that the fast path spells the
+// smoothing constants `2.0/3.0` and `1.0/3.0` where the general path computes
+// `2.0/(2.0+1.0)` and `2.0/(5.0+1.0)`. IEEE division is correctly rounded, so
+// 2/3 and 2/3 are the same double and 2/6 and 1/3 are the same double: the two
+// paths are bit-identical and no special case is written here. This was
+// CHECKED rather than assumed, because a divergent fast path at the default
+// parameters would be the only path this lane ever exercises.
+//
+// ARITHMETIC ORDER: `short_ema += (vf - short_ema) * short_alpha` -- subtract,
+// multiply, add: THREE roundings, and deliberately NOT `mul_add`. (Contrast
+// `wilders`, whose CPU line IS `mul_add` and therefore has one.)
+// `vf = v * temp * 100.0 * sign` is left to right, three multiplies.
+//
+// NaN SEMANTICS: the comparisons `hlc > prev_hlc` / `hlc < prev_hlc` drive an
+// int state machine, not a max. The CPU uses the same bare comparisons, and a
+// NaN makes BOTH false there and here, so `trend` simply holds -- there is no
+// `f64::max` to mirror and no fmax to substitute. Stated because rule 4 asks
+// every comparison chain to be checked, not because one was found.
+//
+// The `trend`/`cm`/`sign` state carries across bars, so this is one thread per
+// column walking bars ascending; no scan reformulation preserves it.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + 1)`, and first_valid is the
+// first index at which high, low, close AND volume are simultaneously non-NaN
+// (kvo.rs:292-297).
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_kvo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    // `KvoParams::default()`.
+    const int short_period = 2;
+    const int long_period = 5;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (short_period < 1) || (long_period < short_period) ||
+        ((n - first_valid) < 2);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const double short_alpha = 2.0 / ((double)short_period + 1.0);
+    const double long_alpha  = 2.0 / ((double)long_period + 1.0);
+
+    const int warm = first_valid + 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+
+    int trend = -1;
+    double sign = -1.0;
+    double cm = 0.0;
+
+    double prev_hlc = high[first_valid] + low[first_valid] + close[first_valid];
+    double prev_dm  = high[first_valid] - low[first_valid];
+
+    double short_ema = 0.0;
+    double long_ema = 0.0;
+
+    int i = warm;
+    if (i < n) {
+        const double h = high[i], l = low[i], c = close[i], v = volume[i];
+        const double hlc = h + l + c;
+        const double dm = h - l;
+
+        if (hlc > prev_hlc && trend != 1) { trend = 1; cm = prev_dm; sign = 1.0; }
+        else if (hlc < prev_hlc && trend != 0) { trend = 0; cm = prev_dm; sign = -1.0; }
+        cm += dm;
+
+        const double temp = fabs((dm / cm) * 2.0 - 1.0);
+        const double vf = v * temp * 100.0 * sign;
+
+        short_ema = vf;
+        long_ema = vf;
+        row[i] = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+        ++i;
+    }
+
+    for (; i < n; ++i) {
+        const double h = high[i], l = low[i], c = close[i], v = volume[i];
+        const double hlc = h + l + c;
+        const double dm = h - l;
+
+        if (hlc > prev_hlc && trend != 1) { trend = 1; cm = prev_dm; sign = 1.0; }
+        else if (hlc < prev_hlc && trend != 0) { trend = 0; cm = prev_dm; sign = -1.0; }
+        cm += dm;
+
+        const double temp = fabs((dm / cm) * 2.0 - 1.0);
+        const double vf = v * temp * 100.0 * sign;
+
+        short_ema += (vf - short_ema) * short_alpha;
+        long_ema  += (vf - long_ema)  * long_alpha;
+
+        row[i] = short_ema - long_ema;
+
+        prev_hlc = hlc;
+        prev_dm = dm;
+    }
+}

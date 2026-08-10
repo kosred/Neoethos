@@ -679,3 +679,120 @@ extern "C" __global__ void NAME(                                                
 
 DEFINE_EHMA_MS1P_TILED_ASYNC(ehma_ms1p_tiled_f32_tx128_ty2_async, 128, 2)
 DEFINE_EHMA_MS1P_TILED_ASYNC(ehma_ms1p_tiled_f32_tx128_ty4_async, 128, 4)
+
+/* ===========================================================================
+ * S4 f64 LANE — ehma (Ehlers Hann moving average)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/moving_averages/ehma.rs
+ *   `ehma_prepare`           (:215) — first_valid and the Err branches
+ *   `build_hann_weights_rec` (:257) — the weight RECURRENCE and inv_coef
+ *   `reverse_weights_in_place` (:281)
+ *   `ehma_with_kernel`       (:285) — warmup = first + period - 1
+ *   `ehma_scalar`            (:392) — the dot product, ascending, `mul_add`
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. `__fmaf_rn` x30 — every term of the dot product and every step of the
+ *     weight recurrence was an f32 fused multiply-add. Here the dot product
+ *     uses `fma` (the CPU uses `f64::mul_add`, so the fusion is REQUIRED to
+ *     match) and the weight recurrence uses PLAIN `*` and `-`/`+`, because
+ *     ehma.rs:270-271 writes `cm * cos_w - sm * sin_w` with no `mul_add`.
+ *     Fusing there would be one rounding fewer than the reference.
+ *  2. THE WEIGHTS ARE A RECURRENCE, NOT `1 - cos(j*omega)`. The CPU rotates
+ *     (cm, sm) forward from (cos w, sin w). Calling `cos((j+1)*omega)` per
+ *     term is mathematically the same and numerically is not — the recurrence
+ *     drifts, and the reference IS the drifting sequence.
+ *  3. THE WEIGHTS ARE REVERSED BEFORE USE (ehma.rs:287). Term j of the sum
+ *     pairs `data[start + j]` with `w[period - 1 - j]`. Dropping the reversal
+ *     computes a different, plausible-looking average.
+ *
+ * WHY A PER-THREAD ARRAY. The reversal forces the weights to be consumed in
+ * DESCENDING recurrence index while the recurrence only runs ascending, and
+ * running the rotation backwards is not bit-equal to running it forwards. So
+ * the row builds the weights once, ascending, into a local array and then
+ * indexes it in reverse. That array is a fixed compile-time bound, which is
+ * why this kernel declares `max_period()` — `sweep` refuses a larger period
+ * BY NAME rather than truncating the window (which would be a different
+ * indicator) or moving it to the host (which is the silent fallback this lane
+ * exists to remove).
+ *
+ * inv_coef is `1.0 / (period + 1)` (ehma.rs:276) — NOT 1/sum(w). Copied, not
+ * re-derived, because it is the reference's definition.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+// Must equal `EHMA_MAX_PERIOD` in src/cuda/neoethos_f64_wrapper.rs.
+#define NEO_EHMA_MAX_PERIOD 512
+
+extern "C" __global__
+void ehma_neo_batch_f64(const double* __restrict__ data,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (len <= 0 || period <= 0 || period > len ||
+        period > NEO_EHMA_MAX_PERIOD ||
+        first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    double w[NEO_EHMA_MAX_PERIOD];
+
+    // build_hann_weights_rec, ehma.rs:257-278. `2.0 * PI` then divide, in that
+    // order, because `omega = 2.0 * PI / (period as f64 + 1.0)` is written
+    // that way and `(2*PI)/x` and `2*(PI/x)` differ in the last place.
+    const double pi = 3.14159265358979323846;   // == std::f64::consts::PI
+    const double omega = (2.0 * pi) / ((double)period + 1.0);
+    // KNOWN AND DECLARED ULP SOURCE: the CPU calls `f64::sin_cos`, i.e. the
+    // host libm; this calls CUDA's `sincos`. Both are sub-ulp but they are not
+    // the same function, so w[0] can differ in the last place and that
+    // difference propagates through the rotation. It is the only term in this
+    // kernel that is not bit-reproducible, it is stated here rather than
+    // discovered by a parity run, and there is no way to remove it short of
+    // shipping our own argument-reduced sine.
+    double sin_w, cos_w;
+    sincos(omega, &sin_w, &cos_w);
+
+    {
+        double cm = cos_w;
+        double sm = sin_w;
+        for (int j = 0; j < period; ++j) {
+            w[j] = 1.0 - cm;
+            const double next_cm = cm * cos_w - sm * sin_w;
+            const double next_sm = sm * cos_w + cm * sin_w;
+            cm = next_cm;
+            sm = next_sm;
+        }
+    }
+
+    const double inv_coef = 1.0 / ((double)period + 1.0);
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+    if (warm >= len) return;
+
+    for (int i = warm; i < len; ++i) {
+        const int start = i + 1 - period;
+        double sum = 0.0;
+        // ehma.rs:412-414, with the reversal of ehma.rs:287 folded into the
+        // index: weights[j] after reversal is w[period - 1 - j].
+        for (int j = 0; j < period; ++j) {
+            sum = fma(data[start + j], w[period - 1 - j], sum);
+        }
+        o[i] = sum * inv_coef;
+    }
+}

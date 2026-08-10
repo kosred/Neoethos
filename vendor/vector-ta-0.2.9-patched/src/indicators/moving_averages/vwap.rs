@@ -1013,11 +1013,9 @@ fn vwap_batch_inner(
     }
     init_matrix_prefixes(&mut raw, cols, &warm);
 
-    let pv: Vec<f64> = prices
-        .iter()
-        .zip(volumes.iter())
-        .map(|(&p, &v)| p * v)
-        .collect();
+    // The `pv` precompute that used to live here is gone with
+    // `vwap_row_scalar_pv`: it existed only to feed that arm, and it was the
+    // extra rounding. See the `Kernel::Scalar` arm below.
 
     let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
         let params = combos.get(row).unwrap();
@@ -1029,8 +1027,24 @@ fn vwap_batch_inner(
             core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
 
         match kern {
+            // WAS `vwap_row_scalar_pv(.., &pv, ..)`. That path precomputed
+            // `pv[i] = p * v` (one rounding) and then did `vol_price_sum += pv`
+            // (a second), where `vwap_scalar` -- which EVERY other arm of this
+            // match reaches, and which the single-series public `vwap()` uses --
+            // does `vol_price_sum = p.mul_add(v, vol_price_sum)`, ONE rounding.
+            // So `Kernel::Scalar` disagreed with `Kernel::Avx2` by 1 ULP, and
+            // both disagreed with `vwap()`, inside one crate. That is the whole
+            // of the `vwap` entry in `WITHHELD_PENDING_CPU_SELF_CONSISTENCY`:
+            // there was no single CPU answer for a device result to be in
+            // parity with.
+            //
+            // Fixed in the CPU, not worked around. The mul_add form wins on
+            // three independent counts: it has FEWER roundings, it is what four
+            // of the five arms here already ran, and it is what the public
+            // single-series entry point produces -- so it is the number every
+            // caller outside this one batch arm already saw.
             Kernel::Scalar => {
-                vwap_row_scalar_pv(timestamps, volumes, &pv, count, unit_char, out_row)
+                vwap_row_scalar(timestamps, volumes, prices, count, unit_char, out_row)
             }
             #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
             Kernel::Avx2 => vwap_row_avx2(timestamps, volumes, prices, count, unit_char, out_row),
@@ -1122,11 +1136,9 @@ fn vwap_batch_inner_into(
         });
     }
 
-    let pv: Vec<f64> = prices
-        .iter()
-        .zip(volumes.iter())
-        .map(|(&p, &v)| p * v)
-        .collect();
+    // No `pv` precompute here either -- same reason as `vwap_batch_inner`:
+    // it was the second rounding that made `Kernel::Scalar` disagree with
+    // `Kernel::Avx2` and with `vwap()` by 1 ULP.
 
     let do_row = |row: usize, dst: &mut [f64]| unsafe {
         let params = combos.get(row).unwrap();
@@ -1138,7 +1150,7 @@ fn vwap_batch_inner_into(
 
         match kern {
             Kernel::Scalar => {
-                vwap_row_scalar_pv(timestamps, volumes, &pv, count, unit_char, out_row)
+                vwap_row_scalar(timestamps, volumes, prices, count, unit_char, out_row)
             }
             #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
             Kernel::Avx2 => vwap_row_avx2(timestamps, volumes, prices, count, unit_char, out_row),
@@ -1236,129 +1248,19 @@ pub unsafe fn vwap_row_scalar(
     vwap_scalar(timestamps, volumes, prices, count, unit_char, out);
 }
 
-#[inline(always)]
-unsafe fn vwap_row_scalar_pv(
-    timestamps: &[i64],
-    volumes: &[f64],
-    pv: &[f64],
-    count: u32,
-    unit_char: char,
-    out: &mut [f64],
-) {
-    debug_assert_eq!(pv.len(), out.len(), "pv length must match out len");
+// `vwap_row_scalar_pv` WAS HERE AND IS DELETED.
+//
+// It was a second implementation of vwap that differed from `vwap_scalar` by
+// one rounding: it consumed a precomputed `pv[i] = price * volume` and did
+// `vol_price_sum += pv[i]`, where `vwap_scalar` does
+// `vol_price_sum = p.mul_add(v, vol_price_sum)`. Only the `Kernel::Scalar` arm
+// of the two batch paths ever reached it, so the crate answered the same
+// question two ways depending on which kernel the caller asked for -- and the
+// f64 CUDA lane could not be in parity with either, which is why `vwap` sat in
+// `WITHHELD_PENDING_CPU_SELF_CONSISTENCY`. Deleting it, rather than teaching
+// the device to reproduce it, is the fix: the crate now has ONE vwap
+// recurrence and `neoethos_vwap_batch_f64` is in parity with it.
 
-    let n = out.len();
-    if n == 0 {
-        return;
-    }
-    let mut current_group_id: i64 = i64::MIN;
-    let mut volume_sum: f64 = 0.0;
-    let mut vol_price_sum: f64 = 0.0;
-
-    let ts_ptr = timestamps.as_ptr();
-    let vol_ptr = volumes.as_ptr();
-    let pv_ptr = pv.as_ptr();
-    let out_ptr = out.as_mut_ptr();
-
-    if unit_char == 'm' || unit_char == 'h' || unit_char == 'd' {
-        const MINUTE_MS: i64 = 60_000;
-        const HOUR_MS: i64 = 3_600_000;
-        const DAY_MS: i64 = 86_400_000;
-        let unit_ms: i64 = match unit_char {
-            'm' => MINUTE_MS,
-            'h' => HOUR_MS,
-            _ => DAY_MS,
-        };
-        let bucket_ms: i64 = (count as i64) * unit_ms;
-
-        let mut i: usize = 0;
-        let unroll_end = n & !1usize;
-        while i < unroll_end {
-            let ts0 = *ts_ptr.add(i);
-            let gid0 = ts0 / bucket_ms;
-            if gid0 != current_group_id {
-                current_group_id = gid0;
-                volume_sum = 0.0;
-                vol_price_sum = 0.0;
-            }
-            let v0 = *vol_ptr.add(i);
-            let pv0 = *pv_ptr.add(i);
-            volume_sum += v0;
-            vol_price_sum += pv0;
-            *out_ptr.add(i) = if volume_sum > 0.0 {
-                vol_price_sum / volume_sum
-            } else {
-                f64::NAN
-            };
-
-            let idx1 = i + 1;
-            let ts1 = *ts_ptr.add(idx1);
-            let gid1 = ts1 / bucket_ms;
-            if gid1 != current_group_id {
-                current_group_id = gid1;
-                volume_sum = 0.0;
-                vol_price_sum = 0.0;
-            }
-            let v1 = *vol_ptr.add(idx1);
-            let pv1 = *pv_ptr.add(idx1);
-            volume_sum += v1;
-            vol_price_sum += pv1;
-            *out_ptr.add(idx1) = if volume_sum > 0.0 {
-                vol_price_sum / volume_sum
-            } else {
-                f64::NAN
-            };
-
-            i += 2;
-        }
-        if unroll_end != n {
-            let ts = *ts_ptr.add(unroll_end);
-            let gid = ts / bucket_ms;
-            if gid != current_group_id {
-                current_group_id = gid;
-                volume_sum = 0.0;
-                vol_price_sum = 0.0;
-            }
-            let v = *vol_ptr.add(unroll_end);
-            let pvx = *pv_ptr.add(unroll_end);
-            volume_sum += v;
-            vol_price_sum += pvx;
-            *out_ptr.add(unroll_end) = if volume_sum > 0.0 {
-                vol_price_sum / volume_sum
-            } else {
-                f64::NAN
-            };
-        }
-        return;
-    }
-
-    if unit_char == 'M' {
-        let mut i: usize = 0;
-        while i < n {
-            let ts = *ts_ptr.add(i);
-            let gid = match floor_to_month(ts, count) {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if gid != current_group_id {
-                current_group_id = gid;
-                volume_sum = 0.0;
-                vol_price_sum = 0.0;
-            }
-            let v = *vol_ptr.add(i);
-            let pvx = *pv_ptr.add(i);
-            volume_sum += v;
-            vol_price_sum += pvx;
-            *out_ptr.add(i) = if volume_sum > 0.0 {
-                vol_price_sum / volume_sum
-            } else {
-                f64::NAN
-            };
-            i += 1;
-        }
-        return;
-    }
-}
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline(always)]

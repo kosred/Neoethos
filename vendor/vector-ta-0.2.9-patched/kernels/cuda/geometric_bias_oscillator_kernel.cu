@@ -255,3 +255,171 @@ extern "C" __global__ void geometric_bias_oscillator_batch_f64(
         row_out[i] = smooth_count == smooth ? smooth_sum / static_cast<double>(smooth) : NAN;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/geometric_bias_oscillator.rs:1069
+// (geometric_bias_oscillator_with_kernel). SINGLE OUTPUT --
+// compute_geometric_bias_oscillator_batch calls expect_value_output
+// (cpu_batch.rs:5032) -- so the column below IS the value column.
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- a Wilder
+// ATR recurrence, a rolling price ring, and a smoothing sum maintained with
+// subtract-then-add, all RESET by the CPU on a non-finite bar. The per-bar
+// work inside the window is a Ramer-Douglas-Peucker simplification over the
+// window, which is itself sequential in the split stack.
+//
+// PERIOD-INVARIANT. compute_geometric_bias_oscillator_batch
+// (cpu_batch.rs:5041-5045) reads length, multiplier, atr_length and smooth and
+// NEVER period, so five swept periods give five identical CPU columns and this
+// kernel emits five identical rows. All four CPU defaults are pinned below.
+//
+// THE SIX WORKING ARRAYS ARE PER-THREAD, so their bound is a property of THIS
+// COMPILED KERNEL rather than of the caller. The RDP stack can hold at most one
+// entry per window index, which is why it is sized with the window and not
+// guessed. At the pinned length of 100 the bound below cannot be approached; it
+// is checked rather than assumed, and an oversized length returns an all-NaN
+// row instead of overrunning.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and RESTARTS the ATR seed,
+// the price ring and the smoothing window at every non-finite bar, so there is
+// no global warmup index. The lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double sqrt/fabs, no f32-suffixed math
+// function, no fast-math intrinsic. The only equality test is the CPU's own
+// denominator == 0.0 in point_line_distance, which is an exact degeneracy test
+// and not a tolerance.
+// ---------------------------------------------------------------------------
+
+#define NEO_GBO_LENGTH 100
+#define NEO_GBO_MULTIPLIER 2.0
+#define NEO_GBO_ATR_LENGTH 14
+#define NEO_GBO_SMOOTH 1
+#define NEO_GBO_MAX_LENGTH 256
+#define NEO_GBO_MAX_SMOOTH 64
+
+extern "C" __global__ void geometric_bias_oscillator_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int length = NEO_GBO_LENGTH;
+    const double multiplier = NEO_GBO_MULTIPLIER;
+    const int atr_length = NEO_GBO_ATR_LENGTH;
+    const int smooth = NEO_GBO_SMOOTH;
+
+    if (length <= 0 || length > NEO_GBO_MAX_LENGTH || atr_length <= 0 || smooth <= 0 ||
+        smooth > NEO_GBO_MAX_SMOOTH || !isfinite(multiplier) || multiplier < 0.1) {
+        return;
+    }
+
+    double price_ring[NEO_GBO_MAX_LENGTH];
+    double ordered[NEO_GBO_MAX_LENGTH];
+    int keep[NEO_GBO_MAX_LENGTH];
+    int stack_start[NEO_GBO_MAX_LENGTH];
+    int stack_end[NEO_GBO_MAX_LENGTH];
+    double smooth_ring[NEO_GBO_MAX_SMOOTH];
+
+    int price_head = 0;
+    int price_count = 0;
+    int smooth_head = 0;
+    int smooth_count = 0;
+    double smooth_sum = 0.0;
+    int atr_count = 0;
+    double atr_sum = 0.0;
+    double atr_value = NAN;
+    double prev_close = NAN;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
+            price_head = 0;
+            price_count = 0;
+            smooth_head = 0;
+            smooth_count = 0;
+            smooth_sum = 0.0;
+            atr_count = 0;
+            atr_sum = 0.0;
+            atr_value = NAN;
+            prev_close = NAN;
+            row[i] = NAN;
+            continue;
+        }
+
+        const double tr =
+            isfinite(prev_close) ? geometric_bias_true_range(h, l, prev_close) : (h - l);
+        prev_close = c;
+
+        price_ring[price_head] = c;
+        price_head += 1;
+        if (price_head == length) {
+            price_head = 0;
+        }
+        if (price_count < length) {
+            price_count += 1;
+        }
+
+        if (atr_count < atr_length) {
+            atr_count += 1;
+            atr_sum += tr;
+            if (atr_count == atr_length) {
+                atr_value = atr_sum / static_cast<double>(atr_length);
+            }
+        } else {
+            atr_value = ((atr_value * static_cast<double>(atr_length - 1)) + tr) /
+                        static_cast<double>(atr_length);
+        }
+
+        if (atr_count < atr_length || price_count < length) {
+            row[i] = NAN;
+            continue;
+        }
+
+        for (int j = 0; j < length; ++j) {
+            ordered[j] = price_ring[(price_head + j) % length];
+        }
+        const double raw = compute_raw_geometric_bias(
+            ordered,
+            length,
+            atr_value,
+            multiplier,
+            keep,
+            stack_start,
+            stack_end
+        );
+
+        if (smooth_count == smooth) {
+            smooth_sum -= smooth_ring[smooth_head];
+        } else {
+            smooth_count += 1;
+        }
+        smooth_ring[smooth_head] = raw;
+        smooth_sum += raw;
+        smooth_head += 1;
+        if (smooth_head == smooth) {
+            smooth_head = 0;
+        }
+
+        row[i] = smooth_count == smooth ? smooth_sum / static_cast<double>(smooth) : NAN;
+    }
+}

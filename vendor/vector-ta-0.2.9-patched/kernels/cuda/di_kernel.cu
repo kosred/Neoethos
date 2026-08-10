@@ -387,3 +387,156 @@ void di_many_series_one_param_f32(const float* __restrict__ high_tm,
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — di (Directional Indicator, +DI)
+// ===========================================================================
+// Reference: src/indicators/di.rs
+//   di_prepare (:207)              — first_valid + the Err branches
+//   di_selected_with_kernel (:273) — alloc_with_nan_prefix(n, first + period - 1)
+//   di_scalar_into (:406)          — the arithmetic
+// Batch default period 14, input high/low/close.
+//
+// WHICH OUTPUT. `di` is multi-output (plus / minus) and the lane emits ONE
+// matrix. compute_di_batch (cpu_batch.rs) maps output_id "value" — the id the
+// f64 lane requests — to PLUS: `if output_id == "plus" || output_id == "value"
+// { 1u8 }`. So this kernel is +DI, matching the column the CPU emits for the
+// same request. -DI is a second entry point's job, not a silent alternative.
+//
+// FIRST-VALID IS THE SIMULTANEOUS RULE (:225):
+//   (0..n).find(|i| !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()))
+// — one index at which all three are non-NaN, i.e. AllInputsNonNan. This is NOT
+// adx's max-of-independent-firsts rule even though the two indicators share a
+// Wilder core; using adx's index here shifts the seed window.
+//
+// NaN SEMANTICS — THE CPU USES AN IF-CHAIN HERE, ON PURPOSE, AND SO DOES THIS.
+// The true range is built as
+//     let mut tr = ch - cl;
+//     if tr2 > tr { tr = tr2; }
+//     if tr3 > tr { tr = tr3; }        (:449-457, :489-497)
+// which is NOT f64::max: if `tr` is NaN both comparisons are false and the NaN
+// SURVIVES. Rewriting this as fmax(fmax(...)) — the correction the adx kernel
+// needed — would be wrong HERE, because it would return the non-NaN operand and
+// silently repair a bar the reference leaves NaN. Matching the reference means
+// matching its NaN behaviour in BOTH directions. The chain is transcribed
+// literally.
+//
+// The +DM / -DM selection is likewise a comparison, not a max:
+//   dp > dm && dp > 0.0 → dp else 0.0 ; with NaN inputs both are false and the
+//   increment is 0.0, exactly as on the CPU.
+//
+// ROUNDING.
+//   cur_plus = cur_plus.mul_add(keep, inc_p)  → ONE fma (:486)
+//   cur_tr   = cur_tr.mul_add(keep, tr)       → ONE fma (:498)
+//   keep     = 1.0 - period.recip()           — recip() then subtract, in that
+//                                               order (:421-422)
+//
+// ZERO GUARD, NOT AN EPSILON. scale is 0.0 when cur_tr == 0.0 EXACTLY (:471,
+// :500). No tolerance appears in the reference and none is invented here.
+//
+// One thread per column: the three Wilder accumulators are carried.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_di_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double pf = (double)period;
+    const double invp = 1.0 / pf;
+    const double keep = 1.0 - invp;
+
+    double prev_h = high[first_valid];
+    double prev_l = low[first_valid];
+    double prev_c = close[first_valid];
+
+    const int start = first_valid + 1;
+    const int stop  = first_valid + period;
+
+    double plus_dm_sum = 0.0;
+    double tr_sum = 0.0;
+
+    for (int i = start; i < stop; ++i) {
+        const double ch = high[i];
+        const double cl = low[i];
+        const double cc = close[i];
+
+        const double dp = ch - prev_h;
+        const double dm = prev_l - cl;
+        if (dp > dm && dp > 0.0) plus_dm_sum += dp;
+
+        double tr = ch - cl;
+        const double tr2 = fabs(ch - prev_c);
+        const double tr3 = fabs(cl - prev_c);
+        if (tr2 > tr) tr = tr2;
+        if (tr3 > tr) tr = tr3;
+        tr_sum += tr;
+
+        prev_h = ch;
+        prev_l = cl;
+        prev_c = cc;
+    }
+
+    double cur_plus = plus_dm_sum;
+    double cur_tr = tr_sum;
+
+    int idx = stop - 1;
+    double scale = (cur_tr == 0.0) ? 0.0 : (100.0 / cur_tr);
+    row[idx] = cur_plus * scale;
+    idx += 1;
+
+    for (; idx < n; ++idx) {
+        const double ch = high[idx];
+        const double cl = low[idx];
+        const double cc = close[idx];
+
+        const double dp = ch - prev_h;
+        const double dm = prev_l - cl;
+        const double inc_p = (dp > dm && dp > 0.0) ? dp : 0.0;
+
+        cur_plus = fma(cur_plus, keep, inc_p);
+
+        double tr = ch - cl;
+        const double tr2 = fabs(ch - prev_c);
+        const double tr3 = fabs(cl - prev_c);
+        if (tr2 > tr) tr = tr2;
+        if (tr3 > tr) tr = tr3;
+        cur_tr = fma(cur_tr, keep, tr);
+
+        scale = (cur_tr == 0.0) ? 0.0 : (100.0 / cur_tr);
+        row[idx] = cur_plus * scale;
+
+        prev_h = ch;
+        prev_l = cl;
+        prev_c = cc;
+    }
+}

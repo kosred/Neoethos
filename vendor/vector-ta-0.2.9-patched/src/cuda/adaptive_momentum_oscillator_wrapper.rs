@@ -1,10 +1,14 @@
 #![cfg(feature = "cuda")]
 
+// `adaptive_momentum_oscillator_batch_with_kernel` and `Kernel` are gone from
+// this file on purpose: they were the host-recompute half of the disguise
+// removed in `batch_dev` below. The CPU implementation itself is untouched in
+// `src/indicators/adaptive_momentum_oscillator.rs` and remains the correct path
+// on a machine with no card.
 use crate::indicators::adaptive_momentum_oscillator::{
-    adaptive_momentum_oscillator_batch_with_kernel, expand_grid_adaptive_momentum_oscillator,
-    AdaptiveMomentumOscillatorBatchRange, AdaptiveMomentumOscillatorParams,
+    expand_grid_adaptive_momentum_oscillator, AdaptiveMomentumOscillatorBatchRange,
+    AdaptiveMomentumOscillatorParams,
 };
-use crate::utilities::enums::Kernel;
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
@@ -317,15 +321,24 @@ impl CudaAdaptiveMomentumOscillator {
 
         self.stream.synchronize()?;
 
-        let cpu = adaptive_momentum_oscillator_batch_with_kernel(data, sweep, Kernel::ScalarBatch)
-            .map_err(|err| CudaAdaptiveMomentumOscillatorError::InvalidInput(err.to_string()))?;
-        if cpu.rows != rows || cpu.cols != cols || cpu.combos.len() != combos.len() {
-            return Err(CudaAdaptiveMomentumOscillatorError::InvalidInput(
-                "cpu parity shape mismatch".into(),
-            ));
-        }
-        let d_cpu_ama = DeviceBuffer::from_slice(&cpu.ama)?;
-
+        // A HALF-DISGUISE used to live here, and it is the subtlest form of the
+        // bug this workflow exists to remove: the kernel above already wrote
+        // BOTH outputs into `d_out_amo` and `d_out_ama`
+        // (`adaptive_momentum_oscillator_kernel.cu:167` writes `row_out_ama`),
+        // and the wrapper then THREW `d_out_ama` AWAY, recomputed `ama` on the
+        // host through `adaptive_momentum_oscillator_batch_with_kernel(..,
+        // Kernel::ScalarBatch)`, and returned `DeviceBuffer::from_slice(&cpu.ama)`
+        // in its place. Half the answer came from the card and half from the
+        // CPU, and nothing in the return type said so.
+        //
+        // Neither the inventory's list of nine empty stubs nor its list of
+        // disguised wrappers contained this file, because the shape is
+        // different: the `get_function` here is real and the launch here is
+        // real. Only the SECOND output was faked.
+        //
+        // The kernel's `ama` is now what is returned. If the launch fails, the
+        // `?` above propagates it — there is no host recomputation left to hide
+        // behind.
         Ok(CudaAdaptiveMomentumOscillatorBatchResult {
             outputs: AdaptiveMomentumOscillatorDeviceArrayF64Pair {
                 amo: AdaptiveMomentumOscillatorDeviceArrayF64 {
@@ -334,7 +347,7 @@ impl CudaAdaptiveMomentumOscillator {
                     cols,
                 },
                 ama: AdaptiveMomentumOscillatorDeviceArrayF64 {
-                    buf: d_cpu_ama,
+                    buf: d_out_ama,
                     rows,
                     cols,
                 },

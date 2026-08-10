@@ -281,3 +281,192 @@ extern "C" __global__ void intraday_momentum_index_batch_f64(
     delete[] bb_values;
     delete[] bb_valid;
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/intraday_momentum_index.rs:717
+// (intraday_momentum_index_with_kernel). The column this emits is imi, which
+// is what output_id == "value" resolves to (dispatch/cpu_batch.rs:13426).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- the
+// gain/loss window is a ring maintained with subtract-then-add and a
+// per-slot validity flag, so the sum at bar i depends on the exact order the
+// entries entered and left it.
+//
+// WHAT IS DELIBERATELY ABSENT. The multi-output entry point above also carries
+// a Bollinger deviation ring, an EMA basis and an EMA signal. NONE of them
+// feeds imi: they are consumed only by upper_hit, lower_hit and signal. This
+// kernel emits imi, so carrying them would be work whose result is discarded
+// -- and, more to the point, it lets the kernel drop the in-kernel new[]/
+// delete[] that entry point uses. A lane kernel has no allocator budget to
+// spend on columns it does not emit.
+//
+// PERIOD-INVARIANT. compute_intraday_momentum_index_batch
+// (cpu_batch.rs:13401-13407) reads length, length_ma, mult, length_bb,
+// apply_smoothing and low_band and NEVER period, so five swept periods give
+// five identical CPU columns and this kernel emits five identical rows. Every
+// CPU default is pinned below -- including apply_smoothing = false, which is
+// why the Ehlers two-pole branch is present but never taken at the defaults.
+// It is kept rather than deleted so the file still reads as the CPU does.
+//
+// INPUT SHAPE: only OPEN and CLOSE are read -- extract_ohlc_full_input
+// destructures high and low as _high and _low (cpu_batch.rs:13393). The lane
+// row declares F64InputKind::Ohlc4 for the same reason Qstick does: the
+// resident upload already carries four series and the four-pointer launch arm
+// already exists.
+//
+// FIRST VALID IS NOT READ: the CPU walks from bar 0 and marks each ring slot
+// valid or invalid individually, so a single hole does not stop the series --
+// it merely withholds the bars whose window still contains it. There is no
+// warmup index. The lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fmax (which is what the CPU's
+// f64::max is -- a NaN diff cannot survive it), and no fast-math intrinsic.
+// The denominator test is the CPU's exact denom > 0.0, not a tolerance.
+// ---------------------------------------------------------------------------
+
+#define NEO_IMI_LENGTH 14
+#define NEO_IMI_LENGTH_MA 6
+#define NEO_IMI_MULT 2.0
+#define NEO_IMI_LENGTH_BB 20
+#define NEO_IMI_APPLY_SMOOTHING 0
+#define NEO_IMI_LOW_BAND 10
+// The gain/loss ring is per-thread, so its depth is a property of THIS
+// COMPILED KERNEL. `length` is pinned at the CPU default 14, so the bound
+// cannot be approached; it is checked rather than assumed.
+#define NEO_IMI_MAX_LENGTH 512
+
+extern "C" __global__ void intraday_momentum_index_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)high;
+    (void)low;
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int length = NEO_IMI_LENGTH;
+    const int length_ma = NEO_IMI_LENGTH_MA;
+    const double mult = NEO_IMI_MULT;
+    const int length_bb = NEO_IMI_LENGTH_BB;
+    const bool apply_smoothing = NEO_IMI_APPLY_SMOOTHING != 0;
+    const int low_band = NEO_IMI_LOW_BAND;
+
+    if (length <= 0 || length > n || length_ma <= 0 || length_ma > n || length_bb <= 0 ||
+        length_bb > n || !isfinite(mult) || mult < 0.0 ||
+        (apply_smoothing && low_band == 0) || length > NEO_IMI_MAX_LENGTH) {
+        return;
+    }
+
+    double gains[NEO_IMI_MAX_LENGTH];
+    double losses[NEO_IMI_MAX_LENGTH];
+    unsigned char valid[NEO_IMI_MAX_LENGTH];
+    for (int i = 0; i < length; ++i) {
+        gains[i] = 0.0;
+        losses[i] = 0.0;
+        valid[i] = 0;
+    }
+
+    double coeff1 = 0.0;
+    double coeff2 = 0.0;
+    double coeff3 = 0.0;
+    if (apply_smoothing) {
+        const double band = static_cast<double>(low_band);
+        const double a1 = exp(-INTRADAY_MI_PI * INTRADAY_MI_SQRT_2 / band);
+        coeff2 = 2.0 * a1 * cos(INTRADAY_MI_SQRT_2 * INTRADAY_MI_PI / band);
+        coeff3 = -(a1 * a1);
+        coeff1 = 1.0 - coeff2 - coeff3;
+    }
+
+    int idx = 0;
+    int count = 0;
+    int valid_count = 0;
+    double sum_gain = 0.0;
+    double sum_loss = 0.0;
+
+    double prev_price = 0.0;
+    double prev_filt1 = 0.0;
+    double prev_filt2 = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const bool valid_bar = isfinite(open[i]) && isfinite(close[i]);
+
+        if (count >= length) {
+            const int old = idx;
+            if (valid[old] != 0) {
+                valid_count -= 1;
+                sum_gain -= gains[old];
+                sum_loss -= losses[old];
+            }
+        } else {
+            count += 1;
+        }
+
+        if (valid_bar) {
+            const double diff = close[i] - open[i];
+            const double gain = fmax(diff, 0.0);
+            const double loss = fmax(-diff, 0.0);
+            gains[idx] = gain;
+            losses[idx] = loss;
+            valid[idx] = 1;
+            valid_count += 1;
+            sum_gain += gain;
+            sum_loss += loss;
+        } else {
+            gains[idx] = 0.0;
+            losses[idx] = 0.0;
+            valid[idx] = 0;
+        }
+
+        idx += 1;
+        if (idx == length) {
+            idx = 0;
+        }
+
+        double imi = NAN;
+        if (count >= length && valid_count == length) {
+            const double denom = sum_gain + sum_loss;
+            if (denom > 0.0 && isfinite(denom)) {
+                const double raw_imi = 100.0 * (sum_gain / denom);
+                if (apply_smoothing) {
+                    const double filt = coeff1 * (raw_imi + prev_price) * 0.5 +
+                        coeff2 * prev_filt1 + coeff3 * prev_filt2;
+                    prev_price = raw_imi;
+                    prev_filt2 = prev_filt1;
+                    prev_filt1 = filt;
+                    imi = filt;
+                } else {
+                    imi = raw_imi;
+                }
+            }
+        }
+
+        if (!isfinite(imi)) {
+            if (apply_smoothing) {
+                prev_price = 0.0;
+                prev_filt1 = 0.0;
+                prev_filt2 = 0.0;
+            }
+            continue;
+        }
+
+        row[i] = imi;
+    }
+}

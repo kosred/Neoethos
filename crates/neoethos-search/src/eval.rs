@@ -7,7 +7,8 @@ use crate::quality::Trade;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::env;
+// `use std::env` removed 2026-08-10 with the last production env read in this
+// file.
 use std::sync::{Once, OnceLock};
 
 pub type SmcRow = [i8; 11];
@@ -97,16 +98,35 @@ pub struct SessionSpreadProfile {
     pub late_ny_pips: f64,
 }
 
+/// Names of the three UTC session buckets, in `bucket_index` order.
+pub const SESSION_BUCKET_NAMES: [&str; 3] = ["asian_22_07", "overlap_07_16", "late_ny_16_22"];
+
 impl SessionSpreadProfile {
-    /// Resolve the bucket spread (pips) for a UTC unix-millisecond timestamp.
-    pub fn spread_pips_at(self, timestamp_ms: i64) -> f64 {
+    /// Which of the three UTC buckets a timestamp falls in: `0` Asian (22–07),
+    /// `1` London/NY overlap (07–16), `2` late NY (16–22).
+    ///
+    /// The SINGLE definition of the boundaries. The per-session trade census in
+    /// `discovery.rs` calls this rather than re-deriving the hours, so the
+    /// census can never report against different buckets than the cost model
+    /// charges.
+    #[inline]
+    pub fn bucket_index(timestamp_ms: i64) -> usize {
         let hour = utc_hour_of_day(timestamp_ms);
         if (7..16).contains(&hour) {
-            self.overlap_pips
+            1
         } else if (16..22).contains(&hour) {
-            self.late_ny_pips
+            2
         } else {
-            self.asian_pips
+            0
+        }
+    }
+
+    /// Resolve the bucket spread (pips) for a UTC unix-millisecond timestamp.
+    pub fn spread_pips_at(self, timestamp_ms: i64) -> f64 {
+        match Self::bucket_index(timestamp_ms) {
+            1 => self.overlap_pips,
+            2 => self.late_ny_pips,
+            _ => self.asian_pips,
         }
     }
 }
@@ -488,39 +508,18 @@ impl Default for BacktestRuntimeOverrides {
 }
 
 impl BacktestRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_BACKTEST_*` env vars. This is
-    /// the only place the backtest evaluator consults the environment for
-    /// these knobs.
-    pub fn from_env() -> Self {
-        let mut overrides = Self::default();
-        if let Some(value) = env::var("NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-        {
-            overrides.initial_equity = value;
-        }
-        if let Some(value) = env::var("NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-        {
-            overrides.month_capacity = value;
-        }
-        // F-695 closure (2026-05-25 — F-CORE3): rayon thread count. The
-        // primary env var matches the audit-recommended NeoEthos naming;
-        // the rayon-stdlib `RAYON_NUM_THREADS` is honoured as a fallback
-        // so existing deployment scripts keep working unchanged.
-        if let Some(value) = env::var("NEOETHOS_BOT_RUST_THREADS")
-            .ok()
-            .or_else(|| env::var("RAYON_NUM_THREADS").ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-        {
-            overrides.rayon_threads = Some(value);
-        }
-        overrides
-    }
+    // `from_env()` DELETED 2026-08-10. It read
+    // `NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY`,
+    // `NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS`, `NEOETHOS_BOT_RUST_THREADS`
+    // and `RAYON_NUM_THREADS` — all four now typed on
+    // `models.backtest_runtime`. Two of them changed BACKTEST ARITHMETIC
+    // (`initial_equity` feeds the absolute 0..100 lot clamp; `month_capacity`
+    // sizes metric slot 7, weighted 0.45 in the prop-firm objective), which is
+    // the last kind of value that should have been settable by an export.
+    //
+    // ⚠ `RAYON_NUM_THREADS` is still read by `neoethos-models`
+    // (`tree_models/config.rs:119`, `cpu_threads_hint`). It is retired HERE,
+    // not workspace-wide; the asymmetry is recorded in the retired-env table.
 
     /// Config-driven constructor (was the `NEOETHOS_BOT_BACKTEST_*` env
     /// vars). Numeric fields are validated (equity > 0, capacity > 0,
@@ -556,17 +555,33 @@ pub fn install_backtest_runtime_overrides(
     BACKTEST_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_BACKTEST_*` env
-/// vars once and installs them. Idempotent: subsequent calls are ignored.
+/// RETIRED 2026-08-10. Installs the typed defaults and reads no environment.
+///
+/// The symbol survives only because `lib.rs` and `genetic/mod.rs` re-export it
+/// and neither file belongs to this change; removing the re-exports and this
+/// shim is a one-line follow-up recorded in the handoff. Calling it on a
+/// production path would install DEFAULTS over the operator's config, so it
+/// says so, loudly, rather than doing it quietly.
 pub fn install_backtest_runtime_overrides_from_env() {
-    // DOCUMENTED-DEFAULT: OnceLock::set returning Err just means the first
-    // installer won (the public API documents idempotency). Nothing to log.
-    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_env());
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_backtest_runtime_overrides_from_env() is RETIRED and installs typed \
+         DEFAULTS — the NEOETHOS_BOT_BACKTEST_* / RAYON_NUM_THREADS layer no longer \
+         exists. Call install_backtest_runtime_overrides_from_settings(&settings)."
+    );
+    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the backtest knobs from the single
 /// `Settings` instead of the environment. Idempotent.
+///
+/// This is also where the retired-environment report fires: every production
+/// binary reaches this function through
+/// `install_search_runtime_overrides_from_settings` at startup, so it is the
+/// one place guaranteed to run once, with `Settings` in hand, before any
+/// evaluation happens.
 pub fn install_backtest_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
+    crate::execution_profile::report_retired_env_vars();
     let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_settings(s));
 }
 
@@ -587,6 +602,39 @@ impl BacktestSettings {
     pub fn month_capacity(&self) -> usize {
         current_backtest_runtime_overrides().month_capacity
     }
+}
+
+/// Announce, once, that `month_capacity` is shorter than the frame and that
+/// metric slot 7 is therefore being computed on a prefix of the history.
+///
+/// 2026-08-10. Before this, the overflow was dropped at two sites
+/// (`simulate_trades_core`'s month roll and the slot-7 loop's `.min()`) and
+/// reported at neither, so a truncated consistency score was indistinguishable
+/// from an honest one. This does not change any number — it makes the number
+/// legible. The refusal belongs in the config validator, which is routed to
+/// `config.rs`; a per-gene evaluator cannot refuse without aborting the run.
+fn report_month_capacity_overflow(month_capacity: usize, month_ptr: i64) {
+    let months_seen = (month_ptr.max(0) as usize).saturating_add(1);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let coverage = if months_seen > 0 {
+            (month_capacity as f64 / months_seen as f64) * 100.0
+        } else {
+            100.0
+        };
+        tracing::error!(
+            target: "neoethos_search::eval",
+            month_capacity,
+            months_in_frame_so_far = months_seen,
+            coverage_pct = format!("{coverage:.1}"),
+            "models.backtest_runtime.month_capacity ({month_capacity}) is SHORTER than the \
+             months this frame spans ({months_seen}). Months past the cap are dropped, so \
+             metric slot 7 (monthly_target_hit_rate — weighted 0.45, the dominant term of \
+             the prop-firm objective) is scored on only {coverage:.1}% of the history and \
+             still returns a plausible number. Raise month_capacity to at least the months \
+             in your dataset."
+        );
+    });
 }
 
 /// **Phase C.2 (2026-05-28)** — apply broker-supplied carry costs to a
@@ -861,6 +909,24 @@ pub fn fast_evaluate_strategy_core(
                 if month_ptr < month_capacity as i64 {
                     monthly_pnls[month_ptr as usize] = current_month_pnl;
                     month_start_equities[month_ptr as usize] = current_month_start_equity;
+                } else {
+                    // OVERFLOW. Every month past the capacity is DROPPED, and
+                    // it used to be dropped in silence — here and again in the
+                    // slot-7 loop. That matters more than a truncated array
+                    // usually would: `monthly_pnls` produces
+                    // `monthly_target_hit_rate`, metric slot 7, which the
+                    // prop-firm objective multiplies by 0.45 (`named.rs:161`)
+                    // — the dominant term. A capacity below the months the
+                    // frame spans therefore scores every gene on a PREFIX of
+                    // its history and returns a number that looks fine.
+                    //
+                    // The UI advertises `min: Some(12)` for this field while
+                    // calling it a RAM cap, so the documented minimum scores a
+                    // ten-year dataset on its first twelve months.
+                    //
+                    // Reported once per process (this is a per-gene hot path),
+                    // at ERROR, with both numbers.
+                    report_month_capacity_overflow(month_capacity, month_ptr);
                 }
             }
             current_month_pnl = 0.0;
@@ -1246,6 +1312,12 @@ pub fn fast_evaluate_strategy_core(
     // monthly_hit=0. The GPU lane is currently disabled (PHASE1_GPU_SIZING_PORTED).
     const MONTHLY_RETURN_TARGET: f64 = 0.04;
     let monthly_target_hit_rate = if month_ptr >= 0 {
+        // SECOND silent drop site (2026-08-10): this `.min()` is what actually
+        // truncates the rate to the first `month_capacity` months. The
+        // announcement is made at the write site above (once per process, with
+        // both numbers and the coverage fraction) rather than here, because
+        // this loop runs per gene and the write site already knows the frame
+        // ran past the array.
         let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
         let mut hit = 0usize;
         let mut counted = 0usize;
@@ -1735,22 +1807,18 @@ fn synthesize_signals_and_confidence_cpu(
     (signals, confidences)
 }
 
-/// GPU device ids the scheduler pinned for THIS process, from the plural
-/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` (or CUDA twin), e.g. "0,1,2,3".
-/// Empty when unset (the supported scheduler path). The scheduler deliberately
-/// does not set this plural override because the current CubeCL multi-device
-/// path is unstable; it remains an experimental/manual override only.
+/// GPU device ids the scheduler pinned for THIS process.
+///
+/// 2026-08-10: always empty. This used to parse the plural
+/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` / `..._CUDA_DEVICES` ("0,1,2,3").
+/// Its own doc admitted the scheduler deliberately never set it because the
+/// CubeCL multi-device path is unstable — an experimental manual override on
+/// an unstable path, reachable only by export, recorded nowhere. The supported
+/// multi-GPU route is the per-lane `device_override` argument, which is what
+/// every caller already passes.
 #[cfg(feature = "gpu")]
 fn eval_gpu_devices() -> Vec<usize> {
-    std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES")
-        .or_else(|_| std::env::var("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES"))
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .filter_map(|s| s.trim().parse::<usize>().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    Vec::new()
 }
 
 /// The largest population worth submitting to [`validation_backtest_population`]
@@ -1989,6 +2057,12 @@ pub fn evaluate_population_core(
             // on the card looks identical to a healthy one, only slower, and the
             // decision point logged nothing. Hence the log line on both
             // outcomes — "it ran on the GPU" must be a record, not an inference.
+            // Name the lane so the launches below file under the GA rather than
+            // merging with the validation tail's. The two call the shared
+            // prototype-B adapter with byte-identical argument lists — the very
+            // property that let a kernel speed-up be credited to the wrong one
+            // of them — so the caller has to say which it is.
+            let _lane = crate::eval_telemetry::LaneScope::enter("population_eval");
             let started = std::time::Instant::now();
             match try_evaluate_population_cuda(
                 close,
@@ -2244,6 +2318,9 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         }
     });
     if signal_ok && backtest_ok && !integrated {
+        // See the twin in `evaluate_population_core`: the shared adapter cannot
+        // tell these two callers apart on its own.
+        let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
         let gpu_started = std::time::Instant::now();
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
@@ -2378,9 +2455,9 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
         };
         match decide_env(failure) {
             FallbackDecision::FailLoud => panic!(
-                "NEOETHOS_REQUIRE_GPU is set but the validation GPU lane failed \
+                "the resolved backend refuses a CPU recompute (system.enable_gpu_preference / models.prop_search_device names a *_required value) but the validation GPU lane failed \
                  ({failure:?}); refusing to run the whole validation on the CPU. \
-                 Unset NEOETHOS_REQUIRE_GPU to allow the CPU fallback."
+                 Change that config value to allow the CPU fallback."
             ),
             FallbackDecision::RecomputeOnCpu => {
                 // A card-present fallback is the bad kind; count it so
@@ -2501,6 +2578,615 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
 #[cfg(not(feature = "gpu"))]
 pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
     validation_backtest_population_cpu(inputs)
+}
+
+// ── Scenarios: one launch, many treatments ───────────────────────────────────
+
+/// The CPU mirror of a scenario work list.
+///
+/// This is what makes the scenario lane safe to fall back from. A GPU failure in
+/// a run that asked for 17 400 device-perturbed Monte-Carlo scenarios must not
+/// quietly become 17 400 evaluations of the UNPERTURBED gene — every number
+/// downstream would still look plausible and the screen would be measuring
+/// nothing. So the mirror reproduces each scenario exactly:
+///
+///   * the gene named by `base_candidate_id`, sliced out of the shared CSR
+///     arrays into a one-gene batch and run through the SAME
+///     `synthesize_signals_and_confidence_cpu` the whole engine uses;
+///   * for `SCENARIO_PERTURB`, the gene as the device would perturb it, through
+///     the generator both lanes share (`scenario::perturbed_gene`);
+///   * for a cost override, the spread and commission the descriptor carries,
+///     converted by the SAME division the device performs.
+///
+/// It refuses what it cannot reproduce rather than approximating it — see
+/// [`crate::gpu_native::scenario::cpu_mirror_unsupported`]. A sub-window is the
+/// only such case today and nothing builds one.
+///
+/// Note the deliberate asymmetry with the spread override: the device's override
+/// replaces the whole per-bar resolution, so the mirror clears
+/// `session_spread_profile` as well as setting `spread_pips`. Leaving the
+/// profile in place would make the CPU charge a per-hour spread where the device
+/// charged a flat one, and only on the fallback path — the worst place for a
+/// divergence to hide.
+pub fn validation_backtest_scenarios_cpu(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    use crate::gpu_native::scenario;
+
+    let PopulationEvalInputs {
+        close,
+        high,
+        low,
+        indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        month_idx,
+        day_idx,
+        timestamps,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        smc_data,
+        gene_smc_flags,
+        gate_threshold,
+        weights,
+        settings,
+    } = inputs;
+    init_rayon();
+    let n_genes = long_thr.len();
+    let n_samples = close.len();
+    if scenarios.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
+
+    scenarios
+        .par_iter()
+        .map(|descriptor| -> anyhow::Result<[f64; 11]> {
+            if let Some(reason) = scenario::cpu_mirror_unsupported(descriptor, n_samples) {
+                anyhow::bail!("the CPU scenario mirror cannot reproduce this launch: {reason}");
+            }
+            let gene = descriptor.base_candidate_id as usize;
+            if gene >= n_genes {
+                anyhow::bail!(
+                    "scenario {} names gene {gene} outside the population of {n_genes}",
+                    descriptor.scenario_id
+                );
+            }
+            let start = gene_offsets[gene] as usize;
+            let end = gene_offsets[gene + 1] as usize;
+
+            // A one-gene batch, so the canonical synth runs unchanged. Building
+            // it is what lets a perturbed gene go through exactly the same code
+            // path as an unperturbed one — the alternative, a second synth that
+            // takes a factor, is a second implementation of the thing parity is
+            // measured against.
+            let perturbed = if descriptor.scenario_type == scenario::SCENARIO_PERTURB {
+                Some(scenario::perturbed_gene(
+                    descriptor.rng_counter,
+                    long_thr[gene],
+                    short_thr[gene],
+                    &gene_weights[start..end],
+                    sl_pips[gene],
+                    tp_pips[gene],
+                ))
+            } else {
+                None
+            };
+            let one_offsets = [0_i32, (end - start) as i32];
+            let one_flags = [gene_smc_flags[gene]];
+            let one_long = [perturbed
+                .as_ref()
+                .map_or(long_thr[gene], |p| p.long_threshold)];
+            let one_short = [perturbed
+                .as_ref()
+                .map_or(short_thr[gene], |p| p.short_threshold)];
+            let one_weights: &[f32] = perturbed
+                .as_ref()
+                .map_or(&gene_weights[start..end], |p| p.weights.as_slice());
+
+            let (signals, confidences) = synthesize_signals_and_confidence_cpu(
+                indicators,
+                &one_offsets,
+                &gene_indices[start..end],
+                one_weights,
+                &one_long,
+                &one_short,
+                smc_data,
+                &one_flags,
+                gate_threshold,
+                weights,
+                0,
+                n_samples,
+            );
+
+            let mut gene_settings = settings.clone();
+            gene_settings.sl_pips = perturbed.as_ref().map_or(sl_pips[gene], |p| p.sl_pips);
+            gene_settings.tp_pips = perturbed.as_ref().map_or(tp_pips[gene], |p| p.tp_pips);
+            gene_settings.adaptive_vol_mult = stop_vol_mult.get(gene).copied().unwrap_or(0.0);
+            if descriptor.spread_ticks != scenario::NO_TICK_OVERRIDE {
+                gene_settings.spread_pips =
+                    f64::from(descriptor.spread_ticks) / scenario::TICKS_PER_PIP;
+                // The device override bypasses the per-hour resolution entirely.
+                gene_settings.session_spread_profile = None;
+            }
+            if descriptor.commission_micros != scenario::NO_MICRO_OVERRIDE {
+                gene_settings.commission_per_trade =
+                    descriptor.commission_micros as f64 / scenario::MICROS_PER_UNIT;
+            }
+
+            Ok(fast_evaluate_strategy_core(
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+                &gene_settings,
+            ))
+        })
+        .collect()
+}
+
+/// Evaluate a scenario work list — ONE launch for the whole quality screen.
+///
+/// The population twin sends one full-series scenario per gene, so a screen
+/// wanting three treatments of the same genes needed three launches and a
+/// Monte-Carlo screen wanting 100 needed the genes cloned 100 times. This takes
+/// the work list directly: 174 genes and 17 574 scenarios in one submission.
+///
+/// Fallback policy is the population twin's: a card-present failure is counted
+/// (`note_cpu_fallback`) and recomputed on the CPU through the mirror above,
+/// which reproduces the scenarios rather than ignoring them. An error from the
+/// mirror is returned rather than swallowed — there is no third thing to try,
+/// and a screen that cannot be computed must not report a number.
+#[cfg(feature = "gpu")]
+pub fn validation_backtest_scenarios(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    let n_scenarios = scenarios.len();
+    if n_scenarios == 0 {
+        return Ok(Vec::new());
+    }
+    let signal_ok = cuda_eval_signal_kernel_enabled();
+    let backtest_ok = cuda_eval_backtest_kernel_enabled();
+    let integrated = integrated_gpu_eval_disabled();
+
+    // The same once-per-process verdict the population twin reports. Without it
+    // a closed gate skips the card WITHOUT A LINE IN THE LOG, which is the
+    // failure mode that hid `prop_search_device: cpu` for eight months — and
+    // this lane is now 50.4 % of measured wall, so it is the worst place to be
+    // silent about it.
+    static SCENARIO_GATE_REPORTED: std::sync::Once = std::sync::Once::new();
+    SCENARIO_GATE_REPORTED.call_once(|| {
+        if signal_ok && backtest_ok && !integrated {
+            tracing::info!(
+                target: "neoethos_search::eval",
+                "validation GPU gate OPEN — scenario work lists dispatch to the card"
+            );
+        } else {
+            tracing::warn!(
+                target: "neoethos_search::eval",
+                signal_kernel_enabled = signal_ok,
+                backtest_kernel_enabled = backtest_ok,
+                integrated_gpu_skip = integrated,
+                "validation GPU gate CLOSED — every scenario work list runs on the CPU"
+            );
+        }
+    });
+
+    // A card + the native f64 lane are present but the gate above is closed (a
+    // kernel kill-switch or an integrated-GPU verdict). Refuse the silent CPU
+    // screen, exactly as `evaluate_population_core` does: a run that puts
+    // nothing on the card looks identical to a healthy one, only slower. The
+    // `cpu_forced` escape is honoured because that is what the operator asked
+    // for by name.
+    #[cfg(feature = "gpu-b-adapter")]
+    if !(signal_ok && backtest_ok && !integrated)
+        && prototype_b_card_present()
+        && crate::backend::current_evaluation_backend().device
+            != crate::backend::DevicePreference::Cpu
+    {
+        anyhow::bail!(
+            "a CUDA card + prototype B are present but the scenario GPU lane gate was closed \
+             (kernel kill-switch / integrated-GPU verdict); refusing the silent CPU quality \
+             screen — fix the fault or set models.prop_search_device: cpu_forced"
+        );
+    }
+
+    // The scenario lane exists only on Prototype B. The cubecl lane has no
+    // notion of a descriptor — it takes a gene array and one settings struct —
+    // so on a Vulkan/ROCm build this whole function is the CPU mirror. That is
+    // stated in a `cfg` rather than discovered at runtime, because a lane that
+    // silently degrades to a different computation is the defect this file has
+    // been repeatedly bitten by.
+    #[cfg(feature = "gpu-b-adapter")]
+    if signal_ok && backtest_ok && !integrated {
+        let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
+        let gpu_started = std::time::Instant::now();
+        let device_override = eval_gpu_devices().first().copied();
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::gpu_native::prototype_b_population_eval::try_evaluate_scenarios_b(
+                inputs.close,
+                inputs.high,
+                inputs.low,
+                inputs.indicators,
+                inputs.gene_offsets,
+                inputs.gene_indices,
+                inputs.gene_weights,
+                inputs.long_thr,
+                inputs.short_thr,
+                inputs.month_idx,
+                inputs.day_idx,
+                inputs.timestamps,
+                inputs.sl_pips,
+                inputs.tp_pips,
+                inputs.stop_vol_mult,
+                inputs.smc_data,
+                inputs.gene_smc_flags,
+                inputs.gate_threshold,
+                inputs.weights,
+                inputs.settings,
+                device_override,
+                scenarios,
+            )
+        }));
+        // Classify, then let the SHARED policy decide — the population twin's
+        // arms, verbatim. This lane had neither: it logged a warning and ran the
+        // CPU mirror, so on a rented card with NEOETHOS_REQUIRE_GPU set the
+        // whole quality screen (50.4 % of measured wall) went to the CPU
+        // quietly. That is the invariant landed at d8681a1d, bypassed by the
+        // newest lane.
+        use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
+        let failure = match gpu {
+            Ok(Ok(rows)) if rows.len() == n_scenarios => {
+                crate::eval_telemetry::record_device(
+                    "validation_eval",
+                    crate::eval_telemetry::Device::Gpu,
+                    gpu_started.elapsed(),
+                );
+                return Ok(rows);
+            }
+            Ok(Ok(rows)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    expected = n_scenarios,
+                    returned = rows.len(),
+                    "scenario GPU lane returned the wrong number of rows"
+                );
+                GpuFailure::WrongShape
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    scenarios = n_scenarios,
+                    error = format!("{error:#}"),
+                    "scenario GPU lane refused the work — this is why it is on the CPU"
+                );
+                GpuFailure::AllocationPressure
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    scenarios = n_scenarios,
+                    "scenario GPU lane panicked — falling back"
+                );
+                GpuFailure::AllocationPressure
+            }
+        };
+        match decide_env(failure) {
+            FallbackDecision::FailLoud => panic!(
+                "the resolved backend refuses a CPU recompute (a *_required device value) but the scenario GPU lane failed \
+                 ({failure:?}); refusing to run the whole quality screen on the CPU. \
+                 Change that config value to allow the CPU fallback."
+            ),
+            FallbackDecision::RecomputeOnCpu => {
+                crate::eval_telemetry::note_cpu_fallback("validation_eval");
+                tracing::warn!(
+                    target: "neoethos_search::eval",
+                    ?failure,
+                    "scenario GPU lane unusable — recomputing on CPU"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    {
+        let _ = (signal_ok, backtest_ok, integrated);
+        // `gpu` WITHOUT `gpu-b-adapter` is a Vulkan or ROCm build, and there is
+        // no scenario lane there: the cubecl entry point takes a gene array and
+        // one settings struct, so it cannot express a descriptor list at all.
+        //
+        // The whole quality screen therefore runs on the CPU on those builds —
+        // which is a correct result and an unacceptable silence. `card_present()`
+        // is false on a non-CUDA build, so `device_summary` would take its
+        // friendly info branch and a Vulkan run would look exactly like a
+        // healthy one. Say it once, loudly, and count it.
+        static NO_SCENARIO_LANE: std::sync::Once = std::sync::Once::new();
+        NO_SCENARIO_LANE.call_once(|| {
+            tracing::warn!(
+                target: "neoethos_search::eval",
+                build = "gpu without gpu-b-adapter (Vulkan/ROCm)",
+                "this build has NO scenario GPU lane — the cubecl entry point takes a gene \
+                 array and one settings struct and cannot express a work list, so the entire \
+                 quality screen runs on the CPU. Build with `gpu-cuda` for the device lane."
+            );
+        });
+        crate::eval_telemetry::note_cpu_fallback("validation_eval");
+    }
+
+    let cpu_started = std::time::Instant::now();
+    let out = validation_backtest_scenarios_cpu(inputs, scenarios);
+    crate::eval_telemetry::record_device(
+        "validation_eval",
+        crate::eval_telemetry::Device::Cpu,
+        cpu_started.elapsed(),
+    );
+    out
+}
+
+/// CPU-only twin for the non-GPU build. See [`validation_backtest_scenarios`].
+#[cfg(not(feature = "gpu"))]
+pub fn validation_backtest_scenarios(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    validation_backtest_scenarios_cpu(inputs, scenarios)
+}
+
+#[cfg(test)]
+mod scenario_mirror_tests {
+    use super::*;
+    use crate::gpu_native::scenario;
+
+    /// A tiny but real population: two genes over 400 bars of a synthetic
+    /// series, evaluated through the same CPU engine production uses.
+    fn fixture() -> (
+        Vec<f64>,
+        ndarray::Array2<f32>,
+        Vec<SmcRow>,
+        Vec<i64>,
+        BacktestSettings,
+    ) {
+        let bars = 400;
+        let close: Vec<f64> = (0..bars)
+            .map(|i| 1.1000 + ((i as f64) * 0.37).sin() * 0.0040)
+            .collect();
+        let mut indicators = ndarray::Array2::<f32>::zeros((2, bars));
+        for i in 0..bars {
+            indicators[(0, i)] = ((i as f32) * 0.11).sin();
+            indicators[(1, i)] = ((i as f32) * 0.07).cos();
+        }
+        let smc = vec![[0_i8; 11]; bars];
+        let months = vec![0_i64; bars];
+        let mut settings = BacktestSettings::default();
+        settings.pip_value = 0.0001;
+        settings.spread_pips = 1.0;
+        settings.commission_per_trade = 2.0;
+        settings.pip_value_per_lot = 10.0;
+        settings.risk_based_sizing = false;
+        settings.sl_pips = 20.0;
+        settings.tp_pips = 40.0;
+        (close, indicators, smc, months, settings)
+    }
+
+    fn inputs<'a>(
+        close: &'a [f64],
+        indicators: &'a ndarray::Array2<f32>,
+        smc: &'a [SmcRow],
+        months: &'a [i64],
+        settings: &'a BacktestSettings,
+        offsets: &'a [i32],
+        idx: &'a [i32],
+        w: &'a [f32],
+        lt: &'a [f32],
+        st: &'a [f32],
+        sl: &'a [f64],
+        tp: &'a [f64],
+        flags: &'a [SmcRow],
+        smc_weights: &'a [f32; 11],
+    ) -> PopulationEvalInputs<'a> {
+        PopulationEvalInputs {
+            close,
+            high: close,
+            low: close,
+            indicators: indicators.view(),
+            gene_offsets: offsets,
+            gene_indices: idx,
+            gene_weights: w,
+            long_thr: lt,
+            short_thr: st,
+            month_idx: months,
+            day_idx: months,
+            timestamps: &[],
+            sl_pips: sl,
+            tp_pips: tp,
+            stop_vol_mult: &[],
+            smc_data: smc,
+            gene_smc_flags: flags,
+            gate_threshold: 0.0,
+            weights: smc_weights,
+            settings,
+        }
+    }
+
+    /// THE PARITY FLOOR, stated as a test rather than as a claim.
+    ///
+    /// A work list of nothing but `base_scenario`, one per gene, must produce
+    /// exactly what the population path produces. If this ever diverges, every
+    /// number the scenario lane reports is suspect, because this is the case the
+    /// 147 GPU parity fixtures also exercise.
+    #[test]
+    fn a_base_work_list_equals_the_population_path_exactly() {
+        let (close, indicators, smc, months, settings) = fixture();
+        let offsets = [0_i32, 1, 2];
+        let idx = [0_i32, 1];
+        let w = [1.0_f32, 1.0];
+        let lt = [0.5_f32, 0.4];
+        let st = [-0.5_f32, -0.4];
+        let sl = [20.0_f64, 25.0];
+        let tp = [40.0_f64, 50.0];
+        let flags = [[0_i8; 11]; 2];
+        let smc_weights = [0.0_f32; 11];
+
+        let population = validation_backtest_population_cpu(inputs(
+            &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st, &sl,
+            &tp, &flags, &smc_weights,
+        ));
+        let work_list: Vec<_> = (0..2u64)
+            .map(|g| scenario::base_scenario(g, g, close.len()))
+            .collect();
+        let scenarios = validation_backtest_scenarios_cpu(
+            inputs(
+                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
+                &sl, &tp, &flags, &smc_weights,
+            ),
+            &work_list,
+        )
+        .expect("a base work list is always reproducible on the CPU");
+
+        assert_eq!(scenarios.len(), population.len());
+        for (gene, (a, b)) in population.iter().zip(scenarios.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "gene {gene} differs between the population path and a base work list"
+            );
+        }
+    }
+
+    /// A cost scenario must charge what the descriptor says, and the descriptor
+    /// must be able to say it exactly.
+    #[test]
+    fn a_cost_scenario_charges_the_descriptor_not_the_settings() {
+        let (close, indicators, smc, months, settings) = fixture();
+        let offsets = [0_i32, 1];
+        let idx = [0_i32];
+        let w = [1.0_f32];
+        let lt = [0.3_f32];
+        let st = [-0.3_f32];
+        let sl = [20.0_f64];
+        let tp = [40.0_f64];
+        let flags = [[0_i8; 11]; 1];
+        let smc_weights = [0.0_f32; 11];
+
+        let base = scenario::base_scenario(0, 0, close.len());
+        // 4 pips and $9/lot against the fixture's 1 pip and $2/lot.
+        let dear = scenario::cost_scenario(
+            0,
+            1,
+            close.len(),
+            scenario::spread_ticks_exact(4.0),
+            scenario::commission_micros_exact(9.0),
+        );
+        let rows = validation_backtest_scenarios_cpu(
+            inputs(
+                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
+                &sl, &tp, &flags, &smc_weights,
+            ),
+            &[base, dear],
+        )
+        .expect("cost scenarios are reproducible on the CPU");
+
+        assert_eq!(rows.len(), 2);
+        // The strategy trades, so paying four times the spread and 4.5x the
+        // commission has to show up as strictly less money.
+        assert!(rows[0][8] > 0.0, "the fixture must actually trade");
+        assert!(
+            rows[1][0] < rows[0][0],
+            "a dearer scenario reported {} against the cheap one's {}",
+            rows[1][0],
+            rows[0][0]
+        );
+    }
+
+    /// The fallback must evaluate the PERTURBED gene, not the gene.
+    ///
+    /// This is the property that makes the device Monte-Carlo lane safe to turn
+    /// on: a GPU failure mid-run recomputes the same perturbations rather than
+    /// silently reporting 100 copies of the unperturbed result.
+    #[test]
+    fn a_perturbed_scenario_is_not_the_unperturbed_gene() {
+        let (close, indicators, smc, months, settings) = fixture();
+        let offsets = [0_i32, 2];
+        let idx = [0_i32, 1];
+        let w = [1.0_f32, 0.5];
+        let lt = [0.3_f32];
+        let st = [-0.3_f32];
+        let sl = [20.0_f64];
+        let tp = [40.0_f64];
+        let flags = [[0_i8; 11]; 1];
+        let smc_weights = [0.0_f32; 11];
+
+        let mut work_list = vec![scenario::base_scenario(0, 0, close.len())];
+        for run in 0..8u64 {
+            work_list.push(scenario::perturb_scenario(0, 1 + run, close.len(), 7717 ^ run));
+        }
+        let rows = validation_backtest_scenarios_cpu(
+            inputs(
+                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
+                &sl, &tp, &flags, &smc_weights,
+            ),
+            &work_list,
+        )
+        .expect("device-perturbation scenarios are reproducible on the CPU");
+
+        assert_eq!(rows.len(), 9);
+        let distinct = rows[1..]
+            .iter()
+            .filter(|row| row[0] != rows[0][0])
+            .count();
+        assert!(
+            distinct >= 4,
+            "only {distinct} of 8 perturbations moved net profit — the mirror is \
+             probably evaluating the unperturbed gene"
+        );
+        // And it is deterministic: the same counters give the same numbers.
+        let again = validation_backtest_scenarios_cpu(
+            inputs(
+                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
+                &sl, &tp, &flags, &smc_weights,
+            ),
+            &work_list,
+        )
+        .unwrap();
+        assert_eq!(rows, again);
+    }
+
+    /// What the mirror cannot reproduce, it refuses.
+    #[test]
+    fn the_mirror_refuses_a_window_it_cannot_walk() {
+        let (close, indicators, smc, months, settings) = fixture();
+        let offsets = [0_i32, 1];
+        let idx = [0_i32];
+        let w = [1.0_f32];
+        let lt = [0.3_f32];
+        let st = [-0.3_f32];
+        let sl = [20.0_f64];
+        let tp = [40.0_f64];
+        let flags = [[0_i8; 11]; 1];
+        let smc_weights = [0.0_f32; 11];
+
+        let mut windowed = scenario::base_scenario(0, 0, close.len());
+        windowed.window_offset = 50;
+        windowed.window_len = 100;
+        let error = validation_backtest_scenarios_cpu(
+            inputs(
+                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
+                &sl, &tp, &flags, &smc_weights,
+            ),
+            &[windowed],
+        )
+        .expect_err("a sub-window must be refused, not silently widened");
+        assert!(format!("{error}").contains("whole series"), "{error}");
+    }
 }
 
 #[cfg(test)]
@@ -2970,8 +3656,11 @@ mod overrides_tests {
         // stop up to ~entry. Bar 3 reverses through the ORIGINAL stop
         // (low 0.9975, below 0.9980). With trailing ON the position exits at the
         // ratcheted ~break-even stop; with trailing OFF it runs to the full
-        // 20-pip loss. This is exactly the break-even protection production
-        // relies on (EvaluationConfig::for_symbol sets trailing_enabled = true).
+        // 20-pip loss. This test pins the MECHANISM, not the policy: since
+        // 2026-08-09 discovery runs with the trail OFF by default
+        // (`models.exit_policy.trailing_enabled`), because leaving it on capped
+        // the realised payoff near 1.0 and made the 2.0 payoff floor unreachable.
+        // The mechanism must still be correct for the operator who turns it on.
         let close = vec![1.0000_f64, 1.0000, 1.0010, 0.9975, 0.9975];
         let high = vec![1.0001_f64, 1.0001, 1.0021, 1.0000, 0.9976];
         let low = vec![0.9999_f64, 1.0000, 1.0000, 0.9975, 0.9974];
@@ -3706,16 +4395,17 @@ mod gpu_cpu_parity_tests {
             })
             .collect();
 
-        // Run the GPU eval under an explicit per-buffer cap (MB), restoring the env
-        // afterwards. `gpu_buffer_elem_cap` now treats this env as a CEILING.
-        let run_gpu_with_cap = |cap_mb: &str| -> anyhow::Result<Vec<[f64; 11]>> {
-            let prev = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB").ok();
-            // SAFETY: test-only env toggle; restored below. Windowing/batching is
-            // exact-by-construction, so a concurrent race with the sibling test only
-            // changes the split COUNT, never the result.
-            unsafe {
-                std::env::set_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", cap_mb);
-            }
+        // Run the GPU eval under an explicit per-buffer cap (MB).
+        //
+        // 2026-08-10: this drove the cap through
+        // `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`, which production no longer
+        // reads. The split-invariance assertion below is the point of the test
+        // and had to survive, so the cap now goes through an explicitly
+        // `#[cfg(test)]` seam — reachable from a test, not from a shell.
+        let run_gpu_with_cap = |cap_mb: u64| -> anyhow::Result<Vec<[f64; 11]>> {
+            use std::sync::atomic::Ordering;
+            let prev = crate::cubecl_eval::TEST_GPU_BUFFER_CAP_MB.load(Ordering::Relaxed);
+            crate::cubecl_eval::TEST_GPU_BUFFER_CAP_MB.store(cap_mb, Ordering::Relaxed);
             let out = crate::cubecl_eval::try_evaluate_population_cuda(
                 &close,
                 &high,
@@ -3739,12 +4429,7 @@ mod gpu_cpu_parity_tests {
                 &settings,
                 None,
             );
-            unsafe {
-                match &prev {
-                    Some(v) => std::env::set_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", v),
-                    None => std::env::remove_var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB"),
-                }
-            }
+            crate::cubecl_eval::TEST_GPU_BUFFER_CAP_MB.store(prev, Ordering::Relaxed);
             out
         };
 
@@ -3752,18 +4437,18 @@ mod gpu_cpu_parity_tests {
         // the 2M-row buffers but with DIFFERENT split granularities. Both stay tiny
         // so they never approach the device's memory limit (a single huge-cap launch
         // would OOM a shared-RAM iGPU — exactly what windowing exists to avoid).
-        let gpu_a = match run_gpu_with_cap("8") {
+        let gpu_a = match run_gpu_with_cap(8) {
             Ok(g) => g,
             Err(e) => {
                 if crate::gpu_fallback::require_gpu() {
-                    panic!("NEOETHOS_REQUIRE_GPU set but heavy-row GPU eval failed: {e}");
+                    panic!("strict-GPU backend installed but heavy-row GPU eval failed: {e}");
                 }
                 eprintln!("GPU heavy-row parity test SKIPPED (no usable GPU device): {e}");
                 return;
             }
         };
         let gpu_b =
-            run_gpu_with_cap("16").expect("second-granularity GPU eval after the first succeeded");
+            run_gpu_with_cap(16).expect("second-granularity GPU eval after the first succeeded");
 
         assert_eq!(gpu_a.len(), n_genes, "gpu(cap=8) wrong gene count");
         assert_eq!(gpu_b.len(), n_genes, "gpu(cap=16) wrong gene count");

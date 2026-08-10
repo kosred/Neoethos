@@ -89,3 +89,119 @@ extern "C" __global__ void volume_zone_oscillator_batch_f64(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — volume_zone_oscillator                      (Closer 5)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/volume_zone_oscillator.rs
+ *   :314 compute_volume_zone_oscillator_into  <- the per-bar body
+ *   :279 compute_vzo_value                    (the two EMA recurrences)
+ *   :247 ema_alpha  = 2 / (period + 1)
+ *   :252 extract_close_volume                 first_valid scans VOLUME ALONE
+ *
+ * PERIOD-INVARIANT. cpu_batch.rs:11552 reads "length" (14),
+ * "intraday_smoothing" (true) and "noise_filter" (4); never "period".
+ *
+ * FIRST-VALID SCANS VOLUME ONLY (:271). Close is deliberately not part of the
+ * scan -- a NaN close is handled INSIDE the loop by the `directed` branch,
+ * which treats a non-finite close as "not an up bar" and therefore signs the
+ * volume NEGATIVE. Adopting close into first_valid would skip bars the CPU
+ * counts as down bars, shifting both EMAs. Registered as VolumeFiniteOnly.
+ *
+ * NON-FINITE VOLUME IS NOT A RESET. compute_vzo_value returns the PREVIOUS
+ * ratio (or None) without touching either EMA, so the state survives the hole.
+ *
+ * ROUNDING: three mul_add sites, one per EMA and one for the noise filter,
+ * each `beta.mul_add(state, alpha * x)` -- one pre-rounded product then ONE
+ * fma. Reproduced with fma in the same operand order.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_VZO_LENGTH       14
+#define NEO_VZO_NOISE_FILTER 4
+/* get_intraday_smoothing default is TRUE (cpu_batch.rs:11555). */
+#define NEO_VZO_INTRADAY     1
+
+extern "C" __global__
+void volume_zone_oscillator_neo_batch_f64(
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int series_len,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const double alpha = 2.0 / ((double)NEO_VZO_LENGTH + 1.0);
+    const double beta = 1.0 - alpha;
+    const double smooth_alpha = 2.0 / ((double)NEO_VZO_NOISE_FILTER + 1.0);
+    const double smooth_beta = 1.0 - smooth_alpha;
+
+    for (int i = 0; i < first_valid; ++i) o[i] = NEO_F64_NAN;
+
+    double prev_close = NEO_F64_NAN;
+    double ema_direction = 0.0;
+    double ema_total = 0.0;
+    double smooth = 0.0;
+    bool smooth_valid = false;
+
+    for (int i = first_valid; i < len; ++i) {
+        const double c = close[i];
+        const double v = volume[i];
+
+        bool have_raw;
+        double raw = 0.0;
+
+        if (!isfinite(v)) {
+            // :288 -- the EMAs are NOT advanced; the previous ratio is reused.
+            if (ema_total != 0.0) {
+                have_raw = true;
+                raw = 100.0 * ema_direction / ema_total;
+            } else {
+                have_raw = false;
+            }
+        } else {
+            const double directed =
+                (isfinite(c) && isfinite(prev_close) && c > prev_close) ? v : -v;
+            ema_direction = fma(beta, ema_direction, alpha * directed);
+            ema_total     = fma(beta, ema_total,     alpha * v);
+            if (ema_total != 0.0) {
+                have_raw = true;
+                raw = 100.0 * ema_direction / ema_total;
+            } else {
+                have_raw = false;
+            }
+        }
+
+        if (isfinite(c)) prev_close = c;
+
+#if NEO_VZO_INTRADAY
+        if (have_raw) {
+            smooth = fma(smooth_beta, smooth, smooth_alpha * raw);
+            smooth_valid = true;
+            o[i] = smooth;
+        } else if (smooth_valid) {
+            o[i] = smooth;
+        } else {
+            o[i] = NEO_F64_NAN;
+        }
+#else
+        o[i] = have_raw ? raw : NEO_F64_NAN;
+#endif
+    }
+}

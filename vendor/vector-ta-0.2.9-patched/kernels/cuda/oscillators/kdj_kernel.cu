@@ -412,3 +412,163 @@ extern "C" __global__ void kdj_many_series_one_param_f32(
         return;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — kdj (K line)
+// ===========================================================================
+// Reference: src/indicators/kdj.rs
+//   kdj_with_kernel (:161)             — first_valid + the Err branches
+//   kdj_compute_into_scalar (:449)     — the ma_type / period fork
+//   kdj_default_sma_9_3_3_into (:857)  — the path this lane takes
+//
+// WHICH OUTPUT. kdj is multi-output (k / d / j) and the lane emits ONE matrix.
+// compute_kdj_batch maps output_id "value" — what the f64 lane asks for — to
+// `out.k`. So this kernel is the K line. d and j are separate entry points'
+// work, not a silent substitution.
+//
+// WHICH PATH. The batch defaults are fast_k 9, slow_k 3, slow_d 3, both MA
+// types "sma", which is EXACTLY the fast-path guard at :476. So
+// kdj_default_sma_9_3_3_into is what runs, its ring sizes are compile-time 3
+// and its monotone deques are compile-time 10 — all of which fit in registers,
+// so this kernel needs no device scratch and no dynamic array.
+//
+// PERIOD-INVARIANT. No `period` parameter is read; a period sweep produces
+// identical rows.
+//
+// FIRST-VALID is the simultaneous rule (kdj.rs:202-206): the first i where
+// high, low AND close are all non-NaN → AllInputsNonNan.
+//
+// THE MONOTONE DEQUES ARE TRANSCRIBED, NOT REPLACED BY fmax/fmin.
+// The CPU pops while max_val[back] <= hi and while min_val[back] >= lo. Under
+// NaN those comparisons are false, so a NaN high is never evicted and can reach
+// the head, making `hh` NaN and the bar's stochastic NaN. An fmax/fmin rolling
+// extreme would return the non-NaN operand and emit a NUMBER where the
+// reference emits NaN. The deque is reproduced literally in a 10-slot register
+// array — the same size the CPU uses.
+//
+// THE MEANS COUNT NON-NaN MEMBERS. sum_k/cnt_k and sum_d/cnt_d skip NaN entries
+// on both insert and evict (:961-969), so the K line is the mean of however
+// many of the last 3 stochastics were finite — NOT a fixed /3. Getting this
+// wrong produces a plausible-looking series that is wrong on exactly the bars
+// that follow a flat window.
+//
+// NO EPSILON. denom == 0.0 is tested exactly and separately from
+// denom.is_nan() (:953). No tolerance exists in the reference and none is
+// invented; an f32 port is tempted to add one because f32 collapses hh-ll to
+// zero far more often, and that temptation is the bug.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_KDJ_FAST_K 9
+#define NEO_S3_KDJ_SLOW_K 3
+#define NEO_S3_KDJ_SLOW_D 3
+#define NEO_S3_KDJ_CAP    10
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_kdj_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;   // PERIOD-INVARIANT — see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const int fast_k = NEO_S3_KDJ_FAST_K;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (fast_k > n) ||
+        ((n - first_valid) < fast_k);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int stoch_warm = first_valid + 8;    // first + fast_k - 1
+    const int k_warm     = stoch_warm + 2;     // + slow_k - 1
+
+    for (int i = 0; i < k_warm && i < n; ++i) row[i] = neo_s3_qnan();
+
+    int    max_idx[NEO_S3_KDJ_CAP];
+    double max_val[NEO_S3_KDJ_CAP];
+    int    min_idx[NEO_S3_KDJ_CAP];
+    double min_val[NEO_S3_KDJ_CAP];
+    int max_head = 0, max_tail = 0, max_cnt = 0;
+    int min_head = 0, min_tail = 0, min_cnt = 0;
+
+    double stoch_ring[NEO_S3_KDJ_SLOW_K];
+    for (int q = 0; q < NEO_S3_KDJ_SLOW_K; ++q) stoch_ring[q] = neo_s3_qnan();
+    double sum_k = 0.0;
+    int cnt_k = 0;
+
+    int pos_k = stoch_warm % NEO_S3_KDJ_SLOW_K;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double hi = high[i];
+        while (max_cnt > 0) {
+            const int back = (max_tail == 0) ? (NEO_S3_KDJ_CAP - 1) : (max_tail - 1);
+            if (max_val[back] <= hi) { max_tail = back; max_cnt -= 1; }
+            else break;
+        }
+        max_val[max_tail] = hi;
+        max_idx[max_tail] = i;
+        max_tail += 1; if (max_tail == NEO_S3_KDJ_CAP) max_tail = 0;
+        max_cnt += 1;
+        while (max_cnt > 0 && max_idx[max_head] + 9 <= i) {
+            max_head += 1; if (max_head == NEO_S3_KDJ_CAP) max_head = 0;
+            max_cnt -= 1;
+        }
+
+        const double lo = low[i];
+        while (min_cnt > 0) {
+            const int back = (min_tail == 0) ? (NEO_S3_KDJ_CAP - 1) : (min_tail - 1);
+            if (min_val[back] >= lo) { min_tail = back; min_cnt -= 1; }
+            else break;
+        }
+        min_val[min_tail] = lo;
+        min_idx[min_tail] = i;
+        min_tail += 1; if (min_tail == NEO_S3_KDJ_CAP) min_tail = 0;
+        min_cnt += 1;
+        while (min_cnt > 0 && min_idx[min_head] + 9 <= i) {
+            min_head += 1; if (min_head == NEO_S3_KDJ_CAP) min_head = 0;
+            min_cnt -= 1;
+        }
+
+        if (i < stoch_warm) continue;
+
+        const double hh = max_val[max_head];
+        const double ll = min_val[min_head];
+        const double denom = hh - ll;
+        double stoch_i;
+        if (denom == 0.0 || isnan(denom)) {
+            stoch_i = neo_s3_qnan();
+        } else {
+            const double c = close[i];
+            stoch_i = 100.0 * ((c - ll) / denom);
+        }
+
+        const double old_st = stoch_ring[pos_k];
+        if (!isnan(old_st)) { sum_k -= old_st; cnt_k -= 1; }
+        stoch_ring[pos_k] = stoch_i;
+        if (!isnan(stoch_i)) { sum_k += stoch_i; cnt_k += 1; }
+        pos_k += 1; if (pos_k == NEO_S3_KDJ_SLOW_K) pos_k = 0;
+
+        if (i >= k_warm) {
+            row[i] = (cnt_k > 0) ? (sum_k / (double)cnt_k) : neo_s3_qnan();
+        }
+    }
+}

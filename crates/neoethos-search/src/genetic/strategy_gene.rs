@@ -307,6 +307,40 @@ fn reject_cross_pair_fallback() -> bool {
         .reject_pip_fallback
 }
 
+/// Sides in one round trip. Named so the `* 2.0` below is never mistaken for
+/// an unexplained fudge factor.
+pub const COMMISSION_SIDES_PER_ROUND_TRIP: f64 = 2.0;
+
+/// Convert a broker's PER-SIDE per-lot commission into the ROUND-TRIP charge
+/// every evaluator in this workspace actually subtracts.
+///
+/// # Why this exists
+///
+/// `BacktestSettings::commission_per_trade` is subtracted exactly ONCE per
+/// closed trade — CPU (`eval.rs:896`, `:1093`, `:1434`, `:1555`), the CUDA
+/// kernel (`prototype_b_population.cu:1006`, `:1151`), and the C prototype all
+/// do the same single subtraction. Brokers, however, quote commission PER SIDE:
+/// 45 USD per million per side is about 0.62 pips per side on EURUSD, so about
+/// 1.24 pips round trip before any spread. Feeding the per-side quote into a
+/// field that is charged once meant **half the real commission was charged on
+/// every trade in every backtest this project has ever run**.
+///
+/// The conversion happens at exactly TWO boundaries — here, and
+/// `DiscoveryConfig::from_settings` — both driven by the same
+/// `risk.commission_per_lot_is_per_side` flag, so they cannot disagree and the
+/// number cannot be doubled twice. Everything downstream of those two points
+/// means ROUND TRIP.
+///
+/// This has ZERO expected value in money. Charging the true cost creates no
+/// edge; it stops the search from selecting candidates on a subsidy.
+pub fn round_trip_commission_per_lot(quoted_per_lot: f64, quoted_is_per_side: bool) -> f64 {
+    if quoted_is_per_side {
+        quoted_per_lot * COMMISSION_SIDES_PER_ROUND_TRIP
+    } else {
+        quoted_per_lot
+    }
+}
+
 pub fn infer_market_cost_profile(
     symbol: &str,
     account_currency: &str,
@@ -434,7 +468,24 @@ pub fn infer_market_cost_profile(
     //      `commission_override`) — for unit tests + when the caller
     //      already knows the value.
     //   2. Process-wide runtime override (`cost.spread_pips` /
-    //      `cost.commission_per_trade`) — operator's `Settings`.
+    //      `cost.commission_per_trade`) — `models.eval_runtime.*`.
+    //      ⚠ UNREACHABLE FROM DISCOVERY (stated 2026-08-10). Every discovery
+    //      run fills step (1) from `risk.*`:
+    //      `DiscoveryConfig::from_settings` computes
+    //      `evaluation_spread_pips = risk.backtest_spread_pips +
+    //      risk.slippage_pips` and a round-trip commission from
+    //      `risk.commission_per_lot` (or broker metadata), passes both as the
+    //      explicit override through `DiscoveryConfig::evaluation_config`, and
+    //      `run_discovery_cycle` refuses a non-finite override — so the
+    //      `.filter` on step (1) can never fall through to step (2).
+    //      `risk.*` therefore wins UNCONDITIONALLY in discovery.
+    //      This matters because the Settings screen renders exactly this pair
+    //      as `cost.spread_pips` / `cost.commission_per_trade`, with tuning
+    //      presets: the surface the operator is offered is the one that loses.
+    //      The substitution is named with both values, once per run, by
+    //      `resolve_and_log_duplicate_knobs` in discovery.rs. Step (2) survives
+    //      only as a library fallback for non-discovery callers that pass
+    //      `None`.
     //   3. **SymbolMetadata** broker-authoritative value — the new
     //      typed boundary populated by the cTrader connector.
     //   4. Asset-class synthetic default — LAST RESORT, kept only so
@@ -506,25 +557,49 @@ pub fn infer_market_cost_profile(
     //   - cross-currency type 3/4 with missing quote_to_account_rate
     // In those cases the synthetic $7/lot fallback is taken with a
     // tracing::warn! — surfaces the gap rather than silently lying.
+    //
+    // PER SIDE vs ROUND TRIP (2026-08-09). The two leading arms —
+    // `commission_override` and `cost.commission_per_trade` — are values a
+    // CALLER chose, and by the name of the field they are already the round
+    // trip; `DiscoveryConfig::from_settings` converts before it passes one in,
+    // and this is the only pair of boundaries that convert, so nothing is
+    // doubled twice. Everything BELOW them comes from a broker schedule or from
+    // the synthetic last resort, both of which are quoted PER SIDE — and the
+    // eval kernels subtract this field exactly once per closed trade. Those
+    // arms are therefore wrapped in `round_trip_commission_per_lot`. Before
+    // this, a per-side broker number was charged once and every backtest paid
+    // half the commission a live fill pays.
+    let commission_is_per_side = cost.commission_is_per_side;
     let commission_per_trade = commission_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.commission_per_trade)
-        .or_else(|| metadata.as_ref().and_then(|m| m.commission_per_lot))
         .or_else(|| {
-            metadata.as_ref().and_then(|m| {
-                m.commission_per_lot_account_ccy(
-                    &account_currency,
-                    price_hint.or(m.typical_price),
-                    cost.quote_to_account_rate,
-                )
-            })
+            metadata
+                .as_ref()
+                .and_then(|m| m.commission_per_lot)
+                .map(|v| round_trip_commission_per_lot(v, commission_is_per_side))
+        })
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|m| {
+                    m.commission_per_lot_account_ccy(
+                        &account_currency,
+                        price_hint.or(m.typical_price),
+                        cost.quote_to_account_rate,
+                    )
+                })
+                .map(|v| round_trip_commission_per_lot(v, commission_is_per_side))
         })
         .unwrap_or_else(|| {
             tracing::warn!(
                 target: "neoethos_search::cost_model",
                 symbol = %symbol,
                 account_currency = %account_currency,
-                fallback_commission = 7.0,
+                fallback_commission_per_side = 7.0,
+                fallback_commission_round_trip =
+                    round_trip_commission_per_lot(7.0, commission_is_per_side),
+                commission_is_per_side,
                 "Synthetic commission fallback used (F-029 LAST RESORT): \
                  SymbolMetadata has no `commission_per_lot`, no operator \
                  override, AND the broker-derived `commission_per_lot_account_ccy` \
@@ -534,7 +609,7 @@ pub fn infer_market_cost_profile(
                  --rebuild-symbol-metadata and supply quote_to_account_rate \
                  to silence this."
             );
-            7.0
+            round_trip_commission_per_lot(7.0, commission_is_per_side)
         });
 
     // **Phase C (2026-05-28)**: pull the broker-supplied swap +
@@ -748,9 +823,23 @@ pub struct EvaluationConfig {
     pub symbol: String,
     pub account_currency: String,
     pub max_hold_bars: usize,
+    /// Exit geometry — resolved from `models.exit_policy`, never hardcoded.
+    ///
+    /// From 2026-06-06 to 2026-08-09 the three fields below were literals in
+    /// `for_symbol` with no config recipient, so no run could measure the search
+    /// without them. See `ExitPolicyOverrides` for what they cost.
     pub trailing_enabled: bool,
+    /// A multiple of the position's OWN STOP DISTANCE, not of ATR
+    /// (`eval.rs:1030-1035`: `hi - trailing_atr_multiplier * pos_sl_pips * pip`).
+    /// The name is a 2026-06-06 misnomer kept because both GPU kernels bind it;
+    /// renaming is kernel-coupled and does not belong in this change.
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
+    /// Floor, in pips, on the profit the armed trail locks in. Previously left
+    /// at `BacktestSettings::default()` (2.0) at every discovery site while the
+    /// other three were set explicitly — a fourth number of the same policy,
+    /// travelling by a different route. It now comes from the same config.
+    pub trailing_min_lock_pips: f64,
     pub pip_value: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
@@ -785,15 +874,39 @@ impl Default for EvaluationConfig {
         // downstream NaN-fitness guard rather than silently backtested
         // against EURUSD/USD math. Production callers MUST use
         // `EvaluationConfig::for_symbol(...)`.
-        let smc = current_strategy_evaluation_runtime_overrides().smc_weights;
+        let overrides = current_strategy_evaluation_runtime_overrides();
+        let smc = overrides.smc_weights;
+        // The exit geometry now arrives here, from config, instead of being
+        // written twice — once as these literals and once as the opposite
+        // literals in `for_symbol`. One source, so a test fixture and a
+        // production run can no longer disagree about what a trade does after
+        // it moves +1R.
+        //
+        // WHICH CONFIG KEY THIS IS, unambiguously (2026-08-10): the ONLY source
+        // of the four trailing values below is `models.exit_policy.*`
+        // (`ExitPolicyOverrides::from_settings`, runtime_overrides.rs). The
+        // identically-named `risk.trailing_enabled` / `_atr_multiplier` /
+        // `_be_trigger_r` / `_min_lock_pips` are a SHADOWED DUPLICATE: they are
+        // read by nothing on the search path, CPU or CUDA, and are ledgered as
+        // such in `crates/neoethos-core/tests/config_has_recipient.rs`. The
+        // disagreement between the two copies is named with both values, once
+        // per run, by `resolve_and_log_duplicate_knobs` in discovery.rs — this
+        // read site does not log, because it runs once per candidate.
+        //
+        // Note the rename across the twin: `risk.trailing_atr_multiplier` maps
+        // to `models.exit_policy.trailing_stop_multiplier`, and despite the old
+        // name it was never an ATR multiple — it is a multiple of the position's
+        // own stop distance.
+        let exit = overrides.exit_policy;
 
         Self {
             symbol: String::new(),
             account_currency: String::new(),
             max_hold_bars: 0,
-            trailing_enabled: false,
-            trailing_atr_multiplier: 1.0,
-            trailing_be_trigger_r: 1.0,
+            trailing_enabled: exit.trailing_enabled,
+            trailing_atr_multiplier: exit.trailing_stop_multiplier,
+            trailing_be_trigger_r: exit.trailing_be_trigger_r,
+            trailing_min_lock_pips: exit.trailing_min_lock_pips,
             pip_value: f64::NAN,
             spread_pips: f64::NAN,
             commission_per_trade: f64::NAN,
@@ -837,20 +950,51 @@ impl EvaluationConfig {
             pip_value_per_lot: profile.pip_value_per_lot,
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
-            // 2026-06-06 operator mandate: break-even + trailing is ALWAYS ON in
-            // discovery (HARDCODED here — the production EvaluationConfig builder).
-            // Both the GA eval (search_engine `b_settings`) and the funnel/prop-firm
-            // window gate (`discovery_backtest_settings`) read these fields, so a single
-            // hardcode makes the risk model consistent everywhere. RATIONALE: with
-            // trailing OFF (the old default), a losing trade ran to the full SL, so
-            // drawdown was higher than necessary and candidates failed the prop-firm
-            // DD/consistency gate. With BE ON, once a trade reaches +1R the stop moves to
-            // ~entry (then trails the extreme), so after 1R the trade can no longer become
-            // a loss → lower DD → more strategies clear the prop-firm gate. `Default`
-            // keeps these at false/1.0/1.0 for test fixtures; production = always on.
-            trailing_enabled: true,
-            trailing_be_trigger_r: 1.0, // move to break-even once +1R in profit
-            trailing_atr_multiplier: 1.0, // then trail 1×SL behind the running extreme
+            // EXIT GEOMETRY REMOVED FROM HERE 2026-08-09.
+            //
+            // What stood here: `trailing_enabled: true`, `trailing_be_trigger_r:
+            // 1.0`, `trailing_atr_multiplier: 1.0`, under a 2026-06-06 comment
+            // calling it an operator mandate and noting that a single hardcode
+            // "makes the risk model consistent everywhere". It did — consistently
+            // unmeasurable. No config, no flag, no test could turn it off, so no
+            // run in fourteen months ever saw the search without it.
+            //
+            // What it did, measured on real EURUSD bars 2026-08-09. The trail is
+            // applied BEFORE the take-profit check on every bar after entry
+            // (`eval.rs:1009-1041`), and the multiplier is a multiple of the
+            // position's own stop, not of ATR. At trigger 1.0 / multiple 1.0 the
+            // stop sits at entry the moment a trade touches +1R, so reaching 3R
+            // requires climbing 1R→3R without ever retracing 1R from the running
+            // high. Realised payoff: 0.87 at sl 6 / tp 45 AND 0.87 at sl 6 /
+            // tp 300 — average win 6.10 vs 6.11 pips. THE TAKE-PROFIT WAS DEAD
+            // CODE. Highest payoff anywhere in the full grid, all timeframes:
+            // 1.08, against a configured payoff floor of 2.0. That floor gates
+            // every survival path (`discovery.rs:5306-5316`), so "174 screened, 0
+            // survived" was arithmetic, not a finding about the market.
+            //
+            // What the old comment claimed and what it cost. The break-even
+            // protection was real: after +1R a trade could not become a loss, so
+            // drawdown fell and more candidates cleared the prop-firm gate. That
+            // benefit is now GONE unless the operator sets
+            // `models.exit_policy.trailing_enabled: true`. Turning it off buys no
+            // profit either — measured across every trailing configuration,
+            // expectancy stayed at -4.15 pips per trade while payoff moved
+            // 0.91 → 2.53. Exit geometry redistributes the (win-rate, payoff)
+            // split; on a driftless price the product is fixed at -cost.
+            //
+            // The value of this change is DIAGNOSTIC. It makes the question
+            // askable. It is not, on its own, an improvement — and on its own it
+            // is strictly WORSE than doing nothing, because a searchable trail
+            // under a payoff-floor objective is a reward hack the GA will find
+            // (trail multiplier 3 → payoff 2.53 → clears a 2.0 floor → loses
+            // 4.18 pips a trade). That is why it lands together with the net-
+            // expectancy gate in `TargetProfile::accepts`.
+            //
+            // The three fields now arrive through `Self::default()` from
+            // `models.exit_policy`, so there is exactly one source and both the
+            // GA eval (`search_engine` b_settings) and the funnel / prop-firm
+            // window gate (`discovery_backtest_settings`) still read the same
+            // numbers as each other.
             ..Self::default()
         }
     }

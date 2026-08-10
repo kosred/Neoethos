@@ -458,3 +458,134 @@ void msw_many_series_one_param_time_major_f32(
         __syncthreads();
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `msw_scalar` (src/indicators/msw.rs:249) and, for the DEFAULT
+ * period 5, `msw_period5_into` (:764). The two are NOT the same doubles: the
+ * generic path builds its angle by ACCUMULATION (`ang += step`, :268) while
+ * the period-5 path forms `step * 2.0`, `step * 3.0`, `step * 4.0` outright
+ * (:774-776). Both are reproduced, selected on `period == 5` exactly as the
+ * CPU selects (:257).
+ *
+ * PERIOD-SWEPT: `compute_msw_batch` reads a parameter literally named
+ * `period`, default 5 (cpu_batch.rs:15582).
+ *
+ * MULTI-OUTPUT: emits SINE, which is what `output_id == "value"` resolves to
+ * (cpu_batch.rs:15594). Never `lead` silently.
+ *
+ * WARMUP: `first + period - 1` (:250). The period-5 path's loop start
+ * `first + 4` is the same index.
+ *
+ * TULIP_PI IS NOT M_PI. msw.rs:37 pins it at 3.1415926 -- seven digits, not
+ * the double. Copying `M_PI` here would move every phase by 2.7e-8 rad, which
+ * is far larger than the ULP this lane exists to preserve.
+ *
+ * NO PER-THREAD TABLE. The CPU precomputes `sin_table`/`cos_table` by
+ * accumulating `ang`; the kernel re-runs that same accumulation inside the
+ * `j` loop from `ang = 0`, so slot `j` carries the identical double without a
+ * `period`-wide local array (which at period 200 would be 3.2 KB of spill per
+ * thread). There is therefore no `max_period`.
+ *
+ * SEQUENTIAL, one thread per combo column: the lane launches this shape, and
+ * the bar loop is the thread body.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* msw.rs:37-38. Deliberately NOT M_PI -- see the header. */
+#define MSW_NEO_TULIP_PI  3.1415926
+#define MSW_NEO_TULIP_TPI (2.0 * MSW_NEO_TULIP_PI)
+
+/* msw_phase_outputs, msw.rs:743-761. `fabs`, not `fabsf`; `atan`, not
+   `atanf`; and the comparison chain is reproduced branch for branch because
+   `rp < 0.0` is FALSE when rp is NaN and the CPU's `if` behaves the same. */
+__device__ __forceinline__ double msw_neo_sine_f64(double rp, double ip)
+{
+    double phase;
+    if (fabs(rp) > 0.001) {
+        phase = atan(ip / rp);
+    } else {
+        phase = MSW_NEO_TULIP_PI * ((ip < 0.0) ? -1.0 : 1.0);
+    }
+    if (rp < 0.0) phase += MSW_NEO_TULIP_PI;
+    phase += MSW_NEO_TULIP_PI * 0.5;
+    if (phase < 0.0)                 phase += MSW_NEO_TULIP_TPI;
+    if (phase > MSW_NEO_TULIP_TPI)   phase -= MSW_NEO_TULIP_TPI;
+    return sin(phase);
+}
+
+extern "C" __global__
+void msw_neo_batch_f64(const double* __restrict__ data,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (first_valid < 0 || first_valid >= len) return;
+
+    const int p = periods[combo];
+    if (p <= 0 || p > len) return;                 /* msw.rs:212 InvalidPeriod */
+    if (len - first_valid < p) return;             /* :218 NotEnoughValidData  */
+
+    const int warm = first_valid + p - 1;          /* :250 */
+    if (warm >= len) return;
+
+    if (p == 5) {
+        /* msw_period5_into, :771-801. Angles as EXACT multiples of step. */
+        const double step = MSW_NEO_TULIP_TPI * 0.2;
+        double s0, c0, s1, c1, s2, c2, s3, c3, s4, c4;
+        sincos(0.0,        &s0, &c0);
+        sincos(step,       &s1, &c1);
+        sincos(step * 2.0, &s2, &c2);
+        sincos(step * 3.0, &s3, &c3);
+        sincos(step * 4.0, &s4, &c4);
+
+        for (int i = first_valid + 4; i < len; ++i) {
+            const double w0 = data[i];
+            const double w1 = data[i - 1];
+            const double w2 = data[i - 2];
+            const double w3 = data[i - 3];
+            const double w4 = data[i - 4];
+
+            double rp = 0.0, ip = 0.0;
+            rp += c0 * w0; ip += s0 * w0;
+            rp += c1 * w1; ip += s1 * w1;
+            rp += c2 * w2; ip += s2 * w2;
+            rp += c3 * w3; ip += s3 * w3;
+            rp += c4 * w4; ip += s4 * w4;
+
+            o[i] = msw_neo_sine_f64(rp, ip);
+        }
+        return;
+    }
+
+    /* Generic path, :261-297. `ang` ACCUMULATES, so slot j is the j-th partial
+       sum of `step` -- not `step * j`. */
+    const double step = MSW_NEO_TULIP_TPI / (double)p;
+
+    for (int i = warm; i < len; ++i) {
+        double rp = 0.0, ip = 0.0;
+        double ang = 0.0;
+        for (int j = 0; j < p; ++j) {
+            double s, c;
+            sincos(ang, &s, &c);
+            const double w = data[i - j];
+            rp += c * w;
+            ip += s * w;
+            ang += step;
+        }
+        o[i] = msw_neo_sine_f64(rp, ip);
+    }
+}

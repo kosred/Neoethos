@@ -289,3 +289,148 @@ extern "C" __global__ void ift_rsi_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — ift_rsi (inverse Fisher transform of RSI)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/ift_rsi.rs
+ *   `ift_rsi_with_kernel`        (:233)  — first_valid, warmup, and the
+ *                                          default-params branch
+ *   `is_default_ift_rsi_params`  (:1298) — (5, 9) takes the specialised path
+ *   `ift_rsi_scalar_default_5_9` (:1303) — THE path this kernel mirrors
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_ift_rsi_batch`
+ * (cpu_batch.rs:3142) reads `rsi_period` (5) and `wma_period` (9); it never
+ * reads `period`. A period sweep therefore produces identical CPU columns and
+ * identical rows here. Declared through `is_period_invariant`.
+ *
+ * THE SPECIALISED PATH IS NOT THE GENERIC PATH WITH CONSTANTS FOLDED IN, AND
+ * THIS IS THE SUBTLE PART. `ift_rsi_scalar_classic` seeds with
+ * `avg_gain /= rp_f` — a DIVISION by 5.0. `ift_rsi_scalar_default_5_9` seeds
+ * with `avg_gain *= ALPHA` where `ALPHA = 0.2` — a MULTIPLICATION by the
+ * nearest double to 1/5, which is not exactly 1/5. The two seeds differ in the
+ * last place, that difference enters a Wilder recursion, and the recursion
+ * carries it for the rest of the series. Since the batch defaults ARE (5, 9),
+ * the specialised path is the reference and `* 0.2` is written below. Using
+ * `/ 5.0` "because it is cleaner" would be a wrong kernel that looks right.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. `tanhf` x4 -> `tanh`. The inverse Fisher transform saturates: for
+ *     |wma| > ~4 the f32 tanh returns exactly 1.0f and the indicator becomes a
+ *     flat line, losing the ordering information the search actually uses.
+ *  2. `__fmaf_rn` x4 -> `fma`, matching `f64::mul_add` one-for-one. The two
+ *     Wilder steps and both WMA updates are single-rounding on the CPU.
+ *  3. `__int_as_float(0x7f...)` -> `__longlong_as_double(0x7ff8...)`.
+ *  4. `0.1f`, `50.0f`, `100.0f`, `0.2f` — every literal is the f64 form here.
+ *     `0.1f` and `0.1` are DIFFERENT NUMBERS, and this one multiplies a
+ *     quantity in [-50, 50] before a tanh.
+ *
+ * THE WMA IS A TWO-ACCUMULATOR ROLLING WEIGHTED SUM, NOT A DOT PRODUCT.
+ * `num` holds the weighted sum and `sum` the plain sum; the update is
+ * `num = fma(9.0, x, num) - sum_old` and then `sum = sum_old + x - x_old`, in
+ * that order, reading the OLD sum for the num update. Reversing the two lines
+ * gives a plausible series that is wrong at every bar after the ninth.
+ *
+ * ONE THREAD PER COLUMN. Carried: avg_gain, avg_loss, num, sum, a 9-slot ring.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_IFTRSI_RP 5
+#define NEO_IFTRSI_WP 9
+
+extern "C" __global__
+void ift_rsi_neo_batch_f64(const double* __restrict__ data,
+                           int series_len,
+                           const int* __restrict__ periods,
+                           int n_combos,
+                           int first_valid,
+                           double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;   /* period-invariant — see the header. */
+
+    const int RP = NEO_IFTRSI_RP;
+    const int WP = NEO_IFTRSI_WP;
+    const double ALPHA = 0.2;
+    const double BETA = 1.0 - ALPHA;
+    const double DENOM_RCP = 1.0 / 45.0;   /* 0.5 * 9 * 10 is exactly 45. */
+    const double WP_F = 9.0;
+
+    /* Every Err branch of `ift_rsi_with_kernel` (:249-262) plus the early
+     * return at :1314 — the CPU emits an all-NaN series in each case. */
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        RP > len || WP > len ||
+        (len - first_valid) < (RP > WP ? RP : WP)) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int n = len - first_valid;
+    const int warmup = first_valid + RP + WP - 1;   /* == first_valid + 13 */
+    for (int i = 0; i < len && i < warmup; ++i) o[i] = NEO_F64_NAN;
+    if ((RP + WP - 1) >= n) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    double avg_gain = 0.0;
+    double avg_loss = 0.0;
+    for (int s = 1; s <= RP; ++s) {
+        const double d = data[first_valid + s] - data[first_valid + s - 1];
+        if (d > 0.0) avg_gain += d; else avg_loss -= d;
+    }
+    /* :1337-1338 — MULTIPLY by 0.2, do not divide by 5. See the header. */
+    avg_gain *= ALPHA;
+    avg_loss *= ALPHA;
+
+    double buf[NEO_IFTRSI_WP];
+    for (int k = 0; k < WP; ++k) buf[k] = 0.0;
+    int head = 0;
+    int filled = 0;
+    double sum = 0.0;
+    double num = 0.0;
+
+    for (int i = RP; i < n; ++i) {
+        if (i > RP) {
+            const double d = data[first_valid + i] - data[first_valid + i - 1];
+            const double gain = (d > 0.0) ? d : 0.0;
+            const double loss = (d < 0.0) ? -d : 0.0;
+            avg_gain = fma(avg_gain, BETA, ALPHA * gain);
+            avg_loss = fma(avg_loss, BETA, ALPHA * loss);
+        }
+
+        const double rs = (avg_loss != 0.0) ? (avg_gain / avg_loss) : 100.0;
+        const double rsi = 100.0 - 100.0 / (1.0 + rs);
+        const double xv = 0.1 * (rsi - 50.0);
+
+        if (filled < WP) {
+            sum += xv;
+            num = fma((double)filled + 1.0, xv, num);
+            buf[head] = xv;
+            head += 1; if (head == WP) head = 0;
+            filled += 1;
+
+            if (filled == WP) {
+                o[first_valid + i] = tanh(num * DENOM_RCP);
+            }
+        } else {
+            const double x_old = buf[head];
+            buf[head] = xv;
+            head += 1; if (head == WP) head = 0;
+
+            const double sum_t = sum;
+            num = fma(WP_F, xv, num) - sum_t;   /* reads the OLD sum */
+            sum = sum_t + xv - x_old;
+
+            o[first_valid + i] = tanh(num * DENOM_RCP);
+        }
+    }
+}

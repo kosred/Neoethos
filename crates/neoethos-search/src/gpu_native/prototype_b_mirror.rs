@@ -14,6 +14,22 @@
 //! syntax error, a race or a precision difference. It does catch the expensive
 //! class of bug — an algorithm that is simply wrong — before a single paid GPU
 //! minute is spent. The kernel and the mirror must be edited together.
+//!
+//! ⚠ NEITHER MECHANIC IS STILL IN THE KERNEL.
+//!
+//! `population_first_hit_kernel` and `population_emit_events_kernel` were
+//! deleted from `prototype_b_population.cu` when signal synthesis was fused
+//! into the walk. Exit detection now happens inline against the position the
+//! walk is holding, and entries are opened straight from the synthesised
+//! signal, so there is no event stream for a warp to search and no scan to
+//! order slots with. What is below is therefore a HISTORICAL reference: its
+//! tests still pass and still prove those two algorithms, but they no longer
+//! guard anything that runs.
+//!
+//! It is left in place rather than deleted in the same change that rewrote the
+//! kernel, because deleting a proof and rewriting the thing it proved at once
+//! is how a regression gets through. Delete it once the fused walk has passed
+//! the 147/147 parity suite on a real card.
 
 /// Exit reasons, mirroring the kernel's encoding.
 pub const MIRROR_EXIT_NONE: i32 = 0;

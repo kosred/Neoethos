@@ -237,3 +237,148 @@ void linearreg_slope_many_series_one_param_f32(const float* __restrict__ prices_
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — linearreg_slope
+// ===========================================================================
+// Reference: src/indicators/linearreg_slope.rs
+//   `linearreg_slope_with_kernel` (:220) — first_valid, Err branches, warmup
+//   `linearreg_slope_scalar` (:268)        — the NON-finite path (Kahan)
+//   `linearreg_slope_scalar_finite` (:358) — the finite path
+// Batch default period 14, source close.
+//
+// TWO ALGORITHMS, NOT ONE. `linearreg_slope_scalar` branches on
+// `data[first..].iter().all(|v| v.is_finite())`. The finite path carries plain
+// running sums AND REBUILDS THEM EVERY 16 BARS (`if (i & 15) == 0`, :403); the
+// non-finite path carries KAHAN-COMPENSATED sums and never rebuilds. Those are
+// different numbers, not different speeds. Both are transcribed and selected by
+// the same test.
+//
+// EPSILONS — both are f64 constants read from the f64 CPU, not scaled f32 ones:
+//   `denom.abs() < f64::EPSILON`  → 2.220446049250313e-16 (:373)
+//   `b.abs() <= 1.1e-8` → 0.0     → the slope deadband (:393, :330)
+// The f32 kernels above cannot express either: f32 epsilon is 1.19e-7, which is
+// LARGER than the 1.1e-8 deadband, so in f32 the deadband is below the noise it
+// is supposed to suppress.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+__device__ __forceinline__ void neo_s3_kahan_add(double* sum, double* c, double x) {
+    const double y = x - *c;
+    const double t = *sum + y;
+    *c = (t - *sum) - y;
+    *sum = t;
+}
+
+extern "C" __global__ void neoethos_linearreg_slope_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period < 2) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warm >= n) return;
+
+    const double p  = (double)period;
+    const double x  = 0.5 * p * (p + 1.0);
+    const double x2 = (p * (p + 1.0) * (2.0 * p + 1.0)) / 6.0;
+    const double denom = p * x2 - x * x;
+    if (fabs(denom) < 2.220446049250313e-16) {   // f64::EPSILON
+        for (int i = warm; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+    const double bd   = 1.0 / denom;
+    const double p_bd = p * bd;
+    const double x_bd = x * bd;
+
+    bool all_finite = true;
+    for (int i = first_valid; i < n; ++i) {
+        if (!isfinite(data[i])) { all_finite = false; break; }
+    }
+
+    if (all_finite) {
+        // ---- linearreg_slope_scalar_finite (:358) ----
+        double y = 0.0, xy = 0.0;
+        for (int j = 0; j < period; ++j) {
+            const double v = data[first_valid + j];
+            y  += v;
+            xy += v * (double)(j + 1);
+        }
+
+        int i = warm;
+        for (;;) {
+            const double b = xy * p_bd - y * x_bd;
+            row[i] = (fabs(b) <= 1.1e-8) ? 0.0 : b;
+            if (i + 1 == n) break;
+
+            const double y_in  = data[i + 1];
+            const double y_out = data[i + 1 - period];
+            const double prev_y = y;
+            y  = prev_y + y_in - y_out;
+            xy = (xy - prev_y) + p * y_in;
+            i += 1;
+            // The CPU rebuilds both sums on every index divisible by 16. This
+            // is arithmetic, not hygiene: it discards the drift accumulated
+            // since the last rebuild, so the emitted value at i changes.
+            if ((i & 15) == 0) {
+                y = 0.0;
+                xy = 0.0;
+                const int start = i + 1 - period;
+                for (int j = 0; j < period; ++j) {
+                    const double v = data[start + j];
+                    y  += v;
+                    xy += v * (double)(j + 1);
+                }
+            }
+        }
+        return;
+    }
+
+    // ---- linearreg_slope_scalar, the Kahan path (:268) ----
+    double y = 0.0, y_c = 0.0, xy = 0.0, xy_c = 0.0;
+    for (int j = 0; j < period - 1; ++j) {
+        const double v = data[first_valid + j];
+        neo_s3_kahan_add(&y, &y_c, v);
+        neo_s3_kahan_add(&xy, &xy_c, v * (double)(j + 1));
+    }
+
+    int in_new = first_valid + period - 1;
+    int in_old = first_valid;
+    for (; in_new < n; ++in_new, ++in_old) {
+        const double v = data[in_new];
+        neo_s3_kahan_add(&y, &y_c, v);
+        neo_s3_kahan_add(&xy, &xy_c, v * p);
+        const double b = xy * p_bd - y * x_bd;
+        row[in_new] = (fabs(b) <= 1.1e-8) ? 0.0 : b;
+        // The CPU performs these two roll-offs only when another bar follows
+        // (`while in_new.add(1) < end`); the final bar falls into the tail
+        // block, which omits them. Same guard here.
+        if (in_new + 1 < n) {
+            neo_s3_kahan_add(&xy, &xy_c, -y);
+            neo_s3_kahan_add(&y, &y_c, -data[in_old]);
+        }
+    }
+}

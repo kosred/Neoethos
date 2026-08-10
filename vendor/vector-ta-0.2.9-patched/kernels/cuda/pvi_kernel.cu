@@ -243,3 +243,92 @@ extern "C" __global__ void pvi_many_series_one_param_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — pvi  (positive volume index)
+// ===========================================================================
+// Reference: src/indicators/pvi.rs
+//   `pvi_with_kernel` (:229) — first_valid = first index where CLOSE AND
+//                               VOLUME are both non-NaN; NaN prefix = that
+//                               index; `valid < 2` is the refusal
+//   `pvi_scalar`      (:419) — the recurrence
+//   `PviInput::get_initial_value` (:144) -> unwrap_or(1000.0)
+//
+// PERIOD-INVARIANT. `pvi` has no period parameter at all; every row of a
+// period sweep is the same series. Declared as such in `F64Kernel::
+// is_period_invariant` so telemetry can explain the repeated work instead of
+// leaving it to be discovered.
+//
+// THE NaN BRANCH IS THE WHOLE INDICATOR'S ROBUSTNESS AND IT IS ASYMMETRIC.
+// On a bar where close or volume is NaN the CPU emits NaN, does NOT update
+// `pvi`, and updates `prev_close`/`prev_vol` ONLY IF BOTH of the CURRENT
+// values are non-NaN — which, inside that branch, can only be true when the
+// PREVIOUS pair was the NaN one. Getting this wrong either freezes the
+// comparison base forever or advances it to a NaN, and both poison every
+// later bar. Reproduced branch for branch.
+//
+// ROUNDINGS: r = (c - prev_close) / prev_close -> sub + div (2);
+//            pvi += r * pvi                    -> mul + add (2).
+// NOT `pvi = pvi.mul_add(r, pvi)` — that would be one rounding where the CPU
+// makes two.
+//
+// f32 hazards fixed here: 5 f32 kernels above, 6 f32-bit-pattern NaNs.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_pvi_batch_f64(
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;   // pvi has no period parameter — see is_period_invariant.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((n - first_valid) < 2);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    for (int i = 0; i < first_valid; ++i) row[i] = neo_s2_qnan();
+
+    double pvi = 1000.0;   // PviParams::get_initial_value -> unwrap_or(1000.0)
+    row[first_valid] = pvi;
+
+    double prev_close = close[first_valid];
+    double prev_vol = volume[first_valid];
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double c = close[i];
+        const double v = volume[i];
+        if (isnan(c) || isnan(v) || isnan(prev_close) || isnan(prev_vol)) {
+            row[i] = neo_s2_qnan();
+            if (!isnan(c) && !isnan(v)) {
+                prev_close = c;
+                prev_vol = v;
+            }
+            continue;
+        }
+        if (v > prev_vol) {
+            const double rr = (c - prev_close) / prev_close;
+            pvi += rr * pvi;
+        }
+        row[i] = pvi;
+        prev_close = c;
+        prev_vol = v;
+    }
+}

@@ -295,3 +295,158 @@ extern "C" __global__ void vpci_many_series_one_param_f32(
                           : nan_f32();
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — vpci (volume price confirmation indicator)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/vpci.rs
+ *   `first_valid_both`             (:389) — first index where close AND volume
+ *                                           are both non-NaN
+ *   `build_prefix_sums`            (:408) — three prefix sums from index 0,
+ *                                           with non-finite inputs zeroed
+ *   `vpci_with_kernel`             (:819) — warmup = first + long - 1
+ *   `vpci_scalar_into_from_psums`  (:489) — the window algebra
+ *
+ * WHICH SERIES THIS EMITS. `compute_vpci_batch` (cpu_batch.rs:5776) maps
+ * output_id "value" -> `VpciOutputField::Vpci`. One matrix, so this is the
+ * VPCI line. The smoothed `vpcis` line is a separate output and is NOT
+ * computed here — its rolling `sum_vpci_vol_short` accumulator feeds nothing
+ * that this matrix reads, so carrying it would be dead work, not fidelity.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_vpci_batch` reads
+ * `short_range` (5) and `long_range` (25) — cpu_batch.rs:5797-5798 — and never
+ * `period`. Identical CPU columns, identical rows here, declared through
+ * `is_period_invariant`. Because both ranges are fixed the prefix ring below
+ * is a compile-time 26 slots and needs no `max_period`.
+ *
+ * WHY A PREFIX-SUM RING AND NOT A WINDOW SUM. The CPU does NOT sum the window;
+ * it DIFFERENCES two prefix sums that were accumulated from index 0 over the
+ * whole series (:536-542). Those are different numbers: the prefix at bar
+ * 90 000 of an FX close series is ~1e5 and subtracting two such values loses
+ * the low bits that a fresh 25-term window sum would keep. Summing the window
+ * directly would be MORE accurate and WRONG — it is not what the reference
+ * computes. So this kernel accumulates the same running prefixes from index 0
+ * and keeps the last `long + 1` of each in a ring, which reproduces the
+ * reference's exact operands with O(long) state instead of O(n).
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. THE PREFIX SUMS ARE THE WHOLE PROBLEM IN f32. `ps_cv` accumulates
+ *     close*volume over the entire series; on FX volume that reaches 1e9-1e12,
+ *     at which point an f32 accumulator's ulp EXCEEDS a single bar's
+ *     contribution and the running sum stops advancing. The window difference
+ *     is then 0 or garbage. This is not a precision tolerance, it is a
+ *     silently frozen indicator, and it is why the file's `vpci_build_prefix_
+ *     single_f32` cannot be rescued by a wider tolerance.
+ *  2. `__int_as_float(0x7f...)` -> `__longlong_as_double(0x7ff8...)`.
+ *  3. The zero-guards are `!= 0.0` EXACTLY, not `fabs(x) < eps`. An epsilon
+ *     here would be an f32-sized constant applied to an f64 quantity — the
+ *     hazard the brief names — and it would also change the answer: the CPU
+ *     divides by any non-zero denominator however small and emits NaN only on
+ *     an exact zero.
+ *  4. `zf()` is `is_finite ? x : 0.0`, which zeroes BOTH NaN and infinity.
+ *     `isfinite` is the f64 spelling; a `!isnan` test would let an infinity
+ *     through and poison the prefix for the rest of the series.
+ *
+ * ONE THREAD PER COLUMN, walking from index 0 because the prefix sums do.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_VPCI_SHORT 5
+#define NEO_VPCI_LONG  25
+#define NEO_VPCI_RING  (NEO_VPCI_LONG + 1)
+
+__device__ __forceinline__ double neo_vpci_zf(double x) {
+    return isfinite(x) ? x : 0.0;
+}
+
+extern "C" __global__
+void vpci_neo_batch_f64(const double* __restrict__ close,
+                        const double* __restrict__ volume,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;   /* period-invariant — see the header. */
+
+    const int shortr = NEO_VPCI_SHORT;
+    const int longr  = NEO_VPCI_LONG;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        longr > len || shortr > len) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warmup = first_valid + longr - 1;
+    for (int i = 0; i < len && i < warmup; ++i) o[i] = NEO_F64_NAN;
+    if (warmup >= len) return;
+
+    const double inv_long  = 1.0 / (double)longr;
+    const double inv_short = 1.0 / (double)shortr;
+
+    /* ps_*[k] for k in [i+1-longr .. i+1], keyed by k % NEO_VPCI_RING. The
+     * CPU's ps arrays are length n+1 with ps[0] = 0. */
+    double ring_c[NEO_VPCI_RING];
+    double ring_v[NEO_VPCI_RING];
+    double ring_cv[NEO_VPCI_RING];
+
+    double acc_c = 0.0, acc_v = 0.0, acc_cv = 0.0;
+    ring_c[0] = 0.0; ring_v[0] = 0.0; ring_cv[0] = 0.0;
+
+    for (int i = 0; i < len; ++i) {
+        const double c_val = neo_vpci_zf(close[i]);
+        const double v_val = neo_vpci_zf(volume[i]);
+        acc_c  = acc_c  + c_val;
+        acc_v  = acc_v  + v_val;
+        acc_cv = acc_cv + c_val * v_val;
+
+        const int end = i + 1;
+        const int slot = end % NEO_VPCI_RING;
+        ring_c[slot]  = acc_c;
+        ring_v[slot]  = acc_v;
+        ring_cv[slot] = acc_cv;
+
+        if (i < warmup) continue;
+
+        /* `end.saturating_sub(long)` — end >= longr here because
+         * i >= warmup >= longr - 1, so end >= longr. */
+        const int long_start  = end - longr;
+        const int short_start = end - shortr;
+        const int ls = long_start  % NEO_VPCI_RING;
+        const int ss = short_start % NEO_VPCI_RING;
+
+        const double sc_l  = ring_c[slot]  - ring_c[ls];
+        const double sv_l  = ring_v[slot]  - ring_v[ls];
+        const double scv_l = ring_cv[slot] - ring_cv[ls];
+
+        const double sc_s  = ring_c[slot]  - ring_c[ss];
+        const double sv_s  = ring_v[slot]  - ring_v[ss];
+        const double scv_s = ring_cv[slot] - ring_cv[ss];
+
+        const double sma_l   = sc_l * inv_long;
+        const double sma_s   = sc_s * inv_short;
+        const double sma_v_l = sv_l * inv_long;
+        const double sma_v_s = sv_s * inv_short;
+
+        const double vwma_l = (sv_l != 0.0) ? (scv_l / sv_l) : NEO_F64_NAN;
+        const double vwma_s = (sv_s != 0.0) ? (scv_s / sv_s) : NEO_F64_NAN;
+
+        const double vpc = vwma_l - sma_l;
+        const double vpr = (sma_s   != 0.0) ? (vwma_s  / sma_s)   : NEO_F64_NAN;
+        const double vm  = (sma_v_l != 0.0) ? (sma_v_s / sma_v_l) : NEO_F64_NAN;
+
+        /* :564 — `vpc * vpr * vm`, left to right. */
+        o[i] = vpc * vpr * vm;
+    }
+}

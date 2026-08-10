@@ -109,14 +109,16 @@ pub fn setup_minimal_logging(verbose: bool) -> anyhow::Result<()> {
 /// `windows_subsystem = "windows"` so NO console window appears.
 /// The HTTP server starts, binds 127.0.0.1:7423, but there is no
 /// visible feedback — the user assumes it crashed silently. This
-/// helper detects "I was launched directly, not by Flutter" via the
-/// `NEOETHOS_LAUNCHED_BY_FLUTTER` env var that the Flutter shell
-/// sets when it spawns the backend, and pops a Win32 MessageBox
-/// telling the user where to find the actual NeoEthos UI.
+/// helper pops a Win32 MessageBox telling the user where to find the
+/// actual NeoEthos UI.
+///
+/// **2026-08-09 (dead-code purge D2)**: the `NEOETHOS_LAUNCHED_BY_FLUTTER`
+/// escape hatch was deleted with the rest of the Flutter surface. Nothing set
+/// it after the 2026-06-22 Tauri migration, so the dialog was already
+/// unconditional here.
 ///
 /// Failure modes:
 /// - Non-Windows: no-op (CLI/terminal users see logs directly).
-/// - Env var present: silent (Flutter shell spawn).
 /// - Debug builds: silent (developers run from terminal; popups annoy).
 /// - MessageBoxW fails: silent (no console fallback either; the only
 ///   user impact is the missing dialog).
@@ -126,12 +128,6 @@ pub fn setup_minimal_logging(verbose: bool) -> anyhow::Result<()> {
 pub fn show_double_click_help_dialog_if_orphaned(server_url: &str) {
     // Skip in debug — devs run from terminal and don't need the popup.
     if cfg!(debug_assertions) {
-        return;
-    }
-    // Skip when the Flutter shell launched us.
-    // **F-CORE3 closure (2026-05-25)**: routed through the canonical
-    // `env_overrides::launched_by_flutter` typed getter.
-    if crate::env_overrides::launched_by_flutter() {
         return;
     }
     #[cfg(windows)]

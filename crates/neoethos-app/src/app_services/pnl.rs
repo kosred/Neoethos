@@ -402,7 +402,10 @@ impl PnLDriftCircuitBreaker {
 /// and return it indexed by `position_id`. The proto contract is one
 /// request per `ctidTraderAccountId` returns ALL positions in a single
 /// response (`repeated ProtoOAPositionUnrealizedPnL positionUnrealizedPnL`
-/// — see `crates/neoethos-app/proto/OpenApiMessages.proto:790`), so we do
+/// — see the upstream `spotware/openapi-proto-messages`
+/// `OpenApiMessages.proto`; the local `crates/neoethos-app/proto/` copy was
+/// deleted 2026-08-09 in dead-code purge D2 with the protoc codegen nothing
+/// consumed), so we do
 /// NOT loop over `position_ids` here. The argument is retained as a
 /// presence hint: if it is empty we still issue the call (the broker
 /// might know about positions our local reconcile missed); if it is

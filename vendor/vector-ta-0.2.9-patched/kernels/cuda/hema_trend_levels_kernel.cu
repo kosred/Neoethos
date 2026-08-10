@@ -306,3 +306,91 @@ extern "C" __global__ void hema_trend_levels_batch_f64(
         prev_slow = slow_hema;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/hema_trend_levels.rs:752
+// (hema_trend_levels_with_kernel). The column this emits is fast_hema, which
+// is what output_id == "value" resolves to (dispatch/cpu_batch.rs:13507-13508).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- a Hull EMA
+// is three chained EMA recurrences (half-length, full-length, and a
+// sqrt-length EMA of 2*half - full), each seeded at its first input and each
+// RESET by the CPU on a non-finite bar. Three carried scalars, no scan form
+// that keeps the rounding.
+//
+// PERIOD-INVARIANT. compute_hema_trend_levels_batch (cpu_batch.rs:13557-13558)
+// reads fast_length and slow_length and NEVER period, so five swept periods
+// give five identical CPU columns and this kernel emits five identical rows.
+// Both CPU defaults are pinned below.
+//
+// WHAT IS DELIBERATELY ABSENT: the slow HEMA, the ATR box offset and the box
+// state machine. None of them feeds fast_hema -- they are consumed by
+// trend_direction, the box columns and the test columns. The slow length is
+// still VALIDATED below, because the CPU refuses the whole computation for a
+// non-positive one and this kernel must refuse the same inputs.
+//
+// THE VALIDITY GATE READS ALL FOUR SERIES: the CPU's finite_ohlc test covers
+// open, high, low and close, and it is the reset trigger for the EMA cascade.
+// So open, high and low are INPUTS to fast_hema's warmup even though its
+// arithmetic reads close alone -- which is why the lane row declares
+// F64InputKind::Ohlc4 and not CloseSlice.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and restarts the cascade
+// at every non-finite bar, so there is no warmup index. The lane row declares
+// F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double llround/sqrt, no f32-suffixed math
+// function, no fast-math intrinsic, no epsilon.
+// ---------------------------------------------------------------------------
+
+#define NEO_HTL_FAST_LENGTH 20
+#define NEO_HTL_SLOW_LENGTH 40
+
+extern "C" __global__ void hema_trend_levels_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int fast_length = NEO_HTL_FAST_LENGTH;
+    const int slow_length = NEO_HTL_SLOW_LENGTH;
+    if (fast_length <= 0 || slow_length <= 0) {
+        return;
+    }
+
+    HemaState fast_state;
+    fast_state.init(fast_length);
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!finite_ohlc(o, h, l, c)) {
+            fast_state.reset();
+            continue;
+        }
+
+        row[i] = fast_state.update(c);
+    }
+}

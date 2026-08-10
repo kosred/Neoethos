@@ -303,3 +303,154 @@ void range_filter_many_series_one_param_f32(const float* __restrict__ prices_tm,
         prev_price  = price;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — range_filter (filter line)
+// ===========================================================================
+// Reference: src/indicators/range_filter.rs
+//   range_filter_prepare (:506)     — first_valid + the Err branches
+//   range_filter_with_kernel (:465) — warmup_end
+//   range_filter_scalar (:645)      — the smooth_range == true branch
+// Batch defaults: range_size 2.618, range_period 14, smooth_range TRUE,
+// smooth_period 27, source close. PERIOD-INVARIANT — no `period` is read.
+//
+// WHICH OUTPUT. Multi-output (filter / high_band / low_band); compute_range_
+// filter_batch maps "value" to FILTER, so this kernel is the filter line.
+//
+// WHICH BRANCH. get_smooth_range defaults to true (:135) and the batch passes
+// that default through, so the SECOND loop (:716) is what runs — the one with
+// the extra range EMA. The first loop is a different series, not a faster one.
+//
+// THE WARMUP PREFIX IS NOT WHERE THE FILTER STARTS. warmup_end is
+//   first + max(range_period, smooth_period) = first + 27
+// but the scalar begins writing at first + 1 and keeps writing through the
+// whole series; the prefix simply overwrites the first 27 of those with NaN.
+// So the state at bar warmup_end depends on bars the output never shows —
+// starting the recursion at warmup_end instead would produce a different
+// series from the first visible bar on.
+//
+// TWO LAZY SEEDS, NOT ONE. ac_ema and range_ema are each initialised on their
+// FIRST finite sample rather than at a fixed index (:689-694, :736-741), and
+// while ac_ema is uninitialised the loop `continue`s WITHOUT writing output —
+// so a leading NaN run inside the series shifts where the filter begins.
+// Both flags are carried here.
+//
+// NaN GUARD. The update is gated on !abs_change.is_nan() (:721): a NaN bar
+// leaves ac_ema untouched instead of poisoning it. Note this is the OPPOSITE
+// polarity from a comparison chain that lets NaN through — matching the
+// reference means matching where it refuses to update.
+//
+// clamp IS NOT fmin/fmax. Rust f64::clamp is
+//     if self < min { min } else if self > max { max } else { self }
+// so a NaN prev_filter passes THROUGH unchanged, whereas fmax(fmin(x,max),min)
+// would return a number. Transcribed as the same comparison chain.
+//
+// ROUNDING. ac_ema = alpha*abs_change + one_minus_alpha*ac_ema is TWO products
+// and ONE add — three roundings. The CPU does not use mul_add here (:726, :740)
+// and neither does this kernel.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_RF_RANGE_SIZE    2.618
+#define NEO_S3_RF_RANGE_PERIOD  14
+#define NEO_S3_RF_SMOOTH_PERIOD 27
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_range_filter_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;   // PERIOD-INVARIANT — see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const double range_size   = NEO_S3_RF_RANGE_SIZE;
+    const int range_period    = NEO_S3_RF_RANGE_PERIOD;
+    const int smooth_period   = NEO_S3_RF_SMOOTH_PERIOD;
+
+    const int needed = (range_period > smooth_period) ? range_period : smooth_period;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (range_period == 0) || (range_period > n) ||
+        (smooth_period == 0) || (smooth_period > n) ||
+        ((n - first_valid) < needed);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warmup_end = first_valid + needed;
+
+    // Every bar the scalar does not write stays NaN, and the first
+    // `warmup_end` are overwritten with NaN regardless.
+    for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+    if (first_valid + 1 >= n) return;
+
+    const double alpha_ac = 2.0 / ((double)range_period + 1.0);
+    const double one_minus_alpha_ac = 1.0 - alpha_ac;
+    const double alpha_range = 2.0 / ((double)smooth_period + 1.0);
+    const double one_minus_alpha_range = 1.0 - alpha_range;
+
+    double ac_ema = 0.0;
+    bool ac_initialized = false;
+    double range_ema = 0.0;
+    bool range_initialized = false;
+
+    double prev_filter = data[first_valid];
+    double prev_price  = prev_filter;
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double price = data[i];
+
+        const double d = price - prev_price;
+        const double abs_change = fabs(d);
+        if (!isnan(abs_change)) {
+            if (!ac_initialized) {
+                ac_ema = abs_change;
+                ac_initialized = true;
+            } else {
+                ac_ema = alpha_ac * abs_change + one_minus_alpha_ac * ac_ema;
+            }
+        }
+
+        if (!ac_initialized) {
+            prev_price = price;
+            continue;
+        }
+
+        double range = ac_ema * range_size;
+        if (!range_initialized) {
+            range_ema = range;
+            range_initialized = true;
+        } else {
+            range_ema = alpha_range * range + one_minus_alpha_range * range_ema;
+        }
+        range = range_ema;
+
+        const double min_b = price - range;
+        const double max_b = price + range;
+        // f64::clamp — NOT fmin/fmax: NaN passes through.
+        double current;
+        if (prev_filter < min_b)      current = min_b;
+        else if (prev_filter > max_b) current = max_b;
+        else                          current = prev_filter;
+
+        if (i >= warmup_end) row[i] = current;
+
+        prev_filter = current;
+        prev_price = price;
+    }
+}

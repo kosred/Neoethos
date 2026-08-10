@@ -270,3 +270,129 @@ void tsf_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — tsf (Time Series Forecast)
+// ===========================================================================
+// Reference: src/indicators/tsf.rs
+//   `tsf_with_kernel` (:260) — first_valid, Err branches,
+//                              `alloc_with_nan_prefix(len, first + period - 1)`
+//   `tsf_scalar` (:383)      — the arithmetic
+// Batch default period 14, source close.
+//
+// The regression constants use x = 0..p-1 (NOT 1..p as `linearreg_slope` does),
+// so `sum_x`/`sum_x2` are accumulated in the CPU's ascending loop rather than
+// from the closed form: the closed form is exact for these magnitudes but the
+// loop is what the reference runs, and "exact" is an argument, not a guarantee.
+//
+// NaN BOOKKEEPING is a COUNTER, not a comparison chain. `nan_count` tracks how
+// many NaNs sit in the window; while it is non-zero the CPU emits NaN AND
+// POISONS s0/s1 to NaN, then rebuilds them from scratch on the first fully
+// clean window (`prev_nan != 0` branch, :463). A comparison chain that merely
+// skipped NaNs would keep a stale sum and silently emit a wrong number for
+// every remaining bar. Transcribed literally.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_tsf_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int p = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (p < 2) || (p > n) ||
+        ((n - first_valid) < p);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warm = first_valid + p - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warm >= n) return;
+
+    const double pf = (double)p;
+
+    double sum_x = 0.0, sum_x2 = 0.0;
+    for (int xi = 0; xi < p; ++xi) {
+        const double xf = (double)xi;
+        sum_x  += xf;
+        sum_x2 += xf * xf;
+    }
+    const double divisor       = pf * sum_x2 - sum_x * sum_x;
+    const double inv_div       = 1.0 / divisor;
+    const double inv_pf        = 1.0 / pf;
+    const double pf_over_div   = pf * inv_div;
+    const double sumx_over_div = sum_x * inv_div;
+    const double p_minus_mean_x = pf - sum_x * inv_pf;
+
+    int base = first_valid;
+    int i = base + p - 1;
+
+    double s0 = 0.0, s1 = 0.0;
+    int nan_count = 0;
+    for (int j = 0; j < p; ++j) {
+        const double v = data[base + j];
+        if (isnan(v)) { nan_count += 1; }
+        else { s0 += v; s1 += (double)j * v; }
+    }
+
+    if (nan_count == 0) {
+        const double m = s1 * pf_over_div - s0 * sumx_over_div;
+        row[i] = s0 * inv_pf + m * p_minus_mean_x;
+    } else {
+        s0 = neo_s3_qnan();
+        s1 = neo_s3_qnan();
+        row[i] = neo_s3_qnan();
+    }
+
+    while (i + 1 < n) {
+        const double y_old = data[base];
+        const double y_new = data[base + p];
+        base += 1;
+        i += 1;
+
+        const int prev_nan = nan_count;
+        if (isnan(y_old)) nan_count = (nan_count > 0) ? nan_count - 1 : 0;
+        if (isnan(y_new)) nan_count = nan_count + 1;
+
+        if (nan_count == 0) {
+            if (prev_nan == 0) {
+                const double new_s0 = s0 + (y_new - y_old);
+                const double new_s1 = pf * y_new + s1 - new_s0;
+                s0 = new_s0;
+                s1 = new_s1;
+            } else {
+                double r0 = 0.0, r1 = 0.0;
+                for (int j = 0; j < p; ++j) {
+                    const double v = data[base + j];
+                    r0 += v;
+                    r1 += (double)j * v;
+                }
+                s0 = r0;
+                s1 = r1;
+            }
+            const double m = s1 * pf_over_div - s0 * sumx_over_div;
+            row[i] = s0 * inv_pf + m * p_minus_mean_x;
+        } else {
+            s0 = neo_s3_qnan();
+            s1 = neo_s3_qnan();
+            row[i] = neo_s3_qnan();
+        }
+    }
+}

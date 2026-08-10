@@ -263,3 +263,151 @@ extern "C" __global__ void trendflex_many_series_one_param_f32(
         prev_price = cur_price;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `moving_averages/trendflex.rs::trendflex_scalar_into` (l.440).
+// `ss_period = round(period / 2.0)` (`trendflex.rs:390`); default period 20.
+//
+//     warm = first_valid + period           -> NaN prefix
+//     a    = exp(-1.414 * PI / ss_period)
+//     b    = 2.0 * a * cos(1.414 * PI / ss_period)
+//     c    = (1.0 + a*a - b) * 0.5
+//     x    = data[first_valid..], m = len - first_valid
+//     prev2 = x[0] ; prev1 = if m > 1 { x[1] } else { x[0] }
+//     ring[period] seeded with prev2 (and prev1 when m > 1), sum likewise
+//     for i in 2..m:
+//         cur = (-a_sq).mul_add(prev2, b.mul_add(prev1, c * (x[i] + x[i-1])))
+//         ... once i >= period:
+//         my_sum     = (period * cur - sum) * inv_tp
+//         ms_current = 0.04.mul_add(my_sum*my_sum, 0.96 * ms_prev)
+//         out        = if ms_current != 0.0 { my_sum / sqrt(ms_current) } else { 0.0 }
+//         sum       += cur - old ; ring rotates
+//
+// THE 1.414 IS A LITERAL, NOT sqrt(2). Ehlers' published constant is 1.414 and
+// the reference writes `1.414_f64`; substituting `sqrt(2.0)` changes `a` in the
+// 4th significant figure and every bar with it. It is carried across verbatim.
+//
+// The two nested mul_adds are ONE rounding each; written unfused the inner
+// `b*prev1 + c*(x[i]+x[i-1])` would round twice. `0.04.mul_add(q, 0.96*ms_prev)`
+// is likewise fused, with `0.96 * ms_prev` rounded first.
+//
+// `ms_current != 0.0` is an EXACT zero test on the CPU — not a tolerance — so
+// no epsilon appears here and none may be invented. `sqrt` is the IEEE double
+// square root, never `sqrtf` and never `rsqrtf`: the f32 file used `rsqrtf`,
+// a fast reciprocal-square-root approximation, which is not even correctly
+// rounded in f32.
+//
+// Serial recurrence with two carried scalars plus a ring -> ONE THREAD PER
+// COLUMN, bars ascending. The ring is `period` entries in a fixed local array,
+// so the compiled kernel carries the period bound.
+//
+// f32 -> f64 audit: pointers/locals widened; `sqrtf`->`sqrt`, `rsqrtf` removed,
+// `roundf`->`round`; every literal widened; the f32 NaN constant replaced by
+// the f64 quiet-NaN bit pattern; no fast-math intrinsic survives; no min/max
+// chain.
+// ---------------------------------------------------------------------------
+
+#ifndef TRENDFLEX_MAX_PERIOD_F64
+#define TRENDFLEX_MAX_PERIOD_F64 512
+#endif
+
+static __device__ __forceinline__ double trendflex_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void trendflex_batch_f64(const double* __restrict__ prices,
+                         int n,
+                         const int*   __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = trendflex_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long warm_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period);
+    if (period <= 0 || period > TRENDFLEX_MAX_PERIOD_F64 || first_valid >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+
+    const int nan_end = (warm_ll >= n) ? n : static_cast<int>(warm_ll);
+    for (int t = 0; t < nan_end; ++t) row[t] = nan_d;
+
+    const int m = n - first_valid;
+    if (m < period) return;
+
+    // ss_period = (period as f64 / 2.0).round() as usize
+    const int ss_period = static_cast<int>(round(static_cast<double>(period) / 2.0));
+    if (ss_period <= 0 || m < ss_period) return;
+
+    const double PI_D = 3.14159265358979323846;
+    const double ang = 1.414 * PI_D / static_cast<double>(ss_period);
+    const double a = exp(-ang);
+    const double a_sq = a * a;
+    const double b = 2.0 * a * cos(ang);
+    const double c = (1.0 + a_sq - b) * 0.5;
+
+    const double* __restrict__ x = prices + first_valid;
+
+    double prev2 = x[0];
+    double prev1 = (m > 1) ? x[1] : x[0];
+
+    double ring[TRENDFLEX_MAX_PERIOD_F64];
+    for (int k = 0; k < period; ++k) ring[k] = 0.0;
+    int head = 0;
+    double sum = 0.0;
+
+    ring[head] = prev2;
+    sum += prev2;
+    head = (head + 1) % period;
+    if (m > 1) {
+        ring[head] = prev1;
+        sum += prev1;
+        head = (head + 1) % period;
+    }
+
+    const double tp_f = static_cast<double>(period);
+    const double inv_tp = 1.0 / tp_f;
+    double ms_prev = 0.0;
+
+    int i = 2;
+    while (i < m && i < period) {
+        const double cur = fma(-a_sq, prev2, fma(b, prev1, c * (x[i] + x[i - 1])));
+        prev2 = prev1;
+        prev1 = cur;
+
+        sum += cur;
+        ring[head] = cur;
+        head = (head + 1) % period;
+        ++i;
+    }
+
+    while (i < m) {
+        const double cur = fma(-a_sq, prev2, fma(b, prev1, c * (x[i] + x[i - 1])));
+        prev2 = prev1;
+        prev1 = cur;
+
+        const double my_sum = (tp_f * cur - sum) * inv_tp;
+        const double ms_current = fma(0.04, my_sum * my_sum, 0.96 * ms_prev);
+        ms_prev = ms_current;
+
+        row[first_valid + i] = (ms_current != 0.0) ? (my_sum / sqrt(ms_current)) : 0.0;
+
+        const double old = ring[head];
+        sum += cur - old;
+        ring[head] = cur;
+        head = (head + 1) % period;
+
+        ++i;
+    }
+}

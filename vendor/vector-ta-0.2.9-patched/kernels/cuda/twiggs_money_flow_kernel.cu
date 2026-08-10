@@ -337,3 +337,131 @@ extern "C" __global__ void twiggs_money_flow_batch_f64(
     delete[] hma_full_buf;
     delete[] hma_sqrt_buf;
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — twiggs_money_flow
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/twiggs_money_flow.rs:865
+ *   twiggs_money_flow_compute_into, GENERIC arm (:892-897), driving
+ *   TwiggsMoneyFlowState::update (:653) with BaseMaState::Ema ->
+ *   EmaState::update (:401).
+ *
+ *   The generic arm is the oracle and not the WmaFixed<21> specialisation
+ *   (:876-890), because that specialisation is only taken when
+ *   ma_type == Wma AND smoothing_length == 14, while the batch defaults are
+ *   ma_type "ema" and smoothing_length 4 (cpu_batch.rs:9795-9796).
+ *
+ * Column: output_id "value" resolves to out.tmf — cpu_batch.rs:9814 accepts
+ *   "tmf"/"value". The `smoothed` column is a separate output id produced by
+ *   HmaState over tmf; it feeds nothing back, so it is not computed here.
+ *
+ * PERIOD-INVARIANT: compute_twiggs_money_flow_batch reads length (21),
+ *   smoothing_length (4) and ma_type ("ema") and NEVER period
+ *   (cpu_batch.rs:9793-9796).
+ *
+ * FIRST-VALID IGNORED: update walks EVERY bar and handles an invalid bar in
+ *   place (:654-657) by clearing or reseating prev_close and emitting NaN. The
+ *   caller's first-valid index is never read.
+ *
+ * Input: (high, low, close, volume) — extract_hlcv_input (cpu_batch.rs:9785)
+ *   — F64InputKind::Hlcv.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. prev_close carries across
+ *   bars and two EMA recurrences run in lockstep.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the EMA step is alpha * value + (1 - alpha) * prev (:405) — TWO
+ *     products and one add, NOT a fused prev + alpha*(value - prev). The
+ *     seed is the first value itself, not a mean.
+ *   * ZERO_RANGE_DIVISOR is 9_999_999.0 (:28) — a Pine-derived MAGIC DIVISOR,
+ *     not a tolerance, and it is exactly representable in f64. It is carried
+ *     across unchanged; it is not an epsilon to be rescaled, and the guard
+ *     that selects it is the exact test tr_c == 0.0.
+ *   * adv is volume * (((close - tr_l) - (tr_h - close)) / denom) (:675) —
+ *     the two ranges are differenced FIRST, then divided, then scaled.
+ *
+ * NaN semantics: prev_close.max(high) and prev_close.min(low) are f64::max /
+ *   f64::min, which return the NON-NaN operand; fmax/fmin are used for exactly
+ *   that reason. Both operands are finite here because the bar passed
+ *   is_valid_bar and prev_close was checked finite, but the CPU semantics are
+ *   still what is reproduced.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:9793-9796. */
+#define NEO_TMF_LENGTH             21
+#define NEO_TMF_ZERO_RANGE_DIVISOR 9999999.0
+
+extern "C" __global__
+void twiggs_money_flow_neo_batch_f64(const double* __restrict__ high,
+                                     const double* __restrict__ low,
+                                     const double* __restrict__ close,
+                                     const double* __restrict__ volume,
+                                     int n,
+                                     const int* __restrict__ periods,
+                                     int n_combos,
+                                     int first_valid,
+                                     double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant — see header */
+    (void)first_valid; /* handled in place — see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    /* twiggs_money_flow_prepare (:931) refuses length > len. */
+    if (NEO_TMF_LENGTH > n) return;
+
+    const double alpha = 2.0 / ((double)NEO_TMF_LENGTH + 1.0);
+
+    double ema_v = NEO_F64_NAN; bool ema_v_init = false;
+    double ema_a = NEO_F64_NAN; bool ema_a_init = false;
+
+    bool   has_prev_close = false;
+    double prev_close = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i], l = low[i], c = close[i], v = volume[i];
+
+        if (!(isfinite(h) && isfinite(l) && isfinite(c) && isfinite(v) && h >= l)) {
+            if (isfinite(c)) { prev_close = c; has_prev_close = true; }
+            else             { has_prev_close = false; }
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        if (!(has_prev_close && isfinite(prev_close))) {
+            prev_close = c; has_prev_close = true;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        const double tr_h  = fmax(prev_close, h);
+        const double tr_l  = fmin(prev_close, l);
+        const double tr_c  = tr_h - tr_l;
+        const double denom = (tr_c == 0.0) ? NEO_TMF_ZERO_RANGE_DIVISOR : tr_c;
+        const double adv   = v * (((c - tr_l) - (tr_h - c)) / denom);
+
+        /* vol_ma FIRST, then adv_ma — the CPU order (:677-678). */
+        if (!ema_v_init) { ema_v = v; ema_v_init = true; }
+        else             { ema_v = alpha * v + (1.0 - alpha) * ema_v; }
+        const double wm_v = ema_v;
+
+        if (!ema_a_init) { ema_a = adv; ema_a_init = true; }
+        else             { ema_a = alpha * adv + (1.0 - alpha) * ema_a; }
+        const double wm_a = ema_a;
+
+        double tmf;
+        if (wm_v == 0.0)                          tmf = 0.0;
+        else if (isfinite(wm_v) && isfinite(wm_a)) tmf = wm_a / wm_v;
+        else                                       tmf = NEO_F64_NAN;
+
+        prev_close = c;
+        o[i] = tmf;
+    }
+}

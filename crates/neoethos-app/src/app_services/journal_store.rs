@@ -49,6 +49,21 @@ pub struct ClosedTrade {
     /// unattributable mixed history and are hidden from per-account views.
     #[serde(default)]
     pub account_id: Option<String>,
+    /// The cTrader broker environment this fill was recorded under — `"Demo"`
+    /// or `"Live"` ([`neoethos_core::broker_config::CTraderBrokerEnvironment::as_str`]).
+    ///
+    /// **Added 2026-08-09.** The demo forward-test gate must count fills that
+    /// happened on a DEMO account, and nothing on this row could express that.
+    /// `account_id` was used as a proxy and it is the wrong one: the account
+    /// that is active while the gate runs is by definition the LIVE account, so
+    /// scoping demo fills to it counts zero, forever. This field is the fact
+    /// the gate actually needs.
+    ///
+    /// `None` on every row written before this date. Those rows are
+    /// unattributable to an environment and the gate EXCLUDES them — the same
+    /// fail-closed rule already applied to `account_id: None`.
+    #[serde(default)]
+    pub environment: Option<String>,
     pub entry_ts_ms: Option<i64>,
     pub entry_price: Option<f64>,
     pub exit_ts_ms: Option<i64>,
@@ -78,6 +93,9 @@ pub struct EquitySample {
     /// Account scope (see [`ClosedTrade::account_id`]).
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Broker environment scope (see [`ClosedTrade::environment`]).
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 /// The ACTIVE cTrader account id (stringified) — the same selection the
@@ -163,6 +181,8 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Vec<T> 
         }
     };
     let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut first_bad_line = 0usize;
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -171,6 +191,10 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Vec<T> 
         match serde_json::from_str::<T>(line) {
             Ok(v) => out.push(v),
             Err(e) => {
+                skipped += 1;
+                if first_bad_line == 0 {
+                    first_bad_line = idx + 1;
+                }
                 tracing::debug!(
                     target: "neoethos_app::journal_store",
                     error = %e, line_no = idx + 1,
@@ -178,6 +202,25 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Vec<T> 
                 );
             }
         }
+    }
+    // A dropped journal row is not cosmetic: the demo forward-test gate counts
+    // these rows to decide whether real money may be risked, and a per-line
+    // `debug!` is invisible at the level the app actually runs at. Report the
+    // total once, at WARN, so a truncated or corrupted journal cannot quietly
+    // shrink the evidence a money gate is judged on.
+    if skipped > 0 {
+        tracing::warn!(
+            target: "neoethos_app::journal_store",
+            path = %path.display(),
+            skipped_rows = skipped,
+            parsed_rows = out.len(),
+            first_bad_line,
+            "{skipped} malformed {label} journal row(s) DISCARDED — every metric \
+             derived from this file (including the demo forward-test gate's trade \
+             count) is computed on the {} rows that parsed. Re-run at \
+             RUST_LOG=debug for the per-line reason",
+            out.len()
+        );
     }
     out
 }
@@ -282,6 +325,7 @@ mod tests {
             net_profit: net,
             balance_after: None,
             account_id: None,
+            environment: None,
         }
     }
 

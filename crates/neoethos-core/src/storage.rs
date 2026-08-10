@@ -3,10 +3,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 pub mod json;
 
@@ -404,50 +402,3 @@ impl MetricsRecorder {
     }
 }
 
-/// Risk Event Ledger
-pub struct RiskLedger {
-    events: Arc<Mutex<VecDeque<RiskEvent>>>,
-    max_events: usize,
-}
-
-use crate::domain::events::RiskEvent;
-
-impl RiskLedger {
-    pub fn new(max_events: usize) -> Self {
-        Self {
-            events: Arc::new(Mutex::new(VecDeque::with_capacity(max_events))),
-            max_events,
-        }
-    }
-
-    pub fn record(
-        &self,
-        event_type: &str,
-        message: &str,
-        severity: &str,
-        context: Option<JsonValue>,
-    ) {
-        // F-099 migration site (2026-05-25): `RiskEvent::new` now takes
-        // the typed `RiskSeverity` enum. We parse the legacy `&str`
-        // severity via the lenient parser + default to `RiskSeverity::Info`
-        // when unrecognised (matches the previous behaviour where an
-        // unknown string would still be stored verbatim).
-        let parsed_severity = crate::domain::events::RiskSeverity::from_lenient(severity)
-            .unwrap_or(crate::domain::events::RiskSeverity::Info);
-        let event = RiskEvent::new(event_type, message, parsed_severity, context);
-
-        if let Ok(mut lock) = self.events.lock() {
-            if lock.len() >= self.max_events {
-                lock.pop_front();
-            }
-            lock.push_back(event);
-        }
-
-        // Log to system logger
-        match severity {
-            "warning" | "WARN" => warn!("Risk Event [{}]: {}", event_type, message),
-            "error" | "ERROR" => error!("Risk Event [{}]: {}", event_type, message),
-            _ => info!("Risk Event [{}]: {}", event_type, message),
-        }
-    }
-}

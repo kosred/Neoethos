@@ -263,3 +263,113 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — aroon (output "first" = aroon UP, index 0 of
+ * fallback_outputs &["first","second"], cuda_non_ma_generated.rs)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/aroon.rs:523 `aroon_scalar`.
+ *
+ * `aroon_scalar` has an all-finite FAST path and a NaN-tolerant SLOW path.
+ * They are PROVABLY the same function on finite input: with every bar finite
+ * the slow path's `invalid_count` is 0 at every bar, `have_extremes` is false
+ * exactly once (at i == length), and the seed scan and the incremental
+ * max/min updates are then identical statement for statement. Only the slow
+ * path is implemented here, so there is one code path to be right about
+ * instead of two to keep in step.
+ *
+ * `first_valid` is IGNORED: `aroon_scalar` starts at absolute index `length`
+ * and never reads `first`. Declared F64FirstValidRule::Ignored.
+ *
+ * `pair_is_finite` tests the EXPONENT FIELD, so it rejects infinities as well
+ * as NaN. `isfinite()` has the same meaning; a bare `!isnan()` would not.
+ *
+ * `aroon_percent` ends in `.max(0.0)` — f64::max, so a NaN distance would
+ * yield 0.0. It cannot be NaN here (it is an integer distance) but fmax is
+ * used anyway so the semantics do not depend on that staying true.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void aroon_neo_batch_f64(const double* __restrict__ high,
+                         const double* __restrict__ low,
+                         int series_len,
+                         const int* __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)first_valid;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int length = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (length < 1 || length > len) return;      // aroon_scalar asserts this range
+
+    const double scale_100 = 100.0 / (double)length;
+    const int window = length + 1;
+
+    int invalid_count = 0;
+    bool have_extremes = false;
+    int maxi = 0, mini = 0;
+    double mx = 0.0, mn = 0.0;
+
+    for (int i = 0; i < len; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        if (!(isfinite(h) && isfinite(l))) invalid_count += 1;
+        if (i >= window) {
+            const int leave = i - window;
+            if (!(isfinite(high[leave]) && isfinite(low[leave]))) invalid_count -= 1;
+        }
+
+        if (i < length) continue;
+
+        if (invalid_count != 0) {
+            o[i] = NEO_F64_NAN;
+            have_extremes = false;
+            continue;
+        }
+
+        const int start = i - length;
+
+        if (!have_extremes) {
+            maxi = start; mini = start;
+            mx = high[start]; mn = low[start];
+            for (int j = start + 1; j <= i; ++j) {
+                const double hv = high[j];
+                if (hv > mx) { mx = hv; maxi = j; }
+                const double lv = low[j];
+                if (lv < mn) { mn = lv; mini = j; }
+            }
+            have_extremes = true;
+        } else {
+            if (maxi < start) {
+                maxi = start; mx = high[maxi];
+                for (int j = start + 1; j <= i; ++j) {
+                    const double hv = high[j];
+                    if (hv > mx) { mx = hv; maxi = j; }
+                }
+            } else if (h > mx) { maxi = i; mx = h; }
+
+            if (mini < start) {
+                mini = start; mn = low[mini];
+                for (int j = start + 1; j <= i; ++j) {
+                    const double lv = low[j];
+                    if (lv < mn) { mn = lv; mini = j; }
+                }
+            } else if (l < mn) { mini = i; mn = l; }
+        }
+
+        const double dist_hi = (double)(i - maxi);
+        o[i] = fmax(100.0 - dist_hi * scale_100, 0.0);     // aroon UP
+    }
+}

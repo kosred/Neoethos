@@ -503,3 +503,85 @@ extern "C" __global__ void natr_many_series_one_param_f32(
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — natr
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/natr.rs:288 `natr_scalar`.
+ *
+ * THE BUG THE BRIEF NAMES, fixed here. The f32 kernels above carry
+ *     atr = (atr * pm1 + tr) * inv_p      // three roundings
+ * while the CPU carries
+ *     atr = (tr - atr).mul_add(inv_p, atr)   // ONE rounding
+ * Those are different numbers, and natr feeds a threshold comparison.
+ *
+ * NaN: `tr1.max(tr2).max(tr3)` is `f64::max`, which RETURNS THE NON-NaN
+ * OPERAND. An `a > b ? a : b` chain does the opposite — a comparison against
+ * NaN is false, so the NaN survives and poisons every later bar of the
+ * recurrence. `fmax` has f64::max's semantics; the chain does not.
+ *
+ * first_valid rule: natr.rs:226-235 takes fh.max(fl).max(fc) — the MAX of
+ * three INDEPENDENT first-non-NaN scans, NOT the first index at which all
+ * three are simultaneously non-NaN. Registered as HlcMaxOfIndependentFirsts.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void natr_neo_batch_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        const double* __restrict__ close,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warm_end = first_valid + period - 1;
+    for (int i = 0; i < warm_end && i < len; ++i) o[i] = NEO_F64_NAN;
+
+    const double inv_p = 1.0 / (double)period;
+    const double k100  = 100.0;
+
+    // natr.rs:307 — the FIRST bar's TR is the bare range, with no previous
+    // close. Seeding it as a three-way max against close[first-1] would read a
+    // bar the CPU never looks at.
+    double sum_tr = high[first_valid] - low[first_valid];
+    for (int i = first_valid + 1; i <= warm_end; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+        const double pc = close[i - 1];
+        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
+        sum_tr += tr;
+    }
+
+    double atr = sum_tr * inv_p;
+    const double c_we = close[warm_end];
+    o[warm_end] = (isfinite(c_we) && c_we != 0.0) ? (atr / c_we) * k100 : NEO_F64_NAN;
+
+    for (int idx = warm_end + 1; idx < len; ++idx) {
+        const double hi = high[idx];
+        const double lo = low[idx];
+        const double pc = close[idx - 1];
+        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
+        atr = fma(tr - atr, inv_p, atr);            // ONE rounding, as the CPU
+        const double cv = close[idx];
+        o[idx] = (isfinite(cv) && cv != 0.0) ? (atr / cv) * k100 : NEO_F64_NAN;
+    }
+}

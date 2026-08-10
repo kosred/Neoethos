@@ -73,7 +73,9 @@ fn run_wizard_tui_with_terminal_state(stdin_is_tty: bool) -> Result<()> {
     //   - symbols.rs   → "5 — Symbols" (two-pane multi-select)
     //   - historical.rs → "6 — History" (ratatui::Gauge)
     //   - hardware.rs  → "7 — Hardware" (card-style block)
-    //   - news_api.rs  → "8 — News" (masked input)
+    //   - (removed 2026-08-09) news_api.rs → "8 — News": the news API key had
+    //     no reader anywhere in the repo and its consumer type was deleted in
+    //     the D3 dead-code purge. Do not port this step.
     //   - autostart.rs → "9 — Autostart" (single toggle)
     //   - autonomy_risk.rs → "9.5 — Quiz + autonomy"
     //   - summary.rs   → "10 — Summary" (scrollable table)

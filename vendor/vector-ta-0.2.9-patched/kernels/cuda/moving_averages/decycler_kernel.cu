@@ -222,3 +222,109 @@ void decycler_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+// ============================================================================
+// f64 LANE — NeoEthos conversion, 2026-08-09
+// ----------------------------------------------------------------------------
+// CPU reference: src/indicators/decycler.rs:506 decycler_scalar
+//                src/indicators/decycler.rs:477 first = first non-NaN of source
+//                hp_period default 125, k default 0.707 (decycler.rs:224/228)
+//
+// THE WARP SCAN ABOVE IS THE THING BEING REPLACED, NOT PORTED.
+// `decycler_batch_warp_scan_f32` reformulates this 2-pole high-pass as an
+// associative scan so a warp can do it in log steps. That is a DIFFERENT
+// accumulation order for a recurrence whose output feeds a threshold
+// comparison, so it is forbidden here by construction: this kernel is ONE
+// THREAD PER COLUMN walking bars ascending, exactly as decycler_scalar does.
+//
+// THE FIVE-STEP FMA CHAIN IS THE SPECIFICATION. The CPU writes
+//   s0 = current * c;                       // 1 rounding
+//   s1 = x1.mul_add(-2.0 * c, s0);          // -2.0*c is a rounding, fma is one
+//   s2 = x2.mul_add(c, s1);                 // one
+//   s3 = hp_prev1.mul_add(2.0*one_minus_alpha, s2);
+//   hp = hp_prev2.mul_add(-one_minus_alpha_sq, s3);
+// Collapsing this into a single polynomial evaluation would be algebraically
+// identical and numerically different. Each step is reproduced as its own fma.
+//
+// EPSILON: `const EPSILON: f64 = 1e-10` with `EPSILON.copysign(cos_val)`
+// (decycler.rs:522) is an f64 constant from the f64 CPU source and is carried
+// over unchanged. The f32 kernel above has no such guard at all — it has
+// `__fmaf_rn` x4 and no cos protection — so this is a correction as well as a
+// conversion.
+//
+// WARMUP: `first + 2` (decycler.rs:515). The first two bars seed hp_prev2 and
+// hp_prev1 from the DATA, not from zero; the `hp_prev2 = 0.0` initialisers at
+// decycler.rs:517-518 are overwritten whenever the series is long enough, which
+// it always is here because `prepare` already required `len - first >= period`.
+//
+// SWEPT PARAMETER: `hp_period`. `k` stays 0.707.
+// ============================================================================
+
+#include "../neo_f64_common.cuh"
+
+extern "C" __global__ void neoethos_decycler_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* row = out + (size_t)r * (size_t)n;
+    const int hp_period = periods[r];
+
+    // decycler_with_kernel: hp_period < 2 || hp_period > len, len-first < period.
+    if (first_valid < 0 || first_valid >= n || hp_period < 2 || hp_period > n ||
+        (n - first_valid) < hp_period) {
+        neo_fill_all(row, n);
+        return;
+    }
+
+    const int warm = first_valid + 2;
+    neo_fill_warmup(row, n, warm);
+    if (warm >= n) return;
+
+    const double PI_D = 3.14159265358979323846;
+    const double k = 0.707;
+    const double angle = (2.0 * PI_D * k) * (1.0 / (double)hp_period);
+    double sin_val, cos_val;
+    sincos(angle, &sin_val, &cos_val);
+
+    const double EPSILON = 1e-10;
+    const double cos_safe = (fabs(cos_val) < EPSILON) ? copysign(EPSILON, cos_val) : cos_val;
+
+    const double alpha = 1.0 + ((sin_val - 1.0) / cos_safe);
+    const double one_minus_alpha_half = 1.0 - alpha / 2.0;
+    const double c = one_minus_alpha_half * one_minus_alpha_half;
+    const double one_minus_alpha = 1.0 - alpha;
+    const double one_minus_alpha_sq = one_minus_alpha * one_minus_alpha;
+
+    double hp_prev2 = data[first_valid];
+    double hp_prev1 = data[first_valid + 1];
+    double x2 = hp_prev2;
+    double x1 = hp_prev1;
+
+    const double m2c = -2.0 * c;
+    const double t2oma = 2.0 * one_minus_alpha;
+    const double moas = -one_minus_alpha_sq;
+
+    for (int i = first_valid + 2; i < n; ++i) {
+        const double current = data[i];
+
+        const double s0 = current * c;
+        const double s1 = fma(x1, m2c, s0);
+        const double s2 = fma(x2, c, s1);
+        const double s3 = fma(hp_prev1, t2oma, s2);
+        const double hp_val = fma(hp_prev2, moas, s3);
+
+        hp_prev2 = hp_prev1;
+        hp_prev1 = hp_val;
+        x2 = x1;
+        x1 = current;
+
+        row[i] = current - hp_val;
+    }
+}

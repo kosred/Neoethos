@@ -593,3 +593,142 @@ void ehlers_ecema_many_series_one_param_2d_f32(
         out_tm[idx_tm] = ec_val;
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — ehlers_ecema (Error-Correcting EMA)
+// ===========================================================================
+// Reference: src/indicators/moving_averages/ehlers_ecema.rs
+//   ehlers_ecema_prepare (:419)                        — first_valid, Err, alpha/beta
+//   ehlers_ecema_scalar_direct_into_with_mode (:823)   — the arithmetic
+// Defaults: length 20 (the SWEPT parameter, :246), gain_limit 50 (:251),
+// confirmed_only FALSE (:208). warmup_end = first + length - 1.
+//
+// THE SEED IS A RUNNING MEAN OVER VALID BARS, NOT AN SMA (:844-853):
+//     ema = ((vc - 1.0) * ema + x) / vc
+// with vc counting only FINITE samples. That is a different number from
+// sum/length whenever any bar in the seed window is non-finite, and it is a
+// different ROUNDING even when none is — divide-per-step, not divide-once.
+//
+// THE GAIN SEARCH IS AN INTEGER MINIMISATION, AND IT IS EXACT.
+// The CPU does not scan all 2*gain_limit+1 candidates: it computes the
+// continuous optimum k_cont = d/s, clamps, and compares only floor(k_cont) and
+// floor(k_cont)+1 by |d - s*k| — with `e0 <= e1` breaking ties toward the LOWER
+// k (:906). Reproduced exactly, including that tie direction; reversing it
+// changes the output whenever d sits exactly between two lattice points.
+//
+// THE DEGENERATE GUARD IS f64::MIN_POSITIVE, NOT AN EPSILON (:879):
+//     if !s.is_finite() || !d.is_finite() || s.abs() <= f64::MIN_POSITIVE { -gL }
+// f64::MIN_POSITIVE is 2.2250738585072014e-308 — the smallest NORMAL double,
+// not the smallest representable and not a tolerance. An f32 port cannot hold
+// it: FLT_MIN is 1.1754944e-38, 270 orders of magnitude larger, so the f32 lane
+// takes the -gL branch on subnormal-but-meaningful steps the reference handles.
+// DBL_MIN below is that exact constant.
+//
+// ROUNDING.
+//   ema     = beta.mul_add(ema, alpha * x)        — product then ONE fma
+//   base    = alpha.mul_add(ema, beta * prev_ec)  — same
+//   prev_ec = (k as f64).mul_add(s, base)         — ONE fma
+//
+// NON-FINITE BARS FREEZE THE EMA rather than poisoning it (:862-864), the same
+// polarity as wto. Transcribed.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_ECEMA_GAIN_LIMIT     50
+#define NEO_S3_ECEMA_CONFIRMED_ONLY 0
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_ehlers_ecema_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int length = periods[r];
+    const int gain_limit = NEO_S3_ECEMA_GAIN_LIMIT;
+    const bool confirmed_only = (NEO_S3_ECEMA_CONFIRMED_ONLY != 0);
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (length == 0) || (length > n) ||
+        ((n - first_valid) < length) ||
+        (gain_limit == 0);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int start_idx = first_valid + length - 1;   // == warmup_end
+    for (int i = 0; i < start_idx && i < n; ++i) row[i] = neo_s3_qnan();
+    if (start_idx >= n) return;
+
+    const double alpha = 2.0 / ((double)length + 1.0);
+    const double beta = 1.0 - alpha;
+
+    double ema = data[first_valid];
+    int valid_count = 1;
+    for (int i = first_valid + 1; i <= start_idx; ++i) {
+        const double x = data[i];
+        if (isfinite(x)) {
+            valid_count += 1;
+            const double vc = (double)valid_count;
+            ema = ((vc - 1.0) * ema + x) / vc;
+        }
+    }
+
+    const int gL = gain_limit;
+    const double step_s = 0.1;
+    double prev_ec = ema;
+
+    for (int i = start_idx; i < n; ++i) {
+        if (i > start_idx) {
+            const double x = data[i];
+            if (isfinite(x)) ema = fma(beta, ema, alpha * x);
+        }
+
+        const double src = (confirmed_only && i > 0) ? data[i - 1] : data[i];
+
+        const double delta = src - prev_ec;
+        const double c = alpha * delta;
+        const double base = fma(alpha, ema, beta * prev_ec);
+        const double d = src - base;
+        const double s = c * step_s;
+
+        int k_best;
+        // 2.2250738585072014e-308 == f64::MIN_POSITIVE (DBL_MIN)
+        if (!isfinite(s) || !isfinite(d) || fabs(s) <= 2.2250738585072014e-308) {
+            k_best = -gL;
+        } else {
+            const double k_cont = d / s;
+            if (k_cont <= (-(double)gL - 1.0)) {
+                k_best = -gL;
+            } else if (k_cont >= ((double)gL + 1.0)) {
+                k_best = gL;
+            } else {
+                int k0 = (int)floor(k_cont);
+                int k1 = k0 + 1;
+                if (k0 < -gL) k0 = -gL; else if (k0 > gL) k0 = gL;
+                if (k1 < -gL) k1 = -gL; else if (k1 > gL) k1 = gL;
+
+                const double e0 = fabs(d - s * (double)k0);
+                const double e1 = fabs(d - s * (double)k1);
+                k_best = (e0 <= e1) ? k0 : k1;   // ties go to the LOWER k
+            }
+        }
+
+        prev_ec = fma((double)k_best, s, base);
+        row[i] = prev_ec;
+    }
+}

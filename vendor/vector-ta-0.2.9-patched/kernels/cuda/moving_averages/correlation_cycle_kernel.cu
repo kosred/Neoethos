@@ -249,3 +249,242 @@ extern "C" __global__ void correlation_cycle_state_many_series_one_param_f32(
         out_state_tm[idx] = st;
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — correlation_cycle (real component)
+// ===========================================================================
+// Reference: src/indicators/correlation_cycle.rs
+//   correlation_cycle_with_kernel (:230)      — first_valid + Err branches
+//   correlation_cycle_compute_into (:565)     — the arithmetic
+//   correlation_cycle_window_sums (:494)      — the O(period) rebase
+// Batch defaults: period 20, threshold 9.0, source close.
+//
+// WHICH OUTPUT. Multi-output (real / imag / angle / state); compute_
+// correlation_cycle_batch maps "value" to REAL, so this kernel is the real
+// component.
+//
+// THE TRIG TABLES ARE RECOMPUTED, NOT ALLOCATED. cos_table[j] = cos(w*(j+1))
+// and sin_table[j] = -sin(w*(j+1)) are pure functions of j, so the two
+// period-length Vecs the CPU builds are replaced by evaluation at the point of
+// use. Same values, no device scratch.
+//
+// THE SEED SUMS GROUP BY FOUR, AND THE mul_add CHAIN NESTS RIGHT-TO-LEFT.
+//   sum_x2 = x0.mul_add(x0, x1.mul_add(x1, x2.mul_add(x2, x3.mul_add(x3, sum))))
+// That is FOUR fmas applied innermost-first — x3 is folded in before x0. A
+// left-to-right loop over the same four terms is a different association and a
+// different result. Reproduced exactly, including the scalar tail for the
+// remainder (:546).
+//
+// NaN IS ZEROED, NOT PROPAGATED. `if x != x { x = 0.0 }` (:518-529, :549) —
+// the reference substitutes zero for a NaN sample rather than poisoning the
+// window. Written as isnan() here, which has the same truth value.
+//
+// THE REBASE INTERVAL IS DATA-DEPENDENT (:669): 1 if ANY value from `first` on
+// is infinite, otherwise 256. That is not a performance knob — at interval 1
+// every bar is recomputed from the window and the incremental rotation is never
+// used, so the two settings produce different numbers. The scan is reproduced.
+//
+// THE COMPLEX ROTATION. Between rebases the CPU advances (sum_xc, sum_xs) by
+// multiplying by the unit phasor (z_re, z_im) = (cos w, -sin w):
+//   s        = sum_xc + dx
+//   next_xc  = z_re.mul_add(s, -z_im * sum_xs)
+//   next_xs  = z_im.mul_add(s,  z_re * sum_xs)
+// Two roundings each. This is an exact algebraic identity for the shifted
+// window, and it is also where drift accumulates — which is why the rebase
+// exists and why its period must be 256 exactly.
+//
+// ANGLE. a = atan(r/i) + asin(1.0), then to_degrees, then -180 if i_val > 0.
+// half_pi is spelled f64::asin(1.0) by the reference rather than a PI/2
+// literal; asin(1.0) is exactly PI/2 rounded, so the constant below is written
+// the same way. to_degrees multiplies by 180/PI as a single folded constant.
+//
+// TRIG PARITY CAVEAT, STATED RATHER THAN HIDDEN: CUDA's double sin/cos/atan are
+// specified to <= 2 ulp, glibc's are effectively correctly rounded. Every value
+// here is derived from those, so this kernel matches the reference to a few ulp
+// rather than bit-for-bit. That is a property of the transcendental library, not
+// of this transcription, and it cannot be removed by writing the arithmetic
+// differently.
+//
+// One thread per column.
+// ===========================================================================
+
+#define NEO_S3_CC_THRESHOLD 9.0
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+__device__ __forceinline__ double neo_s3_cc_cos(double w, int j) {
+    return cos(w * ((double)j + 1.0));
+}
+__device__ __forceinline__ double neo_s3_cc_sin(double w, int j) {
+    return -sin(w * ((double)j + 1.0));
+}
+
+// correlation_cycle_window_sums (:494) — 4-wide, right-nested fma chains.
+__device__ __forceinline__ void neo_s3_cc_window_sums(
+    const double* __restrict__ d, double w, int i, int period,
+    double* o_sx, double* o_sx2, double* o_sxc, double* o_sxs)
+{
+    double sum_x = 0.0, sum_x2 = 0.0, sum_xc = 0.0, sum_xs = 0.0;
+
+    int j = 0;
+    while (j + 4 <= period) {
+        const int idx0 = i - (j + 1);
+        const int idx1 = idx0 - 1;
+        const int idx2 = idx1 - 1;
+        const int idx3 = idx2 - 1;
+
+        double x0 = d[idx0]; if (isnan(x0)) x0 = 0.0;
+        double x1 = d[idx1]; if (isnan(x1)) x1 = 0.0;
+        double x2 = d[idx2]; if (isnan(x2)) x2 = 0.0;
+        double x3 = d[idx3]; if (isnan(x3)) x3 = 0.0;
+
+        const double c0 = neo_s3_cc_cos(w, j),     s0 = neo_s3_cc_sin(w, j);
+        const double c1 = neo_s3_cc_cos(w, j + 1), s1 = neo_s3_cc_sin(w, j + 1);
+        const double c2 = neo_s3_cc_cos(w, j + 2), s2 = neo_s3_cc_sin(w, j + 2);
+        const double c3 = neo_s3_cc_cos(w, j + 3), s3 = neo_s3_cc_sin(w, j + 3);
+
+        sum_x += x0 + x1 + x2 + x3;
+        sum_x2 = fma(x0, x0, fma(x1, x1, fma(x2, x2, fma(x3, x3, sum_x2))));
+        sum_xc = fma(x0, c0, fma(x1, c1, fma(x2, c2, fma(x3, c3, sum_xc))));
+        sum_xs = fma(x0, s0, fma(x1, s1, fma(x2, s2, fma(x3, s3, sum_xs))));
+        j += 4;
+    }
+    while (j < period) {
+        const int idx = i - (j + 1);
+        double x = d[idx]; if (isnan(x)) x = 0.0;
+        const double c = neo_s3_cc_cos(w, j);
+        const double s = neo_s3_cc_sin(w, j);
+        sum_x  += x;
+        sum_x2 = fma(x, x, sum_x2);
+        sum_xc = fma(x, c, sum_xc);
+        sum_xs = fma(x, s, sum_xs);
+        j += 1;
+    }
+
+    *o_sx = sum_x; *o_sx2 = sum_x2; *o_sxc = sum_xc; *o_sxs = sum_xs;
+}
+
+extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+
+    const double half_pi = asin(1.0);
+    const double two_pi  = 4.0 * asin(1.0);
+    const double nn = (double)period;
+    const double w  = two_pi / nn;
+
+    // Seed constants, in the CPU's 4-wide association (:591-645).
+    double sum_cos = 0.0, sum_sin = 0.0, sum_cos2 = 0.0, sum_sin2 = 0.0;
+    {
+        int j = 0;
+        while (j + 4 <= period) {
+            for (int q = 0; q < 4; ++q) {
+                const double c = neo_s3_cc_cos(w, j + q);
+                const double ys = neo_s3_cc_sin(w, j + q);
+                sum_cos += c;
+                sum_sin += ys;
+                sum_cos2 += c * c;
+                sum_sin2 += ys * ys;
+            }
+            j += 4;
+        }
+        while (j < period) {
+            const double c = neo_s3_cc_cos(w, j);
+            const double ys = neo_s3_cc_sin(w, j);
+            sum_cos += c;
+            sum_sin += ys;
+            sum_cos2 += c * c;
+            sum_sin2 += ys * ys;
+            j += 1;
+        }
+    }
+
+    const double t2_const = fma(nn, sum_cos2, -(sum_cos * sum_cos));
+    const double t4_const = fma(nn, sum_sin2, -(sum_sin * sum_sin));
+    const bool has_t2 = t2_const > 0.0;
+    const bool has_t4 = t4_const > 0.0;
+    const double sqrt_t2c = has_t2 ? sqrt(t2_const) : 0.0;
+    const double sqrt_t4c = has_t4 ? sqrt(t4_const) : 0.0;
+
+    const int start_ria = first_valid + period;
+    if (start_ria >= n) return;
+
+    int rebase_interval = 256;
+    for (int i = first_valid; i < n; ++i) {
+        if (isinf(data[i])) { rebase_interval = 1; break; }
+    }
+
+    const double z_re = neo_s3_cc_cos(w, 0);
+    const double z_im = neo_s3_cc_sin(w, 0);
+    int last_rebase = start_ria;
+
+    double sum_x, sum_x2, sum_xc, sum_xs;
+    neo_s3_cc_window_sums(data, w, start_ria, period, &sum_x, &sum_x2, &sum_xc, &sum_xs);
+
+    for (int i = start_ria; i < n; ++i) {
+        const double t1 = fma(nn, sum_x2, -(sum_x * sum_x));
+        double r_val = 0.0;
+        double i_val = 0.0;
+
+        if (t1 > 0.0) {
+            const double sqrt_t1 = sqrt(t1);
+            if (has_t2) {
+                const double denom = sqrt_t1 * sqrt_t2c;
+                if (denom > 0.0) r_val = fma(nn, sum_xc, -(sum_x * sum_cos)) / denom;
+            }
+            if (has_t4) {
+                const double denom = sqrt_t1 * sqrt_t4c;
+                if (denom > 0.0) i_val = fma(nn, sum_xs, -(sum_x * sum_sin)) / denom;
+            }
+        }
+
+        row[i] = r_val;
+        (void)half_pi;   // the angle/state outputs are not this entry point's
+
+        const int next_i = i + 1;
+        if (next_i < n) {
+            if (next_i - last_rebase >= rebase_interval) {
+                neo_s3_cc_window_sums(data, w, next_i, period,
+                                      &sum_x, &sum_x2, &sum_xc, &sum_xs);
+                last_rebase = next_i;
+            } else {
+                double x_new = data[i];
+                double x_old = data[i - period];
+                if (isnan(x_new)) x_new = 0.0;
+                if (isnan(x_old)) x_old = 0.0;
+                const double dx = x_new - x_old;
+                sum_x += dx;
+                sum_x2 += fma(x_new, x_new, -(x_old * x_old));
+                const double s = sum_xc + dx;
+                const double next_xc = fma(z_re, s, -z_im * sum_xs);
+                const double next_xs = fma(z_im, s,  z_re * sum_xs);
+                sum_xc = next_xc;
+                sum_xs = next_xs;
+            }
+        }
+    }
+}

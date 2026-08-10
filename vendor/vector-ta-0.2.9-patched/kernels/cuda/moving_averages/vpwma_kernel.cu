@@ -191,3 +191,114 @@ void vpwma_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `moving_averages/vpwma.rs::vpwma_scalar` (l.316), with the
+// weight construction at `vpwma.rs:268-277` and the CPU default `power = 0.382`
+// (`vpwma.rs:121`):
+//     win_len = period - 1
+//     w[k]    = (period - k)^power   for k in 0..win_len   (k as f64)
+//     norm    = sum of w, accumulated ASCENDING one at a time
+//     inv_norm= 1.0 / norm
+//     out[i]  = ((s0 + s1) + (s2 + s3)) * inv_norm  for i in (first+win_len)..n
+//
+// The dot product is FOUR independent accumulators, fed 8 taps per iteration
+// (s0 gets k+0 then k+4, s1 gets k+1 then k+5, ...), then a 4-wide tail, then
+// a 3/2/1 remainder, and only then combined as (s0+s1)+(s2+s3). Collapsing
+// that into a single accumulator -- which is what the f32 kernel did with one
+// acc and fmaf -- is a DIFFERENT summation tree and a different number. The
+// four-accumulator shape and each mul_add are reproduced literally as
+// s0 = fma(x, w, s0).
+//
+// f32 -> f64 audit: pointers/locals widened; fmaf -> fma; 0.0f -> 0.0;
+// VPWMA_NAN (__int_as_float(0x7fffffff)) -> the f64 quiet-NaN bit pattern;
+// no fast-math intrinsic; no epsilon in this indicator; no min/max chain.
+// Weights are derived ON THE DEVICE from period so the kernel cannot be fed a
+// weight table that disagrees with the CPU, and pow is the IEEE double pow,
+// never powf or __powf.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double vpwma_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void vpwma_batch_f64(const double* __restrict__ prices,
+                     int n,
+                     const int*   __restrict__ periods,
+                     int n_combos,
+                     int first_valid,
+                     double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = vpwma_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const int win_len = period - 1;
+    const long long warm_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(win_len);
+    if (period <= 1 || warm_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int warm = static_cast<int>(warm_ll);
+
+    const double power = 0.382;                       // vpwma.rs:121 default
+    const double pd = static_cast<double>(period);
+
+    double norm = 0.0;
+    for (int k = 0; k < win_len; ++k) {
+        norm += pow(pd - static_cast<double>(k), power);
+    }
+    const double inv_norm = 1.0 / norm;
+
+    for (int t = 0; t < warm; ++t) row[t] = nan_d;
+
+    const int p8 = win_len & ~7;
+    const int p4 = win_len & ~3;
+
+    for (int i = warm; i < n; ++i) {
+        double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+
+        int k = 0;
+        while (k < p8) {
+            s0 = fma(prices[i - (k + 0)], pow(pd - static_cast<double>(k + 0), power), s0);
+            s1 = fma(prices[i - (k + 1)], pow(pd - static_cast<double>(k + 1), power), s1);
+            s2 = fma(prices[i - (k + 2)], pow(pd - static_cast<double>(k + 2), power), s2);
+            s3 = fma(prices[i - (k + 3)], pow(pd - static_cast<double>(k + 3), power), s3);
+
+            s0 = fma(prices[i - (k + 4)], pow(pd - static_cast<double>(k + 4), power), s0);
+            s1 = fma(prices[i - (k + 5)], pow(pd - static_cast<double>(k + 5), power), s1);
+            s2 = fma(prices[i - (k + 6)], pow(pd - static_cast<double>(k + 6), power), s2);
+            s3 = fma(prices[i - (k + 7)], pow(pd - static_cast<double>(k + 7), power), s3);
+            k += 8;
+        }
+        while (k < p4) {
+            s0 = fma(prices[i - (k + 0)], pow(pd - static_cast<double>(k + 0), power), s0);
+            s1 = fma(prices[i - (k + 1)], pow(pd - static_cast<double>(k + 1), power), s1);
+            s2 = fma(prices[i - (k + 2)], pow(pd - static_cast<double>(k + 2), power), s2);
+            s3 = fma(prices[i - (k + 3)], pow(pd - static_cast<double>(k + 3), power), s3);
+            k += 4;
+        }
+        const int rem = win_len - k;
+        if (rem == 3) {
+            s0 = fma(prices[i - (k + 0)], pow(pd - static_cast<double>(k + 0), power), s0);
+            s1 = fma(prices[i - (k + 1)], pow(pd - static_cast<double>(k + 1), power), s1);
+            s2 = fma(prices[i - (k + 2)], pow(pd - static_cast<double>(k + 2), power), s2);
+        } else if (rem == 2) {
+            s0 = fma(prices[i - (k + 0)], pow(pd - static_cast<double>(k + 0), power), s0);
+            s1 = fma(prices[i - (k + 1)], pow(pd - static_cast<double>(k + 1), power), s1);
+        } else if (rem == 1) {
+            s0 = fma(prices[i - (k + 0)], pow(pd - static_cast<double>(k + 0), power), s0);
+        }
+
+        const double sum = (s0 + s1) + (s2 + s3);
+        row[i] = sum * inv_norm;
+    }
+}

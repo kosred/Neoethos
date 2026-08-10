@@ -171,3 +171,186 @@ void apo_many_series_one_param_f32(const float* __restrict__ prices_tm,
         out_tm[t * stride + series_idx] = se - le;
     }
 }
+
+
+// =============================================================================
+// NeoEthos f64 lane — added in place, f64 end to end.
+//
+// CPU reference: src/indicators/apo.rs
+//   * `apo_prepare`  (:209) — first_valid = first non-NaN of the source series.
+//   * `apo_with_kernel` (:278) — warmup prefix is `first`, NOT first + long.
+//   * `apo_scalar`   (:311) — the arithmetic this reproduces.
+//
+// PERIOD-INVARIANT. `compute_apo_batch` (cpu_batch.rs:3374) reads
+// `short_period` (default 10) and `long_period` (default 20) and NEVER reads
+// `period`, so a period sweep produces identical rows on the CPU and must
+// produce identical rows here. The defaults are baked in for the same reason
+// `neoethos_tsi_batch_f64` bakes in 25/13.
+//
+// ROUNDING COUNT. The CPU line is
+//     se = alpha_s * p0 + oma_s * se;
+// — TWO multiplies and ONE add, three roundings, and it is NOT `mul_add`.
+// Reproduced literally; `-fmad=false` on this translation unit is what stops
+// nvcc contracting the multiply-add behind our back and silently producing a
+// DIFFERENT number from the CPU.
+//
+// The CPU unrolls the loop two bars at a time (`while i + 1 < n`) plus a tail.
+// Unrolling does not change the accumulation order, so a single ascending loop
+// is bit-identical.
+//
+// Sequential: `se`/`le` carry across bars. One thread per column.
+// =============================================================================
+
+__device__ __forceinline__ double nef_qnan_apo() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+#define NEF_APO_SHORT 10
+#define NEF_APO_LONG  20
+
+extern "C" __global__
+void neoethos_apo_f64(const double* __restrict__ prices,
+                      int n,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;  // PERIOD-INVARIANT: see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const double QNAN = nef_qnan_apo();
+
+    if (n <= 0) return;
+    if (first_valid < 0 || first_valid >= n) {
+        for (int i = 0; i < n; ++i) row[i] = QNAN;
+        return;
+    }
+
+    // warmup prefix = first_valid (apo.rs:281 `let warmup_period = first;`)
+    for (int i = 0; i < first_valid; ++i) row[i] = QNAN;
+
+    const double alpha_s = 2.0 / ((double)NEF_APO_SHORT + 1.0);
+    const double alpha_l = 2.0 / ((double)NEF_APO_LONG + 1.0);
+    const double oma_s = 1.0 - alpha_s;
+    const double oma_l = 1.0 - alpha_l;
+
+    double se = prices[first_valid];
+    double le = se;
+    row[first_valid] = 0.0;
+
+    for (int i = first_valid + 1; i < n; ++i) {
+        const double p = prices[i];
+        se = alpha_s * p + oma_s * se;
+        le = alpha_l * p + oma_l * le;
+        row[i] = se - le;
+    }
+}
+
+
+// ===========================================================================
+// S1 f64 LANE  --  apo
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/apo.rs -- `apo_scalar` (:311), `apo_prepare` (:209), `apo_with_kernel` (:278)
+//
+// PERIOD-INVARIANT. `compute_apo_batch` (cpu_batch.rs:3357) reads
+// `short_period` (default 10) and `long_period` (default 20) and NEVER reads
+// `period`, so every row of a period sweep is byte-identical -- exactly as
+// `tsi`/`obv` already are in this lane. The swept `periods[r]` is deliberately
+// not consulted; consulting it would compute something the CPU never computes.
+//
+// ARITHMETIC ORDER: the CPU line is `se = alpha_s * p0 + oma_s * se` -- two
+// multiplies and one add, THREE roundings, and NO `mul_add`. It is reproduced
+// literally; an `fma` here would be one rounding and a different number. The
+// CPU's two-at-a-time unroll is reproduced too: it does not change the order
+// (bar i is folded before bar i+1 either way) but keeping it makes the tail
+// (`if i < n`) match, so no bar is written twice or missed.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first)` -- NaN strictly BEFORE
+// first_valid, and `out[first] = 0.0`, not NaN. `apo_prepare` additionally
+// forces `Kernel::Scalar` for `Auto` even when `nightly-avx` is on
+// (apo.rs:238-246), so `apo_scalar` is the ONLY CPU answer on any host and
+// there is no scalar/AVX disagreement to settle for this indicator.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_apo_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    // `ApoParams::default()` -- apo.rs:73-74.
+    const int short_p = 10;
+    const int long_p  = 20;
+    (void)periods;
+
+    // Every branch of `apo_prepare` that returns Err, in its order.
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (short_p == 0) || (long_p == 0) ||
+        (short_p >= long_p) ||
+        ((n - first_valid) < long_p);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const double alpha_s = 2.0 / ((double)short_p + 1.0);
+    const double alpha_l = 2.0 / ((double)long_p + 1.0);
+    const double oma_s = 1.0 - alpha_s;
+    const double oma_l = 1.0 - alpha_l;
+
+    for (int i = 0; i < first_valid; ++i) row[i] = neo_s1_qnan();
+
+    double se = prices[first_valid];
+    double le = se;
+    row[first_valid] = 0.0;
+
+    int i = first_valid + 1;
+    while (i + 1 < n) {
+        const double p0 = prices[i];
+        se = alpha_s * p0 + oma_s * se;
+        le = alpha_l * p0 + oma_l * le;
+        row[i] = se - le;
+
+        const double p1 = prices[i + 1];
+        se = alpha_s * p1 + oma_s * se;
+        le = alpha_l * p1 + oma_l * le;
+        row[i + 1] = se - le;
+
+        i += 2;
+    }
+    if (i < n) {
+        const double p = prices[i];
+        se = alpha_s * p + oma_s * se;
+        le = alpha_l * p + oma_l * le;
+        row[i] = se - le;
+    }
+}

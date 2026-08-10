@@ -254,3 +254,78 @@ extern "C" __global__ void stddev_many_series_one_param_f32(
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — stddev
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/stddev.rs:359 `stddev_scalar`, which for the
+ * DEFAULT nbdev (1.0, stddev.rs:115 / :527) delegates to
+ * `stddev_scalar_nbdev1` (stddev.rs:417). Our lane sweeps `period` with
+ * default params, so nbdev is 1.0 and the two paths are bit-identical anyway
+ * (`x * 1.0 == x`).
+ *
+ * SUM OF SQUARES, NOT WELFORD. The CPU keeps `sum` and `sum_sqr` and forms
+ * `var = sum_sqr*inv - mean*mean`, then clamps `var <= 0 -> 0`. That
+ * cancellation is numerically poor and IS THE REFERENCE; replacing it with a
+ * stable two-pass or Welford update would produce a different number, which is
+ * the failure this lane exists to prevent.
+ *
+ * The rolling update is `sum_sqr += new*new - old*old` — ONE add of a
+ * difference, not two separate updates. Reproduced literally.
+ *
+ * `__int_as_float(0x7f...)` x4 in the f32 file is an f32 NaN bit pattern.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void stddev_neo_batch_f64(const double* __restrict__ data,
+                          int series_len,
+                          const int* __restrict__ periods,
+                          int n_combos,
+                          int first_valid,
+                          double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) < period) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int idx0 = first_valid + period - 1;      // stddev.rs:253 warmup
+    for (int i = 0; i < idx0 && i < len; ++i) o[i] = NEO_F64_NAN;
+
+    const double inv_den = 1.0 / (double)period;
+
+    double sum = 0.0, sum_sqr = 0.0;
+    for (int i = first_valid; i < first_valid + period; ++i) {
+        const double v = data[i];
+        sum     += v;
+        sum_sqr += v * v;
+    }
+
+    const double mean0 = sum * inv_den;
+    const double var0  = (sum_sqr * inv_den) - (mean0 * mean0);
+    o[idx0] = (var0 <= 0.0) ? 0.0 : sqrt(var0);
+
+    for (int i = idx0 + 1; i < len; ++i) {
+        const double old_v = data[i - period];
+        const double new_v = data[i];
+        sum     += new_v - old_v;
+        sum_sqr += new_v * new_v - old_v * old_v;
+
+        const double mean = sum * inv_den;
+        const double var  = (sum_sqr * inv_den) - (mean * mean);
+        o[i] = (var <= 0.0) ? 0.0 : sqrt(var);
+    }
+}

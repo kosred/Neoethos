@@ -220,3 +220,143 @@ extern "C" __global__ void dec_osc_many_series_one_param_time_major_f32(
         x1 = d0;
     }
 }
+
+// ===========================================================================
+// f64 LANE  --  shard S6
+//
+// THIS SECTION BELONGS IN THIS FILE AND NOWHERE ELSE. It was first written
+// into a NEW `kernels/cuda/dec_osc_kernel.cu` at the kernels root, which
+// `build.rs` has no `compile_kernel` call for -- build.rs:1364 compiles THIS
+// file to `dec_osc_kernel.ptx`. The root file therefore produced no PTX, and
+// `F64Kernel::DecOsc` resolved to a module that never contained its symbol:
+// a `MissingKernelSymbol` at launch, not at build. The root file is deleted;
+// keep the f64 entry point beside the f32 ones it shares a translation unit
+// with, which is also what `F64_LANE_SOURCES` (build.rs:224) already covers,
+// so this whole TU builds WITHOUT `--use_fast_math`.
+//
+// CPU reference: `dec_osc_scalar` (src/indicators/dec_osc.rs:352).
+// `dec_osc_avx2` (:422) delegates to it verbatim, and `dec_osc_prepare` pins
+// `Kernel::Auto -> Kernel::Scalar` (:268-271): one CPU answer, no association
+// to settle.
+//
+// first_valid: `data.iter().position(|x| !x.is_nan())` (:244-246) over the
+// single source series (default "close", :117) ->
+// `F64FirstValidRule::AllInputsNonNan`.
+//
+// warm: the CPU writes NaN at `first` and `first + 1` explicitly (:386-387)
+// and the emit loop starts at `first + 2` (:398). The swept `periods` value is
+// `hp_period` (:120-122); `k` keeps its default of 1.0 (:124-126), so
+// `scale = 100.0 * 1.0`.
+//
+// TWO CASCADED 2-POLE IIR FILTERS -- ONE THREAD PER COLUMN, ascending bars.
+// Five scalars are carried across bars (hp_prev_1/2, decosc_prev_1/2,
+// dec_prev_1/2 plus the x1/x2 price lags). This is exactly the shape the brief
+// calls a serial recurrence: it is NOT bar-parallel and it must NOT be turned
+// into a matrix-power scan, because the scan reassociates
+// `c*dx + 2*oma*y1 - oma^2*y2` and moves the last bits of every subsequent bar.
+//
+// THE FILTER COEFFICIENTS ARE COMPUTED ONCE PER THREAD, IN THE CPU'S ORDER.
+// :366-382 -- `angle = 2*PI*0.707/p`, `sin_cos`, `alpha = 1 + (sin-1)/cos`,
+// `t = 1 - alpha*0.5`, `c = t*t`, `oma = 1-alpha`, `two_oma = oma+oma` (an
+// ADDITION, not `2.0*oma`), `oma_sq = oma*oma`. Every one of those is
+// reproduced as written: `two_oma = oma + oma` is exact either way, but the
+// point of copying the expression is that nothing here is re-derived.
+// `sincos()` is CUDA's correctly-rounded pair, matching `f64::sin_cos`.
+// PI is the f64 `std::f64::consts::PI`, written to full f64 precision -- NOT
+// an f32-width decimal, which is the classic silent constant loss when an f32
+// kernel is widened.
+//
+// f32 -> f64 audit: the f32 lane above uses `fmaxf`. Below there is no
+// f32-suffixed function, no f32 literal and no fast-math intrinsic --
+// `__fdividef`, `__sinf` and friends are exactly what would destroy the
+// coefficient derivation here, because `(sin1 - 1.0) / cos1` is a
+// cancellation-sensitive expression whose error is amplified by the recursion.
+// This indicator has no epsilon and no min/max chain; the final division by
+// `d0` is left unguarded exactly as :408 leaves it.
+// ===========================================================================
+
+static __device__ __forceinline__ double dec_osc_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void dec_osc_batch_f64(const double* __restrict__ data,
+                       int n,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = dec_osc_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const int first  = (first_valid < 0) ? 0 : first_valid;
+
+    for (int t = 0; t < n; ++t) row[t] = nan_d;
+
+    // `dec_osc_prepare` rejects period < 3, period > len and len - first < 2.
+    if (period < 3 || period > n || first >= n || (n - first) < 2) return;
+    if (first + 1 >= n) return;                              // :359
+
+    const double PI_F64 = 3.14159265358979323846264338327950288;
+    const double p      = static_cast<double>(period);
+    const double half_p = p * 0.5;                           // :364
+
+    const double angle1 = 2.0 * PI_F64 * 0.707 / p;          // :366
+    double sin1, cos1;
+    sincos(angle1, &sin1, &cos1);                            // :367
+    const double alpha1   = 1.0 + ((sin1 - 1.0) / cos1);     // :368
+    const double t1       = 1.0 - alpha1 * 0.5;              // :369
+    const double c1       = t1 * t1;                         // :370
+    const double oma1     = 1.0 - alpha1;                    // :371
+    const double two_oma1 = oma1 + oma1;                     // :372
+    const double oma1_sq  = oma1 * oma1;                     // :373
+
+    const double angle2 = 2.0 * PI_F64 * 0.707 / half_p;     // :375
+    double sin2, cos2;
+    sincos(angle2, &sin2, &cos2);                            // :376
+    const double alpha2   = 1.0 + ((sin2 - 1.0) / cos2);     // :377
+    const double t2       = 1.0 - alpha2 * 0.5;              // :378
+    const double c2       = t2 * t2;                         // :379
+    const double oma2     = 1.0 - alpha2;                    // :380
+    const double two_oma2 = oma2 + oma2;                     // :381
+    const double oma2_sq  = oma2 * oma2;                     // :382
+
+    const double scale = 100.0 * 1.0;                        // :384, k defaults to 1.0
+
+    // :389-396
+    double x2 = data[first];
+    double x1 = data[first + 1];
+    double hp_prev_2 = x2;
+    double hp_prev_1 = x1;
+    double decosc_prev_2 = 0.0;
+    double decosc_prev_1 = 0.0;
+    double dec_prev_2 = x2 - hp_prev_2;
+    double dec_prev_1 = x1 - hp_prev_1;
+
+    for (int i = first + 2; i < n; ++i) {                    // :398-418
+        const double d0 = data[i];
+
+        const double dx  = d0 - 2.0 * x1 + x2;
+        const double hp0 = c1 * dx + two_oma1 * hp_prev_1 - oma1_sq * hp_prev_2;
+
+        const double dec   = d0 - hp0;
+        const double decdx = dec - 2.0 * dec_prev_1 + dec_prev_2;
+        const double osc0  = c2 * decdx + two_oma2 * decosc_prev_1 - oma2_sq * decosc_prev_2;
+
+        row[i] = scale * osc0 / d0;
+
+        hp_prev_2 = hp_prev_1;
+        hp_prev_1 = hp0;
+        decosc_prev_2 = decosc_prev_1;
+        decosc_prev_1 = osc0;
+        dec_prev_2 = dec_prev_1;
+        dec_prev_1 = dec;
+        x2 = x1;
+        x1 = d0;
+    }
+}

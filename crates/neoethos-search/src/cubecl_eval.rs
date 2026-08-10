@@ -200,7 +200,16 @@ pub(crate) fn cubecl_transfer_telemetry_snapshot() -> CubeClTransferTelemetry {
     transfer_telemetry::snapshot()
 }
 
-// ─── F-CORE3 consolidation — CUDA env-var registry ──────────────────
+// ─── CUDA lane knobs — RETIRED 2026-08-10 ───────────────────────────
+//
+// This registry no longer reads the environment at all: `CudaEnvKnobs
+// ::typed_defaults()` returns the values the lane always had with nothing
+// exported. The struct and its name are kept because `execution_profile.rs`
+// records them into the run profile, and because the profile must go on
+// reporting what the lane used.
+//
+// The history below is left because it names the six variables, which is what
+// a reader looking for a deleted knob will search for.
 //
 // **2026-05-25**: the 7 inline `std::env::var(...)` reads previously
 // scattered across `requested_eval_precision`, `cuda_eval_signal_kernel_enabled`,
@@ -245,27 +254,26 @@ struct CudaEnvKnobs {
 }
 
 impl CudaEnvKnobs {
-    fn from_env() -> Self {
+    /// The typed lane settings. 2026-08-10: every field used to come from an
+    /// env var; each is now the value the lane always had when nothing was
+    /// exported, so an unset shell and a set shell finally produce the same
+    /// run.
+    ///
+    /// WHAT THIS REFUSES that it previously permitted: turning a kernel off,
+    /// hand-picking launch units, pinning a CUDA ordinal, and asking for f64
+    /// on the cubecl lane — all by exporting a variable nothing recorded. The
+    /// device ordinal survives as the explicit `device_override` argument the
+    /// multi-GPU scheduler passes per lane, which is the supported path; the
+    /// precision selection is a compiled-lane question (prototype B is the f64
+    /// engine) and a config field for it is routed to `config.rs`.
+    const fn typed_defaults() -> Self {
         Self {
-            requested_precision: read_requested_precision_from_env(),
-            eval_kernel_enabled: read_kernel_enabled_from_env(
-                "NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL",
-            ),
-            backtest_kernel_enabled: read_kernel_enabled_from_env(
-                "NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
-            ),
-            eval_kernel_units_override: read_kernel_units_from_env(
-                "NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS",
-            ),
-            // Backtest units fall back to eval units when the explicit
-            // backtest knob is unset — preserves the original semantics
-            // (`signal_kernel_units` and `backtest_kernel_units` both
-            // honoured EVAL_KERNEL_UNITS as the umbrella default).
-            backtest_kernel_units_override: read_kernel_units_from_env(
-                "NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
-            )
-            .or_else(|| read_kernel_units_from_env("NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS")),
-            cuda_device_id: read_cuda_device_id_from_env(),
+            requested_precision: TrainingPrecision::Fp32,
+            eval_kernel_enabled: true,
+            backtest_kernel_enabled: true,
+            eval_kernel_units_override: None,
+            backtest_kernel_units_override: None,
+            cuda_device_id: 0,
         }
     }
 }
@@ -273,7 +281,7 @@ impl CudaEnvKnobs {
 static CUDA_ENV_KNOBS: OnceLock<CudaEnvKnobs> = OnceLock::new();
 
 fn cuda_env_knobs() -> CudaEnvKnobs {
-    *CUDA_ENV_KNOBS.get_or_init(CudaEnvKnobs::from_env)
+    *CUDA_ENV_KNOBS.get_or_init(CudaEnvKnobs::typed_defaults)
 }
 
 // ─── GPU per-call timing instrumentation (NEOETHOS_GPU_TIMING) ───────
@@ -297,10 +305,18 @@ mod gpu_timing {
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
-    /// Cached once: is `NEOETHOS_GPU_TIMING` set? Checked at most once per process.
+    /// Cached once: is the per-call GPU timing breakdown wanted?
+    ///
+    /// 2026-08-10: was `env::var("NEOETHOS_GPU_TIMING").is_ok()`. A diagnostic
+    /// that only prints is not a knob that deserves its own environment
+    /// variable — it is a log level. It now follows the process log filter,
+    /// which IS config (`log.level`), so turning it on is the same gesture as
+    /// turning any other diagnostic on and nothing has to be remembered.
     fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("NEOETHOS_GPU_TIMING").is_ok())
+        *ENABLED.get_or_init(
+            || tracing::enabled!(target: "neoethos_search::gpu_timing", tracing::Level::DEBUG),
+        )
     }
 
     /// The phases a population eval splits into. `upload` / `kernel` / `readback`
@@ -522,57 +538,12 @@ mod resident_device_cache {
     pub(super) const SLOT_DAY_IDX: u8 = 7;
 }
 
-fn read_requested_precision_from_env() -> TrainingPrecision {
-    [
-        "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
-        "NEOETHOS_BOT_TRAIN_PRECISION",
-        "FOREX_TRAIN_PRECISION",
-    ]
-    .iter()
-    .find_map(|key| std::env::var(key).ok())
-    .and_then(|value| parse_training_precision(&value))
-    .unwrap_or(TrainingPrecision::Fp32)
-}
-
-fn read_kernel_enabled_from_env(name: &str) -> bool {
-    !matches!(
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    )
-}
-
-fn read_kernel_units_from_env(name: &str) -> Option<u32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-}
-
-fn read_cuda_device_id_from_env() -> usize {
-    match std::env::var("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE") {
-        // Not set: pick device 0 silently — the canonical default.
-        Err(_) => 0,
-        Ok(raw) => match raw.trim().parse::<usize>() {
-            Ok(value) => value,
-            Err(_) => {
-                // The user explicitly set the env var but it did not
-                // parse as a usize ("auto", "all", "GPU0" — typos like
-                // these used to silently fall back to device 0,
-                // running the search on the wrong card without telling
-                // anyone. Now we shout, then default.
-                tracing::warn!(
-                    target: "neoethos_search::gpu",
-                    raw = %raw,
-                    "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
-                     non-negative integer; falling back to device 0."
-                );
-                0
-            }
-        },
-    }
-}
+// The six `read_*_from_env` helpers that used to live here were DELETED
+// 2026-08-10 with the rest of the env layer. What each of them decided, and
+// what decides it now, is the `RETIRED_ENV_VARS` table in `execution_profile
+// .rs` — including the loud startup report when one is still exported.
+//
+// `parse_training_precision` went with them — see the note at its old site.
 
 /// Create a `ComputeClient` for the active GPU runtime. The concrete runtime is
 /// chosen at COMPILE time by the GPU feature flag — CUDA under `gpu-cuda`,
@@ -642,27 +613,14 @@ pub(crate) fn create_gpu_client(
 /// `wgpu` (naga → SPIR-V) path, NOT `wgpu-spirv`: the direct SPIR-V passthrough
 /// crashes AMD's Vulkan driver, so naga emits validated SPIR-V.
 ///
-/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<kind>:<n>` pins this process to the
-/// class-specific adapter ordinal reported by the hardware probe, e.g.
-/// `integrated:0` or `discrete:1`. A bare integer remains a backwards-compatible
-/// discrete selector. Unset ⇒ `DefaultDevice`.
-#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-fn parse_wgpu_device_selector(raw: &str) -> Option<WgpuDevice> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    if let Ok(index) = normalized.parse::<usize>() {
-        return Some(WgpuDevice::DiscreteGpu(index));
-    }
-    let (kind, raw_index) = normalized.split_once(':')?;
-    let index = raw_index.parse::<usize>().ok()?;
-    match kind {
-        "discrete" | "dgpu" => Some(WgpuDevice::DiscreteGpu(index)),
-        "integrated" | "igpu" => Some(WgpuDevice::IntegratedGpu(index)),
-        "virtual" | "vgpu" => Some(WgpuDevice::VirtualGpu(index)),
-        "default" => Some(WgpuDevice::DefaultDevice),
-        _ => None,
-    }
-}
-
+/// Device selection comes from the `device_override` the multi-GPU scheduler
+/// passes per lane. `None` ⇒ `DefaultDevice`.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<kind>:<n>` used to pin
+/// the adapter class here, and `parse_wgpu_device_selector` went with it. It
+/// was a second, invisible device decision sitting beside the argument the
+/// scheduler already passes — the shape that let a run use a different card
+/// from the one the log named.
 #[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
 pub(crate) fn create_gpu_client(
     device_override: Option<usize>,
@@ -675,12 +633,8 @@ pub(crate) fn create_gpu_client(
     // Experimental multi-GPU sharding passes a discrete `device_override` per
     // lane. The supported scheduler path uses the typed singular selector so
     // integrated and virtual adapters are pinned to the right CubeCL variant.
-    let env_device = std::env::var("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE")
-        .ok()
-        .and_then(|value| parse_wgpu_device_selector(&value));
     let base_device = device_override
         .map(WgpuDevice::DiscreteGpu)
-        .or(env_device)
         .unwrap_or(WgpuDevice::DefaultDevice);
 
     // AREA 1 (2026-06-09): initialize the wgpu server for this device EXACTLY ONCE,
@@ -1763,16 +1717,13 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
     (mean, std)
 }
 
-fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "fp32" | "f32" | "float32" => Some(TrainingPrecision::Fp32),
-        "fp16" | "f16" | "float16" | "half" => Some(TrainingPrecision::Fp16),
-        "bf16" | "bfloat16" => Some(TrainingPrecision::Bf16),
-        "fp8" | "float8" => Some(TrainingPrecision::Fp8),
-        "bf4" => Some(TrainingPrecision::Bf4),
-        _ => None,
-    }
-}
+// `parse_training_precision` DELETED 2026-08-10 with its only caller, the
+// `NEOETHOS_BOT_SEARCH_EVAL_PRECISION` / `_TRAIN_PRECISION` /
+// `FOREX_TRAIN_PRECISION` reader. It parsed a string nothing produces any
+// more. Restore it verbatim when the routed
+// `models.search_runtime.eval_precision` config field lands — the accepted
+// spellings were fp32/f32/float32, fp16/f16/float16/half, bf16/bfloat16,
+// fp8/float8, bf4.
 
 fn requested_eval_precision() -> TrainingPrecision {
     // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
@@ -1817,15 +1768,12 @@ pub(crate) fn cuda_eval_backtest_kernel_enabled() -> bool {
 /// APU, or after a driver/kernel change) — that forces the normal hybrid path,
 /// which still measures and demotes as usual.
 pub(crate) fn integrated_gpu_eval_disabled() -> bool {
-    if matches!(
-        std::env::var("NEOETHOS_BOT_SEARCH_USE_IGPU")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("1") | Some("true") | Some("on") | Some("TRUE") | Some("On")
-    ) {
-        return false;
-    }
+    // 2026-08-10: `NEOETHOS_BOT_SEARCH_USE_IGPU=1` used to force the hybrid
+    // path back on. It is gone. An integrated GPU is something the probe
+    // DETECTS, not something a shell declares, and the measurement that closed
+    // this (2026-07-24, real M5 EURUSD on a Ryzen 5 5675U APU) was a net loss
+    // plus OOM every generation. Re-measuring a strong APU is a code change
+    // with a number attached, not an export.
     auto_tune_memory_budgets();
     let disabled = installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0);
     if disabled {
@@ -2259,44 +2207,58 @@ pub fn auto_tune_memory_budgets() {
 /// Maximum elements (i32/f32 = 4 B) a single storage buffer may hold so it stays
 /// under the device's real per-buffer limit.
 ///
-/// Resolution order (bytes):
-///   1. `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB` env override — a manual CEILING,
-///      `min`'d with the probed cap so a user can only ever LOWER it, never blow
-///      past the device's true limit.
-///   2. The device-probed cap installed at first client build
-///      (`GPU_BUFFER_CAP_BYTES`, set by `create_gpu_client`).
-///   3. A startup-budget value (only if the budget still carries a non-zero
-///      `gpu_buffer_mb`; today the auto-tuner sets it to 0 = "probe at build").
-///   4. The 120MB floor — used only before any client exists (e.g. unit code that
-///      computes a window size without a GPU).
+/// Resolution order (bytes) — 2026-08-10, after the env override was deleted:
+///   1. The device-probed cap installed at first client build
+///      (`GPU_BUFFER_CAP_BYTES`, set by `create_gpu_client`), bounded by a
+///      non-zero startup budget (the integrated-GPU case; on a discrete card
+///      the budget is left 0 and the probe wins).
+///   2. A startup-budget value when no client exists yet.
+///   3. The 120MB floor — used only before any client exists (e.g. unit code
+///      that computes a window size without a GPU).
+///
+/// `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB` is GONE. It was already the best-behaved
+/// of the three memory env vars — it `min`'d against the probe — but peak
+/// memory is a function of the hardware and never of a user parameter, and the
+/// only thing lowering it by hand could do that the probe cannot is make the
+/// run slower.
+/// Test-only seam replacing the deleted `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`.
+///
+/// The split-invariance parity test (`eval.rs`, heavy-row) has to force MANY
+/// windows/gene-batches at two DIFFERENT granularities and prove the two are
+/// bit-identical — that assertion is what stands between a gather bug and a
+/// silently corrupted metric. It used to force the split with the env var; the
+/// var is gone from production, so the seam is now explicitly test-only and
+/// cannot be reached by an export. `0` = inactive.
+#[cfg(test)]
+pub(crate) static TEST_GPU_BUFFER_CAP_MB: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn gpu_buffer_elem_cap() -> usize {
-    let env_bytes = std::env::var("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|m| *m > 0)
-        .map(|mb| mb.saturating_mul(1024 * 1024));
+    #[cfg(test)]
+    {
+        let mb = TEST_GPU_BUFFER_CAP_MB.load(std::sync::atomic::Ordering::Relaxed);
+        if mb > 0 {
+            let bytes = mb.saturating_mul(1024 * 1024);
+            return (bytes.saturating_div(4)).max(1) as usize;
+        }
+    }
     let probed = GPU_BUFFER_CAP_BYTES.get().copied();
     let budget_bytes = installed_memory_budgets()
         .map(|b| b.gpu_buffer_mb)
         .filter(|mb| *mb > 0)
         .map(|mb| (mb as u64).saturating_mul(1024 * 1024));
 
-    let bytes = match (env_bytes, probed) {
-        // Env override present AND a probed cap: env is a ceiling, never exceed
-        // the device's true limit.
-        (Some(env), Some(p)) => env.min(p),
-        // Env override only (no client built yet): honor it verbatim.
-        (Some(env), None) => env,
-        // No env override: use the probed cap, but let a (non-zero) budget CAP it.
-        // On a shared-memory GPU (integrated graphics) the probed device limit is
+    let bytes = match probed {
+        // Use the probed cap, but let a (non-zero) budget CAP it. On a
+        // shared-memory GPU (integrated graphics) the probed device limit is
         // the whole system RAM — far more than the fused/windowed path can fill
         // without OOM — so the RAM-derived budget must bound it. On a discrete
         // card the budget is left 0 (probe wins), unchanged.
-        (None, Some(p)) => match budget_bytes {
+        Some(p) => match budget_bytes {
             Some(b) => p.min(b),
             None => p,
         },
-        (None, None) => budget_bytes.unwrap_or(GPU_BUFFER_CAP_FLOOR),
+        None => budget_bytes.unwrap_or(GPU_BUFFER_CAP_FLOOR),
     };
     (bytes.saturating_div(4)).max(1) as usize // 4 bytes/element (i32/f32)
 }
@@ -2325,15 +2287,17 @@ fn backtest_gene_batch(n_genes: usize, n_samples: usize) -> usize {
 /// ask cubecl to release what it can via `memory_cleanup()`. The default is
 /// deliberately small so the engine NEVER OOMs on a modest discrete GPU
 /// regardless of how large a population/generations the user requests; the
-/// startup auto-tuner raises it on cards with more headroom. Override via
-/// `NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB`.
+/// startup auto-tuner raises it on cards with more headroom.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB` DELETED. It was tried
+/// FIRST and never clamped, so an exported number could exceed the card and
+/// disable the pool trim this function exists to perform. The probe-derived
+/// budget (`auto_tune_memory_budgets`) is now the only input — memory tracks
+/// hardware, not user params.
 fn gpu_pool_budget_bytes() -> u64 {
     const DEFAULT_MB: u64 = 3072;
-    std::env::var("NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|m| *m > 0)
-        .or_else(|| installed_memory_budgets().map(|b| b.vram_budget_mb))
+    installed_memory_budgets()
+        .map(|b| b.vram_budget_mb)
         .unwrap_or(DEFAULT_MB)
         .saturating_mul(1024 * 1024)
 }
@@ -2345,9 +2309,14 @@ fn gpu_pool_budget_bytes() -> u64 {
 /// RAM a function of (budget, rows) and NOT of the requested population: a user
 /// can ask for an enormous population and it streams through in chunks instead
 /// of OOMing. Genes are evaluated independently, so a chunk split is numerically
-/// identical to one pass (CPU↔GPU parity preserved). Default budget 2048MB;
-/// override `NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB`; the startup auto-tuner lowers
-/// it on low-RAM boxes.
+/// identical to one pass (CPU↔GPU parity preserved). The startup auto-tuner
+/// sizes the budget from available RAM.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB` DELETED. This is the one
+/// with a measured body count: it was tried FIRST and never clamped against
+/// the probe, and the comment below records what an unclamped budget cost — a
+/// 200-gene M1 pass at 38 GB RSS, SIGSEGV. A user parameter that can raise a
+/// memory ceiling above the machine is the never-OOM invariant inverted.
 fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
     const DEFAULT_MB: u64 = 1024;
     // The signal+confidence assembly is 8 B/gene/sample, but during GPU
@@ -2359,11 +2328,8 @@ fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
     // clean. We bake a 5× factor in so the budget means real RESIDENT RAM, not
     // just the logical buffer — the user/auto-tuner can reason in true GB.
     const HOST_OVERHEAD_FACTOR: u64 = 5;
-    let budget = std::env::var("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|m| *m > 0)
-        .or_else(|| installed_memory_budgets().map(|b| b.host_budget_mb))
+    let budget = installed_memory_budgets()
+        .map(|b| b.host_budget_mb)
         .unwrap_or(DEFAULT_MB)
         .saturating_mul(1024 * 1024);
     let per_gene = (n_samples as u64)
@@ -2379,22 +2345,23 @@ fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
 /// grow-only wgpu pool high-water mark so peak VRAM tracks the live working set,
 /// not the run length. Cheap when under budget (just a usage probe) and never
 /// fails the run — a probe error is ignored (CPU/GPU correctness is unaffected).
-/// Set `NEOETHOS_BOT_SEARCH_VRAM_LOG=1` to log the pool footprint at each check.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_VRAM_LOG=1` DELETED. Like the timing
+/// breakdown, this only ever printed, so it is a log level rather than a knob:
+/// raise `neoethos_search::cubecl_eval` to DEBUG.
 fn trim_gpu_pool_if_over_budget<R: Runtime>(client: &ComputeClient<R>) {
     let usage = match client.memory_usage() {
         Ok(u) => u,
         Err(_) => return,
     };
     let budget = gpu_pool_budget_bytes();
-    if std::env::var("NEOETHOS_BOT_SEARCH_VRAM_LOG").is_ok() {
-        tracing::info!(
-            target: "neoethos_search::cubecl_eval",
-            reserved_mb = usage.bytes_reserved / (1024 * 1024),
-            in_use_mb = usage.bytes_in_use / (1024 * 1024),
-            budget_mb = budget / (1024 * 1024),
-            "gpu pool footprint"
-        );
-    }
+    tracing::debug!(
+        target: "neoethos_search::cubecl_eval",
+        reserved_mb = usage.bytes_reserved / (1024 * 1024),
+        in_use_mb = usage.bytes_in_use / (1024 * 1024),
+        budget_mb = budget / (1024 * 1024),
+        "gpu pool footprint"
+    );
     if usage.bytes_reserved > budget {
         client.memory_cleanup();
     }
@@ -2562,31 +2529,11 @@ mod window_tests {
     }
 }
 
-#[cfg(all(test, feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-mod wgpu_device_selector_tests {
-    use super::parse_wgpu_device_selector;
-    use cubecl::wgpu::WgpuDevice;
-
-    #[test]
-    fn parses_integrated_and_legacy_discrete_device_selectors() {
-        assert_eq!(
-            parse_wgpu_device_selector("integrated:0"),
-            Some(WgpuDevice::IntegratedGpu(0))
-        );
-        assert_eq!(
-            parse_wgpu_device_selector("discrete:2"),
-            Some(WgpuDevice::DiscreteGpu(2))
-        );
-        assert_eq!(
-            parse_wgpu_device_selector("2"),
-            Some(WgpuDevice::DiscreteGpu(2))
-        );
-        assert_eq!(
-            parse_wgpu_device_selector("default:0"),
-            Some(WgpuDevice::DefaultDevice)
-        );
-    }
-}
+// `wgpu_device_selector_tests` DELETED 2026-08-10 with
+// `parse_wgpu_device_selector`. It tested the parser for
+// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE`; the device now comes from the
+// `device_override` argument the multi-GPU scheduler passes, which needs no
+// string parsing and therefore no parser test.
 
 fn launch_signal_kernel<F, R: Runtime>(
     client: &ComputeClient<R>,
@@ -3145,9 +3092,8 @@ define_launch_backtest_kernel!(launch_backtest_kernel_f64, backtest_population_k
 
 /// Is the double-precision backtest lane selected?
 ///
-/// Off by default: the f32 lane is the measured, shipped behaviour and must not
-/// change without a decision. Set `NEOETHOS_GPU_F64=1` to route the backtest
-/// through the f64 lane instead.
+/// Off: the f32 lane is the measured, shipped behaviour of THIS engine and must
+/// not change without a decision.
 ///
 /// This exists to answer a question that was never asked. The finding that "the
 /// f32 lane is wrong" (54 % off over 200 000 bars) came from comparing this
@@ -3155,16 +3101,16 @@ define_launch_backtest_kernel!(launch_backtest_kernel_f64, backtest_population_k
 /// double precision. That matters, because this engine already has every call
 /// site in the discovery pipeline: if precision alone fixes it, there is no
 /// integration work left to do.
+///
+/// 2026-08-10: `NEOETHOS_GPU_F64=1` DELETED. It was the one env var whose
+/// effect was ARITHMETIC — it changed the numbers a money decision is made
+/// from — and it appeared in no artifact, so a run's precision could not be
+/// recovered afterwards. It is exactly the kind of value that has to be config
+/// or nothing; the config field is routed to `config.rs` as
+/// `models.search_runtime.gpu_f64_backtest`, and until it lands the answer is
+/// the shipped, measured one: f32.
 pub(crate) fn gpu_f64_backtest_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("NEOETHOS_GPU_F64")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    false
 }
 
 /// Run the backtest on the selected precision lane.
@@ -3262,11 +3208,16 @@ fn copy_window_into_persistent<T: CubePrimitive>(
 /// parity test.
 #[cfg(feature = "gpu")]
 fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool> {
-    let n_samples: usize = std::env::var("FUSED_TEST_NSAMPLES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(300);
+    // 2026-08-10: `FUSED_TEST_NSAMPLES` DELETED. It was catalogued as a test
+    // knob; it is not — this function is `#[cfg(feature = "gpu")]`, not
+    // `#[cfg(test)]`, and runs on every production GPU startup. What it did was
+    // make the self-check probe slower on purpose. The doc above already argues
+    // that the single-window probe is a COMPLETE card/driver gate, and the
+    // multi-window accumulator's coverage lives in
+    // `gpu_population_eval_matches_cpu_heavy_rows`, which forces its windows
+    // through the `#[cfg(test)]` buffer-cap seam rather than an export.
+    // 300 = a single signal window that runs in well under a second.
+    let n_samples: usize = 300;
     let n_genes = 3usize;
     let n_indicators = 2usize;
 
@@ -3526,24 +3477,13 @@ fn resolve_fused_eval_enabled() -> bool {
             return false;
         }
     }
-    if let Ok(raw) = std::env::var("NEOETHOS_GPU_FUSED_EVAL") {
-        let v = raw.trim();
-        let on = v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
-        let off = v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off");
-        if on || off {
-            tracing::info!(
-                target: "neoethos_search::cubecl_eval",
-                fused_eval = on,
-                "fused VRAM-resident eval set by explicit NEOETHOS_GPU_FUSED_EVAL override"
-            );
-            return on;
-        }
-        tracing::warn!(
-            target: "neoethos_search::cubecl_eval",
-            value = %v,
-            "NEOETHOS_GPU_FUSED_EVAL has an unrecognized value — ignoring it and auto-detecting instead"
-        );
-    }
+    // 2026-08-10: the `NEOETHOS_GPU_FUSED_EVAL` override that used to sit here
+    // is DELETED. The block above already explains why forcing it on cannot
+    // work when prototype B short-circuits the path, and forcing it OFF is
+    // what auto-detection does on its own for every configuration where it
+    // loses. An override whose only reachable effect was re-introducing a
+    // measured VRAM starvation is not a knob.
+    //
     // Make sure the hardware-sized budgets are installed before we read the
     // integrated-GPU marker below — the app's discovery path calls this first, but
     // the lighter `search` CLI path does not. `auto_tune_memory_budgets` is

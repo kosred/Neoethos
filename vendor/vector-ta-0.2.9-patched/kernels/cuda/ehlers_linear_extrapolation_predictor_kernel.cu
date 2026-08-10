@@ -256,3 +256,183 @@ extern "C" __global__ void ehlers_linear_extrapolation_predictor_batch_f64(
         row_go_short[i] = go_short_value;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/ehlers_linear_extrapolation_predictor.rs:648
+// (ehlers_linear_extrapolation_predictor_with_kernel). The column this emits
+// is prediction, which is what output_id == "value" resolves to
+// (dispatch/cpu_batch.rs:9235-9238).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- a two-pole
+// high-pass IIR carrying four scalars, a Hann-weighted low-pass over the last
+// low_pass_length high-pass values, and a ten-deep filter history the linear
+// extrapolation reads. The CPU clears all of it on a non-finite bar, so the
+// warmup is re-served after every hole.
+//
+// THE HISTORY SHIFT IS THE CPU's: both histories are shifted DOWN by one slot
+// per bar rather than indexed as a modular ring. That is not an oversight
+// here -- the summation reads them in slot order, and re-indexing would change
+// which value each Hann coefficient multiplies.
+//
+// PERIOD-INVARIANT. compute_ehlers_linear_extrapolation_predictor_batch
+// (cpu_batch.rs:9193-9216) reads high_pass_length, low_pass_length, gain,
+// bars_forward and signal_mode and NEVER period, so five swept periods give
+// five identical CPU columns and this kernel emits five identical rows. All
+// five CPU defaults are pinned below.
+//
+// WHAT IS DELIBERATELY ABSENT: the filter, state, go_long and go_short
+// columns. They consume the prediction and the filter; they do not produce
+// the prediction. signal_mode is still VALIDATED because the CPU refuses an
+// out-of-range one.
+//
+// THE HIGH-PASS HISTORY IS PER-THREAD, so its depth is a property of THIS
+// COMPILED KERNEL. At the pinned low_pass_length of 12 the bound below cannot
+// be approached; it is checked rather than assumed.
+//
+// FIRST VALID IS NOT READ: there is no warmup index, only a consecutive-bar
+// count restarted at every non-finite value. The lane row declares
+// F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double exp/cos, no f32-suffixed math
+// function, no fast-math intrinsic. FLOAT_TOL is 1e-12 and is only consulted
+// by the signal columns this kernel does not emit.
+// ---------------------------------------------------------------------------
+
+#define NEO_ELEP_HIGH_PASS_LENGTH 125
+#define NEO_ELEP_LOW_PASS_LENGTH 12
+#define NEO_ELEP_GAIN 0.7
+#define NEO_ELEP_BARS_FORWARD 5
+#define NEO_ELEP_SIGNAL_MODE SIGNAL_MODE_PREDICT_FILTER_CROSSES
+#define NEO_ELEP_MAX_LOW_PASS_LENGTH 512
+
+extern "C" __global__ void ehlers_linear_extrapolation_predictor_neo_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int high_pass_length = NEO_ELEP_HIGH_PASS_LENGTH;
+    const int low_pass_length = NEO_ELEP_LOW_PASS_LENGTH;
+    const double gain = NEO_ELEP_GAIN;
+    const int bars_forward = NEO_ELEP_BARS_FORWARD;
+    const int signal_mode = NEO_ELEP_SIGNAL_MODE;
+
+    if (high_pass_length <= 0 || low_pass_length <= 0 ||
+        low_pass_length > NEO_ELEP_MAX_LOW_PASS_LENGTH || !isfinite(gain) || bars_forward < 0 ||
+        bars_forward > MAX_BARS_FORWARD || signal_mode < SIGNAL_MODE_PREDICT_FILTER_CROSSES ||
+        signal_mode > SIGNAL_MODE_FILTER_MIDDLE_CROSSES) {
+        return;
+    }
+
+    const double angle = 1.414 * PI_CONST / static_cast<double>(high_pass_length);
+    const double a1 = exp(-angle);
+    const double hp_c2 = 2.0 * a1 * cos(angle);
+    const double hp_c3 = -a1 * a1;
+    const double hp_c1 = (1.0 + hp_c2 - hp_c3) * 0.25;
+    const double pix2 = 2.0 * PI_CONST / static_cast<double>(low_pass_length + 1);
+
+    double hann_weight_sum = 0.0;
+    for (int count = 1; count <= low_pass_length; ++count) {
+        hann_weight_sum += 1.0 - cos(static_cast<double>(count) * pix2);
+    }
+
+    double hp_history[NEO_ELEP_MAX_LOW_PASS_LENGTH];
+    for (int j = 0; j < low_pass_length; ++j) {
+        hp_history[j] = 0.0;
+    }
+
+    int source_count = 0;
+    double prev_source_1 = 0.0;
+    double prev_source_2 = 0.0;
+    double hp_prev_1 = 0.0;
+    double hp_prev_2 = 0.0;
+    int hp_count = 0;
+    double filter_history_local[HISTORY_LENGTH];
+    int filter_count = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const double value = data[i];
+
+        if (!isfinite(value)) {
+            source_count = 0;
+            prev_source_1 = 0.0;
+            prev_source_2 = 0.0;
+            hp_prev_1 = 0.0;
+            hp_prev_2 = 0.0;
+            hp_count = 0;
+            filter_count = 0;
+            continue;
+        }
+
+        source_count += 1;
+        const double hp = source_count <= 4
+            ? 0.0
+            : hp_c1 * (value - 2.0 * prev_source_1 + prev_source_2) + hp_c2 * hp_prev_1 +
+                  hp_c3 * hp_prev_2;
+
+        prev_source_2 = prev_source_1;
+        prev_source_1 = value;
+        hp_prev_2 = hp_prev_1;
+        hp_prev_1 = hp;
+
+        if (hp_count < low_pass_length) {
+            for (int j = hp_count; j > 0; --j) {
+                hp_history[j] = hp_history[j - 1];
+            }
+            hp_history[0] = hp;
+            hp_count += 1;
+        } else {
+            for (int j = low_pass_length - 1; j > 0; --j) {
+                hp_history[j] = hp_history[j - 1];
+            }
+            hp_history[0] = hp;
+        }
+
+        if (source_count < 4 + low_pass_length - 1 || hp_count < low_pass_length) {
+            continue;
+        }
+
+        double filter = 0.0;
+        for (int count = 1; count <= low_pass_length; ++count) {
+            const double coef = 1.0 - cos(static_cast<double>(count) * pix2);
+            filter += coef * hp_history[count - 1];
+        }
+        filter /= hann_weight_sum;
+
+        if (filter_count < HISTORY_LENGTH) {
+            filter_history_local[filter_count] = filter;
+            filter_count += 1;
+        } else {
+            for (int j = 0; j < HISTORY_LENGTH - 1; ++j) {
+                filter_history_local[j] = filter_history_local[j + 1];
+            }
+            filter_history_local[HISTORY_LENGTH - 1] = filter;
+        }
+
+        if (filter_count < HISTORY_LENGTH) {
+            continue;
+        }
+
+        const double current = filter_history_local[HISTORY_LENGTH - 1];
+        const double prev = filter_history_local[HISTORY_LENGTH - 2];
+        row[i] = bars_forward == 0
+            ? current * gain
+            : (current + static_cast<double>(bars_forward) * (current - prev)) * gain;
+    }
+}

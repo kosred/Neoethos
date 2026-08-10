@@ -7,10 +7,87 @@
 //! config seeded to a different dir) cannot exist here: one process, one CWD.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::Serialize;
 
 mod broker;
+
+/// The ABSOLUTE `config.yaml` this process reads and writes, resolved once by
+/// [`prepare_data_root`] before anything else runs.
+///
+/// **Audit #125 (2026-08-09).** This used to be the bare relative string
+/// `"config.yaml"`, handed to `install_config_path` and to `Settings::from_yaml`.
+/// A relative path resolves against the process CWD, and the CWD is only correct
+/// because `prepare_data_root` chdirs into the data root — a `set_current_dir`
+/// that fails is logged and then ignored (see the two `eprintln!` arms below),
+/// so the app kept running and read a `config.yaml` that was not there. Combined
+/// with #289 (`ModelsConfig::default()` re-arms the export gates the operator
+/// deliberately disarmed on 2026-06-06) a CWD accident was a SILENT CHANGE OF
+/// TRADING POLICY — and since 2026-08-09 a money gate reads its setting through
+/// this same path (`server/orders.rs:63-75`, `require_stop_loss`).
+///
+/// The resolution is now absolute and recorded here; the load is fail-loud.
+static RESOLVED_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the absolute config path for the rest of the process. First install
+/// wins, mirroring `server::state::install_config_path`.
+fn record_config_path(path: PathBuf) {
+    // Absolutise a relative path against the CWD *now*, while the CWD is still
+    // the one that made it correct. Deliberately NOT `fs::canonicalize`: on
+    // Windows that returns a `\\?\` UNC-prefixed path, which is correct but
+    // leaks into every log line and error message the operator reads. And the
+    // file may legitimately not exist yet (a first-run seed that failed), which
+    // `canonicalize` treats as an error.
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    };
+    let _ = RESOLVED_CONFIG_PATH.set(absolute);
+}
+
+/// Stop the app with a visible, actionable message instead of starting under a
+/// configuration the operator never wrote.
+///
+/// **Audit #125/#289 — this is a DELIBERATE fail-closed.** The previous
+/// behaviour (`unwrap_or_else(|_| Settings::default())`) started the app under
+/// `Settings::default()`, which is a *different trading policy*: different
+/// export gates (#289), different risk defaults, and — since 2026-08-09 — a
+/// different answer for the `require_stop_loss` money gate that
+/// `server/orders.rs:63-75` reads through this path. A silently different
+/// policy is strictly worse than an app that will not start, because the
+/// operator cannot see it.
+///
+/// Never called for a *missing* seed on first run: `prepare_data_root` seeds
+/// `config.yaml` from the bundle before this point, and a seed failure is
+/// itself reported here rather than swallowed.
+fn fatal_config_error(what: &str, detail: &str) -> ! {
+    let path = RESOLVED_CONFIG_PATH
+        .get()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    let message = format!(
+        "NeoEthos cannot start: {what}.\n\n\
+         Config file: {path}\n\
+         Details: {detail}\n\n\
+         The app refuses to start on default settings, because the defaults are \
+         NOT your settings — they re-arm export gates and risk limits you \
+         changed deliberately, and they would decide real trades.\n\n\
+         Fix or restore that file (or delete it to be re-seeded from the \
+         bundled defaults on the next launch), then start NeoEthos again."
+    );
+    eprintln!("FATAL: {message}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("NeoEthos — configuration could not be loaded")
+        .set_description(message.as_str())
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(2);
+}
 
 /// In-process backend: the full neoethos-app axum API, served on an ephemeral
 /// loopback port inside THIS process (a tokio task, not a separate exe). It
@@ -46,24 +123,52 @@ mod backend {
             port.to_string(),
         );
 
+        // ── Config resolution + load happen HERE, synchronously, on the
+        // setup thread — BEFORE the server task spawns and before any dialog
+        // would be racing a window. Audit #125/#289: a config miss must stop
+        // the app, not silently become a different trading policy.
+        let config_path = super::RESOLVED_CONFIG_PATH.get().cloned().unwrap_or_else(|| {
+            // Unreachable in `run()` (prepare_data_root always records one),
+            // but a future caller must not silently inherit the CWD.
+            super::fatal_config_error(
+                "the data root was never established, so no config.yaml path exists",
+                "internal ordering error: backend::start() ran before prepare_data_root()",
+            )
+        });
+        eprintln!("config → {}", config_path.display());
+        // Same process-wide install the CLI/main.rs perform, now with the
+        // ABSOLUTE path so `/settings` GET+POST and `Settings::load` cannot
+        // diverge if anything later changes the working directory.
+        server::state::install_config_path(config_path.clone());
+        // F-005: say which env-var overrides are live before anything
+        // acts on them. The desktop shell reads the same env as the
+        // headless binary — NEOETHOS_USER_DATA_DIR in particular, which
+        // relocates the whole data root — so it needs the same line in
+        // its log.
+        neoethos_core::env_overrides::log_active_overrides_at_startup();
+        // Audit S05: install EVERY runtime override from settings, exactly
+        // as the headless main.rs does, via the one shared installer. The
+        // desktop previously installed NONE, so config.yaml runtime knobs
+        // (search population, hardware CPU budget, feature normalization,
+        // tree threads, app-server runtime) were silently ignored here.
+        //
+        // Audit #125: this was `.unwrap_or_else(|_| Settings::default())`.
+        // `Settings::default()` is NOT the shipped configuration — #289
+        // records that `ModelsConfig::default()` still encodes the
+        // pre-2026-06-06 posture and re-arms `require_walkforward_for_export`
+        // + `prop_firm_min_pass_rate`, i.e. it changes WHICH STRATEGIES MAY
+        // REACH LIVE. Swallowing the load error swapped the operator's
+        // trading policy for a different one without a word. It is now fatal.
+        let settings = match neoethos_core::Settings::from_yaml(&config_path) {
+            Ok(s) => s,
+            Err(e) => super::fatal_config_error(
+                &format!("could not load {}", config_path.display()),
+                &format!("{e:#}"),
+            ),
+        };
+        neoethos_app::install_runtime_overrides_from_settings(&settings);
+
         tauri::async_runtime::spawn(async move {
-            // Mirror main.rs bootstrap, minus the Flutter-supervisor bits.
-            // Same default config path the CLI/main.rs use when no override.
-            server::state::install_config_path("config.yaml");
-            // F-005: say which env-var overrides are live before anything
-            // acts on them. The desktop shell reads the same env as the
-            // headless binary — NEOETHOS_USER_DATA_DIR in particular, which
-            // relocates the whole data root — so it needs the same line in
-            // its log.
-            neoethos_core::env_overrides::log_active_overrides_at_startup();
-            // Audit S05: install EVERY runtime override from settings, exactly
-            // as the headless main.rs does, via the one shared installer. The
-            // desktop previously installed NONE, so config.yaml runtime knobs
-            // (search population, hardware CPU budget, feature normalization,
-            // tree threads, app-server runtime) were silently ignored here.
-            let settings = neoethos_core::Settings::from_yaml("config.yaml")
-                .unwrap_or_else(|_| neoethos_core::Settings::default());
-            neoethos_app::install_runtime_overrides_from_settings(&settings);
             let state = server::state::AppApiState::new();
             server::state::install_account_refresh_trigger(state.account_refresh_tx_clone());
             server::bridge::spawn(state.clone());
@@ -396,7 +501,20 @@ fn open_path(path: String) -> Result<(), String> {
 /// (audit M08: the old fallback was the developer's workstation path baked
 /// into every shipped binary — meaningless on any other machine).
 fn resolve_data_root() -> PathBuf {
-    if let Ok(s) = neoethos_core::Settings::load() {
+    // Audit #125, same family: read the config THIS PROCESS resolved, not
+    // whatever `Settings::load()` picks. In a dev/portable launch the engine
+    // reads the repo's `config.yaml` while `Settings::load()` reads
+    // `%LOCALAPPDATA%\neoethos\config.yaml` — so the chart/symbol commands
+    // could show a different dataset than the one the engine trades on.
+    let from_resolved = RESOLVED_CONFIG_PATH
+        .get()
+        .and_then(|p| neoethos_core::Settings::from_yaml(p).ok());
+    if let Some(s) = from_resolved {
+        let d = s.system.data_dir.clone();
+        if d.exists() {
+            return d;
+        }
+    } else if let Ok(s) = neoethos_core::Settings::load() {
         let d = s.system.data_dir.clone();
         if d.exists() {
             return d;
@@ -433,6 +551,7 @@ fn prepare_data_root(app: &tauri::App) {
     // Dev/portable: launched from a dir that already has config.yaml → keep it.
     if !overridden && std::path::Path::new("config.yaml").exists() {
         eprintln!("data root → current dir (config.yaml present)");
+        record_config_path(PathBuf::from("config.yaml"));
         return;
     }
 
@@ -450,6 +569,7 @@ fn prepare_data_root(app: &tauri::App) {
         match std::env::set_current_dir(dir) {
             Ok(()) => {
                 eprintln!("data root → exe dir (config.yaml present): {}", dir.display());
+                record_config_path(dir.join("config.yaml"));
                 return;
             }
             Err(e) => eprintln!("set working dir {} failed: {e}", dir.display()),
@@ -468,15 +588,29 @@ fn prepare_data_root(app: &tauri::App) {
 
     // First run: seed the editable config + default symbol costs from the
     // bundled read-only defaults so a fresh install works out of the box.
+    //
+    // Audit #125: a seed failure used to be one `eprintln!` on a console
+    // nobody sees, after which the app started on `Settings::default()`. Both
+    // failure arms now say plainly that the app will refuse to start, and
+    // `backend::start` enforces it.
     if !cfg_path.exists() {
-        if let Ok(res) = app
+        match app
             .path()
             .resolve("resources/config.yaml", tauri::path::BaseDirectory::Resource)
         {
-            match std::fs::copy(&res, &cfg_path) {
+            Ok(res) => match std::fs::copy(&res, &cfg_path) {
                 Ok(_) => eprintln!("seeded default config → {}", cfg_path.display()),
-                Err(e) => eprintln!("seed config failed: {e}"),
-            }
+                Err(e) => eprintln!(
+                    "seed config {} → {} FAILED: {e} — the app will refuse to start rather \
+                     than run on built-in defaults",
+                    res.display(),
+                    cfg_path.display()
+                ),
+            },
+            Err(e) => eprintln!(
+                "bundled resources/config.yaml could not be resolved: {e} — the app will \
+                 refuse to start rather than run on built-in defaults"
+            ),
         }
         let data = root.join("data");
         let _ = std::fs::create_dir_all(&data);
@@ -492,8 +626,17 @@ fn prepare_data_root(app: &tauri::App) {
     }
 
     if let Err(e) = std::env::set_current_dir(&root) {
-        eprintln!("set working dir {} failed: {e}", root.display());
+        // Audit #125: this failure used to be survivable-looking. It is not —
+        // every relative read in the engine resolves against the CWD. The
+        // config path recorded below is ABSOLUTE, so the config half is now
+        // immune; the data half still depends on the chdir, so say so.
+        eprintln!(
+            "set working dir {} failed: {e} — relative data/cache/model paths will resolve \
+             against the process CWD instead",
+            root.display()
+        );
     }
+    record_config_path(cfg_path);
     eprintln!("data root → {}", root.display());
 }
 

@@ -212,6 +212,41 @@ export const closePosition = (positionId: number, volume: number) =>
   invoke<ExecResult>("close_position", { positionId, volume });
 export const reauthBroker = () => invoke<ReauthResult>("reauth_broker");
 
+// ── cTrader API credentials (audit #119) ──────────────────────────────────
+// Until 2026-08-09 the Dashboard told the operator to "go to Settings and add
+// cTrader credentials" and NO such form existed anywhere in `desktop/src`.
+// Credentials are baked into the binary by `neoethos-app/build.rs`, so a
+// revoked client_id locked him out of his own broker until someone rebuilt it.
+// The backend has always had the endpoints; only the screen was missing.
+//
+// SECRET HANDLING: the GET never returns the secret — only
+// `clientSecretMask` ("****abcd (length 32)") and `clientSecretConfigured`.
+// The POST treats an empty `clientSecret` as "keep the saved one". Never log,
+// echo or persist the typed value anywhere in the UI.
+export type BrokerCredentials = {
+  clientId: string;
+  clientSecretMask: string;
+  clientSecretConfigured: boolean;
+  redirectUri: string;
+  environment: string;
+  accountId: string;
+};
+export const brokerCredentials = () => apiGet<BrokerCredentials>("/broker/credentials");
+export const saveBrokerCredentials = (b: {
+  clientId: string;
+  clientSecret: string;
+  redirectUri?: string;
+  environment?: string;
+  accountId?: string;
+}) =>
+  apiPost<{ ok: boolean; message: string }>("/broker/credentials", {
+    clientId: b.clientId,
+    clientSecret: b.clientSecret,
+    redirectUri: b.redirectUri ?? "",
+    environment: b.environment ?? "Demo",
+    accountId: b.accountId ?? "",
+  });
+
 // ══════════════════════════════════════════════════════════════════════════
 // Full backend API (in-process axum server) — every old Flutter feature.
 // ══════════════════════════════════════════════════════════════════════════
@@ -369,6 +404,49 @@ export const intelligence = () => apiGet<IntelligenceInfo>("/intelligence");
 // ── Journal ───────────────────────────────────────────────────────────────
 export const journalStats = () => apiGet<any>("/journal/stats");
 export const journalTrades = () => apiGet<any>("/journal/trades");
+
+// Per-trade pips / R / MFE-MAE + the breakdowns that locate a problem.
+// Audit #124: this endpoint has existed since 2026-07-30 and until now its
+// ONLY caller repo-wide was `mcp/ops.rs:864` — an LLM tool call. The operator
+// could not reach the one view that would have surfaced the payoff-1.08
+// problem (a 1.08 realised payoff against a 2.0 floor) sixteen months earlier.
+export type DerivedTrade = {
+  positionId: number;
+  symbol: string;
+  side: string;
+  lots: number;
+  entryTsMs: number | null;
+  exitTsMs: number | null;
+  netProfit: number;
+  durationHours: number | null;
+  pips: number | null;
+  rMultiple: number | null;
+  mfePips: number | null;
+  maePips: number | null;
+  captureRatio: number | null;
+  entryHourUtc: number | null;
+  entryWeekday: string | null;
+};
+export type BucketSummary = {
+  bucket: string;
+  trades: number;
+  wins: number;
+  winRatePct: number;
+  netProfit: number;
+  expectancy: number;
+  netPips: number;
+};
+export type JournalAnalytics = {
+  trades: DerivedTrade[];
+  bySymbol: BucketSummary[];
+  byHourUtc: BucketSummary[];
+  byWeekday: BucketSummary[];
+  bySide: BucketSummary[];
+  avgMfePips: number | null;
+  avgCaptureRatio: number | null;
+  inactiveHoursUtc: number[];
+};
+export const journalAnalytics = () => apiGet<JournalAnalytics>("/journal/analytics");
 
 // ── News ──────────────────────────────────────────────────────────────────
 export const newsFeed = (force = false) => apiGet<any>(`/news/feed${force ? "?force=true" : ""}`);

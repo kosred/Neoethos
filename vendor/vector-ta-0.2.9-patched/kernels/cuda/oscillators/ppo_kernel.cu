@@ -514,3 +514,124 @@ extern "C" __global__ void ppo_from_ma_many_series_one_param_time_major_f32(
         out_tm[t * cols + s] = y;
     }
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  ppo
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/ppo.rs -- `ppo_scalar_classic_sma` (:488), `ppo_scalar` (:368), `ppo_with_kernel` (:243)
+//
+// PERIOD-INVARIANT. `compute_ppo_batch` (cpu_batch.rs:4622) reads
+// `fast_period` (12), `slow_period` (26) and `ma_type` (default "sma"); there
+// is no `period` parameter.
+//
+// THE DEFAULT ma_type IS "sma", so `ppo_scalar` takes the
+// `ppo_scalar_classic_sma` branch -- a two-window rolling-sum form, NOT a call
+// into the generic `ma()` dispatcher. That branch is what is written here.
+// `ppo_with_kernel` maps `Auto` to `Kernel::Scalar` (ppo.rs:272-275) and both
+// AVX entry points delegate to `ppo_scalar` verbatim (ppo.rs:541-560), so
+// there is exactly one CPU answer on every host.
+//
+// ARITHMETIC ORDER, and the constant that is easy to get wrong:
+//   `k = slow / fast` is formed ONCE, and the ratio is `(fast_sum * k) /
+//   slow_sum` -- multiply THEN divide. The mathematically equal
+//   `fast_sum / (slow_sum * fast / slow)` is a different number, and so is
+//   scaling by `fast/slow` on the other side.
+//   `y = ratio.mul_add(100.0, -100.0)` -- ONE rounding. Writing
+//   `100.0 * (ratio - 1.0)` is two and loses a bit near ratio == 1, which is
+//   precisely where this oscillator spends its life.
+//
+// THE SEED accumulates both windows in ONE ascending pass over the first
+// `slow` bars, adding to `fast_sum` only once `t >= slow - fast`. That gives
+// `fast_sum` the SAME summation order it would have had on its own, which is
+// why the single pass is faithful and not merely convenient.
+//
+// `slow_sum == 0.0` is an exact zero test, not an epsilon.
+//
+// WARMUP: `alloc_with_nan_prefix(len, first + slow - 1)`.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_ppo_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    // `PpoParams` defaults as read by cpu_batch.rs:4630-4632.
+    const int fast = 12;
+    const int slow = 26;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (fast == 0) || (slow == 0) || (fast > n) || (slow > n) ||
+        (fast > slow) ||
+        ((n - first_valid) < slow);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int start_idx = first_valid + slow - 1;
+    for (int i = 0; i < start_idx && i < n; ++i) row[i] = neo_s1_qnan();
+    if (start_idx >= n) return;
+
+    const double k = (double)slow / (double)fast;
+
+    double slow_sum = 0.0;
+    double fast_sum = 0.0;
+    const int overlap = slow - fast;
+    for (int t = 0; t < slow; ++t) {
+        const double v = prices[first_valid + t];
+        slow_sum += v;
+        if (t >= overlap) fast_sum += v;
+    }
+
+    if (slow_sum == 0.0) {
+        row[start_idx] = neo_s1_qnan();
+    } else {
+        const double ratio = (fast_sum * k) / slow_sum;
+        row[start_idx] = fma(ratio, 100.0, -100.0);
+    }
+
+    for (int i = start_idx + 1; i < n; ++i) {
+        const double add = prices[i];
+        const double sub_fast = prices[i - fast];
+        const double sub_slow = prices[i - slow];
+
+        fast_sum += add - sub_fast;
+        slow_sum += add - sub_slow;
+
+        if (slow_sum == 0.0) {
+            row[i] = neo_s1_qnan();
+        } else {
+            const double ratio = (fast_sum * k) / slow_sum;
+            row[i] = fma(ratio, 100.0, -100.0);
+        }
+    }
+}

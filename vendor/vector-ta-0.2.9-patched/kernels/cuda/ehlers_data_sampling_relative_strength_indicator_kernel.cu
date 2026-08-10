@@ -189,3 +189,85 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_batc
     edsrsi_compute_rsi_row(open, close, len, period, 0, row_original_rsi);
     edsrsi_fill_signal(row_ds_rsi, len, row_signal);
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference:
+// src/indicators/ehlers_data_sampling_relative_strength_indicator.rs:481
+// (ehlers_data_sampling_relative_strength_indicator_with_kernel).
+//
+// WHICH COLUMN, AND WHY IT IS NAMED HERE. The CPU batch
+// (cpu_batch.rs:8132-8144) accepts ds_rsi / data_sampling_rsi, original_rsi
+// and signal -- it has NO "value" alias and returns UnknownOutput for one. So
+// a parity run must ask the CPU for ds_rsi explicitly; this kernel emits that
+// column, which is the RSI of the bar MIDPOINT (open + close) / 2, and never
+// the close-only original.
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- the
+// Wilder average is avg = avg*(1 - 1/period) + (1/period)*delta, carried bar to
+// bar after a mean seed over the first period deltas. Reformulating it as a
+// scan changes the rounding, and this value feeds a threshold comparison.
+//
+// THE TWO-AT-A-TIME LOOP IS THE CPU's, NOT AN OPTIMISATION. The reference
+// steps its recurrence in pairs and then handles a trailing odd bar; the
+// additions therefore associate in that order. Reproduced exactly, including
+// the tail.
+//
+// PERIOD-INVARIANT. The CPU batch (cpu_batch.rs:8114-8119) reads length and
+// NEVER period, so five swept periods give five identical CPU columns and this
+// kernel emits five identical rows. The CPU default 14 is pinned below.
+//
+// INPUT SHAPE: only OPEN and CLOSE are read. The lane row declares
+// F64InputKind::Ohlc4 for the same reason Qstick does -- the resident upload
+// already carries all four series and the four-pointer launch arm already
+// exists, so high and low are accepted and ignored rather than forcing a new
+// shape into shared launch code this change does not own.
+//
+// FIRST VALID IS DERIVED HERE: the CPU scans for the first bar whose MIDPOINT
+// is finite (edsrsi_first_finite above / first_valid in the reference), which
+// is a scan over a DERIVED series and not over any input series, so no
+// F64FirstValidRule variant can express it. The lane row declares
+// F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, no f32-suffixed math function, no fast-math
+// intrinsic, and no epsilon at all -- the zero-denominator test is the CPU's
+// exact == 0.0.
+// ---------------------------------------------------------------------------
+
+#define NEO_EDSRSI_LENGTH 14
+
+extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)high;
+    (void)low;
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int period = NEO_EDSRSI_LENGTH;
+    if (period <= 0 || period > n) {
+        return;
+    }
+
+    // midpoint_mode = 1 is the (open + close) / 2 source, which is what the
+    // ds_rsi column is built on.
+    edsrsi_compute_rsi_row(open, close, n, period, 1, row);
+}

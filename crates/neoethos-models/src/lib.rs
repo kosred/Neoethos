@@ -41,9 +41,6 @@ pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary, set_tr
 // Hardware detection (derived from models/device.py)
 pub mod hardware;
 
-// Evaluation helpers (simple backtest, signal conversion)
-pub mod evaluation_helpers;
-
 // Model registry (model discovery and validation)
 pub mod registry;
 
@@ -82,6 +79,3 @@ pub use streaming::{
 
 // Pure-Rust neural networks via Burn framework (no legacy, no GIL)
 pub mod burn_models;
-
-#[cfg(feature = "onnx")]
-pub use runtime::onnx::ONNXInferenceEngine;

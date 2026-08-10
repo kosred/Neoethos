@@ -72,6 +72,30 @@ pub struct DiscoverySearchLedger {
     /// Top archive (non-portfolio) genes, capped by `archive_top_n`.
     pub archive: Vec<GeneRecord>,
     pub search_meta: SearchMetadata,
+    /// MEASUREMENT SLICE (2026-08-09). The RESOLVED configuration this run
+    /// searched under, plus a hash over it.
+    ///
+    /// Why it exists: a prior run could not be attributed to a config file
+    /// after the fact. The repo `config.yaml` and the operator's store config
+    /// disagreed on `prefilter_top_k` (240 vs 50) and on the payoff floor
+    /// (2.0 vs 0.0), and no artifact said which had been in force — so "the run
+    /// found nothing" could not be separated from "the run was configured to
+    /// find nothing". Two ledgers with the same `config_hash` are the same
+    /// experiment.
+    ///
+    /// `#[serde(default)]` so ledgers written before this field exists still
+    /// load and still seed the seen-set — an old ledger must never break a run.
+    #[serde(default)]
+    pub resolved_config: Option<crate::run_identity::ResolvedConfigStamp>,
+    /// MEASUREMENT SLICE (2026-08-09). Accounting for the per-trial per-period
+    /// return matrix written beside this ledger — how many trials were offered,
+    /// how many were persisted, how many were dropped and why.
+    ///
+    /// `None` means the sidecar was not produced (the quality screen did not
+    /// run, or the write failed) — recorded as absence rather than left to be
+    /// inferred from a missing file.
+    #[serde(default)]
+    pub trial_returns: Option<crate::trial_returns::TrialReturnsManifest>,
 }
 
 /// `<cache_dir>/{SYMBOL}_{TF}.discovery_ledger.json`. Symbol + TF are
@@ -240,6 +264,101 @@ pub fn save_discovery_ledger(
         archive.push(rec);
     }
 
+    // ── MEASUREMENT SLICE (2026-08-09): stamp the resolved configuration ──
+    //
+    // Read through the SAME accessors the search read: the ATR-scaled stop band
+    // from `current_gene_stop_bounds()`, the trailing geometry from the
+    // installed `ExitPolicyOverrides`, the cost model from
+    // `DiscoveryConfig::evaluation_config`. A stamp that re-derived any of them
+    // would record a configuration nobody ran.
+    //
+    // Non-fatal: a stamp failure must not lose the seen-set the ledger exists to
+    // carry. It is recorded as `None` and logged, never silently omitted.
+    let pip_value_per_lot = config.evaluation_config(None).pip_value_per_lot;
+    let inputs = crate::run_identity::payoff_inputs_for_config(config, pip_value_per_lot);
+    let normalize_features = neoethos_data::current_data_runtime_overrides().normalize_features;
+    let resolved_config = match crate::run_identity::max_achievable_payoff(&inputs)
+        .and_then(|ceiling| {
+            crate::run_identity::stamp_resolved_config(
+                config,
+                &inputs,
+                ceiling,
+                pip_value_per_lot,
+                normalize_features,
+            )
+        }) {
+        Ok(stamp) => {
+            tracing::info!(
+                target: "neoethos_search::discovery_ledger",
+                config_hash = %stamp.config_hash,
+                payoff_floor = stamp.payoff_floor,
+                payoff_ceiling = stamp.payoff_ceiling.enforced_ceiling,
+                sl_band = ?stamp.sl_clamp_pips,
+                tp_band = ?stamp.tp_clamp_pips,
+                band_atr_pips = ?stamp.band_atr_pips,
+                trailing_enabled = stamp.trailing_enabled,
+                cost_pips_round_trip = stamp.cost_pips_round_trip,
+                prefilter_top_k = stamp.prefilter_top_k,
+                adaptive_thresholds = stamp.adaptive_thresholds,
+                normalize_features = stamp.normalize_features,
+                "resolved-config stamp for this run"
+            );
+            Some(stamp)
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_search::discovery_ledger",
+                error = %err,
+                "could not stamp the resolved config — the ledger records its ABSENCE. \
+                 A result that cannot name its configuration is not attributable."
+            );
+            None
+        }
+    };
+
+    // The per-trial return matrix is written by the quality screen (it is the
+    // only place that holds every trial's trades). Here we only embed its
+    // accounting, so the ledger says how many trials were persisted out of how
+    // many were run.
+    //
+    // IDENTITY CHECK (2026-08-09 review): the manifest is keyed only on
+    // `{SYMBOL}_{TF}.trial_returns.json`, so a run that skipped the quality
+    // screen, ran under a different configuration, or whose matrix write failed
+    // (non-fatal by design) would otherwise silently attach the PREVIOUS run's
+    // matrix to itself — and then this ledger would assert on that basis that
+    // DSR and PBO are computable. A manifest whose `config_hash` disagrees with
+    // this run's stamp is REFUSED and its absence recorded, which is the honest
+    // state. A `None` hash (written by a caller that had no stamp) is refused
+    // for the same reason: it cannot be attributed.
+    let expected_hash = resolved_config.as_ref().map(|s| s.config_hash.as_str());
+    let trial_returns = match crate::trial_returns::load_manifest(cache_dir, symbol, tf) {
+        Some(m) if m.config_hash.as_deref() == expected_hash && expected_hash.is_some() => Some(m),
+        Some(m) => {
+            tracing::warn!(
+                target: "neoethos_search::discovery_ledger",
+                symbol = %symbol,
+                tf = %tf,
+                manifest_config_hash = ?m.config_hash,
+                ledger_config_hash = ?expected_hash,
+                manifest_timestamp_ms = m.timestamp_ms,
+                ledger_timestamp_ms = timestamp_ms,
+                "trial-returns manifest beside this ledger belongs to a DIFFERENT run — \
+                 REFUSED rather than embedded. DSR and PBO are NOT computable for this run."
+            );
+            None
+        }
+        None => None,
+    };
+    if trial_returns.is_none() {
+        tracing::warn!(
+            target: "neoethos_search::discovery_ledger",
+            symbol = %symbol,
+            tf = %tf,
+            "no usable trial-returns manifest beside this ledger — DSR and PBO are NOT \
+             computable for this run. Expected when the quality screen did not run."
+        );
+    }
+
     let ledger = DiscoverySearchLedger {
         timestamp_ms,
         symbol: symbol.trim().to_ascii_uppercase(),
@@ -251,6 +370,8 @@ pub fn save_discovery_ledger(
             generations: config.generations,
             prefilter_feature_names: names.clone(),
         },
+        resolved_config,
+        trial_returns,
     };
 
     let path = ledger_path(cache_dir, symbol, tf);
@@ -313,7 +434,33 @@ mod tests {
                 generations: 50,
                 prefilter_feature_names: vec!["rsi_14".to_string(), "atr_20".to_string()],
             },
+            resolved_config: None,
+            trial_returns: None,
         }
+    }
+
+    #[test]
+    fn a_ledger_written_before_the_stamp_existed_still_loads() {
+        // Old ledgers carry the seen-set that stops a weekly run re-discovering
+        // what it already found. Adding measurement fields must never make one
+        // unreadable — the `#[serde(default)]` on both new fields is what
+        // guarantees it, and this is the test that holds it.
+        let legacy = serde_json::json!({
+            "timestamp_ms": 1_717_000_000_000_i64,
+            "symbol": "EURUSD",
+            "base_tf": "D1",
+            "portfolio": [],
+            "archive": [],
+            "search_meta": {
+                "population": 10,
+                "generations": 2,
+                "prefilter_feature_names": []
+            }
+        });
+        let parsed: DiscoverySearchLedger =
+            serde_json::from_value(legacy).expect("legacy ledger must still parse");
+        assert!(parsed.resolved_config.is_none());
+        assert!(parsed.trial_returns.is_none());
     }
 
     #[test]

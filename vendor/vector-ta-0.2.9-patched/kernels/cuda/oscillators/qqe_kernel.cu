@@ -350,3 +350,144 @@ extern "C" __global__ void qqe_many_series_one_param_time_major_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 6
+ *
+ * ORACLE: `qqe_scalar_classic` (src/indicators/qqe.rs:556).
+ *
+ * WHY THAT PATH AND NOT THE OTHER ONE, STATED PLAINLY. `qqe_with_kernel`
+ * (:270) takes the classic path only when the chosen kernel is `Scalar` AND
+ * the parameters are the defaults; `qqe_single_kernel` (:489) returns
+ * `Scalar` under `Auto` for `len <= 20_000` and `Avx512`/`Avx2` above that,
+ * and those route to `qqe_into_slices`' GENERIC path -- rsi_into_slice
+ * followed by ema_into_slice (:388-405) -- which is a DIFFERENT accumulation
+ * (a seeded Wilder RSI then a separate EMA pass, versus one fused walk).
+ * So the crate disagrees with ITSELF as a function of series length. The
+ * scalar classic path is taken as the oracle here for the same reason
+ * `wilders_scalar` was: it is the named, dedicated implementation of this
+ * indicator, and it is the path every short-series test in this crate
+ * exercises. RECORDED AS A CRATE DEFECT, not papered over: at 100k+ bars the
+ * CPU answer moves when nothing about the data or the parameters did.
+ *
+ * PERIOD-INVARIANT. `compute_qqe_batch` reads `rsi_period` (14),
+ * `smoothing_factor` (5) and `fast_factor` (4.236) -- NEVER `period`
+ * (cpu_batch.rs:15880-15882). Five swept periods give five identical CPU
+ * columns, so the kernel writes five identical rows.
+ *
+ * MULTI-OUTPUT: emits FAST, which is what `output_id == "value"` resolves to
+ * (cpu_batch.rs:15896). Never `slow` silently.
+ *
+ * WARMUP IS NOT `warm`. `warm = first + rsi + ema - 2` gates the SLOW series;
+ * FAST is written from `rsi_start = first + rsi_period` (:591), which is
+ * EARLIER. Filling the output NaN out to `warm` would blank three real bars.
+ *
+ * THE ATR CONSTANT IS PINNED AT 1/14 (:625) and is NOT `rsi_period` -- it
+ * stays 1/14 even when rsi_period is swept. Deriving it from the parameter
+ * would be a different indicator.
+ *
+ * SEED MEAN, THEN EMA. Inside `[rsi_start, rsi_start + smoothing)` the fast
+ * line is a RUNNING MEAN updated as `((n-1)*mean + rsi) / n` (:643); only
+ * after that does it become `beta.mul_add(prev, alpha * rsi)` -- ONE rounding
+ * for the fused term, reproduced with `fma` (:648).
+ *
+ * NaN. `any_nan` (:588) aborts the whole column when a seed delta is not
+ * finite; the CPU returns Ok and leaves the NaN prefix in place, so the
+ * kernel returns with the column already NaN-filled.
+ *
+ * SEQUENTIAL, one thread per combo column. No per-thread array at all.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define QQE_NEO_RSI_PERIOD 14     /* cpu_batch.rs:15880 */
+#define QQE_NEO_SMOOTHING  5      /* :15881 */
+#define QQE_NEO_FAST_K     4.236  /* :15882 */
+
+extern "C" __global__
+void qqe_neo_batch_f64(const double* __restrict__ data,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;                       /* PERIOD-INVARIANT -- see header. */
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+
+    if (first_valid < 0 || first_valid >= len) return;
+
+    const int    rsi_p  = QQE_NEO_RSI_PERIOD;
+    const int    ema_p  = QQE_NEO_SMOOTHING;
+    const int    first  = first_valid;
+
+    if (rsi_p <= 0 || rsi_p > len) return;                    /* :455 */
+    if (ema_p <= 0 || ema_p > len) return;                    /* :462 */
+    if (len - first < rsi_p + ema_p) return;                  /* :470 */
+
+    const int rsi_start = first + rsi_p;                      /* :565 */
+    if (rsi_start >= len) return;                             /* :567 */
+
+    const int ema_warmup_end = min(rsi_start + ema_p, len);   /* :570 */
+
+    const double inv_rsi  = 1.0 / (double)rsi_p;
+    const double beta_rsi = 1.0 - inv_rsi;
+
+    double avg_gain = 0.0, avg_loss = 0.0;
+
+    /* Seed, :585-601. `init_end` uses len-1, matching the CPU exactly. */
+    const int init_end = min(first + rsi_p, len - 1);
+    for (int i = first + 1; i <= init_end; ++i) {
+        const double delta = data[i] - data[i - 1];
+        if (!isfinite(delta)) return;                          /* any_nan, :607 */
+        if      (delta > 0.0) avg_gain += delta;
+        else if (delta < 0.0) avg_loss -= delta;
+    }
+
+    avg_gain *= inv_rsi;
+    avg_loss *= inv_rsi;
+
+    double rsi = (avg_gain + avg_loss == 0.0)
+        ? 50.0
+        : 100.0 * avg_gain / (avg_gain + avg_loss);
+
+    o[rsi_start] = rsi;                                        /* :621 */
+
+    double mean      = rsi;
+    const double ema_alpha = 2.0 / ((double)ema_p + 1.0);
+    const double ema_beta  = 1.0 - ema_alpha;
+    double prev_ema  = rsi;
+
+    for (int i = rsi_start + 1; i < len; ++i) {
+        const double delta = data[i] - data[i - 1];
+        const double gain  = (delta > 0.0) ?  delta : 0.0;
+        const double loss  = (delta < 0.0) ? -delta : 0.0;
+        avg_gain = inv_rsi * gain + beta_rsi * avg_gain;        /* :634 */
+        avg_loss = inv_rsi * loss + beta_rsi * avg_loss;        /* :635 */
+
+        rsi = (avg_gain + avg_loss == 0.0)
+            ? 50.0
+            : 100.0 * avg_gain / (avg_gain + avg_loss);
+
+        double fast_i;
+        if (i < ema_warmup_end) {
+            const double n = (double)(i - rsi_start + 1);
+            mean = ((n - 1.0) * mean + rsi) / n;                /* :643 */
+            prev_ema = mean;
+            fast_i = mean;
+        } else {
+            /* `ema_beta.mul_add(prev_ema, ema_alpha * rsi)` -- ONE rounding on
+               the fused product-add, so `fma`, not `a*b + c`. */
+            prev_ema = fma(ema_beta, prev_ema, ema_alpha * rsi);
+            fast_i = prev_ema;
+        }
+        o[i] = fast_i;
+    }
+}

@@ -64,6 +64,19 @@ pub mod cycle_channel_oscillator_wrapper;
 pub mod daily_factor_wrapper;
 #[cfg(feature = "cuda")]
 pub mod device_types;
+/// The f64 half of the device vocabulary. ADDITIVE — `device_types` is
+/// untouched because 180 f32 wrappers and the generated f32 dispatcher depend
+/// on it.
+#[cfg(feature = "cuda")]
+pub mod device_types_f64;
+/// Launch planning shared by the from-scratch f64 kernels: the slot count is
+/// chosen from FREE VRAM, never from how wide a sweep the operator asked for.
+#[cfg(feature = "cuda")]
+pub mod f64_launch;
+/// The one place a CUDA wrapper may admit it computed on the host. Its target
+/// value is ZERO — see the module doc for why it exists at all.
+#[cfg(feature = "cuda")]
+pub mod host_fallback;
 #[cfg(feature = "cuda")]
 pub mod di_wrapper;
 #[cfg(feature = "cuda")]
@@ -263,6 +276,12 @@ pub use device_types::{
     CudaDeviceMatrixF32Ref, CudaDeviceOhlc, CudaDeviceOhlcRef, CudaDeviceOhlcv, CudaDeviceOhlcvRef,
     CudaDeviceSliceF32Ref, CudaDeviceSliceI32Ref, CudaDeviceSliceI64Ref, CudaDeviceVector,
     CudaDeviceVectorF32, CudaDeviceVectorI32, CudaDeviceVectorI64, CudaDeviceViewError,
+};
+#[cfg(feature = "cuda")]
+pub use device_types_f64::{
+    CudaDeviceCloseVolumeF64Ref, CudaDeviceHighLowF64Ref, CudaDeviceMatrixF64,
+    CudaDeviceMatrixF64Ref, CudaDeviceOhlcF64Ref, CudaDeviceOhlcvF64, CudaDeviceOhlcvF64Ref,
+    CudaDeviceSliceF64Ref, CudaDeviceVectorF64,
 };
 #[cfg(feature = "cuda")]
 pub use di_wrapper::{CudaDi, CudaDiError, DeviceArrayF32Pair};
@@ -634,6 +653,10 @@ pub mod momentum_ratio_oscillator_wrapper;
 pub mod monotonicity_index_wrapper;
 #[cfg(feature = "cuda")]
 pub mod natr_wrapper;
+/// The NeoEthos f64 indicator lane: one module, ten `*_batch_f64` kernels, no
+/// narrowing and no fast math. See `kernels/cuda/neoethos_f64_kernels.cu`.
+#[cfg(feature = "cuda")]
+pub mod neoethos_f64_wrapper;
 #[cfg(feature = "cuda")]
 pub mod neighboring_trailing_stop_wrapper;
 #[cfg(feature = "cuda")]
@@ -915,6 +938,10 @@ pub use moving_averages::{
 };
 #[cfg(feature = "cuda")]
 pub use natr_wrapper::{CudaNatr, CudaNatrError};
+#[cfg(feature = "cuda")]
+pub use neoethos_f64_wrapper::{
+    CudaF64IndicatorError, CudaF64Indicators, F64Inputs, F64Kernel, F64SweepResult, MFI_MAX_PERIOD,
+};
 #[cfg(feature = "cuda")]
 pub use neighboring_trailing_stop_wrapper::{
     CudaNeighboringTrailingStop, CudaNeighboringTrailingStopError,

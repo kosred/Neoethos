@@ -241,3 +241,98 @@ void willr_many_series_one_param_time_major_f32(
         out_tm[idx] = (denom == 0.0f) ? 0.0f : ((h - c) / denom) * -100.0f;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `willr.rs::willr_scalar` (l.327), warmup
+// `first_valid + period - 1` (`willr.rs:257`, `alloc_with_nan_prefix`).
+//   * close NaN at the bar        -> NaN
+//   * any high/low NaN in window  -> NaN
+//   * denom == h - l; `denom == 0.0` -> 0.0 (EXACT zero test, no epsilon)
+//   * otherwise `(-100.0).mul_add((h - c) / denom, 0.0)` — ONE fused
+//     multiply-add. Written unfused it is two roundings and a different number;
+//     `fma(-100.0, ratio, 0.0)` is what this kernel emits.
+//
+// NaN semantics: the CPU walks the window with `if h0 > h { h = h0 }`, which
+// would let a NaN survive — but it detects NaN FIRST (`h0 != h0`) and breaks,
+// so the comparison chain is never reached with a NaN operand. This kernel
+// reproduces that structure: explicit `isnan` detection, then the comparison.
+// Using fmax/fmin instead would CHANGE the result, because fmax ignores a NaN
+// whereas the CPU turns the whole bar into NaN.
+//
+// f32 -> f64 audit: pointers/locals widened; `fmaxf`/`fminf` (x3 each in the
+// f32 kernel) removed in favour of the NaN-detecting chain above; f32 literals
+// (`-100.0f`, `0.0f`) widened; f32 NaN/INF constants replaced by the f64
+// quiet-NaN bit pattern and `INFINITY`/`-INFINITY`.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double willr_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void willr_batch_f64(const double* __restrict__ high,
+                     const double* __restrict__ low,
+                     const double* __restrict__ close,
+                     int n,
+                     const int*   __restrict__ periods,
+                     int n_combos,
+                     int first_valid,
+                     double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = willr_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    const long long start_ll =
+        static_cast<long long>(first_valid) + static_cast<long long>(period) - 1;
+    if (period <= 0 || start_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+    const int start_i = static_cast<int>(start_ll);
+
+    for (int t = 0; t < start_i; ++t) row[t] = nan_d;
+
+    for (int i = start_i; i < n; ++i) {
+        const double c = close[i];
+        if (isnan(c)) {
+            row[i] = nan_d;
+            continue;
+        }
+
+        const int win_start = i + 1 - period;
+        double h = -INFINITY;
+        double l = INFINITY;
+        bool any_nan = false;
+
+        for (int j = win_start; j <= i; ++j) {
+            const double hj = high[j];
+            const double lj = low[j];
+            if (isnan(hj) || isnan(lj)) {
+                any_nan = true;
+                break;
+            }
+            if (hj > h) h = hj;
+            if (lj < l) l = lj;
+        }
+
+        if (any_nan || !(isfinite(h) && isfinite(l))) {
+            row[i] = nan_d;
+            continue;
+        }
+
+        const double denom = h - l;
+        if (denom == 0.0) {
+            row[i] = 0.0;
+        } else {
+            const double ratio = (h - c) / denom;
+            row[i] = fma(-100.0, ratio, 0.0);
+        }
+    }
+}

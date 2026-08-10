@@ -344,3 +344,235 @@ extern "C" __global__ void devstop_many_series_one_param_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — devstop
+// ===========================================================================
+// Reference: src/indicators/devstop.rs
+//   `devstop_prepare`               (:289) — first = MIN of high's and low's
+//                                             first non-NaN
+//   `devstop_with_kernel`           (:509) -> `devstop_into_slice` (:357)
+//   `devstop_scalar_classic_sma`    (:2270) -> `devstop_scalar_classic_fused
+//                                             ::<false>` (:2030) — the branch
+//                                             the batch route reaches
+//   Batch route: `cpu_batch.rs:15047` sweeps `period`; mult = 0.0,
+//   devtype = 0, direction = "long", ma_type = "sma" — so `EMA == false` and
+//   the `mult * sigma` term is multiplied by ZERO at the default. The sigma
+//   arithmetic is still reproduced exactly, because a caller that passes a
+//   non-zero `mult` must get the CPU's number and not a simplification that
+//   was only correct at the default.
+//
+// FIRST-VALID IS THE **MIN** OF TWO SCANS, NOT THE MAX AND NOT A JOINT SCAN.
+//   `first = fh.min(fl)` (:320). Every other high/low indicator in this lane
+//   takes the first index where BOTH are non-NaN. devstop deliberately starts
+//   at the EARLIER of the two and lets the NaN flow into the range term, where
+//   the `r.is_finite()` guard drops it from the running moments. Using the
+//   common rule would start the series late and change every moment window.
+//   The registry declares `AllInputsNonNan` because that is what the host
+//   computes; the kernel derives devstop's own `first` from the arrays, as
+//   recorded here.
+//
+// WARMUP IS TWO PERIODS. `devstop_warmup = first + 2*period - 1` (:285):
+// `period` bars to fill the range ring and another `period` for the rolling
+// extremum of the base line. Half of that would be the obvious wrong answer.
+//
+// THE VARIANCE IS THE TEXTBOOK UNSTABLE FORM, AND THAT IS THE SPEC.
+//   `var = max0((sum2 - (sum*sum) * inv) * inv)` — sum of squares minus the
+//   square of the sum. In f32 this cancels catastrophically: for a range
+//   series with mean 1e-3 and spread 1e-5, `sum2` and `sum*sum/n` agree to six
+//   digits, which is every digit f32 has, and `sqrt` of the difference is
+//   noise. This is the single strongest reason devstop must be f64, and it is
+//   why the f32 kernel's `sqrtf` x2 could not be fixed by widening the sqrt
+//   alone.
+//   `max0` is `if x < 0.0 { 0.0 } else { x }` — an IF, so a NaN variance stays
+//   NaN. `fmax(x, 0.0)` would return 0.0 and then `sqrt(0)` = 0, turning "no
+//   answer" into "zero volatility".
+//
+// THE RING IS INSERTED AT A POSITION THAT IS **NOT** RESET TO 0.
+//   After the init loop the CPU sets `r_ins_pos = (period - 1) % period`
+//   (:2107), not 0. The main loop then evicts `r_ring[r_ins_pos]` before
+//   writing. Starting at 0 would evict the wrong element for the first
+//   `period` bars and the moments would be wrong for the whole series.
+// ===========================================================================
+
+#define DEVSTOP_MAX_PERIOD 512
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_devstop_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+    const double mult = 0.0;      // DevStopParams::get_mult   -> unwrap_or(0.0)
+    const bool is_long = true;    // direction "long"
+    // devtype 0 + ma_type "sma" -> devstop_scalar_classic_fused::<false>
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) || (period > DEVSTOP_MAX_PERIOD) ||
+        (first_valid < 0) || (first_valid >= n);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+
+    // `first = fh.min(fl)` — the MIN of two independent scans.
+    int fh = -1, fl = -1;
+    for (int i = 0; i < n; ++i) { if (!isnan(high[i])) { fh = i; break; } }
+    for (int i = 0; i < n; ++i) { if (!isnan(low[i]))  { fl = i; break; } }
+    if (fh < 0 || fl < 0) return;
+    const int first = (fh < fl) ? fh : fl;
+    if ((n - first) < period) return;
+
+    const int start_base = first + period;
+    const int start_final = start_base + period - 1;
+    if (start_base >= n) return;
+
+    double r_ring[DEVSTOP_MAX_PERIOD];
+    for (int k = 0; k < period; ++k) r_ring[k] = neo_s2_qnan();
+    int r_ins_pos = 0;
+    int r_inserted = 0;
+
+    double sum = 0.0;
+    double sum2 = 0.0;
+    int cnt = 0;
+
+    double prev_h = high[first];
+    double prev_l = low[first];
+    const int end_init = (start_base < n) ? start_base : n;
+
+    for (int k = first + 1; k < end_init; ++k) {
+        const double h = high[k];
+        const double l = low[k];
+        double rr;
+        if (isnan(h) || isnan(l) || isnan(prev_h) || isnan(prev_l)) {
+            rr = neo_s2_qnan();
+        } else {
+            const double hi2 = (h > prev_h) ? h : prev_h;
+            const double lo2 = (l < prev_l) ? l : prev_l;
+            rr = hi2 - lo2;
+        }
+        r_ring[r_ins_pos] = rr;
+        r_ins_pos += 1;
+        r_inserted += 1;
+        if (isfinite(rr)) {
+            sum += rr;
+            sum2 = fma(rr, rr, sum2);
+            cnt += 1;
+        }
+        prev_h = h;
+        prev_l = l;
+    }
+    r_ins_pos = (period - 1) % period;
+
+    double base_ring[DEVSTOP_MAX_PERIOD];
+    for (int k = 0; k < period; ++k) base_ring[k] = neo_s2_qnan();
+
+    const int cap = period;
+    int dq_buf[DEVSTOP_MAX_PERIOD];
+    int dq_head = 0;
+    int dq_len = 0;
+
+    for (int i = start_base; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+
+        double r_new;
+        if (isnan(h) || isnan(l) || isnan(prev_h) || isnan(prev_l)) {
+            r_new = neo_s2_qnan();
+        } else {
+            const double hi2 = (h > prev_h) ? h : prev_h;
+            const double lo2 = (l < prev_l) ? l : prev_l;
+            r_new = hi2 - lo2;
+        }
+        prev_h = h;
+        prev_l = l;
+
+        const bool had_full = (r_inserted >= period);
+        const double old = had_full ? r_ring[r_ins_pos] : neo_s2_qnan();
+        if (had_full && isfinite(old)) {
+            sum -= old;
+            sum2 -= old * old;
+            cnt -= 1;
+        }
+
+        r_ring[r_ins_pos] = r_new;
+        r_ins_pos = (r_ins_pos + 1) % period;
+        r_inserted += 1;
+        if (isfinite(r_new)) {
+            sum += r_new;
+            sum2 = fma(r_new, r_new, sum2);
+            cnt += 1;
+        }
+
+        double avtr, sigma;
+        if (cnt == 0) {
+            avtr = neo_s2_qnan();
+            sigma = neo_s2_qnan();
+        } else {
+            const double inv = 1.0 / (double)cnt;
+            const double mean = sum * inv;
+            double var = (sum2 - (sum * sum) * inv) * inv;
+            if (var < 0.0) var = 0.0;      // max0 — an if, so NaN survives
+            avtr = mean;
+            sigma = sqrt(var);
+        }
+
+        double base;
+        if (is_long) {
+            base = (isnan(h) || isnan(avtr) || isnan(sigma))
+                 ? neo_s2_qnan()
+                 : (h - avtr - mult * sigma);
+        } else {
+            base = (isnan(l) || isnan(avtr) || isnan(sigma))
+                 ? neo_s2_qnan()
+                 : (l + avtr + mult * sigma);
+        }
+
+        const int bslot = i % period;
+        base_ring[bslot] = base;
+
+        if (is_long) {
+            while (dq_len > 0) {
+                const int j = dq_buf[(dq_head + dq_len - 1) % cap];
+                const double bj = base_ring[j % period];
+                if (isnan(bj) || bj <= base) dq_len -= 1;
+                else break;
+            }
+        } else {
+            while (dq_len > 0) {
+                const int j = dq_buf[(dq_head + dq_len - 1) % cap];
+                const double bj = base_ring[j % period];
+                if (isnan(bj) || bj >= base) dq_len -= 1;
+                else break;
+            }
+        }
+        dq_buf[(dq_head + dq_len) % cap] = i;
+        dq_len += 1;
+
+        const int cut = i + 1 - period;
+        while (dq_len > 0 && dq_buf[dq_head] < cut) {
+            dq_head = (dq_head + 1) % cap;
+            dq_len -= 1;
+        }
+
+        if (i >= start_final) {
+            row[i] = (dq_len > 0) ? base_ring[dq_buf[dq_head] % period] : neo_s2_qnan();
+        }
+    }
+}

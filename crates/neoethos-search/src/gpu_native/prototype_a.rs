@@ -219,6 +219,21 @@ impl PrototypeARebatchPlan {
             .zip(scenarios.scenarios.iter())
             .enumerate()
         {
+            // TWO MEANINGS OF ONE FIELD, and this is the older one.
+            //
+            // Prototype A requires `base_candidate_id` to equal the gene's own
+            // `candidate_id` — a VALUE match — because A pairs one scenario per
+            // gene positionally and uses the equality as a self-check. The
+            // Prototype B population lane reads the same field as an INDEX into
+            // the uploaded gene array (`upload_scenarios` refuses anything
+            // outside `0..population`), which is what lets 174 genes carry
+            // 17 574 scenarios.
+            //
+            // Both hold for every work list in the tree because every producer
+            // numbers genes `0..population`, so index == id. A caller that
+            // numbers genes by anything else would satisfy exactly one of the
+            // two. A is the f32 engine measured 54 % wrong at 200 k bars and is
+            // slated for deletion; when it goes, this meaning goes with it.
             if scenario.base_candidate_id != candidate_id {
                 return Err(PrototypeAUploadError::ScenarioCandidateMismatch {
                     index,

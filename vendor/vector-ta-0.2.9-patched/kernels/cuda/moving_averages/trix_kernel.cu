@@ -337,3 +337,119 @@ void trix_many_series_one_param_f32(const float* __restrict__ prices_tm,
         ema3_prev = ema3;
     }
 }
+
+
+// ===========================================================================
+// S2 f64 LANE — trix
+// ===========================================================================
+// Reference: src/indicators/trix.rs
+//   `trix_prepare`              (:213) — first_valid, needed length, warmup
+//   `trix_with_kernel`          (:395) — alloc_with_nan_prefix(len, warmup_end)
+//   `trix_compute_into_scalar`  (:251) — three cascaded EMAs over ln(price)
+//
+// THE WARMUP IS A THREE-STAGE SEED, NOT A SINGLE OFFSET.
+//   warmup_end = first + 3*(period - 1) + 1
+//   stage 1: SMA of ln(price) over [first, first+period)      -> ema1 seed
+//   stage 2: EMA of ln(price) over [end1, first+2*period-1),
+//            averaged (with the seed included) -> ema2 seed
+//   stage 3: EMA-of-EMA over [end2, first+3*period-2),
+//            averaged (with the seed included) -> ema3 seed
+//   Each stage's running SUM INCLUDES ITS OWN SEED as its first term
+//   (`sum_ema1 = ema1` before the loop). Dropping that term shifts every later
+//   bar. Reproduced literally.
+//
+// SCALE = 10000.0 IS PART OF THE OUTPUT, not a display convenience:
+//   out[i] = (ema3 - ema3_prev) * 10000.0.
+//
+// LOGARITHMS. The f32 kernels above use `logf` (6 call sites). `logf` is not
+// `log` at reduced precision — it is a different polynomial with ~1e-7
+// relative error, and its output is then differenced against the previous
+// bar's, so the error is amplified by the reciprocal of a quantity that is
+// itself ~1e-4. This is the single largest f32 error source in the file.
+//
+// ROUNDINGS PER STAGE PER BAR: `(lv - ema).mul_add(alpha, ema)` -> sub + fma,
+// TWO. The f32 kernels use `__fmaf_rn` x6, which fuses correctly but at f32
+// width; the widening is the fix, the structure was already right.
+//
+// THE CPU'S UNROLL BY FOUR CHANGES NOTHING — identical, strictly dependent
+// bodies — so one loop per stage here.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s2_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_trix_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    // `trix_needed_len(period)` is the span the three seeds consume:
+    // 3*(period - 1) + 2, i.e. warmup_end - first + 1.
+    const long long needed = 3LL * (long long)(period - 1) + 2LL;
+
+    const bool declined =
+        (n <= 0) ||
+        (period <= 0) || (period > n) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        ((long long)(n - first_valid) < needed);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+        return;
+    }
+
+    const int warmup_end = first_valid + 3 * (period - 1) + 1;
+    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    if (warmup_end >= n) return;
+
+    const double alpha = 2.0 / ((double)period + 1.0);
+    const double inv_n = 1.0 / (double)period;
+    const double SCALE = 10000.0;
+
+    // Stage 1 — SMA of ln over [first, first + period).
+    double sum1 = 0.0;
+    const int end1 = first_valid + period;
+    for (int i = first_valid; i < end1; ++i) {
+        sum1 += log(prices[i]);
+    }
+    double ema1 = sum1 * inv_n;
+
+    // Stage 2 — the running sum SEEDED WITH ema1 itself.
+    double sum_ema1 = ema1;
+    const int end2 = first_valid + 2 * period - 1;
+    for (int i = end1; i < end2; ++i) {
+        const double lv = log(prices[i]);
+        ema1 = fma(lv - ema1, alpha, ema1);
+        sum_ema1 += ema1;
+    }
+    double ema2 = sum_ema1 * inv_n;
+
+    // Stage 3 — likewise seeded with ema2.
+    double sum_ema2 = ema2;
+    const int end3 = first_valid + 3 * period - 2;
+    for (int i = end2; i < end3; ++i) {
+        const double lv = log(prices[i]);
+        ema1 = fma(lv - ema1, alpha, ema1);
+        ema2 = fma(ema1 - ema2, alpha, ema2);
+        sum_ema2 += ema2;
+    }
+    double ema3_prev = sum_ema2 * inv_n;
+
+    for (int src = warmup_end; src < n; ++src) {
+        const double lv = log(prices[src]);
+        ema1 = fma(lv - ema1, alpha, ema1);
+        ema2 = fma(ema1 - ema2, alpha, ema2);
+        const double ema3 = fma(ema2 - ema3_prev, alpha, ema3_prev);
+        row[src] = (ema3 - ema3_prev) * SCALE;
+        ema3_prev = ema3;
+    }
+}

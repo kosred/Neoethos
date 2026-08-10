@@ -156,3 +156,152 @@ extern "C" __global__ void cycle_channel_oscillator_batch_f64(
         valid_count += 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/cycle_channel_oscillator.rs:594
+// (`cycle_channel_oscillator_with_kernel`). The column this emits is `fast`,
+// which is what `output_id == "value"` resolves to
+// (dispatch/cpu_batch.rs:9950-9952).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential -- three
+// interlocking Wilder RMA recurrences (the short MA, the medium MA and the
+// medium ATR, all `value + (input - value)/length` after a mean seed) plus a
+// VALID-BAR COUNTER that indexes the delay history. The counter advances only
+// on bars where source, high, low and close are ALL finite, so a bar-parallel
+// form cannot know its own history index.
+//
+// PERIOD-INVARIANT. `compute_cycle_channel_oscillator_batch`
+// (cpu_batch.rs:9968-9979) reads `source`, `short_cycle_length`,
+// `medium_cycle_length`, `short_multiplier` and `medium_multiplier` and NEVER
+// `period`, so five swept periods give five identical CPU columns and this
+// kernel emits five identical rows. Every CPU default is pinned below, and
+// `source` defaults to "close" (:9968) -- which is why this kernel takes the
+// Hlc triple and reads CLOSE where the multi-output entry point above takes a
+// separate `source` pointer.
+//
+// THE DELAY HISTORY IS A RING, NOT THE WHOLE SERIES. The entry point above
+// keeps a `len`-long history per row because it is handed scratch; a lane
+// kernel is not. The CPU only ever reads `history[valid_count - delay]`, so a
+// `delay + 1` ring holds exactly what is reachable. `short_delay` is
+// `(short_cycle_length / 2) / 2` = 2 and `medium_delay` = 7 at the pinned
+// defaults; the ring bound below is checked, not assumed.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and SKIPS -- rather than
+// stops at -- any bar whose four series are not all finite, so there is no
+// warmup index. The lane row declares `F64FirstValidRule::Ignored`.
+//
+// f64 END TO END: `fmax`/`fabs` are the double overloads (and `fmax` is what
+// the CPU's `f64::max` is, so a NaN true range cannot survive an if-chain --
+// rule 4), every literal is a double, and there is no fast-math intrinsic.
+// ---------------------------------------------------------------------------
+
+#define NEO_CCO_SHORT_CYCLE_LENGTH 10
+#define NEO_CCO_MEDIUM_CYCLE_LENGTH 30
+#define NEO_CCO_SHORT_MULTIPLIER 1.0
+#define NEO_CCO_MEDIUM_MULTIPLIER 3.0
+#define NEO_CCO_MAX_DELAY_RING 512
+
+extern "C" __global__ void cycle_channel_oscillator_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int short_cycle_length = NEO_CCO_SHORT_CYCLE_LENGTH;
+    const int medium_cycle_length = NEO_CCO_MEDIUM_CYCLE_LENGTH;
+    const double short_multiplier = NEO_CCO_SHORT_MULTIPLIER;
+    const double medium_multiplier = NEO_CCO_MEDIUM_MULTIPLIER;
+
+    if (short_cycle_length < 2 || medium_cycle_length < 2 || !isfinite(short_multiplier) ||
+        short_multiplier < 0.0 || !isfinite(medium_multiplier) || medium_multiplier < 0.0) {
+        return;
+    }
+
+    const int short_period = short_cycle_length / 2;
+    const int medium_period = medium_cycle_length / 2;
+    const int short_delay = short_period / 2;
+    const int medium_delay = medium_period / 2;
+    const int short_ring_len = short_delay + 1;
+    const int medium_ring_len = medium_delay + 1;
+    if (short_ring_len > NEO_CCO_MAX_DELAY_RING || medium_ring_len > NEO_CCO_MAX_DELAY_RING) {
+        return;
+    }
+
+    double short_hist[NEO_CCO_MAX_DELAY_RING];
+    double medium_hist[NEO_CCO_MAX_DELAY_RING];
+    for (int j = 0; j < short_ring_len; ++j) {
+        short_hist[j] = NAN;
+    }
+    for (int j = 0; j < medium_ring_len; ++j) {
+        medium_hist[j] = NAN;
+    }
+
+    RmaState short_rma;
+    RmaState medium_rma;
+    AtrState medium_atr;
+    short_rma.init(short_period);
+    medium_rma.init(medium_period);
+    medium_atr.init(medium_period);
+
+    int valid_count = 0;
+    for (int i = 0; i < n; ++i) {
+        const double src = close[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        if (!(isfinite(src) && isfinite(h) && isfinite(l) && isfinite(c))) {
+            continue;
+        }
+
+        const double short_ma = short_rma.update(src);
+        const double medium_ma = medium_rma.update(src);
+        const double medium_atr_value = medium_atr.update(h, l, c);
+
+        short_hist[valid_count % short_ring_len] = short_ma;
+        medium_hist[valid_count % medium_ring_len] = medium_ma;
+
+        double short_center = src;
+        if (valid_count + 1 > short_delay) {
+            const double delayed = short_hist[(valid_count - short_delay) % short_ring_len];
+            if (isfinite(delayed)) {
+                short_center = delayed;
+            }
+        }
+        (void)short_center;
+
+        double medium_center = src;
+        if (valid_count + 1 > medium_delay) {
+            const double delayed = medium_hist[(valid_count - medium_delay) % medium_ring_len];
+            if (isfinite(delayed)) {
+                medium_center = delayed;
+            }
+        }
+
+        const double offset = medium_multiplier * medium_atr_value;
+        const double denom = 2.0 * offset;
+        if (isfinite(denom) && denom != 0.0) {
+            const double medium_bottom = medium_center - offset;
+            row[i] = (src - medium_bottom) / denom;
+        }
+
+        valid_count += 1;
+    }
+}

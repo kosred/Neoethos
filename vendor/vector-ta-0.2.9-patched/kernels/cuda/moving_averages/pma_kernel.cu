@@ -324,3 +324,159 @@ extern "C" __global__ void pma_ms1p_tiled_f32_tx1_ty4(
     float* __restrict__ out_trigger_tm) {
     pma_many_series_core(prices_tm, num_series, series_len, first_valids, out_predict_tm, out_trigger_tm);
 }
+
+
+// ===========================================================================
+// S1 f64 LANE  --  pma
+// ===========================================================================
+// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
+// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
+// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
+// the WHOLE translation unit out of `--use_fast_math`, which is the only way
+// the opt-out can be correct: the f32 and f64 entry points share one
+// translation unit and nvcc has no per-entry flag.
+//
+// CPU reference: src/indicators/pma.rs -- `pma_scalar` (:214), `pma_with_kernel` (:187)
+//
+// PERIOD-INVARIANT. `compute_pma_batch` (cpu_batch.rs:15763) takes
+// `|_params|` and constructs `PmaParams::default()`; pma has no parameters at
+// all, so every row of a sweep is byte-identical.
+//
+// `pma_with_kernel` maps `Auto` to `Kernel::Scalar` (pma.rs:192-195).
+//
+// PRIMARY OUTPUT: `predict`. cpu_batch.rs:15776 maps "value" to `out.predict`;
+// `trigger` is a second series. Unlike the other multi-output indicators in
+// this shard, `trigger` is DOWNSTREAM of `predict` (it is a 4-tap sum of the
+// predict series), so dropping it cannot perturb what is emitted -- the
+// dependency runs one way only. Its accumulators are therefore not carried.
+//
+// ARITHMETIC ORDER -- this indicator is nothing BUT accumulation order:
+//   The seed sum is the explicit tree `((x0+x1)+(x2+x3)) + ((x4+x5)+x6)` --
+//   a BALANCED tree, not the ascending chain an ordinary loop would produce.
+//   Written out literally.
+//   The weighted seed is `((s01 + s23) + s45) + 7*x6` where
+//   `s01 = x0.mul_add(1.0, 2.0*x1)`, `s23 = 3*x2 + 4*x3`, `s45 = 5*x4 + 6*x5`.
+//   Note `s01` is a `mul_add` and `s23`/`s45` are not -- an inconsistency in
+//   the CPU that is nonetheless the reference, so it is reproduced exactly.
+//   The slides are `S = 7.0.mul_add(x_new, S) - old_A` and
+//   `S1 = 7.0.mul_add(w1, S1) - old_A1`: ONE fused rounding then a subtract.
+//   The output is `pr = 2.0.mul_add(w1, -w2)` -- ONE rounding; `2*w1 - w2`
+//   would be two.
+//   `INV_28 = 1.0/28.0` is formed once and MULTIPLIED, never divided by 28 at
+//   the use site. 1/28 is not representable, so the two differ.
+//
+// WARMUP: `alloc_with_nan_prefix(n, first + 7)`, but `predict[first + 6]` is
+// then written by the seed block, so the first emitted bar is `first + 6` and
+// the prefix at that index is overwritten. The input is declined outright when
+// `n <= first + 6`.
+// ===========================================================================
+
+#ifndef NEO_S1_QNAN_DEFINED
+#define NEO_S1_QNAN_DEFINED
+// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
+// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
+// quiet-NaN pattern, stated once per translation unit.
+__device__ __forceinline__ double neo_s1_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
+#endif
+
+extern "C" __global__ void neoethos_pma_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    (void)periods;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (n <= first_valid + 6);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
+        return;
+    }
+
+    const int warm = first_valid + 7;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
+
+    const double INV_28 = 1.0 / 28.0;
+
+    double x_ring[7];
+    double w_ring[7];
+    for (int k = 0; k < 7; ++k) { x_ring[k] = 0.0; w_ring[k] = 0.0; }
+    int x_head = 0, w_head = 0;
+
+    double A = 0.0, S = 0.0, A1 = 0.0, S1 = 0.0;
+
+    const int j0 = first_valid + 6;
+
+    const double x0 = prices[j0 - 6];
+    const double x1 = prices[j0 - 5];
+    const double x2 = prices[j0 - 4];
+    const double x3 = prices[j0 - 3];
+    const double x4 = prices[j0 - 2];
+    const double x5 = prices[j0 - 1];
+    const double x6 = prices[j0];
+
+    x_ring[0] = x0; x_ring[1] = x1; x_ring[2] = x2; x_ring[3] = x3;
+    x_ring[4] = x4; x_ring[5] = x5; x_ring[6] = x6;
+
+    A = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + x6);
+
+    {
+        const double s01 = fma(x0, 1.0, 2.0 * x1);
+        const double s23 = (3.0 * x2) + (4.0 * x3);
+        const double s45 = (5.0 * x4) + (6.0 * x5);
+        S = (s01 + s23) + s45 + 7.0 * x6;
+    }
+
+    double w1 = S * INV_28;
+
+    {
+        const double old_A1 = A1;
+        const double old_w = w_ring[w_head];
+        S1 = fma(7.0, w1, S1) - old_A1;
+        A1 = A1 + w1 - old_w;
+        w_ring[w_head] = w1;
+        if (++w_head == 7) w_head = 0;
+    }
+
+    double w2 = S1 * INV_28;
+    double pr = fma(2.0, w1, -w2);
+    row[j0] = pr;
+
+    for (int j = j0 + 1; j < n; ++j) {
+        const double x_new = prices[j];
+        const double x_old = x_ring[x_head];
+        const double old_A = A;
+
+        A = A + x_new - x_old;
+        S = fma(7.0, x_new, S) - old_A;
+
+        x_ring[x_head] = x_new;
+        if (++x_head == 7) x_head = 0;
+
+        w1 = S * INV_28;
+
+        const double old_A1 = A1;
+        const double w_old = w_ring[w_head];
+        S1 = fma(7.0, w1, S1) - old_A1;
+        A1 = A1 + w1 - w_old;
+
+        w_ring[w_head] = w1;
+        if (++w_head == 7) w_head = 0;
+
+        w2 = S1 * INV_28;
+
+        pr = fma(2.0, w1, -w2);
+        row[j] = pr;
+    }
+}

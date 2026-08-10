@@ -4,10 +4,15 @@
 //! tournament size, stagnation patience, archive capacity, SMC gate
 //! shaping, archive scoring thresholds, and selection-policy weighting —
 //! so the audit (P0-8) requires them to live in typed config rather than
-//! ambient env state. The struct is the single owner of those values and
-//! exposes a single `from_env` reader; production binaries install the
-//! resolved overrides once at startup via
-//! [`install_genetic_search_runtime_overrides_from_env`].
+//! ambient env state.
+//!
+//! 2026-08-10 — the env half is GONE. This struct is the single owner of
+//! those values and its only reader is
+//! [`GeneticSearchRuntimeOverrides::from_settings`]; production binaries
+//! install it once at startup via
+//! [`install_genetic_search_runtime_overrides_from_settings`]. The historical
+//! variable names are kept in the field docs below because that is what
+//! someone hunting a knob will search for.
 
 use super::evolution_math::{ParentSelectionPolicy, SurvivorSelectionPolicy};
 use neoethos_core::contracts::DeterminismPolicy;
@@ -200,105 +205,19 @@ impl Default for GeneticSearchRuntimeOverrides {
 }
 
 impl GeneticSearchRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_*` search env vars. This is
-    /// the only place the genetic search consults the environment for
-    /// these knobs.
-    pub fn from_env() -> Self {
-        let mut overrides = Self::default();
+    // `from_env()` DELETED 2026-08-10. It carried 22 `NEOETHOS_BOT_*` names —
+    // the RNG SEED, the novelty weight, early-stop patience, tournament size,
+    // archive cap and mode, the SMC gate curve, the SMC-gate hard bypass, and
+    // the whole parent/survivor selection policy. Every one of them changes
+    // which genes are created and which survive, so a run's meaning depended
+    // on a shell nothing recorded. All of them are typed on
+    // `models.search_runtime` and installed by
+    // `install_genetic_search_runtime_overrides_from_settings`.
 
-        if let Some(seed) = env_u64("NEOETHOS_BOT_SEARCH_SEED") {
-            overrides.seed = Some(seed);
-        }
-        if let Some(weight) = env_f64_finite("NEOETHOS_BOT_NOVELTY_WEIGHT") {
-            overrides.novelty_weight = weight;
-        }
-        if let Some(patience) = env_usize_positive("NEOETHOS_BOT_PROP_STAGNATION_GENS") {
-            overrides.stagnation_patience = patience;
-        }
-        // `env_u64` (not `_positive`) so `0` is honored as "disable early-stop".
-        if let Some(conv) = env_u64("NEOETHOS_BOT_PROP_CONVERGENCE_GENS") {
-            overrides.convergence_patience = conv as usize;
-        }
-        if let Some(min_imp) = env_f64_finite("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT") {
-            overrides.min_improvement = min_imp;
-        }
-        if let Some(frac) = env_f64_finite("NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC") {
-            overrides.convergence_min_elapsed_fraction = frac;
-        }
-        if let Some(tournament) = env_usize_positive("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE") {
-            overrides.tournament_size_override = Some(tournament);
-        }
-        if let Some(cap) = env_usize_positive("NEOETHOS_BOT_PROP_ARCHIVE_CAP") {
-            overrides.archive_cap_override = Some(cap);
-        }
-        if let Some(retry) = env_usize_positive("NEOETHOS_BOT_PROP_SEEN_RETRY") {
-            overrides.seen_retry_attempts = retry;
-        }
-
-        // SMC gate curve.
-        if let Some(start) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_START")
-            .or_else(|| env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE"))
-        {
-            overrides.smc_gate.start = start;
-        }
-        if let Some(end) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_END") {
-            overrides.smc_gate.end = end;
-        }
-        if let Some(curve) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_CURVE") {
-            overrides.smc_gate.curve = curve;
-        }
-        if let Some(step) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP") {
-            overrides.smc_gate.stagnation_step = step;
-        }
-        // Hard bypass: legacy `NEOETHOS_BOT_DISABLE_SMC_GATE=1` env var.
-        // F-CORE3 closure (2026-05-25): previously read inline inside
-        // `signals_for_gene_full` (search_engine.rs) and the GA's
-        // per-gene signal-synthesis loop (eval.rs::synthesize_signals_cpu).
-        // Now consolidated to this typed boundary so the env is hit at
-        // most once per process.
-        if env_truthy("NEOETHOS_BOT_DISABLE_SMC_GATE") {
-            overrides.smc_gate.disable_gate = true;
-        }
-
-        // Archive scoring thresholds.
-        if let Some(mode) = env_string_lowercase("NEOETHOS_BOT_PROP_ARCHIVE_MODE") {
-            overrides.archive_scoring.mode = mode;
-        }
-        if let Some(min_net) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET") {
-            overrides.archive_scoring.min_net = min_net;
-        }
-        if let Some(min_pf) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF") {
-            overrides.archive_scoring.min_pf = min_pf;
-        }
-        if let Some(min_sharpe) = env_f64_finite("NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE") {
-            overrides.archive_scoring.min_sharpe = min_sharpe;
-        }
-
-        // Selection policy.
-        if let Some(immigrants) = env_f64_finite("NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS") {
-            overrides.selection.immigrant_ratio = immigrants;
-        }
-        let survivor_fraction = env_f64_finite("NEOETHOS_BOT_PROP_SURVIVOR_FRACTION")
-            .or_else(|| env_f64_finite("NEOETHOS_BOT_PROP_ELITE_FRACTION"));
-        if let Some(value) = survivor_fraction {
-            overrides.selection.survivor_fraction = value;
-        }
-        if let Some(parent) = env_string_lowercase("NEOETHOS_BOT_PROP_PARENT_SELECTION") {
-            overrides.selection.parent = ParentSelectionPolicy::parse(&parent);
-        }
-        if let Some(survivor) = env_string_lowercase("NEOETHOS_BOT_PROP_SURVIVOR_SELECTION") {
-            overrides.selection.survivor = SurvivorSelectionPolicy::parse(&survivor);
-        }
-        if let Some(temp) = env_f64_finite("NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE") {
-            overrides.selection.temperature = temp;
-        }
-
-        overrides
-    }
 
     /// Config-driven constructor — the operator sets these knobs in the
     /// single `Settings` (config / UI / TUI), never the environment.
-    /// Mirrors [`Self::from_env`] field-for-field; an empty policy /
+    /// Mirrors the deleted `from_env` reader field-for-field; an empty policy /
     /// archive-mode string means "keep the engine default" so the config
     /// default need not duplicate the parser vocabulary. The
     /// `from_settings_default_matches_env_default` test guarantees a
@@ -477,6 +396,17 @@ pub struct CostProfileRuntimeOverrides {
     pub pip_value_per_lot: Option<f64>,
     pub spread_pips: Option<f64>,
     pub commission_per_trade: Option<f64>,
+    /// Is a BROKER-SOURCED per-lot commission quoted per side?
+    ///
+    /// Mirrors `risk.commission_per_lot_is_per_side`. It governs only the
+    /// broker-metadata and synthetic-fallback arms of
+    /// `infer_market_cost_profile` — `commission_per_trade` above is a caller's
+    /// value and is already a round trip by the name of the field, so it is
+    /// never doubled. See
+    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`] for
+    /// why one subtraction per closed trade means this conversion has to happen
+    /// somewhere, and why it happens at exactly two places.
+    pub commission_is_per_side: bool,
     pub reject_pip_fallback: bool,
 }
 
@@ -497,41 +427,19 @@ impl Default for CostProfileRuntimeOverrides {
             pip_value_per_lot: None,
             spread_pips: None,
             commission_per_trade: None,
+            // A broker quotes commission per side. Matches
+            // `RiskConfig::commission_per_lot_is_per_side`; the
+            // `from_settings(&Settings::default()) == default()` gate keeps the
+            // two from drifting.
+            commission_is_per_side: true,
             reject_pip_fallback: true,
         }
     }
 }
 
 impl CostProfileRuntimeOverrides {
-    fn populate_from_env(&mut self) {
-        if let Some(value) = env_string_nonempty("NEOETHOS_BOT_PROP_SYMBOL") {
-            self.symbol = Some(value);
-        }
-        if let Some(value) = env_string_nonempty("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY") {
-            self.account_currency = Some(value);
-        }
-        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_PIP_VALUE") {
-            self.pip_value = Some(value);
-        }
-        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE") {
-            self.quote_to_account_rate = Some(value);
-        }
-        if let Some(value) = env_f64_positive_finite("NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT") {
-            self.pip_value_per_lot = Some(value);
-        }
-        if let Some(value) = env_f64_non_negative_finite("NEOETHOS_BOT_PROP_SPREAD_PIPS") {
-            self.spread_pips = Some(value);
-        }
-        if let Some(value) = env_f64_non_negative_finite("NEOETHOS_BOT_PROP_COMMISSION") {
-            self.commission_per_trade = Some(value);
-        }
-        // F-CORE3 closure (2026-05-25): legacy `NEOETHOS_BOT_REJECT_PIP_FALLBACK=1`
-        // was previously read inline inside `reject_cross_pair_fallback()`
-        // in `strategy_gene.rs`; now consolidated to this typed boundary.
-        if env_truthy("NEOETHOS_BOT_REJECT_PIP_FALLBACK") {
-            self.reject_pip_fallback = true;
-        }
-    }
+    // `populate_from_env` DELETED 2026-08-10 — see the note on
+    // `StrategyEvaluationRuntimeOverrides`.
 }
 
 /// SMC weight knobs that previously lived in the
@@ -573,44 +481,8 @@ impl Default for SmcWeightRuntimeOverrides {
 }
 
 impl SmcWeightRuntimeOverrides {
-    fn populate_from_env(&mut self) {
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_GATE") {
-            self.gate_threshold = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_OB") {
-            self.w_ob = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_FVG") {
-            self.w_fvg = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_LIQ") {
-            self.w_liq = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_MTF") {
-            self.w_mtf = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_PREMIUM") {
-            self.w_premium = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT") {
-            self.w_inducement = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_BOS") {
-            self.w_bos = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_CHOCH") {
-            self.w_choch = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_EQH") {
-            self.w_eqh = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_EQL") {
-            self.w_eql = value;
-        }
-        if let Some(value) = env_f32_finite("NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT") {
-            self.w_displacement = value;
-        }
-    }
+    // `populate_from_env` DELETED 2026-08-10 — see the note on
+    // `StrategyEvaluationRuntimeOverrides`.
 }
 
 /// Typed runtime overrides for `EvaluationConfig::default` and
@@ -624,21 +496,84 @@ impl SmcWeightRuntimeOverrides {
 pub struct StrategyEvaluationRuntimeOverrides {
     pub cost_profile: CostProfileRuntimeOverrides,
     pub smc_weights: SmcWeightRuntimeOverrides,
+    /// Exit geometry. Config recipient for what `EvaluationConfig::for_symbol`
+    /// hardcoded from 2026-06-06 until 2026-08-09. See [`ExitPolicyOverrides`].
+    pub exit_policy: ExitPolicyOverrides,
+}
+
+/// The trailing-stop geometry every discovery evaluation runs under — the typed
+/// mirror of `neoethos_core::config::ExitPolicyConfig`.
+///
+/// BEHAVIOUR CHANGE, stated explicitly (2026-08-09). `trailing_enabled` defaults
+/// to `false`; it was an unreachable `true` literal in
+/// `strategy_gene.rs:851`. What this PERMITS: the take-profit is now reachable,
+/// so a realised payoff above ~1.1 is expressible at all — measured on real
+/// EURUSD bars, the old geometry produced payoff 0.87 at both tp 45 and tp 300
+/// (average win 6.10 vs 6.11 pips), i.e. the take-profit was dead code and the
+/// configured 2.0 payoff floor was unreachable by construction. What it REFUSES:
+/// the automatic move-to-break-even at +1R that the old comment credited with
+/// lowering drawdown enough to clear the prop-firm gate. That effect was real and
+/// is now gone unless the operator asks for it back.
+///
+/// It buys NO expected profit. Across every trailing configuration measured,
+/// expectancy stayed at -4.15 pips per trade while payoff moved 0.91 → 2.53.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExitPolicyOverrides {
+    pub trailing_enabled: bool,
+    pub trailing_be_trigger_r: f64,
+    /// A multiple of the position's own stop distance, NOT of ATR, despite the
+    /// `trailing_atr_multiplier` name it is copied into downstream
+    /// (`eval.rs:1030-1035`, and both GPU kernels bind that name).
+    pub trailing_stop_multiplier: f64,
+    pub trailing_min_lock_pips: f64,
+}
+
+impl Default for ExitPolicyOverrides {
+    fn default() -> Self {
+        Self {
+            trailing_enabled: false,
+            trailing_be_trigger_r: 1.0,
+            trailing_stop_multiplier: 1.0,
+            trailing_min_lock_pips: 2.0,
+        }
+    }
+}
+
+impl ExitPolicyOverrides {
+    /// Config-driven constructor. Non-finite or negative values are refused in
+    /// favour of the default rather than propagated — a NaN trigger would arm
+    /// the trail never, silently, on every gene.
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.exit_policy;
+        let d = Self::default();
+        let sane = |value: f64, fallback: f64| {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                fallback
+            }
+        };
+        Self {
+            trailing_enabled: c.trailing_enabled,
+            trailing_be_trigger_r: sane(c.trailing_be_trigger_r, d.trailing_be_trigger_r),
+            trailing_stop_multiplier: sane(c.trailing_stop_multiplier, d.trailing_stop_multiplier),
+            trailing_min_lock_pips: sane(c.trailing_min_lock_pips, d.trailing_min_lock_pips),
+        }
+    }
 }
 
 impl StrategyEvaluationRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_*` evaluation env
-    /// vars.
-    pub fn from_env() -> Self {
-        let mut overrides = Self::default();
-        overrides.cost_profile.populate_from_env();
-        overrides.smc_weights.populate_from_env();
-        overrides
-    }
+    // `from_env()` DELETED 2026-08-10 together with the two
+    // `populate_from_env` helpers it called. Between them they carried the
+    // COST PROFILE (symbol, account currency, pip value, spread, commission,
+    // slippage) and the twelve SMC scoring weights plus the gate threshold —
+    // i.e. the numbers a candidate's P&L is computed from. All are typed on
+    // `models.eval_runtime` and installed by
+    // `install_strategy_evaluation_runtime_overrides_from_settings`.
 
     /// Config-driven constructor — reads the cost-profile + SMC-weight
     /// knobs from the single `Settings` (config / UI / TUI) instead of the
-    /// environment. Mirrors [`Self::from_env`]; `None` cost fields stay
+    /// environment. Mirrors the deleted `from_env` reader; `None` cost fields stay
     /// `None`. Numeric cost overrides are validated the same way the env
     /// reader validated them (positive / non-negative finite). A
     /// `from_settings(&Settings::default()) == default()` test guarantees
@@ -666,6 +601,11 @@ impl StrategyEvaluationRuntimeOverrides {
                 commission_per_trade: c
                     .commission_per_trade
                     .filter(|v| v.is_finite() && *v >= 0.0),
+                // Lives on `risk`, not on `models.eval_runtime`: it describes
+                // the BROKER's quoting convention, which is a property of the
+                // account, and `risk.commission_per_lot` is the number it
+                // qualifies. Read from there so there is one answer.
+                commission_is_per_side: s.risk.commission_per_lot_is_per_side,
                 reject_pip_fallback: c.reject_pip_fallback,
             },
             smc_weights: SmcWeightRuntimeOverrides {
@@ -682,8 +622,94 @@ impl StrategyEvaluationRuntimeOverrides {
                 w_eql: c.smc_w_eql,
                 w_displacement: c.smc_w_displacement,
             },
+            exit_policy: ExitPolicyOverrides::from_settings(s),
         }
     }
+}
+
+/// The stop/target band gene generation and mutation may draw within — the typed
+/// mirror of `neoethos_core::config::GeneStopBoundsConfig`.
+///
+/// The multiples live here (process-wide, installed once from `Settings`); the
+/// per-run ATR that turns them into pips is a separate replaceable cell in
+/// `evolution_math`, because it is a property of the DATASET, not of the config,
+/// and the batch orchestrator runs many (symbol, timeframe) combos in one
+/// process. Keeping them apart is what stops an M5 scale leaking into an H4 run —
+/// the exact defect audit D06 found in the adaptive threshold ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct GeneStopBoundsOverrides {
+    pub atr_scaled: bool,
+    pub sl_min_atr: f64,
+    pub sl_max_atr: f64,
+    pub rr_min: f64,
+    pub rr_max: f64,
+    pub sl_min_pips: f64,
+    pub sl_max_pips: f64,
+    pub tp_min_pips: f64,
+    pub tp_max_pips: f64,
+}
+
+impl Default for GeneStopBoundsOverrides {
+    fn default() -> Self {
+        Self {
+            atr_scaled: true,
+            sl_min_atr: 1.0,
+            sl_max_atr: 4.0,
+            rr_min: 1.5,
+            rr_max: 4.0,
+            sl_min_pips: 6.0,
+            sl_max_pips: 20.0,
+            tp_min_pips: 12.0,
+            tp_max_pips: 45.0,
+        }
+    }
+}
+
+impl GeneStopBoundsOverrides {
+    /// Config-driven constructor. Every band is repaired to a usable ordering
+    /// rather than accepted as written: an inverted or non-finite band would
+    /// make `clamp` panic deep inside gene mutation, which is a crash in the
+    /// middle of a multi-hour run over a typo in a YAML file.
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let c = &s.models.gene_stop_bounds;
+        let d = Self::default();
+        let pos = |value: f64, fallback: f64| {
+            if value.is_finite() && value > 0.0 {
+                value
+            } else {
+                fallback
+            }
+        };
+        let sl_min_atr = pos(c.sl_min_atr, d.sl_min_atr);
+        let sl_min_pips = pos(c.sl_min_pips, d.sl_min_pips);
+        let tp_min_pips = pos(c.tp_min_pips, d.tp_min_pips);
+        let rr_min = pos(c.rr_min, d.rr_min);
+        Self {
+            atr_scaled: c.atr_scaled,
+            sl_min_atr,
+            sl_max_atr: pos(c.sl_max_atr, d.sl_max_atr).max(sl_min_atr),
+            rr_min,
+            rr_max: pos(c.rr_max, d.rr_max).max(rr_min),
+            sl_min_pips,
+            sl_max_pips: pos(c.sl_max_pips, d.sl_max_pips).max(sl_min_pips),
+            tp_min_pips,
+            tp_max_pips: pos(c.tp_max_pips, d.tp_max_pips).max(tp_min_pips),
+        }
+    }
+}
+
+static GENE_STOP_BOUNDS_OVERRIDES: OnceLock<GeneStopBoundsOverrides> = OnceLock::new();
+
+/// Config-driven install of the stop/target band multiples. Idempotent — called
+/// once at startup from `install_search_runtime_overrides_from_settings`.
+pub fn install_gene_stop_bounds_overrides_from_settings(s: &neoethos_core::Settings) {
+    let _ = GENE_STOP_BOUNDS_OVERRIDES.set(GeneStopBoundsOverrides::from_settings(s));
+}
+
+/// The installed band multiples, or the deterministic defaults when nothing was
+/// installed (the `neoethos-models` GA and every test fixture land here).
+pub fn current_gene_stop_bounds_overrides() -> GeneStopBoundsOverrides {
+    GENE_STOP_BOUNDS_OVERRIDES.get().copied().unwrap_or_default()
 }
 
 static STRATEGY_EVALUATION_RUNTIME_OVERRIDES: OnceLock<StrategyEvaluationRuntimeOverrides> =
@@ -698,11 +724,17 @@ pub fn install_strategy_evaluation_runtime_overrides(
     STRATEGY_EVALUATION_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_*`
-/// evaluation env vars once and installs them. Idempotent.
+/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
+/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
 pub fn install_strategy_evaluation_runtime_overrides_from_env() {
-    let _ =
-        STRATEGY_EVALUATION_RUNTIME_OVERRIDES.set(StrategyEvaluationRuntimeOverrides::from_env());
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_strategy_evaluation_runtime_overrides_from_env() is RETIRED and installs \
+         typed DEFAULTS — the cost-profile and SMC-weight env layer no longer exists. Call \
+         install_strategy_evaluation_runtime_overrides_from_settings(&settings)."
+    );
+    let _ = STRATEGY_EVALUATION_RUNTIME_OVERRIDES
+        .set(StrategyEvaluationRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the strategy-evaluation knobs from the
@@ -721,70 +753,12 @@ pub fn current_strategy_evaluation_runtime_overrides() -> StrategyEvaluationRunt
         .unwrap_or_default()
 }
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok())
-}
-
-fn env_string_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-fn env_f64_positive_finite(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-}
-
-fn env_f64_non_negative_finite(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-}
-
-fn env_usize_positive(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-}
-
-fn env_f64_finite(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-}
-
-fn env_f32_finite(name: &str) -> Option<f32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite())
-}
-
-fn env_string_lowercase(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-}
-
-/// Canonical boolean env-var parser. Returns true for `"1" | "true" | "TRUE"`
-/// (matching the historical inline checks in `signals_for_gene_full`,
-/// `synthesize_signals_cpu`, and `reject_cross_pair_fallback`). Empty
-/// or missing means false. Any unparsed value is treated as false so
-/// typos don't accidentally enable bypass behaviour.
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
-}
+// The nine `env_*` parsers that lived here (env_u64, env_string_nonempty,
+// env_f64_positive_finite, env_f64_non_negative_finite, env_usize_positive,
+// env_f64_finite, env_f32_finite, env_string_lowercase, env_truthy) were
+// DELETED 2026-08-10 with their last caller. Nothing in this crate reads the
+// environment for a knob any more; `crates/neoethos-search/tests
+// /env_surface_is_empty.rs` is the ratchet that keeps it that way.
 
 static GENETIC_SEARCH_RUNTIME_OVERRIDES: OnceLock<GeneticSearchRuntimeOverrides> = OnceLock::new();
 
@@ -797,10 +771,22 @@ pub fn install_genetic_search_runtime_overrides(
     GENETIC_SEARCH_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_*` search env
-/// vars once and installs them. Idempotent.
+/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
+/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
+///
+/// This one matters most: the struct it installs carries the RNG SEED and the
+/// selection policy, so installing defaults over an operator's config would
+/// change which genes the run creates. It says so rather than doing it
+/// quietly.
 pub fn install_genetic_search_runtime_overrides_from_env() {
-    let _ = GENETIC_SEARCH_RUNTIME_OVERRIDES.set(GeneticSearchRuntimeOverrides::from_env());
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_genetic_search_runtime_overrides_from_env() is RETIRED and installs typed \
+         DEFAULTS (including the RNG seed and selection policy) — the NEOETHOS_BOT_* search \
+         env layer no longer exists. Call \
+         install_genetic_search_runtime_overrides_from_settings(&settings)."
+    );
+    let _ = GENETIC_SEARCH_RUNTIME_OVERRIDES.set(GeneticSearchRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the genetic-search knobs from the single
@@ -911,6 +897,48 @@ mod tests {
         assert_eq!(
             StrategyEvaluationRuntimeOverrides::from_settings(&s),
             StrategyEvaluationRuntimeOverrides::default()
+        );
+    }
+
+    #[test]
+    fn gene_stop_bounds_from_settings_default_matches_default() {
+        // Same behaviour-preservation gate as the two above: the duplicated
+        // defaults in `neoethos_core::config::GeneStopBoundsConfig` and here must
+        // not drift apart, or the band the GA draws within depends on whether a
+        // config file was loaded.
+        let s = neoethos_core::Settings::default();
+        assert_eq!(
+            GeneStopBoundsOverrides::from_settings(&s),
+            GeneStopBoundsOverrides::default()
+        );
+    }
+
+    #[test]
+    fn the_discovery_trail_is_off_unless_the_operator_asks_for_it() {
+        // The point of the whole change. A fresh `Settings` must produce a
+        // DISABLED trail: from 2026-06-06 to 2026-08-09 this was `true` and
+        // unreachable, and it capped the realised payoff near 1.0 against a
+        // configured floor of 2.0 — 0 of 174 candidates could survive.
+        let s = neoethos_core::Settings::default();
+        let resolved = ExitPolicyOverrides::from_settings(&s);
+        assert!(
+            !resolved.trailing_enabled,
+            "discovery must default to NO trailing stop"
+        );
+        assert_eq!(resolved, ExitPolicyOverrides::default());
+
+        // And it must still be reachable — this is a knob, not a deletion.
+        let mut on = neoethos_core::Settings::default();
+        on.models.exit_policy.trailing_enabled = true;
+        assert!(ExitPolicyOverrides::from_settings(&on).trailing_enabled);
+
+        // A non-finite trigger arms the trail never, on every gene, silently.
+        // Refuse it at the boundary instead.
+        let mut broken = neoethos_core::Settings::default();
+        broken.models.exit_policy.trailing_be_trigger_r = f64::NAN;
+        assert_eq!(
+            ExitPolicyOverrides::from_settings(&broken).trailing_be_trigger_r,
+            1.0
         );
     }
 

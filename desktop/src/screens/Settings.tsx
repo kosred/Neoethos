@@ -8,8 +8,11 @@ import {
   updateSettings,
   setRiskPreset,
   riskInfo,
+  brokerCredentials,
+  saveBrokerCredentials,
   type BrokerStatus,
   type AccountInfo,
+  type BrokerCredentials,
 } from "../api";
 import { HelpPanel } from "../components/Help";
 
@@ -158,6 +161,56 @@ export default function Settings() {
     }
   };
   const setT = (k: string, v: any) => setTune((t: any) => ({ ...t, [k]: v }));
+
+  // ── cTrader API credentials (audit #119) ────────────────────────────────
+  // The Dashboard banner has told the operator for months to "go to Settings
+  // and add cTrader credentials" while no such form existed anywhere in
+  // `desktop/src`. Credentials are compiled into the binary by
+  // `neoethos-app/build.rs`; a revoked client_id therefore locked him out of
+  // his own broker until someone rebuilt and reinstalled the app. The backend
+  // endpoints (`GET`/`POST /broker/credentials`) already existed and are
+  // secret-safe: the GET returns a MASK and a boolean, never the secret, and
+  // an empty secret on POST means "keep the saved one".
+  //
+  // Nothing here logs, stores or echoes the typed secret. It goes straight to
+  // the backend, which writes it to `broker_credentials.toml` under the app
+  // data dir — the same store the OAuth flow already uses.
+  const [creds, setCreds] = useState<BrokerCredentials | null>(null);
+  const [credForm, setCredForm] = useState({ clientId: "", clientSecret: "", accountId: "", environment: "Demo", redirectUri: "" });
+  const [credsBusy, setCredsBusy] = useState(false);
+  const [showCreds, setShowCreds] = useState(false);
+  const loadCreds = async () => {
+    try {
+      const c = await brokerCredentials();
+      setCreds(c);
+      // Pre-fill everything EXCEPT the secret (the server never sends it).
+      setCredForm({
+        clientId: c.clientId ?? "",
+        clientSecret: "",
+        accountId: c.accountId ?? "",
+        environment: c.environment || "Demo",
+        redirectUri: c.redirectUri ?? "",
+      });
+    } catch (e) {
+      setMsg(`Could not read broker credentials: ${e}`);
+    }
+  };
+  const saveCreds = async () => {
+    setCredsBusy(true);
+    setMsg("Saving cTrader credentials…");
+    try {
+      const r = await saveBrokerCredentials(credForm);
+      // Drop the typed secret from component state the moment it is saved.
+      setCredForm((f) => ({ ...f, clientSecret: "" }));
+      await loadCreds();
+      await refresh();
+      setMsg(`✓ ${r?.message ?? "Credentials saved."}`);
+    } catch (e) {
+      setMsg(`Saving credentials failed: ${e}`);
+    } finally {
+      setCredsBusy(false);
+    }
+  };
 
   const doReauth = async () => {
     setBusy(true);
@@ -390,6 +443,104 @@ export default function Settings() {
           <b>{status?.accountId ?? "—"}</b>
         </div>
       </div>
+
+      <h2>
+        cTrader API credentials
+        <button
+          className="link"
+          style={{ marginLeft: 10 }}
+          onClick={() => {
+            const next = !showCreds;
+            setShowCreds(next);
+            if (next && !creds) loadCreds();
+          }}
+        >
+          {showCreds ? "hide" : "show"}
+        </button>
+      </h2>
+      <p className="muted small">
+        The app ships with a built-in cTrader Open API application. You only need this if your
+        broker revokes it, or you want to use your own — otherwise leave it alone. Get the values
+        from <code>connect.spotware.com</code> → your application. The secret is stored locally and
+        is <b>never</b> shown back to you or sent anywhere but your own machine.
+      </p>
+      {showCreds && (
+        <div className="ticket">
+          {creds && (
+            <p className="muted small" style={{ marginTop: 0 }}>
+              Saved secret: <b>{creds.clientSecretConfigured ? creds.clientSecretMask : "none"}</b>
+              {" · "}leave the field blank to keep it.
+            </p>
+          )}
+          <div className="ticket-row" style={{ flexWrap: "wrap", gap: 14 }}>
+            <label style={{ minWidth: 260 }}>
+              Client ID
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={credForm.clientId}
+                onChange={(e) => setCredForm((f) => ({ ...f, clientId: e.target.value }))}
+                style={{ width: 260 }}
+              />
+            </label>
+            <label style={{ minWidth: 260 }}>
+              Client secret
+              <input
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={creds?.clientSecretConfigured ? "(unchanged)" : ""}
+                value={credForm.clientSecret}
+                onChange={(e) => setCredForm((f) => ({ ...f, clientSecret: e.target.value }))}
+                style={{ width: 260 }}
+              />
+            </label>
+            <label style={{ minWidth: 150 }}>
+              Environment
+              <select
+                value={credForm.environment}
+                onChange={(e) => setCredForm((f) => ({ ...f, environment: e.target.value }))}
+                style={{ width: 150 }}
+              >
+                <option value="Demo">Demo (safe)</option>
+                <option value="Live">Live (real money)</option>
+              </select>
+            </label>
+            <label style={{ minWidth: 180 }}>
+              Account id (optional)
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={credForm.accountId}
+                onChange={(e) => setCredForm((f) => ({ ...f, accountId: e.target.value }))}
+                style={{ width: 180 }}
+              />
+            </label>
+            <label style={{ minWidth: 260 }}>
+              Redirect URI (leave blank for the default)
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={credForm.redirectUri}
+                onChange={(e) => setCredForm((f) => ({ ...f, redirectUri: e.target.value }))}
+                style={{ width: 260 }}
+              />
+            </label>
+          </div>
+          <div className="btn-row">
+            <button className="primary" disabled={credsBusy} onClick={saveCreds}>
+              {credsBusy ? "Saving…" : "Save credentials"}
+            </button>
+            <span className="muted small">
+              After saving, press <b>Authenticate cTrader</b> below once — the saved credentials are
+              what the OAuth flow uses.
+            </span>
+          </div>
+        </div>
+      )}
 
       <div className="banner info">
         Authentication is <b>automatic</b>. You only authenticate <b>once</b> — after that the access

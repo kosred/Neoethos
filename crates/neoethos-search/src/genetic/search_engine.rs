@@ -265,21 +265,27 @@ pub struct SmcGateArrays {
     rows: Vec<crate::eval::SmcRow>,
 }
 
-/// Counts `SmcGateArrays::build` calls so a test can pin that the pool-wide
-/// build happens ONCE per screen.
-///
-/// Without it, moving the build back inside the screen's `filter_map` —
-/// strictly worse than the code before the hoist, since it also pays the
-/// row-pack per candidate — leaves the whole suite green and hands the entire
-/// saving back with no signal. A reviewer ran exactly that mutant.
-///
-/// Thread-local, not a global atomic: five other tests in this binary build gate
-/// arrays, so a process-wide before/after delta measured them too and the
-/// assertion failed in the suite while passing alone. The screen runs inside a
-/// single-worker pool in the test so every build it triggers lands on the
-/// counting thread.
 #[cfg(test)]
 thread_local! {
+    /// Counts `SmcGateArrays::build` calls so a test can pin that the pool-wide
+    /// build happens ONCE per screen.
+    ///
+    /// Without it, moving the build back inside the screen's `filter_map` —
+    /// strictly worse than the code before the hoist, since it also pays the
+    /// row-pack per candidate — leaves the whole suite green and hands the entire
+    /// saving back with no signal. A reviewer ran exactly that mutant.
+    ///
+    /// Thread-local, not a global atomic: five other tests in this binary build gate
+    /// arrays, so a process-wide before/after delta measured them too and the
+    /// assertion failed in the suite while passing alone. The screen runs inside a
+    /// single-worker pool in the test so every build it triggers lands on the
+    /// counting thread.
+    ///
+    /// The doc block sits INSIDE the macro, not above the invocation: above it,
+    /// rustdoc discards it (`unused_doc_comments`) and this reasoning — which is
+    /// the only record of why a reviewer's mutant went undetected — is silently
+    /// dropped from the docs. Same principle as the rest of this workflow: a
+    /// silent drop is a defect even when what is dropped is only prose.
     pub(crate) static SMC_GATE_BUILD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -560,6 +566,10 @@ pub fn evaluate_genes_cached(
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,
         trailing_be_trigger_r: config.trailing_be_trigger_r,
+        // Carried explicitly (2026-08-09): it was inheriting the struct default
+        // here while the other three came from `config`, so a change to the
+        // lock-in floor reached the funnel and not the GA.
+        trailing_min_lock_pips: config.trailing_min_lock_pips,
         pip_value: config.pip_value,
         spread_pips: config.spread_pips,
         commission_per_trade: config.commission_per_trade,
@@ -626,30 +636,95 @@ pub fn evaluate_genes_cached(
 /// the fixed-1-lot trade-pnl sum, so a consumer testing `metrics[g][0] > 0.0`
 /// gets the SAME profitable/not verdict as the serial
 /// `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`.
-pub fn validation_genes_population(
-    features: &FeatureFrame,
+/// The per-RUN half of validation host prep.
+///
+/// Everything in here is a function of the BARS alone — the transposed indicator
+/// matrix, the month and day indices, and the eleven SMC arrays interleaved into
+/// per-bar rows. None of it depends on which genes are being evaluated, and all
+/// of it was being rebuilt on every call.
+///
+/// The cost of that is not incidental. `validation_genes_population`'s own
+/// in-tree measurement reads "eighteen of these calls take 413.6 s of a 452.4 s
+/// run — 23 s each — while the device stage timing inside one adds up to 0.30
+/// s". `transpose_features` copies `features x bars` floats; `build_smc_arrays`
+/// derives eleven lookback-heavy series over the whole history. On EURUSD M5
+/// that is 843 456 bars rebuilt from scratch, seven times, to evaluate genes
+/// that changed and bars that did not.
+///
+/// The GA has had exactly this cache (`EvalDataCache`) since it was written.
+/// The validation tail — which is 99.9 % of a run — had none.
+#[derive(Debug, Clone)]
+pub struct ValidationPrep {
+    pub indicators: Array2<f32>,
+    pub months: Vec<i64>,
+    pub days: Vec<i64>,
+    pub smc_data: Vec<crate::eval::SmcRow>,
+}
+
+impl ValidationPrep {
+    /// Build it once, at the top of a run, and hand it to every call.
+    pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<Self> {
+        let n_samples = features.n_samples();
+        if n_samples == 0 || features.n_features() == 0 {
+            bail!("empty feature matrix");
+        }
+        if ohlcv.close.len() != n_samples {
+            bail!("ohlcv length does not match feature rows");
+        }
+        let indicators = transpose_features(features);
+        let (months, days) = month_day_indices(&features.timestamps);
+        let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+            build_smc_arrays(features, ohlcv);
+        let mut smc_data = Vec::with_capacity(n_samples);
+        for i in 0..n_samples {
+            smc_data.push([
+                ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i],
+                eql[i], disp[i],
+            ]);
+        }
+        Ok(Self {
+            indicators,
+            months,
+            days,
+            smc_data,
+        })
+    }
+}
+
+/// The per-CALL half: the gene CSR pack, the per-gene SL/TP fallbacks, the SMC
+/// flag rows and the adaptive-stop resolution.
+///
+/// Separated from [`ValidationPrep`] because this genuinely does depend on the
+/// genes — and separated from the launch itself because none of it touches the
+/// device. That is what lets the caller build it OUTSIDE `GPU_LAUNCH_LOCK`: the
+/// lock exists so a rayon `par_iter` cannot create one ~16 GB session per
+/// worker, and holding it across host work that no other thread's device access
+/// could conflict with serialises the CPU for nothing.
+pub struct PreparedValidation {
+    pub offsets: Vec<i32>,
+    pub indices: Vec<i32>,
+    pub weights: Vec<f32>,
+    pub long_thr: Vec<f32>,
+    pub short_thr: Vec<f32>,
+    pub sl_pips: Vec<f64>,
+    pub tp_pips: Vec<f64>,
+    pub stop_vol_mults: Vec<f64>,
+    pub gene_smc_flags: Vec<crate::eval::SmcRow>,
+    pub smc_weights: [f32; 11],
+    pub gate_threshold: f32,
+    pub settings: BacktestSettings,
+}
+
+/// Pack a gene batch for the validation lane. Pure host work; no device call.
+pub fn prepare_validation_population(
     ohlcv: &Ohlcv,
     genes: &[Gene],
     config: &EvaluationConfig,
     settings_template: &BacktestSettings,
-) -> Result<Vec<[f64; 11]>> {
-    if genes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if features.n_samples() == 0 || features.n_features() == 0 {
-        bail!("empty feature matrix");
-    }
-    let n_samples = features.n_samples();
-    if ohlcv.close.len() != n_samples {
-        bail!("ohlcv length does not match feature rows");
-    }
-
-    let indicators = transpose_features(features);
+) -> Result<PreparedValidation> {
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does:
-    // the gene's own finite-positive value, else the 20/40-pip fallback. This is
-    // what the serial validation path injected into `simulate_trades_core`, so
-    // the SL/TP exits stay identical.
+    // the gene's own finite-positive value, else the 20/40-pip fallback.
     let mut sl_pips = Vec::with_capacity(genes.len());
     let mut tp_pips = Vec::with_capacity(genes.len());
     for g in genes {
@@ -663,17 +738,6 @@ pub fn validation_genes_population(
         } else {
             40.0
         });
-    }
-    let (months, days) = month_day_indices(&features.timestamps);
-
-    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
-        build_smc_arrays(features, ohlcv);
-    let mut smc_data = Vec::with_capacity(n_samples);
-    for i in 0..n_samples {
-        smc_data.push([
-            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
-            disp[i],
-        ]);
     }
     let mut gene_smc_flags = Vec::with_capacity(genes.len());
     for g in genes {
@@ -691,7 +755,6 @@ pub fn validation_genes_population(
             g.use_displacement as i8,
         ]);
     }
-
     let smc_weights = [
         config.smc_weight_ob,
         config.smc_weight_fvg,
@@ -705,11 +768,8 @@ pub fn validation_genes_population(
         config.smc_weight_eql,
         config.smc_weight_displacement,
     ];
-
     // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
-    // metrics[0] sign matches the serial `simulate_trades_core` reference. The
-    // caller is expected to pass `risk_based_sizing == false` already; this is
-    // belt-and-suspenders so a stray template can never silently change sizing.
+    // metrics[0] sign matches the serial `simulate_trades_core` reference.
     let mut settings = settings_template.clone();
     settings.risk_based_sizing = false;
     let stop_vol_mults = resolve_adaptive_stops(
@@ -720,29 +780,166 @@ pub fn validation_genes_population(
         config,
         &mut settings,
     )?;
+    Ok(PreparedValidation {
+        offsets,
+        indices,
+        weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mults,
+        gene_smc_flags,
+        smc_weights,
+        gate_threshold: config.smc_gate_threshold,
+        settings,
+    })
+}
+
+/// ONE LAUNCH FOR THE WHOLE WORK LIST.
+///
+/// The scenario twin of [`validation_genes_population`]. The gene array and the
+/// descriptor array are independent: 174 genes carrying 17 574 scenarios is one
+/// submission where the population form needed seven — six Monte-Carlo chunks
+/// and a sensitivity pass.
+///
+/// Takes both caches by reference and touches the device exactly once, so a
+/// caller can hold `GPU_LAUNCH_LOCK` across this call and nothing else.
+pub fn validation_genes_scenarios(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    prep: &ValidationPrep,
+    prepared: &PreparedValidation,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> Result<Vec<[f64; 11]>> {
+    if scenarios.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _telemetry_started = std::time::Instant::now();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard(
+        "search_engine::validation_genes_scenarios",
+        scenarios.len(),
+        _telemetry_started,
+    );
+
+    crate::eval::validation_backtest_scenarios(
+        crate::eval::PopulationEvalInputs {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            indicators: prep.indicators.view(),
+            gene_offsets: &prepared.offsets,
+            gene_indices: &prepared.indices,
+            gene_weights: &prepared.weights,
+            long_thr: &prepared.long_thr,
+            short_thr: &prepared.short_thr,
+            month_idx: &prep.months,
+            day_idx: &prep.days,
+            timestamps: &features.timestamps,
+            sl_pips: &prepared.sl_pips,
+            tp_pips: &prepared.tp_pips,
+            stop_vol_mult: &prepared.stop_vol_mults,
+            smc_data: &prep.smc_data,
+            gene_smc_flags: &prepared.gene_smc_flags,
+            gate_threshold: prepared.gate_threshold,
+            weights: &prepared.smc_weights,
+            settings: &prepared.settings,
+        },
+        scenarios,
+    )
+}
+
+pub fn validation_genes_population(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+) -> Result<Vec<[f64; 11]>> {
+    // Reports itself on first call — see `eval_telemetry`.
+    //
+    // This function was invisible. Its own in-tree measurement reads "eighteen
+    // of these calls take 413.6 s of a 452.4 s run — 23 s each — while the
+    // device stage timing inside one adds up to 0.30 s", and the only telemetry
+    // covering any of it started AFTER the prep below: the transpose, the
+    // month/day index build, the eleven SMC arrays and the adaptive-stop
+    // resolution were attributed to nothing at all. Two guards, because the
+    // whole-function total and the prep-only total answer different questions
+    // and only their difference names the culprit.
+    let _telemetry_started = std::time::Instant::now();
+    struct TelemetryGuard(&'static str, usize, std::time::Instant);
+    impl Drop for TelemetryGuard {
+        fn drop(&mut self) {
+            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
+        }
+    }
+    let _telemetry = TelemetryGuard(
+        "search_engine::validation_genes_population",
+        genes.len(),
+        _telemetry_started,
+    );
+
+    if genes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if features.n_samples() == 0 || features.n_features() == 0 {
+        bail!("empty feature matrix");
+    }
+    let n_samples = features.n_samples();
+    if ohlcv.close.len() != n_samples {
+        bail!("ohlcv length does not match feature rows");
+    }
+
+    let prep_started = std::time::Instant::now();
+    // Both halves, built here because this entry point has nowhere to cache
+    // them. That is the cost this signature imposes and the reason
+    // `ValidationPrep` exists as a separate type: a caller that makes more than
+    // one call — the quality screen made seven — should build the bar-derived
+    // half ONCE and use `validation_genes_scenarios` instead. There is one
+    // implementation of the prep either way, so the two paths cannot drift.
+    let prep = ValidationPrep::build(features, ohlcv)?;
+    let prepared = prepare_validation_population(ohlcv, genes, config, settings_template)?;
+
+    // Everything above — transpose, gene CSR pack, month/day indices, the
+    // eleven SMC arrays, the adaptive-stop resolution — is host work done
+    // BEFORE any device sees anything, on the full series, once per call. It is
+    // recorded separately from the whole-function total so the difference
+    // between the two lines is the evaluation itself; one number for both would
+    // charge the card for work it never did.
+    crate::eval_telemetry::record(
+        "search_engine::validation_genes_population/host_prep",
+        genes.len(),
+        prep_started.elapsed(),
+    );
 
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
             close: &ohlcv.close,
             high: &ohlcv.high,
             low: &ohlcv.low,
-            indicators: indicators.view(),
-            gene_offsets: &offsets,
-            gene_indices: &indices,
-            gene_weights: &weights,
-            long_thr: &long_thr,
-            short_thr: &short_thr,
-            month_idx: &months,
-            day_idx: &days,
+            indicators: prep.indicators.view(),
+            gene_offsets: &prepared.offsets,
+            gene_indices: &prepared.indices,
+            gene_weights: &prepared.weights,
+            long_thr: &prepared.long_thr,
+            short_thr: &prepared.short_thr,
+            month_idx: &prep.months,
+            day_idx: &prep.days,
             timestamps: &features.timestamps,
-            sl_pips: &sl_pips,
-            tp_pips: &tp_pips,
-            stop_vol_mult: &stop_vol_mults,
-            smc_data: &smc_data,
-            gene_smc_flags: &gene_smc_flags,
-            gate_threshold: config.smc_gate_threshold,
-            weights: &smc_weights,
-            settings: &settings,
+            sl_pips: &prepared.sl_pips,
+            tp_pips: &prepared.tp_pips,
+            stop_vol_mult: &prepared.stop_vol_mults,
+            smc_data: &prep.smc_data,
+            gene_smc_flags: &prepared.gene_smc_flags,
+            gate_threshold: prepared.gate_threshold,
+            weights: &prepared.smc_weights,
+            settings: &prepared.settings,
         },
     ))
 }
@@ -1338,6 +1535,10 @@ pub fn evaluate_genes(
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,
         trailing_be_trigger_r: config.trailing_be_trigger_r,
+        // Carried explicitly (2026-08-09): it was inheriting the struct default
+        // here while the other three came from `config`, so a change to the
+        // lock-in floor reached the funnel and not the GA.
+        trailing_min_lock_pips: config.trailing_min_lock_pips,
         pip_value: config.pip_value,
         spread_pips: config.spread_pips,
         commission_per_trade: config.commission_per_trade,

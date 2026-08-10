@@ -56,10 +56,27 @@ fn position_open_times(runtime: &CTraderAccountRuntimeSnapshot) -> HashMap<i64, 
     opened
 }
 
+/// The cTrader broker environment currently selected on disk, as the string the
+/// journal stores (`"Demo"` / `"Live"`).
+///
+/// 2026-08-09: this is the fact the demo forward-test gate needs and could not
+/// previously read off a journal row. It is deliberately taken here, on the
+/// reconcile path, because this is the moment the fill is turned into a record —
+/// the environment that was live when the deal executed is the environment the
+/// account-refresh that produced this snapshot ran against.
+fn current_environment_label() -> String {
+    crate::app_services::broker_persistence::load_broker_settings()
+        .ctrader
+        .environment
+        .as_str()
+        .to_string()
+}
+
 fn closed_trade_from_deal(
     d: &CTraderDealSnapshot,
     names: &HashMap<i64, String>,
     account_id: &str,
+    environment: &str,
     opened_at: &HashMap<i64, i64>,
 ) -> Option<ClosedTrade> {
     let net = d.net_profit?;
@@ -95,6 +112,10 @@ fn closed_trade_from_deal(
         // Per-account scoping (2026-07-02): the journal serves ONE account's
         // history at a time — stamp every row with its owner.
         account_id: Some(account_id.to_string()),
+        // Environment scoping (2026-08-09): the demo forward-test gate counts
+        // DEMO fills. Without this stamp there was no way to tell one from the
+        // other on a stored row.
+        environment: Some(environment.to_string()),
         // Only when it is genuinely earlier than the close. An opening deal that
         // arrived in the same batch as its closing one would otherwise stamp a
         // zero-length trade, which reads as a measurement rather than a gap.
@@ -124,16 +145,43 @@ pub fn reconcile_best_effort(
     };
 
     let account_id = runtime.reconcile.account_id.to_string();
+    let environment = current_environment_label();
     let mut recorded_any = false;
     let opened_at = position_open_times(runtime);
+
+    // Every deal that does NOT become a journal row is counted and reasoned.
+    // The journal is a decision path — the demo forward-test gate counts these
+    // rows before real money is allowed — so "it just didn't show up" must
+    // never be a possible explanation.
+    let mut recorded = 0usize;
+    let mut already_present = 0usize;
+    let mut write_failed = 0usize;
+    let mut opening_fills = 0usize;
+    let mut deferred_cold_catalog = 0usize;
     for deal in &runtime.recent_deals {
-        let Some(trade) = closed_trade_from_deal(deal, names, &account_id, &opened_at) else {
+        if deal.net_profit.is_none() {
+            // An opening fill is not a closed trade; nothing is lost.
+            opening_fills += 1;
+            continue;
+        }
+        let Some(trade) =
+            closed_trade_from_deal(deal, names, &account_id, &environment, &opened_at)
+        else {
+            // The only remaining refusal: the broker symbol catalog has not
+            // populated yet. Recording is idempotent on `position_id` and the
+            // deal stays in the broker's recent-deals window, so the next
+            // refresh records it under its real name. Deferred, not dropped.
+            deferred_cold_catalog += 1;
             continue;
         };
         match journal_store::record_closed_trade(&dir, &trade) {
-            Ok(true) => recorded_any = true,
-            Ok(false) => {} // already recorded
+            Ok(true) => {
+                recorded += 1;
+                recorded_any = true;
+            }
+            Ok(false) => already_present += 1,
             Err(e) => {
+                write_failed += 1;
                 tracing::warn!(
                     target: "neoethos_app::journal_reconcile",
                     error = %e, position_id = trade.position_id,
@@ -141,6 +189,25 @@ pub fn reconcile_best_effort(
                 );
             }
         }
+    }
+    if deferred_cold_catalog > 0 || write_failed > 0 {
+        tracing::warn!(
+            target: "neoethos_app::journal_reconcile",
+            deals_seen = runtime.recent_deals.len(),
+            recorded, already_present, opening_fills,
+            deferred_cold_catalog, write_failed,
+            "journal reconcile did not record every closing deal — \
+             {deferred_cold_catalog} deferred until the broker symbol catalog \
+             populates (retried on the next refresh), {write_failed} failed to write"
+        );
+    } else if recorded > 0 {
+        tracing::debug!(
+            target: "neoethos_app::journal_reconcile",
+            deals_seen = runtime.recent_deals.len(),
+            recorded, already_present, opening_fills,
+            %environment,
+            "journal reconcile: closing deals recorded"
+        );
     }
 
     // Sample equity only when a new trade closed — keeps the equity file
@@ -156,6 +223,7 @@ pub fn reconcile_best_effort(
                 // balance is the realized-equity anchor for the curve.
                 equity: balance,
                 account_id: Some(account_id.clone()),
+                environment: Some(environment.clone()),
             },
         );
     }
@@ -207,7 +275,7 @@ mod entry_time_tests {
         assert_eq!(opened.get(&500), Some(&1_700_000_000_000));
 
         let closing = &deals[1];
-        let trade = closed_trade_from_deal(closing, &catalog(), "acct", &opened)
+        let trade = closed_trade_from_deal(closing, &catalog(), "acct", "Demo", &opened)
             .expect("a closing deal with a net figure is a closed trade");
         assert_eq!(trade.entry_ts_ms, Some(1_700_000_000_000));
         assert_eq!(trade.exit_ts_ms, Some(1_700_003_600_000));
@@ -222,7 +290,7 @@ mod entry_time_tests {
         let mut opened: HashMap<i64, i64> = HashMap::new();
         opened.insert(501, 1_700_003_600_000); // only the close is known
 
-        let trade = closed_trade_from_deal(&closing, &catalog(), "acct", &opened)
+        let trade = closed_trade_from_deal(&closing, &catalog(), "acct", "Demo", &opened)
             .expect("still a closed trade");
         assert_eq!(
             trade.entry_ts_ms, None,

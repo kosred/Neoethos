@@ -368,13 +368,22 @@ impl PrototypePopulationWorkload {
     }
 
     fn scenario_is_supported(&self, index: usize) -> bool {
+        use neoethos_gpu_contracts::device::{NO_MICRO_OVERRIDE, NO_TICK_OVERRIDE};
         let scenario = &self.scenarios.scenarios[index];
+        // "No cost override" is the SENTINEL, not zero.
+        //
+        // These read `spread_ticks == 0 && commission_micros == 0`, which was
+        // right while 0 meant "unset". It now means "charge nothing", so the
+        // test approved a free-trading scenario and refused the real
+        // no-override one — the B/C intersection would have rejected every
+        // descriptor `base_scenario` produces while waving through the one that
+        // prices trades at zero.
         scenario.window_offset == 0
             && scenario.window_len as usize == self.dataset.bars()
             && scenario.scenario_type == 0
-            && scenario.spread_ticks == 0
+            && scenario.spread_ticks == NO_TICK_OVERRIDE
             && scenario.slippage_ticks == 0
-            && scenario.commission_micros == 0
+            && scenario.commission_micros == NO_MICRO_OVERRIDE
             && scenario.perturbation_count == 0
     }
 }

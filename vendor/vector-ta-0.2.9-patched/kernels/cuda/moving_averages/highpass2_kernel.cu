@@ -343,3 +343,87 @@ void highpass2_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — highpass_2_pole  (this file serves id `highpass_2_pole`,
+ * proven by highpass2_wrapper.rs:160)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/moving_averages/highpass_2_pole.rs:444
+ * `highpass_2_pole_scalar_`. Defaults: period 48, k 0.707 (:204, :208).
+ *
+ * THE WARP SCAN ABOVE IS NOT THIS FUNCTION — see the note in
+ * supersmoother_3_pole; the same 2x2 matrix-power reformulation is used here
+ * and it re-associates the recurrence. One thread per column, bars ascending.
+ *
+ * `alpha = 1 + (sin(theta) - 1)/cos(theta)` is a CANCELLING expression: for a
+ * long period theta is small, sin(theta)-1 is close to -1 and cos(theta) is
+ * close to 1, and the whole point is that alpha ends up tiny. At f32 the
+ * leading digits of `s - 1.0f` are noise; at f64 they are not. This is the
+ * single strongest reason this indicator had to leave the f32 lane.
+ *
+ * `__fmaf_rn` x24 in the f32 file: the CPU really does use mul_add at every
+ * one of these sites (:492-513, :527-530), so `fma` is correct here — the
+ * roundings match one for one. The nesting is preserved exactly, including
+ * that `t` is built as TWO chained fmas before y is built as two more.
+ *
+ * The two seeded bars are COPIES of the input (:472, :476).
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void highpass2_neo_batch_f64(const double* __restrict__ data,
+                             int series_len,
+                             const int* __restrict__ periods,
+                             int n_combos,
+                             int first_valid,
+                             double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    // highpass_2_pole.rs:454 debug_asserts 2 <= period <= n.
+    if (period < 2 || period > len || first_valid < 0 || first_valid >= len) return;
+
+    const double PI_ = 3.14159265358979323846;
+    const double k = 0.707;                       // highpass_2_pole.rs:208 default
+    const double theta = 2.0 * PI_ * k / (double)period;
+    const double s  = sin(theta);
+    const double c0 = cos(theta);
+    const double alpha = 1.0 + ((s - 1.0) / c0);
+
+    const double one_minus_alpha = 1.0 - alpha;
+    const double c = (1.0 - 0.5 * alpha) * (1.0 - 0.5 * alpha);
+
+    const double cm2        = -2.0 * c;
+    const double two_1m     = 2.0 * one_minus_alpha;
+    const double neg_oma_sq = -(one_minus_alpha * one_minus_alpha);
+
+    o[first_valid] = data[first_valid];
+    if (first_valid + 1 >= len) return;
+    o[first_valid + 1] = data[first_valid + 1];
+    if (first_valid + 2 >= len) return;
+
+    double x_im2 = data[first_valid];
+    double x_im1 = data[first_valid + 1];
+    double y_im2 = o[first_valid];
+    double y_im1 = o[first_valid + 1];
+
+    for (int i = first_valid + 2; i < len; ++i) {
+        const double xi = data[i];
+        const double y = fma(two_1m, y_im1,
+                             fma(neg_oma_sq, y_im2,
+                                 fma(c, x_im2, fma(cm2, x_im1, c * xi))));
+        o[i] = y;
+        x_im2 = x_im1; x_im1 = xi;
+        y_im2 = y_im1; y_im1 = y;
+    }
+}

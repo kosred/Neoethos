@@ -395,3 +395,112 @@ void acosc_many_series_one_param_f32_warp(const float* __restrict__ high_tm,
         out_change_tm[t * stride + s] = mom;
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — acosc (output "osc", index 0 of
+ * fallback_outputs &["osc","change"])
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/acosc.rs:196 `acosc_scalar`.
+ *
+ * PERIOD-INVARIANT and FIRST-VALID-IGNORED, both by construction, not by
+ * omission: `acosc_scalar` takes no period at all (the windows are the fixed
+ * 5 and 34 of the Awesome Oscillator) and it starts at absolute index 0.
+ * Declared F64FirstValidRule::Ignored so the table does not claim a warmup the
+ * kernel does not honour.
+ *
+ * THE THREE RUNNING SUMS ARE SLIDING, NOT RECOMPUTED. `sum34 += med - queue34[idx]`
+ * accumulates rounding across the whole series; recomputing the mean over the
+ * window each bar would be more accurate and WRONG — it is a different number
+ * from the reference. Same for sum5 and for the sum of the last five AO values.
+ *
+ * INV5/INV34 are `1.0/5.0` and `1.0/34.0` as the CPU spells them (acosc.rs:199).
+ * 1/34 is not representable; forming it once and multiplying is not the same as
+ * dividing by 34 each bar, and the CPU multiplies.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+extern "C" __global__
+void acosc_neo_batch_f64(const double* __restrict__ high,
+                         const double* __restrict__ low,
+                         int series_len,
+                         const int* __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods; (void)first_valid;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+
+    const int P5 = 5, P34 = 34;
+    const double INV5  = 1.0 / 5.0;
+    const double INV34 = 1.0 / 34.0;
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    // acosc.rs:205 debug_asserts len >= 39; below that the CPU produces nothing.
+    if (len < P34 + P5) return;
+
+    double queue5[5], queue34[34], queue5_ao[5];
+    double sum5 = 0.0, sum34 = 0.0, sum5_ao = 0.0;
+    int idx5 = 0, idx34 = 0, idx5_ao = 0;
+    for (int t = 0; t < 5; ++t) { queue5[t] = 0.0; queue5_ao[t] = 0.0; }
+    for (int t = 0; t < 34; ++t) queue34[t] = 0.0;
+
+    for (int i = 0; i < P34; ++i) {
+        const double med = (high[i] + low[i]) * 0.5;
+        sum34 += med;
+        queue34[i] = med;
+        if (i < P5) { sum5 += med; queue5[i] = med; }
+    }
+    for (int i = P34; i < P34 + P5 - 1; ++i) {
+        const double med = (high[i] + low[i]) * 0.5;
+        sum34 += med - queue34[idx34];
+        queue34[idx34] = med;
+        idx34 += 1; if (idx34 == P34) idx34 = 0;
+        const double sma34 = sum34 * INV34;
+
+        sum5 += med - queue5[idx5];
+        queue5[idx5] = med;
+        idx5 += 1; if (idx5 == P5) idx5 = 0;
+        const double sma5 = sum5 * INV5;
+
+        const double ao = sma5 - sma34;
+        sum5_ao += ao;
+        queue5_ao[idx5_ao] = ao;
+        idx5_ao += 1;
+    }
+    if (idx5_ao == P5) idx5_ao = 0;
+
+    double prev_res = 0.0;
+    for (int i = P34 + P5 - 1; i < len; ++i) {
+        const double med = (high[i] + low[i]) * 0.5;
+        sum34 += med - queue34[idx34];
+        queue34[idx34] = med;
+        idx34 += 1; if (idx34 == P34) idx34 = 0;
+        const double sma34 = sum34 * INV34;
+
+        sum5 += med - queue5[idx5];
+        queue5[idx5] = med;
+        idx5 += 1; if (idx5 == P5) idx5 = 0;
+        const double sma5 = sum5 * INV5;
+
+        const double ao = sma5 - sma34;
+        const double old_ao = queue5_ao[idx5_ao];
+        sum5_ao += ao - old_ao;
+        queue5_ao[idx5_ao] = ao;
+        idx5_ao += 1; if (idx5_ao == P5) idx5_ao = 0;
+
+        const double sma5_ao = sum5_ao * INV5;
+        const double res = ao - sma5_ao;
+        prev_res = res;                 // `change` (output 1) is res - prev_res
+        o[i] = res;                     // output "osc"
+    }
+    (void)prev_res;
+}

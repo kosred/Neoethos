@@ -14,7 +14,6 @@ use crate::gpu_native::prototype_population::{
 };
 use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 use ndarray::Array2;
-use neoethos_gpu_contracts::device::ScenarioDescriptor;
 use std::collections::HashSet;
 
 /// Host-owned outputs for parity levels 11-12.
@@ -209,14 +208,10 @@ impl TinyPopulationFixture {
         let scenarios = candidate_ids
             .iter()
             .copied()
-            .map(|candidate_id| ScenarioDescriptor {
-                base_candidate_id: candidate_id,
-                scenario_id: candidate_id,
-                rng_counter: 0,
-                window_offset: 0,
-                window_len: self.bars() as u32,
-                scenario_type: 0,
-                ..ScenarioDescriptor::default()
+            // Through the ONE builder — see `snapshot_fixture` for why
+            // `..ScenarioDescriptor::default()` was a free-trading backtest.
+            .map(|candidate_id| {
+                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id, self.bars())
             })
             .collect();
         (

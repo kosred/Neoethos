@@ -316,3 +316,126 @@ extern "C" __global__ void ui_one_series_many_params_f32(
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — ui (ulcer index)
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/ui.rs:346 `ui_scalar`. Default scalar = 100.0
+ * (ui.rs:115); our lane sweeps `period` with default params.
+ *
+ * THE EPSILON IS AN f64 EPSILON AND IT COMES FROM THE CPU. ui.rs:425 guards
+ * the drawdown divide with `m.abs() > f64::EPSILON`, i.e. 2.220446049250313e-16.
+ * The f32 lane's equivalent would be FLT_EPSILON, 1.19e-7 — eleven orders of
+ * magnitude larger, which silently drops every bar whose rolling maximum is a
+ * small price. Spelled out below rather than copied from the f32 file.
+ *
+ * `ui_scalar` has a `period <= 64` variant that tracks ring validity in a u64
+ * bitmask and a general variant that uses a byte ring. The ARITHMETIC is
+ * identical — same `sum` add/subtract, same `count` — so one implementation
+ * serves both; only the bookkeeping container differs.
+ *
+ * `dd.mul_add(dd, 0.0)` (ui.rs:427) is a genuine fma with a zero addend, not a
+ * plain square: fma(dd, dd, 0.0) rounds ONCE, `dd*dd` also rounds once, and
+ * they agree — but the fma is written because that is what the CPU emits.
+ *
+ * Fixed window bound: the squares ring is a running total over `period`, so it
+ * needs the ring. NEO_UI_MAX_PERIOD is refused BY NAME by the host wrapper
+ * rather than truncated.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Must match NEO_UI_MAX_PERIOD in neoethos_f64_wrapper.rs. */
+#define NEO_UI_MAX_PERIOD 512
+
+extern "C" __global__
+void ui_neo_batch_f64(const double* __restrict__ data,
+                      int series_len,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (period <= 0 || period > NEO_UI_MAX_PERIOD || period > len ||
+        first_valid < 0 || first_valid >= len) return;
+
+    const double scalar_param = 100.0;               // ui.rs:115 default
+    const double F64_EPS = 2.2204460492503131e-16;   // f64::EPSILON, NOT FLT_EPSILON
+    const double inv_period = 1.0 / (double)period;
+    const int warmup_end = first_valid + (period * 2 - 2);
+
+    int deq[NEO_UI_MAX_PERIOD];                      // monotonic max-deque of indices
+    double sq_ring[NEO_UI_MAX_PERIOD];
+    unsigned char valid_ring[NEO_UI_MAX_PERIOD];
+    for (int t = 0; t < period; ++t) { sq_ring[t] = 0.0; valid_ring[t] = 0; }
+
+    const int cap = period;
+    int head = 0, tail = 0, dsize = 0;
+    int ring_idx = 0;
+    double sum = 0.0;
+    int count = 0;
+
+    for (int i = first_valid; i < len; ++i) {
+        const int start = (i + 1 >= period) ? (i + 1 - period) : 0;
+
+        while (dsize != 0) {
+            const int j = deq[head];
+            if (j < start) { head += 1; if (head == cap) head = 0; dsize -= 1; }
+            else break;
+        }
+
+        const double xi = data[i];
+        const bool xi_finite = isfinite(xi);
+        if (xi_finite) {
+            while (dsize != 0) {
+                int back = tail;
+                if (back == 0) back = cap - 1; else back -= 1;
+                const double xj = data[deq[back]];
+                if (xj <= xi) { tail = back; dsize -= 1; }
+                else break;
+            }
+            deq[tail] = i;
+            tail += 1; if (tail == cap) tail = 0;
+            dsize += 1;
+        }
+
+        unsigned char new_valid = 0;
+        double new_sq = 0.0;
+        if (i + 1 >= first_valid + period && dsize != 0) {
+            const double m = data[deq[head]];
+            if (xi_finite && isfinite(m) && fabs(m) > F64_EPS) {
+                const double dd = (xi - m) * (scalar_param / m);
+                new_sq = fma(dd, dd, 0.0);
+                new_valid = 1;
+            }
+        }
+
+        if (valid_ring[ring_idx] != 0) { sum -= sq_ring[ring_idx]; count -= 1; }
+        if (new_valid != 0)            { sum += new_sq;            count += 1; }
+        sq_ring[ring_idx] = new_sq;
+        valid_ring[ring_idx] = new_valid;
+
+        ring_idx += 1; if (ring_idx == period) ring_idx = 0;
+
+        if (i >= warmup_end) {
+            if (count == period) {
+                double avg = sum * inv_period;
+                if (avg < 0.0) avg = 0.0;
+                o[i] = sqrt(avg);
+            } else {
+                o[i] = NEO_F64_NAN;
+            }
+        }
+    }
+}

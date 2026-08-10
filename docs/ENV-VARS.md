@@ -90,7 +90,5 @@ operator has one search target):
 
 | Variable | Documented in | Purpose |
 |---|---|---|
-| `PERPLEXITY_API_KEY` | (not committed) | News-blackout LLM gate (optional) |
-| `NEOETHOS_LAUNCHED_BY_FLUTTER` | `crates/neoethos-app/src/main.rs` | Set by the Flutter `BackendSupervisor` so the backend can distinguish "spawned by UI" vs "manual run" (#179) |
 | `CONFIG_FILE` | `crates/neoethos-app/src/main.rs` | Override the default `%LOCALAPPDATA%\neoethos\config.yaml` lookup path |
 | `VULKAN_SDK` / `LIBCLANG_PATH` | `scripts/build-cargo-release.ps1` | Compile-time tooling, not runtime |

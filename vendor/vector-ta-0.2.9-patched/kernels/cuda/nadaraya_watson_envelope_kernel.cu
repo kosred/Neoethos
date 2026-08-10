@@ -326,3 +326,233 @@ void nadaraya_watson_envelope_many_series_one_param_f32(const float* __restrict_
         }
     }
 }
+
+// ===========================================================================
+// f64 LANE  --  closer 6
+//
+// CPU reference: `nwe_compute_scalar_prepared`
+// (src/indicators/nadaraya_watson_envelope.rs:468) and the two walks it
+// selects between, `nwe_compute_scalar_no_nan` (:510) and
+// `nwe_compute_scalar_nan_checked` (:566). Reached from
+// `nadaraya_watson_envelope_with_kernel` (:659) -> `..._envelope` (:648) on
+// every non-AVX build, which is what `compute_nadaraya_watson_envelope_batch`
+// (dispatch/cpu_batch.rs:15607) takes.
+//
+// OUTPUT: `upper`. `compute_..._batch:15636` maps output_id "value" onto
+// `out.upper`; `lower` is `y - mae` in the same walk and is one launch away
+// once the lane grows an output selector.
+//
+// PERIOD-INVARIANT. The CPU batch reads `bandwidth` (8.0), `multiplier`
+// (3.0) and `lookback` (500) and NEVER `period` (:15619-15621). A caller
+// sweeping [7,21,50,100,200] gets five identical CPU columns, so this kernel
+// emits five identical rows. The three named parameters are pinned at the
+// CPU defaults.
+//
+// SEQUENTIAL, ONE THREAD PER COLUMN -- NOT bar-parallel, and the brief's
+// sketch ("no carried state, so this one is genuinely bar-parallel") is
+// WRONG about this indicator. The kernel regression `y` alone would be
+// bar-parallel, but the band is `y +/- mae` where `mae` is a sliding sum of
+// the last 499 ABSOLUTE RESIDUALS (`rbuf`/`rsum`, :523-525). That sum is
+// carried across bars and is accumulation-order dependent -- `rsum -= old;
+// rsum += resid` at :545-548 is not the same number as a fresh sum of the
+// window. Reproducing it is the only faithful shape.
+//
+// THE CPU CHOOSES BETWEEN TWO WALKS AND SO DOES THIS KERNEL. :497-506 scans
+// `data[first..]` for any NaN, where `first = warm_out + 1 - lookback`, and
+// takes the cheap walk only if there is none. The two are NOT equivalent on
+// clean data plus one late hole: the no-NaN walk lets a NaN residual poison
+// `rsum` permanently, while the checked walk counts NaNs in the ring
+// (`r_nan_cnt`) and emits NaN until the hole has left the 499-bar window.
+// Picking one walk unconditionally would have been wrong in both directions,
+// so the scan is reproduced.
+//
+// WARMUP IS TWO-STAGE AND THE SECOND STAGE IS 499 BARS LONG.
+// `warm_out = first + lookback - 1` (:402) is where the regression starts
+// being computed; `warm_total = warm_out + MAE_LEN - 1` (:403) is where the
+// BAND starts being emitted, because the residual ring must be full first.
+// The walk therefore begins at `warm_out` and writes nothing until
+// `warm_total` -- the residuals between the two indices exist only to fill
+// the ring. A kernel that started writing at `warm_out` would emit 498 bars
+// the CPU leaves NaN.
+//
+// NaN: there is no `f64::max` in this reference at all, so no comparison
+// chain here needs converting to fmax. The NaN handling that does exist is
+// explicit `is_nan` bookkeeping and is reproduced as `isnan`.
+//
+// EPSILON: none. This indicator has no tolerance constant on either side --
+// `den` is a sum of `exp(...)` terms which is strictly positive for any
+// valid bandwidth, and `nwe_prepare:383` has already refused a bandwidth
+// that is zero, negative or NaN.
+//
+// f32 -> f64 audit of this section: no f32 literal, no f32-suffixed math
+// function (the f32 lane above uses expf, fabsf and __fmaf_rn), no fast-math
+// intrinsic. The quiet NaN is `__longlong_as_double(0x7ff8000000000000ULL)`,
+// which is the same bit pattern the CPU writes with
+// `f64::from_bits(0x7ff8_0000_0000_0000)` (:481).
+// ===========================================================================
+
+// `MAE_LEN` -- :401, :521, :581. A fixed 499, not a parameter.
+#define NWE_F64_MAE_LEN 499
+
+// The CPU defaults, cpu_batch.rs:15619-15621. `lookback` also sizes the
+// per-thread weight array, so it is the bound this kernel declares: an
+// oversized lookback is REFUSED BY NAME in the wrapper rather than truncated
+// or moved to the host.
+#define NWE_F64_LOOKBACK 500
+#define NWE_F64_BANDWIDTH 8.0
+#define NWE_F64_MULTIPLIER 3.0
+
+static __device__ __forceinline__ double nwe_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void nadaraya_watson_envelope_batch_f64(const double* __restrict__ prices,
+                                        int n,
+                                        const int* __restrict__ periods,
+                                        int n_combos,
+                                        int first_valid,
+                                        double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    // PERIOD-INVARIANT: read so the parameter is not silently dropped from the
+    // signature, but the CPU batch never consults it.
+    (void)periods;
+
+    const double nan_d = nwe_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(r) * static_cast<size_t>(n);
+
+    const int lookback = NWE_F64_LOOKBACK;
+
+    if (n <= 0 || first_valid < 0 || first_valid >= n) {
+        for (int i = 0; i < n; ++i) row[i] = nan_d;
+        return;
+    }
+
+    const int warm_out   = first_valid + lookback - 1;                  // :402
+    const int warm_total = warm_out + NWE_F64_MAE_LEN - 1;              // :403
+
+    // `nwe_prepare:405` errors -- and `collect_f64` turns the error into an
+    // all-NaN column -- when the series ends at or before `warm_out`.
+    if (n <= warm_out) {
+        for (int i = 0; i < n; ++i) row[i] = nan_d;
+        return;
+    }
+
+    // `alloc_with_nan_prefix(len, warm_total)` -- :651.
+    for (int i = 0; i < n && i < warm_total; ++i) row[i] = nan_d;
+    if (warm_total >= n) return;                                        // :493-495
+
+    // ------------------------------------------------------------------
+    // Weights. :412-418. Built in the CPU's ascending-k order so `den`
+    // accumulates identically.
+    // ------------------------------------------------------------------
+    double w[NWE_F64_LOOKBACK];
+    double den = 0.0;
+    const double bw = NWE_F64_BANDWIDTH;
+    for (int k = 0; k < lookback; ++k) {
+        const double kf = static_cast<double>(k);
+        const double wk = exp(-(kf) * (kf) / (2.0 * bw * bw));          // :415
+        w[k] = wk;
+        den += wk;                                                      // :417
+    }
+
+    const double mult = NWE_F64_MULTIPLIER;
+    const double scale = mult / static_cast<double>(NWE_F64_MAE_LEN);   // :526, :585
+
+    // ------------------------------------------------------------------
+    // Which walk. :497-506.
+    // ------------------------------------------------------------------
+    const int scan_from = warm_out + 1 - lookback;
+    bool any_nan_in_tail = false;
+    for (int i = scan_from; i < n; ++i) {
+        if (isnan(prices[i])) { any_nan_in_tail = true; break; }
+    }
+
+    double rbuf[NWE_F64_MAE_LEN];
+    int rhead = 0;
+    double rsum = 0.0;
+
+    if (!any_nan_in_tail) {
+        // -------------------------------------------------------------
+        // `nwe_compute_scalar_no_nan` -- :510-563.
+        // -------------------------------------------------------------
+        for (int k = 0; k < NWE_F64_MAE_LEN; ++k) rbuf[k] = 0.0;        // :523
+
+        for (int t = warm_out; t < n; ++t) {                            // :531
+            double num = 0.0;
+            for (int k = 0; k < lookback; ++k) {                        // :535-538
+                num += prices[t - k] * w[k];
+            }
+
+            const double y = num / den;                                 // :541
+            const double resid = fabs(prices[t] - y);                   // :542
+
+            const double old = rbuf[rhead];                             // :544
+            rsum -= old;
+            rbuf[rhead] = resid;
+            rsum += resid;                                              // :548
+
+            ++rhead;
+            if (rhead == NWE_F64_MAE_LEN) rhead = 0;                    // :550-553
+
+            if (t >= warm_total) {                                      // :555
+                const double mae = rsum * scale;                        // :556
+                row[t] = y + mae;                                       // :557 upper
+            }
+        }
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // `nwe_compute_scalar_nan_checked` -- :566-644.
+    // -----------------------------------------------------------------
+    for (int k = 0; k < NWE_F64_MAE_LEN; ++k) rbuf[k] = nan_d;          // :582
+    int r_nan_cnt = NWE_F64_MAE_LEN;                                    // :584
+
+    for (int t = warm_out; t < n; ++t) {                                // :590
+        double num = 0.0;
+        bool any_nan = false;
+        for (int k = 0; k < lookback; ++k) {                            // :595-602
+            const double x = prices[t - k];
+            if (isnan(x)) { any_nan = true; break; }
+            num += x * w[k];
+        }
+
+        const double y = any_nan ? nan_d : (num / den);                 // :605
+        const double xt = prices[t];                                    // :606
+        const double resid = (!isnan(xt) && !isnan(y))
+                             ? fabs(xt - y) : nan_d;                    // :607-611
+
+        const double old = rbuf[rhead];                                 // :613
+        if (isnan(old)) {
+            // `saturating_sub(1)` -- :615. Cannot underflow here because the
+            // ring starts full of NaN and every NaN removed was counted, but
+            // the clamp is reproduced rather than assumed away.
+            r_nan_cnt = (r_nan_cnt > 0) ? (r_nan_cnt - 1) : 0;
+        } else {
+            rsum -= old;                                                // :617
+        }
+
+        rbuf[rhead] = resid;                                            // :621
+        if (isnan(resid)) {
+            ++r_nan_cnt;                                                // :623
+        } else {
+            rsum += resid;                                              // :625
+        }
+
+        ++rhead;
+        if (rhead == NWE_F64_MAE_LEN) rhead = 0;                        // :628-631
+
+        if (t >= warm_total) {                                          // :633
+            if (!isnan(y) && r_nan_cnt == 0) {
+                const double mae = rsum * scale;                        // :635
+                row[t] = y + mae;                                       // :636 upper
+            } else {
+                row[t] = nan_d;                                         // :639
+            }
+        }
+    }
+}

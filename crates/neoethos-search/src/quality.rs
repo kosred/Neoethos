@@ -31,24 +31,12 @@ impl Default for QualityRuntimeOverrides {
 }
 
 impl QualityRuntimeOverrides {
-    /// One-shot read of the legacy `NEOETHOS_BOT_PROP_*` quality env vars.
-    pub fn from_env() -> Self {
-        let mut overrides = Self::default();
-        if let Some(value) = std::env::var("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            overrides.min_trades_per_month = value;
-        }
-        if let Some(value) = std::env::var("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 1.0)
-        {
-            overrides.trading_days_per_month = value;
-        }
-        overrides
-    }
+    // `from_env()` DELETED 2026-08-10 with
+    // `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH` and
+    // `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH`. Both change CANONICAL strategy
+    // quality scoring — which months count toward `monthly_win_rate` and how
+    // observed trading days become a months-traded estimate — and both are
+    // typed on `models.quality_runtime`.
 
     /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_*` quality
     /// env vars). `trading_days_per_month` is validated finite ≥ 1.0 like
@@ -88,10 +76,16 @@ pub fn install_quality_runtime_overrides(
     QUALITY_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// Convenience wrapper that resolves the legacy `NEOETHOS_BOT_PROP_*` quality
-/// env vars once and installs them. Idempotent.
+/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
+/// Kept only because `lib.rs` re-exports it; see the handoff for the one-line
+/// removal.
 pub fn install_quality_runtime_overrides_from_env() {
-    let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::from_env());
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_quality_runtime_overrides_from_env() is RETIRED and installs typed \
+         DEFAULTS. Call install_quality_runtime_overrides_from_settings(&settings)."
+    );
+    let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the quality knobs from the single
@@ -163,7 +157,41 @@ pub struct StrategyMetrics {
     pub positive_months: usize,
     pub negative_months: usize,
     pub avg_monthly_return_pct: f64,
+    /// THE COST-CHARGED NET EXPECTANCY PER TRADE, in account currency.
+    ///
+    /// The plain mean of the per-trade net P&L the backtest booked, so spread,
+    /// commission, swap and the conversion fee are already subtracted. It answers
+    /// the only question that decides whether an account grows: after paying the
+    /// broker, does the average trade make money?
+    ///
+    /// This is the PRIMARY survival criterion as of 2026-08-09
+    /// (`TargetProfile::accepts`). It replaced a payoff-ratio floor that could
+    /// not carry the job: measured, a candidate at payoff 2.53 had an expectancy
+    /// of -4.18 pips per trade. Payoff describes the SHAPE of the win/loss split;
+    /// only expectancy describes the direction of the money.
+    ///
+    /// Nothing was renamed to say so — this field already held the number, it was
+    /// simply never gated on. Its standard error is `net_expectancy_stderr`.
     pub profit_per_trade: f64,
+    /// Standard error of [`Self::profit_per_trade`]: `sd(pnl) / sqrt(n)`.
+    ///
+    /// An expectancy without one is a point estimate presented as a fact. With
+    /// 30 trades and a per-trade sd of 200 currency units, an expectancy of +20
+    /// has a standard error of 36 — indistinguishable from zero, and the search
+    /// would have ranked it above a +5 with 5 000 trades.
+    ///
+    /// Sample sd, `n - 1` denominator, `0.0` when fewer than two trades. It
+    /// bounds SAMPLING noise only. It says nothing about selection bias across
+    /// the thousands of candidates the GA tried — that needs DSR/PBO over the
+    /// per-trial return series, which this project does not yet persist and
+    /// therefore cannot compute.
+    #[serde(default)]
+    pub net_expectancy_stderr: f64,
+    /// `profit_per_trade / net_expectancy_stderr` — how many standard errors
+    /// above zero the expectancy sits. `0.0` when the standard error is zero or
+    /// undefined (fewer than two trades, or every trade identical).
+    #[serde(default)]
+    pub net_expectancy_t_stat: f64,
     pub avg_trade_duration_hours: f64,
     pub trades_per_month: f64,
     pub quality_score: f64,
@@ -538,6 +566,27 @@ impl StrategyQualityAnalyzer {
             0.0
         };
 
+        // Cost-charged net expectancy per trade + its standard error. `pnls` are
+        // the realised per-trade net P&L, so every cost the engine charges is
+        // already in them.
+        //
+        // Sample sd (n - 1). With one trade there is no dispersion to estimate,
+        // so the error is 0.0 and the t-stat is 0.0 — deliberately NOT infinity:
+        // a single lucky trade must not read as infinitely significant.
+        let net_expectancy_per_trade = if pnls.is_empty() { 0.0 } else { mean(&pnls) };
+        let net_expectancy_stderr = if pnls.len() >= 2 {
+            let sd = stddev_sample(&pnls, net_expectancy_per_trade);
+            let se = sd / (pnls.len() as f64).sqrt();
+            if se.is_finite() && se > 0.0 { se } else { 0.0 }
+        } else {
+            0.0
+        };
+        let net_expectancy_t_stat = if net_expectancy_stderr > 0.0 {
+            net_expectancy_per_trade / net_expectancy_stderr
+        } else {
+            0.0
+        };
+
         let mut metrics = StrategyMetrics {
             strategy_id: strategy_id.to_string(),
             total_trades,
@@ -568,7 +617,9 @@ impl StrategyQualityAnalyzer {
             positive_months: monthly_metrics.positive,
             negative_months: monthly_metrics.negative,
             avg_monthly_return_pct,
-            profit_per_trade: if !pnls.is_empty() { mean(&pnls) } else { 0.0 },
+            profit_per_trade: net_expectancy_per_trade,
+            net_expectancy_stderr,
+            net_expectancy_t_stat,
             avg_trade_duration_hours: avg_duration,
             trades_per_month,
             quality_score: 0.0,
@@ -938,6 +989,8 @@ pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         negative_months: 0,
         avg_monthly_return_pct: 0.0,
         profit_per_trade: 0.0,
+        net_expectancy_stderr: 0.0,
+        net_expectancy_t_stat: 0.0,
         avg_trade_duration_hours: 0.0,
         trades_per_month: 0.0,
         quality_score: 0.0,

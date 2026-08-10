@@ -85,7 +85,7 @@ pub fn validate_news_calendar_source(raw: &str) -> Result<String, String> {
 
 /// System-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SystemConfig {
     pub symbol: String,
     /// Market Watch live-tick subscription set (F-338). Empty → the spot
@@ -154,15 +154,36 @@ pub struct SystemConfig {
     pub poll_interval_seconds: u64,
     pub metrics_db_path: PathBuf,
     pub cache_dir: PathBuf,
+    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]` since
+    /// 2026-08-10: nothing reads this field (`config_has_recipient.rs:210-233`),
+    /// and `Settings::save` serialises the WHOLE struct on every write, so one
+    /// click on any control used to pickle the detector's answer into the YAML
+    /// as a literal. `n_jobs: 11` in the operator's live store is
+    /// `available_parallelism() - 1` on a 12-core box, frozen - and then
+    /// carried to a machine with different cores. The value is detected at
+    /// runtime; an `n_jobs:` key in a file is now named at WARN and ignored
+    /// (see `RETIRED_KEYS`). Deleting the field is blocked on `system.rs`
+    /// (AutoTuner still assigns it) - routed to `pending-A.md`.
+    #[serde(skip)]
     pub n_jobs: usize,
     pub enable_gpu_preference: String,
     // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
     // (`discovery_auto_cap` / `discovery_max_rows` / `discovery_stream`). They
     // were never read anywhere in the workspace — the REAL discovery row cap is
     // `models.prop_search_max_rows` (→ DiscoveryConfig.max_rows, discovery.rs).
-    // SystemConfig does NOT derive `#[serde(deny_unknown_fields)]`, so any stale
-    // copies of these keys still in a user's config.yaml are ignored, not errors.
+    //
+    // CORRECTED 2026-08-10: this block used to end "SystemConfig does NOT derive
+    // `#[serde(deny_unknown_fields)]`, so any stale copies of these keys are
+    // ignored, not errors." It does now, and that sentence was the whole defect
+    // written down as a feature — the same permissiveness accepted
+    // `trailing_enabeld:` and reported it saved. The three keys are listed in
+    // `load_seal::RETIRED_KEYS`, so a file that still carries them loads with
+    // each one NAMED at WARN; anything not on that list is refused.
     pub enable_gpu: bool,
+    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. See `n_jobs` above.
+    /// `num_gpus: 0` in the operator's live store, on a box with a 3090, is
+    /// the same frozen detector output. `#[serde(skip)]` 2026-08-10.
+    #[serde(skip)]
     pub num_gpus: usize,
     pub device: String,
     pub max_training_rows_per_tf: usize,
@@ -190,7 +211,7 @@ pub struct SystemConfig {
 /// name, two readers, one of them dead — which is precisely the argument for a
 /// single resolution point rather than simply relocating the variables.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HardwareConfig {
     /// CPU thread budget for model training; `None` = auto (cores-based).
     pub cpu_budget: Option<usize>,
@@ -312,7 +333,7 @@ impl SystemConfig {
 
 /// Risk management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RiskConfig {
     /// Named prop-firm preset that seeds every other field in this
     /// struct. The runtime is firm-agnostic; this field just selects
@@ -323,6 +344,11 @@ pub struct RiskConfig {
     #[serde(default)]
     pub preset: PropFirmPreset,
     pub initial_balance: f64,
+    /// WARNING UNWIRED - `RiskManager` has no production constructor; every
+    /// `RiskManager::new` in the workspace is inside its own test module. This
+    /// is RETAINED AS INTENT (it records the operator's monthly floor and is
+    /// seeded from the active preset) but no live decision reads it.
+    /// See `tests/config_has_recipient.rs::UNWIRED`.
     pub monthly_profit_target_pct: f64,
     pub min_risk_per_trade: f64,
     pub max_risk_per_trade: f64,
@@ -358,7 +384,24 @@ pub struct RiskConfig {
     pub total_drawdown_limit: f64,
     pub min_risk_reward: f64,
     pub max_lot_size: f64,
+    /// Manual-order authority: when `true`, `POST /orders` and
+    /// `POST /orders/pending` REFUSE an order with no `stopLossPips`, and the
+    /// body's `risky: true` flag does not override it.
+    ///
+    /// Wired 2026-08-09 (W1) in `neoethos-app/src/server/orders.rs`. Before
+    /// that it was displayed in the Settings knob catalog and echoed by
+    /// `GET /risk` and read by nothing; the `config_has_recipient` guard passed
+    /// it on `RiskDto`'s same-named field.
+    ///
+    /// Does NOT affect order SIZE on the manual path — by operator decision
+    /// there is no `max_lot_size` clamp there. It also does not affect the
+    /// autopilot, which always places a bracket (the gene's, or the kernel's
+    /// 20/40-pip defaults).
     pub require_stop_loss: bool,
+    /// WARNING UNWIRED - `RiskManager` has no production constructor, so
+    /// nothing reads this. Both repo YAMLs ship `challenge_mode: true` against
+    /// a `Default` of `false`: a mode that does not exist has been deliberately
+    /// armed. RETAINED AS INTENT; do not read the `true` as an active regime.
     pub challenge_mode: bool,
     /// ⚠ UNWIRED — nothing reads this field.
     ///
@@ -401,6 +444,25 @@ pub struct RiskConfig {
     pub atr_period: usize,
     pub atr_stop_multiplier: f64,
     pub triple_barrier_max_bars: usize,
+    // ---------------------------------------------------------------------
+    // WARNING UNWIRED / SHADOWED DUPLICATE - the four fields below (2026-08-10)
+    //
+    // `trailing_enabled`, `trailing_be_trigger_r` and `trailing_min_lock_pips`
+    // ALSO exist on `models.exit_policy` (`ExitPolicyConfig`, below), and THE
+    // SEARCH READS THAT COPY (`strategy_gene.rs:867`). The operator's live
+    // store sets THESE - including a hand-tuned `trailing_atr_multiplier: 0.4`
+    // and `trailing_be_trigger_r: 0.1` - and they move nothing.
+    // `config_has_recipient.rs:173-198` ledgers all four as SHADOWED
+    // DUPLICATE; `trailing_atr_multiplier` was never an ATR multiple.
+    //
+    // THEY ARE NOT DELETED YET, DELIBERATELY. Live execution trails
+    // UNCONDITIONALLY with no config recipient at all
+    // (`live_trading.rs:1226-1272`). Deleting these keys would convert a
+    // visibly-wrong value into an INVISIBLE HARDCODE on the path that spends
+    // real money. The order is: wire live to `models.exit_policy` FIRST, then
+    // delete these - never the reverse. Tracked in
+    // `docs/pending-edits-forbidden-territory.md`.
+    // ---------------------------------------------------------------------
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
@@ -415,7 +477,77 @@ pub struct RiskConfig {
     pub trailing_min_lock_pips: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
+    /// Is `commission_per_lot` the charge for ONE SIDE, or for the round trip?
+    ///
+    /// Brokers quote it per side. A cTrader FX account at 45 USD per million
+    /// per side is about **0.62 pips per side** on EURUSD, so **1.24 pips round
+    /// trip** before any spread. Every evaluator in this workspace subtracts
+    /// `commission_per_trade` exactly ONCE per closed trade (CPU `eval.rs`, the
+    /// CUDA kernel `prototype_b_population.cu`, the C prototype) — so with a
+    /// per-side number in the field the backtest charged HALF the commission a
+    /// live fill pays, on every trade, forever.
+    ///
+    /// `true` (the default, and the correct reading of a broker schedule) makes
+    /// the resolvers double the number once, at the two boundaries named in
+    /// `neoethos_search::genetic::strategy_gene::round_trip_commission_per_lot`,
+    /// so that everything downstream of those boundaries means ROUND TRIP and
+    /// the single subtraction is right. Set `false` only if the number you put
+    /// in `commission_per_lot` is already the round trip.
+    ///
+    /// **Behaviour change (2026-08-09).** At the shipped `commission_per_lot:
+    /// 7.0` this raises the charged commission from $7 to $14 per lot per
+    /// closed trade — about 1.4 pips on a EURUSD standard lot instead of 0.7.
+    /// It refuses nothing new by itself; it makes every net figure smaller and
+    /// truer. It has ZERO expected value in money: charging the real cost does
+    /// not create edge, it stops the search from selecting on a subsidy.
+    pub commission_per_lot_is_per_side: bool,
     pub backtest_spread_pips: f64,
+    /// Session-aware backtest spread, in pips, for the three UTC buckets the
+    /// evaluator resolves per bar (`eval::SessionSpreadProfile::spread_pips_at`):
+    /// Asian = hours 22–07, Overlap (London/NY) = 07–16, Late NY = 16–22.
+    ///
+    /// The mechanism has existed on both the CPU path (`eval.rs:843`) and the
+    /// CUDA kernel (`prototype_b_population.cu:47 spread_pips_for_bar`) for
+    /// months, and **it was never populated outside `#[cfg(test)]`**: every
+    /// production construction site left `session_spread_profile: None`, so a
+    /// flat `backtest_spread_pips` was charged at 03:00 Tokyo and at the London
+    /// open alike. Setting all three of these keys is what turns the curve on.
+    ///
+    /// All three must be set together, or none. A partial setting is a config
+    /// ERROR, not a silent fall-back to flat — half a curve is a cost model
+    /// nobody can reason about. `slippage_pips` is added to each bucket exactly
+    /// as it is added to `backtest_spread_pips`.
+    ///
+    /// Left unset by default because this project does not invent broker
+    /// numbers (see the F-301 fail-loud note on the synthetic-spread removal).
+    ///
+    /// The measurement already exists: `neoethos-app`'s `spread_stats` service
+    /// samples the live tick cache once a minute and accumulates per-(symbol,
+    /// UTC-hour) mean and max spread into `<data_dir>/spread_stats.json`. Its
+    /// module header names the eval kernels as its intended consumer — this is
+    /// that consumer. Average the hourly means over 22–07, 07–16 and 16–22 and
+    /// set the three keys. Until you do, the run WARNs that it is charging a
+    /// flat spread.
+    pub backtest_spread_pips_asian: Option<f64>,
+    pub backtest_spread_pips_overlap: Option<f64>,
+    pub backtest_spread_pips_late_ny: Option<f64>,
+    /// Round-trip cost band, in pips, that every reported result is measured
+    /// against — never a single "true cost" number.
+    ///
+    /// A backtest result is a function of the cost you charged it, and nobody
+    /// knows their real all-in cost to better than a few tenths of a pip
+    /// (spread varies by hour and by news, commission is quoted per side, and
+    /// slippage is not a constant). Reporting one number invites the reader to
+    /// believe it. So the screen evaluates each survivor at BOTH edges and a
+    /// candidate that is profitable at `cost_band_optimistic_pips` but not at
+    /// `cost_band_pessimistic_pips` is flagged `optimistic_edge_only` — which
+    /// is to say: **not a result**.
+    ///
+    /// These are TOTAL round-trip costs (spread + commission + slippage,
+    /// expressed in pips), not spreads. 1.6–2.4 is the band the 2026-08-09
+    /// cost review settled on for FX majors on a retail ECN account.
+    pub cost_band_optimistic_pips: f64,
+    pub cost_band_pessimistic_pips: f64,
     pub conformal_enabled: bool,
     pub conformal_alpha: f64,
     pub conformal_abstain_min_set_size: usize,
@@ -507,7 +639,18 @@ impl Default for RiskConfig {
             trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
+            // Per side — that is how a broker quotes it, and how the number 7.0
+            // was obtained. See the field doc for the arithmetic and for what
+            // this changes.
+            commission_per_lot_is_per_side: true,
             backtest_spread_pips: 1.5,
+            // Unset: no broker per-hour curve has been measured for this
+            // install. The run WARNs and charges the flat spread.
+            backtest_spread_pips_asian: None,
+            backtest_spread_pips_overlap: None,
+            backtest_spread_pips_late_ny: None,
+            cost_band_optimistic_pips: 1.6,
+            cost_band_pessimistic_pips: 2.4,
             conformal_enabled: true,
             conformal_alpha: 0.10,
             conformal_abstain_min_set_size: 3,
@@ -520,9 +663,107 @@ impl Default for RiskConfig {
     }
 }
 
+/// Session-spread curve in pips, already ordered the way
+/// `neoethos_search::eval::SessionSpreadProfile` reads it.
+///
+/// This crate cannot name that type (it does not depend on the search crate),
+/// so the resolved curve travels as a plain triple and the search crate builds
+/// the profile from it. The ORDER is part of the contract: `[asian, overlap,
+/// late_ny]`, matching the UTC buckets 22–07 / 07–16 / 16–22.
+pub type SessionSpreadPips = [f64; 3];
+
+impl RiskConfig {
+    /// Resolve the operator's session-spread curve.
+    ///
+    /// - `Ok(None)` — none of the three keys is set. The evaluator charges the
+    ///   flat `backtest_spread_pips` at every hour of the day. This is the
+    ///   shipped default and the caller is expected to say so out loud.
+    /// - `Ok(Some(curve))` — all three set, finite and non-negative.
+    /// - `Err(reason)` — a PARTIAL curve, or a non-finite / negative bucket.
+    ///   Refused rather than repaired: a cost model that is two-thirds
+    ///   configured charges numbers nobody chose.
+    pub fn session_spread_pips(&self) -> Result<Option<SessionSpreadPips>, String> {
+        let named = [
+            ("backtest_spread_pips_asian", self.backtest_spread_pips_asian),
+            (
+                "backtest_spread_pips_overlap",
+                self.backtest_spread_pips_overlap,
+            ),
+            (
+                "backtest_spread_pips_late_ny",
+                self.backtest_spread_pips_late_ny,
+            ),
+        ];
+        let set: Vec<&str> = named
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+        if set.is_empty() {
+            return Ok(None);
+        }
+        if set.len() != named.len() {
+            let missing: Vec<&str> = named
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            return Err(format!(
+                "session spread curve is partially configured: {} set, {} missing. All three \
+                 buckets must be given together (Asian 22–07 UTC, Overlap 07–16, Late NY 16–22) \
+                 or none — a partial curve would charge an unchosen number for a third of every \
+                 trading day.",
+                set.join(", "),
+                missing.join(", ")
+            ));
+        }
+        let mut out = [0.0f64; 3];
+        for (slot, (key, value)) in out.iter_mut().zip(named.iter()) {
+            let v = value.unwrap_or(f64::NAN);
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!(
+                    "{key} = {v} is not a usable spread (must be finite and >= 0)"
+                ));
+            }
+            *slot = v;
+        }
+        Ok(Some(out))
+    }
+
+    /// The commission this account pays for a COMPLETE round trip on one lot,
+    /// in account currency.
+    ///
+    /// Every evaluator subtracts this exactly once per closed trade, so this —
+    /// not the per-side quote — is what belongs in `commission_per_trade`.
+    pub fn round_trip_commission_per_lot(&self) -> f64 {
+        let per_lot = self.commission_per_lot.max(0.0);
+        if self.commission_per_lot_is_per_side {
+            per_lot * 2.0
+        } else {
+            per_lot
+        }
+    }
+
+    /// The cost band, ordered `(optimistic, pessimistic)`, sanitised.
+    ///
+    /// Returns `None` when the band is unusable (non-finite, negative, or
+    /// inverted) so the caller can refuse rather than silently report a
+    /// one-sided cost. An operator who genuinely wants a point estimate has to
+    /// set both edges to the same number, and the report will then say the band
+    /// is degenerate instead of pretending it measured a range.
+    pub fn cost_band_pips(&self) -> Option<(f64, f64)> {
+        let lo = self.cost_band_optimistic_pips;
+        let hi = self.cost_band_pessimistic_pips;
+        if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < 0.0 || hi < lo {
+            return None;
+        }
+        Some((lo, hi))
+    }
+}
+
 /// Models and training configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelsConfig {
     pub ml_models: Vec<String>,
     pub use_rl_agent: bool,
@@ -610,7 +851,45 @@ pub struct ModelsConfig {
     pub prop_search_min_win_rate: f64,
     /// Target profile: the lowest average-win over average-loss a candidate may
     /// have. `0.0` disables the gate.
+    ///
+    /// SECONDARY ONLY since 2026-08-09. This number is a SHAPE preference and it
+    /// is not, and can never be, evidence of profit. Measured: a candidate at
+    /// payoff 2.53 had an expectancy of -4.18 pips per trade. It clears a 2.0
+    /// floor and loses money on every trade it takes. The gate that decides
+    /// survival is `prop_search_min_net_expectancy_per_trade` below; this one can
+    /// only narrow what that gate already admitted.
     pub prop_search_min_payoff_ratio: f64,
+    /// The PRIMARY survival gate: the lowest cost-charged net expectancy per
+    /// trade, in account currency, a candidate may have.
+    ///
+    /// `0.0` does NOT mean "no preference" — unlike every other field on the
+    /// target profile, it means "must be strictly greater than zero". There is
+    /// no configuration in which a negative-expectancy candidate is admitted.
+    ///
+    /// The number is the mean of the per-trade net P&L the backtest actually
+    /// booked, so spread, commission, swap and the conversion fee are already
+    /// subtracted. It answers the only question that decides whether an account
+    /// grows: after paying the broker, does the average trade make money?
+    pub prop_search_min_net_expectancy_per_trade: f64,
+    /// How many standard errors above zero that expectancy must sit.
+    ///
+    /// `mean / (sd / sqrt(n))`. `0.0` requires only the sign, which is the
+    /// default because a significance floor is a separate decision from a
+    /// correctness bound and the operator has not made it yet. Set it to ~2.0 to
+    /// refuse candidates whose positive expectancy is inside its own noise —
+    /// note that this is an IN-SAMPLE t-statistic on overlapping trades, so it
+    /// bounds sampling noise, not selection bias. Only DSR/PBO over the full
+    /// trial set can do the latter.
+    ///
+    /// The per-trial return series that DSR/PBO need IS now persisted — every
+    /// screened candidate, captured before any gate, written to
+    /// `{SYMBOL}_{TF}.trial_returns.bin` beside the ledger. What does not exist
+    /// yet is a READER: nothing in the workspace computes a deflated Sharpe or a
+    /// CSCV/PBO from that matrix. So the precondition has landed and the
+    /// correction has not, and until it does, a candidate that clears this floor
+    /// has been checked against its own sampling noise and NOT against the
+    /// thousands of trials it was selected from.
+    pub prop_search_min_expectancy_t_stat: f64,
     /// Target profile: the most of the evaluated span a candidate may spend
     /// holding a position, as a fraction.
     ///
@@ -648,6 +927,12 @@ pub struct ModelsConfig {
     /// holdout. Gated to `bars >= heavy_booster_min_bars` and `trials > 1` to
     /// bound the 15×-fold fit cost; below that it falls back to the single
     /// holdout. Set `false` to restore the single-holdout HPO.
+    /// WARNING NAMING TWIN of `models.enable_cpcv` - NOT a duplicate. This one
+    /// gates TRAINING CPCV (`training_orchestrator.rs:4432`); `enable_cpcv`
+    /// gates the SEARCH admission gate (`discovery.rs:2586-2591`). Disarming
+    /// the wrong one admits candidates that never passed purged CV. Renaming
+    /// this to `training_cpcv_enabled` needs `neoethos-models` in the same wave
+    /// - routed to `docs/pending-edits-forbidden-territory.md`.
     pub ml_cpcv_enabled: bool,
     pub prop_search_parent_selection: String,
     pub prop_search_survivor_selection: String,
@@ -686,8 +971,20 @@ pub struct ModelsConfig {
     /// hardcoded $7/lot in discovery.rs.
     pub prop_search_sensitivity_commission_per_lot: f64,
     pub train_batch_size: usize,
+    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]`
+    /// 2026-08-10. Zero readers (`config_has_recipient.rs:210-233`);
+    /// `HardwareExecutionPlan::inference_batch_size` (`system.rs:1466-1477`)
+    /// computes it from the probe and hands it to the consumer as a parameter
+    /// rather than writing it back into `Settings`. Deleting the field is
+    /// blocked on `system.rs` - routed to `pending-A.md`.
+    #[serde(skip)]
     pub inference_batch_size: usize,
     pub enable_transformer_expert: bool,
+    /// WARNING ARITHMETIC TWIN of `transformer_n_heads` (below): both are read
+    /// and collapsed by `.max()` at `training_orchestrator.rs:886-892`, with no
+    /// winner named. They ship equal, agreeing by luck. One field should
+    /// survive; the call site is in `neoethos-models` - routed to
+    /// `docs/pending-edits-forbidden-territory.md`.
     pub transformer_heads: usize,
     pub transformer_layers: usize,
     pub transformer_hidden_dim: usize,
@@ -715,7 +1012,6 @@ pub struct ModelsConfig {
     #[serde(serialize_with = "serialize_sorted_map")]
     pub max_epochs_by_model: HashMap<String, usize>,
     pub ray_tune_max_concurrency: usize,
-    pub export_onnx: bool,
     pub calibration_enabled: bool,
     pub calibration_method: String,
     pub calibration_min_rows: usize,
@@ -771,7 +1067,18 @@ pub struct ModelsConfig {
     pub label_geometry: String,
     pub label_horizon_bars: usize,
     pub label_neutral_band_atr_fraction: f64,
+    /// MONEY WARNING ARITHMETIC TWIN of `risk.atr_stop_multiplier`: collapsed
+    /// by `.max()` at `training_orchestrator.rs:2316-2321`, no winner named,
+    /// and a THIRD hardcoded 1.5 lives at `stop_target.rs:226`. Survivor should
+    /// be `risk.atr_stop_multiplier`. Call site is in `neoethos-models` -
+    /// routed to `docs/pending-edits-forbidden-territory.md`.
     pub label_stop_atr_multiplier: f64,
+    /// MONEY WARNING ARITHMETIC TWIN of `risk.min_risk_reward`: collapsed by
+    /// `.max()` at `training_orchestrator.rs:2481-2487` - but ONLY when
+    /// `label_geometry` selects the Asymmetric arm. The shipped `symmetric` arm
+    /// reads NEITHER, which is why a 2RR floor may never reach the labels.
+    /// Survivor should be `risk.min_risk_reward`. Routed to
+    /// `docs/pending-edits-forbidden-territory.md`.
     pub label_take_profit_rr: f64,
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
@@ -780,6 +1087,14 @@ pub struct ModelsConfig {
     /// or `"strict"` (full FilteringConfig floors). Was the env-only
     /// `NEOETHOS_BOT_DISCOVERY_MODE`; now a first-class config knob the
     /// operator sets from the UI / TUI — never the environment.
+    /// WARNING RESTRICT, DO NOT MERGE (refuter overturn).
+    /// `discovery.rs:5755-5760` maps only `strict|legacy`; every other value
+    /// falls through to `system.trading_mode`. It reaches `Strict`, which
+    /// `trading_mode` structurally cannot, so the two are NOT one knob. The
+    /// accepted values must be narrowed to `strict|legacy` and the fall-through
+    /// logged by name - the caller is `neoethos-search::discovery` and the TUI
+    /// that offers `risky`/`prop_firm` and rejects `legacy` is app-side. Routed
+    /// to `docs/pending-edits-forbidden-territory.md`.
     pub discovery_mode: String,
     /// agent 2026-06-05 overfitting fix: when `true` (default), a discovered
     /// portfolio is only export-ready in PropFirm mode if it ALSO passes the
@@ -799,6 +1114,14 @@ pub struct ModelsConfig {
     /// edge, with the live models lifting the rest (discovery=edge, models=grow).
     /// The base-filter max-DD + walk-forward export gate still reject blow-ups /
     /// overfit. Raise toward 0.65 for stricter selection; lower for more candidates.
+    /// MONEY WARNING ARITHMETIC TWIN of
+    /// `models.discovery_runtime.prop_firm_gate.pass_rate`: collapsed by
+    /// `.max()` at `discovery.rs:7812`. The 2026-06-06 mandate written into
+    /// both repo YAMLs names only THIS field, so raising the other silently
+    /// overrides the disarm. One field should survive; while both exist the
+    /// SAFER (higher) value wins and the disagreement must be logged with both
+    /// numbers. Caller is in `neoethos-search` - routed to
+    /// `docs/pending-edits-forbidden-territory.md`.
     pub prop_firm_min_pass_rate: f64,
     /// Genetic-search runtime knobs (config-driven replacement for the
     /// `NEOETHOS_BOT_*` search env vars). See [`SearchRuntimeConfig`].
@@ -822,6 +1145,13 @@ pub struct ModelsConfig {
     /// Adaptive-stop cost caps. See [`StopTargetRuntimeConfig`] — the
     /// recipient the hardcoded `tail_max_bars = 300_000` never had.
     pub stop_target_runtime: StopTargetRuntimeConfig,
+    /// Discovery exit geometry. See [`ExitPolicyConfig`] — the recipient the
+    /// hardcoded `trailing_enabled: true` in `strategy_gene.rs:851` never had.
+    pub exit_policy: ExitPolicyConfig,
+    /// The stop/target band gene generation and mutation draw within. See
+    /// [`GeneStopBoundsConfig`] — the recipient the `[6, 20]` / `[12, 45]` pip
+    /// literals in `evolution_math.rs` never had.
+    pub gene_stop_bounds: GeneStopBoundsConfig,
     /// Seen-signature dedup-memory knobs (config-driven replacement for
     /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
     /// [`SeenSignatureRuntimeConfig`].
@@ -867,6 +1197,10 @@ pub struct ModelsConfig {
     pub prop_accuracy_weight: f64,
     pub prop_min_trades: usize,
     pub prop_conf_threshold: f64,
+    /// WARNING NAMING TWIN of `models.ml_cpcv_enabled` - NOT a duplicate. THIS
+    /// one is the SEARCH purged-CV admission gate (`discovery.rs:2586-2591`).
+    /// Rename to `search_cpcv_gate_enabled` needs `neoethos-search` in the same
+    /// wave - routed to `docs/pending-edits-forbidden-territory.md`.
     pub enable_cpcv: bool,
     pub cpcv_n_splits: usize,
     pub cpcv_n_test_groups: usize,
@@ -877,6 +1211,8 @@ pub struct ModelsConfig {
     pub enable_ddp: bool,
     pub enable_fsdp: bool,
     pub ddp_world_size: usize,
+    /// WARNING ARITHMETIC TWIN - see `transformer_hidden_dim` above. These
+    /// three are the `.max()` partners at `training_orchestrator.rs:878-900`.
     pub transformer_d_model: usize,
     pub transformer_n_heads: usize,
     pub transformer_n_layers: usize,
@@ -936,7 +1272,7 @@ pub struct ModelsConfig {
 /// fields mean "use the engine default" (so the config default need not
 /// duplicate the parser vocabulary).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchRuntimeConfig {
     pub seed: Option<u64>,
     pub novelty_weight: f64,
@@ -1023,10 +1359,19 @@ impl Default for SearchRuntimeConfig {
 /// the UI / TUI, never the environment. Defaults reproduce the previous
 /// env-absent behaviour exactly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
     /// Max features kept after the in-sample correlation prefilter; `0`
     /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
+    ///
+    /// **The default MUST equal the value shipped in `config.yaml`.** It did
+    /// not: the code said 50 while the shipped config said 240, so any path
+    /// that fell back to the default searched a quarter of the intended
+    /// feature pool. At 50 the base set collapses from 217 columns to roughly
+    /// 64 and the SMC, session and footprint families die first, because —
+    /// unlike `regime_` — they have no force-keep. That divergence is now
+    /// pinned by `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`,
+    /// which parses the shipped YAML and fails if the two ever disagree again.
     pub prefilter_top_k: usize,
     /// Fraction of rows treated as in-sample when ranking features; must be
     /// in `(0, 1]`. (was `NEOETHOS_BOT_PREFILTER_INSAMPLE`)
@@ -1053,10 +1398,41 @@ pub struct DiscoveryRuntimeConfig {
     /// runs; `0` skips the pre-flight check. (was
     /// `NEOETHOS_BOT_MIN_HISTORY_YEARS`)
     pub min_history_years: u32,
-    /// Opt-in: derive a per-dataset adaptive coarse-threshold ladder from the
-    /// feature cube. Experimental — the install is process-global (OnceLock),
-    /// so leave off for multi-symbol sweeps until per-symbol install lands
-    /// (F-277b). (was `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`)
+    /// Derive the coarse-threshold ladder from THIS run's feature cube instead
+    /// of using the static one.
+    ///
+    /// **Default flipped to `true` on 2026-08-09.** The static ladder
+    /// `[0.10, 0.20, 0.35, 0.50, 0.70, 0.90]` carries its own calibration in a
+    /// comment — "Calibrated for z-score-normalised features"
+    /// (`evolution_math.rs:560-563`) — and `models.data_runtime.normalize_features`
+    /// was `false` in both shipped configs and in the code default. So the
+    /// ladder was being compared against raw feature magnitudes spanning about
+    /// 1e5:1 (RSI ~50, EMA ~1.08, M5 ATR ~5e-4). A gene's threshold at 0.35 is
+    /// unreachable for an ATR term and always-on for an RSI term, whatever
+    /// weight the GA gave it.
+    ///
+    /// `derive_adaptive_threshold_ladder_from_features` (`evolution_math.rs:648`)
+    /// exists for exactly this and is installed at `discovery.rs:3492` when the
+    /// flag is true; it places the six rungs at percentile points of the
+    /// dataset's own per-column median magnitude, so a threshold means the same
+    /// thing on XAUUSD M1 as on EURUSD D1.
+    ///
+    /// **What this fixes and what it does NOT.** It fixes the THRESHOLD side
+    /// only. The weight ladder is still `{0.2, 0.4, 0.6, 0.8, 1.0}` — a 5:1
+    /// span — set against a feature-scale span of ~1e5:1, so a multi-term gene
+    /// is still arithmetically equal to its single largest-magnitude term. The
+    /// complete fix is `models.data_runtime.normalize_features: true`, which
+    /// puts every column on a comparable scale and makes the weight ladder
+    /// decide something. See that field's docs for the trade-off.
+    ///
+    /// The old "leave off for multi-symbol sweeps (OnceLock)" caveat is stale:
+    /// audit D06 (2026-07-13) replaced the `OnceLock` with a per-run replace
+    /// (`install_adaptive_threshold_ladder` / `clear_adaptive_threshold_ladder`),
+    /// so a batch sweep no longer leaks the first symbol's ladder.
+    ///
+    /// **This changes what is searched.** Genes initialise and mutate onto
+    /// different thresholds, so a run before this flag and a run after it are
+    /// not comparable. (was `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS`)
     pub adaptive_thresholds: bool,
     /// Prop-firm window-pass gate parameters (FTMO baseline + overrides).
     /// See [`PropFirmGateConfig`]. (was the
@@ -1089,13 +1465,18 @@ pub struct DiscoveryRuntimeConfig {
 impl Default for DiscoveryRuntimeConfig {
     fn default() -> Self {
         Self {
-            prefilter_top_k: 50,
+            // 240, matching config.yaml. See the field docs — the previous 50
+            // silently contradicted the shipped config.
+            prefilter_top_k: 240,
             prefilter_insample_frac: 0.80,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
-            adaptive_thresholds: false,
+            // true, matching BOTH shipped config.yaml files. The static ladder
+            // is calibrated for normalised features that normalisation never
+            // produced; see the field docs.
+            adaptive_thresholds: true,
             prop_firm_gate: PropFirmGateConfig::default(),
             // false = today: the GeneticStrategyExpert searches the full
             // series. See the field docs for why this is not simply `true`.
@@ -1112,7 +1493,7 @@ impl Default for DiscoveryRuntimeConfig {
 /// value to override that specific rule (e.g. to target a non-FTMO firm's
 /// challenge from the UI / TUI).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PropFirmGateConfig {
     /// Max daily-loss fraction (e.g. `0.05` = 5%). `None` = FTMO baseline.
     /// (was `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT`)
@@ -1164,8 +1545,27 @@ impl Default for PropFirmGateConfig {
 /// == default()` test enforces it). `None` cost fields mean "no
 /// override" (production callers pass explicit values).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EvalRuntimeConfig {
+    // ---------------------------------------------------------------------
+    // WARNING LIBRARY FALLBACK, NEVER REACHED BY DISCOVERY (2026-08-10).
+    //
+    // `symbol` / `account_currency`: `system.symbol` and
+    // `system.account_currency` win whenever non-empty (`discovery.rs:735`,
+    // `:747`); these are a last-resort fallback that logs an error and returns
+    // a NaN sentinel. Two `symbol:` keys ~1300 lines apart in one file.
+    //
+    // `spread_pips` / `commission_per_trade` (MONEY): `risk.backtest_spread_pips`
+    // + `slippage_pips` + `commission_per_lot` win UNCONDITIONALLY -
+    // `strategy_gene.rs:509-511` is a 4-step chain whose step (1) is filled by
+    // `discovery.rs:754-756` on EVERY discovery run, and `:4086-4104` refuses a
+    // non-finite override so the `.filter` can never fall through. These two
+    // are nevertheless what the Settings screen renders as `cost.spread_pips` /
+    // `cost.commission_per_trade`, with tuning presets - the UI advertises the
+    // loser. Deleting them requires the search-side read to collapse to
+    // `risk.*` in the same wave - routed to
+    // `docs/pending-edits-forbidden-territory.md`.
+    // ---------------------------------------------------------------------
     pub symbol: Option<String>,
     pub account_currency: Option<String>,
     pub pip_value: Option<f64>,
@@ -1230,7 +1630,7 @@ impl Default for EvalRuntimeConfig {
 /// `from_settings(&Settings::default()) == default()` test enforces the
 /// matching defaults.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct QualityRuntimeConfig {
     /// Minimum trades a calendar month needs to count toward monthly
     /// win-rate / avg-return scoring.
@@ -1295,7 +1695,7 @@ impl Default for QualityRuntimeConfig {
 /// gene's fixed pips. Fail-loud is deliberate; the old silence is how 14 240
 /// zero-price bars once produced a £77 211 phantom move without a whisper.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StopTargetRuntimeConfig {
     /// Hard cap on how many bars the rolling expected-shortfall series will
     /// process. `0` (the default) means NO cap — every series gets the tail
@@ -1330,11 +1730,146 @@ impl Default for StopTargetRuntimeConfig {
     }
 }
 
+/// The exit geometry discovery evaluates every candidate under.
+///
+/// WHY THIS EXISTS (2026-08-09). Until today these four numbers were literals
+/// inside `EvaluationConfig::for_symbol` (`strategy_gene.rs:849-853`) —
+/// `trailing_enabled: true`, `trailing_be_trigger_r: 1.0`,
+/// `trailing_atr_multiplier: 1.0` — with a comment calling them an operator
+/// mandate. Nothing could switch them off, so nothing ever measured the search
+/// without them.
+///
+/// What they did, measured on real EURUSD bars: `trailing_atr_multiplier`
+/// despite its name is NOT an ATR multiple, it is a multiple of the position's
+/// own stop distance (`eval.rs:1030-1035`), and the trail is applied BEFORE the
+/// take-profit check on every bar after entry. At trigger 1.0 / multiple 1.0 the
+/// stop sits at entry the instant a trade touches +1R, so reaching 3R requires
+/// climbing 1R→3R without ever giving back 1R from the running high. The
+/// realised payoff was 0.87 at sl 6 / tp 45 AND 0.87 at sl 6 / tp 300 — average
+/// win 6.10 vs 6.11 pips. The take-profit was dead code. Highest payoff observed
+/// anywhere in the full grid, all timeframes: 1.08, against a configured floor of
+/// 2.0. Zero of 174 screened candidates could survive, before a bar was read.
+///
+/// WHAT THIS IS NOT. Turning the trail off has ZERO prior expected value in
+/// money. Measured across every trailing configuration, expectancy stayed at
+/// -4.15 pips per trade while the payoff ratio moved from 0.91 to 2.53. Exit
+/// geometry redistributes the (win-rate, payoff) split; on a driftless price the
+/// product is fixed at -cost. The value of this knob is DIAGNOSTIC: it makes the
+/// question askable. Do not read a payoff improvement here as an edge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExitPolicyConfig {
+    /// Whether the break-even + trailing stop is active in discovery.
+    ///
+    /// DEFAULT `false` — the opposite of the old hardcode. What this now
+    /// PERMITS: a take-profit that can actually be reached, so a payoff ratio
+    /// above ~1.1 is expressible at all. What it REFUSES: the automatic
+    /// break-even protection the old comment credited with lowering drawdown.
+    /// Both effects are real; only the first one was ever measured.
+    pub trailing_enabled: bool,
+    /// Profit, in multiples of the position's initial stop distance, that must
+    /// be reached before the trail arms at all.
+    pub trailing_be_trigger_r: f64,
+    /// How far behind the running extreme the armed trail sits, as a multiple of
+    /// the position's initial stop distance.
+    ///
+    /// Named `trailing_atr_multiplier` in `BacktestSettings` / `EvaluationConfig`
+    /// for historical reasons. It has never been an ATR multiple. The name is
+    /// kept there because the CUDA kernel and the cubecl kernel both bind to it;
+    /// renaming is a kernel-coupled change and does not belong in this one.
+    pub trailing_stop_multiplier: f64,
+    /// Floor, in pips, on the profit the armed trail locks in.
+    pub trailing_min_lock_pips: f64,
+}
+
+impl Default for ExitPolicyConfig {
+    fn default() -> Self {
+        Self {
+            // OFF. See the type doc for the measurement.
+            trailing_enabled: false,
+            trailing_be_trigger_r: 1.0,
+            trailing_stop_multiplier: 1.0,
+            trailing_min_lock_pips: 2.0,
+        }
+    }
+}
+
+/// The stop/target band the GA is allowed to draw and mutate within, expressed
+/// in MULTIPLES OF THE DATASET'S OWN TYPICAL BAR RANGE rather than absolute pips.
+///
+/// WHY. `evolution_math.rs` clamped every gene to `sl ∈ [6, 20]` pips and
+/// `tp ∈ [12, 45]` pips, and sampled reward:risk only in `[1.5, 2.5]`. Those are
+/// M5 numbers. On H1 (ATR ≈ 12 pips) a 6-pip stop is inside the spread; on H4
+/// (ATR ≈ 30 pips) the entire band is below one bar's range. So "move to a higher
+/// timeframe" was not advice the search could act on — the higher timeframes were
+/// literally inexpressible.
+///
+/// It also excluded the reward:risk the payoff floor demanded. With barriers only
+/// the payoff is `(tp - c) / (sl + c)`, so a floor of 2.0 needs `tp >= 2·sl + 3·c`.
+/// At the charged cost of c = 2.89 pips a 20-pip stop needs `tp >= 48.67` — outside
+/// the 45-pip ceiling, and the initialiser never sampled a reward:risk above 2.5
+/// anyway.
+///
+/// The unit is the median ATR of the dataset being searched, measured per run and
+/// installed by discovery. When no scale has been installed the absolute
+/// pre-2026-08-09 band is used verbatim, so a caller outside discovery
+/// (`neoethos-models`' own GA) behaves exactly as before.
+///
+/// Same warning as [`ExitPolicyConfig`]: widening the band has no prior expected
+/// value in money. It changes which shapes are REACHABLE, not whether they pay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GeneStopBoundsConfig {
+    /// When `false`, gene generation and mutation use the absolute pip band
+    /// below and ignore the dataset's ATR entirely (the pre-2026-08-09 behaviour,
+    /// kept reachable for reproducing an old run).
+    pub atr_scaled: bool,
+    /// Tightest stop the GA may draw, in ATR units.
+    pub sl_min_atr: f64,
+    /// Widest stop the GA may draw, in ATR units.
+    pub sl_max_atr: f64,
+    /// Lowest reward:risk the initialiser samples.
+    pub rr_min: f64,
+    /// Highest reward:risk the initialiser samples. Raised from the old 2.5 so
+    /// the reward:risk a 2.0 payoff floor demands is inside the search space
+    /// instead of outside it.
+    pub rr_max: f64,
+    /// Absolute pip band used when `atr_scaled` is false or no ATR scale has
+    /// been installed for the run. These four are the literals that were in
+    /// `evolution_math.rs` before this config existed.
+    pub sl_min_pips: f64,
+    pub sl_max_pips: f64,
+    pub tp_min_pips: f64,
+    pub tp_max_pips: f64,
+}
+
+impl Default for GeneStopBoundsConfig {
+    fn default() -> Self {
+        Self {
+            atr_scaled: true,
+            // EURUSD M5 ATR ≈ 5 pips, so [1.0, 4.0] ATR reproduces the old
+            // [6, 20]-pip band on the timeframe it was tuned for, and means the
+            // same thing on H1 (≈ [12, 48] pips) and H4 (≈ [30, 120]).
+            sl_min_atr: 1.0,
+            sl_max_atr: 4.0,
+            rr_min: 1.5,
+            // 4.0, not 2.5: `tp >= 2·sl + 3·c` at c = 2.89 pips needs 2.43 at
+            // sl = 20 and 3.95 at sl = 6. A 2.0 payoff floor with rr_max = 2.5
+            // is a gate no draw can clear on a small stop.
+            rr_max: 4.0,
+            sl_min_pips: 6.0,
+            sl_max_pips: 20.0,
+            tp_min_pips: 12.0,
+            tp_max_pips: 45.0,
+        }
+    }
+}
+
 /// Backtest-evaluation runtime knobs — config-driven replacement for the
 /// `NEOETHOS_BOT_BACKTEST_*` + `NEOETHOS_BOT_RUST_THREADS` env vars.
 /// Mirrors `neoethos_search::eval::BacktestRuntimeOverrides`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BacktestRuntimeConfig {
     /// Starting equity for canonical backtest PnL accounting (> 0).
     pub initial_equity: f64,
@@ -1360,11 +1895,18 @@ impl Default for BacktestRuntimeConfig {
 /// load/entry caps, and on-disk path). Mirrors
 /// `neoethos_search::genetic::SeenSignatureMemoryRuntimeOverrides`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SeenSignatureRuntimeConfig {
     pub flush_every: usize,
     pub load_max: usize,
     /// `0` → unbounded (`usize::MAX`); otherwise the entry cap.
+    /// `0` means DERIVE FROM AVAILABLE MEMORY - it does NOT mean "unbounded".
+    ///
+    /// Changed 2026-08-10. `0` is exactly what an operator types for "no
+    /// limit", and the old reading grew a `HashSet<u64>` + `VecDeque<u64>` for
+    /// the whole run. WARNING: eviction is FIFO, so a LOWERED cap silently
+    /// re-admits previously-seen genes and CHANGES WHAT THE RUN EXPLORES - the
+    /// effective cap and the first eviction are logged by the search crate.
     pub max_entries: usize,
     /// Optional on-disk seen-signature file. Empty / unset → in-memory only.
     pub file_path: Option<String>,
@@ -1398,13 +1940,18 @@ impl Default for SeenSignatureRuntimeConfig {
 /// runs, but the seeded hashes are not visible to the engine's fresh in-memory
 /// set — set a `file_path` to get true cross-run dedup.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DiscoveryLedgerConfig {
     /// Master switch. When `false`, discovery behaves byte-identically to a
     /// build without this feature (no ledger read, no seed, no ledger write).
     pub enabled: bool,
     /// Directory the per-symbol/TF ledger JSON files live in. Relative paths
     /// resolve against the process CWD (same convention as `cache/features`).
+    /// WARNING NAMING TWIN of `system.cache_dir` - genuinely different
+    /// artifacts and different types (`PathBuf` vs a relative `String`). KEEP
+    /// BOTH; this one should be renamed `ledger_dir`. The rename needs
+    /// `neoethos-search::discovery` in the same wave - routed to
+    /// `docs/pending-edits-forbidden-territory.md`.
     pub cache_dir: String,
     /// How many top archive (non-portfolio) genes to also record per run, so
     /// the seen-set grows beyond just the promoted portfolio.
@@ -1434,7 +1981,7 @@ impl Default for DiscoveryLedgerConfig {
 /// (probabilities are clamped to `[0,1]`; `force_enabled = false` zeroes
 /// `force_ratio` + `min_flags`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SmcSearchRuntimeConfig {
     pub force_ratio: f64,
     pub min_flags: usize,
@@ -1480,12 +2027,48 @@ impl Default for SmcSearchRuntimeConfig {
 /// env vars. Both default OFF (opt-in). Consumed by the data crate via
 /// `neoethos_data::install_data_runtime_overrides(...)` at startup.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DataRuntimeConfig {
-    /// Per-column robust z-score normalization of the feature matrix
-    /// before the GA search (was `NEOETHOS_BOT_NORMALIZE_FEATURES`).
-    /// OFF by default — enabling without re-calibrating GA thresholds
-    /// changes discovery for symbols that currently work.
+    /// Per-column robust z-score normalization of the feature matrix before the
+    /// GA search (was `NEOETHOS_BOT_NORMALIZE_FEATURES`).
+    ///
+    /// **Default flipped to `true` on 2026-08-09, and this one is not cosmetic.**
+    ///
+    /// The GA's signal is `combined = Σ wᵢ · featureᵢ`, with `wᵢ` drawn from
+    /// `{0.2, 0.4, 0.6, 0.8, 1.0}` (optionally negated) — a 5:1 span. Raw
+    /// feature magnitudes span about 1e5:1 on a single symbol: RSI ≈ 50,
+    /// an EMA ≈ 1.08, an M5 ATR ≈ 5e-4. A 5:1 weight cannot reorder terms that
+    /// differ by 1e5, so **a multi-indicator gene was arithmetically equal to
+    /// its single largest-magnitude term** and every other weight the GA
+    /// searched was decoration. `normalization.rs` says the same thing in its
+    /// own module docs, and names the empty-portfolio bug it produced on EURJPY
+    /// (magnitudes ±3.5e11) and XAUUSD.
+    ///
+    /// With this on, `normalize_feature_series_in_place` applies a robust
+    /// per-column z-score — `(x − median) / (1.4826·MAD)`, clipped to ±10,
+    /// fitted on the leading 80% of rows so the out-of-sample tail cannot leak
+    /// into its own scale — and the weight ladder starts deciding something.
+    ///
+    /// ## What this changes, stated plainly
+    ///
+    /// 1. **Every gene threshold now means what the static ladder always said
+    ///    it meant.** `evolution_math.rs:560` calls that ladder "Calibrated for
+    ///    z-score-normalised features"; until now nothing produced them.
+    /// 2. **Non-finite cells become exactly 0.0.** That includes the leading
+    ///    NaN run every higher-timeframe column carries from
+    ///    `align_features_by_ns`. Those rows stop being *skippable* and start
+    ///    being *data* — a constant block at the column's median. The prefilter's
+    ///    pairwise-complete correlation will therefore report `skipped = 0` and
+    ///    a slightly attenuated |r| for those columns, so the alignment gap
+    ///    stops being visible THERE. `run_discovery_cycle` logs this interaction
+    ///    once per run rather than letting it be inferred.
+    /// 3. **Prior artifacts are not comparable.** Anything fitted on the raw
+    ///    cube — trained models, exported genes, saved thresholds — was fitted
+    ///    on a different feature scale. Retrain and re-search; do not mix.
+    ///
+    /// It has ZERO expected value in money on its own. It does not create edge.
+    /// It makes the search's own parameters mean something, which is the
+    /// precondition for finding out whether there is any.
     pub normalize_features: bool,
     /// Auto-rebuild a present-but-stale higher timeframe from the base
     /// instead of NaN-ing the stale tail (was
@@ -1496,7 +2079,10 @@ pub struct DataRuntimeConfig {
 impl Default for DataRuntimeConfig {
     fn default() -> Self {
         Self {
-            normalize_features: false,
+            // true, matching BOTH shipped config.yaml files. See the field docs:
+            // without it the GA's 5:1 weight ladder cannot reorder terms that
+            // differ by 1e5, so a multi-indicator gene equalled its largest term.
+            normalize_features: true,
             rebuild_stale_higher_tfs: false,
         }
     }
@@ -1510,7 +2096,7 @@ impl Default for DataRuntimeConfig {
 /// in core/search/models, so it needs a single system-level knob — is a
 /// separate follow-up.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TreeRuntimeConfig {
     /// Device preference for tree-model training: `"auto"` | `"cpu"` |
     /// `"gpu"` | `"cuda"` | `"cuda:N"`. `""` is treated as `"auto"`. Was
@@ -1677,6 +2263,14 @@ impl Default for ModelsConfig {
             // never silently relaxed. Was 0.0 (gate off) — the single reason
             // 16 months of runs kept selecting one-point-of-margin systems.
             prop_search_min_payoff_ratio: 2.0,
+            // The primary gate (2026-08-09). `0.0` = strictly positive required.
+            // This is the floor the payoff ratio was standing in for and could
+            // not carry: payoff 2.53 at expectancy -4.18 pips/trade passes a 2.0
+            // payoff floor and empties the account.
+            prop_search_min_net_expectancy_per_trade: 0.0,
+            // Sign only, by default. Raising this is an operator decision about
+            // how much in-sample noise to tolerate, not a correctness bound.
+            prop_search_min_expectancy_t_stat: 0.0,
             prop_search_max_in_market: 0.0,
             prop_search_val_min_monthly_profit_pct: 0.0,
             prop_search_val_log_trades: false,
@@ -1736,7 +2330,6 @@ impl Default for ModelsConfig {
             hpo_max_rows: 1_000_000,
             max_epochs_by_model: HashMap::new(),
             ray_tune_max_concurrency: 1,
-            export_onnx: false,
             calibration_enabled: true,
             calibration_method: "platt".to_string(),
             calibration_min_rows: 300,
@@ -1809,6 +2402,8 @@ impl Default for ModelsConfig {
             quality_runtime: QualityRuntimeConfig::default(),
             backtest_runtime: BacktestRuntimeConfig::default(),
             stop_target_runtime: StopTargetRuntimeConfig::default(),
+            exit_policy: ExitPolicyConfig::default(),
+            gene_stop_bounds: GeneStopBoundsConfig::default(),
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
             discovery_ledger: DiscoveryLedgerConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
@@ -1863,8 +2458,17 @@ impl Default for ModelsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NewsTradingMode {
-    /// Block new orders inside `news_kill_window_min` of any
-    /// high-impact event. Default — the safe choice.
+    /// Block new orders inside the blackout window of any high-impact
+    /// event. Default — the safe choice.
+    ///
+    /// The window is fixed by the live gate, not configurable: 15 min
+    /// before / 10 min after (`app_services::news_calendar::
+    /// BLACKOUT_BEFORE_MS` / `BLACKOUT_AFTER_MS`), consulted from
+    /// `entry_blackout_for` at `live_trading.rs:1078`. The former
+    /// `news.news_kill_window_min` / `news.news_lookahead_minutes` knobs
+    /// were deleted in the 2026-08-09 D3 purge: they reached only a
+    /// `NewsFilter` nothing constructed, so they advertised control over
+    /// this window that they never had.
     #[default]
     BlockOnNews,
     /// Allow orders through the kill window. The UI shows a banner
@@ -1906,42 +2510,28 @@ impl NewsTradingMode {
 
 /// News and LLM configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NewsConfig {
     /// How the trading gate handles incoming high-impact news.
     /// Operator-controlled; default `block_on_news` preserves the
     /// pre-#117 safe behaviour. See [`NewsTradingMode`].
     #[serde(default)]
     pub news_trading_mode: NewsTradingMode,
-    /// Minutes AHEAD of a high-impact event the blackout begins.
-    ///
-    /// ⚠ Reaches only `AppState::new`, which is `#[cfg(test)]`-only scaffolding
-    /// (`app_state.rs` — "the legacy egui state struct retained as the wide
-    /// test fixture"). No production code constructs a `NewsFilter`, so
-    /// changing this changes nothing a live run does. Listed in
-    /// `tests/config_has_recipient.rs::TEST_FIXTURE_ONLY`.
-    pub news_kill_window_min: usize,
     pub news_calendar_enabled: bool,
     /// Economic-calendar provider id. The ONLY implemented provider is
     /// `forexfactory`; `news_calendar::fetch_calendar` rejects anything else
     /// with an actionable error rather than silently fetching ForexFactory
     /// while the operator believes another source is live.
     pub news_calendar_source: String,
-    /// See `news_kill_window_min` — same test-fixture-only caveat.
-    pub news_lookahead_minutes: usize,
     pub rss_feeds: Vec<String>,
-    /// See `news_kill_window_min` — same test-fixture-only caveat.
-    pub perplexity_enabled: bool,
 }
 
 impl Default for NewsConfig {
     fn default() -> Self {
         Self {
             news_trading_mode: NewsTradingMode::default(),
-            news_kill_window_min: 30,
             news_calendar_enabled: true,
             news_calendar_source: NEWS_CALENDAR_FOREXFACTORY.to_string(),
-            news_lookahead_minutes: 60,
             // Public, no-API-key financial NEWS feeds for the AI news
             // desk (GET /news/feed). Operator-editable in Settings → News.
             // NB: the economic *calendar* lives in `news_calendar_source`
@@ -1952,7 +2542,6 @@ impl Default for NewsConfig {
             // calendar, not RSS (see `news_calendar_source`). Reused as the
             // runtime fallback when a user's configured feeds all fail.
             rss_feeds: default_news_rss_feeds(),
-            perplexity_enabled: true,
         }
     }
 }
@@ -1965,7 +2554,7 @@ impl Default for NewsConfig {
 /// the single config instead of `std::env`. Clamping is applied by the
 /// getters (same bounds the env readers used).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppRuntimeConfig {
     /// HTTP server bind address `host:port` (default `127.0.0.1:7423`).
     pub server_bind: String,
@@ -2006,28 +2595,1053 @@ impl Default for AppRuntimeConfig {
     }
 }
 
-/// Main settings structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Settings {
-    pub system: SystemConfig,
-    pub risk: RiskConfig,
-    pub models: ModelsConfig,
-    pub news: NewsConfig,
-    /// App / server / trading-runtime knobs (config-driven replacement for
-    /// the `neoethos-app` env_overrides registry). See [`AppRuntimeConfig`].
-    pub app_runtime: AppRuntimeConfig,
-}
+pub use load_seal::{ConfigProvenance, ConfigSource, Settings};
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            system: SystemConfig::default(),
-            risk: RiskConfig::default(),
-            models: ModelsConfig::default(),
-            news: NewsConfig::default(),
-            app_runtime: AppRuntimeConfig::default(),
+/// **THE SINGLE RESOLUTION POINT.** The only place in the workspace where a
+/// [`Settings`] value can come into existence.
+///
+/// ## Why this is a module and not a convention
+///
+/// Before 2026-08-10 `Settings` was an ordinary `#[derive(Deserialize)]`
+/// struct with public fields. That meant three ways to obtain one, each
+/// bypassing whatever the last one had learned:
+///
+/// 1. `Settings::load()` — the intended path;
+/// 2. `serde_yaml_ng::from_str::<Settings>(..)` — used by the raw-YAML
+///    endpoint validator, which therefore accepted `trailing_enabeld:` and
+///    reported "saved (verbatim)";
+/// 3. a `Settings { .. }` literal — nothing to stop a fourth loader.
+///
+/// The recorded lesson from the previous attempt at this fix is that
+/// *migrating the call sites* reproduces the defect: the next author adds
+/// path 4. So the seal is structural:
+///
+/// * [`Settings`] carries a **private** `provenance: ConfigProvenance` field.
+///   A struct literal outside this module does not compile.
+/// * [`ConfigProvenance`]'s own fields are private to this module and its only
+///   constructor is `ConfigProvenance::record`, which **logs the source by
+///   name**. Even a second loader written inside this file has to declare
+///   where its bytes came from.
+/// * `Deserialize` is **hand-written and is itself the seal** — it is not a
+///   bypass around the loader, it *is* the loader. Every `from_str`,
+///   `from_reader` and `from_value` in the workspace therefore runs the same
+///   retired-key prune, the same unknown-key refusal, the same preset
+///   re-derivation and the same money-path reports. There is nothing left to
+///   route around.
+///
+/// The compiler enforces all three; there is no derived `Deserialize` left to
+/// fall back to.
+mod load_seal {
+    use super::{
+        user_config_path, AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig,
+    };
+    use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
+    use serde::{Deserialize, Deserializer, Serialize};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    // ─── noise control ──────────────────────────────────────────────────────
+    // `Settings::from_yaml` is called ~40 times per app session (every route
+    // re-reads the file). Emitting the same money-path finding 40 times is how
+    // a real finding becomes wallpaper. Each DISTINCT message is emitted once
+    // per process; nothing is ever downgraded or suppressed by content.
+    fn say_once(key: String, emit: impl FnOnce()) {
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = match seen.lock() {
+            Ok(g) => g,
+            // A poisoned mutex must never silence a money-path report.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.insert(key) {
+            drop(guard);
+            emit();
         }
+    }
+
+    /// Which of the four historical config surfaces produced this `Settings`.
+    ///
+    /// §8 of the 2026-08-09 knob pass: nothing in the workspace logged which
+    /// file a run had opened, and two subsystems in one process were observed
+    /// reading two different files. Every value below is logged by name at the
+    /// moment it is chosen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConfigSource {
+        /// No file was read — `Settings::default()`, the compiled defaults.
+        CompiledDefaults,
+        /// `$CONFIG_FILE` was set and pointed here.
+        EnvConfigFile,
+        /// The operator's live store (`%LOCALAPPDATA%\neoethos\config.yaml`
+        /// and its POSIX equivalents). **This is what a real run reads.**
+        UserStore,
+        /// Last-resort relative `"config.yaml"`, resolved against the process
+        /// working directory — the same binary reads a different file
+        /// depending on the directory it was started from.
+        RepoRelative,
+        /// A caller-supplied path (`Settings::from_yaml`).
+        ExplicitPath,
+        /// Deserialized from bytes with no path: the raw-YAML editor's schema
+        /// check, tests, an embedded document.
+        InMemory,
+    }
+
+    impl ConfigSource {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::CompiledDefaults => "compiled_defaults",
+                Self::EnvConfigFile => "env:CONFIG_FILE",
+                Self::UserStore => "user_store",
+                Self::RepoRelative => "cwd_relative",
+                Self::ExplicitPath => "explicit_path",
+                Self::InMemory => "in_memory",
+            }
+        }
+    }
+
+    /// Proof that a [`Settings`] was minted by the single resolution point.
+    ///
+    /// The fields are private to `load_seal` and the only constructor is
+    /// `record`, which is private to `load_seal`. No code outside this module
+    /// can produce one, which is what makes a second load path a **compile
+    /// error** rather than a code-review opinion.
+    #[derive(Debug, Clone)]
+    pub struct ConfigProvenance {
+        source: ConfigSource,
+        path: Option<PathBuf>,
+    }
+
+    impl ConfigProvenance {
+        fn record(source: ConfigSource, path: Option<PathBuf>) -> Self {
+            let me = Self { source, path };
+            let described = me.describe();
+            say_once(format!("provenance:{described}"), || {
+                tracing::info!(
+                    target: "neoethos_core::config",
+                    source = source.as_str(),
+                    config = %described,
+                    "config resolved — this is the file this process reads"
+                );
+            });
+            me
+        }
+
+        pub fn source(&self) -> ConfigSource {
+            self.source
+        }
+
+        pub fn path(&self) -> Option<&Path> {
+            self.path.as_deref()
+        }
+
+        fn path_display(&self) -> String {
+            match &self.path {
+                Some(p) => p.display().to_string(),
+                None => "<none>".to_string(),
+            }
+        }
+
+        /// One-line, log-safe description for a startup banner.
+        pub fn describe(&self) -> String {
+            format!("{} ({})", self.source.as_str(), self.path_display())
+        }
+    }
+
+    impl Default for ConfigProvenance {
+        fn default() -> Self {
+            Self {
+                source: ConfigSource::CompiledDefaults,
+                path: None,
+            }
+        }
+    }
+
+    /// Main settings structure.
+    ///
+    /// Construction is sealed — see the [module docs](self). Obtain one with
+    /// [`Settings::load`], [`Settings::from_yaml`] or [`Settings::default`].
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Settings {
+        pub system: SystemConfig,
+        pub risk: RiskConfig,
+        pub models: ModelsConfig,
+        pub news: NewsConfig,
+        /// App / server / trading-runtime knobs (config-driven replacement for
+        /// the `neoethos-app` env_overrides registry). See [`AppRuntimeConfig`].
+        pub app_runtime: AppRuntimeConfig,
+        /// PRIVATE — the seal. Never serialized: it records where the value
+        /// came from, which is not a value the operator chose.
+        #[serde(skip)]
+        provenance: ConfigProvenance,
+    }
+
+    /// The wire shape. Private, so nothing outside can deserialize around the
+    /// seal. `deny_unknown_fields` here is what catches a stale TOP-LEVEL key
+    /// such as the `secrets_file:` in the operator's live store.
+    #[derive(Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SettingsWire {
+        system: SystemConfig,
+        risk: RiskConfig,
+        models: ModelsConfig,
+        news: NewsConfig,
+        app_runtime: AppRuntimeConfig,
+    }
+
+    impl Default for SettingsWire {
+        fn default() -> Self {
+            Self {
+                system: SystemConfig::default(),
+                risk: RiskConfig::default(),
+                models: ModelsConfig::default(),
+                news: NewsConfig::default(),
+                app_runtime: AppRuntimeConfig::default(),
+            }
+        }
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self::mint(
+                SettingsWire::default(),
+                ConfigProvenance::record(ConfigSource::CompiledDefaults, None),
+            )
+        }
+    }
+
+    // ─── retired keys ───────────────────────────────────────────────────────
+
+    /// What happened to a key that a real config file still carries.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RetiredKind {
+        /// The field was deleted from `Settings`. Nothing reads it.
+        Deleted,
+        /// The field still exists but is now DERIVED from detected hardware,
+        /// so a value in the file is a detector OUTPUT that `Settings::save`
+        /// pickled back in as an INPUT.
+        Derived,
+    }
+
+    struct RetiredKey {
+        /// Dotted path, exactly as it appears in the YAML.
+        path: &'static str,
+        kind: RetiredKind,
+        /// What to tell the operator.
+        note: &'static str,
+    }
+
+    /// Keys a real config file may still carry that this build has no field
+    /// for.
+    ///
+    /// **Every entry was verified present in a real file.** The operator's
+    /// live store (`%LOCALAPPDATA%\neoethos\config.yaml`, 2026-07-31, 509
+    /// lines) carries 51 of them. Without this table `deny_unknown_fields`
+    /// would refuse to load his config and the app would not open. With it,
+    /// each one is named at WARN and ignored — exactly the behaviour he has
+    /// today; the difference is that it is no longer silent.
+    ///
+    /// A key that is NOT here and NOT a field is a hard load failure. That is
+    /// the `trailing_enabeld:` case, which used to save and report success.
+    const RETIRED_KEYS: &[RetiredKey] = &[
+        // ── top level ──
+        RetiredKey {
+            path: "secrets_file",
+            kind: RetiredKind::Deleted,
+            note: "broker credentials live in the broker config / OS keyring; this key has zero \
+                   readers anywhere in the workspace",
+        },
+        // ── system.* — the dead discovery_* trio removed 2026-06-05 ──
+        RetiredKey {
+            path: "system.discovery_auto_cap",
+            kind: RetiredKind::Deleted,
+            note: "the real discovery row cap is models.prop_search_max_rows",
+        },
+        RetiredKey {
+            path: "system.discovery_max_rows",
+            kind: RetiredKind::Deleted,
+            note: "the real discovery row cap is models.prop_search_max_rows",
+        },
+        RetiredKey {
+            path: "system.discovery_stream",
+            kind: RetiredKind::Deleted,
+            note: "never read anywhere in the workspace",
+        },
+        // ── system.* — pre-2026 keys with no field today ──
+        RetiredKey {
+            path: "system.ui_locale",
+            kind: RetiredKind::Deleted,
+            note: "no field; the desktop shell picks the locale",
+        },
+        RetiredKey {
+            path: "system.indices_path",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.use_online_indices",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.use_volume_features",
+            kind: RetiredKind::Deleted,
+            note: "no field; volume features are chosen by the feature builder",
+        },
+        RetiredKey {
+            path: "system.required_timeframes",
+            kind: RetiredKind::Deleted,
+            note: "superseded by base_timeframe + higher_timeframes + multi_resolution_timeframes",
+        },
+        RetiredKey {
+            path: "system.enable_level2",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.level2_depth_levels",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.broker_timezone",
+            kind: RetiredKind::Deleted,
+            note: "no field; bar timestamps are normalised to UTC on import",
+        },
+        RetiredKey {
+            path: "system.evo_multiproc_per_gpu",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.cache_training_frames",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.training_cache_max_bytes",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.downcast_training_float32",
+            kind: RetiredKind::Deleted,
+            note: "no field; precision is system.hardware.training_precision",
+        },
+        RetiredKey {
+            path: "system.vortex_memory_map",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "system.smc_freshness_limit",
+            kind: RetiredKind::Deleted,
+            note: "no field; SMC knobs live under models.smc_search_runtime / models.eval_runtime",
+        },
+        RetiredKey {
+            path: "system.smc_atr_displacement",
+            kind: RetiredKind::Deleted,
+            note: "no field; see models.smc_search_runtime",
+        },
+        RetiredKey {
+            path: "system.smc_max_levels",
+            kind: RetiredKind::Deleted,
+            note: "no field; see models.smc_search_runtime",
+        },
+        RetiredKey {
+            path: "system.smc_use_cuda",
+            kind: RetiredKind::Deleted,
+            note: "no field; device selection is models.prop_search_device",
+        },
+        // ── system.* — DERIVED, no longer an input (§4a of the knob pass) ──
+        RetiredKey {
+            path: "system.n_jobs",
+            kind: RetiredKind::Derived,
+            note: "hardware-derived. A value here is a detector output that `Settings::save` \
+                   pickled back in as an input — `n_jobs: 11` is `available_parallelism()-1` on \
+                   a 12-core box, frozen into the file and then carried to other machines",
+        },
+        RetiredKey {
+            path: "system.num_gpus",
+            kind: RetiredKind::Derived,
+            note: "hardware-derived. `num_gpus: 0` on a box with a 3090 is the same frozen \
+                   detector output",
+        },
+        // ── risk.* ──
+        RetiredKey {
+            path: "risk.meta_label_tp_pips",
+            kind: RetiredKind::Deleted,
+            note: "superseded by risk.meta_label_fixed_tp (price units, not pips)",
+        },
+        RetiredKey {
+            path: "risk.meta_label_sl_pips",
+            kind: RetiredKind::Deleted,
+            note: "superseded by risk.meta_label_fixed_sl (price units, not pips)",
+        },
+        RetiredKey {
+            path: "risk.vol_ensemble_weights_trend",
+            kind: RetiredKind::Deleted,
+            note: "no field; the volatility ensemble is not operator-weighted",
+        },
+        RetiredKey {
+            path: "risk.vol_ensemble_weights_range",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "risk.vol_ensemble_weights_neutral",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        // ── models.* ──
+        RetiredKey {
+            path: "models.export_onnx",
+            kind: RetiredKind::Deleted,
+            note: "deleted in the 2026-08-09 D3 purge — it reached no exporter",
+        },
+        RetiredKey {
+            path: "models.inference_batch_size",
+            kind: RetiredKind::Derived,
+            note: "hardware-derived. HardwareExecutionPlan computes the inference batch from the \
+                   probe and hands it to the consumer as a parameter",
+        },
+        // ── news.* — the 2026-08-09 D3 purge and its predecessors ──
+        RetiredKey {
+            path: "news.news_kill_window_min",
+            kind: RetiredKind::Deleted,
+            note: "the blackout window is fixed by the live gate (15 min before / 10 min after); \
+                   this knob reached a NewsFilter nothing constructed",
+        },
+        RetiredKey {
+            path: "news.news_lookahead_minutes",
+            kind: RetiredKind::Deleted,
+            note: "same NewsFilter nothing constructed",
+        },
+        RetiredKey {
+            path: "news.perplexity_enabled",
+            kind: RetiredKind::Deleted,
+            note: "deleted in the 2026-08-09 D3 purge",
+        },
+        RetiredKey {
+            path: "news.perplexity_api_key_env",
+            kind: RetiredKind::Deleted,
+            note: "deleted with the Perplexity path",
+        },
+        RetiredKey {
+            path: "news.perplexity_model",
+            kind: RetiredKind::Deleted,
+            note: "deleted with the Perplexity path",
+        },
+        RetiredKey {
+            path: "news.perplexity_num_results",
+            kind: RetiredKind::Deleted,
+            note: "deleted with the Perplexity path",
+        },
+        RetiredKey {
+            path: "news.perplexity_timeframe_hours",
+            kind: RetiredKind::Deleted,
+            note: "deleted with the Perplexity path",
+        },
+        RetiredKey {
+            path: "news.news_decay_minutes",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_confidence_threshold",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_trade_on_event",
+            kind: RetiredKind::Deleted,
+            note: "superseded by news.news_trading_mode",
+        },
+        RetiredKey {
+            path: "news.news_trade_confidence_threshold",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_event_risk_pct",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.enable_news",
+            kind: RetiredKind::Deleted,
+            note: "superseded by news.news_calendar_enabled + news.news_trading_mode",
+        },
+        RetiredKey {
+            path: "news.news_sources",
+            kind: RetiredKind::Deleted,
+            note: "superseded by news.rss_feeds + news.news_calendar_source",
+        },
+        RetiredKey {
+            path: "news.enable_llm_helper",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.llm_helper_enabled",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.llm_sentiment_positive_threshold",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.llm_sentiment_negative_threshold",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_backfill_enabled",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_backfill_days",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.news_local_glob",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.strategist_enabled",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.strategist_interval_minutes",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.auto_rescore_enabled",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.auto_rescore_days",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.auto_rescore_max_events",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+        RetiredKey {
+            path: "news.auto_rescore_only_missing",
+            kind: RetiredKind::Deleted,
+            note: "no field",
+        },
+    ];
+
+    /// Remove every retired key present in `raw`, naming each one.
+    fn prune_retired_keys(raw: &mut serde_yaml_ng::Value, origin: &str) {
+        for entry in RETIRED_KEYS {
+            if remove_dotted(raw, entry.path).is_none() {
+                continue;
+            }
+            let path = entry.path;
+            let note = entry.note;
+            let kind = entry.kind;
+            let origin = origin.to_string();
+            say_once(format!("retired:{origin}:{path}"), move || match kind {
+                RetiredKind::Deleted => tracing::warn!(
+                    target: "neoethos_core::config",
+                    key = path,
+                    config = %origin,
+                    "config key is RETIRED and is being IGNORED — {note}. Delete the line: it has \
+                     no effect and never will."
+                ),
+                RetiredKind::Derived => tracing::warn!(
+                    target: "neoethos_core::config",
+                    key = path,
+                    config = %origin,
+                    "config key is DERIVED FROM HARDWARE and is being IGNORED — {note}. Delete \
+                     the line: the runtime detects it."
+                ),
+            });
+        }
+    }
+
+    fn remove_dotted(raw: &mut serde_yaml_ng::Value, dotted: &str) -> Option<serde_yaml_ng::Value> {
+        let mut parts = dotted.split('.').peekable();
+        let mut node = raw;
+        loop {
+            let key = parts.next()?;
+            let map = node.as_mapping_mut()?;
+            if parts.peek().is_none() {
+                return map.remove(key);
+            }
+            node = map.get_mut(key)?;
+        }
+    }
+
+    fn get_dotted<'a>(
+        raw: &'a serde_yaml_ng::Value,
+        dotted: &str,
+    ) -> Option<&'a serde_yaml_ng::Value> {
+        let mut node = raw;
+        for key in dotted.split('.') {
+            node = node.as_mapping()?.get(key)?;
+        }
+        Some(node)
+    }
+
+    // ─── the preset ordering fix ────────────────────────────────────────────
+
+    /// The six `risk.*` fields `RiskConfig::default()` seeds from the active
+    /// preset, and whether a LOWER number is the SAFER number.
+    ///
+    /// `#[serde(default)]` on `RiskConfig` builds `Default` FIRST — with
+    /// `PropFirmPreset::default()` (= `Ftmo`, `domain/prop_firm.rs:38`) — and
+    /// only then applies the YAML keys. So `preset: the5ers` arrived AFTER the
+    /// six fields it is documented to seed, and nothing re-derived them: you
+    /// got The5%ers' name with FTMO's drawdown, lot and target numbers.
+    const PRESET_SEEDED_FIELDS: &[(&str, bool)] = &[
+        ("risk.monthly_profit_target_pct", false), // a target, not a limit
+        ("risk.daily_drawdown_limit", true),
+        ("risk.total_drawdown_limit", true),
+        ("risk.max_lot_size", true),
+        ("risk.max_trades_per_day", true),
+        ("risk.prop_firm_rules", true), // `true` is the safer reading
+    ];
+
+    /// What the ACTIVE preset says the six fields should hold.
+    struct PresetSeeds {
+        monthly_profit_target_pct: f64,
+        daily_drawdown_limit: f64,
+        total_drawdown_limit: f64,
+        max_lot_size: f64,
+        max_trades_per_day: usize,
+        prop_firm_rules: bool,
+    }
+
+    impl PresetSeeds {
+        fn for_preset(preset: PropFirmPreset) -> Self {
+            let constraints = PropFirmConstraints::for_preset(preset);
+            let runtime = PropFirmRuntimeDefaults::for_preset(preset);
+            Self {
+                monthly_profit_target_pct: constraints.min_monthly_net_profit_pct as f64,
+                daily_drawdown_limit: runtime.daily_dd_stop_trading_pct,
+                total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
+                max_lot_size: runtime.max_lot_size,
+                max_trades_per_day: runtime.max_trades_per_day,
+                prop_firm_rules: preset != PropFirmPreset::None,
+            }
+        }
+    }
+
+    /// f32-widening tolerance. The preset numbers are `f32` constants widened
+    /// to `f64`, and `Settings::save` writes the widened form
+    /// (`0.03999999910593033`). Comparing those against `0.04` as exact `f64`
+    /// would report a divergence that does not exist — the same f32 fingerprint
+    /// that identified the writer behind the two drawdown divergences.
+    fn same_number(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
+    }
+
+    /// One preset-seeded field. Returns `Some(new_value)` only when the field
+    /// must be RE-SEEDED because the file never set it; otherwise `None` and
+    /// the operator's value stands.
+    ///
+    /// Never silently corrects a value the operator typed. When his number is
+    /// the LOOSER of the two, both readings are named at ERROR and his number
+    /// is still what runs — a preset is documented as a seed, not a lock, and
+    /// quietly clamping his file would be exactly the hidden fallback this
+    /// pass exists to remove.
+    fn reconcile_one(
+        path: &'static str,
+        current: f64,
+        seed: f64,
+        lower_is_safer: bool,
+        explicit: bool,
+        preset: &'static str,
+    ) -> Option<f64> {
+        if same_number(current, seed) {
+            return None;
+        }
+        if !explicit {
+            say_once(format!("preset-seed:{preset}:{path}"), move || {
+                tracing::warn!(
+                    target: "neoethos_core::config",
+                    key = path,
+                    preset,
+                    old = current,
+                    new = seed,
+                    "PRESET RE-DERIVED: the file selects this preset but does not set this \
+                     field, and `#[serde(default)]` had already filled it from the DEFAULT \
+                     preset. Re-seeded from the SELECTED preset."
+                );
+            });
+            return Some(seed);
+        }
+        let looser = lower_is_safer && current > seed;
+        say_once(format!("preset-conflict:{preset}:{path}"), move || {
+            if looser {
+                tracing::error!(
+                    target: "neoethos_core::config",
+                    key = path,
+                    preset,
+                    your_value = current,
+                    preset_value = seed,
+                    "TWO READINGS OF ONE LIMIT: your config sets a value LOOSER than the \
+                     selected preset's. Your value is used — a preset is a seed, not a lock — \
+                     but the firm's number is the tighter one and it is the one that fails a \
+                     challenge."
+                );
+            } else {
+                tracing::info!(
+                    target: "neoethos_core::config",
+                    key = path,
+                    preset,
+                    your_value = current,
+                    preset_value = seed,
+                    "config overrides the preset seed (tighter, or not a limit); your value is \
+                     used"
+                );
+            }
+        });
+        None
+    }
+
+    impl Settings {
+        fn mint(wire: SettingsWire, provenance: ConfigProvenance) -> Self {
+            Self {
+                system: wire.system,
+                risk: wire.risk,
+                models: wire.models,
+                news: wire.news,
+                app_runtime: wire.app_runtime,
+                provenance,
+            }
+        }
+
+        /// Where this `Settings` came from. Print it in a startup banner: it is
+        /// the answer to "which of the four config files did this process
+        /// actually read?", which nothing in the workspace could answer before
+        /// 2026-08-10.
+        pub fn provenance(&self) -> &ConfigProvenance {
+            &self.provenance
+        }
+
+        /// Load settings from a YAML config file.
+        ///
+        /// Goes through the same seal as every other path: retired keys are
+        /// named and pruned, an unrecognised key is REFUSED, the prop-firm
+        /// preset is re-derived, and every money-path reading is logged.
+        pub fn from_yaml(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+            Self::from_path_tagged(path.as_ref(), ConfigSource::ExplicitPath)
+        }
+
+        fn from_path_tagged(path: &Path, source: ConfigSource) -> anyhow::Result<Self> {
+            let content = std::fs::read_to_string(path).map_err(|err| {
+                anyhow::anyhow!("cannot read config file {}: {err}", path.display())
+            })?;
+            let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|err| {
+                anyhow::anyhow!("config file {} is not valid YAML: {err}", path.display())
+            })?;
+            Self::from_raw(raw, ConfigProvenance::record(source, Some(path.to_path_buf())))
+        }
+
+        /// THE resolution order, and the only one.
+        ///
+        ///   1. `$CONFIG_FILE` (CI / test overrides).
+        ///   2. `user_config_path()` — the operator's live store — **if it
+        ///      exists**. On his machine it does, so this is the branch a real
+        ///      run takes, and it is not either of the two files in the repo.
+        ///   3. literal `"config.yaml"`, resolved against the process working
+        ///      directory.
+        ///
+        /// Each branch logs, by name, the file it opened.
+        pub fn load() -> anyhow::Result<Self> {
+            if let Ok(explicit) = std::env::var("CONFIG_FILE") {
+                let path = PathBuf::from(explicit);
+                return Self::from_path_tagged(&path, ConfigSource::EnvConfigFile);
+            }
+            let user = user_config_path();
+            if user.exists() {
+                return Self::from_path_tagged(&user, ConfigSource::UserStore);
+            }
+            say_once("cwd-relative-config".to_string(), || {
+                tracing::warn!(
+                    target: "neoethos_core::config",
+                    user_store = %user_config_path().display(),
+                    cwd = ?std::env::current_dir().ok(),
+                    "the operator's config store does not exist — falling back to the RELATIVE \
+                     path \"config.yaml\". The same binary reads a different file depending on \
+                     the directory it was started from."
+                );
+            });
+            Self::from_path_tagged(&PathBuf::from("config.yaml"), ConfigSource::RepoRelative)
+        }
+
+        fn from_raw(
+            mut raw: serde_yaml_ng::Value,
+            provenance: ConfigProvenance,
+        ) -> anyhow::Result<Self> {
+            let origin = provenance.describe();
+            // An empty file is a valid "all defaults" document.
+            if raw.is_null() {
+                raw = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+            }
+            prune_retired_keys(&mut raw, &origin);
+
+            // Which of the preset-seeded fields the operator typed EXPLICITLY.
+            // Captured before the typed parse, because afterwards every field
+            // holds a value and the distinction is gone — that erasure IS the
+            // ordering bug.
+            let explicit: Vec<&'static str> = PRESET_SEEDED_FIELDS
+                .iter()
+                .filter(|(path, _)| get_dotted(&raw, path).is_some())
+                .map(|(path, _)| *path)
+                .collect();
+            let preset_explicit = get_dotted(&raw, "risk.preset").is_some();
+
+            let wire = serde_yaml_ng::from_value::<SettingsWire>(raw)
+                .map_err(|err| unknown_key_error(err, &origin))?;
+            let mut settings = Self::mint(wire, provenance);
+            settings.reconcile_preset(preset_explicit, &explicit);
+            settings.validate_safety_bounds();
+            settings.report_ambiguous_sentinels(&origin);
+            Ok(settings)
+        }
+
+        /// Re-derive the six preset-seeded fields AFTER `risk.preset` is known.
+        ///
+        /// * Field ABSENT from the file → seeded from the ACTIVE preset, and
+        ///   the substitution is logged with old, new and why. This is the bug
+        ///   fix: before today `preset: the5ers` selected the label and left
+        ///   FTMO's numbers in place.
+        /// * Field PRESENT and disagreeing → the operator's typed value wins
+        ///   (his file is his word; the preset is documented as a seed, not a
+        ///   lock) and the disagreement is reported LOUDLY naming BOTH
+        ///   readings. Where his value is the LOOSER of the two it is an
+        ///   ERROR, because that is a limit sitting above the firm's. Nothing
+        ///   is silently corrected in either direction.
+        fn reconcile_preset(&mut self, preset_explicit: bool, explicit: &[&'static str]) {
+            let preset = self.risk.preset;
+            let seeds = PresetSeeds::for_preset(preset);
+            let name = preset.as_str();
+
+            let is_explicit = |path: &str| explicit.iter().any(|p| *p == path);
+
+            // Six calls, one helper. Deliberately NOT a `macro_rules!` that
+            // touches `self`: a macro body referring to `self` resolves at the
+            // definition site, which is a footgun sitting on the prop-firm
+            // drawdown numbers.
+            let fix = |path: &'static str, current: f64, seed: f64, lower_is_safer: bool| {
+                reconcile_one(path, current, seed, lower_is_safer, is_explicit(path), name)
+            };
+
+            if let Some(v) = fix(
+                "risk.monthly_profit_target_pct",
+                self.risk.monthly_profit_target_pct,
+                seeds.monthly_profit_target_pct,
+                false,
+            ) {
+                self.risk.monthly_profit_target_pct = v;
+            }
+            if let Some(v) = fix(
+                "risk.daily_drawdown_limit",
+                self.risk.daily_drawdown_limit,
+                seeds.daily_drawdown_limit,
+                true,
+            ) {
+                self.risk.daily_drawdown_limit = v;
+            }
+            if let Some(v) = fix(
+                "risk.total_drawdown_limit",
+                self.risk.total_drawdown_limit,
+                seeds.total_drawdown_limit,
+                true,
+            ) {
+                self.risk.total_drawdown_limit = v;
+            }
+            if let Some(v) = fix(
+                "risk.max_lot_size",
+                self.risk.max_lot_size,
+                seeds.max_lot_size,
+                true,
+            ) {
+                self.risk.max_lot_size = v;
+            }
+            if let Some(v) = fix(
+                "risk.max_trades_per_day",
+                self.risk.max_trades_per_day as f64,
+                seeds.max_trades_per_day as f64,
+                true,
+            ) {
+                self.risk.max_trades_per_day = v.max(0.0).round() as usize;
+            }
+
+            if !is_explicit("risk.prop_firm_rules")
+                && self.risk.prop_firm_rules != seeds.prop_firm_rules
+            {
+                let (old, new) = (self.risk.prop_firm_rules, seeds.prop_firm_rules);
+                say_once(format!("preset-seed:{name}:risk.prop_firm_rules"), move || {
+                    tracing::warn!(
+                        target: "neoethos_core::config",
+                        key = "risk.prop_firm_rules",
+                        preset = name,
+                        old = old,
+                        new = new,
+                        "PRESET RE-DERIVED from the SELECTED preset"
+                    );
+                });
+                self.risk.prop_firm_rules = seeds.prop_firm_rules;
+            }
+
+            if !preset_explicit {
+                say_once("preset-implicit".to_string(), move || {
+                    tracing::info!(
+                        target: "neoethos_core::config",
+                        preset = name,
+                        "config sets no `risk.preset`; the compiled default preset is in force"
+                    );
+                });
+            }
+        }
+
+        /// Report every knob whose name says "maximum" or "minimum" but whose
+        /// `0` the code reads as "no limit at all".
+        ///
+        /// This never changes a value. Per the operator's standing rule a
+        /// money-path reading is not corrected behind his back: `0` is
+        /// reported with BOTH readings named, and he decides.
+        fn report_ambiguous_sentinels(&self, origin: &str) {
+            /// key, what the code does at 0, what the name/UI implies at 0.
+            const AMBIGUOUS: &[(&str, &str, &str)] = &[
+                (
+                    "risk.max_portfolio_risk",
+                    "NO CAP AT ALL on total concurrent risk across every running engine",
+                    "the Advanced screen calls 0 'disabled' and says entries PAUSE at the cap; \
+                     live_trading.rs:1749-1770 instead SIZES DOWN, so with no open positions the \
+                     first entry is resized to the cap. At 0 neither happens",
+                ),
+                (
+                    "models.prop_search_max_in_market",
+                    "NO CAP on the fraction of time a candidate may hold a position",
+                    "read as a maximum, 0 would mean 'never in the market', which would reject \
+                     every candidate",
+                ),
+                (
+                    "models.prop_search_min_payoff_ratio",
+                    "NO PAYOFF FLOOR — every candidate clears this gate",
+                    "read as a minimum, 0 is also the literal floor 'payoff >= 0'. The compiled \
+                     default is 2.0 (the 2RR mandate); a 0 here disarms it",
+                ),
+                (
+                    "models.prop_search_min_expectancy_t_stat",
+                    "NO STATISTICAL-SIGNIFICANCE FLOOR on expectancy",
+                    "read as a minimum, 0 is also the literal floor 't >= 0'",
+                ),
+            ];
+
+            let values: [(&str, f64, f64); 4] = [
+                ("risk.max_portfolio_risk", self.risk.max_portfolio_risk, 0.0),
+                (
+                    "models.prop_search_max_in_market",
+                    self.models.prop_search_max_in_market,
+                    0.0,
+                ),
+                (
+                    "models.prop_search_min_payoff_ratio",
+                    self.models.prop_search_min_payoff_ratio,
+                    2.0,
+                ),
+                (
+                    "models.prop_search_min_expectancy_t_stat",
+                    self.models.prop_search_min_expectancy_t_stat,
+                    0.0,
+                ),
+            ];
+
+            for (key, value, compiled_default) in values {
+                if value != 0.0 {
+                    continue;
+                }
+                let Some((_, reading_a, reading_b)) = AMBIGUOUS.iter().find(|(k, _, _)| *k == key)
+                else {
+                    continue;
+                };
+                let disarmed = compiled_default != 0.0;
+                let origin = origin.to_string();
+                say_once(format!("sentinel:{origin}:{key}"), move || {
+                    if disarmed {
+                        tracing::error!(
+                            target: "neoethos_core::config",
+                            key,
+                            value = 0.0,
+                            compiled_default,
+                            config = %origin,
+                            "AMBIGUOUS SENTINEL ON A MONEY PATH, AND IT IS NOT THE DEFAULT. \
+                             Reading A (what the code does): {reading_a}. Reading B: {reading_b}. \
+                             The compiled default is {compiled_default} — this file turns the \
+                             gate OFF. Nothing has been changed; set an explicit value."
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "neoethos_core::config",
+                            key,
+                            value = 0.0,
+                            config = %origin,
+                            "AMBIGUOUS SENTINEL: a knob named as a limit is 0. Reading A (what \
+                             the code does): {reading_a}. Reading B: {reading_b}. This matches \
+                             the shipped default; nothing has been changed."
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Settings {
+        /// The seal. There is no derived `Deserialize` to route around: every
+        /// `from_str` / `from_reader` / `from_value` in the workspace lands
+        /// here and gets the retired-key prune, the unknown-key refusal, the
+        /// preset re-derivation and the money-path reports.
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let raw = serde_yaml_ng::Value::deserialize(deserializer)?;
+            Self::from_raw(raw, ConfigProvenance::record(ConfigSource::InMemory, None))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+
+    /// Turn serde's `unknown field` into something an operator can act on.
+    ///
+    /// **What this now REFUSES that it used to accept:** a key that is neither
+    /// a field nor listed in `RETIRED_KEYS`. `trailing_enabeld:` used to
+    /// parse, save, and report "config.yaml saved (verbatim)" through the
+    /// raw-YAML editor — the only route to 364 of the 390 knobs.
+    fn unknown_key_error(err: serde_yaml_ng::Error, origin: &str) -> anyhow::Error {
+        let text = err.to_string();
+        if !text.contains("unknown field") {
+            return anyhow::anyhow!("config {origin} does not match the settings schema: {text}");
+        }
+        anyhow::anyhow!(
+            "config {origin} contains a key this build does not recognise.\n\n  {text}\n\n\
+             WHAT TO DO\n\
+             \x20 1. Check the spelling against the expected-field list above. A misspelled key \
+             (the classic is `trailing_enabeld` for `trailing_enabled`) was silently accepted \
+             before 2026-08-10 and reported as saved.\n\
+             \x20 2. If the key was retired by an earlier release, it belongs in RETIRED_KEYS in \
+             crates/neoethos-core/src/config.rs — add it there with a note and it becomes a \
+             warning instead of a failure.\n\
+             \x20 3. Your file has NOT been modified by this error. Back it up before editing; \
+             scripts/migrate_live_config.ps1 takes the backup and shows the diff first."
+        )
     }
 }
 
@@ -2055,7 +3669,7 @@ impl Default for Settings {
 /// (Settings → App tab, F-312 raw YAML editor, `/settings` POST) write
 /// back to the same path. Tests that need a synthetic path can still
 /// supply one via the `CONFIG_FILE` env var — `Settings::load` checks
-/// that first.
+/// that first and LOGS which of the three branches it took.
 pub fn user_config_path() -> PathBuf {
     // Explicit override (NEOETHOS_USER_DATA_DIR) wins on every platform, so the
     // desktop shell / power users can point ALL config + data readers at one
@@ -2108,45 +3722,6 @@ impl Settings {
         self.models.backtest_runtime.rayon_threads = Some(threads);
     }
 
-    /// Load settings from YAML config file
-    pub fn from_yaml(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let settings: Settings = serde_yaml_ng::from_str(&content)?;
-        settings.validate_safety_bounds();
-        Ok(settings)
-    }
-
-    /// Load settings from the canonical user-data config path.
-    ///
-    /// **F-311 (2026-05-29)**: this used to fall back to the literal
-    /// string `"config.yaml"` (so it resolved against the process cwd).
-    /// That broke whenever the operator ran the installed app from
-    /// `Start Menu` — cwd is `C:\Windows\System32` and the bundle's
-    /// read-only `config.yaml` lived elsewhere. The 4-location shadow
-    /// (CLI / server / models / TUI each rolling their own path) made
-    /// debugging F-310 painful. The unified resolution order is now:
-    ///   1. `$CONFIG_FILE` env var (CI / test overrides)
-    ///   2. `user_config_path()` — `%LOCALAPPDATA%\neoethos\config.yaml`
-    ///      on Windows, `$XDG_DATA_HOME/neoethos/config.yaml` on Linux,
-    ///      `~/Library/Application Support/neoethos/config.yaml` on
-    ///      macOS — the same place the F-310 supervisor seeds.
-    ///   3. Last-resort fallback to literal `"config.yaml"` (relative)
-    ///      so cargo-test invocations in the workspace root still work.
-    pub fn load() -> anyhow::Result<Self> {
-        let config_file = std::env::var("CONFIG_FILE")
-            .map(PathBuf::from)
-            .ok()
-            .unwrap_or_else(|| {
-                let user = user_config_path();
-                if user.exists() {
-                    user
-                } else {
-                    PathBuf::from("config.yaml")
-                }
-            });
-        Self::from_yaml(&config_file)
-    }
-
     /// Sanity-check loaded RiskConfig values against prop-firm-safe bounds.
     ///
     /// We can't reject the load — config consumers expect a non-fatal load —
@@ -2195,191 +3770,6 @@ impl Settings {
                 "RiskConfig.total_drawdown_limit > 30% — exceeds every published prop-firm rule"
             );
         }
-    }
-
-    fn parse_csv_list(value: &str) -> Vec<String> {
-        value
-            .split(',')
-            .map(|entry| entry.trim().to_string())
-            .filter(|entry| !entry.is_empty())
-            .collect()
-    }
-
-    fn apply_overrides_from_lookup<F>(&mut self, mut lookup: F)
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        if let Some(symbol) = lookup("NEOETHOS_BOT_SYMBOL") {
-            self.system.symbol = symbol;
-        }
-
-        let data_root = lookup("NEOETHOS_BOT_DATA_ROOT").or_else(|| lookup("NEOETHOS_BOT_DATA_DIR"));
-        if let Some(data_root) = data_root {
-            self.system.data_dir = PathBuf::from(data_root);
-        }
-
-        if let Some(base_tf) = lookup("NEOETHOS_BOT_BASE_TIMEFRAME") {
-            self.system.base_timeframe = base_tf;
-        }
-
-        if let Some(higher_tfs) = lookup("NEOETHOS_BOT_HIGHER_TFS") {
-            let parsed = Self::parse_csv_list(&higher_tfs);
-            if !parsed.is_empty() {
-                self.system.higher_timeframes = parsed;
-            }
-        }
-
-        if let Some(device) = lookup("NEOETHOS_BOT_DEVICE") {
-            self.system.device = device;
-        }
-
-        if let Some(preference) = lookup("NEOETHOS_BOT_ENABLE_GPU_PREFERENCE") {
-            self.system.enable_gpu_preference = preference;
-        }
-
-        if let Some(tree_device) = lookup("NEOETHOS_BOT_TREE_DEVICE") {
-            self.models.tree_device_preference = tree_device;
-        }
-
-        if let Some(model_names) = lookup("NEOETHOS_BOT_ML_MODELS") {
-            let parsed = Self::parse_csv_list(&model_names);
-            if !parsed.is_empty() {
-                self.models.ml_models = parsed;
-            }
-        }
-
-        if let Some(num_transformers) =
-            lookup("NEOETHOS_BOT_NUM_TRANSFORMERS").and_then(|value| value.parse::<usize>().ok())
-        {
-            self.models.num_transformers = num_transformers.max(1);
-        }
-
-        if let Some(model_names) = lookup("NEOETHOS_BOT_PHASE5_CORE_MODELS") {
-            let parsed = Self::parse_csv_list(&model_names);
-            if !parsed.is_empty() {
-                self.models.phase5_core_models = parsed;
-            }
-        }
-
-        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_TREND_MODELS") {
-            let parsed = Self::parse_csv_list(&model_names);
-            if !parsed.is_empty() {
-                self.models.regime_trend_models = parsed;
-            }
-        }
-
-        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_RANGE_MODELS") {
-            let parsed = Self::parse_csv_list(&model_names);
-            if !parsed.is_empty() {
-                self.models.regime_range_models = parsed;
-            }
-        }
-
-        if let Some(model_names) = lookup("NEOETHOS_BOT_REGIME_NEUTRAL_MODELS") {
-            let parsed = Self::parse_csv_list(&model_names);
-            if !parsed.is_empty() {
-                self.models.regime_neutral_models = parsed;
-            }
-        }
-
-        if let Some(enabled) = lookup("NEOETHOS_BOT_PHASE5_FILTER_META_BLENDER") {
-            self.models.phase5_filter_meta_blender = matches!(
-                enabled.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
-        if let Some(enabled) = lookup("NEOETHOS_BOT_REGIME_ROUTER_ENABLED") {
-            self.models.regime_router_enabled = matches!(
-                enabled.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
-        if let Some(min_models) = lookup("NEOETHOS_BOT_REGIME_ROUTER_MIN_MODELS")
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            self.models.regime_router_min_models = min_models.max(1);
-        }
-
-        if let Some(method) = lookup("NEOETHOS_BOT_CALIBRATION_METHOD") {
-            self.models.calibration_method = method;
-        }
-
-        if let Some(min_rows) =
-            lookup("NEOETHOS_BOT_CALIBRATION_MIN_ROWS").and_then(|value| value.parse::<usize>().ok())
-        {
-            self.models.calibration_min_rows = min_rows.max(1);
-        }
-
-        if let Some(holdout_pct) =
-            lookup("NEOETHOS_BOT_TRAIN_HOLDOUT_PCT").and_then(|value| value.parse::<f64>().ok())
-        {
-            self.models.train_holdout_pct = holdout_pct;
-        }
-
-        if let Some(label_horizon) =
-            lookup("NEOETHOS_BOT_LABEL_HORIZON_BARS").and_then(|value| value.parse::<usize>().ok())
-        {
-            self.models.label_horizon_bars = label_horizon;
-        }
-
-        if let Some(meta_hold) = lookup("NEOETHOS_BOT_META_LABEL_MAX_HOLD_BARS")
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            self.risk.meta_label_max_hold_bars = meta_hold.max(1);
-        }
-
-        if let Some(conf_threshold) =
-            lookup("NEOETHOS_BOT_PROP_CONF_THRESHOLD").and_then(|value| value.parse::<f64>().ok())
-        {
-            self.models.prop_conf_threshold = conf_threshold;
-        }
-
-        if let Some(use_rllib_agent) = lookup("NEOETHOS_BOT_USE_RLLIB_AGENT") {
-            self.models.use_rllib_agent = matches!(
-                use_rllib_agent.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
-        if let Some(rllib_workers) =
-            lookup("NEOETHOS_BOT_RLLIB_NUM_WORKERS").and_then(|value| value.parse::<usize>().ok())
-        {
-            self.models.rllib_num_workers = rllib_workers;
-        }
-
-        if let Some(auto_enable_rllib) = lookup("NEOETHOS_BOT_AUTO_ENABLE_RLLIB") {
-            self.models.auto_enable_rllib = matches!(
-                auto_enable_rllib.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
-        if let Some(prop_search_device) = lookup("NEOETHOS_BOT_PROP_SEARCH_DEVICE") {
-            self.models.prop_search_device = prop_search_device;
-        }
-
-        if let Some(prop_search_async) = lookup("NEOETHOS_BOT_PROP_SEARCH_ASYNC") {
-            self.models.prop_search_async = matches!(
-                prop_search_async.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-
-        if let Some(prop_search_async_wait) = lookup("NEOETHOS_BOT_PROP_SEARCH_ASYNC_WAIT") {
-            self.models.prop_search_async_wait = matches!(
-                prop_search_async_wait.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
-        }
-    }
-
-    /// Load settings with environment variable overrides
-    pub fn load_with_env() -> anyhow::Result<Self> {
-        let mut settings = Self::load()?;
-        settings.apply_overrides_from_lookup(|key| std::env::var(key).ok());
-        Ok(settings)
     }
 
     /// Save settings to YAML file
@@ -2552,104 +3942,6 @@ mod tests {
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
     }
 
-    #[test]
-    fn runtime_overrides_apply_to_dispatch_and_label_settings() {
-        let mut settings = Settings::default();
-        let overrides = HashMap::from([
-            (
-                "NEOETHOS_BOT_ENABLE_GPU_PREFERENCE".to_string(),
-                "gpu".to_string(),
-            ),
-            ("NEOETHOS_BOT_TREE_DEVICE".to_string(), "cuda".to_string()),
-            ("NEOETHOS_BOT_NUM_TRANSFORMERS".to_string(), "4".to_string()),
-            (
-                "NEOETHOS_BOT_ML_MODELS".to_string(),
-                "lightgbm, xgboost , neat".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_PHASE5_CORE_MODELS".to_string(),
-                "transformer, tabnet".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_PHASE5_FILTER_META_BLENDER".to_string(),
-                "false".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_REGIME_ROUTER_ENABLED".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_REGIME_ROUTER_MIN_MODELS".to_string(),
-                "3".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_CALIBRATION_METHOD".to_string(),
-                "temperature".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_CALIBRATION_MIN_ROWS".to_string(),
-                "512".to_string(),
-            ),
-            ("NEOETHOS_BOT_TRAIN_HOLDOUT_PCT".to_string(), "0.3".to_string()),
-            ("NEOETHOS_BOT_LABEL_HORIZON_BARS".to_string(), "24".to_string()),
-            (
-                "NEOETHOS_BOT_META_LABEL_MAX_HOLD_BARS".to_string(),
-                "144".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_PROP_CONF_THRESHOLD".to_string(),
-                "0.72".to_string(),
-            ),
-            ("NEOETHOS_BOT_USE_RLLIB_AGENT".to_string(), "1".to_string()),
-            ("NEOETHOS_BOT_RLLIB_NUM_WORKERS".to_string(), "6".to_string()),
-            ("NEOETHOS_BOT_AUTO_ENABLE_RLLIB".to_string(), "off".to_string()),
-            (
-                "NEOETHOS_BOT_PROP_SEARCH_DEVICE".to_string(),
-                "cuda:0".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_PROP_SEARCH_ASYNC".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "NEOETHOS_BOT_PROP_SEARCH_ASYNC_WAIT".to_string(),
-                "true".to_string(),
-            ),
-        ]);
-
-        settings.apply_overrides_from_lookup(|key| overrides.get(key).cloned());
-
-        assert_eq!(settings.system.enable_gpu_preference, "gpu");
-        assert_eq!(settings.models.tree_device_preference, "cuda");
-        assert_eq!(settings.models.num_transformers, 4);
-        assert_eq!(
-            settings.models.ml_models,
-            vec![
-                "lightgbm".to_string(),
-                "xgboost".to_string(),
-                "neat".to_string(),
-            ]
-        );
-        assert_eq!(
-            settings.models.phase5_core_models,
-            vec!["transformer".to_string(), "tabnet".to_string()]
-        );
-        assert!(!settings.models.phase5_filter_meta_blender);
-        assert!(settings.models.regime_router_enabled);
-        assert_eq!(settings.models.regime_router_min_models, 3);
-        assert_eq!(settings.models.calibration_method, "temperature");
-        assert_eq!(settings.models.calibration_min_rows, 512);
-        assert_eq!(settings.models.train_holdout_pct, 0.3);
-        assert_eq!(settings.models.label_horizon_bars, 24);
-        assert_eq!(settings.risk.meta_label_max_hold_bars, 144);
-        assert_eq!(settings.models.prop_conf_threshold, 0.72);
-        assert!(settings.models.use_rllib_agent);
-        assert_eq!(settings.models.rllib_num_workers, 6);
-        assert!(!settings.models.auto_enable_rllib);
-        assert_eq!(settings.models.prop_search_device, "cuda:0");
-        assert!(settings.models.prop_search_async);
-        assert!(settings.models.prop_search_async_wait);
-    }
 }
 
 /// Profit the trail locks once it engages, in pips.

@@ -23,6 +23,13 @@ pub mod prototype_c_gpu;
 pub mod prototype_population;
 pub mod prototype_population_oracle;
 pub mod ranking;
+/// The scenario as the unit of work — descriptor construction, the fixed-point
+/// cost scales, the perturbation generator both lanes share, and the validation
+/// that refuses a descriptor the device would misread.
+///
+/// Deliberately ungated: the descriptors are built and mirrored in every build,
+/// only the CUDA lane that runs them is gated.
+pub mod scenario;
 pub mod semantics;
 #[cfg(all(test, any(feature = "gpu-cuda", feature = "gpu-vulkan")))]
 pub mod signal_trace_gpu;

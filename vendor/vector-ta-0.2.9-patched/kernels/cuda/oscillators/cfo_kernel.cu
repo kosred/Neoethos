@@ -179,3 +179,97 @@ extern "C" __global__ void cfo_many_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// f64 lane.
+//
+// CPU reference: `cfo.rs::cfo_scalar` (l.367). Defaults: period 14, scalar
+// 100.0 (`cfo.rs:112`, `cfo.rs:116`). The registry sweeps `period`; `scalar`
+// takes the CPU default.
+//
+// The rounding structure is copied line for line, because every one of these
+// is a fused multiply-add on the CPU and an unfused pair here would round
+// twice:
+//   sum_xy = v.mul_add(w, sum_xy)                -> fma(v, w, sum_xy)
+//   sum_xy = v.mul_add(n, sum_xy)                -> fma(v, n, sum_xy)
+//   b      = (-sx).mul_add(sum_y, n*sum_xy) * inv_denom
+//                                                -> fma(-sx, sum_y, n*sum_xy) * inv_denom
+//   f      = b.mul_add(half_nm1, sum_y * inv_n)  -> fma(b, half_nm1, sum_y*inv_n)
+// and the emit is `(v - f) * (scalar / v)` — NOT `(v-f)*scalar/v`, which is a
+// different rounding.
+//
+// sx and sx2 are integer triangular / square-pyramidal numbers on the CPU
+// (`(period*(period+1))/2`, `(period*(period+1)*(2*period+1))/6`) evaluated in
+// `usize` and only then cast to f64. They are computed here in `long long` for
+// the same reason: forming them in double would round for periods past 2^53/6.
+//
+// f32 -> f64 audit: pointers/locals widened; `__int_as_float` NaN -> f64
+// quiet-NaN pattern; no fast-math intrinsic survives; no epsilon (`v != 0.0` is
+// an exact test and stays exact); the only comparison is `isfinite(v) && v != 0`
+// which cannot let a NaN through the true branch.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ double cfo_qnan_f64() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void cfo_batch_f64(const double* __restrict__ prices,
+                   int n,
+                   const int*   __restrict__ periods,
+                   int n_combos,
+                   int first_valid,
+                   double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const double nan_d = cfo_qnan_f64();
+    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    const int period = periods[combo];
+    if (period <= 0 || first_valid >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+
+    const int pre = period - 1;
+    const long long start_ll = static_cast<long long>(first_valid) + static_cast<long long>(pre);
+    if (start_ll >= n) {
+        for (int t = 0; t < n; ++t) row[t] = nan_d;
+        return;
+    }
+
+    const double scalar = 100.0;                 // cfo.rs:116 default
+    const double nn = static_cast<double>(period);
+    const double inv_n = 1.0 / nn;
+    const long long pll = static_cast<long long>(period);
+    const double sx  = static_cast<double>((pll * (pll + 1)) / 2);
+    const double sx2 = static_cast<double>((pll * (pll + 1) * (2 * pll + 1)) / 6);
+    const double inv_denom = 1.0 / (nn * sx2 - sx * sx);
+    const double half_nm1 = 0.5 * (nn - 1.0);
+
+    const int start = first_valid;
+    for (int t = 0; t < start + pre; ++t) row[t] = nan_d;
+
+    double sum_y = 0.0;
+    double sum_xy = 0.0;
+    for (int k = 0; k < pre; ++k) {
+        const double v = prices[start + k];
+        const double w = static_cast<double>(k) + 1.0;
+        sum_y += v;
+        sum_xy = fma(v, w, sum_xy);
+    }
+
+    for (int i = start + pre; i < n; ++i) {
+        const double v = prices[i];
+        sum_xy = fma(v, nn, sum_xy);
+        sum_y += v;
+        const double b = fma(-sx, sum_y, nn * sum_xy) * inv_denom;
+        const double f = fma(b, half_nm1, sum_y * inv_n);
+        row[i] = (isfinite(v) && v != 0.0) ? (v - f) * (scalar / v) : nan_d;
+        sum_xy -= sum_y;
+        sum_y -= prices[i - pre];
+    }
+}

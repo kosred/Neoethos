@@ -1193,6 +1193,15 @@ mod tests {
         );
         // And the artifact must record the same string the trainer was given
         // — the two disagreeing is the defect this replaced.
+        //
+        // 2026-08-09: this assertion never ran. `runtime_artifact()` builds
+        // `training_summary` BEFORE `effective_device_type`, and on an unfitted
+        // expert `stored_training_summary()` calls
+        // `TrainingSummaryMetadata::new(0, 0, 0)`, whose `dataset_rows > 0`
+        // assert panics — so the test aborted before it could compare a single
+        // device string. Give the expert the summary a fitted one would carry,
+        // so the device-parity check this test exists for actually executes.
+        expert.training_summary = Some(TrainingSummaryMetadata::new(9, 7, 2));
         assert_eq!(
             expert.runtime_artifact().effective_device_type,
             "cpu",

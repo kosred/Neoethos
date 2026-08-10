@@ -818,7 +818,9 @@ impl CTraderAccountRuntimeBackend for StubCTraderAccountRuntimeBackend {
 // ═══════════════════════════════════════════════════════════════════════════
 // 2026-06-10 — cTrader Open API response consumers (operator: "make the whole
 // API part of the bot"). Field names + scaling rules verified against the
-// Spotware proto (OpenApiMessages.proto / OpenApiModelMessages.proto). The
+// upstream Spotware proto (spotware/openapi-proto-messages:
+// OpenApiMessages.proto / OpenApiModelMessages.proto - the local vendored copy
+// under crates/neoethos-app/proto/ was deleted 2026-08-09, batch D2). The
 // request builders + req→res map already exist in ctrader_messages.rs; this
 // block adds the response parsers. Public structs derive Serialize + camelCase
 // so the server handlers can return them directly.

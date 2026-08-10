@@ -238,3 +238,32 @@ void wilders_many_series_one_param_f32(const float* __restrict__ prices_tm,
 
     }
 }
+
+// ===========================================================================
+// S2 NOTE — where the f64 `wilders` lives, and why it is not in this file
+// ===========================================================================
+// The authoritative f64 entry point for `wilders` is
+// `neoethos_wilders_batch_f64` in `kernels/cuda/neoethos_f64_kernels.cu`. It
+// is NOT duplicated here: two implementations of one indicator is the disease
+// this lane exists to cure, and the one over there is already written against
+// `wilders_scalar` with the 4-wide seed association.
+//
+// It was WITHHELD from `F64_KERNELS` because vector-ta's own CPU paths
+// disagreed by 1 ULP and there was therefore no single answer to be in parity
+// with. That is now fixed, in the CPU, not worked around: `wilders_scalar`,
+// `wilders_avx2`, `wilders_avx512_short` and `wilders_avx512_long` all call
+// `wilders_seed_sum` (moving_averages/wilders.rs), so the crate agrees with
+// itself and the kernel is registered.
+//
+// The divergence was NEVER in the recurrence — all four paths always ran
+// `y = (x - y).mul_add(alpha, y)`. It was the warm-up seed: the same `period`
+// values summed 4-wide, 8-wide and 16-wide, three summation trees, three
+// roundings, and `y = sum * inv_n` carried the difference to the last bar.
+//
+// The two f32 kernels ABOVE remain f32 and remain wrong for our purposes for a
+// third reason on top of precision: `wilders_batch_f32` seeds with
+// `block_reduce_sum` (a shuffle tree whose association depends on `blockDim.x`)
+// and `wilders_batch_warp_scan_f32` reformulates the recurrence as a
+// matrix-power warp scan. They serve the f32 dispatcher, which 180 wrappers
+// still depend on; nothing in the f64 lane reaches them.
+// ===========================================================================

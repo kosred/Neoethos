@@ -479,3 +479,111 @@ extern "C" __global__ void zscore_many_series_one_param_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — zscore
+// ===========================================================================
+// Reference: src/indicators/zscore.rs
+//   zscore_with_kernel (:257)         — first_valid + the Err branches
+//   zscore_scalar (:320)              — the ma_type / devtype fork
+//   zscore_scalar_classic_sma (:369)  — the path this lane takes
+// Batch defaults (compute_zscore_batch): period 14, ma_type "sma", nbdev 1.0,
+// devtype 0, source close. devtype == 0 && ma_type == "sma" is the FIRST branch
+// of zscore_scalar (:378-380), so the classic-SMA path is what runs.
+//
+// THE UPDATE IS AN ALGEBRAIC IDENTITY, AND IT IS NOT THE OBVIOUS ONE.
+//   sum_sqr = (new_val + old_val).mul_add(dd, sum_sqr)     where dd = new - old
+// That is sum_sqr + (new+old)(new-old) = sum_sqr + new^2 - old^2, computed with
+// ONE rounding via mul_add instead of the two a naive
+// sum_sqr + new*new - old*old would take — and with markedly less cancellation.
+// Reproducing it as the naive form is the single easiest way to make this
+// kernel disagree with the reference on every bar after the first.
+//
+//   variance = (-mean).mul_add(mean, sum_sqr * inv)
+// is likewise ONE fma over a separately-rounded product: two roundings, not
+// three. Both are written with fma() below.
+//
+// NO EPSILON. The CPU tests stddev == 0.0 exactly and separately tests
+// stddev.is_nan(); it does NOT compare against a tolerance. Introducing one —
+// which is what an f32 port is tempted to do, since f32 cancels to zero far
+// more often — would emit NaN for windows the reference scores normally.
+// variance < 0.0 is clamped to 0.0, again exactly, with no epsilon.
+//
+// One thread per column: sum / sum_sqr are carried across bars.
+// ===========================================================================
+
+#define NEO_S3_ZSCORE_NBDEV 1.0
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_zscore_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+    const double nbdev = NEO_S3_ZSCORE_NBDEV;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warmup_end = first_valid + period - 1;
+    for (int i = 0; i < warmup_end && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warmup_end >= n) return;
+
+    const double inv = 1.0 / (double)period;
+
+    double sum = 0.0, sum_sqr = 0.0;
+    for (int j = first_valid; j <= warmup_end; ++j) {
+        const double v = data[j];
+        sum += v;
+        sum_sqr = fma(v, v, sum_sqr);
+    }
+
+    double mean = sum * inv;
+    double variance = fma(-mean, mean, sum_sqr * inv);
+    if (variance < 0.0) variance = 0.0;
+    double stddev = (variance == 0.0) ? 0.0 : (sqrt(variance) * nbdev);
+
+    {
+        const double xw = data[warmup_end];
+        row[warmup_end] = (stddev == 0.0 || isnan(stddev))
+            ? neo_s3_qnan()
+            : ((xw - mean) / stddev);
+    }
+
+    for (int i = warmup_end + 1; i < n; ++i) {
+        const double old_val = data[i - period];
+        const double new_val = data[i];
+        const double dd = new_val - old_val;
+        sum += dd;
+
+        sum_sqr = fma(new_val + old_val, dd, sum_sqr);
+        mean = sum * inv;
+
+        variance = fma(-mean, mean, sum_sqr * inv);
+        if (variance < 0.0) variance = 0.0;
+        stddev = (variance == 0.0) ? 0.0 : (sqrt(variance) * nbdev);
+
+        row[i] = (stddev == 0.0 || isnan(stddev))
+            ? neo_s3_qnan()
+            : ((new_val - mean) / stddev);
+    }
+}

@@ -178,3 +178,95 @@ extern "C" __global__ void ao_many_series_one_param_f32(
         dst   += num_series;
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — ao (Awesome Oscillator)
+// ===========================================================================
+// Reference: src/indicators/ao.rs
+//   `ao_prepare` (:289) — first_valid + the four Err branches
+//   `ao_with_kernel` (:318) — `alloc_with_nan_prefix(len, first + long - 1)`
+//   `ao_scalar` (:367) — the arithmetic, including the 2x unroll
+//
+// PERIOD-INVARIANT. `compute_ao_batch` reads `short_period` (default 5) and
+// `long_period` (default 34) and NEVER reads `period`, so a sweep over periods
+// produces `n_combos` byte-identical rows. `(void)periods` below is that fact,
+// not an oversight — the same contract `neoethos_tsi_batch_f64` documents.
+//
+// SOURCE. `compute_ao_batch` resolves `source.unwrap_or("hl2")`. The single
+// price series this kernel receives MUST be hl2, not close; feeding close
+// computes a different indicator that every length check would pass. That is
+// declared upstream by `F64InputKind::Hl2Slice`.
+//
+// ROUNDING. `short_sum.mul_add(inv_s, -long_sum * inv_l)` is ONE fused
+// multiply-add over a separately-rounded product — two roundings total. Written
+// as `short_sum*inv_s - long_sum*inv_l` it would be three. `fma(short_sum,
+// inv_s, -(long_sum * inv_l))` reproduces the CPU exactly.
+//
+// The CPU's 2x unrolled loop and its scalar tail perform the same operations in
+// the same order on the same values, so one loop reproduces both.
+// ===========================================================================
+
+#define NEO_S3_AO_SHORT 5
+#define NEO_S3_AO_LONG  34
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_ao_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)periods;  // PERIOD-INVARIANT — see the header.
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+
+    const int shortp = NEO_S3_AO_SHORT;
+    const int longp  = NEO_S3_AO_LONG;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (shortp == 0) || (longp == 0) ||
+        (shortp >= longp) ||
+        ((n - first_valid) < longp);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warm = first_valid + longp - 1;
+    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warm >= n) return;
+
+    const double inv_s = 1.0 / (double)shortp;
+    const double inv_l = 1.0 / (double)longp;
+
+    // ao.rs:383-395 — long_sum over the first (long-1) bars from `first`,
+    // short_sum over the (short-1) bars ending just before `warm`.
+    double long_sum = 0.0;
+    for (int i = 0; i < longp - 1; ++i) long_sum += data[first_valid + i];
+
+    double short_sum = 0.0;
+    for (int i = 0; i < shortp - 1; ++i) short_sum += data[first_valid + longp - shortp + i];
+
+    int tail_long  = first_valid;
+    int tail_short = first_valid + longp - shortp;
+
+    for (int i = warm; i < n; ++i) {
+        const double v = data[i];
+        long_sum  += v;
+        short_sum += v;
+        row[i] = fma(short_sum, inv_s, -(long_sum * inv_l));
+        long_sum  -= data[tail_long];
+        short_sum -= data[tail_short];
+        ++tail_long;
+        ++tail_short;
+    }
+}

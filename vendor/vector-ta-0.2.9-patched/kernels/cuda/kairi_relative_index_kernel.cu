@@ -668,3 +668,118 @@ extern "C" __global__ void kairi_relative_index_batch_f64(
     delete[] buf2;
     delete[] buf3;
 }
+
+// ===========================================================================
+// f64 LANE  --  closer C3
+// ===========================================================================
+//
+// WHY A SECOND ENTRY POINT RATHER THAN REGISTERING `kairi_relative_index_batch_f64`.
+// That kernel (:491) is one thread per COMBO over a `(lengths, ma_codes)` grid
+// and reproduces the GENERAL `compute_into` stream path. The CPU dispatcher,
+// called the way the lane calls it, never reaches that path: `length` defaults
+// to 50 and `ma_type` to "SMA" (cpu_batch.rs:7037-7038), `is_default_kairi_params`
+// (:727) is therefore true, and `kairi_relative_index_into_slice` (:807) takes
+// `compute_default_sma50_into` (:732) instead -- a different function with a
+// different accumulation. The lane must mirror the function the CPU ACTUALLY
+// runs, so it gets its own entry point.
+//
+// CPU REFERENCE
+// -------------
+//   src/indicators/kairi_relative_index.rs
+//     :727 is_default_kairi_params   -- length == 50 && SMA
+//     :732 compute_default_sma50_into  <- the whole specification
+//     :807 kairi_relative_index_into_slice
+//   dispatch: cpu_batch.rs:6976, params `length` (50) and `ma_type` ("SMA");
+//   `period` is never read.
+//
+// SHAPE
+// -----
+// ONE THREAD PER PARAMETER ROW walking bars ascending. `sum` is a rolling
+// accumulator with an ADD on entry and a SUBTRACT on exit; a prefix-scan
+// reformulation would give a different `sum` in the last bits at every bar, and
+// the result is then divided by that sum, so the error does not stay local.
+//
+// PERIOD-INVARIANT. FIRST-VALID IGNORED: `compute_default_sma50_into` fills the
+// whole output with NaN and then walks from index 0, so it never consults a
+// first-valid index at all -- hence `F64FirstValidRule::Ignored`.
+//
+// ARITHMETIC
+// ----------
+// f64 end to end, no fast-math. `RCP` is `1.0 / 50.0` and the CPU MULTIPLIES by
+// it (`sum * RCP`), so this does too -- turning it into `sum / 50.0` would be a
+// different rounding. `is_finite` is the CPU test, not `!is_nan`: an infinite
+// price is counted as INVALID by the CPU and would be accepted by a NaN-only
+// check.
+
+#define KAIRI_NEO_PERIOD 50
+#define KAIRI_NEO_SCALE  100.0
+
+__device__ __forceinline__ double kairi_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__ void kairi_relative_index_neo_batch_f64(
+    const double* __restrict__ source,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= n_combos) return;
+
+    const double nan_d = kairi_neo_qnan();
+    double* __restrict__ o = out + static_cast<size_t>(row) * static_cast<size_t>(n);
+
+    (void)periods;      // PERIOD-INVARIANT
+    (void)first_valid;  // FIRST-VALID IGNORED -- see the header
+
+    for (int i = 0; i < n; ++i) o[i] = nan_d;
+    if (n <= 0) return;
+
+    const double rcp = 1.0 / static_cast<double>(KAIRI_NEO_PERIOD);
+
+    double sum = 0.0;
+    int valid_count = 0;
+    double values[KAIRI_NEO_PERIOD];
+    unsigned char valid[KAIRI_NEO_PERIOD];
+    for (int k = 0; k < KAIRI_NEO_PERIOD; ++k) { values[k] = 0.0; valid[k] = 0; }
+    int head = 0;
+    int count = 0;
+
+    for (int i = 0; i < n; ++i) {
+        if (count == KAIRI_NEO_PERIOD) {
+            if (valid[head] != 0) {
+                sum -= values[head];
+                valid_count -= 1;
+            }
+        } else {
+            count += 1;
+        }
+
+        const double src = source[i];
+        if (isfinite(src)) {
+            values[head] = src;
+            valid[head] = 1;
+            sum += src;
+            valid_count += 1;
+        } else {
+            values[head] = 0.0;
+            valid[head] = 0;
+        }
+
+        head += 1;
+        if (head == KAIRI_NEO_PERIOD) head = 0;
+
+        if (count == KAIRI_NEO_PERIOD && valid_count == KAIRI_NEO_PERIOD) {
+            const double ma = sum * rcp;
+            if (ma != 0.0) {
+                o[i] = (src - ma) * KAIRI_NEO_SCALE / ma;
+            } else if (src == 0.0) {
+                o[i] = 0.0;
+            }
+            // ma == 0 with src != 0 leaves the NaN in place, exactly as :776.
+        }
+    }
+}

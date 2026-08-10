@@ -1,6 +1,6 @@
 # Codex Control Plane — MCP Server Design
 
-Status: IMPLEMENTED — `crates/neoethos-mcp` (binary `neoethos-mcp`), tier-1
+Status: IMPLEMENTED — `crates/neoethos-mcp` (binary `neoethos-control-plane`), tier-1
 tests green; operator setup steps in §8
 Date: 2026-08-08
 Scope: give OpenAI Codex CLI (and any MCP-speaking agent runtime) full operational
@@ -17,10 +17,16 @@ under a hard, server-side, fail-closed DEMO-ONLY guard.
 - **Crate:** `crates/neoethos-mcp` (new member of the root workspace, added to
   `members` and `default-members` so plain `cargo build --release` produces it).
   The top-level `mcp/` directory (the existing MCP **client** aggregator sidecar,
-  its own excluded workspace) is unrelated and untouched; the name collision is
-  resolved by path: `mcp/` = outbound client sidecar, `crates/neoethos-mcp` =
-  inbound control plane server.
-- **Binary:** `neoethos-mcp` → `target/release/neoethos-mcp.exe`.
+  its own excluded workspace) is unrelated and untouched. Until 2026-08-10 the
+  two were disambiguated by PATH ALONE — both declared `[[bin]] name =
+  "neoethos-mcp"` — so they produced identically-named executables, and the
+  desktop app spawns `neoethos-mcp.exe` **by name** from its own directory
+  (`desktop/src-tauri/src/lib.rs:245`), where the installer places the `mcp/`
+  one. Whichever binary landed there won and nothing verified which. Resolved
+  by renaming this crate's binary: `mcp/` = outbound client sidecar
+  (`neoethos-mcp`), `crates/neoethos-mcp` = inbound control plane server
+  (`neoethos-control-plane`).
+- **Binary:** `neoethos-control-plane` → `target/release/neoethos-control-plane.exe`.
 - **SDK:** official `rmcp`, pinned exactly: `rmcp = { version = "=3.1.2",
   features = ["server", "transport-io", "macros"] }` (MCP spec 2026-07-28; same
   protocol implementation family Codex CLI itself ships). Pin is exact because
@@ -300,7 +306,7 @@ tools annotated `destructive_hint=true ∧ read_only_hint=false` minus
 File: `~/.codex/config.toml` (user-global — the project-scoped
 `.codex/config.toml` only applies to trusted projects and is easy to silently
 lose; use the global file). Alternative setup: `codex mcp add neoethos --
-C:/Users/konst/development/forex-ai/target/release/neoethos-mcp.exe`, then edit
+C:/Users/konst/development/forex-ai/target/release/neoethos-control-plane.exe`, then edit
 the per-tool blocks in the file. Verify with `codex mcp list` and `/mcp` in the
 Codex TUI.
 
@@ -309,7 +315,7 @@ Codex TUI.
 default_tools_approval_mode = "writes"
 
 [mcp_servers.neoethos]
-command = "C:/Users/konst/development/forex-ai/target/release/neoethos-mcp.exe"
+command = "C:/Users/konst/development/forex-ai/target/release/neoethos-control-plane.exe"
 args = ["--base-url", "http://127.0.0.1:7423"]
 # Fail loudly at Codex startup if the MCP server cannot initialize.
 required = true
@@ -467,7 +473,7 @@ Verify it runs (help prints to STDERR — stdout is reserved for JSON-RPC):
 Either paste the §4 TOML into `~/.codex/config.toml` (user-global), or:
 
 ```powershell
-codex mcp add neoethos -- C:/Users/konst/development/forex-ai/target/release/neoethos-mcp.exe --base-url http://127.0.0.1:7423
+codex mcp add neoethos -- C:/Users/konst/development/forex-ai/target/release/neoethos-control-plane.exe --base-url http://127.0.0.1:7423
 codex mcp list          # must show `neoethos`
 ```
 

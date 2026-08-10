@@ -66,8 +66,8 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE, build_account_auth_request,
-    build_application_auth_request, build_subscribe_spots_request, parse_ctrader_error_payload,
-    parse_open_api_envelope,
+    build_application_auth_request, build_subscribe_spots_request, ctrader_json_wss_url,
+    parse_ctrader_error_payload, parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -399,7 +399,7 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
 }
 
 fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
-    let url = format!("wss://{}:5036", config.endpoint_host);
+    let url = ctrader_json_wss_url(&config.endpoint_host);
     crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
     let (mut socket, _) = connect(url.as_str())
         .with_context(|| format!("failed to connect to cTrader spot stream {url}"))?;

@@ -36,9 +36,9 @@ impl Default for SmcSearchConfig {
             // pool that often discovers profitable counter-momentum
             // strategies on D1/H4.
             //
-            // Operator can still pin the old value via:
-            //   NEOETHOS_BOT_PROP_SMC_FORCE_RATIO=0.65
-            // — env override at `read_smc_search_config_from_env` below.
+            // Operator can still pin the old value via
+            // `models.smc_search_runtime.force_ratio: 0.65` (2026-08-10: was
+            // the `NEOETHOS_BOT_PROP_SMC_FORCE_RATIO` env var, now retired).
             force_ratio: 0.30,
             min_flags: 1,
             p_ob: default_p,
@@ -58,64 +58,29 @@ impl Default for SmcSearchConfig {
 
 static SMC_SEARCH_CONFIG_CACHE: OnceLock<SmcSearchConfig> = OnceLock::new();
 
-fn smc_env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(default)
-}
-
-fn smc_env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn smc_env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
-fn read_smc_search_config_from_env() -> SmcSearchConfig {
-    let default_p = smc_env_f64("NEOETHOS_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
-    let mut cfg = SmcSearchConfig {
-        force_ratio: smc_env_f64("NEOETHOS_BOT_PROP_SMC_FORCE_RATIO", 0.30).clamp(0.0, 1.0),
-        min_flags: smc_env_usize("NEOETHOS_BOT_PROP_SMC_MIN_FLAGS", 1),
-        p_ob: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
-        p_fvg: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
-        p_liq: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_LIQ", default_p).clamp(0.0, 1.0),
-        p_premium: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_PREMIUM", default_p).clamp(0.0, 1.0),
-        p_inducement: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT", default_p).clamp(0.0, 1.0),
-        p_mtf: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_MTF", 0.85).clamp(0.0, 1.0),
-        p_bos: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_BOS", default_p).clamp(0.0, 1.0),
-        p_choch: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_CHOCH", default_p).clamp(0.0, 1.0),
-        p_eqh: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_EQH", default_p).clamp(0.0, 1.0),
-        p_eql: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_EQL", default_p).clamp(0.0, 1.0),
-        p_displacement: smc_env_f64("NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT", default_p).clamp(0.0, 1.0),
-    };
-    if !smc_env_bool("NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED", true) {
-        cfg.force_ratio = 0.0;
-        cfg.min_flags = 0;
-    }
-    cfg
-}
+// The 15 `NEOETHOS_BOT_PROP_SMC_*` readers (`smc_env_f64` / `_usize` / `_bool`
+// and `read_smc_search_config_from_env`) were DELETED 2026-08-10. Every one of
+// them is now a typed field on `models.smc_search_runtime`, installed through
+// `install_smc_search_config_from_settings`. These probabilities decide which
+// genes can EXIST, so an export that changed them and appeared in no artifact
+// made two runs of the same config incomparable.
 
 impl SmcSearchConfig {
-    /// Returns the cached SMC search config, lazily reading the
-    /// `NEOETHOS_BOT_PROP_SMC_*` env vars at most once per process. Existing
-    /// callers (`evolve_search`, `neoethos-models::genetic`) keep their
-    /// `SmcSearchConfig::from_env()` API; the change is that subsequent
-    /// invocations no longer re-walk `std::env`.
+    /// The installed SMC search config, or the typed defaults when nothing was
+    /// installed (the `neoethos-models` GA and test fixtures land here).
+    ///
+    /// This is the honest name. `from_env` below is the old one, kept because
+    /// call sites outside this change still use it.
+    pub fn current() -> Self {
+        *SMC_SEARCH_CONFIG_CACHE.get_or_init(SmcSearchConfig::default)
+    }
+
+    /// Deprecated spelling of [`Self::current`] — it has read no environment
+    /// since 2026-08-10. Retained because `genetic/search_engine.rs` and
+    /// `execution_profile.rs` call it; renaming those is a mechanical follow-up
+    /// recorded in the handoff.
     pub fn from_env() -> Self {
-        *SMC_SEARCH_CONFIG_CACHE.get_or_init(read_smc_search_config_from_env)
+        Self::current()
     }
 
     /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_SMC_*` env
@@ -148,11 +113,16 @@ impl SmcSearchConfig {
     }
 }
 
-/// Eagerly install the SMC search config from the legacy
-/// `NEOETHOS_BOT_PROP_SMC_*` env vars. Idempotent — calling this from a
-/// binary's `main` simply forces the cache to populate at startup.
+/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
+/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
 pub fn install_smc_search_config_from_env() {
-    let _ = SMC_SEARCH_CONFIG_CACHE.set(read_smc_search_config_from_env());
+    tracing::error!(
+        target: "neoethos_search::retired_env",
+        "install_smc_search_config_from_env() is RETIRED and installs typed DEFAULTS — \
+         the NEOETHOS_BOT_PROP_SMC_* layer no longer exists. Call \
+         install_smc_search_config_from_settings(&settings)."
+    );
+    let _ = SMC_SEARCH_CONFIG_CACHE.set(SmcSearchConfig::default());
 }
 
 /// Config-driven install — reads the SMC search knobs from the single

@@ -553,3 +553,285 @@ extern "C" __global__ void ttm_squeeze_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — ttm_squeeze
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/ttm_squeeze.rs
+ *   `ttm_squeeze_with_kernel`    (:342)  — first_valid scans CLOSE ONLY,
+ *                                          warmup = first + length - 1, and
+ *                                          the classic-path predicate
+ *   `ttm_squeeze_scalar_classic` (:1124) — the path the defaults take
+ *
+ * WHICH SERIES THIS EMITS. `compute_ttm_squeeze_batch` (cpu_batch.rs:5913)
+ * maps output_id "value" -> `out.momentum`. One matrix, so this is the
+ * MOMENTUM line. The `squeeze` state (0/1/2/3) is a separate output; its
+ * arithmetic is still carried below because it costs three multiplies and
+ * keeps this a line-for-line mirror, but it is not written out.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_ttm_squeeze_batch` reads
+ * `length` (20), `bb_mult` (2.0) and three kc multipliers (1.0/1.5/2.0) —
+ * cpu_batch.rs:5883-5893. It never reads `period`. Identical CPU columns,
+ * identical rows here, declared through `is_period_invariant`. And because
+ * `length` is fixed at 20 the ring buffers are a compile-time 20 slots, so
+ * this kernel needs no `max_period`.
+ *
+ * THE CLASSIC PATH IS ONLY REACHED AT THE DEFAULTS. ttm_squeeze.rs:402-408
+ * requires `length == 20 && bb_mult == 2.0 && kc == (1.0, 1.5, 2.0)` AND
+ * `Kernel::Scalar`. `compute_ttm_squeeze_batch` passes
+ * `req.kernel.to_non_batch()`, and `Auto` resolves to `Scalar` at :398. So the
+ * defaults take this path and this is the reference. The generic path
+ * (:432-459) computes the same indicator through `sma_with_kernel` twice and
+ * is a DIFFERENT rounding; it is not what a default call runs.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. `fabsf` x8, `fmaxf` x7 -> `fabs`, and `fmax` ONLY where the CPU uses
+ *     `f64::max`. See 2 — this file uses BOTH forms and they are not
+ *     interchangeable.
+ *  2. TRUE RANGE IS COMPUTED TWICE, WITH TWO DIFFERENT NaN SEMANTICS, AND
+ *     THAT IS DELIBERATE IN THE REFERENCE.
+ *       - warm-up loop, :1189-1201: an explicit `if hl >= hc {...} else {...}`
+ *         chain. A comparison against NaN is false, so NaN falls through.
+ *       - steady loop, :1364: `hl.max(hc).max(lc)`, i.e. `f64::max`, which
+ *         RETURNS THE NON-NaN OPERAND.
+ *     The two disagree the moment any of high/low/close is NaN. Both are
+ *     reproduced exactly as written. Collapsing them to one form — either
+ *     form — is a wrong kernel that passes every clean-data test.
+ *  3. THE VARIANCE IS ONE FUSED ROUNDING. `(-m).mul_add(m, sumsq * inv_n)` is
+ *     `fma(-m, m, sumsq * inv_n)`: one rounding on the fused pair, one on the
+ *     scaled sum. `sumsq/n - m*m` is three and drifts.
+ *  4. THE ROLLING sum1 UPDATE READS THE OLD sum0. :1348 is
+ *     `sum1 - sum0_old + old + (n-1)*new` where `sum0_old` was captured BEFORE
+ *     `sum0 += new - old`. Using the new sum0 gives a plausible slope that is
+ *     wrong at every bar.
+ *  5. `sumsq = new.mul_add(new, sumsq - old*old)` — the subtraction happens
+ *     INSIDE the fma addend, so it is `fma(new, new, sumsq - old*old)`, two
+ *     roundings, not `sumsq + new*new - old*old`, which is three.
+ *  6. `__int_as_float(0x7f...)` -> `__longlong_as_double(0x7ff8...)`.
+ *
+ * ONE THREAD PER COLUMN. Carried: four rolling sums, two monotonic deques and
+ * two value rings.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_TTMSQ_LENGTH 20
+#define NEO_TTMSQ_BB     2.0
+#define NEO_TTMSQ_KC_HI  1.0
+#define NEO_TTMSQ_KC_MID 1.5
+#define NEO_TTMSQ_KC_LO  2.0
+
+extern "C" __global__
+void ttm_squeeze_neo_batch_f64(const double* __restrict__ high,
+                               const double* __restrict__ low,
+                               const double* __restrict__ close,
+                               int series_len,
+                               const int* __restrict__ periods,
+                               int n_combos,
+                               int first_valid,
+                               double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    (void)periods;   /* period-invariant — see the header. */
+
+    const int length = NEO_TTMSQ_LENGTH;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        length > len || (len - first_valid) < length) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int warmup = first_valid + length - 1;
+    for (int i = 0; i < len && i < warmup; ++i) o[i] = NEO_F64_NAN;
+    if (warmup >= len) return;
+
+    const double n = (double)length;
+    const double sx = 0.5 * n * (n - 1.0);
+    const double sx2 = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
+    const double den = n * sx2 - sx * sx;
+    const double inv_den = 1.0 / den;
+    const double inv_n = 1.0 / n;
+    const double half_nm1 = 0.5 * (n - 1.0);
+
+    const double bb_sq      = NEO_TTMSQ_BB     * NEO_TTMSQ_BB;
+    const double kc_low_sq  = NEO_TTMSQ_KC_LO  * NEO_TTMSQ_KC_LO;
+    const double kc_mid_sq  = NEO_TTMSQ_KC_MID * NEO_TTMSQ_KC_MID;
+    const double kc_high_sq = NEO_TTMSQ_KC_HI  * NEO_TTMSQ_KC_HI;
+
+    double cbuf[NEO_TTMSQ_LENGTH];
+    double trbuf[NEO_TTMSQ_LENGTH];
+    int    max_q[NEO_TTMSQ_LENGTH];
+    int    min_q[NEO_TTMSQ_LENGTH];
+    const int cap = length;
+
+    int cpos = 0, trpos = 0;
+    int max_head = 0, max_tail = 0, max_len_ = 0;
+    int min_head = 0, min_tail = 0, min_len_ = 0;
+
+    double sum0 = 0.0, sum1 = 0.0, sumsq = 0.0, tr_sum = 0.0;
+
+    /* ---------------------------------------------------------- warm-up ---
+     * ttm_squeeze.rs:1172-1249. NOTE the comparison-chain true range. */
+    {
+        int r = 0;
+        for (int i = first_valid; i <= warmup; ++i) {
+            const double c = close[i];
+            cbuf[cpos] = c;
+            sum0 += c;
+            sumsq = fma(c, c, sumsq);
+            sum1 += (double)r * c;
+
+            double tr_val;
+            if (i == first_valid) {
+                tr_val = high[i] - low[i];
+            } else {
+                const double pc = close[i - 1];
+                const double hl = high[i] - low[i];
+                const double hc = fabs(high[i] - pc);
+                const double lc = fabs(low[i] - pc);
+                if (hl >= hc) { tr_val = (hl >= lc) ? hl : lc; }
+                else          { tr_val = (hc >= lc) ? hc : lc; }
+            }
+            trbuf[trpos] = tr_val;
+            tr_sum += tr_val;
+
+            while (max_len_ > 0) {
+                const int back_pos = (max_tail == 0) ? (cap - 1) : (max_tail - 1);
+                if (high[i] <= high[max_q[back_pos]]) break;
+                max_tail = back_pos;
+                max_len_ -= 1;
+            }
+            max_q[max_tail] = i;
+            max_tail += 1; if (max_tail == cap) max_tail = 0;
+            max_len_ += 1;
+
+            while (min_len_ > 0) {
+                const int back_pos = (min_tail == 0) ? (cap - 1) : (min_tail - 1);
+                if (low[i] >= low[min_q[back_pos]]) break;
+                min_tail = back_pos;
+                min_len_ -= 1;
+            }
+            min_q[min_tail] = i;
+            min_tail += 1; if (min_tail == cap) min_tail = 0;
+            min_len_ += 1;
+
+            cpos += 1;  if (cpos == length)  cpos = 0;
+            trpos += 1; if (trpos == length) trpos = 0;
+            r += 1;
+        }
+    }
+
+    /* ------------------------------------------------ the seeded bar ----- */
+    {
+        const double m = sum0 * inv_n;
+        const double var = fma(-m, m, sumsq * inv_n);
+        const double var_pos = (var > 0.0) ? var : 0.0;
+        const double dkc = tr_sum * inv_n;
+        const double dkc2 = dkc * dkc;
+
+        /* The squeeze state is a separate output; computed to keep the mirror
+         * exact and to keep the compiler from reordering what follows. */
+        const double bbv = bb_sq * var_pos;
+        const double t_low = kc_low_sq * dkc2;
+        const double t_mid = kc_mid_sq * dkc2;
+        const double t_high = kc_high_sq * dkc2;
+        (void)bbv; (void)t_low; (void)t_mid; (void)t_high;
+
+        const double highest = high[max_q[max_head]];
+        const double lowest  = low[min_q[min_head]];
+
+        const double midpoint = 0.5 * (highest + lowest);
+        const double avg = 0.5 * (midpoint + m);
+        const double sy = sum0 - avg * n;
+        const double sxy = sum1 - avg * sx;
+        const double slope = fma(n, sxy, -(sx * sy)) * inv_den;
+        o[warmup] = sy * inv_n + slope * half_nm1;
+    }
+
+    /* ------------------------------------------------- the steady loop ---- */
+    for (int i = warmup + 1; i < len; ++i) {
+        const int start_idx = i + 1 - length;
+
+        while (max_len_ > 0) {
+            if (max_q[max_head] >= start_idx) break;
+            max_head += 1; if (max_head == cap) max_head = 0;
+            max_len_ -= 1;
+        }
+        while (min_len_ > 0) {
+            if (min_q[min_head] >= start_idx) break;
+            min_head += 1; if (min_head == cap) min_head = 0;
+            min_len_ -= 1;
+        }
+
+        while (max_len_ > 0) {
+            const int back_pos = (max_tail == 0) ? (cap - 1) : (max_tail - 1);
+            if (high[i] <= high[max_q[back_pos]]) break;
+            max_tail = back_pos;
+            max_len_ -= 1;
+        }
+        max_q[max_tail] = i;
+        max_tail += 1; if (max_tail == cap) max_tail = 0;
+        max_len_ += 1;
+
+        while (min_len_ > 0) {
+            const int back_pos = (min_tail == 0) ? (cap - 1) : (min_tail - 1);
+            if (low[i] >= low[min_q[back_pos]]) break;
+            min_tail = back_pos;
+            min_len_ -= 1;
+        }
+        min_q[min_tail] = i;
+        min_tail += 1; if (min_tail == cap) min_tail = 0;
+        min_len_ += 1;
+
+        const double old_c = cbuf[cpos];
+        const double new_c = close[i];
+        const double sum0_old = sum0;
+        sum0 += new_c - old_c;
+        sumsq = fma(new_c, new_c, sumsq - old_c * old_c);
+        sum1 = sum1 - sum0_old + old_c + (n - 1.0) * new_c;
+        cbuf[cpos] = new_c;
+        cpos += 1; if (cpos == length) cpos = 0;
+
+        const double old_tr = trbuf[trpos];
+        const double pc = close[i - 1];
+        const double hi_i = high[i];
+        const double lo_i = low[i];
+        const double hl = hi_i - lo_i;
+        const double hc = fabs(hi_i - pc);
+        const double lc = fabs(lo_i - pc);
+        /* :1364 — `f64::max`, NOT the warm-up loop's comparison chain. */
+        const double tr_new = fmax(fmax(hl, hc), lc);
+        tr_sum += tr_new - old_tr;
+        trbuf[trpos] = tr_new;
+        trpos += 1; if (trpos == length) trpos = 0;
+
+        const double m = sum0 * inv_n;
+        const double var = fma(-m, m, sumsq * inv_n);
+        const double var_pos = (var > 0.0) ? var : 0.0;
+        const double dkc = tr_sum * inv_n;
+        const double dkc2 = dkc * dkc;
+        const double bbv = bb_sq * var_pos;
+        const double t_low = kc_low_sq * dkc2;
+        const double t_mid = kc_mid_sq * dkc2;
+        const double t_high = kc_high_sq * dkc2;
+        (void)bbv; (void)t_low; (void)t_mid; (void)t_high;
+
+        const double highest = high[max_q[max_head]];
+        const double lowest  = low[min_q[min_head]];
+
+        const double midpoint = 0.5 * (highest + lowest);
+        const double avg = 0.5 * (midpoint + m);
+        const double sy = sum0 - avg * n;
+        const double sxy = sum1 - avg * sx;
+        const double slope = fma(n, sxy, -(sx * sy)) * inv_den;
+        o[i] = sy * inv_n + slope * half_nm1;
+    }
+}

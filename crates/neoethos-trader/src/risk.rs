@@ -1,11 +1,25 @@
 //! Phase-1 `RiskGate` stubs.
 //!
-//! The real gate (Phase 5) routes every intent through
-//! `RiskManager::check_trade_allowed` (PropFirm: daily-loss / max-DD /
-//! drawdown-recovery tiers) or `RiskyModeManager::check_trade_allowed`
-//! (kill switches, daily/monthly caps, the equity-floor of design §8). Phase 1
-//! ships a permissive gate (proves the allow path) plus a tiny
-//! max-concurrent-positions cap so the reject path is exercised end-to-end.
+//! The intended Phase-5 gate routes every intent through
+//! `RiskyModeManager::check_trade_allowed` (kill switches, daily/monthly caps,
+//! the equity-floor of design §8). Phase 1 ships a permissive gate (proves the
+//! allow path) plus a tiny max-concurrent-positions cap so the reject path is
+//! exercised end-to-end.
+//!
+//! **CORRECTION 2026-08-09 (audit #137).** This header also named
+//! `neoethos_core::domain::risk::RiskManager::check_trade_allowed` (the
+//! PropFirm daily-loss / max-DD / drawdown-recovery tiers) as the other real
+//! gate. That type has **no production constructor anywhere in the workspace** —
+//! all three `RiskManager::new` call sites are inside its own `#[cfg(test)]`
+//! module — so it is not something this crate can be "wired to" today. Whether
+//! it gets wired or deleted is an open operator decision recorded on the struct
+//! itself. Until then, do not read this file as "the real thing exists, we just
+//! haven't plugged it in".
+//!
+//! [`PermissiveRiskGate`] is what every `data_replay::replay_*` path actually
+//! uses, which is why every replay reports it in
+//! [`crate::engine::EngineStats::fidelity_warnings`]: no trade in a replay run
+//! was ever refused for risk.
 
 use crate::contracts::{AccountSnapshot, KillSwitchTier, RiskGate, TradeIntent};
 

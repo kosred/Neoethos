@@ -322,3 +322,158 @@ void volume_adjusted_ma_multi_series_one_param_time_major_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// S3 f64 LANE — volume_adjusted_ma
+// ===========================================================================
+// Reference: src/indicators/moving_averages/volume_adjusted_ma.rs
+//   VolumeAdjustedMa_prepare (:345) — first_valid + the Err branches
+//   VolumeAdjustedMa_scalar (:459)  — the arithmetic
+// Defaults (:43-46): length 13 (this is the SWEPT parameter — compute_ma_batch
+// maps the combo's `period` onto `length`), vi_factor 0.67, strict TRUE,
+// sample_period 0. Inputs: (close, volume).
+//
+// sample_period == 0 IS A DIFFERENT AVERAGE, NOT A DEGENERATE ONE (:487-492).
+// With the default the volume average is CUMULATIVE — cum_vol / (i+1) over the
+// whole series from bar 0 — not a rolling window. cum_vol is primed over
+// [0, warmup) BEFORE the emit loop (:476-484), so it counts bars this kernel
+// never outputs. Starting the accumulation at `first` or at `warmup` would give
+// a different divisor and a different value at every bar.
+//
+// strict == true CHANGES THE LOOP EXIT (:559-565): the walk back stops when the
+// accumulated normalised volume v2i_sum reaches `length`, and the cap is
+// length*10 rather than length. So the number of bars folded in is
+// DATA-DEPENDENT — this is not a fixed window and cannot be turned into one.
+//
+// NON-FINITE HANDLING IS SKIP, NOT POISON. Every accumulation is gated on
+// is_finite (:480, :503, :511, :515, :549, :553) — a NaN volume contributes
+// zero and a NaN price is omitted from the weighted sum — while a NaN p0 at the
+// tail makes the whole bar NaN (:577-580). Two different NaN policies inside
+// one function; both transcribed.
+//
+// ROUNDING.
+//   weighted_sum = px.mul_add(v2i, weighted_sum)                 — ONE fma
+//   out = ((length - v2i_sum).mul_add(p0, weighted_sum)) / length — ONE fma
+//         over a separately-rounded subtraction, then one divide.
+//
+// ZERO GUARDS, NOT EPSILONS: `if vi_th > 0.0 { 1.0/vi_th } else { 0.0 }` and
+// `if inv == 0.0` are exact tests (:523, :531).
+//
+// One thread per column: cum_vol is carried across the whole series.
+// ===========================================================================
+
+#define NEO_S3_VAMA_VI_FACTOR     0.67
+#define NEO_S3_VAMA_STRICT        1
+#define NEO_S3_VAMA_SAMPLE_PERIOD 0
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_volume_adjusted_ma_batch_f64(
+    const double* __restrict__ data,
+    const double* __restrict__ vol,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int length = periods[r];
+    const double vi_factor = NEO_S3_VAMA_VI_FACTOR;
+    const int strict = NEO_S3_VAMA_STRICT;
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (length == 0) || (length > n) ||
+        ((n - first_valid) < length);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    const int warmup = first_valid + length - 1;
+    for (int i = 0; i < warmup && i < n; ++i) row[i] = neo_s3_qnan();
+    if (warmup >= n) return;
+
+    // sample_period == 0: prime the CUMULATIVE volume over [0, warmup).
+    double cum_vol = 0.0;
+    {
+        const int upto = (warmup < n) ? warmup : n;
+        for (int j = 0; j < upto; ++j) {
+            const double x = vol[j];
+            if (isfinite(x)) cum_vol += x;
+        }
+    }
+
+    for (int i = warmup; i < n; ++i) {
+        const double xv = vol[i];
+        if (isfinite(xv)) cum_vol += xv;
+        const double avg_volume = cum_vol / (double)(i + 1);
+
+        const double vi_th = avg_volume * vi_factor;
+        const double inv = (vi_th > 0.0) ? (1.0 / vi_th) : 0.0;
+
+        int cap;
+        if (strict) {
+            const long long c = 10LL * (long long)length;
+            const long long lim = (long long)i + 1;
+            cap = (int)((c < lim) ? c : lim);
+        } else {
+            cap = (length < i + 1) ? length : (i + 1);
+        }
+
+        if (inv == 0.0) {
+            const int nmb = cap;
+            if (i >= nmb) {
+                const double p0 = data[i - nmb];
+                row[i] = isfinite(p0) ? p0 : neo_s3_qnan();
+            } else {
+                row[i] = neo_s3_qnan();
+            }
+            continue;
+        }
+
+        double weighted_sum = 0.0;
+        double v2i_sum = 0.0;
+        int nmb = 0;
+
+        int idx = i;
+        for (int j = 0; j < cap; ++j) {
+            const double vv = vol[idx];
+            const double v2i = isfinite(vv) ? (vv * inv) : 0.0;
+            v2i_sum += v2i;
+
+            const double px = data[idx];
+            if (isfinite(px)) weighted_sum = fma(px, v2i, weighted_sum);
+
+            nmb = j + 1;
+
+            if (strict) {
+                if (v2i_sum >= (double)length) break;
+            } else if (nmb >= length) {
+                break;
+            }
+
+            if (idx == 0) break;
+            idx -= 1;
+        }
+
+        if (nmb > 0 && i >= nmb) {
+            const double p0 = data[i - nmb];
+            if (isfinite(p0)) {
+                row[i] = fma((double)length - v2i_sum, p0, weighted_sum) / (double)length;
+            } else {
+                row[i] = neo_s3_qnan();
+            }
+        } else {
+            row[i] = neo_s3_qnan();
+        }
+    }
+}

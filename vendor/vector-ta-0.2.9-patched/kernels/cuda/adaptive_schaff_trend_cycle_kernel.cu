@@ -373,3 +373,224 @@ extern "C" __global__ void adaptive_schaff_trend_cycle_batch_f64(
         row_stc[i] = stc_raw - CENTER;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 3
+//
+// CPU reference: src/indicators/adaptive_schaff_trend_cycle.rs:807
+// (adaptive_schaff_trend_cycle_with_kernel). The column this emits is stc,
+// which is what output_id == "value" resolves to
+// (dispatch/cpu_batch.rs:12627-12629).
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential, five deep:
+// a rolling time-correlation whose sums are maintained incrementally, a
+// second-order MACD recurrence whose coefficient k is re-derived every bar
+// from that correlation, an EMA of the bar range, two monotone-deque
+// min/max windows, and two chained one-pole smoothers. Every stage reads the
+// previous bar's output of the stage before it.
+//
+// PERIOD-INVARIANT. compute_adaptive_schaff_trend_cycle_batch
+// (cpu_batch.rs:12645-12658) reads adaptive_length, stc_length,
+// smoothing_factor, fast_length and slow_length and NEVER period, so five
+// swept periods give five identical CPU columns and this kernel emits five
+// identical rows. All five CPU defaults are pinned below.
+//
+// WHAT IS DELIBERATELY ABSENT: the histogram column and the EMA that feeds
+// it. It consumes the MACD, it does not produce the STC.
+//
+// THE WORKING ARRAYS ARE PER-THREAD, so their bounds are properties of THIS
+// COMPILED KERNEL. The correlation keeps adaptive_length values; each monotone
+// deque holds at most stc_length entries, which is why the queue bound is
+// stated in terms of stc_length. At the pinned 55 and 12 neither bound can be
+// approached, and both are checked rather than assumed.
+//
+// FIRST VALID IS NOT READ: the CPU emits from bar 0 and RESETS every one of
+// the five machines at a non-finite bar, so there is no warmup index -- the
+// warmup is re-served after each hole. The lane row declares
+// F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double sqrt/fabs/fmin/fmax, no f32-suffixed
+// math function, no fast-math intrinsic. EPS in this file is the crate's own
+// f64-sized degeneracy guard on a span and a correlation denominator; it is
+// NOT an f32 epsilon carried forward (rule 2).
+// ---------------------------------------------------------------------------
+
+#define NEO_ASTC_ADAPTIVE_LENGTH 55
+#define NEO_ASTC_STC_LENGTH 12
+#define NEO_ASTC_SMOOTHING_FACTOR 0.45
+#define NEO_ASTC_FAST_LENGTH 26
+#define NEO_ASTC_SLOW_LENGTH 50
+#define NEO_ASTC_ADAPTIVE_CAP 256
+#define NEO_ASTC_QUEUE_CAP 64
+
+extern "C" __global__ void adaptive_schaff_trend_cycle_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = NAN;
+    }
+
+    const int adaptive_length = NEO_ASTC_ADAPTIVE_LENGTH;
+    const int stc_length = NEO_ASTC_STC_LENGTH;
+    const double smoothing_factor = NEO_ASTC_SMOOTHING_FACTOR;
+    const int fast_length = NEO_ASTC_FAST_LENGTH;
+    const int slow_length = NEO_ASTC_SLOW_LENGTH;
+
+    if (adaptive_length <= 0 || adaptive_length > NEO_ASTC_ADAPTIVE_CAP || stc_length <= 0 ||
+        stc_length > NEO_ASTC_QUEUE_CAP || !isfinite(smoothing_factor) ||
+        smoothing_factor <= 0.0 || smoothing_factor > 1.0 || fast_length <= 0 ||
+        slow_length <= 0) {
+        return;
+    }
+
+    double corr_values[NEO_ASTC_ADAPTIVE_CAP];
+    int macd_min_idx[NEO_ASTC_QUEUE_CAP];
+    int macd_max_idx[NEO_ASTC_QUEUE_CAP];
+    int smooth_min_idx[NEO_ASTC_QUEUE_CAP];
+    int smooth_max_idx[NEO_ASTC_QUEUE_CAP];
+    double macd_min_val[NEO_ASTC_QUEUE_CAP];
+    double macd_max_val[NEO_ASTC_QUEUE_CAP];
+    double smooth_min_val[NEO_ASTC_QUEUE_CAP];
+    double smooth_max_val[NEO_ASTC_QUEUE_CAP];
+
+    RollingCorrelationTimeDevice correlation;
+    correlation.init(adaptive_length, corr_values);
+
+    EmaStateDevice range_ema;
+    range_ema.init(slow_length);
+
+    const double fast_alpha = 2.0 / (static_cast<double>(fast_length) + 1.0);
+    const double slow_alpha = 2.0 / (static_cast<double>(slow_length) + 1.0);
+    double prev_close = NAN;
+    double macd_prev1 = 0.0;
+    double macd_prev2 = 0.0;
+    double normalized_prev = 0.0;
+    double smoothed_macd_prev = 0.0;
+    bool smoothed_macd_initialized = false;
+    double smoothed_normalized_prev = 0.0;
+    double stc_prev = 0.0;
+    bool stc_initialized = false;
+
+    int macd_next_index = 0;
+    int macd_min_count = 0;
+    int macd_max_count = 0;
+    int smooth_next_index = 0;
+    int smooth_min_count = 0;
+    int smooth_max_count = 0;
+
+    for (int i = 0; i < n; ++i) {
+        if (!valid_bar(high[i], low[i], close[i])) {
+            correlation.reset();
+            range_ema.reset();
+            prev_close = NAN;
+            macd_prev1 = 0.0;
+            macd_prev2 = 0.0;
+            normalized_prev = 0.0;
+            smoothed_macd_prev = 0.0;
+            smoothed_macd_initialized = false;
+            smoothed_normalized_prev = 0.0;
+            stc_prev = 0.0;
+            stc_initialized = false;
+            macd_next_index = 0;
+            macd_min_count = 0;
+            macd_max_count = 0;
+            smooth_next_index = 0;
+            smooth_min_count = 0;
+            smooth_max_count = 0;
+            continue;
+        }
+
+        range_ema.update(high[i] - low[i]);
+        double corr = NAN;
+        const bool has_corr = correlation.update(close[i], &corr);
+        const double prev_close_value = prev_close;
+        prev_close = close[i];
+
+        if (!has_corr) {
+            continue;
+        }
+
+        const double delta = isfinite(prev_close_value) ? (close[i] - prev_close_value) : 0.0;
+        const double r2 = 0.5 * corr * corr + 0.5;
+        const double k = r2 * ((1.0 - fast_alpha) * (1.0 - slow_alpha)) +
+            (1.0 - r2) * ((1.0 - fast_alpha) / (1.0 - slow_alpha));
+        const double macd = delta * (fast_alpha - slow_alpha) +
+            (2.0 - fast_alpha - slow_alpha) * macd_prev1 - k * macd_prev2;
+        macd_prev2 = macd_prev1;
+        macd_prev1 = macd;
+
+        double macd_min = NAN;
+        double macd_max = NAN;
+        if (!rolling_minmax_update(
+                stc_length,
+                &macd_next_index,
+                macd_min_idx,
+                macd_min_val,
+                &macd_min_count,
+                macd_max_idx,
+                macd_max_val,
+                &macd_max_count,
+                macd,
+                &macd_min,
+                &macd_max)) {
+            continue;
+        }
+
+        const double macd_span = macd_max - macd_min;
+        const double normalized =
+            macd_span > EPS ? ((macd - macd_min) / macd_span * SCALE_100) : normalized_prev;
+        normalized_prev = normalized;
+
+        const double smoothed_macd = !smoothed_macd_initialized
+            ? normalized
+            : (smoothed_macd_prev + smoothing_factor * (normalized - smoothed_macd_prev));
+        smoothed_macd_prev = smoothed_macd;
+        smoothed_macd_initialized = true;
+
+        double smoothed_min = NAN;
+        double smoothed_max = NAN;
+        if (!rolling_minmax_update(
+                stc_length,
+                &smooth_next_index,
+                smooth_min_idx,
+                smooth_min_val,
+                &smooth_min_count,
+                smooth_max_idx,
+                smooth_max_val,
+                &smooth_max_count,
+                smoothed_macd,
+                &smoothed_min,
+                &smoothed_max)) {
+            continue;
+        }
+
+        const double smoothed_span = smoothed_max - smoothed_min;
+        const double smoothed_normalized = smoothed_span > EPS
+            ? ((smoothed_macd - smoothed_min) / smoothed_span * SCALE_100)
+            : smoothed_normalized_prev;
+        smoothed_normalized_prev = smoothed_normalized;
+
+        const double stc_raw = !stc_initialized
+            ? smoothed_normalized
+            : (stc_prev + smoothing_factor * (smoothed_normalized - stc_prev));
+        stc_prev = stc_raw;
+        stc_initialized = true;
+
+        row[i] = stc_raw - CENTER;
+    }
+}

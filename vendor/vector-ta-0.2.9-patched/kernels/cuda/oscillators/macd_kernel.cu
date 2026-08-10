@@ -346,3 +346,118 @@ void macd_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+/* ===========================================================================
+ * S4 f64 LANE — macd
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/macd.rs
+ *   `macd_prepare`                      (:576) — first_valid, both warmups,
+ *                                                every Err branch
+ *   `macd_with_kernel`                  (:975) — ma_type "ema" takes the
+ *                                                classic path
+ *   `macd_compute_into_classic_ema`     (:642) — dispatches on fast <= slow
+ *   `macd_compute_into_classic_ema_fast`(:761) — the path the defaults take
+ *
+ * WHICH SERIES THIS EMITS. `compute_macd_batch` (cpu_batch.rs:5463) maps
+ * output_id "value" -> `out.macd`. The lane carries one matrix, so this is the
+ * MACD line, not the signal and not the histogram.
+ *
+ * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_macd_batch` reads
+ * `fast_period` (12), `slow_period` (26), `signal_period` (9) and `ma_type`
+ * ("ema") — cpu_batch.rs:5444-5447. It NEVER reads `period`. A caller sweeping
+ * `[7,21,50,100,200]` therefore gets five identical CPU columns, so this
+ * kernel emits five identical rows and `F64Kernel::is_period_invariant`
+ * reports it. This is the same situation as `tsi`, declared the same way,
+ * rather than inventing a mapping from the swept int onto one of the three
+ * periods — which would compute something the CPU never computes.
+ *
+ * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ *
+ *  1. THREE COUPLED EMA RECURRENCES OVER THE WHOLE SERIES. macd is the
+ *     difference of two exponential averages, and the difference of two nearly
+ *     equal f32 numbers keeps only the digits they DISAGREE on. On a 1.1-level
+ *     FX close, fast_ema and slow_ema agree to ~5 digits, so the f32 macd line
+ *     carries ~2 significant digits. The signal EMA then smooths that noise
+ *     and the histogram differences it again.
+ *  2. `__fmaf_rn` x4 -> `fma`. The CPU uses `f64::mul_add` on the EMA step
+ *     (`x.mul_add(af, omf * fast_ema)`): ONE rounding on the fused pair and a
+ *     separate rounding on `omf * ema`. Two roundings per step, reproduced
+ *     exactly — not `af*x + omf*ema` (three) and not `fma(af, x, fma(omf, ema, 0))`.
+ *  3. `__int_as_float` NaN patterns -> `__longlong_as_double(0x7ff8...)`.
+ *
+ * THE SEEDS ARE SIMPLE MEANS, NOT EMAs, AND THEIR WINDOWS DIFFER. `fast_ema`
+ * seeds as the mean of `data[first .. first+fast]` and is then stepped forward
+ * to `macd_warmup`; `slow_ema` seeds as the mean of `data[first .. first+slow]`
+ * and is NOT stepped. Getting that asymmetry wrong shifts the whole line.
+ *
+ * ONE THREAD PER COLUMN, ascending. Three carried scalars.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+#define NEO_MACD_FAST   12
+#define NEO_MACD_SLOW   26
+#define NEO_MACD_SIGNAL 9
+
+extern "C" __global__
+void macd_neo_batch_f64(const double* __restrict__ data,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    // `periods[combo]` is deliberately unread — see PERIOD-INVARIANT above.
+    (void)periods;
+
+    const int fast   = NEO_MACD_FAST;
+    const int slow   = NEO_MACD_SLOW;
+    const int signal = NEO_MACD_SIGNAL;
+
+    if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        fast > len || slow > len || signal > len ||
+        (len - first_valid) < slow) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    const int macd_warmup = first_valid + slow - 1;
+    for (int i = 0; i < len && i < macd_warmup; ++i) o[i] = NEO_F64_NAN;
+    if (macd_warmup >= len) return;
+
+    const double af    = 2.0 / ((double)fast + 1.0);
+    const double aslow = 2.0 / ((double)slow + 1.0);
+    const double omf   = 1.0 - af;
+    const double oms   = 1.0 - aslow;
+
+    double fsum = 0.0;
+    for (int k = 0; k < fast; ++k) fsum += data[first_valid + k];
+    double ssum = 0.0;
+    for (int k = 0; k < slow; ++k) ssum += data[first_valid + k];
+
+    double fast_ema = fsum / (double)fast;
+    double slow_ema = ssum / (double)slow;
+
+    // macd.rs:804-809 — the FAST ema alone is stepped up to macd_warmup.
+    for (int t = first_valid + fast; t <= macd_warmup; ++t) {
+        fast_ema = fma(data[t], af, omf * fast_ema);
+    }
+
+    double m = fast_ema - slow_ema;
+    o[macd_warmup] = m;
+
+    for (int i = macd_warmup + 1; i < len; ++i) {
+        const double x = data[i];
+        fast_ema = fma(x, af,    omf * fast_ema);
+        slow_ema = fma(x, aslow, oms * slow_ema);
+        m = fast_ema - slow_ema;
+        o[i] = m;
+    }
+}

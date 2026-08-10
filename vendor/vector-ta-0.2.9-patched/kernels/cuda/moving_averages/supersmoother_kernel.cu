@@ -295,3 +295,91 @@ extern "C" __global__ void supersmoother_many_series_one_param_f32(
         y_im1 = yi;
     }
 }
+
+// ============================================================================
+// f64 LANE — NeoEthos conversion, 2026-08-09
+// ----------------------------------------------------------------------------
+// CPU reference: src/indicators/moving_averages/supersmoother.rs:906
+//                    supersmoother_row_scalar
+//                supersmoother.rs:219 first non-NaN, :239 warm = first+period-1
+//
+// THE MATRIX-POWER WARP SCAN ABOVE IS DELETED FROM OUR LANE, NOT TRANSLATED.
+// `supersmoother_batch_warp_scan_f32` reformulates the 2-pole IIR as a 2x2
+// matrix power (`c00,c01,c10,c11` at line 198) and scans it across a warp.
+// Every step of that reformulation reassociates the recurrence. This kernel is
+// the CPU's literal recurrence, one thread per column, bars ascending.
+//
+// `__cosf` AND `__expf` ARE GONE. The f32 kernel calls BOTH fast-math
+// intrinsics to build its filter coefficients — so its `a`, `b` and `c` are
+// approximations before a single bar is touched, and every bar of the column
+// inherits that error through the recurrence. Here they are `cos` and `exp`,
+// and build.rs compiles this file without `--use_fast_math`.
+//
+// `1.414` IS NOT `sqrt(2.0)`. supersmoother.rs:914 writes `1.414_f64 * PI /
+// period`. Substituting sqrt(2) = 1.4142135... would be "more correct" and
+// therefore WRONG: the filter's coefficients would differ in the third decimal
+// place, which is a visibly different series, not a rounding.
+//
+// SEED: the first TWO output bars are copies of the input (`y[warm] = x[warm]`,
+// `y[warm+1] = x[warm+1]`), and the recurrence starts at warm+2. The CPU
+// returns early when the series ends before either of them.
+//
+// ROUNDINGS per bar: `s = mul_add(b, y_im1, -a_sq * y_im2)` is a multiply then
+// one fma (two); `y = mul_add(c, x_i + x_prev, s)` is an add then one fma
+// (two). Four in total, and `-fmad=false` keeps nvcc from making it three.
+//
+// SWEPT PARAMETER: `period`.
+// ============================================================================
+
+#include "../neo_f64_common.cuh"
+
+extern "C" __global__ void neoethos_supersmoother_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    if (first_valid < 0 || first_valid >= n || period <= 0 || period > n ||
+        (n - first_valid) < period) {
+        neo_fill_all(row, n);
+        return;
+    }
+
+    const int warm = first_valid + period - 1;
+    neo_fill_warmup(row, n, warm);
+    if (n <= warm) return;
+
+    const double PI_D = 3.14159265358979323846;
+    const double f = 1.414 * PI_D / (double)period;
+    const double a = exp(-f);
+    const double a_sq = a * a;
+    const double b = 2.0 * a * cos(f);
+    const double c = 0.5 * (1.0 + a_sq - b);
+
+    row[warm] = data[warm];
+    if (n == warm + 1) return;
+    row[warm + 1] = data[warm + 1];
+    if (n == warm + 2) return;
+
+    double y_im2 = row[warm];
+    double y_im1 = row[warm + 1];
+    double x_prev = data[warm + 1];
+
+    for (int i = warm + 2; i < n; ++i) {
+        const double x_i = data[i];
+        const double s0 = fma(b, y_im1, -a_sq * y_im2);
+        const double y0 = fma(c, x_i + x_prev, s0);
+        row[i] = y0;
+        y_im2 = y_im1;
+        y_im1 = y0;
+        x_prev = x_i;
+    }
+}

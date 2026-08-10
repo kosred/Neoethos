@@ -158,6 +158,21 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     // (consistency = sharpe/3.46 clamped), which a few big months inflate — they do
     // NOT predict the window pass-rate, which is exactly why v2 over-rewarded lumpy
     // genes. The DD penalty stays UNSCALED so blow-ups are still rejected.
+    // ⚠ WHERE `monthly_hit` COMES FROM, and the knob that silently truncates it
+    // (2026-08-10). Slot 7 is produced from `monthly_pnls` / `month_start_equities`
+    // in `eval.rs`, both of which are sized by
+    // `models.backtest_runtime.month_capacity`. Months beyond that capacity are
+    // DROPPED — silently, in two places — so this term, the dominant one in the
+    // whole objective at 0.45, is computed over the FIRST `month_capacity`
+    // months of the dataset and not over the dataset. The knob catalog
+    // advertises `min: Some(12)` while describing it as a RAM cap: setting the
+    // UI-endorsed minimum scores every gene on its first twelve months of a
+    // ten-year record and returns a perfectly plausible number.
+    //
+    // The 0.45 is NOT the defect and is deliberately not touched here — the
+    // coverage is. A validator refusing a `month_capacity` below the months the
+    // loaded frame spans, plus a logged coverage figure, is the fix; it lands
+    // with the evaluator that does the dropping, not with this weight.
     let hit = monthly_hit.clamp(0.0, 1.0) * 0.45;
     let ret = (net / 20_000.0).clamp(-2.0, 2.0) * 0.15;
     let sh = sharpe_component(sharpe, conf) * 0.10;

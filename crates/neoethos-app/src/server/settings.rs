@@ -44,6 +44,27 @@ pub struct SettingsDto {
     /// Top-level trading mode (`"risky"` | `"prop_firm"`) — see
     /// `SystemConfig::trading_mode`. Drives discovery + risk orientation.
     pub trading_mode: String,
+    /// Raw `models.discovery_mode` — the power-user escape hatch, NOT the
+    /// master switch. Only `"strict"` / `"legacy"` do anything here; every
+    /// other value defers to `trading_mode`.
+    ///
+    /// Surfaced 2026-08-09 (#267) so the UI cannot render a mode the engine
+    /// does not run. Before this, `GET /settings` returned `trading_mode`
+    /// alone and the escape hatch was invisible to every client.
+    pub discovery_mode: String,
+    /// The mode the SEARCH ENGINE will actually run, resolved with the same
+    /// precedence the engine uses (`neoethos_core::resolved_config`, pinned to
+    /// `neoethos_search::discovery::resolve_discovery_mode` by the cross-crate
+    /// test `display_mode_matches_the_engine_mode`). One of `"risky"` |
+    /// `"prop_firm"` | `"strict"`.
+    ///
+    /// **This is the field a UI should display as "current mode".**
+    /// `trading_mode` is what the operator asked for; this is what he gets.
+    pub effective_discovery_mode: String,
+    /// True when `effective_discovery_mode != trading_mode` — i.e. the escape
+    /// hatch is overriding the master switch. A client that shows
+    /// `trading_mode` without honouring this flag is lying to the operator.
+    pub trading_mode_divergent: bool,
     /// Compute device preference (`"auto"` | `"cpu"` | `"gpu"`) — see
     /// `SystemConfig::enable_gpu_preference`. `auto` picks the best device and,
     /// with the never-OOM auto-tuner, fits any card; `cpu` forces the CPU lane.
@@ -212,6 +233,13 @@ pub struct RawYamlUpdate {
 ///   2. Re-parses as `Settings` to enforce the typed schema (catches
 ///      missing required fields, type mismatches). Reject 400 on
 ///      schema failure with the typed-deserialize error.
+///   2b. **Checks the risk VALUES (#293, 2026-08-09).** Steps 1 and 2
+///      validate shape only, so before this the endpoint accepted and
+///      persisted `risk_per_trade: 50`, a disabled daily breaker, or a
+///      total breaker below the daily one — `Settings::from_yaml`'s
+///      `validate_safety_bounds` never ran on this path. Reject 400
+///      listing every violation. This refuses saves that used to
+///      succeed; that is the point.
 ///   3. Writes a timestamped backup of the current file alongside it
 ///      (`config.yaml.bak.<unix-ms>`). Pull-to-restore is then a
 ///      manual `Copy-Item` away — cheap insurance against a Save
@@ -253,19 +281,111 @@ pub async fn update_settings_raw_yaml(
     // (2) Typed schema check. This catches fat-finger field renames
     // before they reach the GA engine. Use the same deserializer that
     // `Settings::from_yaml` uses internally.
-    if let Err(err) = serde_yaml_ng::from_str::<neoethos_core::Settings>(&payload.yaml) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("Schema error — your YAML parses but \
-                                  doesn't match the Settings struct: {err}"),
-                "code": "yaml_schema_failed",
-                "hint": "Common causes: typo in a field name, wrong type \
-                         (e.g. string where the schema expects a number), \
-                         missing required section.",
-            })),
-        )
-            .into_response();
+    let candidate: neoethos_core::Settings =
+        match serde_yaml_ng::from_str::<neoethos_core::Settings>(&payload.yaml) {
+            Ok(s) => s,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Schema error — your YAML parses but \
+                                          doesn't match the Settings struct: {err}"),
+                        "code": "yaml_schema_failed",
+                        "hint": "Common causes: typo in a field name, wrong type \
+                                 (e.g. string where the schema expects a number), \
+                                 missing required section.",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    // (2b) **VALUE check — #293, added 2026-08-09.** Steps 1 and 2 validate
+    // SHAPE only. `Settings::from_yaml` additionally runs
+    // `validate_safety_bounds` (`config.rs:2615`); this endpoint went straight
+    // from `serde_yaml_ng::from_str` to the disk write, so a hand-edited
+    // `risk_per_trade: 50` (meaning 50%, typed as 5000%) was accepted, written,
+    // and became the sizing input on the next run.
+    //
+    // `validate_safety_bounds` is private to `neoethos-core` AND only logs — it
+    // cannot reject, by design, because config consumers require a non-fatal
+    // load. A save endpoint is the one place where refusing IS possible, so the
+    // same conditions it screams about are enforced here as a hard 400. The
+    // thresholds are copied deliberately and named in the message; if
+    // `config.rs` moves one, this list must move with it.
+    //
+    // **This REFUSES saves that were previously accepted.** The five conditions
+    // are listed in the response so a refusal is never mysterious. The config on
+    // disk today (daily 0.10, total 0.20, risk_per_trade 0.03) passes all five —
+    // this does not lock the operator out of his own editor.
+    {
+        let r = &candidate.risk;
+        let mut violations: Vec<String> = Vec::new();
+        if !r.risk_per_trade.is_finite() || r.risk_per_trade < 0.0 || r.risk_per_trade > 1.0 {
+            violations.push(format!(
+                "risk.risk_per_trade = {} — must be a FRACTION in [0, 1]. 0.005 means 0.5%, \
+                 not 0.5. A value above 1.0 sizes every position ~100x too big.",
+                r.risk_per_trade
+            ));
+        }
+        if !r.daily_drawdown_limit.is_finite()
+            || r.daily_drawdown_limit <= 0.0
+            || r.daily_drawdown_limit > 0.20
+        {
+            violations.push(format!(
+                "risk.daily_drawdown_limit = {} — must be in (0, 0.20]. This is the daily \
+                 loss at which the bot stops trading; 0 or negative disables the brake \
+                 entirely and >0.20 exceeds every published prop-firm rule.",
+                r.daily_drawdown_limit
+            ));
+        }
+        if !r.total_drawdown_limit.is_finite() || r.total_drawdown_limit <= 0.0 {
+            violations.push(format!(
+                "risk.total_drawdown_limit = {} — must be greater than 0. This is the \
+                 account-level breaker.",
+                r.total_drawdown_limit
+            ));
+        }
+        if r.total_drawdown_limit.is_finite()
+            && r.daily_drawdown_limit.is_finite()
+            && r.total_drawdown_limit <= r.daily_drawdown_limit
+        {
+            violations.push(format!(
+                "risk.total_drawdown_limit ({}) must exceed risk.daily_drawdown_limit ({}) — \
+                 otherwise the account breaker fires on the first bad day and the daily \
+                 breaker can never fire at all.",
+                r.total_drawdown_limit, r.daily_drawdown_limit
+            ));
+        }
+        if r.total_drawdown_limit.is_finite() && r.total_drawdown_limit > 0.30 {
+            violations.push(format!(
+                "risk.total_drawdown_limit = {} — above 0.30 exceeds every published \
+                 prop-firm rule; the breaker would arm after the account is already failed.",
+                r.total_drawdown_limit
+            ));
+        }
+        if !violations.is_empty() {
+            tracing::error!(
+                target: "neoethos_app::server::settings",
+                violations = ?violations,
+                "REFUSED POST /settings/raw — risk values outside safe bounds. Nothing was \
+                 written and no backup was taken."
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Refused: {} risk value(s) are outside safe bounds. Nothing was saved.",
+                        violations.len()
+                    ),
+                    "code": "risk_values_out_of_bounds",
+                    "violations": violations,
+                    "hint": "Every risk figure is a FRACTION of the account, not a percent: \
+                             0.03 = 3%. Fix the listed values and save again.",
+                })),
+            )
+                .into_response();
+        }
     }
 
     // (3) Backup the existing file. We accept a missing source (e.g.
@@ -409,7 +529,71 @@ pub async fn update_settings(
             )
                 .into_response();
         }
-        settings.system.trading_mode = mode;
+        settings.system.trading_mode = mode.clone();
+
+        // ── #267 (§2.4 of docs/audit-status-2026-08-09.md) — RE-VERIFIED AND
+        // REFUTED 2026-08-09. DO NOT "fix" this by adding
+        // `settings.models.discovery_mode = mode`. ──────────────────────────
+        // The audit says this handler writes `system.trading_mode` while
+        // "discovery reads `models.discovery_mode`", so a Risky click yields a
+        // PropFirm run. Read the engine before believing it:
+        //   * `neoethos_search::discovery::resolve_discovery_mode`
+        //     (`discovery.rs:5772`) takes BOTH strings, and it is
+        //     `system.trading_mode` — the field written above — that selects
+        //     Risky vs PropFirm.
+        //   * `models.discovery_mode` is consulted for ONE purpose: the
+        //     `"strict"` / `"legacy"` power-user escape hatch
+        //     (`discovery_mode_from_config`, `discovery.rs:5755`). Every other
+        //     value, including `"risky"`, falls through to PropFirm there —
+        //     which is why assigning `"risky"` to it is at best a no-op.
+        //   * The call site is `discovery.rs:843-846`
+        //     (`DiscoveryConfig::from_settings`), and the cross-crate test
+        //     `display_mode_matches_the_engine_mode`
+        //     (`discovery_tests.rs:2523`) pins that precedence against the
+        //     report's copy of it.
+        // Writing the escape hatch from this handler would SILENTLY DESTROY a
+        // `strict`/`legacy` setting on every mode click — a real regression
+        // traded for an imaginary one.
+        //
+        // What IS real, and is what this block now closes: when the escape
+        // hatch is armed, the engine runs Strict no matter which mode the
+        // operator picks here, and the banner would still read what he clicked.
+        // So we resolve the mode through the SAME resolver the report uses
+        // (`neoethos_core::resolved_config`, kept in step with the engine by the
+        // test above — no precedence logic is re-implemented here) and REFUSE
+        // the save when the selection would not take effect. Nothing is written
+        // in that case: the operator clears the hatch first, deliberately.
+        let effective = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings)
+            .search
+            .mode;
+        if effective != mode {
+            tracing::error!(
+                target: "neoethos_app::server::settings",
+                requested = %mode,
+                effective = %effective,
+                discovery_mode = %settings.models.discovery_mode,
+                "REFUSED trading_mode change — `models.discovery_mode` escape hatch \
+                 overrides it, so the UI would show a mode the engine does not run"
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Cannot select `{mode}`: `models.discovery_mode` is set to `{}`, \
+                         which forces the search into `{effective}` regardless of the \
+                         trading mode. Nothing was saved. Clear `models.discovery_mode` \
+                         (set it to `prop_firm`) in Settings → Advanced → raw YAML first, \
+                         then pick the mode again.",
+                        settings.models.discovery_mode
+                    ),
+                    "code": "trading_mode_overridden_by_discovery_mode",
+                    "requested": mode.clone(),
+                    "effective": effective.clone(),
+                    "discoveryMode": settings.models.discovery_mode.clone(),
+                })),
+            )
+                .into_response();
+        }
     }
     if let Some(rpt) = payload.risk_per_trade {
         let cap = if settings.risk.max_risk_per_trade > 0.0 {
@@ -579,9 +763,49 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
     // Keep the JSON keys flat so the Flutter side doesn't have to
     // mirror the Rust nesting.
     let mode = settings.news.news_trading_mode;
+    // #267 — resolve the mode the ENGINE runs through the same resolver the run
+    // report uses, rather than echoing the master switch and hoping. See the
+    // long note in `update_settings`: `models.discovery_mode` is an escape
+    // hatch that can override `system.trading_mode`, and until today no client
+    // could see that it was armed.
+    let effective_discovery_mode =
+        neoethos_core::resolved_config::ResolvedConfig::from_settings(settings)
+            .search
+            .mode;
+    // `"growth"` is an accepted alias of `"risky"` on the engine side
+    // (`discovery.rs:5779`), so normalise before comparing — otherwise a
+    // perfectly consistent `trading_mode: growth` would be reported as a
+    // divergence and the flag would train the reader to ignore it.
+    let requested_mode = match settings
+        .system
+        .trading_mode
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "growth" => "risky".to_string(),
+        other => other.to_string(),
+    };
+    let trading_mode_divergent = effective_discovery_mode != requested_mode;
+    if trading_mode_divergent {
+        tracing::error!(
+            target: "neoethos_app::server::settings",
+            trading_mode = %settings.system.trading_mode,
+            discovery_mode = %settings.models.discovery_mode,
+            effective = %effective_discovery_mode,
+            "config.yaml selects one trading mode and the search will run another — \
+             `models.discovery_mode` is overriding `system.trading_mode`. The UI is \
+             being told both values plus `tradingModeDivergent: true`; every candidate \
+             ranked under the effective mode was ranked under rules the operator did \
+             not pick from the mode switch."
+        );
+    }
     SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         trading_mode: settings.system.trading_mode.clone(),
+        discovery_mode: settings.models.discovery_mode.clone(),
+        effective_discovery_mode,
+        trading_mode_divergent,
         compute_mode: settings.system.enable_gpu_preference.clone(),
         risky_start_balance: settings.system.risky_start_balance_usd,
         risky_target_balance: settings.system.risky_target_balance_usd,

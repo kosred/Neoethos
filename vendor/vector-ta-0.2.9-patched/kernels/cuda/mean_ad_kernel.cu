@@ -272,3 +272,126 @@ void mean_ad_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+// ===========================================================================
+// S3 f64 LANE — mean_ad
+// ===========================================================================
+// Reference: src/indicators/mean_ad.rs
+//   `mean_ad_with_kernel` (:186) — first_valid + the three Err branches
+//   `mean_ad_scalar` (:240)      — warmup_end = first + (period<<1) - 2
+//   `mean_ad_row_scalar` (:683)  — the arithmetic
+// Batch default period 5 (`cpu_batch.rs`, `get_usize_param("mean_ad", …, 5)`),
+// source close.
+//
+// THE RING BUFFER, AND WHY THERE IS NONE HERE
+//
+// The CPU keeps `residual_buffer: Vec<f64>` of length `period` so it can
+// subtract the residual that falls out of the window:
+//   residual_sum += residual - old      (mean_ad.rs:727)
+// A per-thread array of length `period` is not available on the device —
+// `period` is a runtime value, so it would have to be a global scratch
+// allocation the whole lane does not have.
+//
+// It is not needed. `old` is `|data[t-period] - sma_{t-period}|`, and
+// `sma_j` is produced by ONE deterministic accumulator recurrence seeded at
+// `first`:  sum += data[j+1] - data[j+1-period];  sma = sum * inv_p.
+// A SECOND accumulator seeded identically and advanced one step per bar of the
+// main loop is, at every step, bit-for-bit the state the first accumulator had
+// `period` bars earlier — same seed, same operations, same order. So the lagged
+// sma is recomputed rather than remembered, and `old` is exact, not
+// approximately equal. That is the whole trick: two scalars instead of an
+// array, with no change to the arithmetic.
+//
+// ROUNDING COUNT. `residual_sum += residual - old` is TWO roundings
+// (the subtract, then the add) and is written that way below — not as
+// `residual_sum = residual_sum + residual - old`, which associates
+// differently. `sum += data[a] - data[b]` likewise.
+// ===========================================================================
+
+__device__ __forceinline__ double neo_s3_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void neoethos_mean_ad_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    const int period = periods[r];
+
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period == 0) || (period > n) ||
+        ((n - first_valid) < period);
+    if (declined) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    // `mean_ad_scalar` :260 — first + period > n emits an all-NaN series.
+    // Unreachable given the check above, kept because the CPU has it.
+    if (first_valid + period > n) {
+        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        return;
+    }
+
+    // `alloc_with_nan_prefix(n, warmup_end.min(n))`, warmup_end :265.
+    const int warmup_end = first_valid + (period << 1) - 2;
+    const int prefix = warmup_end < n ? warmup_end : n;
+    for (int i = 0; i < prefix; ++i) row[i] = neo_s3_qnan();
+    // Bars at and after `warmup_end` that the row loop never reaches stay NaN
+    // only if the loop writes them; it writes every one from `first_output` on.
+
+    const double inv_p = 1.0 / (double)period;
+
+    // Seed: sum over [first, first+period). CPU accumulates ascending.
+    double seed = 0.0;
+    for (int i = first_valid; i < first_valid + period; ++i) seed += data[i];
+
+    double sumA = seed;
+    double smaA = sumA * inv_p;   // sma valid at bar `start_t`
+    double sumB = seed;
+    double smaB = sumB * inv_p;   // the same state, replayed `period` bars late
+
+    const int start_t = first_valid + period - 1;
+    int fill_end = start_t + period - 1;
+    if (fill_end > n - 1) fill_end = n - 1;
+
+    double residual_sum = 0.0;
+    for (int t = start_t; t <= fill_end; ++t) {
+        const double residual = fabs(data[t] - smaA);
+        residual_sum += residual;
+        if (t + 1 < n) {
+            sumA += data[t + 1] - data[t + 1 - period];
+            smaA = sumA * inv_p;
+        }
+    }
+
+    const int first_output = first_valid + (period << 1) - 2;
+    if (first_output < n) row[first_output] = residual_sum * inv_p;
+
+    for (int t = start_t + period; t < n; ++t) {
+        const double residual = fabs(data[t] - smaA);
+        const int j = t - period;                       // the bar leaving the window
+        const double old = fabs(data[j] - smaB);
+        residual_sum += residual - old;
+        row[t] = residual_sum * inv_p;
+
+        if (t + 1 < n) {
+            sumA += data[t + 1] - data[t + 1 - period];
+            smaA = sumA * inv_p;
+        }
+        // Replay the identical update one lag behind. j+1-period >= first_valid
+        // holds for every t in this loop, so the read is in range.
+        sumB += data[j + 1] - data[j + 1 - period];
+        smaB = sumB * inv_p;
+    }
+}

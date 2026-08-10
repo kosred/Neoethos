@@ -324,3 +324,154 @@ void dx_many_series_one_param_time_major_f32_fast(
         ph = ch; pl = cl; pc = cc;
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE — dx
+ * ---------------------------------------------------------------------------
+ * CPU oracle: src/indicators/dx.rs:286 `dx_scalar`, with `dx_initial_value`
+ * (dx.rs:507) and `dx_rolling_value` (dx.rs:528).
+ *
+ * TWO SEED FORMULAS, SELECTED BY SERIES LENGTH. dx.rs:298 routes series of
+ * 1,000,000 bars or more to `dx_scalar_original` (dx.rs:398), whose seed
+ * computes +DI and -DI through tr_sum FIRST and then combines them, where
+ * `dx_scalar` cancels tr_sum analytically. The two agree in exact arithmetic
+ * and DIFFER in floating point. Ten years of M1 is ~3.7M bars per symbol, so
+ * this branch is the LIVE one for our data, not a corner case — it is
+ * reproduced rather than normalised away.
+ *
+ * NaN: `tr1.max(tr2).max(tr3)` is f64::max (returns the non-NaN operand) ->
+ * fmax. The explicit is_nan() bar-skip is kept exactly: the CPU carries the
+ * PREVIOUS output forward and still advances prev_high/low/close to the NaN
+ * values, so the next real bar's up_move/down_move are NaN too.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+__device__ __forceinline__
+double dx_neo_initial_value_f64(double plus_dm_sum, double minus_dm_sum, double tr_sum)
+{
+    const double hundred = 100.0;
+    if (tr_sum != 0.0 && isfinite(tr_sum)) {
+        const double dm_sum = plus_dm_sum + minus_dm_sum;
+        if (dm_sum != 0.0) return hundred * (fabs(plus_dm_sum - minus_dm_sum) / dm_sum);
+        return 0.0;
+    }
+    const double plus_di  = (plus_dm_sum / tr_sum) * hundred;
+    const double minus_di = (minus_dm_sum / tr_sum) * hundred;
+    const double sum_di   = plus_di + minus_di;
+    return (sum_di != 0.0) ? hundred * (fabs(plus_di - minus_di) / sum_di) : 0.0;
+}
+
+__device__ __forceinline__
+double dx_neo_rolling_value_f64(double plus_dm_sum, double minus_dm_sum,
+                                double tr_sum, double fallback)
+{
+    const double hundred = 100.0;
+    if (tr_sum != 0.0) {
+        if (isfinite(tr_sum)) {
+            const double dm_sum = plus_dm_sum + minus_dm_sum;
+            if (dm_sum != 0.0) return hundred * (fabs(plus_dm_sum - minus_dm_sum) / dm_sum);
+            return fallback;
+        }
+        const double plus_di  = (plus_dm_sum / tr_sum) * hundred;
+        const double minus_di = (minus_dm_sum / tr_sum) * hundred;
+        const double sum_di   = plus_di + minus_di;
+        if (sum_di != 0.0) return hundred * (fabs(plus_di - minus_di) / sum_di);
+    }
+    return fallback;
+}
+
+extern "C" __global__
+void dx_neo_batch_f64(const double* __restrict__ high,
+                      const double* __restrict__ low,
+                      const double* __restrict__ close,
+                      int series_len,
+                      const int* __restrict__ periods,
+                      int n_combos,
+                      int first_valid,
+                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ o = out + (size_t)combo * (size_t)len;
+    const int period = periods[combo];
+
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+
+    // dx_with_kernel: warm = first + period - 1 (dx.rs:258)
+    const int warm = first_valid + period - 1;
+    for (int i = 0; i < warm && i < len; ++i) o[i] = NEO_F64_NAN;
+    for (int i = warm; i < len; ++i) o[i] = NEO_F64_NAN;   // every bar is written below or stays NaN
+
+    const bool long_series = (len >= 1000000);              // dx.rs:298
+    const double p_f64 = (double)period;
+    const double hundred = 100.0;
+
+    double prev_high  = high[first_valid];
+    double prev_low   = low[first_valid];
+    double prev_close = close[first_valid];
+
+    double plus_dm_sum = 0.0, minus_dm_sum = 0.0, tr_sum = 0.0;
+    int initial_count = 0;
+
+    for (int i = first_valid + 1; i < len; ++i) {
+        const double h  = high[i];
+        const double l  = low[i];
+        const double cl = close[i];
+
+        if (isnan(h) || isnan(l) || isnan(cl)) {
+            o[i] = (i > 0) ? o[i - 1] : NEO_F64_NAN;
+            prev_high = h; prev_low = l; prev_close = cl;
+            continue;
+        }
+
+        const double up_move   = h - prev_high;
+        const double down_move = prev_low - l;
+        double plus_dm = 0.0, minus_dm = 0.0;
+        if (up_move > 0.0 && up_move > down_move)        plus_dm  = up_move;
+        else if (down_move > 0.0 && down_move > up_move) minus_dm = down_move;
+
+        const double tr = fmax(fmax(h - l, fabs(h - prev_close)), fabs(l - prev_close));
+
+        if (initial_count < (period - 1)) {
+            plus_dm_sum  += plus_dm;
+            minus_dm_sum += minus_dm;
+            tr_sum       += tr;
+            initial_count += 1;
+            if (initial_count == (period - 1)) {
+                if (long_series) {
+                    const double plus_di  = (plus_dm_sum / tr_sum) * hundred;
+                    const double minus_di = (minus_dm_sum / tr_sum) * hundred;
+                    const double sum_di   = plus_di + minus_di;
+                    o[i] = (sum_di != 0.0) ? hundred * (fabs(plus_di - minus_di) / sum_di) : 0.0;
+                } else {
+                    o[i] = dx_neo_initial_value_f64(plus_dm_sum, minus_dm_sum, tr_sum);
+                }
+            }
+        } else {
+            plus_dm_sum  = plus_dm_sum  - (plus_dm_sum  / p_f64) + plus_dm;
+            minus_dm_sum = minus_dm_sum - (minus_dm_sum / p_f64) + minus_dm;
+            tr_sum       = tr_sum       - (tr_sum       / p_f64) + tr;
+            if (long_series) {
+                const double plus_di  = (plus_dm_sum / tr_sum) * hundred;
+                const double minus_di = (minus_dm_sum / tr_sum) * hundred;
+                const double sum_di   = plus_di + minus_di;
+                o[i] = (sum_di != 0.0) ? hundred * (fabs(plus_di - minus_di) / sum_di)
+                                       : ((i > 0) ? o[i - 1] : NEO_F64_NAN);
+            } else {
+                o[i] = dx_neo_rolling_value_f64(plus_dm_sum, minus_dm_sum, tr_sum,
+                                                (i > 0) ? o[i - 1] : NEO_F64_NAN);
+            }
+        }
+
+        prev_high = h; prev_low = l; prev_close = cl;
+    }
+}

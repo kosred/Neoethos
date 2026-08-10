@@ -964,7 +964,34 @@ pub fn compute_hpc_features(ohlcv: &Ohlcv) -> Result<FeatureFrame> {
     compute_hpc_feature_frame(ohlcv, FeatureProfile::Standard)
 }
 
-pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Result<FeatureFrame> {
+pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, profile: FeatureProfile) -> Result<FeatureFrame> {
+    compute_hpc_feature_frame_sized(ohlcv, profile, ohlcv.len())
+}
+
+/// Same as [`compute_hpc_feature_frame`], but with the indicator vocabulary
+/// budget sized against `budget_rows` instead of against THIS frame.
+///
+/// # Why a multi-timeframe build MUST use this
+///
+/// `hpc_ta` turns free RAM into a maximum column count and then admits the
+/// prefix of `ALL_INDICATORS` that fits. Size that from each frame's own row
+/// count and the admitted ID SET becomes a function of the frame — and every
+/// timeframe has a different row count. Measured on the operator's box
+/// (20.6 GB free): base M5 at 1,054,320 bars admits 269 ids, H1 at 70,288
+/// admits all 342, H4 at 17,572 admits all 342. The per-timeframe blocks then
+/// differ in width by ~140 columns, `try_assemble_cube_in_ram`'s width
+/// invariant refuses (correctly) to assemble, and every run on a box under
+/// roughly 40 GB free silently falls through to the slower streaming disk path.
+///
+/// So the cube builder sizes ONE budget from the run's WIDEST frame — the base
+/// timeframe — and passes that row count to every timeframe. Conservative by
+/// construction: the higher timeframes are charged the base frame's per-column
+/// price, so the plan can only over-reserve, never under-reserve.
+pub fn compute_hpc_feature_frame_sized(
+    ohlcv: &Ohlcv,
+    _profile: FeatureProfile,
+    budget_rows: usize,
+) -> Result<FeatureFrame> {
     let mut names = Vec::new();
     let mut columns: Vec<Vec<f64>> = Vec::new();
 
@@ -984,7 +1011,13 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
         || compute_smc_feature_columns(ohlcv),
         || {
             rayon::join(
-                || compute_classic_ta_columns(ohlcv),
+                || {
+                    crate::core::hpc_ta::compute_classic_ta_columns_sized(
+                        ohlcv,
+                        crate::core::hpc_ta::resolved_indicator_compute_policy(),
+                        budget_rows,
+                    )
+                },
                 || {
                     rayon::join(
                         || compute_quant_feature_columns(ohlcv),
@@ -1010,6 +1043,14 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
         },
     );
 
+    // `compute_classic_ta_columns` now returns a Result: it hard-errors when
+    // the indicator vocabulary collapses below its measured floor (the
+    // 341-silent-drop regression). Propagated here rather than logged, because
+    // a feature frame built on 66 of 800 columns is not a degraded frame — it
+    // is a different search, and every artifact from it would be labelled as
+    // though it were the same.
+    let classic = classic?;
+
     for (name, col) in smc
         .into_iter()
         .chain(classic)
@@ -1024,6 +1065,24 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
 
     let n_rows = ohlcv.len();
     let n_cols = columns.len();
+
+    // NO ZERO-PADDING, EVER. The copy below writes into a pre-zeroed Array2
+    // with no length check: a column shorter than `n_rows` would keep the
+    // allocation's zeros in its tail, and a zero is a REAL VALUE the GA can
+    // threshold against. Today every family emits exactly `n` — but that
+    // invariant is enforced nowhere, and restoring hundreds of indicator
+    // columns is precisely the change that makes it reachable. A short column
+    // is a build defect with no correct silent handling, so it is a hard error
+    // that names the column.
+    for (name, col) in names.iter().zip(columns.iter()) {
+        anyhow::ensure!(
+            col.len() == n_rows,
+            "feature column '{name}' has {} values but the frame has {n_rows} bars — refusing to \
+             zero-pad a feature (a padded zero is indistinguishable from a real reading)",
+            col.len()
+        );
+    }
+
     let mut data = Array2::zeros((n_rows, n_cols));
     // Note — explicit f64 → f32 narrowing at the feature-cube
     // boundary. The downstream consumers (neoethos-models tree models, the
@@ -1186,7 +1245,11 @@ fn compute_aligned_higher_block(
     let Some(h_ohlcv) = ds.frames.get(h_tf) else {
         return Ok(None);
     };
-    let h_feats = compute_hpc_feature_frame(h_ohlcv, profile)?;
+    // The budget is sized from the BASE grid, not from this higher timeframe —
+    // otherwise the admitted indicator set (and therefore this block's width)
+    // would differ from the base block's and the cube could not be assembled.
+    // See `compute_hpc_feature_frame_sized`.
+    let h_feats = compute_hpc_feature_frame_sized(h_ohlcv, profile, base_ns.len())?;
     let h_ns = h_ohlcv
         .timestamp
         .as_ref()
@@ -1315,7 +1378,12 @@ where
 /// Decide whether the multi-TF feature cube is assembled in RAM (fast, no disk
 /// write/cleanup) or streamed to a disk-mmap store (the NEVER-OOM fallback).
 ///
-/// `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` forces the choice.
+/// 2026-08-10: `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` used to force
+/// the choice, and the `ram` arm returned BEFORE the free-RAM check two lines
+/// below — a failure wearing the costume of a choice, and the never-OOM
+/// invariant inverted. It is gone. The decision is derived from the probe, and
+/// the derivation is now logged so "why did this run go to disk?" has an
+/// answer in the log instead of in someone's shell history.
 ///
 /// The `auto` requirement is derived from the assembly's ACTUAL peak, which is
 /// why it changed on 2026-07-20. The old assembly built every per-TF block and
@@ -1331,22 +1399,89 @@ where
 /// 1.5× plus the same 2 GB floor for the OS and the GA's working buffers. A
 /// failed free-RAM probe (0) still takes the safe disk path, and any surprise
 /// during assembly falls back to disk rather than growing memory.
+/// Test-only seam replacing the deleted `NEOETHOS_FEATURE_CUBE_MODE`.
+/// `0` = derive (production), `1` = force RAM, `2` = force disk.
+///
+/// The RAM and disk assemblies must produce BIT-IDENTICAL cubes — if they
+/// diverge, discovery results depend on how much free RAM the machine happened
+/// to have, which is the worst kind of non-determinism. Proving that needs a
+/// way to run both paths on the same input, so the seam survives the env
+/// deletion as something a test can reach and a shell cannot.
+#[cfg(test)]
+pub(crate) static TEST_CUBE_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
-    match std::env::var("NEOETHOS_FEATURE_CUBE_MODE")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
+    #[cfg(test)]
     {
-        Some("ram") => return true,
-        Some("disk") => return false,
-        _ => {}
+        match TEST_CUBE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
     }
+    report_retired_env_vars();
     let available = neoethos_core::available_memory_bytes();
     if available == 0 {
+        tracing::warn!(
+            target: "neoethos_data::feature_cube",
+            cube_gb = format!("{:.1}", cube_bytes as f64 / 1e9),
+            "available-memory probe returned 0 — taking the disk-mmap path. This is the \
+             safe answer, not a measured one."
+        );
         return false;
     }
     let needed = (cube_bytes as f64) * 1.5 + 2.0e9;
-    needed < available as f64
+    let in_ram = needed < available as f64;
+    tracing::info!(
+        target: "neoethos_data::feature_cube",
+        cube_gb = format!("{:.1}", cube_bytes as f64 / 1e9),
+        needed_gb = format!("{:.1}", needed / 1e9),
+        available_gb = format!("{:.1}", available as f64 / 1e9),
+        in_ram,
+        "feature-cube assembly path derived from the free-RAM probe"
+    );
+    in_ram
+}
+
+/// Environment variables this crate used to honour and no longer does.
+/// `(name, what decides it now)`.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "NEOETHOS_FEATURE_CUBE_MODE",
+        "the free-RAM probe in should_build_cube_in_ram (never-OOM invariant)",
+    ),
+    (
+        "NEOETHOS_REQUIRE_GPU",
+        "the indicator compute policy installed from Settings \
+         (hpc_ta::set_indicator_compute_policy, called by \
+         neoethos_search::backend::install_evaluation_backend_from_settings)",
+    ),
+];
+
+/// Report, once per process and at ERROR, every retired environment variable
+/// of this crate that is still exported. A stale export that is silently
+/// ignored is the failure mode being removed; being ignored LOUDLY is not.
+pub fn report_retired_env_vars() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for (name, replacement) in RETIRED_ENV_VARS {
+            let Ok(value) = std::env::var(name) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            tracing::error!(
+                target: "neoethos_data::retired_env",
+                env_var = %name,
+                value_found = %value,
+                decided_by = %replacement,
+                "RETIRED ENVIRONMENT VARIABLE IS SET AND WAS IGNORED — this value did NOT \
+                 reach the run."
+            );
+        }
+    });
 }
 
 /// Assemble the multi-timeframe cube directly in RAM, allocating it ONCE and
@@ -1917,15 +2052,17 @@ mod cube_assembly_tests {
             ..Default::default()
         };
 
-        // SAFETY: single-threaded test setup; the env var is read inside
-        // `should_build_cube_in_ram` on this same thread.
-        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
+        // 2026-08-10: was `NEOETHOS_FEATURE_CUBE_MODE`, now the `#[cfg(test)]`
+        // seam — the forcing this test needs, without a lever production can
+        // be handed by a shell.
+        use std::sync::atomic::Ordering;
+        super::TEST_CUBE_MODE.store(1, Ordering::Relaxed);
         let ram = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
             .expect("in-RAM cube");
-        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "disk") };
+        super::TEST_CUBE_MODE.store(2, Ordering::Relaxed);
         let disk = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
             .expect("disk cube");
-        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+        super::TEST_CUBE_MODE.store(0, Ordering::Relaxed);
 
         assert!(
             matches!(ram.data, crate::core::features::FeatureData::InMemory(_)),
@@ -1954,11 +2091,18 @@ mod cube_assembly_tests {
         }
     }
 
+    /// 2026-08-10: renamed from `..._and_honours_the_override`. There is no
+    /// override to honour any more — `NEOETHOS_FEATURE_CUBE_MODE=ram` used to
+    /// return BEFORE the free-RAM check below, so the one input that could
+    /// cause an OOM was the one input that skipped the OOM guard. The
+    /// decision is now derived, full stop, and what this test pins is that the
+    /// derivation is real rather than a constant.
     #[test]
-    fn in_ram_budget_tracks_available_memory_and_honours_the_override() {
+    fn in_ram_budget_tracks_available_memory() {
+        use std::sync::atomic::Ordering;
+        super::TEST_CUBE_MODE.store(0, Ordering::Relaxed);
         // The decision must scale with the cube AND the machine — not a fixed
         // fraction. A byte-sized cube always fits; an absurd one never does.
-        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
         assert!(should_build_cube_in_ram(1));
         assert!(!should_build_cube_in_ram(u64::MAX / 4));
 
@@ -1970,10 +2114,15 @@ mod cube_assembly_tests {
             assert!(!should_build_cube_in_ram(just_fits + 1_000_000_000));
         }
 
-        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "disk") };
-        assert!(!should_build_cube_in_ram(1), "explicit disk wins");
+        // An absurd cube can no longer be forced into RAM by any ambient
+        // value — which is the never-OOM invariant, stated as a test.
+        // SAFETY: single-threaded test; nothing reads this any more.
         unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
-        assert!(should_build_cube_in_ram(u64::MAX / 4), "explicit ram wins");
+        assert!(
+            !should_build_cube_in_ram(u64::MAX / 4),
+            "NEOETHOS_FEATURE_CUBE_MODE is retired; it must not be able to skip the \
+             free-RAM check"
+        );
         unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
     }
 }

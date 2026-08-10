@@ -375,7 +375,7 @@ fn build_catalog() -> Vec<KnobEntry> {
             default: "true",
             current: "true".to_string(),
             help_short: "When on, the risk gate REJECTS any order without a stop_loss.",
-            help_long: "**F-249/F-271 closure (2026-05-25 — operator-approved configurable preset)**: Conservative preset turns this ON so prop-firm validation never trades without SL. Balanced/Aggressive turn it OFF for scalp strategies that fill first and place SL second. NOTE: Risky Mode ALWAYS requires SL+TP regardless of this flag (kill-switch math depends on it).",
+            help_long: "**F-249/F-271 closure (2026-05-25 — operator-approved configurable preset)**: Conservative preset turns this ON so prop-firm validation never trades without SL. Balanced/Aggressive turn it OFF for scalp strategies that fill first and place SL second. NOTE: Risky Mode ALWAYS requires SL+TP regardless of this flag (kill-switch math depends on it). **2026-08-09 (W1) — this control now ENFORCES.** Until today it was displayed here and in GET /risk and read by no code path at all. It is enforced in `server::orders::place` and `place_pending`: with it ON, `stopLossPips` is mandatory on a manual order and `risky:true` does NOT override it. It does not touch order SIZE — the manual path deliberately applies no lot cap.",
             preset_conservative: "true",
             preset_balanced: "false",
             preset_aggressive: "false",
@@ -1020,40 +1020,81 @@ pub struct PresetsResponse {
     pub presets: Vec<PresetSummary>,
 }
 
-/// `GET /settings/presets` — returns the three safety presets the UI
-/// surfaces as one-click switches.
+/// `GET /settings/presets` — **withdrawn 2026-08-09 (#115 / #116). Returns 501
+/// with an empty list and the reason.**
+///
+/// ## What this used to be, and why it is gone
+///
+/// It returned three safety-posture presets — Conservative / Balanced /
+/// Aggressive — each with a description promising a specific bundle:
+/// *"0.5% risk/trade, strict SMC gate, tight PnL circuit breaker, fewer cTrader
+/// retries … Risky Mode disabled."*
+///
+/// **Nothing in the product could apply any of them.** Verified across
+/// `crates/`, `desktop/src`, `desktop/src-tauri/src`, `mesh/` and `mcp/`: there
+/// was no `POST` counterpart, no apply function, and no client. The only preset
+/// writer in the backend is `server::risk::update_preset`, which parses a
+/// completely different vocabulary (`ftmo | myforexfunds | fundednext | the5ers
+/// | none`) and rejects every id above with `unknown_preset`. The desktop
+/// Settings screen already carries a comment saying exactly that
+/// (`desktop/src/screens/Settings.tsx:37-39`) and deliberately calls
+/// `/risk/preset` instead.
+///
+/// Two disjoint preset vocabularies, one of them inert, is how #213/#214
+/// happened: the operator reasonably believed a posture existed that would set
+/// his risk knobs for him, so nobody checked what the ONE working preset path
+/// actually wrote into the drawdown breakers.
+///
+/// ## Why 501 and not a silent deletion
+///
+/// The route is registered in `server/mod.rs:232`, which this change does not
+/// own. Returning `501 Not Implemented` with a machine-readable code keeps the
+/// route compiling while making the absence explicit to every client, instead
+/// of handing back three plausible-looking objects that do nothing.
+///
+/// ## What restoring it would require (do not restore it partially)
+///
+/// A real apply path must write EVERY knob its description promises, or the
+/// description is a new lie in place of the old one. Of the five things the
+/// text above promised, only two have a `Settings` field with a live consumer
+/// today — `risk.risk_per_trade` and `risk.require_stop_loss`. "Strict SMC
+/// gate", "PnL circuit breaker" and "fewer cTrader retries" resolve to search
+/// runtime overrides and cTrader knobs with no single Settings recipient, and
+/// "Risky Mode disabled" is `system.trading_mode` plus the §6.4 acknowledgement.
+/// Wiring three of five and shipping the same description is the defect, not the
+/// fix. The per-knob `presetConservative` / `presetBalanced` / `presetAggressive`
+/// strings on every [`KnobEntry`] survive as ADVISORY values — a UI may render
+/// them as "recommended", never as a control that sets anything.
 pub async fn get_presets(State(_state): State<AppApiState>) -> Response {
+    tracing::warn!(
+        target: "neoethos_app::server::knob_catalog",
+        "GET /settings/presets called — this endpoint is withdrawn (#115/#116): the \
+         safety-posture presets it used to advertise had no apply path anywhere in the \
+         product. Use POST /risk/preset (ftmo|myforexfunds|fundednext|the5ers|none) for \
+         prop-firm presets, or set individual knobs via POST /settings."
+    );
     let response = PresetsResponse {
-        presets: vec![
-            PresetSummary {
-                id: "conservative",
-                label: "Conservative",
-                description:
-                    "Capital-preservation defaults. 0.5% risk/trade, strict SMC gate, \
-                     tight PnL circuit breaker, fewer cTrader retries. Best for \
-                     prop-firm passing and new operators. Risky Mode disabled.",
-            },
-            PresetSummary {
-                id: "balanced",
-                label: "Balanced",
-                description:
-                    "Production-recommended defaults. 1% risk/trade, default SMC gate, \
-                     1% PnL circuit breaker. Best for funded accounts and multi-month \
-                     campaigns. Risky Mode disabled.",
-            },
-            PresetSummary {
-                id: "aggressive",
-                label: "Aggressive (advanced)",
-                description:
-                    "Higher risk, permissive filters. 2% risk/trade, relaxed SMC gate, \
-                     5% PnL circuit breaker. Risky Mode AVAILABLE but requires the \
-                     signed §6.4 acknowledgement (99% ruin probability ceiling). Only \
-                     for operators who understand Kelly mathematics and run a separate \
-                     prop-firm-passing account on the Conservative preset.",
-            },
-        ],
+        // Empty on purpose. A client that iterates this list now renders
+        // nothing, which is the truth, instead of three switches that do
+        // nothing, which is worse than nothing.
+        presets: Vec::new(),
     };
-    Json(response).into_response()
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "presets": response.presets,
+            "code": "safety_presets_withdrawn",
+            "error": "Safety-posture presets (conservative/balanced/aggressive) were \
+                      advertised by this endpoint but no code in the product could apply \
+                      them. They have been withdrawn rather than left as controls that do \
+                      nothing.",
+            "useInstead": {
+                "propFirmPresets": "POST /risk/preset — ftmo | myforexfunds | fundednext | the5ers | none",
+                "individualKnobs": "POST /settings, or Settings -> Advanced -> raw YAML",
+            },
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

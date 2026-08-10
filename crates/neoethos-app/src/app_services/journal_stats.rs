@@ -47,6 +47,112 @@ pub struct JournalStats {
     pub sharpe: Option<f64>,
 }
 
+/// Max drawdown measured from the cumulative P&L of a **scoped set of trades**,
+/// instead of from an account equity curve.
+///
+/// # Why this exists (2026-08-09, item #197)
+///
+/// [`JournalStats::max_drawdown_pct`] is computed peak-to-trough over
+/// [`EquitySample`]s, and an equity sample is an ACCOUNT-level fact: one number
+/// for the whole cTrader account, moved by every engine and every manual order
+/// on it. That is the right measurement for "how did the account do" and the
+/// wrong one for "how did THIS strategy do".
+///
+/// The demo forward-test gate needs the second question answered: it compares
+/// the live figure against ONE strategy's `quality.json`, whose
+/// `max_drawdown_pct` is that strategy's own equity curve. Feeding it the
+/// account union curve fails a qualified strategy whenever another engine was
+/// drawing down at the same time, and passes an unqualified one on a quiet
+/// account. Neither error is visible in the result.
+///
+/// An [`EquitySample`] cannot be scoped to a symbol — the account has one
+/// balance, not one per instrument — so the strategy's curve is RECONSTRUCTED
+/// from the scoped trades' own realised P&L, laid on top of a baseline account
+/// equity that supplies the percentage denominator.
+///
+/// **What this is not.** It is a *closed-trade* curve: it moves only when a
+/// trade closes, so intra-trade excursion is invisible and the figure is a
+/// lower bound on the true peak-to-trough. The backtest number it is compared
+/// against is built the same way, which is exactly why it is the comparable one.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeDrawdown {
+    /// Peak-to-trough of `baseline_equity + cumulative net P&L`, in account currency.
+    pub max_drawdown_abs: f64,
+    /// The same, as a percent of the running peak.
+    pub max_drawdown_pct: f64,
+    /// The denominator: account equity the scoped curve was laid on top of.
+    pub baseline_equity: f64,
+    /// Trades that actually moved the curve.
+    pub trades_used: usize,
+    /// Trades discarded because their `net_profit` was NaN/infinite. Counted
+    /// rather than dropped silently — a discard on a decision path is a fact
+    /// the caller has to be able to see.
+    pub trades_skipped_non_finite: usize,
+}
+
+/// Reconstruct a scoped strategy's drawdown from its own closed trades.
+///
+/// `trades` are re-sorted by effective timestamp internally, so the caller's
+/// ordering is never load-bearing. `baseline_equity` is the account equity the
+/// curve starts from and the percentage denominator.
+///
+/// `None` when there is nothing measurable — no trades, or a baseline that is
+/// not a positive finite number. **`None` means "not measured", never "zero
+/// drawdown"**; a caller on a gating path must treat it as a refusal to
+/// measure, not as a pass.
+pub fn max_drawdown_from_trade_pnl(
+    trades: &[ClosedTrade],
+    baseline_equity: f64,
+) -> Option<TradeDrawdown> {
+    if trades.is_empty() || !baseline_equity.is_finite() || baseline_equity <= 0.0 {
+        return None;
+    }
+    let mut ordered: Vec<(i64, f64)> = trades
+        .iter()
+        .map(|t| (t.effective_ts_ms(), t.net_profit))
+        .collect();
+    ordered.sort_by_key(|(ts, _)| *ts);
+
+    let mut equity = baseline_equity;
+    let mut peak = baseline_equity;
+    let mut max_dd_abs = 0.0f64;
+    let mut max_dd_pct = 0.0f64;
+    let mut used = 0usize;
+    let mut skipped = 0usize;
+    for (_, pnl) in &ordered {
+        if !pnl.is_finite() {
+            skipped += 1;
+            continue;
+        }
+        used += 1;
+        equity += *pnl;
+        if equity > peak {
+            peak = equity;
+        }
+        let dd = peak - equity;
+        if dd > max_dd_abs {
+            max_dd_abs = dd;
+        }
+        if peak > 0.0 {
+            let dd_pct = (dd / peak) * 100.0;
+            if dd_pct > max_dd_pct {
+                max_dd_pct = dd_pct;
+            }
+        }
+    }
+    if used == 0 {
+        return None;
+    }
+    Some(TradeDrawdown {
+        max_drawdown_abs: max_dd_abs,
+        max_drawdown_pct: max_dd_pct,
+        baseline_equity,
+        trades_used: used,
+        trades_skipped_non_finite: skipped,
+    })
+}
+
 /// Compute the full stats bundle. Defensive: empty inputs → all-zero
 /// stats; every ratio that could divide by zero is guarded and returns
 /// `None` rather than `inf`/`NaN`.
@@ -183,6 +289,7 @@ mod tests {
             net_profit: net,
             balance_after: None,
             account_id: None,
+            environment: None,
         }
     }
 
@@ -228,9 +335,90 @@ mod tests {
             balance: e,
             equity: e,
             account_id: None,
+            environment: None,
         };
         let s = compute_stats(&[], &[eq(1, 100.0), eq(2, 110.0), eq(3, 90.0), eq(4, 120.0)]);
         assert!((s.max_drawdown_abs - 20.0).abs() < 1e-9);
         assert!((s.max_drawdown_pct - (20.0 / 110.0 * 100.0)).abs() < 1e-9);
+    }
+
+    fn t_at(net: f64, exit_ms: i64) -> ClosedTrade {
+        let mut trade = t(net);
+        trade.exit_ts_ms = Some(exit_ms);
+        trade.recorded_at_unix_ms = exit_ms;
+        trade
+    }
+
+    #[test]
+    fn trade_scoped_drawdown_walks_the_scoped_curve_only() {
+        // 1000 → 1100 → 1010 → 1210. Peak 1100, trough 1010 → 90 abs, 8.18%.
+        let trades = [t_at(100.0, 1), t_at(-90.0, 2), t_at(200.0, 3)];
+        let d = max_drawdown_from_trade_pnl(&trades, 1000.0).expect("measurable");
+        assert!((d.max_drawdown_abs - 90.0).abs() < 1e-9);
+        assert!((d.max_drawdown_pct - (90.0 / 1100.0 * 100.0)).abs() < 1e-9);
+        assert_eq!(d.trades_used, 3);
+        assert_eq!(d.trades_skipped_non_finite, 0);
+        assert!((d.baseline_equity - 1000.0).abs() < 1e-9);
+    }
+
+    /// THE DEFECT #197 CLOSES. Another engine on the same account drew the
+    /// ACCOUNT curve down 25%; this strategy's own trades never lost more than
+    /// ~1.8%. The account-curve figure refuses a strategy that qualified.
+    #[test]
+    fn another_engines_drawdown_does_not_land_on_this_strategy() {
+        let eq = |ts: i64, e: f64| EquitySample {
+            ts_ms: ts,
+            balance: e,
+            equity: e,
+            account_id: None,
+            environment: Some("Demo".to_string()),
+        };
+        // This strategy: +20, -20, +20 on a 1000 baseline → 1.96% worst.
+        let trades = [t_at(20.0, 1), t_at(-20.0, 2), t_at(20.0, 3)];
+        // The account, meanwhile, went 1000 → 1000 → 750 (a different engine).
+        let account = [eq(1, 1000.0), eq(2, 1000.0), eq(3, 750.0)];
+
+        let account_view = compute_stats(&trades, &account);
+        assert!(
+            account_view.max_drawdown_pct > 24.0,
+            "the account curve shows the union: {}",
+            account_view.max_drawdown_pct
+        );
+
+        let scoped = max_drawdown_from_trade_pnl(&trades, 1000.0).expect("measurable");
+        assert!(
+            scoped.max_drawdown_pct < 2.0,
+            "this strategy's own drawdown is small: {}",
+            scoped.max_drawdown_pct
+        );
+    }
+
+    #[test]
+    fn ordering_is_not_the_callers_responsibility() {
+        let forward = [t_at(100.0, 1), t_at(-90.0, 2), t_at(200.0, 3)];
+        let shuffled = [t_at(200.0, 3), t_at(100.0, 1), t_at(-90.0, 2)];
+        let a = max_drawdown_from_trade_pnl(&forward, 1000.0).expect("measurable");
+        let b = max_drawdown_from_trade_pnl(&shuffled, 1000.0).expect("measurable");
+        assert!((a.max_drawdown_pct - b.max_drawdown_pct).abs() < 1e-12);
+    }
+
+    /// Unmeasurable must be distinguishable from "no drawdown" — a gate that
+    /// reads 0.0 for "I could not measure" is a gate that admits on ignorance.
+    #[test]
+    fn an_unusable_baseline_refuses_to_measure_rather_than_reporting_zero() {
+        let trades = [t_at(100.0, 1), t_at(-90.0, 2)];
+        assert!(max_drawdown_from_trade_pnl(&trades, 0.0).is_none());
+        assert!(max_drawdown_from_trade_pnl(&trades, -5.0).is_none());
+        assert!(max_drawdown_from_trade_pnl(&trades, f64::NAN).is_none());
+        assert!(max_drawdown_from_trade_pnl(&[], 1000.0).is_none());
+    }
+
+    #[test]
+    fn non_finite_pnl_is_counted_not_silently_dropped() {
+        let trades = [t_at(100.0, 1), t_at(f64::NAN, 2), t_at(-50.0, 3)];
+        let d = max_drawdown_from_trade_pnl(&trades, 1000.0).expect("measurable");
+        assert_eq!(d.trades_used, 2);
+        assert_eq!(d.trades_skipped_non_finite, 1);
+        assert!((d.max_drawdown_abs - 50.0).abs() < 1e-9);
     }
 }

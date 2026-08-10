@@ -171,7 +171,7 @@ box — nothing special is required. GPU acceleration is selected at **runtime**
 (Settings → compute mode: auto/cpu/gpu), not via a build feature flag, and is
 auto-detected where available.
 
-Heavy CUDA acceleration (dedicated NVIDIA cards, libtorch/CUDA toolchain, VPS
+Heavy CUDA acceleration (dedicated NVIDIA cards, CUDA toolchain, VPS
 deployment) is an advanced topic with its own environment requirements and is not
 needed to build or run the app locally. If you have a shared-RAM integrated GPU,
 prefer CPU or `auto` — a discovery run can otherwise exhaust shared memory.
