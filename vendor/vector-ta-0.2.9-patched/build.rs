@@ -690,6 +690,30 @@ const F64_LANE_SOURCES: &[&str] = &[
     "kernels/cuda/mesa_stochastic_multi_length_kernel.cu",
     "kernels/cuda/moving_average_cross_probability_kernel.cu",
     "kernels/cuda/multi_length_stochastic_average_kernel.cu",
+    // ------------------------------------------------ THE ONE BUILD, round 3
+    // These seven landed in the final gap-filling round: each carries a
+    // lane-shaped `*_neo_batch_f64` entry point AND a `F64_KERNELS` row, so
+    // our lane routes to them — but nobody added the FILE here, which meant
+    // all seven were about to be compiled WITH `--use_fast_math`.
+    //
+    // This is not a cosmetic omission. `bandpass` and `ott`/`otto` are IIR
+    // recurrences: under fast math the divide in the recursion becomes
+    // `rcp.approx.ftz.f64` (the shipped PTX already carries 23 of those), and
+    // the error compounds bar over bar into a value that feeds a threshold
+    // comparison. Registered-but-not-opted-out is the worst of the three
+    // states, because the lane USES the kernel and trusts it.
+    //
+    // Found by comparing, file by file, the set that defines a lane entry
+    // point against this list — not by reading the round-3 reports, which
+    // said these were "written and registered" and were correct as far as
+    // they went.
+    "kernels/cuda/bandpass_kernel.cu",
+    "kernels/cuda/halftrend_kernel.cu",
+    "kernels/cuda/mod_god_mode_kernel.cu",
+    "kernels/cuda/moving_averages/dma_kernel.cu",
+    "kernels/cuda/moving_averages/ott_kernel.cu",
+    "kernels/cuda/moving_averages/otto_kernel.cu",
+    "kernels/cuda/prb_kernel.cu",
 ];
 
 fn is_f64_lane_source(rel_src: &str) -> bool {

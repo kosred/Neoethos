@@ -39,7 +39,7 @@ use neoethos_trader::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::app_services::broker_api::{
-    OrderSide, amend_position_sltp_blocking, close_position_blocking,
+    OrderSide, amend_position_sltp_expecting, close_position_blocking,
     fetch_recent_chart_bars_blocking, submit_market_order_blocking,
 };
 
@@ -1492,15 +1492,62 @@ async fn run(
                     }
                     if let Some(raw) = new_trail {
                         let sl_price = (raw / pip).round() * pip; // snap to a broker-valid pip grid
-                        // NOTE (#199): this amend is the one order-path call not
-                        // bound to the admitted environment, and the result is
-                        // dropped here. `amend_position_sltp_blocking` logs its
-                        // own failure loudly; the environment binding is being
-                        // added to that function separately.
-                        let _ = tokio::task::spawn_blocking(move || {
-                            amend_position_sltp_blocking(pos_id, Some(sl_price), None, None)
+                        // #199 CLOSED. This was the last order-path call still
+                        // resolving credentials WITHOUT the environment it was
+                        // admitted against, so a Demo->Live flip mid-iteration
+                        // could send a stop-modification to an environment this
+                        // engine was never admitted to. The binding function was
+                        // written in the same wave and then never called — the
+                        // hand-off was routed to the build phase, and the build
+                        // phase edited no files, so it fell on the floor. Its own
+                        // doc-comment at broker_api.rs:1323 already said the
+                        // autopilot "must call amend_position_sltp_expecting".
+                        // Now it does.
+                        //
+                        // `gated_env_is_live` is this run's admission (parameter
+                        // at :512), the same value close_position_blocking is
+                        // already given at :1222 and :1371. Some(_) REFUSES the
+                        // amend outright when broker_credentials.toml now names
+                        // the other environment; no request leaves the process.
+                        let expected_env = gated_env_is_live;
+                        let amend = tokio::task::spawn_blocking(move || {
+                            amend_position_sltp_expecting(
+                                pos_id,
+                                Some(sl_price),
+                                None,
+                                None,
+                                Some(expected_env),
+                            )
                         })
                         .await;
+                        // The Result was dropped twice over before: once by the
+                        // missing check, once by `let _`. The callee logs its own
+                        // failure at error; this names which position and which
+                        // stop the operator did NOT get, and skips the
+                        // "advanced" line below so the log cannot claim a move
+                        // that never happened.
+                        let advanced = match amend {
+                            Ok(Ok(_)) => true,
+                            Ok(Err(error)) => {
+                                tracing::error!(
+                                    target: "neoethos_app::live_trading",
+                                    position_id = pos_id, intended_sl = sl_price,
+                                    %error,
+                                    "TRAILING STOP NOT MOVED — the broker refused the amend.                                      The position is still protected by its previous stop,                                      not by the one this iteration computed."
+                                );
+                                false
+                            }
+                            Err(join) => {
+                                tracing::error!(
+                                    target: "neoethos_app::live_trading",
+                                    position_id = pos_id, intended_sl = sl_price,
+                                    error = %join,
+                                    "TRAILING STOP NOT MOVED — the amend task failed to run."
+                                );
+                                false
+                            }
+                        };
+                        if advanced {
                         tracing::info!(
                             target: "neoethos_app::live_trading",
                             position_id = pos_id, new_sl = sl_price, extreme = pos_extreme,
@@ -1509,6 +1556,7 @@ async fn run(
                             min_lock_pips = lock_pips,
                             "trailing stop advanced (models.exit_policy geometry)"
                         );
+                        }
                     }
                 }
             }

@@ -2148,7 +2148,18 @@ impl F64Kernel {
                 | F64Kernel::TtmSqueeze
                 | F64Kernel::DamianiVolatmeter
                 | F64Kernel::Wavetrend
-                | F64Kernel::Aroon
+                // THE ONE BUILD: `Aroon` was here and the claim is FALSE.
+                // This predicate's own contract is "the CPU reference does not
+                // read the swept period at all". `compute_aroon_batch`
+                // (cpu_batch.rs:5959) reads
+                // `get_usize_param("aroon", params, "length", 14)` ONCE PER
+                // COMBO, and `aroon_neo_batch_f64` (kernels/cuda/aroon_kernel.cu:312)
+                // correspondingly reads `periods[combo]` -- so the rows of an
+                // aroon sweep genuinely differ. Nothing consumes this
+                // predicate today, which is exactly why the wrong answer was
+                // survivable; the moment anything uses it to collapse
+                // duplicate launches, a real aroon sweep would silently become
+                // one repeated row. Removed rather than left as a latent trap.
                 | F64Kernel::Acosc
                 | F64Kernel::Ad
                 | F64Kernel::CciCycle
