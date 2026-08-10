@@ -1642,6 +1642,16 @@ pub struct DiscoveryRunProfile {
     /// non-deterministic variants surface in the persisted profile so
     /// `LivePromotionGate::PromotionRejectedDeterminism` failures can
     /// be diagnosed without re-running.
+    /// Which engine(s) actually evaluated the population in this run.
+    ///
+    /// Recovered from f910c0f2 during the 2026-08-10 cherry-pick: the strict-mode
+    /// fix is only half a fix without it. The CubeCL f64 lane is ~0.19% off at
+    /// 200,000 bars and the f32 lane is 54% off there, because rounding flips
+    /// stop/target comparisons and the run takes 129-430 more trades. Two runs on
+    /// different engines therefore ranked different strategies, and nothing in the
+    /// artifact said which had run. Empty means no population evaluation was
+    /// recorded in this process (a profile built from a fixture).
+    pub population_eval_engines: Vec<crate::engine_identity::PopulationEvalEngine>,
     pub determinism_policy: DeterminismPolicy,
     // ── SLICE 5 (2026-08-08): the config fields the profile silently ──────
     // dropped before. `build_discovery_profile` now destructures
@@ -9820,6 +9830,7 @@ pub fn build_discovery_profile(
         min_history_years,
     } = runtime_overrides;
     DiscoveryRunProfile {
+        population_eval_engines: crate::engine_identity::observed_population_engines(),
         timeframe_label: timeframe_label.clone(),
         population: *population,
         population_auto: *population_auto,
