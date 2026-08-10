@@ -1659,6 +1659,9 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
 /// value, source (config / sentinel-expanded / env / default), and
 /// notes. The TUI's Config page renders the same data.
 fn cmd_config(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some("normalize") {
+        return cmd_config_normalize(&args[1..]);
+    }
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
     let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
 
@@ -1690,6 +1693,148 @@ fn cmd_config(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `config normalize` — show, and optionally rewrite, the operator's store as
+/// an OVERRIDE DOCUMENT instead of a full snapshot.
+///
+/// Why this command exists. Older builds saved settings by dumping every field,
+/// so a store written then is a photograph of that build's defaults. From that
+/// moment it shadows every default the codebase improves — not by disagreeing
+/// with them, but by repeating older ones that were never chosen. The operator
+/// cannot see this by reading his file: a deliberate limit and a fossilised
+/// default are the same line of YAML. The measured case on this machine was a
+/// 509-line store in which seven gates sat at values no one had selected,
+/// including a payoff floor of 0.0 against a default of 2.0 and an export gate
+/// disabled against a default that requires walk-forward.
+///
+/// The fix is not to patch values — that is the same mistake with fresher
+/// numbers. It is to make the file carry ONLY what diverges, so that every
+/// future default arrives on its own. `Settings::save` already writes that
+/// shape; nothing called it on an existing store, so no store was ever
+/// converted.
+///
+///   config normalize            Print each divergence beside the default it
+///                               shadows. Reads nothing else, writes nothing.
+///   config normalize --write    Back the store up, rewrite it as overrides,
+///                               reload it, and REFUSE (restoring the backup)
+///                               unless the reloaded settings are identical.
+fn cmd_config_normalize(args: &[String]) -> Result<()> {
+    let write = has_flag(args, "--write");
+    let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
+    let provenance = settings.provenance().describe();
+    let path = settings.provenance().path().map(std::path::Path::to_path_buf);
+    let before = settings.overrides_against_defaults()?;
+
+    println!("Config store: {provenance}");
+    if let Some(p) = &path {
+        let lines = std::fs::read_to_string(p)
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+        println!("On disk     : {lines} lines");
+    }
+    println!(
+        "Overrides   : {} ({} diverge from default, {} money keys carried by rule)",
+        before.len(),
+        before.iter().filter(|o| o.diverges).count(),
+        before.iter().filter(|o| o.money_key).count()
+    );
+    println!();
+    println!("{:<46} {:<32} {:<32} {}", "key", "your file", "default", "");
+    println!("{}", "-".repeat(120));
+    for o in &before {
+        let default = o.default.as_deref().unwrap_or("<not in schema>");
+        let mark = match (o.money_key, o.diverges, o.default.is_none()) {
+            (_, _, true) => "LEFTOVER",
+            (true, false, _) => "money (= default)",
+            (true, true, _) => "MONEY",
+            (false, true, _) => "",
+            (false, false, _) => "",
+        };
+        println!(
+            "{:<46} {:<32} {:<32} {}",
+            truncate(&o.path, 46),
+            truncate(&o.live, 32),
+            truncate(default, 32),
+            mark
+        );
+    }
+    println!();
+
+    if !write {
+        println!(
+            "Nothing written. Re-run with --write to convert the store to this \
+             shape; every key not listed above then follows the compiled default \
+             instead of a frozen copy of it."
+        );
+        return Ok(());
+    }
+
+    let Some(path) = path else {
+        anyhow::bail!(
+            "no config file to normalize — this process resolved to the compiled \
+             defaults ({provenance}). There is nothing on disk to convert."
+        );
+    };
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("read the clock: {e}"))?
+        .as_secs();
+    let backup = path.with_extension(format!("yaml.pre-normalize-{stamp}"));
+    std::fs::copy(&path, &backup)
+        .map_err(|e| anyhow::anyhow!("back up {} to {}: {e}", path.display(), backup.display()))?;
+    println!("Backup      : {}", backup.display());
+
+    settings.save(&path)?;
+
+    // Refuse to leave a rewritten store in place unless it reloads to the same
+    // settings. A conversion that changes behaviour is the exact failure this
+    // command is meant to end, so it is checked rather than assumed — and on
+    // any mismatch the operator's original file is put back before we return.
+    let restore = |why: String| -> anyhow::Error {
+        let _ = std::fs::copy(&backup, &path);
+        anyhow::anyhow!("{why}\nThe original store has been restored from {}.", backup.display())
+    };
+    let reloaded = neoethos_core::Settings::from_yaml(&path)
+        .map_err(|e| restore(format!("the normalized store failed to load: {e}")))?;
+    let after = reloaded
+        .overrides_against_defaults()
+        .map_err(|e| restore(format!("the normalized store could not be re-read: {e}")))?;
+    if after != before {
+        let mut diff = Vec::new();
+        for o in &before {
+            if !after.contains(o) {
+                diff.push(format!("  lost:    {} = {}", o.path, o.live));
+            }
+        }
+        for o in &after {
+            if !before.contains(o) {
+                diff.push(format!("  gained:  {} = {}", o.path, o.live));
+            }
+        }
+        return Err(restore(format!(
+            "the normalized store does not round-trip — {} change(s):\n{}",
+            diff.len(),
+            diff.join("\n")
+        )));
+    }
+
+    let lines = std::fs::read_to_string(&path)
+        .map(|t| t.lines().count())
+        .unwrap_or(0);
+    println!("Written     : {} ({lines} lines, was a full snapshot)", path.display());
+    println!("Verified    : reloads to identical settings; every other key now follows the default.");
+    Ok(())
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 /// Auto search-train loop (P9). Forward-only:

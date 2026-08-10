@@ -34,9 +34,12 @@ use std::path::{Path, PathBuf};
 
 use neoethos_core::config::Settings;
 
-/// Written as the first line of the generated body. `scripts/migrate_live_config.ps1`
-/// refuses to use the seed as a defaults source unless it finds this marker,
-/// so a stale hand-written seed can never be mistaken for the real defaults.
+/// Written as the first line of the generated body: proof that this file was
+/// produced from `Settings::default()` rather than typed by a person. Nothing
+/// reads it as a defaults SOURCE any more — `neoethos-cli config normalize`
+/// compares the operator's store against the compiled defaults in-process, so
+/// a stale seed cannot leak a value into the one file a run reads. The marker
+/// remains because a hand-edited generated file is still a lie worth catching.
 pub const GENERATED_MARKER: &str = "# neoethos-generated-defaults: v1";
 
 const HEADER: &str = "\
@@ -58,7 +61,7 @@ const HEADER: &str = "\
 #
 # The operator's live store (%LOCALAPPDATA%\\neoethos\\config.yaml) is the only
 # file a run actually reads. It carries OVERRIDES ONLY. Migrate it with
-# scripts/migrate_live_config.ps1 — never by hand, never unattended.
+#   neoethos-cli config normalize --write     — never by hand.
 # ============================================================================
 ";
 
@@ -212,17 +215,16 @@ fn desktop_seed_is_the_serialised_defaults() {
 }
 
 /// The generator is only worth anything if the marker it writes is actually
-/// present, because that marker is what `scripts/migrate_live_config.ps1` keys
-/// off before it will trust this file as a defaults source. A migration that
-/// silently used a stale hand-written seed as "the defaults" would write wrong
-/// values into the one file a run reads.
+/// present: it is the one signal that separates a projection of the compiled
+/// defaults from a file somebody edited. A hand-written seed wearing the same
+/// name would be read as "the shipped defaults" by every human who opened it.
 #[test]
 fn the_generated_body_carries_the_marker_the_migration_tool_requires() {
     let generated = expected_seed();
     assert!(
         generated.contains(GENERATED_MARKER),
         "the generated seed must contain the line `{GENERATED_MARKER}` — \
-         scripts/migrate_live_config.ps1 refuses to read defaults from a file without it"
+         without it nothing separates this file from one written by hand"
     );
     // And it must be a real marker line, not a substring of prose.
     assert!(
@@ -255,8 +257,8 @@ fn the_seed_on_disk_declares_itself_generated() {
          projection of Settings::default(): the defaults live in \
          crates/neoethos-core/src/config.rs and nowhere else. Change the `Default` impl and \
          re-run `cargo test -p neoethos-core --test generated_seed_is_current`. \
-         scripts/migrate_live_config.ps1 also refuses to read defaults from a file without this \
-         marker, so a hand-edited seed cannot leak values into the operator's live store.",
+         A hand-edited file wearing this name would be read as the shipped defaults by every \
+         human who opened it.",
         path.display()
     );
 }

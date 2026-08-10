@@ -2816,7 +2816,7 @@ impl Serialize for AppRuntimeConfig {
     }
 }
 
-pub use load_seal::{ConfigProvenance, ConfigSource, Settings};
+pub use load_seal::{ConfigOverride, ConfigProvenance, ConfigSource, Settings};
 
 /// **THE SINGLE RESOLUTION POINT.** The only place in the workspace where a
 /// [`Settings`] value can come into existence.
@@ -2934,6 +2934,42 @@ mod load_seal {
                 Self::InMemory => "in_memory",
             }
         }
+    }
+
+    /// Always written to the operator's store, never pruned. Each one governs
+    /// how much money can be lost or committed; none may move because a default
+    /// moved. A limit he can read in his own file is worth the extra lines.
+    pub(crate) const ALWAYS_PERSIST: &[&str] = &[
+        "risk.daily_drawdown_limit",
+        "risk.total_drawdown_limit",
+        "risk.risk_per_trade",
+        "risk.risky_max_risk_per_trade",
+        "risk.max_portfolio_risk",
+        "risk.preset",
+        "risk.require_stop_loss",
+        "risk.min_risk_reward",
+        "system.trading_mode",
+        "system.account_currency",
+    ];
+
+    /// One leaf of the operator's store set against the default it shadows.
+    ///
+    /// See [`Settings::overrides_against_defaults`] for why this is the only
+    /// honest question a full-snapshot config file can answer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ConfigOverride {
+        /// Dotted path, e.g. `risk.max_portfolio_risk`.
+        pub path: String,
+        /// What the operator's file says.
+        pub live: String,
+        /// What the compiled default says. `None` means the current schema has
+        /// no such key — a leftover from an older build.
+        pub default: Option<String>,
+        /// A key that governs money, carried even when it equals the default.
+        pub money_key: bool,
+        /// `false` for a money key that happens to equal its default; such a
+        /// row is present for visibility, not because anything diverges.
+        pub diverges: bool,
     }
 
     /// Proof that a [`Settings`] was minted by the single resolution point.
@@ -3936,7 +3972,7 @@ mod load_seal {
              crates/neoethos-core/src/config.rs — add it there with a note and it becomes a \
              warning instead of a failure.\n\
              \x20 3. Your file has NOT been modified by this error. Back it up before editing; \
-             scripts/migrate_live_config.ps1 takes the backup and shows the diff first."
+             `neoethos-cli config normalize --write` takes the backup and shows every \n             override beside the default it shadows."
         )
     }
 
@@ -4198,22 +4234,7 @@ impl Settings {
     /// them would be semantically identical *today* and would silently move a
     /// drawdown limit or a risk fraction the day a default changes underneath
     /// him. A limit he can read in his own file is worth the four extra lines.
-    fn as_override_document(&self) -> anyhow::Result<serde_yaml_ng::Value> {
-        /// Always written, never pruned. Each one governs how much money can be
-        /// lost or committed; none may move because a default moved.
-        const ALWAYS_PERSIST: &[&str] = &[
-            "risk.daily_drawdown_limit",
-            "risk.total_drawdown_limit",
-            "risk.risk_per_trade",
-            "risk.risky_max_risk_per_trade",
-            "risk.max_portfolio_risk",
-            "risk.preset",
-            "risk.require_stop_loss",
-            "risk.min_risk_reward",
-            "system.trading_mode",
-            "system.account_currency",
-        ];
-
+    pub fn as_override_document(&self) -> anyhow::Result<serde_yaml_ng::Value> {
         fn prune(
             current: &serde_yaml_ng::Value,
             default: &serde_yaml_ng::Value,
@@ -4250,8 +4271,102 @@ impl Settings {
 
         let current = serde_yaml_ng::to_value(self)?;
         let default = serde_yaml_ng::to_value(Self::default())?;
-        Ok(prune(&current, &default, "", ALWAYS_PERSIST)
+        Ok(prune(&current, &default, "", load_seal::ALWAYS_PERSIST)
             .unwrap_or(serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new())))
+    }
+
+    /// Every leaf on which this `Settings` DIVERGES from the compiled defaults,
+    /// each beside the default it is shadowing.
+    ///
+    /// This exists because a config file written by an older build is a FULL
+    /// SNAPSHOT, not a record of decisions: it repeats every default of its own
+    /// era, and from that day forward it silently shadows every default the
+    /// codebase improves. The operator cannot tell the two apart by reading it —
+    /// a deliberate choice and a fossilised default are the same line of YAML.
+    ///
+    /// So the file cannot answer "what did I choose?", but it CAN answer "where
+    /// do I differ, and from what?" — and that question has a short, reviewable
+    /// answer where the file has five hundred lines. Every entry is then either
+    /// a real decision worth keeping or a fossil worth dropping, and the
+    /// operator decides per line instead of per file.
+    ///
+    /// Money keys are reported even when they equal the default, for the same
+    /// reason [`Self::as_override_document`] never prunes them.
+    pub fn overrides_against_defaults(&self) -> anyhow::Result<Vec<ConfigOverride>> {
+        // One line per value, always. A block-style sequence would break the
+        // table this feeds and make a 28-symbol watchlist unreadable next to
+        // the default it shadows.
+        fn render(v: &serde_yaml_ng::Value) -> String {
+            match v {
+                serde_yaml_ng::Value::String(s) => s.clone(),
+                serde_yaml_ng::Value::Sequence(items) => {
+                    let inner: Vec<String> = items.iter().map(render).collect();
+                    format!("[{}]", inner.join(", "))
+                }
+                serde_yaml_ng::Value::Mapping(m) => {
+                    let inner: Vec<String> = m
+                        .iter()
+                        .map(|(k, v)| {
+                            format!("{}: {}", k.as_str().unwrap_or_default(), render(v))
+                        })
+                        .collect();
+                    format!("{{{}}}", inner.join(", "))
+                }
+                other => serde_yaml_ng::to_string(other)
+                    .unwrap_or_else(|_| "<unrenderable>".to_string())
+                    .trim_end()
+                    .to_string(),
+            }
+        }
+
+        // `default` is `None` only when the DEFAULTS MAPPING HAS NO SUCH KEY —
+        // which is not the same thing as a key whose default is null. An
+        // `Option<f64>` field defaulting to `None` serialises as `null` and is
+        // a perfectly live setting; conflating the two would report every
+        // opt-in knob the operator turned on as an unrecognised leftover.
+        fn walk(
+            over: &serde_yaml_ng::Value,
+            default: Option<&serde_yaml_ng::Value>,
+            path: &str,
+            out: &mut Vec<ConfigOverride>,
+        ) {
+            match over {
+                serde_yaml_ng::Value::Mapping(map) => {
+                    for (k, v) in map {
+                        let name = k.as_str().unwrap_or_default();
+                        let child = if path.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{path}.{name}")
+                        };
+                        let d = default.and_then(|d| d.as_mapping()).and_then(|m| m.get(k));
+                        walk(v, d, &child, out);
+                    }
+                }
+                leaf => {
+                    let is_money = load_seal::ALWAYS_PERSIST.contains(&path);
+                    let default_str = default.map(render);
+                    let live_str = render(leaf);
+                    // A money key that equals its default is carried by
+                    // `as_override_document` on purpose; report it as such
+                    // instead of listing it as a divergence it is not.
+                    let same = default_str.as_deref() == Some(live_str.as_str());
+                    out.push(ConfigOverride {
+                        path: path.to_string(),
+                        live: live_str,
+                        default: default_str,
+                        money_key: is_money,
+                        diverges: !same,
+                    });
+                }
+            }
+        }
+
+        let over = self.as_override_document()?;
+        let default = serde_yaml_ng::to_value(Self::default())?;
+        let mut out = Vec::new();
+        walk(&over, Some(&default), "", &mut out);
+        Ok(out)
     }
 
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {

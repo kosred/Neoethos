@@ -15,12 +15,13 @@
 # Running them as one command would burn hours of card time on a discovery run
 # launched from a build nobody had read.
 #
-# THE CONFIG MIGRATION IS NOT HERE ANY MORE. It rewrites the only file a run
-# reads, it calls Read-Host by design, and it belongs to the "one config" work
-# that happens BEFORE the card is rented:
-#     pwsh -File scripts/migrate_live_config.ps1          # report, read the diff
-#     pwsh -File scripts/migrate_live_config.ps1 -Apply   # then apply
-# Stage A refuses to start if the store still carries the pre-migration values.
+# NORMALIZING THE STORE IS NOT DONE HERE. It rewrites the only file a run reads,
+# and it belongs to the "one config" work that happens BEFORE the card is rented:
+#     neoethos-cli config normalize            # report: every override vs its default
+#     neoethos-cli config normalize --write    # back up, collapse, verify round-trip
+# After that the store carries OVERRIDES ONLY, so every default improved later
+# arrives on its own instead of being shadowed by a frozen copy of an older one.
+# Stage A refuses to start if the store still carries the pre-normalize values.
 #
 # HOST REQUIREMENTS, learned the expensive way:
 #   - AMD host. Building features on an Intel Xeon SIGILLs.
@@ -105,10 +106,10 @@ if [ -f "$STORE" ]; then
   grep -qE '^\s*prefilter_top_k:\s*50\s*$'                 "$STORE" && { echo "STALE: prefilter_top_k is 50 against a ~1795-column vocabulary"; stale=1; }
   if [ "$stale" = "1" ]; then
     echo
-    echo "The migration has not been applied to this store. Run it on the dev box:"
-    echo "    pwsh -File scripts/migrate_live_config.ps1          # read the diff"
-    echo "    pwsh -File scripts/migrate_live_config.ps1 -Apply"
-    [ "$STAGE" = "search" ] && fail "refusing to search under pre-migration values — the answer would be about the config, not the market"
+    echo "This store was never normalized. Run it on the dev box:"
+    echo "    neoethos-cli config normalize            # read the report"
+    echo "    neoethos-cli config normalize --write    # back up, collapse, verify"
+    [ "$STAGE" = "search" ] && fail "refusing to search under pre-normalize values — the answer would be about the config, not the market"
     echo "(stage cuda continues: a CUDA build does not depend on these.)"
   fi
 fi

@@ -76,8 +76,9 @@ can move without editing that table.
 
 ### 4. The operator's live store carries overrides only
 
-It is the only file a run reads. It is migrated by
-`scripts/migrate_live_config.ps1`, never by hand and never by a startup step.
+It is the only file a run reads. It is collapsed to overrides by
+`neoethos-cli config normalize --write`, never by hand and never by a startup
+step.
 
 ---
 
@@ -186,13 +187,15 @@ position's own stop distance.
 
 ## Running the migration
 
-```powershell
-# 1. Report only. Nothing is written. Read this first.
-pwsh scripts/migrate_live_config.ps1
+```bash
+# 1. Report only. Nothing is written. Read this first: one row per key you
+#    override, beside the default it shadows, money keys marked.
+neoethos-cli config normalize
 
-# 2. Apply, interactively: backs up, shows the diff, asks per section,
-#    asks per money item, and asks once more before writing.
-pwsh scripts/migrate_live_config.ps1 -Apply
+# 2. Apply: backs the store up, rewrites it carrying ONLY what diverges, then
+#    reloads it and RESTORES THE BACKUP unless the reload is byte-identical in
+#    effect. Money keys are written even when they equal the default.
+neoethos-cli config normalize --write
 ```
 
 There is deliberately no `-Force` and no `-Yes`. The backup is timestamped and

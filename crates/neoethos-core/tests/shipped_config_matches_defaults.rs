@@ -203,24 +203,9 @@ const ROOT_REGISTERED: &[(&str, &str, &str)] = &[
 
 /// Divergences in `%LOCALAPPDATA%\neoethos\config.yaml` — the only file a run
 /// reads. Every entry here is something the OPERATOR chose or inherited, and
-/// every one is surfaced by `scripts/migrate_live_config.ps1` for him to
+/// every one is surfaced by `neoethos-cli config normalize` for him to
 /// sanction. Nothing in this list is corrected by code.
 const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
-    (
-        "models.prop_search_min_payoff_ratio",
-        "0.0",
-        "MONEY. 0.0 means THE PAYOFF FLOOR IS OFF — the state that let the search buy trade \
-         volume with no payoff margin. Default is now 2.0 (reject any strategy whose realized \
-         average win is under 2x its average loss). His file predates the floor.",
-    ),
-    (
-        "models.discovery_runtime.prefilter_top_k",
-        "50",
-        "MONEY-ADJACENT. At 50 the base feature set collapses from 217 columns to roughly 64 \
-         and the SMC, session and footprint families die first. This is the exact key the old \
-         version of this test was written to protect, and it has been live at 50 the whole \
-         time because that test could not see this file.",
-    ),
     (
         "models.discovery_runtime.prefilter_insample_frac",
         "0.7",
@@ -228,59 +213,14 @@ const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
          changed.",
     ),
     (
-        "models.require_walkforward_for_export",
-        "false",
-        "MONEY. The out-of-sample EXPORT GATE is OFF. Matches the repo's 2026-06-06 mandate, \
-         so this is consistent rather than drifted — but it is the gate that decides whether an \
-         in-sample-overfit strategy can reach live money, so it is listed with the money items.",
-    ),
-    (
-        "models.prop_firm_min_pass_rate",
-        "0.0",
-        "Ranking-only, per the same mandate. Consistent with the repo profile.",
-    ),
-    (
         "risk.max_portfolio_risk",
-        "0.0",
-        "MONEY. Under today's reading this is NO CAP AT ALL, not 'no risk'. Being turned into \
-         a loud startup error naming both readings rather than silently re-interpreted, because \
-         picking either meaning changes how much of the account can be at risk at once.",
-    ),
-    (
-        "risk.trailing_enabled",
-        "true",
-        "MONEY. This is the ORPHANED RiskConfig copy. He also hand-tuned \
-         trailing_atr_multiplier: 0.4 and trailing_be_trigger_r: 0.1 here — deliberate values \
-         that move nothing, because the search reads models.exit_policy and live execution \
-         trails unconditionally.",
-    ),
-    (
-        "models.discovery_runtime.adaptive_thresholds",
-        "false",
-        "The static coarse-threshold ladder documents itself as calibrated for z-score \
-         normalised features, while raw magnitudes span ~1e5:1 — so a 0.35 threshold is \
-         unreachable for an ATR term and always-on for an RSI term. Default is now true. \
-         Changing it changes WHAT IS SEARCHED, so it is reported, not corrected.",
-    ),
-    (
-        "models.data_runtime.normalize_features",
-        "false",
-        "The other half of the same defect: the GA's 5:1 weight ladder cannot reorder feature \
-         terms that differ by 1e5, so a multi-indicator gene equalled its single \
-         largest-magnitude term. Default is now true. Anything fitted on the raw cube must be \
-         retrained, which is why this is his decision and not a migration's.",
-    ),
-    (
-        "models.cpcv_max_rows",
-        "0",
-        "0 = UNBOUNDED. CPCV is the heaviest serial validation in the run; Default is 200000. \
-         Reported because 'unbounded' is a runtime and memory decision, not a correctness one.",
-    ),
-    (
-        "system.multi_resolution_enabled",
-        "true",
-        "On, matching the Default, against the repo profile's false. Recorded on both sides so \
-         the disagreement is visible from either end.",
+        "0.34",
+        "MONEY. Set 2026-08-10, and the only live divergence here that moves live sizing. The \
+         store carried 0.0 — and so does the DEFAULT, which is the finding: on a knob named \
+         max_ that reads as NO CAP AT ALL, and it is the shipped behaviour everywhere rather \
+         than anything the operator chose. 0.34 is the risky profile's cap and is strictly \
+         safer, putting a ceiling where there was none. Written explicitly, never inherited, \
+         so it cannot move because a default moves.",
     ),
     (
         "models.regime_router_enabled",
@@ -586,9 +526,9 @@ fn the_live_store_still_loads() {
         &path,
         "Remedy: add the key to `load_seal::RETIRED_KEYS` in config.rs if a past release wrote \
          it (it will then be named at WARN and ignored), or restore the field it names. If it \
-         is a typo, run `pwsh scripts/migrate_live_config.ps1`, which backs the file up first, \
-         shows the full diff before writing, and refuses to run unattended. Do NOT hand-edit \
-         the live store.",
+         is a typo, run `neoethos-cli config normalize --write`, which backs the file up first, \
+         prints every override beside the default it shadows, and restores the backup unless \
+         the rewritten file reloads to identical settings. Do NOT hand-edit the live store.",
     );
 }
 
@@ -699,7 +639,7 @@ fn prefilter_top_k_default_is_the_shipped_240_not_the_old_50() {
         "the code default for prefilter_top_k must be 240. At 50 the base feature set collapses \
          from 217 columns to roughly 64 and the SMC, session and footprint families are the \
          first to go. NOTE the operator's live store still carries 50 — that is his to change, \
-         and scripts/migrate_live_config.ps1 puts it in front of him."
+         and `neoethos-cli config normalize` puts it in front of him."
     );
 }
 
@@ -798,8 +738,8 @@ const PROFILE_HEADER: &str = "\
 #   * desktop/src-tauri/resources/config.yaml is GENERATED from those defaults
 #     and fails the build if it drifts.
 #   * The operator's store (%LOCALAPPDATA%\\neoethos\\config.yaml) is the ONLY
-#     file a run reads, and carries HIS overrides only. Migrate it with
-#     scripts/migrate_live_config.ps1 — never by hand, never unattended.
+#     file a run reads, and carries HIS overrides only. Convert it with
+#     `neoethos-cli config normalize --write` — never by hand.
 #   * THIS FILE is read by NOTHING unless you point $CONFIG_FILE at it.
 #
 # HOW TO RUN A LOCAL EXPERIMENT WITH A DIFFERENT SETTING:

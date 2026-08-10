@@ -13,8 +13,8 @@
 #   * desktop/src-tauri/resources/config.yaml is GENERATED from those defaults
 #     and fails the build if it drifts.
 #   * The operator's store (%LOCALAPPDATA%\neoethos\config.yaml) is the ONLY
-#     file a run reads, and carries HIS overrides only. Migrate it with
-#     scripts/migrate_live_config.ps1 — never by hand, never unattended.
+#     file a run reads, and carries HIS overrides only. Convert it with
+#     `neoethos-cli config normalize --write` — never by hand.
 #   * THIS FILE is read by NOTHING unless you point $CONFIG_FILE at it.
 #
 # HOW TO RUN A LOCAL EXPERIMENT WITH A DIFFERENT SETTING:

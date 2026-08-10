@@ -16,7 +16,7 @@
 #
 # The operator's live store (%LOCALAPPDATA%\neoethos\config.yaml) is the only
 # file a run actually reads. It carries OVERRIDES ONLY. Migrate it with
-# scripts/migrate_live_config.ps1 — never by hand, never unattended.
+#   neoethos-cli config normalize --write     — never by hand.
 # ============================================================================
 # neoethos-generated-defaults: v1
 system:

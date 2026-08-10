@@ -178,8 +178,16 @@ is the sentence a future reader will reason from.
 The 08-09 ledger cites `config.yaml:NNN` throughout. As of `b763ca2f` the repo root
 `config.yaml` **is read by nothing** unless `$CONFIG_FILE` points at it
 (`config.rs:3660-3689`). The only file a run opens is
-`%LOCALAPPDATA%\neoethos\config.yaml`. I read it. It is dated **2026-07-31** and
-`scripts/migrate_live_config.ps1` has not been run against it.
+`%LOCALAPPDATA%\neoethos\config.yaml`. I read it. It was dated **2026-07-31** and had
+never been reconciled against the defaults.
+
+> **CLOSED 2026-08-10.** The store was collapsed with `neoethos-cli config normalize
+> --write`: 509 lines -> 44 overrides, 57 retired keys dropped, round-trip verified. The
+> root cause was not the individual values — it was that an older build SAVED A FULL
+> SNAPSHOT, so his file repeated every default of its own era and shadowed every default
+> improved since. Patching values would have reproduced the same failure with fresher
+> numbers. `scripts/migrate_live_config.ps1` has been DELETED; the command replaces it.
+
 
 What that file says, against the code as it stands today:
 
@@ -213,9 +221,10 @@ What that file says, against the code as it stands today:
 
 **The recount's plainest sentence: the money-path number improved from 47 to 28 in the
 code, and the two settings that matter most on his own disk — the payoff floor and the
-portfolio risk cap — are both switched off in the file the code reads.** Running
-`scripts/migrate_live_config.ps1` is the cheapest money action available today, and it must
-be run before the next card run, not after.
+portfolio risk cap — were both switched off in the file the code reads.** Collapsing the
+store was the cheapest money action available, and it is DONE (2026-08-10): the payoff
+floor now inherits 2.0 and `max_portfolio_risk` is written explicitly at 0.34, because on
+that knob 0.0 is the DEFAULT too and means NO CAP AT ALL.
 
 ---
 
@@ -269,8 +278,9 @@ be run before the next card run, not after.
 
 ## 8. THE NEXT WAVE, RE-DERIVED FROM THIS RECOUNT
 
-1. **Run `scripts/migrate_live_config.ps1`.** §5. It is the only action that changes what
-   the next run actually does. Nothing else on this list competes with it.
+1. ~~**Collapse the live store.**~~ **DONE 2026-08-10** via `neoethos-cli config
+   normalize --write`. §5. It was the only action that changed what the next run actually
+   does, and it is the one the whole list was waiting on.
 2. **`autonomous.rs:74` — pass `replay_engine_config`, or delete the Replay button.** §4.1.
    The CLI already proves the shape.
 3. **`prototype_a_engine.rs:170/:172` — the two `== 0` sentinels.** One line. It was on

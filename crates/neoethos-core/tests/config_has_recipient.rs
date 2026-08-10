@@ -404,6 +404,10 @@ struct ConfigModel {
     installs: BTreeMap<String, BTreeSet<String>>,
     /// Structs reachable from `Settings` by field traversal.
     reachable: BTreeSet<String>,
+    /// Structs whose derive list contains `Deserialize` — the only ones serde
+    /// can build from the operator's YAML, and therefore the only ones that
+    /// can carry a knob he sets.
+    deserializable: BTreeSet<String>,
 }
 
 impl ConfigModel {
@@ -463,9 +467,17 @@ fn base_type(ty: &str) -> String {
 fn parse_config_model(src: &str) -> ConfigModel {
     let mut model = ConfigModel::default();
     let mut current: Option<(String, usize)> = None;
+    // Attributes seen since the last item, so a struct's derive list is known
+    // by the time its `pub struct` line is read. Multi-line derives are why
+    // this accumulates instead of inspecting the previous line.
+    let mut pending_attrs = String::new();
     for line in src.lines() {
         let trimmed_start = line.trim_start();
         let indent = line.len() - trimmed_start.len();
+        if current.is_none() && trimmed_start.starts_with('#') {
+            pending_attrs.push_str(trimmed_start);
+            continue;
+        }
         if let Some(rest) = trimmed_start.strip_prefix("pub struct ") {
             let name = rest
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -473,9 +485,18 @@ fn parse_config_model(src: &str) -> ConfigModel {
                 .unwrap_or_default();
             if !name.is_empty() && rest.contains('{') {
                 model.structs.entry(name.to_string()).or_default();
+                if pending_attrs.contains("Deserialize") {
+                    model.deserializable.insert(name.to_string());
+                }
                 current = Some((name.to_string(), indent));
             }
+            pending_attrs.clear();
             continue;
+        }
+        if current.is_none() && !trimmed_start.is_empty() && !trimmed_start.starts_with("///") {
+            // Any other item ends the attribute run; without this a derive on
+            // an enum would be credited to the next struct below it.
+            pending_attrs.clear();
         }
         if trimmed_start.starts_with('}')
             && current.as_ref().is_some_and(|(_, open)| indent <= *open)
@@ -1633,25 +1654,69 @@ fn every_settings_field_reaches_a_qualified_consumer() {
     // Nothing in config.rs that CARRIES OPERATOR KNOBS may sit outside the
     // Settings graph unnoticed.
     //
-    // The filter on `pub` fields is load-bearing, not a loophole. This check
-    // exists so an operator-settable struct cannot be added and quietly go
-    // unchecked. A struct with no `pub` fields carries nothing an operator can
-    // set — `ConfigProvenance` (which records WHICH file a Settings came from,
-    // fields `source`/`path`, both private) is the case that forced this: it is
+    // Two filters, both load-bearing, neither a loophole.
+    //
+    // `pub` fields: a struct with none carries nothing an operator can set.
+    // `ConfigProvenance` (which records WHICH file a Settings came from, fields
+    // `source`/`path`, both private) is the case that forced this: it is
     // internal machinery of the single load path, deliberately unreachable from
-    // `Settings`, and flagging it says nothing about knob coverage. If a struct
-    // ever gains a `pub` field it re-enters this assertion immediately, which is
-    // the property worth keeping.
+    // `Settings`, and flagging it says nothing about knob coverage.
+    //
+    // `Deserialize`: a knob is a value serde reads out of the operator's YAML.
+    // A struct serde cannot construct from that file is incapable of carrying
+    // one, whatever its fields say. `ConfigOverride` is the case that forced
+    // this: it REPORTS the operator's store back to him — one row per key he
+    // overrides, beside the default it shadows — so it flows out of the config
+    // system, never in. Requiring it to hang off `Settings` would mean adding a
+    // report type to the settings graph, which is the opposite of correct.
+    //
+    // Both are properties of the declaration, not names on a list: give either
+    // struct a `pub` field and a `Deserialize` derive and it re-enters this
+    // assertion the same second. That is what keeps this from being an
+    // allowlist someone can quietly append to.
+    // The `Deserialize` filter is only safe if it actually finds the derive.
+    // A parser that found none would turn the assertion below into a no-op and
+    // this test would go green on a config.rs with knobs nobody reads. Every
+    // SUB-struct reachable from `Settings` is parsed out of the operator's YAML,
+    // so every one of them must be detected — which makes this check fail loudly
+    // the moment the attribute scan breaks, instead of failing silently open.
+    //
+    // `Settings` itself is the deliberate exception and derives Serialize only:
+    // that missing `Deserialize` IS the seal. Its parser is the inherent one
+    // `#[serde(remote = "Self")]` emits on the wire type, reachable exclusively
+    // through the single load path, which is what makes a second load path a
+    // compile error. If this root ever regains a `Deserialize` derive, that seal
+    // is gone and `config_single_load_path` says so in its own words.
+    let undetected: Vec<&String> = model
+        .reachable
+        .iter()
+        .filter(|name| {
+            name.as_str() != "Settings"
+                && !model.deserializable.contains(*name)
+                && model.structs.get(*name).is_some_and(|f| !f.is_empty())
+        })
+        .collect();
+    assert!(
+        undetected.is_empty(),
+        "the Deserialize scan missed struct(s) that Settings demonstrably parses from YAML: \
+         {undetected:?}. The attribute parser is broken, and the orphan check below would \
+         have passed vacuously."
+    );
+
     let orphan_structs: Vec<&String> = model
         .structs
         .iter()
-        .filter(|(name, fields)| !model.reachable.contains(*name) && !fields.is_empty())
+        .filter(|(name, fields)| {
+            !model.reachable.contains(*name)
+                && !fields.is_empty()
+                && model.deserializable.contains(*name)
+        })
         .map(|(name, _)| name)
         .collect();
     assert!(
         orphan_structs.is_empty(),
-        "config.rs declares struct(s) unreachable from `Settings`, so their fields are \
-         unchecked by this test: {orphan_structs:?}"
+        "config.rs declares deserializable struct(s) unreachable from `Settings`, so their \
+         fields are unchecked by this test: {orphan_structs:?}"
     );
 
     let index = scan_workspace(&model);
