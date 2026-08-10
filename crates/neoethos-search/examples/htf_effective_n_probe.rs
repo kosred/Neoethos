@@ -503,5 +503,101 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── EVIDENCE-WEIGHTED COMPARISON ─────────────────────────────────────────
+    //
+    // |r| alone cannot compare timeframes: a base column's |r| rests on ~138,000
+    // independent bars, an H4 column's on ~2,800 (or, for a sparse event column,
+    // on 15). The comparable quantity is the t statistic against the column's
+    // OWN effective n, and the bar it must clear is a Bonferroni threshold over
+    // the whole cube — because the prefilter is running 5,838 simultaneous
+    // hypothesis tests and keeping the winners, which is precisely the setting
+    // where an uncorrected max is meaningless.
+    let z_bonf = {
+        // Two-sided 5% family-wise over n_cols tests. Inverse normal via a
+        // bisection on erfc — no new dependency, and 40 iterations is exact to
+        // well past the digits printed.
+        let target = 0.05 / (2.0 * n_cols as f64); // upper-tail probability
+        let (mut lo, mut hi) = (0.0f64, 12.0f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            // upper tail = 0.5 * erfc(mid / sqrt(2)); erfc via continued
+            // fraction is overkill — use the complementary error function from
+            // statrs, already a dependency of this crate.
+            let tail = 1.0 - statrs::function::erf::erf(mid / std::f64::consts::SQRT_2);
+            let tail = 0.5 * tail;
+            if tail > target { lo = mid } else { hi = mid }
+        }
+        0.5 * (lo + hi)
+    };
+    println!("\n═══ EVIDENCE-WEIGHTED — t = |r|·sqrt(n_eff-2)/sqrt(1-r²), n_eff = distinct runs ═══");
+    println!("Bonferroni |z| threshold for {n_cols} simultaneous tests at family-wise 5% = {z_bonf:.3}");
+
+    let t_of = |r: f64, n: usize| -> f64 {
+        if !(r.is_finite()) || n < 3 || r.abs() >= 1.0 {
+            return 0.0;
+        }
+        r.abs() * ((n - 2) as f64).sqrt() / (1.0 - r * r).sqrt()
+    };
+
+    for (label, pick) in [("r_dense", 0usize), ("r_runs", 1usize)] {
+        println!("\n-- t from {label} --");
+        println!(
+            "{:<6} {:>6} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}",
+            "TF", "cols", "t p50", "t p90", "t max", "n_eff p50", "t>=thresh", "share"
+        );
+        let mut ts_all: Vec<(usize, f64)> = Vec::new();
+        for (tf, idxs) in &by_tf {
+            let mut ts: Vec<f64> = Vec::new();
+            let mut neff: Vec<f64> = Vec::new();
+            let mut pass = 0usize;
+            for i in idxs {
+                let (r, ok) = if pick == 0 {
+                    (rows[*i].r_dense, rows[*i].dense_rankable)
+                } else {
+                    (rows[*i].r_runs, rows[*i].runs_rankable)
+                };
+                if !ok || names[*i].starts_with("regime_") {
+                    continue;
+                }
+                let t = t_of(r, rows[*i].runs_min);
+                if t >= z_bonf {
+                    pass += 1;
+                }
+                ts.push(t);
+                neff.push(rows[*i].runs_min as f64);
+                ts_all.push((*i, t));
+            }
+            let n = ts.len();
+            match (quantiles(ts), quantiles(neff)) {
+                (Some((_, _, _, p50, p90, mx)), Some((_, _, _, nmed, _, _))) => println!(
+                    "{:<6} {:>6} {:>10.3} {:>10.3} {:>10.3} {:>10.0} {:>12} {:>13.1}%",
+                    tf,
+                    n,
+                    p50,
+                    p90,
+                    mx,
+                    nmed,
+                    pass,
+                    100.0 * pass as f64 / n.max(1) as f64
+                ),
+                _ => println!("{tf:<6} (none)"),
+            }
+        }
+        ts_all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut top_by_tf: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, _) in ts_all.iter().take(top_k) {
+            *top_by_tf.entry(tf_of(&names[*i])).or_insert(0) += 1;
+        }
+        println!("top-{top_k} membership by TF when ranked on t: {top_by_tf:?}");
+        println!("top 15 by t:");
+        for (i, t) in ts_all.iter().take(15) {
+            let r = if pick == 0 { rows[*i].r_dense } else { rows[*i].r_runs };
+            println!(
+                "  {:<48} t={:>9.3}  |r|={:>8.6}  n_eff={}",
+                names[*i], t, r, rows[*i].runs_min
+            );
+        }
+    }
+
     Ok(())
 }

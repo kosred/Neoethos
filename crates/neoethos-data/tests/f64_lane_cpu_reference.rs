@@ -46,8 +46,17 @@ use vector_ta::utilities::enums::Kernel;
 const CLAIMED: &[&str] = &[
     // batch 1
     "sma", "ema", "rsi", "roc", "mom", "atr", "adx", "willr", "cci", "mfi",
-    // batch 2 — the reachable half of hpc_ta::MULTI_PERIOD_IDS, less `vwap`
+    // batch 2 — the reachable half of hpc_ta::MULTI_PERIOD_IDS
     "tsi", "obv", //
+    // 2026-08-10: `vwap` and `wilders` promoted out of WITHHELD. They were held
+    // because Kernel::Scalar and Kernel::Auto disagreed by 1 ULP, so there was no
+    // single CPU oracle to be in parity WITH. vector-ta fixed that at the source:
+    // the divergence was never in the recurrence — all four wilders paths compute
+    // the identical one-rounding `y = (x0 - y).mul_add(alpha, y)` — it was in the
+    // WARM-UP SEED, summed 4-wide by scalar, 8- and 16-wide by AVX. The 4-wide
+    // scalar association was chosen as the oracle with a written argument, the
+    // vector paths now call it, and `vwap_row_scalar_pv` was deleted outright.
+    "vwap", "wilders", //
     // batch 2 — moving averages, less `wilders`
     "wma", "smma", "dema", "tema", "zlema", "vwma", //
     // batch 2 — volatility / directional / volume
@@ -194,7 +203,20 @@ fn first_difference(a: &[f64], b: &[f64]) -> Option<(usize, f64, f64)> {
 /// disagree for them. Measured, not assumed — see
 /// [`withheld_indicators_still_diverge`], which fails when a divergence
 /// DISAPPEARS so the entry can be promoted rather than quietly kept withheld.
-const WITHHELD: &[&str] = &["vwap", "wilders"];
+/// Empty, and that is the point.
+///
+/// It held `vwap` and `wilders` until 2026-08-10, and
+/// `withheld_indicators_still_diverge` below is what emptied it — the test fails
+/// in BOTH directions, so when vector-ta fixed the scalar/AVX seed association
+/// upstream, the assertion fired and its own message spelled out the four steps.
+/// vector-ta had done steps 1 and 4 (registered both in F64_KERNELS, emptied
+/// WITHHELD_PENDING_CPU_SELF_CONSISTENCY); this crate had never done 2 and 3.
+/// The kernels were sitting written, compiled and unreachable in between.
+///
+/// Leave the list and the test in place. This is the half of the record that
+/// normally rots: a kernel gets disabled, the cause is fixed upstream months
+/// later, and nobody notices the work is ready.
+const WITHHELD: &[&str] = &[];
 
 #[test]
 fn scalar_and_auto_agree_for_every_claimed_indicator() {
