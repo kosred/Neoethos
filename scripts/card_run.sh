@@ -133,6 +133,34 @@ done
 grep -E '^test result: FAILED' "$LOGS/05-tests.log" > "$LOGS/05-failures.txt" || true
 [ -s "$LOGS/05-failures.txt" ] && echo "SOME SUITES FAILED — $LOGS/05-failures.txt (continuing to the run anyway; a red unit test does not invalidate the device measurement)"
 
+# ── 5b. THE BURN-CUDA A/B — the gate on model scale ──────────────────────────
+# burn-cuda-backend is deliberately EXCLUDED from the gpu-cuda aggregate, on a
+# 2026-06-10 A6000 measurement: 14 real epochs in 74 minutes for one combination,
+# with burn-tensor dtype panics, against ~17 minutes TOTAL on burn-ndarray CPU.
+# That decision is documented in neoethos-models/Cargo.toml and must NOT be
+# overturned by argument.
+#
+# But kernel-launch overhead is a FIXED cost and the work has grown by orders of
+# magnitude since — 1,795 feature columns now, against a few hundred then — and a
+# 2026-08-01 observation recorded a training run sitting at GPU 0% / 1 MiB for
+# over an hour at 799,880 rows. The ratio may have inverted. This step is the
+# only thing that can say so, and it is the gate on whether a ~2B ensemble is
+# reachable at all: today every burn neural model trains on the CPU, so scale is
+# blocked regardless of which card is rented.
+step=5b; say "burn-cuda A/B — does the neural side belong on the card yet"
+if [ "${SKIP_BURN_AB:-0}" != "1" ]; then
+  for variant in "without:$FEATURES" "with:$FEATURES,burn-cuda-backend"; do
+    name="${variant%%:*}"; feats="${variant##*:}"
+    echo "--- burn $name cuda ---"
+    /usr/bin/time -f "%e s wall  %M KB peak"       cargo test --release -j "${JOBS:-8}" -p neoethos-models --features "$feats"         burn_ -- --nocapture > "$LOGS/05b-burn-$name.log" 2>&1
+    tail -3 "$LOGS/05b-burn-$name.log"
+  done
+  echo "compare wall time and peak memory in $LOGS/05b-burn-*.log"
+  echo "If WITH is now faster, add burn-cuda-backend to the gpu-cuda aggregate and"
+  echo "say the 2026-06-10 measurement expired. If it is still slower, leave the"
+  echo "exclusion and record the new number beside the old one."
+fi
+
 # ── 6. THE RUN. M15, end to end ──────────────────────────────────────────────
 step=6; say "M15 discovery run"
 SYMBOL="${SYMBOL:-EURUSD}"

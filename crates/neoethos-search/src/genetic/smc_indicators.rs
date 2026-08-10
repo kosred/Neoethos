@@ -1030,8 +1030,19 @@ mod column_binding_tests {
     }
 
     /// End to end on real EURUSD M1 bars: a frame of nothing but decoys must
-    /// produce EXACTLY the bar-derived arrays. Any capture would perturb at
-    /// least one of the eleven.
+    /// leave every one of the eleven arrays exactly where the bars put them.
+    /// Any capture would perturb at least one of them.
+    ///
+    /// The baseline is NOT `derive_smc_arrays` verbatim, and this is not a
+    /// concession to make a test pass. `build_smc_arrays` ends with a step
+    /// that reads the arrays it is already holding rather than the frame:
+    /// inducement is promoted to 1 wherever DISPLACEMENT is non-zero. With
+    /// nothing bound those arrays are the derived ones, so the promotion
+    /// still fires and `build != derive` for inducement — which has been true
+    /// since long before the exact-binding change (verified present unchanged
+    /// at `6c4e9390^`). The baseline therefore applies that same promotion
+    /// explicitly. Written out here rather than borrowed from the function
+    /// under test, so a leak cannot hide inside a shared helper.
     #[test]
     fn build_from_a_decoy_only_frame_equals_the_bar_derived_arrays() {
         let ohlcv = ctrader_sample_ohlcv();
@@ -1052,7 +1063,19 @@ mod column_binding_tests {
         let frame = FeatureFrame::from_array(ts, cols, data);
 
         let built = build_smc_arrays(&frame, &ohlcv);
-        let derived = derive_smc_arrays(&ohlcv);
+        let mut derived = derive_smc_arrays(&ohlcv);
+        // The frame-independent tail step of `build_smc_arrays`, restated.
+        let disp_baseline = derived.10.clone();
+        for (disp, slot) in disp_baseline.iter().zip(derived.5.iter_mut()) {
+            if *disp != 0 {
+                *slot = 1;
+            }
+        }
+        assert!(
+            disp_baseline.iter().any(|d| *d != 0),
+            "the promotion step is vacuous on these bars — the inducement \
+             assertion below would then prove nothing"
+        );
         assert_eq!(built.0, derived.0, "ob leaked");
         assert_eq!(built.1, derived.1, "fvg leaked");
         assert_eq!(built.2, derived.2, "liq leaked");
