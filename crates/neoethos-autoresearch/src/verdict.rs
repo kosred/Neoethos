@@ -385,7 +385,15 @@ pub enum StopReason {
 /// 3. Otherwise continue — the wall-clock and sweep budgets belong to the
 ///    runner, which owns the clock.
 pub fn decide(session: &Session, _goals: &GoalSet, th: &JudgeThresholds) -> Decision {
-    if let Some(candidate) = promotion_candidate(session)
+    // A candidate whose configuration cannot be NAMED stops the session. It is
+    // not skipped and it is not promoted under a guessed identity: the one
+    // out-of-sample touch is spent on a `config_hash`, and spending it on the
+    // wrong one is unrecoverable.
+    let candidate = match promotion_candidate(session) {
+        Ok(candidate) => candidate,
+        Err(detail) => return Decision::Stop(StopReason::InfrastructureAbort { detail }),
+    };
+    if let Some(candidate) = candidate
         && session.oos_touches_spent < th.oos_touches_total
     {
         return Decision::Promote(candidate);
@@ -401,7 +409,16 @@ pub fn decide(session: &Session, _goals: &GoalSet, th: &JudgeThresholds) -> Deci
 /// Only a `ScreenResult::Passed` qualifies: `Failed` and `Unavailable` are both
 /// failures, and a candidate drawn from either would spend the one out-of-sample
 /// touch on something the in-sample judge already refused.
-pub fn promotion_candidate(session: &Session) -> Option<PromotionCandidate> {
+///
+/// **`Err` is a wiring fault, never "no candidate".** The screen vector is keyed
+/// by SLOT while `per_search` is keyed by POSITION, and the two differ whenever
+/// a proposal was refused before it ran. Indexing one with the other and then
+/// papering over the miss with `unwrap_or_default()` produced either a DIFFERENT
+/// configuration's hash or an empty string — on the one resource the session
+/// cannot buy twice. The lookup is now by slot and a miss is a named refusal
+/// that stops the session, exactly as `runner.rs` refuses the analogous
+/// `unwrap_or(0)` for the champion slot.
+pub fn promotion_candidate(session: &Session) -> Result<Option<PromotionCandidate>, String> {
     let mut best: Option<PromotionCandidate> = None;
     for sweep in &session.sweeps {
         let Some(screens) = session.screens_of(sweep.sweep) else {
@@ -418,6 +435,17 @@ pub fn promotion_candidate(session: &Session) -> Option<PromotionCandidate> {
             else {
                 continue;
             };
+            let Some(record) = sweep.per_search.iter().find(|p| p.slot == slot) else {
+                return Err(format!(
+                    "{} slot {slot} carries a PASSING screen but no search record names that \
+                     slot, so the configuration the out-of-sample touch would be spent on cannot \
+                     be identified. The sweep recorded {} search record(s), for slot(s) {:?}. \
+                     The touch is not spent on a guess and it is not silently skipped.",
+                    sweep.sweep,
+                    sweep.per_search.len(),
+                    sweep.per_search.iter().map(|p| p.slot).collect::<Vec<_>>()
+                ));
+            };
             if best
                 .as_ref()
                 .map(|b| *e_screen_pess > b.e_screen_pess)
@@ -426,11 +454,7 @@ pub fn promotion_candidate(session: &Session) -> Option<PromotionCandidate> {
                 best = Some(PromotionCandidate {
                     sweep: sweep.sweep,
                     slot,
-                    config_hash: sweep
-                        .per_search
-                        .get(slot)
-                        .map(|p| p.config_hash.clone())
-                        .unwrap_or_default(),
+                    config_hash: record.config_hash.clone(),
                     e_screen_pess: *e_screen_pess,
                     dsr: Some(*dsr),
                     pbo_sweep: *pbo_sweep,
@@ -440,7 +464,7 @@ pub fn promotion_candidate(session: &Session) -> Option<PromotionCandidate> {
             }
         }
     }
-    best
+    Ok(best)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,7 +996,91 @@ mod tests {
         // PASSED. `Failed` and `Unavailable` are both failures, and a candidate
         // drawn from either would spend the window on something the in-sample
         // judge already refused.
-        assert!(promotion_candidate(&empty_session()).is_none());
+        assert!(
+            promotion_candidate(&empty_session())
+                .expect("no wiring fault")
+                .is_none()
+        );
+    }
+
+    /// C3, second half. A compacted sweep — slots 1 and 3 refused before they
+    /// ran — leaves `per_search` keyed by POSITION and `screens` keyed by SLOT.
+    /// The old code indexed one with the other and swallowed the miss with
+    /// `unwrap_or_default()`, so the one out-of-sample touch was spent under a
+    /// DIFFERENT configuration's hash, or under an empty string.
+    #[test]
+    fn a_passing_slot_is_resolved_by_slot_and_never_by_position() {
+        use crate::journal::{SearchRecord, SweepKind};
+        use crate::session::{SweepOutcome, SweepSummary};
+
+        let record = |slot: usize, hash: &str| SearchRecord {
+            slot,
+            config_hash: hash.to_string(),
+            trials_offered: 10,
+            survivors: 1,
+            e_screen_pess: Some(0.5),
+            n_trades: 400,
+            dsr: Some(0.99),
+            pbo: Some(0.2),
+            dsr_refusal: None,
+            pbo_refusal: None,
+            cost_band: crate::journal::CostBandCounts::default(),
+            rejections: Vec::new(),
+            streamed: true,
+            batch_columns: 0,
+            next_cursor: 0,
+            wall_ms: 1,
+            error: None,
+        };
+
+        let mut s = empty_session();
+        s.sweeps.push(SweepSummary {
+            sweep: SweepId(1),
+            kind: SweepKind::Live,
+            sweep_hash: "fnv64:sweep".to_string(),
+            trials_offered: 30,
+            outcome: SweepOutcome::Completed,
+            // Slots 0, 2 and 4 ran; 1 and 3 were refused before they ran. Slot 4
+            // therefore sits at POSITION 2.
+            per_search: vec![
+                record(0, "fnv64:h0"),
+                record(2, "fnv64:h2"),
+                record(4, "fnv64:h4"),
+            ],
+            wall_ms: 1,
+        });
+        s.apply(&crate::journal::Record::Screened {
+            sweep: SweepId(1),
+            slot: 4,
+            screen_result: ScreenResult::Passed {
+                e_screen_pess: 0.5,
+                dsr: 0.99,
+                pbo_sweep: 0.2,
+                excess_over_expected_max_per_period: 0.1,
+                n_trades: 400,
+                q_shuffle_95: 0.1,
+            },
+            failing_conjunct: None,
+        })
+        .expect("the fold accepts a screen for slot 4");
+
+        // The gap-fill must not have manufactured passes at slots 0..3.
+        let screens = s.screens_of(SweepId(1)).expect("screens");
+        assert_eq!(screens.len(), 5);
+        assert_eq!(
+            screens.iter().filter(|r| r.passed()).count(),
+            1,
+            "a gap is a refusal, not a clone of the arriving result"
+        );
+
+        let candidate = promotion_candidate(&s)
+            .expect("no wiring fault")
+            .expect("slot 4 passed");
+        assert_eq!(candidate.slot, 4);
+        assert_eq!(
+            candidate.config_hash, "fnv64:h4",
+            "positional indexing would have named slot 2's configuration"
+        );
     }
 
     #[test]

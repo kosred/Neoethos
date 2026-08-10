@@ -515,6 +515,130 @@ pub struct DeflatedSharpeReport {
     pub assumptions: Vec<String>,
 }
 
+/// `SR*` — the per-period Sharpe a candidate is expected to reach by luck alone
+/// after `trials_n` independent trials.
+///
+/// Bailey & López de Prado (2014):
+/// `SR* = sqrt(V) · [ (1−γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)) ]`
+///
+/// **One implementation.** [`deflated_sharpe`] computes it from a matrix and
+/// [`redeflate_sharpe`] recomputes it at a larger `N`; a second copy of this
+/// formula anywhere would let the two answers drift apart silently, and the
+/// whole point of the deflation is that N is not negotiable.
+fn expected_max_sharpe(
+    sharpe_variance_across_trials: f64,
+    trials_n: usize,
+) -> Result<f64, String> {
+    let n = trials_n as f64;
+    let (Some(q1), Some(q2)) = (
+        normal_ppf(1.0 - 1.0 / n),
+        normal_ppf(1.0 - 1.0 / (n * std::f64::consts::E)),
+    ) else {
+        return Err(format!(
+            "REFUSED: the expected-maximum quantiles are not representable at N={trials_n}."
+        ));
+    };
+    let sr_star = sharpe_variance_across_trials.sqrt()
+        * ((1.0 - EULER_MASCHERONI) * q1 + EULER_MASCHERONI * q2);
+    if !sr_star.is_finite() {
+        return Err(
+            "REFUSED: the expected maximum Sharpe evaluated to a non-finite value.".to_string(),
+        );
+    }
+    Ok(sr_star)
+}
+
+/// `DSR = Φ( (SR − SR*)·√(T−1) / √(1 − γ3·SR + ((γ4−1)/4)·SR²) )`
+///
+/// The champion's own moments, and the selection-adjusted benchmark it must
+/// beat. One implementation, for the same reason as [`expected_max_sharpe`].
+fn dsr_from_moments(
+    raw_sr: f64,
+    sr_star: f64,
+    skew: f64,
+    kurt: f64,
+    periods: usize,
+) -> Result<f64, String> {
+    let t = periods as f64;
+    let denom_sq = 1.0 - skew * raw_sr + ((kurt - 1.0) / 4.0) * raw_sr * raw_sr;
+    if denom_sq <= 0.0 || !denom_sq.is_finite() {
+        return Err(format!(
+            "REFUSED: the DSR variance term is {denom_sq:.6} (≤ 0) at skew={skew:.4}, \
+             kurtosis={kurt:.4}, Sharpe={raw_sr:.4}. The statistic's asymptotic variance is \
+             undefined there; a value printed anyway would be a square root of a negative number \
+             dressed up as a probability."
+        ));
+    }
+    let z = (raw_sr - sr_star) * (t - 1.0).sqrt() / denom_sq.sqrt();
+    let dsr = normal_cdf(z);
+    if !dsr.is_finite() {
+        return Err("REFUSED: the DSR evaluated to a non-finite value.".to_string());
+    }
+    Ok(dsr)
+}
+
+/// Re-deflate an existing report against a LARGER trial count, **without the
+/// matrix**.
+///
+/// `N` enters the DSR in exactly one place — through `SR*`, the expected maximum
+/// Sharpe over `N` draws. Nothing else in the statistic depends on it: the
+/// champion's raw Sharpe, its skew, its kurtosis, the period count and the
+/// cross-trial Sharpe variance are all properties of the matrix alone and are
+/// carried on the report. So the honest N can be installed after the fact, by
+/// arithmetic, and the answer is bit-for-bit what re-reading the matrix would
+/// have produced.
+///
+/// This exists because **the party that runs a search cannot know the honest
+/// N.** In a research loop the denominator is every candidate the whole session
+/// offered, and that number is not final until the session is. A search
+/// deflated against its own trial count is not deflated; it is flattered by
+/// orders of magnitude. The runner therefore re-deflates every report against
+/// the session-wide fold once that fold is known.
+///
+/// `trials_offered` is a FLOOR, never a ceiling: the result uses
+/// `max(trials_offered, report.trials_n)`, so this can only ever deflate
+/// further. There is deliberately no path here that makes a number look better.
+pub fn redeflate_sharpe(
+    report: &DeflatedSharpeReport,
+    trials_offered: usize,
+) -> Result<DeflatedSharpeReport, String> {
+    let trials_n = trials_offered.max(report.trials_n);
+    if trials_n == report.trials_n {
+        return Ok(report.clone());
+    }
+    let sr_star = expected_max_sharpe(report.sharpe_variance_across_trials, trials_n)?;
+    let dsr = dsr_from_moments(
+        report.raw_sharpe_per_period,
+        sr_star,
+        report.skewness,
+        report.kurtosis,
+        report.periods,
+    )?;
+
+    let ann = PERIODS_PER_YEAR.sqrt();
+    let mut out = report.clone();
+    let was = report.trials_n;
+    out.trials_n = trials_n;
+    out.trials_n_source = format!(
+        "trials_offered={trials_n}, installed after the fact by redeflate_sharpe (the search \
+         itself was analysed at N={was}, which is only its OWN trial count and not the honest \
+         denominator)"
+    );
+    out.expected_max_sharpe_per_period = sr_star;
+    out.expected_max_sharpe_annualised = sr_star * ann;
+    out.excess_over_expected_max_per_period = report.raw_sharpe_per_period - sr_star;
+    out.deflated_sharpe_ratio = dsr;
+    out.assumptions.push(format!(
+        "RE-DEFLATED from N={was} to N={trials_n}. N enters only through SR*, so the raw Sharpe, \
+         skew, kurtosis, period count and cross-trial Sharpe variance are unchanged and this is \
+         exactly the number a re-analysis of the matrix at N={trials_n} would give. SR* moved \
+         {:+.6} per period and the DSR moved {:+.6}.",
+        sr_star - report.expected_max_sharpe_per_period,
+        dsr - report.deflated_sharpe_ratio
+    ));
+    Ok(out)
+}
+
 /// Compute the DSR, or say why not.
 pub fn deflated_sharpe(
     matrix: &DecodedTrialMatrix,
@@ -602,40 +726,8 @@ pub fn deflated_sharpe(
         (rows, format!("rows in the matrix ({rows})"))
     };
 
-    // Bailey & López de Prado (2014), expected maximum Sharpe over N trials:
-    //   SR* = sqrt(V) * [ (1-γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e)) ]
-    let n = trials_n as f64;
-    let (Some(q1), Some(q2)) = (
-        normal_ppf(1.0 - 1.0 / n),
-        normal_ppf(1.0 - 1.0 / (n * std::f64::consts::E)),
-    ) else {
-        return Err(format!(
-            "REFUSED: the expected-maximum quantiles are not representable at N={trials_n}."
-        ));
-    };
-    let sr_star =
-        sr_var.sqrt() * ((1.0 - EULER_MASCHERONI) * q1 + EULER_MASCHERONI * q2);
-    if !sr_star.is_finite() {
-        return Err("REFUSED: the expected maximum Sharpe evaluated to a non-finite value."
-            .to_string());
-    }
-
-    // DSR = Φ( (SR − SR*)·√(T−1) / √(1 − γ3·SR + ((γ4−1)/4)·SR²) )
-    let t = periods as f64;
-    let denom_sq = 1.0 - skew * raw_sr + ((kurt - 1.0) / 4.0) * raw_sr * raw_sr;
-    if denom_sq <= 0.0 || !denom_sq.is_finite() {
-        return Err(format!(
-            "REFUSED: the DSR variance term is {denom_sq:.6} (≤ 0) at skew={skew:.4}, \
-             kurtosis={kurt:.4}, Sharpe={raw_sr:.4}. The statistic's asymptotic variance is \
-             undefined there; a value printed anyway would be a square root of a negative number \
-             dressed up as a probability."
-        ));
-    }
-    let z = (raw_sr - sr_star) * (t - 1.0).sqrt() / denom_sq.sqrt();
-    let dsr = normal_cdf(z);
-    if !dsr.is_finite() {
-        return Err("REFUSED: the DSR evaluated to a non-finite value.".to_string());
-    }
+    let sr_star = expected_max_sharpe(sr_var, trials_n)?;
+    let dsr = dsr_from_moments(raw_sr, sr_star, skew, kurt, periods)?;
 
     let ann = PERIODS_PER_YEAR.sqrt();
     let assumptions = vec![
@@ -1091,6 +1183,65 @@ impl TrialStatisticsReport {
                     .to_string(),
             ],
         }
+    }
+
+    /// Re-deflate this report against a larger, later-known trial count.
+    ///
+    /// The writer of a single search knows only how many trials IT offered. In
+    /// a research loop the honest denominator is every candidate the whole
+    /// session offered — a number that is not final until the session is — so
+    /// the party that owns that fold installs it here, afterwards.
+    ///
+    /// What changes and what does not:
+    /// * `deflated_sharpe` is recomputed at the new N (see
+    ///   [`redeflate_sharpe`]); if the recomputation refuses, the value is
+    ///   REPLACED BY THAT REFUSAL rather than left standing at the smaller N —
+    ///   a stale DSR is the flattering direction.
+    /// * `pbo` is untouched: CSCV ranks the rows of THIS matrix against each
+    ///   other and does not contain N at all.
+    /// * `trials_offered` becomes the N the report was deflated against, which
+    ///   is what a reader of this field needs in order to check the statistic.
+    ///   The per-search offered count is not lost — it lives on the search's own
+    ///   record and in the sweep's outcome record, where it is what feeds the
+    ///   fold in the first place.
+    ///
+    /// A report that carries no DSR (unreadable, or a named refusal) is stamped
+    /// and returned unchanged, so the failure a reader is shown is the real one
+    /// and not a downstream complaint about N.
+    pub fn redeflated_against(&self, trials_offered: usize) -> Self {
+        let mut out = self.clone();
+        let was = self.trials_offered;
+        out.trials_offered = trials_offered.max(self.trials_offered);
+        if out.trials_offered == was {
+            // N did not move, so neither does anything else. Returned without a
+            // note: a note claiming a re-deflation that did not happen is the
+            // same lie as a deflation that did not happen.
+            return out;
+        }
+        if let Some(d) = self.deflated_sharpe.as_ref() {
+            match redeflate_sharpe(d, out.trials_offered) {
+                Ok(redeflated) => {
+                    out.deflated_sharpe = Some(redeflated);
+                    out.deflated_sharpe_refusal = None;
+                }
+                Err(refusal) => {
+                    out.deflated_sharpe = None;
+                    out.deflated_sharpe_refusal = Some(format!(
+                        "{refusal} (raised while re-deflating from N={} to N={}; the value \
+                         computed at the smaller N is NOT reported, because a Sharpe deflated \
+                         against the wrong denominator is not a deflated Sharpe)",
+                        d.trials_n, out.trials_offered
+                    ));
+                }
+            }
+        }
+        out.notes.push(format!(
+            "Re-deflated against N={} — the trial count of the whole selection procedure, not of \
+             this search alone (this search offered {was}). PBO is unchanged: CSCV ranks this \
+             matrix's own rows and does not contain N.",
+            out.trials_offered
+        ));
+        out
     }
 
     /// Convenience for a caller that only wants to log one number each.
@@ -1602,5 +1753,95 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: TrialStatisticsReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r, "the ledger must carry the exact values");
+    }
+
+    #[test]
+    fn redeflating_a_report_equals_re_analysing_the_matrix_at_the_larger_n() {
+        // The whole justification for the analytic shortcut. A research loop
+        // cannot know its honest N until the session is over, so it installs
+        // that N afterwards — by arithmetic on the report, without the matrix.
+        // That is only legitimate if the answer is IDENTICAL to what re-reading
+        // the matrix would have produced. Asserted bit for bit, not approximated.
+        let m = build(200, 60, |i| 0.002 + 0.00002 * i as f64);
+        let at_own_count = analyse_matrix(&m, 200);
+        let at_session = analyse_matrix(&m, 25_000);
+
+        let redeflated = redeflate_sharpe(
+            at_own_count.deflated_sharpe.as_ref().expect("a DSR at N=200"),
+            25_000,
+        )
+        .expect("re-deflation at a larger N");
+        let truth = at_session.deflated_sharpe.as_ref().expect("a DSR at N=25000");
+
+        assert_eq!(redeflated.trials_n, truth.trials_n);
+        assert_eq!(
+            redeflated.expected_max_sharpe_per_period, truth.expected_max_sharpe_per_period,
+            "SR* is the ONLY place N enters; it must land on the same bits"
+        );
+        assert_eq!(
+            redeflated.excess_over_expected_max_per_period,
+            truth.excess_over_expected_max_per_period
+        );
+        assert_eq!(
+            redeflated.deflated_sharpe_ratio, truth.deflated_sharpe_ratio,
+            "the deflated Sharpe itself must be the same number"
+        );
+        // And the direction is never flattering: more trials searched means a
+        // higher bar to have cleared by luck.
+        let before = at_own_count.deflated_sharpe.as_ref().unwrap();
+        assert!(
+            truth.expected_max_sharpe_per_period > before.expected_max_sharpe_per_period,
+            "SR* must RISE with N"
+        );
+        assert!(
+            truth.deflated_sharpe_ratio <= before.deflated_sharpe_ratio,
+            "the DSR must never improve because the search turned out to be larger"
+        );
+    }
+
+    #[test]
+    fn a_redeflated_report_carries_the_session_n_and_leaves_pbo_alone() {
+        // `trials_offered` is what a reader checks the deflation against, so it
+        // must BE the N used. PBO ranks this matrix's own rows and contains no
+        // N at all — re-deflating must not perturb it.
+        let m = build(200, 60, |i| 0.002 + 0.00002 * i as f64);
+        let own = analyse_matrix(&m, 200);
+        let session = own.redeflated_against(25_000);
+
+        assert_eq!(session.trials_offered, 25_000);
+        assert_eq!(session.pbo, own.pbo, "PBO does not depend on N");
+        assert_eq!(session.matrix_rows, own.matrix_rows);
+        assert!(
+            session.notes.iter().any(|n| n.contains("25000")),
+            "the report must say out loud which N it was deflated against"
+        );
+
+        // A floor, never a ceiling: a SMALLER offered count cannot un-deflate a
+        // report. There is deliberately no path here that improves a number.
+        let smaller = own.redeflated_against(10);
+        assert_eq!(smaller.trials_offered, own.trials_offered);
+        assert_eq!(smaller.deflated_sharpe, own.deflated_sharpe);
+    }
+
+    #[test]
+    fn an_unreadable_report_is_stamped_with_the_session_n_and_stays_unreadable() {
+        // The judge checks `trials_offered == n_session` before it looks at the
+        // statistics. An unreadable report that kept `trials_offered = 0` would
+        // be reported as an N-contract violation — a disk finding filed under
+        // the wrong cause. It is stamped, and it stays refused.
+        let unreadable = TrialStatisticsReport::unreadable("no such file".to_string());
+        let stamped = unreadable.redeflated_against(25_000);
+        assert_eq!(stamped.trials_offered, 25_000);
+        assert!(stamped.deflated_sharpe.is_none());
+        assert!(stamped.pbo.is_none());
+        assert_eq!(stamped.matrix_rows, 0);
+        assert!(
+            stamped
+                .deflated_sharpe_refusal
+                .as_deref()
+                .unwrap()
+                .contains("no such file"),
+            "the named cause survives"
+        );
     }
 }

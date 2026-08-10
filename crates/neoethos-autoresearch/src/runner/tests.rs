@@ -75,6 +75,66 @@ fn n_min_oos_is_derived_from_the_window_not_fixed() {
 }
 
 #[test]
+fn n_min_screen_is_derived_from_the_in_sample_span_not_the_whole_load() {
+    // The screen never sees an out-of-sample bar. A floor derived from the whole
+    // loaded span would demand trades from months the screen is forbidden to
+    // look at — a bar no honest candidate could clear.
+    const DAY: i64 = 86_400_000;
+    let config = base_config(); // 0.5 trades/day -> 15 per month
+    let span = (0, 1_000 * DAY);
+    let oos = OosWindow {
+        start_ms: 800 * DAY,
+        end_ms: 1_000 * DAY,
+    };
+
+    // In sample: 800 days = 26.67 months x 15 = 400.
+    assert_eq!(ctx_n_min_screen(&config, span, oos), 400);
+    // The whole load would have asked for 500 — and the extra 100 are trades
+    // from the reserved window.
+    assert_eq!(derived_trade_floor(&config, 0, 1_000 * DAY), 500);
+    // Out of sample: 200 days = 6.67 months x 15 = 100.
+    assert_eq!(ctx_n_min_oos(&config, oos), 100);
+}
+
+#[test]
+fn the_session_judge_enforces_the_derived_floors_not_the_placeholders() {
+    // §15 — `with_derived_floors` had ZERO non-test callers: both floors were
+    // computed for the startup self-check and the judge then applied the
+    // 30-trade placeholder. `session_thresholds` is the one place that builds
+    // the judge a session runs under, and it must install them.
+    const DAY: i64 = 86_400_000;
+    let config = base_config();
+    let span = (0, 1_000 * DAY);
+    let oos = OosWindow {
+        start_ms: 800 * DAY,
+        end_ms: 1_000 * DAY,
+    };
+    let th = session_thresholds(&config, span, oos);
+
+    assert_eq!(th.n_min_screen, 400);
+    assert_eq!(th.n_min_oos, 100);
+    assert!(
+        th.n_min_oos > crate::judge::N_MIN_OOS_DEFAULT,
+        "a derived floor that equals the placeholder proves nothing"
+    );
+    // The floors are hashed, so a session cannot resume under a different bar
+    // than the one its earlier sweeps were judged by.
+    assert_ne!(
+        th.judge_hash(),
+        crate::judge::JudgeThresholds::frozen().judge_hash()
+    );
+
+    // And it is never zero, whatever the window does: a floor of zero lets a
+    // candidate that closed no trade clear the trade conjunct.
+    let degenerate = OosWindow {
+        start_ms: 0,
+        end_ms: 0,
+    };
+    let th = session_thresholds(&config, (0, 0), degenerate);
+    assert!(th.n_min_screen >= 1 && th.n_min_oos >= 1);
+}
+
+#[test]
 fn the_session_seed_is_a_function_of_the_session_id_alone() {
     // A proposal has to be replayable from (session_seed, sweep_index), and the
     // session id is what an operator has in front of them.
@@ -117,14 +177,32 @@ fn the_refusing_executor_refuses_rather_than_returning_an_empty_sweep() {
             config: &config,
             config_hash: "fnv64:test",
             trial_returns_path: std::path::PathBuf::from("unused"),
+            promotion_evidence_path: std::path::PathBuf::from("unused"),
             permutation: None,
         })
         .expect_err("it must refuse");
     assert!(format!("{err:#}").contains("indistinguishable from a sweep that found nothing"));
 
+    let portfolio = PromotionPortfolio {
+        schema: PROMOTION_EVIDENCE_SCHEMA.to_string(),
+        sweep: SweepId(1),
+        slot: 0,
+        config_hash: "fnv64:test".to_string(),
+        feature_names: vec!["rsi_14".to_string()],
+        genes: vec![neoethos_search::genetic::Gene::default()],
+        streamed: false,
+        batches: 1,
+    };
+    // It refuses in the PREFLIGHT — before the runner journals the touch as
+    // spent — and again in the evaluation, so the window survives an executor
+    // that cannot use it either way.
+    assert!(
+        executor.oos_preflight(&portfolio).is_err(),
+        "it must refuse BEFORE the out-of-sample window is journalled as spent"
+    );
     assert!(
         executor
-            .evaluate_oos(SweepId(1), 0, &config)
+            .evaluate_oos(SweepId(1), 0, &config, &portfolio)
             .is_err(),
         "it must never touch the out-of-sample window"
     );
@@ -134,26 +212,35 @@ fn the_refusing_executor_refuses_rather_than_returning_an_empty_sweep() {
 }
 
 #[test]
-fn the_champion_is_the_best_pessimistic_edge_survivor() {
+fn every_slot_offers_its_own_row_and_the_runner_selects_none_of_them() {
+    // The runner MATERIALISES one row per slot and selects nothing. Selecting
+    // here — the old `best_champion` argmax over every non-errored search,
+    // screened or not — is what let a REJECT's return series reach the session
+    // champion matrix after the judge re-stamped it with the winner's identity.
     let outcomes = vec![
         outcome_with(0, Some(0.10), "a"),
         outcome_with(1, Some(0.42), "b"),
         outcome_with(2, Some(-0.30), "c"),
-        // An errored search never becomes the champion, however good its number
-        // looks: the number came from a run that did not complete.
+        // An errored search offers no row, however good its number looks: the
+        // number came from a run that did not complete.
         SearchOutcome {
             error: Some("the card fell over".into()),
             ..outcome_with(3, Some(9.99), "d")
         },
     ];
-    let champion = best_champion(SweepId(7), &outcomes).expect("a champion");
-    assert_eq!(champion.strategy_id, "b");
-    assert!((champion.e_screen_pess - 0.42).abs() < 1e-12);
-    assert_eq!(champion.sweep, SweepId(7));
+    let rows = champion_rows(SweepId(7), &outcomes);
+    assert_eq!(rows.len(), outcomes.len(), "one row slot per search, always");
+    // The LOSER still offers its row. It is the judge's job to leave it there.
+    assert_eq!(rows[0].as_ref().expect("slot 0 offers a row").strategy_id, "a");
+    assert_eq!(rows[1].as_ref().expect("slot 1 offers a row").strategy_id, "b");
+    assert_eq!(rows[2].as_ref().expect("slot 2 offers a row").strategy_id, "c");
+    assert!(rows[3].is_none(), "an errored search offers no row");
+    assert_eq!(rows[1].as_ref().unwrap().sweep, SweepId(7));
+    assert!((rows[1].as_ref().unwrap().e_screen_pess - 0.42).abs() < 1e-12);
 }
 
 #[test]
-fn a_sweep_with_no_survivors_contributes_no_champion_row() {
+fn a_search_with_no_survivors_offers_no_champion_row() {
     // A champion row that is fabricated when nothing survived would put a
     // meaningless series into the session champion matrix and therefore into
     // `pbo_session` — the statistic that judges the loop's OWN selection.
@@ -162,7 +249,7 @@ fn a_sweep_with_no_survivors_contributes_no_champion_row() {
         e_screen_pess: None,
         ..outcome_with(0, None, "")
     }];
-    assert!(best_champion(SweepId(1), &outcomes).is_none());
+    assert_eq!(champion_rows(SweepId(1), &outcomes), vec![None]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,13 +299,14 @@ fn evidence_of(sweep: SweepId, per_search: Vec<SearchRecord>) -> SweepEvidence {
         .iter()
         .map(|_| TrialStatisticsReport::unreadable("test fixture".to_string()))
         .collect();
+    let champion_rows = vec![None; per_search.len()];
     SweepEvidence {
         sweep,
         kind: SweepKind::Live,
         sweep_hash: "fnv64:sweep".to_string(),
         per_search,
         statistics,
-        champion: None,
+        champion_rows,
         trials_offered: 0,
         wall_ms: 0,
     }
@@ -238,7 +326,10 @@ fn screen_of(
     crate::judge::SweepScreen {
         per_slot,
         champion: None,
+        champion_refusal: None,
         champion_slot: champion_position,
+        champion_config_hash: None,
+        champion_e_screen_pess: None,
         champion_n_trades: 0,
         champion_dsr: None,
         champion_pbo: None,
@@ -341,8 +432,11 @@ fn a_slot_that_never_ran_is_named_kept_and_never_credited_to_the_posterior() {
         refused.error.as_deref().unwrap().starts_with(NOT_RUN_PREFIX),
         "a census reader must be able to tell 'failed' from 'never happened'"
     );
-    // It never becomes the champion, whatever else is in the sweep.
-    assert!(best_champion(SweepId(1), std::slice::from_ref(&refused)).is_none());
+    // It offers no champion row, whatever else is in the sweep.
+    assert_eq!(
+        champion_rows(SweepId(1), std::slice::from_ref(&refused)),
+        vec![None]
+    );
 
     let evidence = evidence_of(
         SweepId(1),

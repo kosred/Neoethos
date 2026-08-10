@@ -56,10 +56,13 @@ mod required_symbols {
         MEASURED_TRAILING_PAYOFF_CEILING, PayoffCeilingInputs, ResolvedConfigStamp,
         assert_payoff_floor_reachable, max_achievable_payoff,
     };
-    // The DSR / PBO reader.
+    // The DSR / PBO reader. `redeflate_sharpe` is what lets the runner install
+    // the session-wide N after the fact: a single search cannot know the honest
+    // denominator, because it is a fold over the whole session's journal.
     use neoethos_search::deflated::{
         DecodedTrialMatrix, DecodedTrialRow, DeflatedSharpeReport, PboReport,
         TrialStatisticsReport, analyse_matrix, analyse_run, deflated_sharpe, pbo_cscv,
+        redeflate_sharpe,
     };
     // The per-trial return matrix the judge reads.
     use neoethos_search::trial_returns::{
@@ -128,8 +131,14 @@ mod required_symbols {
 //   judge::screen_sweep(&session::SweepEvidence, &JudgeThresholds, n_session: usize,
 //                       &shuffle::ShuffleNull) -> judge::SweepScreen
 //   judge::SweepScreen { per_slot: Vec<ScreenResult>, champion: Option<session::ChampionRow>,
-//                        champion_slot: Option<usize>, champion_n_trades: usize,
+//                        champion_refusal: Option<String>, champion_slot: Option<usize>,
+//                        champion_config_hash: Option<String>,
+//                        champion_e_screen_pess: Option<f64>, champion_n_trades: usize,
 //                        champion_dsr: Option<f64>, champion_pbo: Option<f64> }
+//        // `champion` is TAKEN from the slot that passed — from
+//        // `SweepEvidence::champion_rows[slot]` — never re-stamped from another
+//        // slot's row. `champion_config_hash` / `champion_e_screen_pess` name
+//        // that slot for `best_ever`, which needs no return series.
 //   judge::promote(&verdict::PromotionCandidate, &runner::OosEvidence, &JudgeThresholds,
 //                  &GoalSet, &goals::Scenario, &Session) -> anyhow::Result<PromotionOutcome>
 //   judge::PromotionOutcome { promoted: bool, failing_conjunct: Option<String>,

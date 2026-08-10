@@ -349,18 +349,32 @@ pub fn judge_block(
     control_best: Option<f64>,
     control_dsr: Option<f64>,
 ) -> BlockOutcome {
-    let live_best = block_best(session, block).map(|(_, e)| e);
-    let live_dsr = session
-        .live_sweeps_in_block(block)
-        .into_iter()
-        .filter_map(|s| {
-            s.per_search
-                .iter()
-                .filter_map(|p| p.dsr)
-                .filter(|d| d.is_finite())
-                .reduce(f64::max)
-        })
-        .reduce(f64::max);
+    // BOTH sides of both comparisons come from the SAME population: the source
+    // sweep, whose exact proposals the control re-ran byte for byte.
+    //
+    // `live_best` already did — the block's maximum expectancy IS the source
+    // sweep's maximum, since the source sweep is the one that attained it — but
+    // `live_dsr` maxed over EVERY sweep in the block: up to 400 live searches
+    // against the control's 100, journalled as if like-for-like. A maximum over
+    // four times the draws is larger for that reason alone, so `dsr_gap` read
+    // positive on the strength of the sample size and the block passed a
+    // falsification it had not survived.
+    let best = block_best(session, block);
+    let live_best = best.map(|(_, e)| e);
+    let live_dsr = best.and_then(|(source, _)| {
+        session
+            .live_sweeps_in_block(block)
+            .into_iter()
+            .filter(|s| s.sweep == source)
+            .filter_map(|s| {
+                s.per_search
+                    .iter()
+                    .filter_map(|p| p.dsr)
+                    .filter(|d| d.is_finite())
+                    .reduce(f64::max)
+            })
+            .reduce(f64::max)
+    });
 
     let control_best = control_best.filter(|e| e.is_finite());
     let control_dsr = control_dsr.filter(|d| d.is_finite());
@@ -418,11 +432,17 @@ impl ShuffleNull {
                 .copied()
                 .filter(|e| e.is_finite())
                 .collect(),
-            refused: session
-                .null_observations
-                .iter()
-                .filter(|e| !e.is_finite())
-                .count(),
+            // BOTH kinds of refusal. A control that produced a non-finite
+            // number is refused here; a control that produced NO number at all
+            // never reaches `null_observations` — the fold counts it in
+            // `Session::null_refusals` instead — and forgetting that second
+            // kind is what pinned this counter at zero.
+            refused: session.null_refusals
+                + session
+                    .null_observations
+                    .iter()
+                    .filter(|e| !e.is_finite())
+                    .count(),
         }
     }
 
@@ -825,6 +845,65 @@ mod tests {
         assert!(j.indistinguishable);
         assert_eq!(j.p_block, 1.0);
         assert!(j.delta_expectancy.is_finite() && j.dsr_gap.is_finite());
+    }
+
+    /// C6. `dsr_gap` compares the LIVE side against the CONTROL side, and the
+    /// control re-runs ONE sweep — the block's best — byte for byte. Maxing the
+    /// live DSR over every sweep in the block put up to four times as many draws
+    /// on the live side of a maximum, so the gap read positive on sample size
+    /// alone and the block passed a falsification it had not survived.
+    #[test]
+    fn the_live_dsr_comes_from_the_sweep_the_control_re_ran_not_from_the_block() {
+        use crate::journal::{SearchRecord, SweepKind};
+        use crate::session::{SweepOutcome, SweepSummary};
+
+        let search = |e: Option<f64>, dsr: Option<f64>| SearchRecord {
+            slot: 0,
+            config_hash: "fnv64:h".to_string(),
+            trials_offered: 10,
+            survivors: 1,
+            e_screen_pess: e,
+            n_trades: 400,
+            dsr,
+            pbo: Some(0.2),
+            dsr_refusal: None,
+            pbo_refusal: None,
+            cost_band: crate::journal::CostBandCounts::default(),
+            rejections: Vec::new(),
+            streamed: true,
+            batch_columns: 0,
+            next_cursor: 0,
+            wall_ms: 1,
+            error: None,
+        };
+        let sweep = |id: u64, e: f64, dsr: f64| SweepSummary {
+            sweep: SweepId(id),
+            kind: SweepKind::Live,
+            sweep_hash: format!("fnv64:{id}"),
+            trials_offered: 10,
+            outcome: SweepOutcome::Completed,
+            per_search: vec![search(Some(e), Some(dsr))],
+            wall_ms: 1,
+        };
+
+        let mut s = Session::default();
+        // Sweep 1 attains the block's best EXPECTANCY, so it is the sweep the
+        // control re-runs. Sweep 2 has a higher DSR and is NOT re-run.
+        s.sweeps.push(sweep(1, 0.90, 0.55));
+        s.sweeps.push(sweep(2, 0.10, 0.99));
+        assert_eq!(best_sweep_of_block(&s, BlockId(0)), Some(SweepId(1)));
+
+        // Control DSR 0.70: it beat sweep 1, which is the honest comparison.
+        let j = judge_block(&s, BlockId(0), Some(0.20), Some(0.70));
+        assert!(
+            (j.dsr_gap - (0.55 - 0.70)).abs() < 1e-12,
+            "dsr_gap must be the SOURCE sweep's 0.55 against 0.70, got {}",
+            j.dsr_gap
+        );
+        assert!(
+            j.indistinguishable,
+            "a negative dsr_gap is a block the control was not beaten in"
+        );
     }
 
     #[test]

@@ -131,6 +131,15 @@ impl JudgeThresholds {
     ///
     /// They still enter `judge_hash`, so a session cannot silently resume under
     /// a different floor.
+    ///
+    /// **[`Self::frozen`] alone is not a judge a session may run under.** Its
+    /// two floors are placeholders, and a placeholder floor is the failure this
+    /// method exists to prevent: on a two-year out-of-sample window at half a
+    /// trade a day the derived floor is around 360 trades, so judging with the
+    /// 30-trade default applies a bar twelve times weaker than the one the
+    /// startup self-check told the operator it had verified — on the one window
+    /// that cannot be re-read. `runner::session_thresholds` is the caller, and
+    /// it is the only one outside tests.
     pub fn with_derived_floors(mut self, n_min_screen: usize, n_min_oos: usize) -> Self {
         self.n_min_screen = n_min_screen.max(1);
         self.n_min_oos = n_min_oos.max(1);
@@ -203,7 +212,18 @@ pub fn n_min_trades(min_trades_per_month: f64, months_in_window: f64) -> usize {
     if !raw.is_finite() {
         return 1;
     }
-    (raw.ceil() as usize).max(1)
+    // A partial trade rounds UP — half a trade is not a trade, and the floor is
+    // a floor. But `15 × (800/30)` evaluates to 400.000000000000057, and a
+    // floating-point remainder of 6e-14 is not a trade either: bare `ceil` would
+    // turn a clean 400 into 401 and make the bar depend on how the window
+    // happens to divide. Anything within a millionth of an integer IS that
+    // integer; everything else still rounds up.
+    let snapped = if (raw - raw.round()).abs() < 1.0e-6 {
+        raw.round()
+    } else {
+        raw.ceil()
+    };
+    (snapped as usize).max(1)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,26 +410,14 @@ pub fn screen(
     }
     let st = ev.statistics;
 
-    // The trial count the statistics were deflated against must BE the honest
-    // N. A report built with one search's own row count would understate the
-    // selection adjustment by orders of magnitude and every DSR below would be
-    // flattered. Checked, not assumed — this is the quietest way this judge
-    // could be defeated.
-    if st.trials_offered != n_session {
-        return fail(
-            ScreenConjunct::S2Dsr,
-            format!(
-                "the statistics were deflated against trials_offered = {} but the session-wide \
-                 trial count is {n_session}. A deflation against the wrong N is not a deflation; \
-                 rebuild the report with deflated::analyse_matrix(&matrix, n_session).",
-                st.trials_offered
-            ),
-        );
-    }
-
     // Unreadable: BOTH statistics refused for the same named cause. Reported
     // against S1 because that is the first conjunct it defeats, with the cause
     // spelled out so it is never mistaken for "the sweep was bad".
+    //
+    // **Checked BEFORE the N contract below.** An unreadable report has no
+    // deflation to have a wrong N, and complaining about its denominator would
+    // file a disk or wiring finding under S2 with a message about statistics
+    // that were never computed — the real cause hidden behind a derived one.
     if st.deflated_sharpe.is_none() && st.pbo.is_none() && st.matrix_rows == 0 {
         return fail(
             ScreenConjunct::S1Pbo,
@@ -417,6 +425,32 @@ pub fn screen(
                 "UNREADABLE trial-return matrix — neither statistic was attempted. {} This is a \
                  wiring or disk finding, not a verdict on the configuration.",
                 st.pbo_refusal.clone().unwrap_or_default()
+            ),
+        );
+    }
+
+    // The trial count the statistics were deflated against must BE the honest
+    // N. A report built with one search's own row count would understate the
+    // selection adjustment by orders of magnitude and every DSR below would be
+    // flattered. Checked, not assumed — this is the quietest way this judge
+    // could be defeated.
+    //
+    // **This is satisfiable, and the runner is what satisfies it.** `n_session`
+    // is a fold over the journal and is not final until the sweep that is being
+    // screened has been recorded, so the executor that ran the search CANNOT be
+    // handed it. The runner therefore re-deflates every report against the fold
+    // — `TrialStatisticsReport::redeflated_against` — after `SweepCompleted` is
+    // appended and before the judge sees anything. When this fires it means
+    // that step was skipped, which is a wiring fault and not a research result.
+    if st.trials_offered != n_session {
+        return fail(
+            ScreenConjunct::S2Dsr,
+            format!(
+                "the statistics were deflated against trials_offered = {} but the session-wide \
+                 trial count is {n_session}. A deflation against the wrong N is not a deflation; \
+                 the runner must install the fold with \
+                 TrialStatisticsReport::redeflated_against(n_session) before screening.",
+                st.trials_offered
             ),
         );
     }
@@ -589,7 +623,24 @@ pub struct SweepScreen {
     /// from a failed screen would put the loop's own rejects into the very
     /// matrix its overfitting probability is measured from.
     pub champion: Option<ChampionRow>,
+    /// Why this sweep contributes NO row although a slot passed. `None` when
+    /// there is nothing to explain.
+    ///
+    /// A sweep dropping out of `pbo_session`'s input changes the number that
+    /// gates every promotion, so the reason is carried rather than inferred from
+    /// a `None`. It is never a licence to substitute another slot's series.
+    pub champion_refusal: Option<String>,
     pub champion_slot: Option<usize>,
+    /// The passing slot's own identity and screened expectancy.
+    ///
+    /// Carried separately from [`Self::champion`] because the session's
+    /// BEST-EVER record needs neither a return series nor a place in the PBO
+    /// matrix — it needs the slot, the hash and the number. Reading them off the
+    /// champion row instead would make `best_ever` — and therefore R2's U2, and
+    /// therefore the loop's ability to report GOAL UNREACHABLE — silently
+    /// conditional on a matrix write that is non-fatal by design.
+    pub champion_config_hash: Option<String>,
+    pub champion_e_screen_pess: Option<f64>,
     pub champion_n_trades: usize,
     pub champion_dsr: Option<f64>,
     pub champion_pbo: Option<f64>,
@@ -667,18 +718,55 @@ pub fn screen_sweep(
     match best {
         Some((slot, e)) => {
             let rec = &evidence.per_search[slot];
+            // The row is TAKEN from the slot that passed. It is never taken from
+            // somewhere else and re-stamped: a re-stamp makes a mismatch
+            // invisible, and the mismatch is the defect. The slot's own row
+            // already carries the slot's own `config_hash` and its own
+            // `e_screen_pess`, so there is nothing left to relabel.
+            let (champion, champion_refusal) = match evidence.champion_rows.get(slot) {
+                Some(Some(row)) if row.config_hash == rec.config_hash => (Some(row.clone()), None),
+                Some(Some(row)) => (
+                    None,
+                    Some(format!(
+                        "slot {slot} passed the screen under configuration {} but the champion row \
+                         materialised for that slot names {}. The two are index-aligned by \
+                         contract, so a disagreement means the row would enter the session \
+                         champion matrix — the input to pbo_session, which gates every promotion — \
+                         under an identity that is not its own. Refused, and this sweep \
+                         contributes NO row.",
+                        rec.config_hash, row.config_hash
+                    )),
+                ),
+                Some(None) => (
+                    None,
+                    Some(format!(
+                        "slot {slot} ({}) passed the screen but its search produced no per-period \
+                         champion series, so this sweep contributes no row to the session champion \
+                         matrix. The row is NOT taken from another slot: the highest-expectancy \
+                         slot is typically the overfit outlier the screen just rejected, and its \
+                         return series wearing this slot's identity is precisely what \
+                         pbo_session would then be measuring.",
+                        rec.config_hash
+                    )),
+                ),
+                None => (
+                    None,
+                    Some(format!(
+                        "the evidence carries {} champion rows for {} search records, so slot \
+                         {slot}'s row cannot be located. The two vectors are index-aligned by \
+                         contract and this pair is not.",
+                        evidence.champion_rows.len(),
+                        evidence.per_search.len()
+                    )),
+                ),
+            };
             SweepScreen {
                 per_slot,
-                champion: evidence.champion.clone().map(|mut c| {
-                    // The loop offers one champion row per sweep; the judge
-                    // stamps it with the slot that actually passed, so the row
-                    // in the PBO matrix and the row in the report are the same
-                    // configuration.
-                    c.config_hash = rec.config_hash.clone();
-                    c.e_screen_pess = e;
-                    c
-                }),
+                champion,
+                champion_refusal,
                 champion_slot: Some(slot),
+                champion_config_hash: Some(rec.config_hash.clone()),
+                champion_e_screen_pess: Some(e),
                 champion_n_trades: rec.n_trades,
                 champion_dsr: rec.dsr,
                 champion_pbo: rec.pbo,
@@ -687,7 +775,10 @@ pub fn screen_sweep(
         None => SweepScreen {
             per_slot,
             champion: None,
+            champion_refusal: None,
             champion_slot: None,
+            champion_config_hash: None,
+            champion_e_screen_pess: None,
             champion_n_trades: 0,
             champion_dsr: None,
             champion_pbo: None,
@@ -1549,12 +1640,260 @@ mod tests {
         }
     }
 
+    /// A report whose DSR can survive being re-deflated from a single search's
+    /// trial count all the way up to the session-wide one.
+    ///
+    /// The shared `dsr_report` helper carries a cross-trial Sharpe variance
+    /// (0.01) large enough that SR* swamps the champion at any realistic N, so
+    /// it can prove a REFUSAL but never a PASS. This one is a plausible sweep:
+    /// a champion at 0.5 per period against a tight spread of trials.
+    fn redeflatable(trials_offered: usize) -> TrialStatisticsReport {
+        let mut st = statistics(Some(0.99), 0.20, Some(0.20), trials_offered);
+        {
+            let d = st.deflated_sharpe.as_mut().unwrap();
+            d.trials_n = 2;
+            d.periods = 36;
+            d.raw_sharpe_per_period = 0.5;
+            d.skewness = 0.0;
+            d.kurtosis = 3.0;
+            d.sharpe_variance_across_trials = 1.0e-4;
+        }
+        // SR*, the excess and the DSR are recomputed from those moments, so the
+        // report is internally consistent at `trials_offered` rather than a set
+        // of hand-written numbers that could not have come from one matrix.
+        let consistent = neoethos_search::deflated::redeflate_sharpe(
+            st.deflated_sharpe.as_ref().unwrap(),
+            trials_offered,
+        )
+        .expect("a well-formed report re-deflates");
+        st.deflated_sharpe = Some(consistent);
+        st
+    }
+
+    /// **THE defect that made the screen unsatisfiable.**
+    ///
+    /// `screen` requires the report's `trials_offered` to BE `n_session`, and
+    /// `n_session` is a session-wide fold that no single search can know. A
+    /// measured run of 71 searches produced ZERO passes for exactly this reason
+    /// — every one failed S2 with "deflated against 40 but the session-wide
+    /// count is 1080" — which left `best_ever` permanently `None` and the loop
+    /// unable to report either goal reached or goal unreachable.
+    ///
+    /// The contract stays. What this proves is that it is SATISFIABLE, through
+    /// the one call the runner makes after `SweepCompleted` is appended.
+    #[test]
+    fn the_n_contract_is_satisfiable_by_redeflating_against_the_session_fold() {
+        let as_the_executor_produced_it = redeflatable(40);
+
+        // 1. Unfixed: refused, and named against S2 with both numbers shown.
+        match screen(
+            evidence(&as_the_executor_produced_it),
+            &JudgeThresholds::frozen(),
+            N,
+            &ready_null(),
+        ) {
+            ScreenResult::Failed { conjunct, detail } => {
+                assert_eq!(conjunct, ScreenConjunct::S2Dsr);
+                assert!(detail.contains("trials_offered = 40"), "{detail}");
+                assert!(detail.contains(&N.to_string()), "{detail}");
+            }
+            other => panic!("a report deflated against its own N must fail: {other:?}"),
+        }
+
+        // 2. Fixed, by the sanctioned call — and it PASSES. If this ever stops
+        //    passing, no configuration in any session can ever be screened.
+        let installed = as_the_executor_produced_it.redeflated_against(N);
+        assert_eq!(installed.trials_offered, N);
+        let result = screen(
+            evidence(&installed),
+            &JudgeThresholds::frozen(),
+            N,
+            &ready_null(),
+        );
+        assert!(
+            result.passed(),
+            "the screen must be reachable at all — it was not, for 71 measured searches in a \
+             row: {}",
+            result.detail()
+        );
+
+        // 3. And the fix deflates rather than flatters: the bar the champion had
+        //    to clear by luck alone is HIGHER at the session-wide N.
+        let before = as_the_executor_produced_it.deflated_sharpe.as_ref().unwrap();
+        let after = installed.deflated_sharpe.as_ref().unwrap();
+        assert!(
+            after.expected_max_sharpe_per_period > before.expected_max_sharpe_per_period,
+            "SR* must rise with N"
+        );
+        assert!(after.deflated_sharpe_ratio <= before.deflated_sharpe_ratio);
+    }
+
+    /// An unreadable matrix is a disk or wiring finding. Reporting it as an
+    /// N-contract violation files it under a cause that is not its own — and
+    /// that is what happened to every not-run row, because `unreadable()` sets
+    /// `trials_offered = 0` and the N check used to run first.
+    #[test]
+    fn an_unreadable_report_is_named_by_its_own_cause_not_by_the_n_contract() {
+        let st = TrialStatisticsReport::unreadable("the ledger file is absent".to_string());
+        match screen(evidence(&st), &JudgeThresholds::frozen(), N, &ready_null()) {
+            ScreenResult::Failed { conjunct, detail } => {
+                assert_eq!(conjunct, ScreenConjunct::S1Pbo);
+                assert!(detail.contains("UNREADABLE"), "{detail}");
+                assert!(detail.contains("the ledger file is absent"), "{detail}");
+                assert!(
+                    !detail.contains("trials_offered = 0"),
+                    "the real cause must not be hidden behind the N contract: {detail}"
+                );
+            }
+            other => panic!("an unreadable matrix is never a pass: {other:?}"),
+        }
+    }
+
+    /// §15 — the derived floors must be enforced, not merely computed.
+    ///
+    /// `with_derived_floors` had ZERO non-test callers: both floors were derived
+    /// for the startup self-check and then the judge applied the 30-trade
+    /// placeholder. On a two-year OOS window at half a trade a day the derived
+    /// floor is ~360, so the bar actually applied was twelve times weaker than
+    /// the startup message said it had verified.
+    #[test]
+    fn the_derived_screen_floor_is_what_the_judge_actually_applies() {
+        let st = redeflatable(N);
+        let ev = SearchEvidence {
+            n_trades: 100,
+            ..evidence(&st)
+        };
+
+        // Under the placeholder, 100 trades clears 30 and the screen passes.
+        assert!(screen(ev, &JudgeThresholds::frozen(), N, &ready_null()).passed());
+
+        // Under the floor derived from a two-year window it does not, and the
+        // failure is named against S5 with the number it had to beat.
+        let derived = JudgeThresholds::frozen().with_derived_floors(360, 360);
+        match screen(ev, &derived, N, &ready_null()) {
+            ScreenResult::Failed { conjunct, detail } => {
+                assert_eq!(conjunct, ScreenConjunct::S5Trades);
+                assert!(detail.contains("360"), "{detail}");
+            }
+            other => panic!("100 trades must not clear a floor of 360: {other:?}"),
+        }
+    }
+
     fn ready_null() -> ShuffleNull {
         let mut null = ShuffleNull::new();
         for e in [0.10, 0.20, 0.30] {
             null.observe(ControlKind::CircularRotation, Some(e));
         }
         null
+    }
+
+    fn search_record(slot: usize, hash: &str, e: f64) -> crate::journal::SearchRecord {
+        crate::journal::SearchRecord {
+            slot,
+            config_hash: hash.to_string(),
+            trials_offered: N,
+            survivors: 3,
+            e_screen_pess: Some(e),
+            n_trades: 400,
+            dsr: Some(0.99),
+            pbo: Some(0.20),
+            dsr_refusal: None,
+            pbo_refusal: None,
+            cost_band: band(),
+            rejections: Vec::new(),
+            streamed: true,
+            batch_columns: 0,
+            next_cursor: 0,
+            wall_ms: 1,
+            error: None,
+        }
+    }
+
+    fn champion_row(hash: &str, id: &str, returns: Vec<f64>) -> ChampionRow {
+        ChampionRow {
+            sweep: SweepId(4),
+            config_hash: hash.to_string(),
+            strategy_id: id.to_string(),
+            period_keys: (0..returns.len() as i64).map(|k| 24_300 + k).collect(),
+            monthly_returns: returns,
+            e_screen_pess: 0.0,
+        }
+    }
+
+    /// THE defect: two argmaxes, one row, and the stamping hid the difference.
+    ///
+    /// The highest-expectancy slot is typically the overfit outlier the screen
+    /// rejects. The old code took THAT slot's return series, overwrote its
+    /// `config_hash` and `e_screen_pess` with the passing slot's, and handed the
+    /// result to `pbo_session` — the statistic that gates every promotion.
+    #[test]
+    fn the_champion_row_comes_from_the_slot_that_passed_not_from_the_outlier() {
+        let passing = statistics(Some(0.99), 0.20, Some(0.20), N);
+        // The outlier scores far higher and fails S1 — the routine case.
+        let rejected = statistics(Some(0.999), 5.00, Some(0.99), N);
+
+        let evidence = SweepEvidence {
+            sweep: SweepId(4),
+            kind: crate::journal::SweepKind::Live,
+            sweep_hash: "fnv64:sweep".to_string(),
+            per_search: vec![
+                search_record(0, "fnv64:passed", 0.80),
+                search_record(1, "fnv64:rejected", 5.00),
+            ],
+            statistics: vec![passing, rejected],
+            champion_rows: vec![
+                Some(champion_row("fnv64:passed", "honest", vec![0.01, 0.02, 0.03])),
+                Some(champion_row("fnv64:rejected", "outlier", vec![9.0, 9.0, 9.0])),
+            ],
+            trials_offered: N,
+            wall_ms: 1,
+        };
+
+        let screen = screen_sweep(&evidence, &JudgeThresholds::frozen(), N, &ready_null());
+        assert!(screen.per_slot[0].passed(), "{:?}", screen.per_slot[0]);
+        assert!(!screen.per_slot[1].passed(), "the outlier must fail S1");
+        assert_eq!(screen.champion_slot, Some(0));
+
+        let row = screen.champion.expect("the passing slot offers a row");
+        assert_eq!(row.config_hash, "fnv64:passed");
+        // The SERIES is what `pbo_session` is computed from, and it is the one
+        // that belongs to the identity beside it.
+        assert_eq!(row.strategy_id, "honest");
+        assert_eq!(row.monthly_returns, vec![0.01, 0.02, 0.03]);
+        assert!(screen.champion_refusal.is_none());
+    }
+
+    /// A passing slot with no return series contributes NOTHING, and says so.
+    /// Substituting another slot's series is the defect above, wearing a
+    /// different hat.
+    #[test]
+    fn a_passing_slot_with_no_series_contributes_no_row_and_names_the_reason() {
+        let passing = statistics(Some(0.99), 0.20, Some(0.20), N);
+        let rejected = statistics(Some(0.999), 5.00, Some(0.99), N);
+        let evidence = SweepEvidence {
+            sweep: SweepId(4),
+            kind: crate::journal::SweepKind::Live,
+            sweep_hash: "fnv64:sweep".to_string(),
+            per_search: vec![
+                search_record(0, "fnv64:passed", 0.80),
+                search_record(1, "fnv64:rejected", 5.00),
+            ],
+            statistics: vec![passing, rejected],
+            champion_rows: vec![
+                None,
+                Some(champion_row("fnv64:rejected", "outlier", vec![9.0, 9.0, 9.0])),
+            ],
+            trials_offered: N,
+            wall_ms: 1,
+        };
+
+        let screen = screen_sweep(&evidence, &JudgeThresholds::frozen(), N, &ready_null());
+        assert!(screen.champion.is_none(), "the reject's series must not stand in");
+        let why = screen.champion_refusal.expect("the drop must be NAMED");
+        assert!(why.contains("no per-period champion series"), "{why}");
+        // best-ever is NOT gated on the row: R2's U2 still gets its number.
+        assert_eq!(screen.champion_config_hash.as_deref(), Some("fnv64:passed"));
+        assert_eq!(screen.champion_e_screen_pess, Some(0.80));
     }
 
     #[test]
@@ -1765,6 +2104,11 @@ mod tests {
         assert_eq!(n_min_trades(0.0, 36.0), 1);
         assert_eq!(n_min_trades(2.5, 36.0), 90);
         assert_eq!(n_min_trades(f64::NAN, 36.0), 1);
+        // A partial trade rounds up...
+        assert_eq!(n_min_trades(15.0, 2.5), 38, "37.5 trades is a floor of 38");
+        // ...but floating-point dust does not manufacture one: 15 x (800/30)
+        // evaluates to 400.000000000000057 and the floor is 400, not 401.
+        assert_eq!(n_min_trades(15.0, 800.0 / 30.0), 400);
         assert_eq!(
             JudgeThresholds::frozen()
                 .with_derived_floors(0, 0)

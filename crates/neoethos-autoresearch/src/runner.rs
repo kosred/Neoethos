@@ -117,6 +117,16 @@ pub struct SearchRequest<'a> {
     pub config_hash: &'a str,
     /// Where this search's trial-returns matrix must be written.
     pub trial_returns_path: std::path::PathBuf,
+    /// Where this search's PROMOTION EVIDENCE must be written — the genes it
+    /// selected, the feature names those genes address, and the `config_hash`
+    /// stamp that says which configuration selected them.
+    ///
+    /// It is a path in the SESSION STORE and not in the executor's scratch
+    /// directory, and that is the whole point: the scratch root is keyed by
+    /// SYMBOL and is reused by every session, while the promotion candidate may
+    /// be a sweep that ran days earlier and is resumed into. Evidence that lives
+    /// anywhere else is evidence the single out-of-sample touch cannot rely on.
+    pub promotion_evidence_path: std::path::PathBuf,
     /// `Some` for a shuffle control: the permutation to apply to the feature
     /// block before the search sees it. Prices, labels, costs, exit geometry,
     /// gene encoding and the GA seed are untouched — only the relationship
@@ -240,6 +250,172 @@ impl SearchOutcome {
     }
 }
 
+/// The schema of the per-slot promotion-evidence artifact.
+pub const PROMOTION_EVIDENCE_SCHEMA: &str = "neoethos.autoresearch.promotion_evidence.v1";
+
+/// What a search selected IN SAMPLE, persisted at S5 so the one out-of-sample
+/// touch has something to evaluate.
+///
+/// **Written by the executor into the session store, read by the runner before
+/// the window is spent.** Three things make it trustworthy rather than merely
+/// present:
+///
+/// 1. **It is stamped.** `config_hash` is the slot's stamp as the runner handed
+///    it to the executor, and the loader refuses an artifact whose stamp is not
+///    the promotion candidate's. A file found at the right path is not evidence
+///    that it describes the right configuration — the session store is keyed by
+///    session, but a resumed session, a re-run sweep or a hand-copied directory
+///    all put bytes at that path.
+/// 2. **It carries the names its gene indices address.** A `Gene`'s `indices`
+///    are positions into the feature list that search actually used — after
+///    discovery's prefilter, and after the streaming loop's canonical remap.
+///    They are NOT positions into whatever `prepare_multitimeframe_features`
+///    happens to build later. Carrying the names is what lets the out-of-sample
+///    evaluation project by NAME and refuse loudly when a name is absent,
+///    instead of silently reading a different column and calling the answer out
+///    of sample.
+/// 3. **It is honest about being empty.** A search that selected nothing writes
+///    no artifact, so "no evidence" and "evidence saying nothing survived" are
+///    the same observable, and the promotion path refuses instead of evaluating
+///    an empty portfolio and reporting its zero trades as a result.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PromotionPortfolio {
+    pub schema: String,
+    pub sweep: SweepId,
+    /// The SLOT that names the proposal — never a position in a vector.
+    pub slot: usize,
+    /// The stamp of the configuration that selected these genes.
+    pub config_hash: String,
+    /// The feature names the genes' `indices` address, in that exact order.
+    pub feature_names: Vec<String>,
+    /// The portfolio, exactly as the search selected it.
+    pub genes: Vec<neoethos_search::genetic::Gene>,
+    /// Did this search stream? Recorded because a streamed run's feature names
+    /// can include working-set columns that a plain whole-vocabulary build does
+    /// not contain, which is the one way the projection below can fail.
+    pub streamed: bool,
+    /// How many batches contributed genes.
+    pub batches: usize,
+}
+
+impl PromotionPortfolio {
+    /// Refuse an artifact that does not describe the configuration the touch is
+    /// about to be spent on.
+    ///
+    /// Every check here is a refusal and none is a repair: the whole purpose of
+    /// the stamp is that the answer to "is this the right evidence?" is either
+    /// YES or a stop, never a guess.
+    pub fn assert_names(
+        &self,
+        sweep: SweepId,
+        slot: usize,
+        config_hash: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        if self.schema != PROMOTION_EVIDENCE_SCHEMA {
+            bail!(
+                "{} carries schema {:?} but this build reads {PROMOTION_EVIDENCE_SCHEMA}. Refusing \
+                 to spend the single out-of-sample touch on an artifact whose shape this build \
+                 does not know it agrees with.",
+                path.display(),
+                self.schema
+            );
+        }
+        if self.sweep != sweep || self.slot != slot {
+            bail!(
+                "{} says it is {} slot {} but it was loaded as the evidence for {sweep} slot \
+                 {slot}. Two searches are wearing one path.",
+                path.display(),
+                self.sweep,
+                self.slot
+            );
+        }
+        if self.config_hash != config_hash {
+            bail!(
+                "{} is stamped {} but the promotion candidate is stamped {config_hash}. THIS IS \
+                 THE CHECK THAT CANNOT BE SKIPPED: the artifact would otherwise hand a DIFFERENT \
+                 configuration's genes to the one out-of-sample evaluation, and the result would \
+                 be reported under the candidate's name. Refusing; the window is NOT spent.",
+                path.display(),
+                self.config_hash
+            );
+        }
+        if self.genes.is_empty() {
+            bail!(
+                "{} records no genes, so there is nothing to evaluate out of sample. A search that \
+                 selected nothing is not a promotion candidate, and this path will NOT re-search \
+                 to find one.",
+                path.display()
+            );
+        }
+        if self.feature_names.is_empty() {
+            bail!(
+                "{} records {} genes but no feature names, so nothing can say WHICH columns their \
+                 indices address. An index without a name is a number that reads whatever happens \
+                 to be in that position.",
+                path.display(),
+                self.genes.len()
+            );
+        }
+        for (position, gene) in self.genes.iter().enumerate() {
+            if let Some(out_of_range) = gene
+                .indices
+                .iter()
+                .find(|index| **index >= self.feature_names.len())
+            {
+                bail!(
+                    "{}: gene {position} addresses feature index {out_of_range} but only {} names \
+                     were recorded. The artifact is internally inconsistent, so no projection of \
+                     it can be trusted.",
+                    path.display(),
+                    self.feature_names.len()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a slot's promotion evidence lives inside the SESSION STORE.
+///
+/// Deliberately NOT under `trial_returns/`: that directory is what
+/// [`SessionStore::gc_trial_matrices`] empties, and the promotion candidate may
+/// be a sweep whose matrices were collected long before the touch is spent.
+fn promotion_evidence_path(
+    store: &SessionStore,
+    sweep: SweepId,
+    slot: usize,
+) -> std::path::PathBuf {
+    store
+        .sweep_dir(sweep)
+        .join("promotion")
+        .join(format!("slot_{slot:03}.json"))
+}
+
+/// Load and verify a promotion candidate's evidence. Called BEFORE the window is
+/// journalled as spent.
+fn load_promotion_portfolio(
+    path: &std::path::Path,
+    sweep: SweepId,
+    slot: usize,
+    config_hash: &str,
+) -> Result<PromotionPortfolio> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "reading the promotion candidate's evidence from {}. It is written at S5 by the \
+             search that selected the genes, into the SESSION STORE. Its absence means either \
+             that search selected nothing, or that it ran under a build that did not write it — \
+             and in both cases the out-of-sample window stays UNSPENT rather than being spent on \
+             a path that cannot succeed.",
+            path.display()
+        )
+    })?;
+    let portfolio: PromotionPortfolio = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    portfolio.assert_names(sweep, slot, config_hash, path)?;
+    Ok(portfolio)
+}
+
 /// The evidence a promotion is judged on. Produced ONCE, on the OOS window.
 #[derive(Debug, Clone)]
 pub struct OosEvidence {
@@ -294,15 +470,40 @@ pub trait SweepExecutor {
     /// regions already searched.
     fn execute(&mut self, request: &SearchRequest<'_>) -> Result<SearchOutcome>;
 
+    /// Everything this executor can refuse WITHOUT reading the out-of-sample
+    /// window, asked before the window is journalled as spent.
+    ///
+    /// It exists because the expensive half of "the promotion path cannot
+    /// succeed" was never that it failed — it was that it failed *after* the
+    /// budget record was written, so the one irreplaceable window was consumed
+    /// by a call that could not have returned. Anything an executor knows in
+    /// advance (a capability it lacks, a frame it no longer holds, an empty
+    /// portfolio) belongs here, where a refusal costs nothing.
+    ///
+    /// The default is `Ok(())` and it means exactly one thing: *this executor
+    /// has no condition it can check in advance*. It is not a place to hide a
+    /// missing check — `evaluate_oos` is still required to re-assert anything
+    /// this returns, so a preflight that is skipped cannot let a bad touch
+    /// through, it can only make the refusal expensive.
+    fn oos_preflight(&self, portfolio: &PromotionPortfolio) -> Result<()> {
+        let _ = portfolio;
+        Ok(())
+    }
+
     /// Evaluate — **never search** — a promotion candidate on the OOS window.
     ///
     /// Nothing is fitted and nothing is selected here: the candidate's genes
-    /// were chosen in sample and are simply backtested forward.
+    /// were chosen in sample, are handed in as `portfolio`, and are simply
+    /// backtested forward. The genes are a PARAMETER rather than something this
+    /// call goes and finds, because the party that must prove the evidence
+    /// exists is the party that decides whether the window gets spent, and that
+    /// party is the runner.
     fn evaluate_oos(
         &mut self,
         sweep: SweepId,
         slot: usize,
         config: &DiscoveryConfig,
+        portfolio: &PromotionPortfolio,
     ) -> Result<OosEvidence>;
 }
 
@@ -349,11 +550,21 @@ impl SweepExecutor for RefusingExecutor {
         )
     }
 
+    /// It refuses HERE, before the budget record is written, so a session that
+    /// reaches promotion with this executor stops with the window still clean.
+    fn oos_preflight(&self, _portfolio: &PromotionPortfolio) -> Result<()> {
+        bail!(
+            "the refusing executor never touches the out-of-sample window, and it says so BEFORE \
+             the touch is journalled as spent"
+        )
+    }
+
     fn evaluate_oos(
         &mut self,
         _sweep: SweepId,
         _slot: usize,
         _config: &DiscoveryConfig,
+        _portfolio: &PromotionPortfolio,
     ) -> Result<OosEvidence> {
         bail!("the refusing executor never touches the out-of-sample window")
     }
@@ -647,7 +858,16 @@ pub fn run_with_executor(
             proposer.credits_for(&aligned.credit_proposals, &aligned.credit_screens);
         writer.append(Record::PosteriorUpdated { sweep, credits })?;
 
-        if let Some(champion) = screen.champion.clone() {
+        // The champion ROW and the BEST-EVER record are two different things and
+        // are no longer gated on one another. The row needs a per-period return
+        // series and only feeds `pbo_session`; best-ever needs the slot, the hash
+        // and the number, and feeds R2's U2 — the condition that lets the loop
+        // say GOAL UNREACHABLE. Coupling them made the loop's ability to state a
+        // refutation conditional on a matrix write that is non-fatal by design.
+        if let (Some(config_hash), Some(e_screen_pess)) = (
+            screen.champion_config_hash.clone(),
+            screen.champion_e_screen_pess,
+        ) {
             // A champion with no slot is a champion nobody can find again: the
             // best-ever record, the GC's keep-set and the promotion candidate
             // are all keyed by it. `unwrap_or(0)` here would silently name slot
@@ -658,20 +878,31 @@ pub fn run_with_executor(
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
                         detail: format!(
-                            "{sweep} produced a champion row but the screen named no slot for it, \
-                             so nothing could say WHICH configuration the session's best-ever \
-                             result belongs to."
+                            "{sweep} produced a passing screen but named no slot for it, so \
+                             nothing could say WHICH configuration the session's best-ever result \
+                             belongs to."
                         ),
                     },
                 );
             };
-            writer.push_champion(champion.clone())?;
-            ctx.store.write_champions(&writer.session().champions)?;
+            if let Some(champion) = screen.champion.clone() {
+                writer.push_champion(champion)?;
+                ctx.store.write_champions(&writer.session().champions)?;
+            } else if let Some(why) = &screen.champion_refusal {
+                // Counted and NAMED. A sweep silently absent from the matrix
+                // moves `pbo_session`, which gates every promotion.
+                tracing::warn!(
+                    target: "neoethos_autoresearch",
+                    %sweep,
+                    reason = %why,
+                    "this sweep contributes NO row to the session champion matrix"
+                );
+            }
             writer.offer_best_ever(BestEver {
                 sweep,
                 slot: champion_slot,
-                config_hash: champion.config_hash.clone(),
-                e_screen_pess: champion.e_screen_pess,
+                config_hash,
+                e_screen_pess,
                 n_trades: screen.champion_n_trades,
                 dsr: screen.champion_dsr,
                 pbo: screen.champion_pbo,
@@ -724,7 +955,7 @@ pub fn run_with_executor(
         // ── S9 DECIDE ───────────────────────────────────────────────────────
         match crate::verdict::decide(writer.session(), &ctx.goals, &ctx.thresholds) {
             crate::verdict::Decision::Continue => {
-                gc(&mut ctx, &writer)?;
+                gc(&mut ctx, &mut writer, sweep)?;
             }
             crate::verdict::Decision::Promote(candidate) => {
                 return promote(&mut ctx, &mut writer, executor, candidate);
@@ -765,15 +996,18 @@ fn open_or_resume(
         None => goals.primary().clone(),
     };
 
-    let thresholds = crate::judge::JudgeThresholds::frozen();
-    let judge_hash = thresholds.judge_hash();
-
     let pip_value_per_lot = base_config.evaluation_config(None).pip_value_per_lot;
     let costs = frozen_cost_fields(&base_config, pip_value_per_lot);
     let cost_hash = hash_named(&costs);
 
     // The OOS window is defined ONCE, here, and recorded in the header.
     let (search_span, oos_window, oos_bars, bars_per_trade) = executor.windows()?;
+
+    // The judge, with its two floors DERIVED from the windows just resolved.
+    // Built here and not earlier because both floors need those windows and
+    // both enter `judge_hash`.
+    let thresholds = session_thresholds(&base_config, search_span, oos_window);
+    let judge_hash = thresholds.judge_hash();
 
     let root = SessionStore::root()?;
     let created_utc = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -902,7 +1136,11 @@ fn open_or_resume(
         search_span_ms: search_span,
         oos_window_ms: (oos_window.start_ms, oos_window.end_ms),
         oos_bars,
-        n_min_oos: ctx_n_min_oos(&base_config, oos_window),
+        // Read off the JUDGE, not re-derived: the self-check's job is to verify
+        // the floor that will actually be enforced. Two call sites of the same
+        // derivation is how the startup message came to describe a bar the
+        // judge did not apply.
+        n_min_oos: thresholds.n_min_oos,
         oos_bars_per_expected_trade: bars_per_trade,
         mirror_risky: (
             base_config.risky_start_balance,
@@ -972,19 +1210,80 @@ fn identity_source() -> String {
         .to_string()
 }
 
-/// `N_MIN_OOS` is **derived**, never a constant (§15).
+/// **The judge a session runs under.** §15 — the two trade floors are DERIVED,
+/// and they are installed where they are ENFORCED.
+///
+/// `JudgeThresholds::frozen()` carries 30-trade placeholders. The judge applies
+/// `n_min_screen` at screen conjunct S5 and `n_min_oos` at the single
+/// out-of-sample touch, so deriving the floors for the startup self-check and
+/// then judging with the placeholders means the line the operator reads at
+/// startup — "verified: this window can hold N trades" — describes a bar
+/// nothing ever applies. On a two-year OOS window at half a trade a day the
+/// derived floor is around 360 against an enforced 30: a twelve-times weaker
+/// bar, on the one window that cannot be re-read.
+///
+/// Both floors enter `judge_hash`, which the session id is built from and every
+/// resume is checked against, so a session whose windows moved refuses to
+/// resume rather than continuing under a floor its earlier sweeps were never
+/// judged by.
+fn session_thresholds(
+    config: &DiscoveryConfig,
+    search_span: (i64, i64),
+    oos_window: OosWindow,
+) -> crate::judge::JudgeThresholds {
+    crate::judge::JudgeThresholds::frozen().with_derived_floors(
+        ctx_n_min_screen(config, search_span, oos_window),
+        ctx_n_min_oos(config, oos_window),
+    )
+}
+
+/// The ONE derivation behind both trade floors (§15).
 ///
 /// `min_trades_per_month × months_in_window`, where the months come from the
-/// OOS window's own wall-clock duration and `min_trades_per_month` from the
+/// window's own wall-clock duration and `min_trades_per_month` from the
 /// configured `min_trades_per_day`. Deriving it is the point: a fixed trade
 /// count degrades differently on every dataset — it is a strict bar on a
 /// two-month window and no bar at all on a two-year one.
-fn ctx_n_min_oos(config: &DiscoveryConfig, oos_window: OosWindow) -> usize {
+///
+/// Both floors go through here and through [`crate::judge::n_min_trades`], so
+/// the in-sample bar and the out-of-sample bar MEAN the same thing measured on
+/// different windows, rather than being two similar-looking formulas that drift
+/// apart. The result is never zero: a floor of zero lets a candidate that
+/// closed no trade clear the trade conjunct.
+fn derived_trade_floor(config: &DiscoveryConfig, start_ms: i64, end_ms: i64) -> usize {
     const MS_PER_DAY: f64 = 86_400_000.0;
-    let days = ((oos_window.end_ms - oos_window.start_ms).max(0) as f64 / MS_PER_DAY).max(1.0);
+    let days = ((end_ms - start_ms).max(0) as f64 / MS_PER_DAY).max(1.0);
     let months = (days / 30.0).max(1.0);
     let per_month = (config.min_trades_per_day.max(0.05) * 30.0).max(1.0);
-    (per_month * months).round() as usize
+    crate::judge::n_min_trades(per_month, months)
+}
+
+/// `N_MIN_OOS` is **derived**, never a constant (§15) — from the OOS window.
+fn ctx_n_min_oos(config: &DiscoveryConfig, oos_window: OosWindow) -> usize {
+    derived_trade_floor(config, oos_window.start_ms, oos_window.end_ms)
+}
+
+/// `N_MIN_SCREEN` is **derived**, never a constant (§15) — from the IN-SAMPLE
+/// span, which is the loaded span with the reserved OOS tail removed.
+///
+/// The screen never sees an OOS bar, so deriving its floor from the whole
+/// loaded span would demand trades from months the screen is not allowed to
+/// look at. When the window arithmetic is degenerate — an OOS start at or
+/// before the span start, which the startup self-check rejects separately — the
+/// span falls back to the whole loaded range rather than collapsing to a
+/// one-day window and a floor of one, because a floor of one is no floor.
+fn ctx_n_min_screen(
+    config: &DiscoveryConfig,
+    search_span: (i64, i64),
+    oos_window: OosWindow,
+) -> usize {
+    let (span_start, span_end) = search_span;
+    let in_sample_end = if oos_window.start_ms > span_start {
+        oos_window.start_ms.min(span_end)
+    } else {
+        span_end
+    };
+    derived_trade_floor(config, span_start, in_sample_end)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1244,6 +1543,7 @@ fn run_sweep(
             config: &config,
             config_hash: &proposal.config_hash,
             trial_returns_path: ctx.store.trial_returns_path(sweep, slot),
+            promotion_evidence_path: promotion_evidence_path(&ctx.store, sweep, slot),
             permutation,
         };
 
@@ -1278,20 +1578,17 @@ fn run_sweep(
     }
 
     let wall_ms = began.elapsed().as_millis() as u64;
-    let per_search: Vec<SearchRecord> = outcomes.iter().map(SearchOutcome::to_record).collect();
-    let statistics: Vec<TrialStatisticsReport> =
-        outcomes.iter().map(|o| o.statistics.clone()).collect();
 
     // The rows are one-per-proposal by construction. Checked rather than
     // asserted in a comment, and checked BEFORE the outcome record is written,
     // because "by construction" is what this defect was wearing the last time.
-    if per_search.len() != proposals.len() {
+    if outcomes.len() != proposals.len() {
         let recovered = ctx.store.recover_partial_trials(sweep);
         let detail = format!(
             "{sweep} produced {} search records for {} proposals. Every proposal contributes \
              exactly one row — a refused one contributes a NOT-RUN row — so a short vector means a \
              slot was dropped and every slot after it now names a different experiment.",
-            per_search.len(),
+            outcomes.len(),
             proposals.len()
         );
         // The sweep is closed rather than left open: a crash loses one sweep,
@@ -1304,12 +1601,40 @@ fn run_sweep(
         bail!(detail);
     }
 
+    // ── DEFLATE AGAINST N_session ───────────────────────────────────────────
+    //
+    // The executor deflated each report against ITS OWN trial count, because
+    // that is the only number a single search can know. The honest denominator
+    // is every candidate this SESSION has offered, including the sweep that has
+    // just finished — a fold over the journal, and therefore not final until
+    // this sweep is recorded. That is the whole reason this step lives in the
+    // runner and cannot be pushed into `SweepExecutor`.
+    //
+    // `n_session_after` is the fold the `SweepCompleted` below will produce, and
+    // it is PROVED against the fold immediately after the append rather than
+    // trusted: a projection that silently disagreed with the journal would
+    // reintroduce exactly the mismatch this fixes, one level down.
+    let n_session_after = writer.session().n_session() + trials_offered;
+    for outcome in &mut outcomes {
+        let redeflated = outcome.statistics.redeflated_against(n_session_after);
+        outcome.statistics = redeflated;
+    }
+
+    let per_search: Vec<SearchRecord> = outcomes.iter().map(SearchOutcome::to_record).collect();
+    let statistics: Vec<TrialStatisticsReport> =
+        outcomes.iter().map(|o| o.statistics.clone()).collect();
+
     ctx.store
         .write_sweep_artifact(sweep, "statistics.json", &statistics)?;
     ctx.store
         .write_sweep_artifact(sweep, "censuses.json", &per_search)?;
 
-    // OUTCOME.
+    // OUTCOME. Written AFTER the re-deflation so that the journal row, the
+    // `statistics.json` artifact and the evidence the judge screens are the
+    // same three numbers. `SearchRecord::dsr` is read by the shuffle control's
+    // block judgement; a journal holding the un-deflated value while the judge
+    // used the deflated one would make those two comparisons disagree about
+    // what a DSR is.
     writer.append(Record::SweepCompleted {
         sweep,
         trials_offered,
@@ -1317,7 +1642,22 @@ fn run_sweep(
         wall_ms,
     })?;
 
-    let champion = best_champion(sweep, &outcomes);
+    // The projection above must BE the fold. If it is not, every report in this
+    // sweep was deflated against a number that is not `n_session`, the judge's
+    // N contract will refuse all of them, and the cause is here rather than in
+    // the sweep. The sweep is already closed by the record above, so the session
+    // keeps its history and the caller turns this into a stop WITH a verdict.
+    let folded = writer.session().n_session();
+    if folded != n_session_after {
+        bail!(
+            "{sweep}: the statistics were deflated against N = {n_session_after} but recording the \
+             sweep left the session-wide fold at {folded}. The deflation denominator and the \
+             journal's own count of offered trials must be the same number — a screen judged \
+             against anything else is not deflated, it is flattered."
+        );
+    }
+
+    let champion_rows = champion_rows(sweep, &outcomes);
 
     Ok(SweepRun {
         evidence: SweepEvidence {
@@ -1326,7 +1666,7 @@ fn run_sweep(
             sweep_hash,
             per_search,
             statistics,
-            champion,
+            champion_rows,
             trials_offered,
             wall_ms,
         },
@@ -1345,22 +1685,35 @@ fn sweep_hash_of(proposals: &[crate::proposal::Proposal]) -> String {
     crate::fnv64(&canonical)
 }
 
-/// The sweep's champion row for the session champion matrix: the survivor with
-/// the highest PESSIMISTIC-edge expectancy.
-fn best_champion(sweep: SweepId, outcomes: &[SearchOutcome]) -> Option<ChampionRow> {
+/// The champion row **every slot** offers, index-aligned with `outcomes`.
+///
+/// The runner MATERIALISES; it does not select. It used to do both — argmax
+/// `e_screen_pess` over every non-errored search, screened or not — and the
+/// judge then re-stamped that one row with the identity of the best *passing*
+/// slot. Two different selection rules, one row, and the stamping hid the
+/// disagreement: the session champion matrix received a REJECT's return series
+/// under the winner's `config_hash`. Selection now happens once, in the judge,
+/// over slots that actually passed the screen.
+///
+/// A row needs both a return series and a number; a search missing either
+/// offers `None` rather than a half-built row.
+fn champion_rows(sweep: SweepId, outcomes: &[SearchOutcome]) -> Vec<Option<ChampionRow>> {
     outcomes
         .iter()
-        .filter(|o| o.error.is_none() && !o.champion_returns.is_empty())
-        .filter_map(|o| o.e_screen_pess.map(|e| (o, e)))
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(o, e)| ChampionRow {
-            sweep,
-            config_hash: o.config_hash.clone(),
-            strategy_id: o.champion_strategy_id.clone(),
-            period_keys: o.champion_period_keys.clone(),
-            monthly_returns: o.champion_returns.clone(),
-            e_screen_pess: e,
+        .map(|o| {
+            if o.error.is_some() || o.champion_returns.is_empty() {
+                return None;
+            }
+            o.e_screen_pess.map(|e| ChampionRow {
+                sweep,
+                config_hash: o.config_hash.clone(),
+                strategy_id: o.champion_strategy_id.clone(),
+                period_keys: o.champion_period_keys.clone(),
+                monthly_returns: o.champion_returns.clone(),
+                e_screen_pess: e,
+            })
         })
+        .collect()
 }
 
 fn journal_draw(
@@ -1526,63 +1879,194 @@ fn promote(
         );
     }
 
-    let proposals = writer
+    // ── EVERYTHING BELOW THIS LINE HAPPENS BEFORE THE WINDOW IS SPENT ───────
+    //
+    // The window is spent when the touch HAPPENS, not when the runner decides
+    // to attempt one. Every step that can fail without reading an
+    // out-of-sample bar — reconstructing the configuration, loading the genes,
+    // asking the executor whether it can evaluate at all — is taken first, and
+    // each failure is a NAMED REFUSAL that stops the session with a verdict and
+    // leaves `oos_spent()` false. A resume can then try again once the missing
+    // thing exists, which is the entire difference between "this session has
+    // nothing to say" and "this session cannot ever say anything".
+    //
+    // None of these refusals is an `Err` out of `promote`, because an `Err` here
+    // propagates out of `run` and the session ends with NO `SessionStopped` and
+    // NO `verdict.json` — the multi-hour run that produced no artifact.
+    // Read out into an OWNED vector in its own statement: the session borrow
+    // ends here, so every refusal below is free to take `writer` mutably and
+    // stop with a verdict.
+    let recorded = writer
         .session()
         .proposals_of(candidate.sweep)
-        .map(<[_]>::to_vec)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the promotion candidate's sweep {} has no recorded proposals, so its \
-                 configuration cannot be reconstructed for the OOS evaluation",
-                candidate.sweep
-            )
-        })?;
+        .map(<[_]>::to_vec);
+    let Some(proposals) = recorded else {
+        return stop(
+            ctx,
+            writer,
+            crate::verdict::StopReason::InfrastructureAbort {
+                detail: format!(
+                    "the promotion candidate's sweep {} has no recorded proposals, so its \
+                     configuration cannot be reconstructed for the out-of-sample evaluation. The \
+                     journal is the memory; this means a ProposalDrawn record is missing. The \
+                     window is NOT spent.",
+                    candidate.sweep
+                ),
+            },
+        );
+    };
     // THE ONE PLACE A MISNAMED SLOT COULD NOT BE TAKEN BACK.
     //
     // `candidate.slot` NAMES a proposal; it is not an offset into this vector.
     // The lookup is by identity and it is cross-checked against the
     // `config_hash` the screen recorded, so if the two ever disagree the touch
     // is REFUSED rather than spent on whichever configuration an index reached.
-    let proposal = proposal_named_by(
+    let proposal = match proposal_named_by(
         candidate.sweep,
         &proposals,
         candidate.slot,
         Some(candidate.config_hash.as_str()),
-    )
-    .with_context(|| {
-        format!(
-            "resolving the promotion candidate for {} slot {} before spending the single \
-             out-of-sample touch",
-            candidate.sweep, candidate.slot
-        )
-    })?;
-    let config = proposal.resolve(&ctx.base_config)?;
+    ) {
+        Ok(proposal) => proposal.clone(),
+        Err(err) => {
+            return stop(
+                ctx,
+                writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "resolving the promotion candidate for {} slot {} before spending the \
+                         single out-of-sample touch: {err:#}. The window is NOT spent.",
+                        candidate.sweep, candidate.slot
+                    ),
+                },
+            );
+        }
+    };
+    let config = match proposal.resolve(&ctx.base_config) {
+        Ok(config) => config,
+        Err(err) => {
+            return stop(
+                ctx,
+                writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "the promotion candidate {} slot {} could no longer be resolved into a \
+                         runnable configuration: {err:#}. The window is NOT spent.",
+                        candidate.sweep, candidate.slot
+                    ),
+                },
+            );
+        }
+    };
 
-    // The budget is spent BEFORE the evaluation, so a crash inside it cannot
-    // leave the session believing the window is still clean.
+    // THE EVIDENCE IS LOADED AND STAMP-CHECKED BEFORE THE BUDGET IS SPENT.
+    //
+    // This is the half of the promotion path that used to be guaranteed to
+    // fail: the genes were read from a file in the executor's scratch directory
+    // that nothing in the workspace ever wrote, and the `OosTouchSpent` record
+    // was already on disk by the time anyone found out. The evidence now lives
+    // in the session store, is written at S5 by the search that selected it,
+    // and carries the slot's `config_hash` so that a file at the right path
+    // still has to prove it describes the right configuration.
+    let evidence_path = promotion_evidence_path(&ctx.store, candidate.sweep, candidate.slot);
+    let portfolio = match load_promotion_portfolio(
+        &evidence_path,
+        candidate.sweep,
+        candidate.slot,
+        &proposal.config_hash,
+    ) {
+        Ok(portfolio) => portfolio,
+        Err(err) => {
+            return stop(
+                ctx,
+                writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "the promotion candidate {} slot {} has no usable in-sample evidence, so \
+                         the single out-of-sample touch was NOT spent and the window stays clean \
+                         for a resume: {err:#}",
+                        candidate.sweep, candidate.slot
+                    ),
+                },
+            );
+        }
+    };
+
+    // Anything the executor can refuse without reading a bar, refused now.
+    if let Err(err) = executor.oos_preflight(&portfolio) {
+        return stop(
+            ctx,
+            writer,
+            crate::verdict::StopReason::InfrastructureAbort {
+                detail: format!(
+                    "the executor cannot evaluate {} slot {} out of sample and said so BEFORE the \
+                     window was spent: {err:#}",
+                    candidate.sweep, candidate.slot
+                ),
+            },
+        );
+    }
+
+    // ── THE TOUCH ───────────────────────────────────────────────────────────
+    //
+    // The budget is spent immediately BEFORE the evaluation and after every
+    // check that could have avoided it, so a crash inside the evaluation cannot
+    // leave the session believing the window is still clean, and a refusal that
+    // never read a bar cannot leave it believing the window is gone.
     writer.append(Record::OosTouchSpent {
         window: ctx.oos_window,
         sweep: candidate.sweep,
         candidate: proposal.config_hash.clone(),
     })?;
 
-    let oos = executor
-        .evaluate_oos(candidate.sweep, candidate.slot, &config)
-        .with_context(|| {
-            format!(
-                "evaluating {} slot {} on the out-of-sample window",
-                candidate.sweep, candidate.slot
-            )
-        })?;
+    let oos = match executor.evaluate_oos(
+        candidate.sweep,
+        candidate.slot,
+        &config,
+        &portfolio,
+    ) {
+        Ok(oos) => oos,
+        Err(err) => {
+            // The window IS spent — the record above is already fsynced — so
+            // this stops with a verdict rather than losing the session. A
+            // session that spent its window and reported nothing is the worst
+            // of both outcomes.
+            return stop(
+                ctx,
+                writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "evaluating {} slot {} on the out-of-sample window failed AFTER the touch \
+                         was journalled as spent, so this session cannot try again: {err:#}",
+                        candidate.sweep, candidate.slot
+                    ),
+                },
+            );
+        }
+    };
 
-    let outcome = crate::judge::promote(
+    let outcome = match crate::judge::promote(
         &candidate,
         &oos,
         &ctx.thresholds,
         &ctx.goals,
         &ctx.scenario,
         writer.session(),
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return stop(
+                ctx,
+                writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "the out-of-sample evidence for {} slot {} could not be judged: {err:#}",
+                        candidate.sweep, candidate.slot
+                    ),
+                },
+            );
+        }
+    };
 
     if outcome.promoted {
         writer.append(Record::Promoted {
@@ -1610,6 +2094,19 @@ fn promote(
             "oos_window": ctx.oos_window,
             "oos_trades": oos.per_trade_net_pips.len(),
             "proposal": proposal,
+            // WHICH genes were evaluated, and where they are. The counts are
+            // here so a reader can tell a portfolio from a single strategy
+            // without opening the artifact; the artifact itself is not inlined,
+            // because this file is the loop's only tradeable output and it stays
+            // a description of a configuration rather than a deployable one.
+            "promotion_evidence": {
+                "path": evidence_path.display().to_string(),
+                "config_hash": portfolio.config_hash,
+                "genes": portfolio.genes.len(),
+                "feature_names": portfolio.feature_names.len(),
+                "streamed": portfolio.streamed,
+                "batches": portfolio.batches,
+            },
             "NOT_A_PROMOTION": "This file is a PROPOSAL. Nothing in the trading path reads it. \
                                 Promoting it is the operator's act.",
         }))?;
@@ -1692,7 +2189,20 @@ fn stop(
 
 /// §3.2 — delete the trial-returns matrices this session no longer needs, under
 /// a named census. Never silently.
-fn gc(ctx: &mut LoopContext, writer: &SessionWriter) -> Result<()> {
+///
+/// **The pass is JOURNALLED, and that is the point of the record.**
+/// `AbandonCensus::gc_deleted_matrices` and `gc_bytes_reclaimed` are rendered by
+/// every verdict and by `census_line` at every stop; until
+/// [`Record::GarbageCollected`] existed there was no record for the fold to fold,
+/// so both numbers were structurally zero while this function deleted every
+/// non-kept sweep's matrices. The operator was told nothing had been deleted by a
+/// session that had deleted all of it, and a `tracing::info!` that only fired
+/// when `deleted > 0` was the whole of the evidence.
+///
+/// Every pass is recorded, including one that reclaimed nothing: *"the GC ran and
+/// found nothing"* and *"the GC never ran"* are different facts, and only the
+/// second is a wiring finding.
+fn gc(ctx: &mut LoopContext, writer: &mut SessionWriter, after: SweepId) -> Result<()> {
     let mut keep: HashSet<SweepId> = HashSet::new();
     if let Some(best) = &writer.session().best_ever {
         keep.insert(best.sweep);
@@ -1703,18 +2213,20 @@ fn gc(ctx: &mut LoopContext, writer: &SessionWriter) -> Result<()> {
         }
     }
     let census = ctx.store.gc_trial_matrices(&keep)?;
-    if census.deleted > 0 {
-        tracing::info!(
-            target: "neoethos_autoresearch::runner",
-            kept = census.kept,
-            deleted = census.deleted,
-            bytes_reclaimed = census.bytes_reclaimed,
-            free_bytes_after = ?census.free_bytes_after,
-            rule = %census.rule,
-            "sweeps_gc"
-        );
-    }
-    Ok(())
+    tracing::info!(
+        target: "neoethos_autoresearch::runner",
+        sweep = %after,
+        kept = census.kept,
+        deleted = census.deleted,
+        bytes_reclaimed = census.bytes_reclaimed,
+        free_bytes_after = ?census.free_bytes_after,
+        rule = %census.rule,
+        "sweeps_gc"
+    );
+    writer.append(Record::GarbageCollected {
+        sweep: after,
+        census,
+    })
 }
 
 /// `--dry-run`: draw and stamp one sweep's proposals, write them, run nothing.

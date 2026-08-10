@@ -1016,7 +1016,17 @@ Root: resolved through the existing store resolver
       proposals.json           the 100 stamped proposals, in draw order
       statistics.json          per-search TrialStatisticsReport
       censuses.json            ten rejection counters, CostBandCensus, batch ledger
-      survivors.json           canonical genes + canonical feature names
+      promotion/slot_NNN.json  canonical genes + the canonical feature NAMES their
+                               indices address + the slot's config_hash STAMP.
+                               ONE PER SEARCH, not one per sweep: a sweep runs 100
+                               searches and each selects its own portfolio, so a
+                               single file per sweep could only describe one of them.
+                               Written at S5 by the search that selected the genes;
+                               a search that selected nothing writes NOTHING, so
+                               "no evidence" has exactly one shape. Read once, by
+                               the promotion path, BEFORE the out-of-sample touch is
+                               journalled as spent — and refused unless the stamp is
+                               the promoted configuration's.
       trial_returns.bin        KEPT ONLY for best-ever / promotion / control (§3.2)
   session_champions.json       one champion row per sweep (the pbo_session input)
   verdict.json                 written ONCE, at stop

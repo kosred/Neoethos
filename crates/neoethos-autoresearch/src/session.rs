@@ -651,9 +651,22 @@ pub struct SweepEvidence {
     /// Index-aligned with `statistics`.
     pub per_search: Vec<SearchRecord>,
     pub statistics: Vec<neoethos_search::deflated::TrialStatisticsReport>,
-    /// The champion row this sweep contributes to the session champion matrix,
-    /// if anything survived.
-    pub champion: Option<ChampionRow>,
+    /// The champion row **each slot** offers, index-aligned with `per_search`.
+    /// `None` where that search produced no per-period champion series at all.
+    ///
+    /// One row PER SLOT, never one pre-selected row. The runner used to hand the
+    /// judge a single row — the argmax of `e_screen_pess` over every non-errored
+    /// search, SCREENED OR NOT — and the judge then stamped it with the
+    /// `config_hash` and expectancy of the best *passing* slot. When those two
+    /// argmaxes disagreed (the routine case: the highest-expectancy slot is
+    /// typically the overfit outlier that fails S1/S2/S5) the session champion
+    /// matrix received a REJECTED configuration's return series wearing the
+    /// winner's identity, and the stamping is what hid it. `pbo_session` — the
+    /// PBO of the loop's own selection procedure, which gates every promotion —
+    /// is computed from exactly those rows.
+    ///
+    /// So the selection happens ONCE, in the judge, over slots that passed.
+    pub champion_rows: Vec<Option<ChampionRow>>,
     pub trials_offered: usize,
     pub wall_ms: u64,
 }
@@ -684,6 +697,15 @@ pub struct Session {
     /// The shuffle null: every control sweep's best `E_screen_pess`, in block
     /// order.
     pub null_observations: Vec<f64>,
+    /// Controls that produced NO number. Carried separately because
+    /// `null_observations` is a `Vec<f64>` on a `PartialEq` struct and a NaN
+    /// sentinel would make the session unequal to itself.
+    ///
+    /// A refusal is not an observation and it is not nothing: `shuffle.rs`
+    /// promises every control is *"counted, never dropped"*, and this field is
+    /// where the count lives. Without it `ShuffleSummary::null_refusals` — which
+    /// is rendered under EVERY headline the loop prints — was structurally zero.
+    pub null_refusals: usize,
     /// The best screened result the session has ever seen.
     ///
     /// Folded from [`Record::BestEverAdvanced`] and from nothing else. It was
@@ -937,8 +959,26 @@ impl Session {
                     self.census.screen_failed_by_conjunct[index] += 1;
                 }
                 let slots = self.screens.entry(sweep.0).or_default();
-                if slots.len() <= *slot {
-                    slots.resize_with(*slot + 1, || screen_result.clone());
+                // A GAP IS NOT A REPEAT. The vector is keyed by SLOT and the
+                // records arrive by slot, so a record for slot k landing in a
+                // vector of length j < k means slots j..k have no screen at all.
+                // Filling them with a CLONE of the arriving result made every
+                // one of them a Pass carrying slot k's statistics — and
+                // `promotion_candidate` selects out of exactly this vector, so
+                // the fabricated passes competed for the one irreplaceable
+                // out-of-sample touch. They are filled with a REFUSAL instead:
+                // "nothing could be judged here" is the truth, and it is a
+                // truth that can never be promoted.
+                while slots.len() <= *slot {
+                    let missing = slots.len();
+                    slots.push(crate::judge::ScreenResult::Unavailable {
+                        detail: format!(
+                            "no Screened record has arrived for slot {missing} of {sweep}. The \
+                             screen vector is keyed by slot, so this slot was never judged — it \
+                             is NOT the verdict of the neighbouring slot, and it can never be a \
+                             promotion candidate."
+                        ),
+                    });
                 }
                 slots[*slot] = screen_result.clone();
             }
@@ -988,17 +1028,48 @@ impl Session {
             }
 
             Record::ShuffleControlCompleted {
-                trials_offered,
+                block,
                 e_screen_pess,
                 source_sweep,
                 ..
             } => {
-                // The control's trials count into N_session exactly like a live
-                // sweep's: the null is not free, and pretending it is would
-                // flatter every deflated statistic in the session.
-                self.terminal_trials.push((*source_sweep, *trials_offered));
-                if let Some(e) = e_screen_pess {
-                    self.null_observations.push(*e);
+                // ── N_session ────────────────────────────────────────────────
+                //
+                // NOT credited here. The control's trials count into N_session
+                // exactly like a live sweep's — the null is not free — and that
+                // is precisely how they are already counted: a control IS a
+                // sweep. `run_block_control` drives it through `run_sweep`,
+                // which appends its own `SweepCompleted` with this same
+                // `trials_offered`, and the arm above credits it. Crediting it
+                // a second time here, under the SOURCE sweep's id, inflated
+                // N_session by one control per block — about 20% — which does
+                // not flatter the deflated statistics but does make every
+                // headline N a number no other artifact can reproduce.
+                //
+                // `trials_offered` is left in the record: it is what makes the
+                // control's own line readable by a person holding only
+                // `journal.jsonl`.
+
+                // ── the null ─────────────────────────────────────────────────
+                match e_screen_pess {
+                    Some(e) => self.null_observations.push(*e),
+                    // A control that produced NO number is COUNTED, never
+                    // dropped. `shuffle.rs` promises exactly this and the fold
+                    // used to break the promise silently: `null_refusals` was
+                    // structurally zero under every headline the loop printed,
+                    // so a session whose controls were all broken read as a
+                    // session with a clean null. It is also NAMED in the
+                    // census, because a counter with no example beside it is a
+                    // number nobody can act on.
+                    None => {
+                        self.null_refusals += 1;
+                        note(
+                            &mut self.census,
+                            "a shuffle control produced no E_screen_pess, so it joins the null as \
+                             a REFUSAL and not as an observation",
+                            &format!("{block} (source {source_sweep})"),
+                        );
+                    }
                 }
             }
 
@@ -1023,6 +1094,36 @@ impl Session {
             }
 
             Record::Promoted { .. } | Record::PromotionRefused { .. } => {}
+
+            Record::GarbageCollected { sweep, census } => {
+                self.note_sweep(*sweep);
+                // THE TWO COUNTERS THAT WERE RENDERED BY EVERY VERDICT AND
+                // ASSIGNED BY NOBODY.
+                //
+                // `AbandonCensus::render` prints "trial matrices GC'd N (B bytes
+                // reclaimed)" on every report and `census_line` prints it at
+                // every stop, while `SessionStore::gc_trial_matrices` was
+                // deleting every non-kept sweep's matrices with only a
+                // `tracing::info!` to show for it. There was no record, so the
+                // fold had nothing to fold, so the numbers were structurally
+                // zero — the operator was told nothing had been deleted by a
+                // session that had deleted all of it.
+                //
+                // Accumulated across passes rather than overwritten: the census
+                // is a session total, and a GC that ran fifteen times must not
+                // report only the fifteenth.
+                let first_pass_that_reclaimed =
+                    self.census.gc_deleted_matrices == 0 && census.deleted > 0;
+                self.census.gc_deleted_matrices += census.deleted;
+                self.census.gc_bytes_reclaimed += census.bytes_reclaimed;
+                // The RULE, named once, on the first pass that actually deleted
+                // something — not on every pass: the example list is capped at
+                // CENSUS_EXAMPLE_LIMIT and is rendered in full, so a line per
+                // pass would crowd out the named drops it exists to carry.
+                if first_pass_that_reclaimed {
+                    note(&mut self.census, &census.rule, &format!("gc after {sweep}"));
+                }
+            }
 
             Record::SessionStopped { verdict } => {
                 self.stopped = Some(verdict.clone());
@@ -2142,8 +2243,102 @@ mod tests {
         assert_eq!(session.null_observations, vec![0.31]);
         assert_eq!(session.blocks.len(), 1);
         assert_eq!(session.indistinguishable_blocks(), 0);
-        // The control's trials count into N.
-        assert_eq!(session.n_session(), 100);
+        // The control's trials count into N exactly ONCE, through the control
+        // sweep's own `SweepCompleted`. This journal has none, so the summary
+        // record on its own contributes nothing — crediting it here is what
+        // double-counted every control in a real session.
+        assert_eq!(session.n_session(), 0);
+        assert_eq!(
+            session.n_session(),
+            crate::journal::n_session(&records),
+            "the two definitions of N must not drift apart"
+        );
+    }
+
+    /// C5. A control that produced no number is COUNTED and NAMED, never
+    /// dropped. `ShuffleSummary::null_refusals` rides under every headline the
+    /// loop prints, and it used to be structurally zero.
+    #[test]
+    fn a_shuffle_control_with_no_number_is_counted_as_a_refusal_and_named() {
+        let records = vec![
+            header_record("ar-test"),
+            Record::ShuffleControlCompleted {
+                block: BlockId(0),
+                kind: crate::shuffle::ControlKind::CircularRotation,
+                tau: 0.31,
+                source_sweep: SweepId(3),
+                trials_offered: 100,
+                e_screen_pess: None,
+                dsr: None,
+            },
+        ];
+        let session = Session::fold(&records).unwrap();
+        assert!(session.null_observations.is_empty());
+        assert_eq!(session.null_refusals, 1);
+        assert_eq!(crate::shuffle::ShuffleNull::from_session(&session).refused(), 1);
+        assert_eq!(
+            crate::shuffle::ShuffleSummary::from_session(&session).null_refusals,
+            1,
+            "the headline must not print a clean null over a broken control"
+        );
+        assert!(
+            session
+                .census
+                .examples
+                .iter()
+                .any(|(reason, _)| reason.contains("no E_screen_pess")),
+            "counted is not enough — it must be NAMED: {:?}",
+            session.census.examples
+        );
+    }
+
+    /// C4. The control sweep's own `SweepCompleted` is the ONE place its trials
+    /// are credited. This is the journal a real block boundary writes.
+    #[test]
+    fn a_control_sweeps_trials_are_counted_once_not_twice() {
+        let records = vec![
+            header_record("ar-test"),
+            Record::SweepStarted {
+                sweep: SweepId(1),
+                sweep_hash: "fnv64:live".to_string(),
+                kind: SweepKind::Live,
+                started_ms: 1,
+            },
+            Record::SweepCompleted {
+                sweep: SweepId(1),
+                trials_offered: 100,
+                per_search: Vec::new(),
+                wall_ms: 1,
+            },
+            Record::SweepStarted {
+                sweep: SweepId(2),
+                sweep_hash: "fnv64:control".to_string(),
+                kind: SweepKind::Control {
+                    control: crate::shuffle::ControlKind::CircularRotation,
+                    source_sweep: SweepId(1),
+                    block: BlockId(0),
+                },
+                started_ms: 2,
+            },
+            Record::SweepCompleted {
+                sweep: SweepId(2),
+                trials_offered: 100,
+                per_search: Vec::new(),
+                wall_ms: 1,
+            },
+            Record::ShuffleControlCompleted {
+                block: BlockId(0),
+                kind: crate::shuffle::ControlKind::CircularRotation,
+                tau: 0.31,
+                source_sweep: SweepId(1),
+                trials_offered: 100,
+                e_screen_pess: Some(-0.2),
+                dsr: None,
+            },
+        ];
+        let session = Session::fold(&records).unwrap();
+        assert_eq!(session.n_session(), 200, "not 300");
+        assert_eq!(session.n_session(), crate::journal::n_session(&records));
     }
 
     #[test]
@@ -2291,6 +2486,61 @@ mod tests {
         assert!(census.rule.contains("best-ever"));
         assert!(store.trial_returns_path(SweepId(1), 0).exists());
         assert!(!store.trial_returns_path(SweepId(2), 0).exists());
+    }
+
+    /// The GC counters the verdict renders are FOLDED, not zero.
+    ///
+    /// Before `Record::GarbageCollected` existed, `gc_deleted_matrices` and
+    /// `gc_bytes_reclaimed` were rendered by `AbandonCensus::render` and by
+    /// `census_line` on every single report and were written by NOTHING. The
+    /// operator was told zero matrices had been deleted while the session had
+    /// deleted all of them — the exact shape of "a census that reads clean is
+    /// worse than no census, because a reader takes it as evidence".
+    #[test]
+    fn a_garbage_collection_pass_is_counted_into_the_census() {
+        let pass = |sweep: u64, deleted: usize, bytes: u64| Record::GarbageCollected {
+            sweep: SweepId(sweep),
+            census: GcCensus {
+                kept: 1,
+                deleted,
+                bytes_reclaimed: bytes,
+                rule: "keep the best-ever sweep, the promotion candidate and every control"
+                    .to_string(),
+                free_bytes_after: Some(9_000),
+            },
+        };
+        let records = vec![
+            header_record("ar-test"),
+            // A pass that reclaimed nothing is still a pass and is still
+            // recorded — "the GC found nothing" and "the GC never ran" are
+            // different facts.
+            pass(1, 0, 0),
+            pass(2, 97, 4_096),
+            pass(3, 100, 8_192),
+        ];
+        let session = Session::fold(&records).unwrap();
+
+        // ACCUMULATED across passes. A session that GC'd fifteen times must not
+        // report only the fifteenth.
+        assert_eq!(session.census.gc_deleted_matrices, 197);
+        assert_eq!(session.census.gc_bytes_reclaimed, 12_288);
+        // And the counters are visible in the two places every report reads.
+        assert!(session.census.render().contains("197 (12288 bytes reclaimed)"));
+        assert!(session.census_line().contains("gc_deleted=197"));
+
+        // The RULE is named ONCE — on the first pass that actually reclaimed
+        // something — so it cannot crowd out the named drops the example list
+        // exists to carry.
+        let rules = session
+            .census
+            .examples
+            .iter()
+            .filter(|(_, hash)| hash.starts_with("gc after"))
+            .count();
+        assert_eq!(rules, 1, "examples: {:?}", session.census.examples);
+
+        // A GC pass deletes EVIDENCE, never trials.
+        assert_eq!(session.n_session(), 0);
     }
 
     #[test]

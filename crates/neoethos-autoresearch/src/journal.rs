@@ -44,7 +44,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::session::{BestEver, BlockId, ChampionRow, SessionId, SweepId};
+use crate::session::{BestEver, BlockId, ChampionRow, GcCensus, SessionId, SweepId};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialisable mirrors of upstream types
@@ -401,6 +401,35 @@ pub enum Record {
         failing_conjunct: String,
     },
 
+    /// One garbage-collection pass over the trial-returns matrices (§3.2).
+    ///
+    /// **This record exists because the two GC counters were rendered by every
+    /// verdict and ASSIGNED BY NOBODY.** `AbandonCensus::gc_deleted_matrices`
+    /// and `gc_bytes_reclaimed` are printed on every report — *"trial matrices
+    /// GC'd 0 (0 bytes reclaimed)"* — while `SessionStore::gc_trial_matrices`
+    /// was quietly deleting every non-kept sweep's matrices on the way past.
+    /// There was no `Record` variant for a GC pass, so the fold
+    /// had nothing to fold and the operator was told zero matrices had been
+    /// deleted by a session that had deleted all of them. A census that reads
+    /// clean while the deletions happen is worse than no census, because a
+    /// reader takes it as evidence — the same sentence
+    /// [`CostBandCounts::discriminates`] exists for.
+    ///
+    /// Journalled on **every** pass, including a pass that deleted nothing: "the
+    /// GC ran and found nothing to reclaim" and "the GC never ran" are different
+    /// facts, and only one of them is a wiring finding.
+    ///
+    /// The census is carried WHOLE rather than re-declared field by field, so
+    /// the number in the log line and the number in the verdict are the same
+    /// value and not two values that agree today.
+    GarbageCollected {
+        /// The sweep the pass followed. A GC pass is not a sweep, but it always
+        /// happens after one, and keying it lets a reader line the reclaimed
+        /// bytes up against the sweep whose matrices went.
+        sweep: SweepId,
+        census: GcCensus,
+    },
+
     SessionStopped {
         verdict: crate::verdict::SessionVerdict,
     },
@@ -428,7 +457,8 @@ impl Record {
             | Self::PosteriorUpdated { sweep, .. }
             | Self::OosTouchSpent { sweep, .. }
             | Self::Promoted { sweep, .. }
-            | Self::PromotionRefused { sweep, .. } => Some(*sweep),
+            | Self::PromotionRefused { sweep, .. }
+            | Self::GarbageCollected { sweep, .. } => Some(*sweep),
             Self::ShuffleControlCompleted { source_sweep, .. } => Some(*source_sweep),
             Self::BestEverAdvanced { best } => Some(best.sweep),
             Self::ChampionRecorded { row } => Some(row.sweep),
@@ -461,6 +491,7 @@ impl Record {
             Self::OosTouchSpent { .. } => "OosTouchSpent",
             Self::Promoted { .. } => "Promoted",
             Self::PromotionRefused { .. } => "PromotionRefused",
+            Self::GarbageCollected { .. } => "GarbageCollected",
             Self::SessionStopped { .. } => "SessionStopped",
             Self::TruncatedTail { .. } => "TruncatedTail",
         }
@@ -690,6 +721,15 @@ impl Journal {
 /// journal on every use, which is what makes *"a loop that resets its own N
 /// between sweeps"* structurally impossible rather than forbidden by policy.
 ///
+/// **Counted from the TERMINAL SWEEP records only.** A control counts because a
+/// control IS a sweep: `run_block_control` drives it through `run_sweep`, which
+/// appends its own `SweepCompleted`. [`Record::ShuffleControlCompleted`] is the
+/// control's SUMMARY — its `trials_offered` is the same number, restated for a
+/// reader holding only `journal.jsonl` — and adding it here counted every
+/// control twice, inflating N by roughly one sweep per block. Over-counting N
+/// does not flatter a deflated statistic, but it does make the headline N a
+/// number no other artifact in the session can reproduce.
+///
 /// This is `docs/autoresearch-loop.md` §8.1, verbatim.
 pub fn n_session(journal: &[Record]) -> usize {
     journal
@@ -697,8 +737,7 @@ pub fn n_session(journal: &[Record]) -> usize {
         .filter_map(|r| match r {
             Record::SweepCompleted { trials_offered, .. }
             | Record::SweepFailed { trials_offered, .. }
-            | Record::SweepAbandoned { trials_offered, .. }
-            | Record::ShuffleControlCompleted { trials_offered, .. } => Some(*trials_offered),
+            | Record::SweepAbandoned { trials_offered, .. } => Some(*trials_offered),
             _ => None,
         })
         .sum()
@@ -731,6 +770,41 @@ mod tests {
             dsr: Some(0.97),
             pbo: Some(0.31),
         }
+    }
+
+    fn gc_record(sweep: u64, deleted: usize, bytes: u64) -> Record {
+        Record::GarbageCollected {
+            sweep: SweepId(sweep),
+            census: crate::session::GcCensus {
+                kept: 2,
+                deleted,
+                bytes_reclaimed: bytes,
+                rule: "keep the best-ever sweep and every control".to_string(),
+                free_bytes_after: Some(1_234_567),
+            },
+        }
+    }
+
+    /// The GC pass survives the process, so the counters the verdict renders can
+    /// be re-derived from the journal alone.
+    ///
+    /// Pinned at the journal level because the failure this closes was that the
+    /// record did not exist at all: `AbandonCensus::gc_deleted_matrices` and
+    /// `gc_bytes_reclaimed` were printed by every report and written by nothing,
+    /// so the operator was told zero matrices had been deleted by a session that
+    /// had deleted all of them.
+    #[test]
+    fn a_garbage_collection_pass_survives_a_close_and_reopen() {
+        let dir = tmp();
+        let path = dir.path().join("journal.jsonl");
+        let pass = gc_record(9, 300, 14_680_064);
+        {
+            let mut j = Journal::open(&path).unwrap();
+            j.append(pass.clone()).unwrap();
+        }
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(reopened.records(), [pass].as_slice());
+        assert_eq!(reopened.replay_report().truncated_tail_bytes, 0);
     }
 
     fn champion(sweep: u64) -> ChampionRow {
@@ -812,6 +886,11 @@ mod tests {
         // A trial that ran is a trial that ran. Forgetting the failed and
         // abandoned ones would understate N and therefore FLATTER every
         // deflated Sharpe in the session.
+        //
+        // The CONTROL counts once, through its own `SweepCompleted` — a control
+        // is a sweep. `ShuffleControlCompleted` restates the same number for a
+        // reader and must not be added again: this journal is what a real block
+        // boundary writes, and 100 + 40 + 17 + 100 is the double count.
         let records = vec![
             completed(1, 100),
             Record::SweepFailed {
@@ -824,6 +903,9 @@ mod tests {
                 trials_offered: 17,
                 reason: "process died".into(),
             },
+            // The control sweep itself…
+            completed(4, 100),
+            // …and its summary, carrying the SAME 100.
             Record::ShuffleControlCompleted {
                 block: BlockId(0),
                 kind: crate::shuffle::ControlKind::CircularRotation,
@@ -858,6 +940,10 @@ mod tests {
                 dsr_gap: -0.5,
                 indistinguishable: true,
             },
+            // A GC pass deletes EVIDENCE, never trials. If it could move N the
+            // session's deflation would get easier every time the disk was
+            // tidied.
+            gc_record(4, 97, 4_096),
             Record::PosteriorRetracted {
                 block: BlockId(0),
                 sweep_ids: vec![SweepId(1)],
