@@ -250,3 +250,236 @@ extern "C" __global__ void relative_strength_index_wave_indicator_batch_f64(
     delete[] w3_buf;
     delete[] w4_buf;
 }
+
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 2, round 3
+//
+// WHY A SECOND ENTRY POINT
+//
+// relative_strength_index_wave_indicator_batch_f64 above is genuine
+// double-in/double-out, but it takes 15 parameters, writes FIVE output matrices
+// and calls `new double[]` on the DEVICE for its four WMA rings. The f64 lane
+// launches one shape -- (high, low, close, n, periods, n_combos, first_valid,
+// out) -- and allocates ONE output matrix, so that entry point cannot be
+// reached from it.
+//
+// CPU REFERENCE
+//   src/indicators/relative_strength_index_wave_indicator.rs:708
+//     relative_strength_index_wave_indicator_with_kernel ->
+//     :641 compute_relative_strength_index_wave_indicator_into ->
+//     RelativeStrengthIndexWaveCore::update :594
+//   RsiCore::update :477   WmaCore::update :549
+//
+// THE COLUMN THIS EMITS is rsi_ma1, which is what output_id == "value" resolves
+// to (cpu_batch.rs -- "rsi_ma1" || "value").
+//
+// PINNED CPU DEFAULTS (compute_relative_strength_index_wave_indicator_batch):
+// source "close", rsi_length 14, length1 2. length2/3/4 (5, 9, 13) are NOT
+// pinned because they feed rsi_ma2/3/4 and the state column, none of which is
+// the emitted one -- rsi_ma1 comes from wma1 alone (:614).
+//
+// THE INPUT IS A TRIPLE, and the third series is the SOURCE, not merely a
+// close: the CPU runs THREE independent Wilder RSIs -- one on the source, one
+// on high, one on low (:601-603) -- and blends them. With source defaulting to
+// "close" the lane's Hlc shape is exactly right, which is why the lane row
+// declares F64InputKind::Hlc.
+//
+// PERIOD-INVARIANT. The batch reads source, rsi_length and length1..length4 and
+// NEVER `period`, so five swept periods give five identical CPU columns and
+// this kernel emits five identical rows.
+//
+// SHAPE: one thread per combo, bars ascending. Three Wilder recursions plus a
+// rolling WMA, all carried; a bar where any of source/high/low is non-finite
+// RESETS all four (:595-598), so the series restarts its warmup after every
+// gap.
+//
+// ARITHMETIC ORDER:
+//   * The Wilder step is `avg_gain.mul_add(beta, inv_p * gain)` (:494) -- ONE
+//     rounding -- so `fma()` is used. The seed is `sum_gain * inv_p` (:490),
+//     a multiply by the reciprocal, NOT a divide.
+//   * `gain = delta.max(0.0)` and `loss = (-delta).max(0.0)` are f64::max, so
+//     fmax is used: a NaN delta must not win the comparison and slip into the
+//     carried average as a finite number.
+//   * `hlc_rsi = (high_rsi + low_rsi + 2.0 * custom_rsi) * 0.25` (:613) -- the
+//     adds are left to right and the scale is a multiply by 0.25, not a divide
+//     by 4.
+//   * WmaCore on a full ring (:566-567) computes
+//     `weighted_sum = weighted_sum + len*value - old_sum` then
+//     `sum = old_sum + value - old`, both reading the PRE-update sum, and its
+//     divisor is `(len * (len + 1) / 2) as f64` -- an INTEGER division, exact.
+//
+// FIRST VALID IS NOT READ: compute_..._into writes every index (NaN before the
+// cascade is ready and after every gap). The lane row declares
+// F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fmax/fma, no f32-suffixed math
+// function, no fast-math intrinsic, and no epsilon -- the CPU's only guard on
+// this path is the literal `denom == 0.0` at :501.
+// ---------------------------------------------------------------------------
+
+#define RSIW_NEO_RSI_LENGTH 14
+#define RSIW_NEO_LENGTH1 2
+
+__device__ __forceinline__ double rsiw_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+// RsiCore (relative_strength_index_wave_indicator.rs:404-506), carried per
+// series. Three instances: source, high, low.
+struct RsiwNeoRsi {
+    bool initialized;
+    double prev;
+    int deltas_seen;
+    double sum_gain;
+    double sum_loss;
+    double avg_gain;
+    double avg_loss;
+    bool ready;
+};
+
+__device__ __forceinline__ void rsiw_neo_rsi_reset(RsiwNeoRsi* s) {
+    s->initialized = false;
+    s->prev = rsiw_neo_qnan();
+    s->deltas_seen = 0;
+    s->sum_gain = 0.0;
+    s->sum_loss = 0.0;
+    s->avg_gain = 0.0;
+    s->avg_loss = 0.0;
+    s->ready = false;
+}
+
+__device__ __forceinline__ double rsiw_neo_rsi_update(
+    RsiwNeoRsi* s,
+    double value,
+    double inv_p,
+    double beta
+) {
+    if (!s->initialized) {
+        s->prev = value;
+        s->initialized = true;
+        return rsiw_neo_qnan();
+    }
+    const double delta = value - s->prev;
+    s->prev = value;
+    const double gain = fmax(delta, 0.0);
+    const double loss = fmax(-delta, 0.0);
+
+    if (!s->ready) {
+        s->sum_gain += gain;
+        s->sum_loss += loss;
+        s->deltas_seen += 1;
+        if (s->deltas_seen < RSIW_NEO_RSI_LENGTH) {
+            return rsiw_neo_qnan();
+        }
+        s->avg_gain = s->sum_gain * inv_p;
+        s->avg_loss = s->sum_loss * inv_p;
+        s->ready = true;
+    } else {
+        s->avg_gain = fma(s->avg_gain, beta, inv_p * gain);
+        s->avg_loss = fma(s->avg_loss, beta, inv_p * loss);
+    }
+
+    const double denom = s->avg_gain + s->avg_loss;
+    if (denom == 0.0) {
+        return 50.0;
+    }
+    return 100.0 * s->avg_gain / denom;
+}
+
+extern "C" __global__ void relative_strength_index_wave_indicator_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    const double qnan = rsiw_neo_qnan();
+    for (int i = 0; i < n; ++i) {
+        row[i] = qnan;
+    }
+
+    const double inv_p = 1.0 / static_cast<double>(RSIW_NEO_RSI_LENGTH);
+    const double beta = 1.0 - inv_p;
+
+    RsiwNeoRsi rsi_source;
+    RsiwNeoRsi rsi_high;
+    RsiwNeoRsi rsi_low;
+    rsiw_neo_rsi_reset(&rsi_source);
+    rsiw_neo_rsi_reset(&rsi_high);
+    rsiw_neo_rsi_reset(&rsi_low);
+
+    // WmaCore::new(length1) (:513-523). The divisor is the CPU's INTEGER
+    // (len * (len + 1) / 2) cast to f64 -- exact, because the product is even.
+    double wma_ring[RSIW_NEO_LENGTH1];
+    int wma_pos = 0;
+    int wma_count = 0;
+    double wma_sum = 0.0;
+    double wma_weighted_sum = 0.0;
+    const double wma_denom =
+        static_cast<double>(RSIW_NEO_LENGTH1 * (RSIW_NEO_LENGTH1 + 1) / 2);
+
+    for (int i = 0; i < n; ++i) {
+        const double source_value = close[i];
+        const double high_value = high[i];
+        const double low_value = low[i];
+
+        if (!isfinite(source_value) || !isfinite(high_value) || !isfinite(low_value)) {
+            // :595-598 -- reset() clears the three RSIs, the WMAs and prev_slo.
+            rsiw_neo_rsi_reset(&rsi_source);
+            rsiw_neo_rsi_reset(&rsi_high);
+            rsiw_neo_rsi_reset(&rsi_low);
+            wma_pos = 0;
+            wma_count = 0;
+            wma_sum = 0.0;
+            wma_weighted_sum = 0.0;
+            continue;
+        }
+
+        const double custom_rsi = rsiw_neo_rsi_update(&rsi_source, source_value, inv_p, beta);
+        const double high_rsi = rsiw_neo_rsi_update(&rsi_high, high_value, inv_p, beta);
+        const double low_rsi = rsiw_neo_rsi_update(&rsi_low, low_value, inv_p, beta);
+        if (!isfinite(custom_rsi) || !isfinite(high_rsi) || !isfinite(low_rsi)) {
+            continue;
+        }
+
+        const double hlc_rsi = (high_rsi + low_rsi + 2.0 * custom_rsi) * 0.25;
+
+        // WmaCore::update (:549-575).
+        double rsi_ma1 = qnan;
+        if (wma_count < RSIW_NEO_LENGTH1) {
+            wma_ring[wma_count] = hlc_rsi;
+            wma_count += 1;
+            wma_sum += hlc_rsi;
+            wma_weighted_sum += static_cast<double>(wma_count) * hlc_rsi;
+            if (wma_count == RSIW_NEO_LENGTH1) {
+                rsi_ma1 = wma_weighted_sum / wma_denom;
+            }
+        } else {
+            const double old_sum = wma_sum;
+            const double old = wma_ring[wma_pos];
+            wma_ring[wma_pos] = hlc_rsi;
+            wma_pos += 1;
+            if (wma_pos == RSIW_NEO_LENGTH1) {
+                wma_pos = 0;
+            }
+            wma_weighted_sum =
+                wma_weighted_sum + static_cast<double>(RSIW_NEO_LENGTH1) * hlc_rsi - old_sum;
+            wma_sum = old_sum + hlc_rsi - old;
+            rsi_ma1 = wma_weighted_sum / wma_denom;
+        }
+
+        row[i] = rsi_ma1;
+    }
+}

@@ -1005,3 +1005,435 @@ extern "C" __global__ void possible_rsi_batch_f64(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 2, round 3
+//
+// WHY A SECOND ENTRY POINT
+//
+// possible_rsi_batch_f64 above is real and complete -- it computes all SEVEN
+// output series -- but it takes 28 parameters, writes seven output matrices and
+// demands two caller-allocated scratch arenas (six `cols`-wide double arrays
+// plus a weights buffer, a sorted buffer and two index deques PER SLOT). The
+// f64 lane launches exactly one shape -- (prices, n, periods, n_combos,
+// first_valid, out) -- and allocates ONE output matrix and no scratch at all,
+// so that entry point cannot be reached from it.
+//
+// THE SCRATCH IS NOT NEEDED FOR THE COLUMN THE LANE WANTS. The lane asks for
+// "value", which is out.value (cpu_batch.rs -- the first arm of
+// compute_possible_rsi_batch). Reaching `value` needs only the first four
+// stages of the pipeline, and EVERY ONE of them has a BOUNDED window:
+//
+//   rsi (Wilder)                 2 carried scalars
+//   rolling min/max, norm_period two monotonic deques, 100 deep
+//   gaussian-fisher              rolling min/max 15 deep + 2 carried scalars
+//   nonlag MA                    a 74-deep ring and 74 fixed weights
+//
+// The dynamic-zone percentile (dz_period) and the six signal columns are the
+// ONLY consumers of the remaining scratch, and none of them feeds `value`. So
+// this twin is a single streaming pass with ~4 KB of per-thread state and no
+// full-length intermediate array anywhere.
+//
+// CPU REFERENCE
+//   src/indicators/possible_rsi.rs:1359  possible_rsi_with_kernel
+//     :1193 compute_possible_rsi_output    :1225 compute_possible_rsi_levels
+//     :827  compute_rsi_series             :874  rolling_min_max
+//     :1034 normalize_min_max              :1051 apply_secondary_normalization
+//     :959  fisher_transform_series        :1064 build_nonlag_weights
+//     :1090 nonlag_ma_series
+//   src/indicators/rsi.rs:327 rsi_compute_into_scalar (rsi_mode "regular")
+//
+// PINNED CPU DEFAULTS (compute_possible_rsi_batch): rsi_mode "regular",
+// run_highpass false, norm_period 100, normalization_mode "gaussian_fisher",
+// normalization_length 15, nonlag_period 15. The dynamic-zone and signal
+// parameters are NOT pinned because they are not read on the path to `value`.
+//
+// NOT PERIOD-INVARIANT. compute_possible_rsi_batch reads a parameter literally
+// named `period` (default 32) and it is the RSI length, so `periods[row]` is
+// read and every row of the sweep is a different column. This is one of the few
+// ids in the lane where the sweep does real work.
+//
+// SHAPE: one thread per combo, bars ascending. FORCED sequential four times
+// over -- the Wilder recursion, the two segment-scoped monotonic deques whose
+// contents depend on eviction order, the fisher transform's prev_value /
+// prev_fish, and the nonlag ring.
+//
+// SEGMENT GUARDS ARE REDUNDANT, WHICH IS WHY STREAMING IS EXACT. rolling_min_max
+// (:874) and nonlag_ma_series (:1090) both scan a maximal run of finite values
+// and skip the run when `end - start < window`. That test cannot change any
+// output: the emitting loop starts at `start + window - 1`, so a run shorter
+// than the window emits nothing either way. A streaming pass that resets its
+// state on a non-finite input and counts consecutive finite inputs therefore
+// produces the identical series without ever knowing where a run ends.
+//
+// ARITHMETIC ORDER:
+//   * The RSI recursion is `avg_gain.mul_add(beta, inv_p * g)` (rsi.rs:376) --
+//     ONE rounding -- so `fma()` is used, not `avg_gain*beta + inv_p*g`.
+//   * rsi.rs walks TWO bars per iteration then mops up the last one. The
+//     arithmetic PER BAR is identical either way, so the loop below is one bar
+//     per iteration; the unrolling is a CPU cache decision, not a rounding one.
+//   * The fisher line is `0.66 * (x - 0.5) + 0.67 * prev` and
+//     `0.5 * ln((1+v)/(1-v)) + 0.5 * prev_fish` -- separate multiplies and adds,
+//     NOT fmas. -fmad=false keeps the compiler from contracting them.
+//   * The nonlag sum accumulates k ASCENDING from the most recent bar (:1104),
+//     and weight_sum accumulates in the same k order (:1080).
+//
+// EPSILONS ARE THE CPU'S OWN f64 ONES: `fabs(high - low) <= DBL_EPSILON`
+// mirrors `(high - low).abs() <= f64::EPSILON` at :1044 and :975. DBL_EPSILON
+// is 2.220446049250313e-16. An f32 epsilon here (1.19e-7) would silently blank
+// every bar whose 100-bar RSI range is narrower than that.
+//
+// FIRST VALID IS NOT READ: the CPU derives its own start from the first
+// non-NaN bar inside rsi.rs (:284, `!x.is_nan()`, which ACCEPTS an infinity --
+// not is_finite) and the batch worker overwrites the whole row. The lane row
+// declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double log/fabs, `fma`, no f32-suffixed math
+// function, no fast-math intrinsic. The file is already listed in
+// F64_LANE_SOURCES.
+// ---------------------------------------------------------------------------
+
+#define PR_NEO_NORM_PERIOD 100
+#define PR_NEO_NORM_DEQUE_CAP 101
+#define PR_NEO_NORM_LENGTH 15
+#define PR_NEO_NORM_LENGTH_DEQUE_CAP 16
+#define PR_NEO_NONLAG_PERIOD 15
+// build_nonlag_weights (:1064): phase = nonlag_period - 1 = 14, cycle = 4,
+// so wlen = 15*4 + 14 = 74. Declared as the compiled bound of the ring.
+#define PR_NEO_WLEN 74
+
+extern "C" __global__ void possible_rsi_neo_batch_f64(
+    const double* __restrict__ prices,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    const double qnan = pr_qnan();
+    for (int i = 0; i < n; ++i) {
+        row[i] = qnan;
+    }
+
+    const int period = periods[row_idx];
+    if (period <= 0 || period > n) {
+        return;
+    }
+
+    // build_nonlag_weights (:1064-1088), term for term.
+    const double cycle = 4.0;
+    const double coeff = 3.0 * M_PI;
+    const double phase = static_cast<double>(PR_NEO_NONLAG_PERIOD) - 1.0;
+    const int wlen =
+        static_cast<int>(static_cast<double>(PR_NEO_NONLAG_PERIOD) * cycle + phase);
+    if (wlen <= 0 || wlen > PR_NEO_WLEN) {
+        return;
+    }
+    double weights[PR_NEO_WLEN];
+    double weight_sum = 0.0;
+    for (int k = 0; k < wlen; ++k) {
+        double t;
+        if (phase > 1.0 && static_cast<double>(k) <= phase - 1.0) {
+            t = static_cast<double>(k) / (phase - 1.0);
+        } else {
+            t = 1.0 + (static_cast<double>(k) - phase + 1.0) * (2.0 * cycle - 1.0) /
+                          (cycle * static_cast<double>(PR_NEO_NONLAG_PERIOD) - 1.0);
+        }
+        const double beta_w = cos(M_PI * t);
+        double g = 1.0 / (coeff * t + 1.0);
+        if (t <= 0.5) {
+            g = 1.0;
+        }
+        const double weight = g * beta_w;
+        weights[k] = weight;
+        weight_sum += weight;
+    }
+
+    // ---- stage 1 state: Wilder RSI (rsi.rs:327-412) -------------------------
+    const double inv_p = 1.0 / static_cast<double>(period);
+    const double beta = 1.0 - inv_p;
+    double avg_gain = 0.0;
+    double avg_loss = 0.0;
+    bool warm_has_nan = false;
+    int first = -1;   // first index with !is_nan -- rsi.rs:284, NOT is_finite
+    int idx0 = -1;    // first + period, the bar the seeded RSI lands on
+
+    // ---- stage 2 state: rolling min/max over rsi, window 100 ----------------
+    double rmin_val[PR_NEO_NORM_DEQUE_CAP];
+    int rmin_idx[PR_NEO_NORM_DEQUE_CAP];
+    double rmax_val[PR_NEO_NORM_DEQUE_CAP];
+    int rmax_idx[PR_NEO_NORM_DEQUE_CAP];
+    int rmin_head = 0, rmin_len = 0, rmax_head = 0, rmax_len = 0;
+    int rsi_seg_pos = 0;
+
+    // ---- stage 3 state: rolling min/max over scaled, window 15 --------------
+    double smin_val[PR_NEO_NORM_LENGTH_DEQUE_CAP];
+    int smin_idx[PR_NEO_NORM_LENGTH_DEQUE_CAP];
+    double smax_val[PR_NEO_NORM_LENGTH_DEQUE_CAP];
+    int smax_idx[PR_NEO_NORM_LENGTH_DEQUE_CAP];
+    int smin_head = 0, smin_len = 0, smax_head = 0, smax_len = 0;
+    int scaled_seg_pos = 0;
+
+    // ---- stage 3b state: fisher transform (:959-996) ------------------------
+    double prev_value = 0.0;
+    double prev_fish = 0.0;
+    bool fisher_seeded = false;
+
+    // ---- stage 4 state: nonlag MA ring (:1090-1116) -------------------------
+    double nl_ring[PR_NEO_WLEN];
+    int nl_pos = 0;
+    int nl_count = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const double px = prices[i];
+
+        // ---------------- stage 1: rsi ---------------------------------------
+        double rsi_val = qnan;
+        if (first < 0) {
+            if (!isnan(px)) {
+                first = i;
+                idx0 = first + period;
+            }
+        } else if (i <= idx0) {
+            // Warm-up: sum the first `period` deltas (rsi.rs:355-368). A
+            // non-finite delta poisons the seed, exactly as the CPU's `has_nan`
+            // does, and the seed it produces is NaN.
+            const double delta = px - prices[i - 1];
+            if (!isfinite(delta)) {
+                warm_has_nan = true;
+            } else if (delta > 0.0) {
+                avg_gain += delta;
+            } else if (delta < 0.0) {
+                avg_loss -= delta;
+            }
+            if (i == idx0) {
+                if (warm_has_nan) {
+                    avg_gain = qnan;
+                    avg_loss = qnan;
+                    rsi_val = qnan;
+                } else {
+                    avg_gain *= inv_p;
+                    avg_loss *= inv_p;
+                    const double denom = avg_gain + avg_loss;
+                    rsi_val = (denom == 0.0) ? 50.0 : (100.0 * avg_gain / denom);
+                }
+            }
+        } else {
+            // rsi.rs:376-377 -- mul_add, ONE rounding.
+            const double d = px - prices[i - 1];
+            const double g1 = d > 0.0 ? d : 0.0;
+            const double l1 = d < 0.0 ? -d : 0.0;
+            avg_gain = fma(avg_gain, beta, inv_p * g1);
+            avg_loss = fma(avg_loss, beta, inv_p * l1);
+            const double denom = avg_gain + avg_loss;
+            rsi_val = (denom == 0.0) ? 50.0 : (100.0 * avg_gain / denom);
+        }
+
+        // ---------------- stage 2: rolling min/max over rsi ------------------
+        double rmin_out = qnan;
+        double rmax_out = qnan;
+        if (isfinite(rsi_val)) {
+            const int p = rsi_seg_pos;
+            while (rmin_len > 0 && rmin_idx[rmin_head] + PR_NEO_NORM_PERIOD <= p) {
+                rmin_head += 1;
+                if (rmin_head == PR_NEO_NORM_DEQUE_CAP) {
+                    rmin_head = 0;
+                }
+                rmin_len -= 1;
+            }
+            while (rmax_len > 0 && rmax_idx[rmax_head] + PR_NEO_NORM_PERIOD <= p) {
+                rmax_head += 1;
+                if (rmax_head == PR_NEO_NORM_DEQUE_CAP) {
+                    rmax_head = 0;
+                }
+                rmax_len -= 1;
+            }
+            while (rmin_len > 0) {
+                int back = rmin_head + rmin_len - 1;
+                if (back >= PR_NEO_NORM_DEQUE_CAP) {
+                    back -= PR_NEO_NORM_DEQUE_CAP;
+                }
+                if (rmin_val[back] >= rsi_val) {
+                    rmin_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            while (rmax_len > 0) {
+                int back = rmax_head + rmax_len - 1;
+                if (back >= PR_NEO_NORM_DEQUE_CAP) {
+                    back -= PR_NEO_NORM_DEQUE_CAP;
+                }
+                if (rmax_val[back] <= rsi_val) {
+                    rmax_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            {
+                int tail = rmin_head + rmin_len;
+                if (tail >= PR_NEO_NORM_DEQUE_CAP) {
+                    tail -= PR_NEO_NORM_DEQUE_CAP;
+                }
+                rmin_idx[tail] = p;
+                rmin_val[tail] = rsi_val;
+                rmin_len += 1;
+            }
+            {
+                int tail = rmax_head + rmax_len;
+                if (tail >= PR_NEO_NORM_DEQUE_CAP) {
+                    tail -= PR_NEO_NORM_DEQUE_CAP;
+                }
+                rmax_idx[tail] = p;
+                rmax_val[tail] = rsi_val;
+                rmax_len += 1;
+            }
+            if (p + 1 >= PR_NEO_NORM_PERIOD) {
+                rmin_out = rmin_val[rmin_head];
+                rmax_out = rmax_val[rmax_head];
+            }
+            rsi_seg_pos = p + 1;
+        } else {
+            rsi_seg_pos = 0;
+            rmin_head = 0;
+            rmin_len = 0;
+            rmax_head = 0;
+            rmax_len = 0;
+        }
+
+        // ---------------- normalize_min_max (:1034-1049) ---------------------
+        double scaled = qnan;
+        if (isfinite(rsi_val) && isfinite(rmin_out) && isfinite(rmax_out) &&
+            fabs(rmax_out - rmin_out) > DBL_EPSILON) {
+            scaled = 100.0 * (rsi_val - rmin_out) / (rmax_out - rmin_out);
+        }
+
+        // ---------------- stage 3: rolling min/max over scaled ---------------
+        double smin_out = qnan;
+        double smax_out = qnan;
+        if (isfinite(scaled)) {
+            const int p = scaled_seg_pos;
+            while (smin_len > 0 && smin_idx[smin_head] + PR_NEO_NORM_LENGTH <= p) {
+                smin_head += 1;
+                if (smin_head == PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    smin_head = 0;
+                }
+                smin_len -= 1;
+            }
+            while (smax_len > 0 && smax_idx[smax_head] + PR_NEO_NORM_LENGTH <= p) {
+                smax_head += 1;
+                if (smax_head == PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    smax_head = 0;
+                }
+                smax_len -= 1;
+            }
+            while (smin_len > 0) {
+                int back = smin_head + smin_len - 1;
+                if (back >= PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    back -= PR_NEO_NORM_LENGTH_DEQUE_CAP;
+                }
+                if (smin_val[back] >= scaled) {
+                    smin_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            while (smax_len > 0) {
+                int back = smax_head + smax_len - 1;
+                if (back >= PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    back -= PR_NEO_NORM_LENGTH_DEQUE_CAP;
+                }
+                if (smax_val[back] <= scaled) {
+                    smax_len -= 1;
+                } else {
+                    break;
+                }
+            }
+            {
+                int tail = smin_head + smin_len;
+                if (tail >= PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    tail -= PR_NEO_NORM_LENGTH_DEQUE_CAP;
+                }
+                smin_idx[tail] = p;
+                smin_val[tail] = scaled;
+                smin_len += 1;
+            }
+            {
+                int tail = smax_head + smax_len;
+                if (tail >= PR_NEO_NORM_LENGTH_DEQUE_CAP) {
+                    tail -= PR_NEO_NORM_LENGTH_DEQUE_CAP;
+                }
+                smax_idx[tail] = p;
+                smax_val[tail] = scaled;
+                smax_len += 1;
+            }
+            if (p + 1 >= PR_NEO_NORM_LENGTH) {
+                smin_out = smin_val[smin_head];
+                smax_out = smax_val[smax_head];
+            }
+            scaled_seg_pos = p + 1;
+        } else {
+            scaled_seg_pos = 0;
+            smin_head = 0;
+            smin_len = 0;
+            smax_head = 0;
+            smax_len = 0;
+        }
+
+        // ---------------- gaussian fisher (:959-996 / :1051-1062) ------------
+        double normalized = qnan;
+        if (!isfinite(scaled) || !isfinite(smin_out) || !isfinite(smax_out) ||
+            fabs(smax_out - smin_out) <= DBL_EPSILON) {
+            fisher_seeded = false;
+            prev_value = 0.0;
+            prev_fish = 0.0;
+        } else {
+            double v = 0.66 * ((scaled - smin_out) / (smax_out - smin_out) - 0.5) +
+                       0.67 * (fisher_seeded ? prev_value : 0.0);
+            if (v > 0.99) {
+                v = 0.999;
+            }
+            if (v < -0.99) {
+                v = -0.999;
+            }
+            const double fish =
+                0.5 * log((1.0 + v) / (1.0 - v)) + 0.5 * (fisher_seeded ? prev_fish : 0.0);
+            normalized = fish;
+            prev_value = v;
+            prev_fish = fish;
+            fisher_seeded = true;
+        }
+
+        // ---------------- stage 4: nonlag MA (:1090-1116) --------------------
+        if (isfinite(normalized)) {
+            nl_ring[nl_pos] = normalized;
+            nl_pos += 1;
+            if (nl_pos == PR_NEO_WLEN) {
+                nl_pos = 0;
+            }
+            if (nl_count < wlen) {
+                nl_count += 1;
+            }
+            if (nl_count >= wlen) {
+                double sum = 0.0;
+                for (int k = 0; k < wlen; ++k) {
+                    int idx = nl_pos - 1 - k;
+                    while (idx < 0) {
+                        idx += PR_NEO_WLEN;
+                    }
+                    sum += weights[k] * nl_ring[idx];
+                }
+                row[i] = sum / weight_sum;
+            }
+        } else {
+            nl_count = 0;
+        }
+    }
+}

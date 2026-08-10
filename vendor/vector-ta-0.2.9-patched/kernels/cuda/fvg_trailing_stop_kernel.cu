@@ -867,3 +867,307 @@ extern "C" __global__ void fvg_trailing_stop_many_series_one_param_f32(
         upper_tm_out[idx] = lower_tm_out[idx] = upper_ts_tm_out[idx] = lower_ts_tm_out[idx] = CUDART_NAN_F;
     }
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: fvg_ts_scalar (src/indicators/fvg_trailing_stop.rs:172-486).
+// At the batch defaults (lookback 5, smoothing 9, reset_on_cross false)
+// fvg_ts_compute_into (:946) routes to fvg_ts_scalar_default_5_9 (:489); that
+// function is fvg_ts_scalar with the two windows constant-folded and an
+// ALL_VALID short-circuit on a PREDICATE, not on any arithmetic, so one body
+// reproduces both.
+//
+// OUTPUT: the UPPER band -- compute_fvg_trailing_stop_batch (cpu_batch.rs:14884)
+// resolves output_id == "value" to out.upper.
+//
+// PERIOD-INVARIANT: that batch reads unmitigated_fvg_lookback (5),
+// smoothing_length (9) and reset_on_cross (false) and NEVER `period`
+// (cpu_batch.rs:14862-14867), so a sweep of five periods gets five identical
+// CPU columns and this kernel writes five identical rows.
+//
+// FIRST-VALID: Ignored, and that is the contract rather than a shrug. The
+// batch calls fvg_trailing_stop_with_kernel (:1040), which allocates with
+// alloc_uninit_f64 and applies NO warmup prefix at all -- the prefix in
+// fvg_trailing_stop_into_slices (:1131) is on a different entry point the
+// batch does not take. The loop runs from bar 0.
+//
+// SHAPE: one thread per combo walking bars ASCENDING. Two unmitigated-gap
+// buffers are compacted in place at every bar, two nine-wide displacement
+// rings carry a running sum with a NaN count, and the trailing stop is a
+// ratchet whose value reads its own previous value. Nothing here is
+// bar-parallel.
+//
+// NaN SEMANTICS: the CPU ratchet is bull_disp.max(t) / bear_disp.min(t)
+// (:719-727), which is f64::max -- it RETURNS THE NON-NaN OPERAND. bull_disp
+// is NaN whenever the ring is short or carries a NaN, so an if-chain here
+// would let the NaN survive and poison every later bar of the carry. fmax and
+// fmin are used instead.
+// ===========================================================================
+
+#define FVG_TS_NEO_LOOKBACK 5
+#define FVG_TS_NEO_SMOOTH 9
+
+static __forceinline__ __device__ double fvg_ts_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void fvg_trailing_stop_neo_batch_f64(const double* __restrict__ high,
+                                     const double* __restrict__ low,
+                                     const double* __restrict__ close,
+                                     int n,
+                                     const int* __restrict__ periods,
+                                     int n_combos,
+                                     int first_valid,
+                                     double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+    (void)periods;      // PERIOD-INVARIANT -- see the header.
+    (void)first_valid;  // Ignored -- see the header.
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = fvg_ts_neo_qnan();
+
+    const int lookback = FVG_TS_NEO_LOOKBACK;
+    const int w = FVG_TS_NEO_SMOOTH;
+    const bool reset_on_cross = false;
+
+    // fvg_ts_prepare, :895-917. first_valid_ohlc_status returns usize::MAX
+    // when every bar of the triple is NaN, which is AllValuesNaN.
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(high[i]) && !isnan(low[i]) && !isnan(close[i])) { first = i; break; }
+    }
+    const int need = 2 + (w > 0 ? w - 1 : 0);
+    if (first < 0 || (n - first) < need) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    double bull_buf[FVG_TS_NEO_LOOKBACK];
+    double bear_buf[FVG_TS_NEO_LOOKBACK];
+    int bull_len = 0, bear_len = 0;
+
+    int last_bull_non_na = -1;
+    int last_bear_non_na = -1;
+
+    double bull_ring_vals[FVG_TS_NEO_SMOOTH];
+    double bear_ring_vals[FVG_TS_NEO_SMOOTH];
+    bool bull_ring_nan[FVG_TS_NEO_SMOOTH];
+    bool bear_ring_nan[FVG_TS_NEO_SMOOTH];
+
+    double bull_sum = 0.0, bear_sum = 0.0;
+    int bull_nan_cnt = 0, bear_nan_cnt = 0;
+    int bull_ring_count = 0, bear_ring_count = 0;
+    int bull_ring_idx = 0, bear_ring_idx = 0;
+
+    int os = 0;          // 0 == None, 1 / -1 as in the CPU Option<i8>
+    bool ts_some = false;
+    double ts_val = 0.0;
+    bool ts_prev_some = false;
+    double ts_prev_val = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        // :219-241 -- record an unmitigated gap.
+        if (i >= 2 && !isnan(high[i - 2]) && !isnan(low[i - 2]) && !isnan(close[i - 1])) {
+            if (low[i] > high[i - 2] && close[i - 1] > high[i - 2]) {
+                if (bull_len < lookback) {
+                    bull_buf[bull_len] = high[i - 2];
+                    bull_len += 1;
+                } else {
+                    for (int k = 1; k < lookback; ++k) bull_buf[k - 1] = bull_buf[k];
+                    bull_buf[lookback - 1] = high[i - 2];
+                }
+            }
+            if (high[i] < low[i - 2] && close[i - 1] < low[i - 2]) {
+                if (bear_len < lookback) {
+                    bear_buf[bear_len] = low[i - 2];
+                    bear_len += 1;
+                } else {
+                    for (int k = 1; k < lookback; ++k) bear_buf[k - 1] = bear_buf[k];
+                    bear_buf[lookback - 1] = low[i - 2];
+                }
+            }
+        }
+
+        const double c = close[i];
+
+        // :245-266 -- compact in place, summing the survivors in order.
+        int new_bull_len = 0;
+        double bull_acc = 0.0;
+        for (int k = 0; k < bull_len; ++k) {
+            const double v = bull_buf[k];
+            if (c >= v) {
+                bull_buf[new_bull_len] = v;
+                new_bull_len += 1;
+                bull_acc += v;
+            }
+        }
+        bull_len = new_bull_len;
+
+        int new_bear_len = 0;
+        double bear_acc = 0.0;
+        for (int k = 0; k < bear_len; ++k) {
+            const double v = bear_buf[k];
+            if (c <= v) {
+                bear_buf[new_bear_len] = v;
+                new_bear_len += 1;
+                bear_acc += v;
+            }
+        }
+        bear_len = new_bear_len;
+
+        const double bull_avg = (bull_len > 0) ? (bull_acc / (double)bull_len) : nn;
+        const double bear_avg = (bear_len > 0) ? (bear_acc / (double)bear_len) : nn;
+
+        if (!isnan(bull_avg)) last_bull_non_na = i;
+        if (!isnan(bear_avg)) last_bear_non_na = i;
+
+        // :285-308 -- the fallback SMA length.
+        int bull_bs;
+        if (isnan(bull_avg)) {
+            if (last_bull_non_na >= 0) {
+                int d = i - last_bull_non_na;
+                if (d < 1) d = 1;
+                if (d > w) d = w;
+                bull_bs = d;
+            } else {
+                bull_bs = 1;
+            }
+        } else {
+            bull_bs = 1;
+        }
+        int bear_bs;
+        if (isnan(bear_avg)) {
+            if (last_bear_non_na >= 0) {
+                int d = i - last_bear_non_na;
+                if (d < 1) d = 1;
+                if (d > w) d = w;
+                bear_bs = d;
+            } else {
+                bear_bs = 1;
+            }
+        } else {
+            bear_bs = 1;
+        }
+
+        double bull_sma = nn;
+        if (isnan(bull_avg) && (i + 1) >= bull_bs) {
+            double s = 0.0;
+            const int start = i + 1 - bull_bs;
+            for (int j = start; j <= i; ++j) s += close[j];
+            bull_sma = s / (double)bull_bs;
+        }
+        double bear_sma = nn;
+        if (isnan(bear_avg) && (i + 1) >= bear_bs) {
+            double s = 0.0;
+            const int start = i + 1 - bear_bs;
+            for (int j = start; j <= i; ++j) s += close[j];
+            bear_sma = s / (double)bear_bs;
+        }
+
+        const double x_bull = !isnan(bull_avg) ? bull_avg : bull_sma;
+        const double x_bear = !isnan(bear_avg) ? bear_avg : bear_sma;
+
+        // :332-392 -- the displacement rings, with an explicit NaN count so a
+        // NaN never enters the running sum.
+        if (bull_ring_count < w) {
+            const bool is_nan = isnan(x_bull);
+            bull_ring_nan[bull_ring_count] = is_nan;
+            bull_ring_vals[bull_ring_count] = is_nan ? 0.0 : x_bull;
+            if (is_nan) bull_nan_cnt += 1; else bull_sum += x_bull;
+            bull_ring_count += 1;
+        } else {
+            const int idx = bull_ring_idx;
+            if (bull_ring_nan[idx]) bull_nan_cnt -= 1;
+            else bull_sum -= bull_ring_vals[idx];
+            const bool is_nan = isnan(x_bull);
+            bull_ring_nan[idx] = is_nan;
+            if (is_nan) { bull_ring_vals[idx] = 0.0; bull_nan_cnt += 1; }
+            else { bull_ring_vals[idx] = x_bull; bull_sum += x_bull; }
+            bull_ring_idx = (idx + 1 == w) ? 0 : (idx + 1);
+        }
+
+        if (bear_ring_count < w) {
+            const bool is_nan = isnan(x_bear);
+            bear_ring_nan[bear_ring_count] = is_nan;
+            bear_ring_vals[bear_ring_count] = is_nan ? 0.0 : x_bear;
+            if (is_nan) bear_nan_cnt += 1; else bear_sum += x_bear;
+            bear_ring_count += 1;
+        } else {
+            const int idx = bear_ring_idx;
+            if (bear_ring_nan[idx]) bear_nan_cnt -= 1;
+            else bear_sum -= bear_ring_vals[idx];
+            const bool is_nan = isnan(x_bear);
+            bear_ring_nan[idx] = is_nan;
+            if (is_nan) { bear_ring_vals[idx] = 0.0; bear_nan_cnt += 1; }
+            else { bear_ring_vals[idx] = x_bear; bear_sum += x_bear; }
+            bear_ring_idx = (idx + 1 == w) ? 0 : (idx + 1);
+        }
+
+        const double bull_disp =
+            (bull_ring_count >= w && bull_nan_cnt == 0) ? (bull_sum / (double)w) : nn;
+        const double bear_disp =
+            (bear_ring_count >= w && bear_nan_cnt == 0) ? (bear_sum / (double)w) : nn;
+
+        // :407-419 -- the sticky trend flag.
+        const int prev_os = os;
+        int next_os;
+        if (!isnan(bear_disp) && c > bear_disp) next_os = 1;
+        else if (!isnan(bull_disp) && c < bull_disp) next_os = -1;
+        else next_os = os;
+        os = next_os;
+
+        // :421-446 -- the ratchet. fmax / fmin, never an if-chain: see the
+        // header.
+        if (os != 0 && prev_os != 0) {
+            if (os == 1 && prev_os != 1) {
+                ts_some = true; ts_val = bull_disp;
+            } else if (os == -1 && prev_os != -1) {
+                ts_some = true; ts_val = bear_disp;
+            } else if (os == 1) {
+                if (ts_some) ts_val = fmax(bull_disp, ts_val);
+            } else if (os == -1) {
+                if (ts_some) ts_val = fmin(bear_disp, ts_val);
+            }
+        } else {
+            if (os == 1 && ts_some) ts_val = fmax(bull_disp, ts_val);
+            if (os == -1 && ts_some) ts_val = fmin(bear_disp, ts_val);
+        }
+
+        // :448-466 -- unreachable at the batch default, kept faithful.
+        if (reset_on_cross) {
+            if (os == 1) {
+                if (ts_some) {
+                    if (c < ts_val) ts_some = false;
+                } else if (!isnan(bear_disp) && c > bear_disp) {
+                    ts_some = true; ts_val = bull_disp;
+                }
+            } else if (os == -1) {
+                if (ts_some) {
+                    if (c > ts_val) ts_some = false;
+                } else if (!isnan(bull_disp) && c < bull_disp) {
+                    ts_some = true; ts_val = bear_disp;
+                }
+            }
+        }
+
+        // :468-486 -- the UPPER column only; the other three are not this
+        // lane's output.
+        const bool show = ts_some || ts_prev_some;
+        if (os == 1 && show) {
+            row[i] = nn;
+        } else if (os == -1 && show) {
+            row[i] = bear_disp;
+        } else {
+            row[i] = nn;
+        }
+
+        ts_prev_some = ts_some;
+        ts_prev_val = ts_val;
+        (void)ts_prev_val;
+    }
+}

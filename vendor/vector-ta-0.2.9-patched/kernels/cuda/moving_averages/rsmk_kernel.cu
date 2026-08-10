@@ -418,3 +418,151 @@ extern "C" __global__ void rsmk_many_series_one_param_time_major_ema_ema_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (rsmk)
+ *
+ * CPU reference: `rsmk_scalar` (src/indicators/rsmk.rs:391), the `_ =>` arm of
+ *   `rsmk_with_kernel` (:380). The two AVX arms above it are gated on
+ *   `nightly-avx`; the scalar arm is the default build's path and, per the
+ *   brief's rule for a crate we fork, the single oracle.
+ *
+ * Column: output_id "value" -> `out.indicator` (cpu_batch.rs:16503-16505).
+ *   The `signal` column is a SECOND ema over the same series; it is not this
+ *   column, so its accumulator is deliberately absent below rather than
+ *   computed and thrown away.
+ *
+ * PERIOD-SWEPT -- and it is the only one of this closer's ten that is.
+ *   `compute_rsmk_batch` reads a parameter literally named `period`
+ *   (cpu_batch.rs:16479, default 3) alongside `lookback` (90) and
+ *   `signal_period` (20). So `periods[combo]` IS read here, and the rows of a
+ *   sweep genuinely differ.
+ *
+ * Input: (main, compare) -- `compute_rsmk_batch` binds them from
+ *   `IndicatorDataRef::CloseVolume { close, volume }` as `(close, volume)`
+ *   (cpu_batch.rs:16445-16447) -> F64InputKind::CloseVolume. That pairing is
+ *   surprising for a relative-strength indicator and it is DELIBERATE here:
+ *   the kernel computes what the CPU computes, not what the name suggests.
+ *
+ * FIRST-VALID IGNORED. The CPU's index is the first non-NaN of the LOG-RATIO
+ *   series, not of either input: `lr[i]` is NaN when main is NaN, OR compare
+ *   is NaN, OR `compare == 0.0` (:322-326), and `first_valid` is
+ *   `lr.iter().position(|x| !x.is_nan())` (:333). No rule in
+ *   `F64FirstValidRule` expresses "and the divisor is non-zero", and a zero
+ *   compare is a bar `AllInputsNonNan` would accept and then divide by. So
+ *   the kernel derives its own index, as `garman_klass_volatility` already
+ *   does for the same class of reason.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. `ema_ind` at bar i is a
+ *   function of its own value at bar i-1; a parallel scan would re-associate
+ *   the recursion and this column feeds a threshold comparison.
+ *
+ * Roundings, counted against the CPU lines:
+ *   :325   (m / c).ln()                          -- ONE divide, ONE log
+ *   :475   let src100 = mv * 100.0               -- ONE multiply
+ *   :477   (src100 - ema_ind).mul_add(alpha_ind, ema_ind)   -- ONE fma
+ *   :453   let mut ema_ind = (sum / cnt as f64) * 100.0     -- divide then mul
+ *   The seed is NOT an fma and the step IS one. Writing the step as
+ *   `ema*(1-a) + src100*a` would be THREE roundings where the reference has
+ *   ONE, which is the exact defect the brief names in `natr`.
+ *
+ * `log`, never `logf`: the f32 entry points above use `logf`/`__logf`; this
+ *   column is f64 end to end and uses the double-precision `log`.
+ *
+ * NaN semantics: the CPU has no max/min on this column. `mom[i]` is NaN when
+ *   either leg is NaN (:361-365) and the ema simply HOLDS its previous value
+ *   through a NaN bar (:474-479 -- the update is inside `if !v.is_nan()` but
+ *   the store is outside it). Reproduced exactly: a NaN bar must not reset
+ *   and must not poison.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:16478-16482. `period` is NOT here -- it is swept. */
+#define NEO_RSMK_LOOKBACK      90
+#define NEO_RSMK_SIGNAL_PERIOD 20
+
+/* `lr[i]` -- rsmk.rs:322-326. */
+__device__ __forceinline__ double neo_rsmk_lr(const double* __restrict__ main_s,
+                                              const double* __restrict__ cmp_s,
+                                              int i)
+{
+    const double m = main_s[i];
+    const double c = cmp_s[i];
+    if (isnan(m) || isnan(c) || c == 0.0) return NEO_F64_NAN;
+    return log(m / c);
+}
+
+extern "C" __global__
+void rsmk_neo_batch_f64(const double* __restrict__ main_s,
+                        const double* __restrict__ cmp_s,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)first_valid; /* log-ratio scan, derived below -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int period        = periods[combo];
+    const int lookback      = NEO_RSMK_LOOKBACK;
+    const int signal_period = NEO_RSMK_SIGNAL_PERIOD;
+
+    /* rsmk.rs:305-315 -- InvalidPeriod. */
+    if (lookback == 0 || period <= 0 || signal_period == 0) return;
+    if (period > n || signal_period > n || lookback >= n) return;
+
+    /* :331-334 -- first non-NaN of the LOG-RATIO series. */
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(neo_rsmk_lr(main_s, cmp_s, i))) { first = i; break; }
+    }
+    if (first < 0) return;                       /* AllValuesNaN */
+
+    const int max_ps = (period > signal_period) ? period : signal_period;
+    const int needed = lookback + max_ps;        /* :337 */
+    if (n - first < needed) return;              /* :338 NotEnoughValidData */
+
+    const int mom_fv     = first + lookback;             /* :393 */
+    const int ind_warmup = mom_fv + (period - 1);        /* :425 */
+    if (ind_warmup >= n) return;                         /* :430 -- row stays NaN */
+
+    /* Seed: the mean of the first `period` non-NaN momentum values, then x100
+     * (:434-455). `cnt` counts only the non-NaN ones, so a hole shortens the
+     * seed rather than poisoning it -- which is why this is a count, not a
+     * fixed divisor. */
+    double sum = 0.0;
+    int    cnt = 0;
+    int    init_end = mom_fv + period;
+    if (init_end > n) init_end = n;
+    for (int i = mom_fv; i < init_end; ++i) {
+        const double a = neo_rsmk_lr(main_s, cmp_s, i);
+        const double b = neo_rsmk_lr(main_s, cmp_s, i - lookback);
+        const double v = (isnan(a) || isnan(b)) ? NEO_F64_NAN : (a - b);
+        if (!isnan(v)) { sum += v; cnt += 1; }
+    }
+    if (cnt == 0) return;                        /* :495-500 -- the row is NaN */
+
+    const double alpha_ind = 2.0 / ((double)period + 1.0);
+    double ema_ind = (sum / (double)cnt) * 100.0;
+    o[ind_warmup] = ema_ind;
+
+    for (int i = ind_warmup + 1; i < n; ++i) {
+        const double a  = neo_rsmk_lr(main_s, cmp_s, i);
+        const double b  = neo_rsmk_lr(main_s, cmp_s, i - lookback);
+        const double mv = (isnan(a) || isnan(b)) ? NEO_F64_NAN : (a - b);
+        if (!isnan(mv)) {
+            const double src100 = mv * 100.0;
+            /* :477 -- ONE fma, matching `(src100 - ema_ind).mul_add(..)`. */
+            ema_ind = fma(src100 - ema_ind, alpha_ind, ema_ind);
+        }
+        o[i] = ema_ind;   /* the store is OUTSIDE the NaN guard -- :480 */
+    }
+}

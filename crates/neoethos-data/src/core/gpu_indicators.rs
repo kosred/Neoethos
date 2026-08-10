@@ -181,6 +181,13 @@ pub enum DeviceInput {
     /// `Slice` over the volume already resident inside the OHLCV upload, so
     /// this shape costs no extra transfer.
     VolumeSlice,
+    // ------------------------------------------------------ closer 6, round 3
+    /// Kernel reads (hlcc4, volume) -- `elastic_volume_weighted_moving_average`
+    /// alone. The SAME device shape as [`Self::Hlc3CloseVolume`] and
+    /// [`Self::CloseVolume`] with a THIRD price series in it; the pair is built
+    /// here from the resident hlcc4 upload, so the distinction is made once, at
+    /// the upload, and a kernel expecting hlcc4 can never be handed close.
+    Hlcc4CloseVolume,
 }
 
 impl DeviceInput {
@@ -206,6 +213,8 @@ impl DeviceInput {
             // closer 5
             F64InputKind::Hlcc4Slice => DeviceInput::Hlcc4Slice,
             F64InputKind::VolumeSlice => DeviceInput::VolumeSlice,
+            // closer 6, round 3
+            F64InputKind::Hlcc4Volume => DeviceInput::Hlcc4CloseVolume,
             // shard 3: `aso` reads OPEN as well as high/low/close. The resident
             // OHLCV ref already carries open, so no new upload shape is needed —
             // only the declaration that this kernel takes four price pointers,
@@ -415,6 +424,15 @@ pub struct GpuIndicatorEngine {
     first_valid_hlcc4: usize,
     /// Volume non-NaN -- `vosc.rs:361` scans the volume series alone.
     first_valid_volume: usize,
+    // ------------------------------------------------------ closer 6, round 3
+    /// hlcc4 AND volume both `is_finite` at the same index --
+    /// `elastic_volume_weighted_moving_average.rs:308-317`.
+    ///
+    /// Stated separately from `first_valid_hlcc4` and from a non-NaN pair scan
+    /// for the reason every narrow field here exists: `is_finite` REJECTS an
+    /// infinity that `!is_nan` accepts, and this index sets both the NaN prefix
+    /// and the bar the EVWMA recurrence seeds `base` from.
+    first_valid_hlcc4_volume_finite: usize,
     /// Volume `is_finite` -- `volume_zone_oscillator.rs:271`. NOT the same
     /// as `first_valid_volume`: that one is a `!is_nan` scan and accepts an
     /// infinity this one rejects.
@@ -583,6 +601,11 @@ impl GpuIndicatorEngine {
             .collect();
         let first_valid_hlcc4 =
             first_valid_1(&hlcc4).context("GpuIndicatorEngine: hlcc4 is entirely NaN")?;
+        // closer 6, round 3: `is_finite` on BOTH, which is what
+        // `elastic_volume_weighted_moving_average.rs:313-315` scans for.
+        let first_valid_hlcc4_volume_finite = (0..n)
+            .find(|&i| hlcc4[i].is_finite() && volume[i].is_finite())
+            .context("GpuIndicatorEngine: no bar has both a finite hlcc4 and a finite volume")?;
         let first_valid_volume =
             first_valid_1(&volume).context("GpuIndicatorEngine: volume is entirely NaN")?;
         let first_valid_volume_finite = (0..n)
@@ -784,6 +807,7 @@ impl GpuIndicatorEngine {
             first_valid_high_low,
             first_valid_hl2,
             first_valid_hlcc4,
+            first_valid_hlcc4_volume_finite,
             first_valid_volume,
             first_valid_volume_finite,
             first_valid_hlc_consecutive_pair,
@@ -949,6 +973,17 @@ impl GpuIndicatorEngine {
             DeviceInput::Hlcc4Slice => IndicatorCudaDeviceDataRefF64::Slice {
                 values: self.hlcc4.as_view_f64(),
             },
+            // closer 6, round 3: the same (price, volume) device shape the two
+            // arms above use, built from the resident hlcc4 upload.
+            DeviceInput::Hlcc4CloseVolume => IndicatorCudaDeviceDataRefF64::CloseVolume(
+                CudaDeviceCloseVolumeF64Ref::new(
+                    self.hlcc4.as_view_f64(),
+                    self.ohlcv.volume.as_view_f64(),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("CudaDeviceCloseVolumeF64Ref::new(hlcc4, volume) failed: {e:?}")
+                })?,
+            ),
             // closer 5: volume is already resident inside the OHLCV upload, so
             // this shape is a VIEW rather than a ninth transfer.
             DeviceInput::VolumeSlice => IndicatorCudaDeviceDataRefF64::Slice {
@@ -1037,6 +1072,12 @@ impl GpuIndicatorEngine {
             F64FirstValidRule::Ohlc4AllNonNan => self.first_valid_ohlc4_non_nan,
             // andean_oscillator.rs:244
             F64FirstValidRule::OpenCloseFinite => self.first_valid_open_close_finite,
+            // ----------------------------------------------- closer 6, round 3
+            // elastic_volume_weighted_moving_average.rs:308-317 -- price AND
+            // volume both `is_finite`. NOT the `AllInputsNonNan` pair scan:
+            // that one is `!is_nan` and would accept an INFINITE volume the
+            // CPU skips, and the index it names seeds the recurrence.
+            F64FirstValidRule::PriceVolumeFinite => self.first_valid_hlcc4_volume_finite,
             F64FirstValidRule::AllInputsNonNan => match input {
                 DeviceInput::CloseFromOhlcv => self.first_valid_close,
                 DeviceInput::Ohlc => self.first_valid_hlc,
@@ -1050,6 +1091,16 @@ impl GpuIndicatorEngine {
                 DeviceInput::Hlcv => self.first_valid_hlcv,
                 DeviceInput::OpenCloseVolume => self.first_valid_open_close_volume,
                 DeviceInput::Hlcc4Slice => self.first_valid_hlcc4,
+                // closer 6, round 3. NO ROW IN `F64_KERNELS` USES THIS PAIR
+                // WITH THIS RULE today -- the only `Hlcc4Volume` indicator,
+                // `elastic_volume_weighted_moving_average`, is registered
+                // `PriceVolumeFinite` and is answered above. The arm exists
+                // because the match is exhaustive, and it reports the `is_finite`
+                // index rather than a non-NaN one: an indicator reaching here
+                // would be claiming the COMMON rule over a pair this engine only
+                // ever scans the stricter way, and the stricter index is the
+                // safe one to hand a kernel that divides by volume.
+                DeviceInput::Hlcc4CloseVolume => self.first_valid_hlcc4_volume_finite,
                 DeviceInput::VolumeSlice => self.first_valid_volume,
                 // closer 5, round 2. NO ROW IN `F64_KERNELS` USES THIS PAIR
                 // TODAY -- the only `Ohlcv5` indicator, `trend_flow_trail`, is

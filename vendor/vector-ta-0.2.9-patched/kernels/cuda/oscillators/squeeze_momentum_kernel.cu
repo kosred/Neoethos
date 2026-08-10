@@ -722,3 +722,230 @@ extern "C" __global__ void squeeze_momentum_many_series_one_param_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (squeeze_momentum)
+ *
+ * CPU reference: `squeeze_momentum_scalar_classic`
+ *   (src/indicators/squeeze_momentum.rs:1051). `squeeze_momentum_into_slices`
+ *   discards the kernel selector outright (`let _ = kern;`, :292) and calls
+ *   this function unconditionally, so there is ONE CPU path and therefore one
+ *   oracle -- no scalar-vs-AVX seed question arises here.
+ *
+ * Column: output_id "value" -> `out.momentum` (cpu_batch.rs:6281-6284).
+ *   `squeeze` and `momentum_signal` are different columns and are deliberately
+ *   not computed: `momentum` depends on `length_kc` alone, never on `mult_bb`
+ *   or `mult_kc`, so the Bollinger/Keltner comparison is dead weight for this
+ *   output.
+ *
+ * PERIOD-INVARIANT: `compute_squeeze_momentum_batch` reads `length_bb` (20),
+ *   `mult_bb` (2.0), `length_kc` (20) and `mult_kc` (1.5)
+ *   (cpu_batch.rs:6260-6263) and NEVER `period`.
+ *
+ * Input: high / low / close -- `extract_ohlc_input("squeeze_momentum",
+ *   req.data)` (cpu_batch.rs:6252) -> F64InputKind::Hlc.
+ *
+ * FIRST-VALID: :280-282 is the first index at which high, low AND close are
+ *   ALL non-NaN SIMULTANEOUSLY -- F64FirstValidRule::AllInputsNonNan. It is
+ *   NOT `HlcMaxOfIndependentFirsts`: this scan is a single `find` over the
+ *   triple, so on a gapped symbol it names a different bar from the adx/natr
+ *   rule, and the index sets both the NaN prefix and the seed window.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. `S0`/`S1` are updated
+ *   incrementally (`(S1 - S0) + p * y_new`, :1372) so bar i's rolling linear
+ *   regression depends on bar i-1's pair; and the windowed high/low use
+ *   monotonic deques whose contents depend on the arrival order.
+ *
+ * The deques are reproduced EXACTLY rather than replaced by a window scan.
+ *   A scan would return the same max VALUE on clean data, but the CPU's pop
+ *   condition is `high[idx] <= hi` (:1228) -- a comparison that is FALSE
+ *   against a NaN -- so on a frame carrying a NaN high the two disagree about
+ *   which index survives, and `highest` is read from that index.
+ *
+ * Roundings, counted against the CPU lines:
+ *   :1105  sumsq_bb = f64::mul_add(v, v, sumsq_bb)      -- (squeeze only)
+ *   :1338  s1 = f64::mul_add(j, y, s1)                  -- ONE fma
+ *   :1346  let b = f64::mul_add(-sum_x, S0, p * S1) * inv_denom  -- ONE fma
+ *   :1348  let yhat_last = f64::mul_add(b, x_last_minus_xbar, ybar) -- ONE fma
+ *   :1372  let new_S1 = (S1 - S0) + p * y_new           -- plain, NO fma
+ *   :1373  let new_S0 = (S0 - y_old) + y_new            -- plain, NO fma
+ *   :1317  let raw_i = c_i - 0.25 * (highest + lowest) - 0.5 * kc_mid -- plain
+ *   Three fmas and no more. Folding :1372 into an fma would REMOVE a rounding
+ *   the reference performs, and this column feeds a sign test.
+ *
+ * NaN semantics: `tr1.max(tr2).max(tr3)` (:1134) is `f64::max`, which returns
+ *   the NON-NaN operand -- `fmax` is used here for exactly that reason. The
+ *   true range feeds `sum_tr`, which is carried subtract-then-add, so a NaN
+ *   admitted by an if-chain would poison every later bar of the row.
+ *
+ * One honest divergence, stated rather than hidden: on the CPU, momentum at
+ *   indices in [length_kc - 1, first_valid + length_kc - 1) is never written
+ *   at all -- `squeeze_momentum_with_kernel` allocates with
+ *   `alloc_with_nan_prefix(len, 0)` (:311) and `scalar_classic` fills only
+ *   `[..warm_m]` (:1074). Those bars are uninitialised memory whenever
+ *   `first_valid > 0`. This kernel writes NaN there, which is the only
+ *   defensible value; it is a divergence from garbage, not from a number.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:6260-6263. `length_kc` bounds three per-thread
+ * rings, and it is a CPU DEFAULT rather than a swept parameter (this indicator
+ * is period-invariant), so no caller-supplied number reaches them. */
+#define NEO_SQM_LKC 20
+
+extern "C" __global__
+void squeeze_momentum_neo_batch_f64(const double* __restrict__ high,
+                                    const double* __restrict__ low,
+                                    const double* __restrict__ close,
+                                    int n,
+                                    const int* __restrict__ periods,
+                                    int n_combos,
+                                    int first_valid,
+                                    double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods; /* period-invariant -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int lkc = NEO_SQM_LKC;
+    const int lbb = NEO_SQM_LKC;   /* length_bb, same default; unused by this column */
+
+    /* :266-278 -- InvalidPeriod. */
+    if (lbb == 0 || lbb > n || lkc == 0 || lkc > n) return;
+
+    const int first = first_valid;
+    if (first < 0 || first >= n) return;
+
+    const int need = (lbb > lkc) ? lbb : lkc;
+    if (n - first < need) return;                /* :284 NotEnoughValidData */
+
+    const double inv_lkc = 1.0 / (double)lkc;
+
+    /* :1088-1093 -- the fixed linear-regression geometry. */
+    const double p                 = (double)lkc;
+    const double sum_x             = 0.5 * p * (p + 1.0);
+    const double sum_x2            = p * (p + 1.0) * (2.0 * p + 1.0) / 6.0;
+    const double denom             = p * sum_x2 - sum_x * sum_x;
+    const double inv_denom         = 1.0 / denom;
+    const double x_last_minus_xbar = p - sum_x * inv_lkc;
+
+    const int start_kc = first + (lkc - 1);      /* :1096 */
+
+    /* :1120-1139 -- seed `sum_kc` over the first window. */
+    double sum_kc = 0.0;
+    if (start_kc < n) {
+        const int s = start_kc + 1 - lkc;
+        for (int j = s; j <= start_kc; ++j) sum_kc += close[j];
+    }
+
+    /* Monotonic deques over `high` (max) and `low` (min), plus the raw ring. */
+    int    dq_max_idx[NEO_SQM_LKC];
+    int    dq_min_idx[NEO_SQM_LKC];
+    double raw_buf[NEO_SQM_LKC];
+    for (int k = 0; k < lkc; ++k) { dq_max_idx[k] = 0; dq_min_idx[k] = 0; raw_buf[k] = 0.0; }
+
+    int max_head = 0, max_len = 0, min_head = 0, min_len = 0;
+    int rb_pos = 0, raw_count = 0;
+    double S0 = 0.0, S1 = 0.0;
+    double prev_mom = NEO_F64_NAN;   /* only the momentum column is emitted */
+
+    for (int i = first; i < n; ++i) {
+        const double hi = high[i];
+        const double lo = low[i];
+
+        /* Expire indices that have left the window -- :1199-1223. */
+        while (max_len > 0) {
+            const int idx = dq_max_idx[max_head];
+            if (idx + lkc <= i) { max_head += 1; if (max_head == lkc) max_head = 0; max_len -= 1; }
+            else break;
+        }
+        while (min_len > 0) {
+            const int idx = dq_min_idx[min_head];
+            if (idx + lkc <= i) { min_head += 1; if (min_head == lkc) min_head = 0; min_len -= 1; }
+            else break;
+        }
+
+        /* Pop-back while dominated -- :1225-1249. The comparison is FALSE
+         * against a NaN, exactly as on the CPU. */
+        while (max_len > 0) {
+            int back = max_head + max_len - 1; if (back >= lkc) back -= lkc;
+            const int idx = dq_max_idx[back];
+            if (high[idx] <= hi) max_len -= 1; else break;
+        }
+        { int pos = max_head + max_len; if (pos >= lkc) pos -= lkc;
+          dq_max_idx[pos] = i; max_len += 1; }
+
+        while (min_len > 0) {
+            int back = min_head + min_len - 1; if (back >= lkc) back -= lkc;
+            const int idx = dq_min_idx[back];
+            if (low[idx] >= lo) min_len -= 1; else break;
+        }
+        { int pos = min_head + min_len; if (pos >= lkc) pos -= lkc;
+          dq_min_idx[pos] = i; min_len += 1; }
+
+        /* :1261-1263 -- slide `sum_kc`. The true-range ring feeds `squeeze`
+         * only, so it is not carried here. */
+        if (i > start_kc) sum_kc += close[i] - close[i - lkc];
+
+        if (i >= start_kc) {
+            const int    hi_idx  = dq_max_idx[max_head];
+            const int    lo_idx  = dq_min_idx[min_head];
+            const double highest = high[hi_idx];
+            const double lowest  = low[lo_idx];
+
+            const double kc_mid = sum_kc * inv_lkc;
+            const double c_i    = close[i];
+            /* :1317 -- plain, no fma. */
+            const double raw_i  = c_i - 0.25 * (highest + lowest) - 0.5 * kc_mid;
+
+            const double y_old = raw_buf[rb_pos];
+            raw_buf[rb_pos] = raw_i;
+            rb_pos += 1; if (rb_pos == lkc) rb_pos = 0;
+            if (raw_count < lkc) raw_count += 1;
+
+            double yhat_last = NEO_F64_NAN;
+
+            if (raw_count == lkc && i == start_kc + lkc - 1) {
+                /* :1329-1345 -- the ONE full pass that seeds S0/S1. */
+                double s0 = 0.0, s1 = 0.0;
+                int    idx = rb_pos;
+                double j   = 1.0;
+                for (int k = 0; k < lkc; ++k) {
+                    const double y = raw_buf[idx];
+                    s0 += y;
+                    s1  = fma(j, y, s1);          /* :1338 */
+                    j  += 1.0;
+                    idx += 1; if (idx == lkc) idx = 0;
+                }
+                S0 = s0; S1 = s1;
+
+                const double b    = fma(-sum_x, S0, p * S1) * inv_denom;  /* :1346 */
+                const double ybar = S0 * inv_lkc;
+                yhat_last = fma(b, x_last_minus_xbar, ybar);              /* :1348 */
+                o[i] = yhat_last;
+            } else if (raw_count == lkc) {
+                /* :1370-1377 -- incremental, and deliberately NOT fma'd. */
+                const double y_new  = raw_i;
+                const double new_S1 = (S1 - S0) + p * y_new;
+                const double new_S0 = (S0 - y_old) + y_new;
+                S1 = new_S1; S0 = new_S0;
+
+                const double b    = fma(-sum_x, S0, p * S1) * inv_denom;
+                const double ybar = S0 * inv_lkc;
+                yhat_last = fma(b, x_last_minus_xbar, ybar);
+                o[i] = yhat_last;
+            } else {
+                o[i] = NEO_F64_NAN;               /* :1397 */
+            }
+
+            prev_mom = yhat_last;
+        }
+    }
+    (void)prev_mom;   /* the signal column, which this output is not, reads it */
+}

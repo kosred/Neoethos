@@ -145,6 +145,53 @@ pub const DII_MAX_PERIOD: usize = 512;
 /// to the kernel and not to the caller.
 pub const CSO_MAX_PERIOD: usize = 512;
 
+/// Must match `NEO_VRARSX_MAX_PERIOD` in
+/// `kernels/cuda/volatility_ratio_adaptive_rsx_kernel.cu`.
+///
+/// `volatility_ratio_adaptive_rsx` keeps TWO per-thread rings of `period`
+/// doubles -- one of prices, one of the rolling deviations built from them
+/// (volatility_ratio_adaptive_rsx.rs:388, :394) -- and both are sized at
+/// compile time, so the bound belongs to the kernel and not to the caller.
+pub const VRARSX_MAX_PERIOD: usize = 512;
+
+/// Must match `NEO_AT_MAX_PERIOD` in `kernels/cuda/alphatrend_kernel.cu`.
+///
+/// The swept period is BOTH the true-range window AND the MFI period
+/// (alphatrend.rs:604-630), so the kernel carries a true-range ring of
+/// `period + 1` and the MFI's two flow rings of `period` each. All three are
+/// per-thread arrays sized at compile time.
+pub const ALPHATREND_MAX_PERIOD: usize = 512;
+
+/// `kernels/cuda/moving_averages/cora_wave_kernel.cu` and
+/// `kernels/cuda/moving_averages/dma_kernel.cu`.
+///
+/// Both keep ONE per-thread ring whose depth is `round(sqrt(period))` --
+/// cora_wave's smoothing WMA and dma's difference window. A 64-entry ring
+/// admits every period up to 4160, because `round(sqrt(4160))` is 64 and
+/// `round(sqrt(4161))` is 65. The bound therefore belongs to the compiled
+/// kernel, and `CudaF64Indicators::sweep` refuses a larger period BY NAME
+/// rather than truncating the window or moving the sweep to the host.
+pub const CORA_WAVE_MAX_PERIOD: usize = 4160;
+pub const DMA_MAX_PERIOD: usize = 4160;
+
+// ---------------------------------------------------------- closer 6, round 3
+/// Must match `LMA_MAX_PERIOD` in
+/// `kernels/cuda/moving_averages/logarithmic_moving_average_kernel.cu`.
+///
+/// `compute_lma` (logarithmic_moving_average.rs:775) weights the window with
+/// `1 / ln(max(i + steepness, 2))^2`, one logarithm per slot. Rebuilding that
+/// vector inside the bar loop would run `period` logarithms PER BAR, so it is
+/// built once into a per-thread array and its length is a property of the
+/// COMPILED kernel. A larger period is REFUSED BY NAME.
+pub const LMA_MAX_PERIOD: usize = 512;
+/// Must match `WS_MAX_PERIOD` in
+/// `kernels/cuda/moving_averages/wave_smoother_kernel.cu`; the array there is
+/// one longer, because the wave window is `period + 1` (wave_smoother.rs:260).
+///
+/// Same reason as [`LMA_MAX_PERIOD`]: the weights are a sin/cos per slot
+/// (:268) and are built once per thread rather than per bar.
+pub const WS_MAX_PERIOD: usize = 512;
+
 #[derive(Debug, Error)]
 pub enum CudaF64IndicatorError {
     #[error(transparent)]
@@ -1077,6 +1124,120 @@ pub enum F64Kernel {
     RollingSkewnessKurtosis,
     SmoothTheilSen,
 
+    // ------------------------------------------------ closer 2, round 3
+    //
+    // Ten indicators whose `.cu` file ALREADY held a genuine
+    // double-in/double-out kernel that the lane could not call. Every one of
+    // those ten entry points is MULTI-OUTPUT with a bespoke parameter list --
+    // `range_filtered_trend_signals_batch_f64` declares 25 parameters and
+    // THIRTEEN output matrices, `possible_rsi_batch_f64` 28 and seven plus two
+    // scratch arenas, `neighboring_trailing_stop_batch_f64` 21 and six plus
+    // four -- while the lane launches exactly one shape and allocates ONE
+    // output matrix. So none could be reused, and each file now carries a
+    // lane-shaped twin beside it (search the file for
+    // `NEOETHOS f64 LANE  --  closer 2, round 3`).
+    //
+    // THREE of the ten also dropped a device-side `new double[]` on the way:
+    // `normalized_volume_true_range`, `regression_slope_oscillator` and
+    // `relative_strength_index_wave_indicator` allocated their rings inside the
+    // kernel. The twins size every ring from a CPU default at compile time, so
+    // the bound is a property of the compiled kernel rather than of the caller.
+    //
+    // WHICH COLUMN EACH EMITS -- eight are what `output_id == "value"` resolves
+    // to on the CPU (neighboring_trailing_stop -> trailing_stop,
+    // normalized_volume_true_range -> normalized_volume,
+    // price_moving_average_ratio_percentile -> plotline, range_breakout_signals
+    // -> range_top, relative_strength_index_wave_indicator -> rsi_ma1, and
+    // nonlinear_regression_zero_lag_moving_average / possible_rsi /
+    // regression_slope_oscillator name `value` outright). The other two have NO
+    // `value` output at all: `normalized_resonator` accepts only "oscillator"
+    // and "signal", and `range_filtered_trend_signals` REJECTS "value" and
+    // accepts thirteen named columns, so each emits its primary series --
+    // oscillator and kalman respectively, the first arm of its own CPU match.
+    NeighboringTrailingStop,
+    NonlinearRegressionZeroLagMovingAverage,
+    NormalizedResonator,
+    NormalizedVolumeTrueRange,
+    PossibleRsi,
+    PriceMovingAverageRatioPercentile,
+    RangeBreakoutSignals,
+    RangeFilteredTrendSignals,
+    RegressionSlopeOscillator,
+    RelativeStrengthIndexWaveIndicator,
+
+    // ------------------------------------------------ closer 4, round 3
+    //
+    // Ten more, every entry point written INTO THE .cu FILE ITS INDICATOR
+    // ALREADY SHIPS IN (see `module_stem`), beside the f32 entry points the
+    // f32 wrappers still call, and against the CPU reference named in that
+    // file's `NEOETHOS f64 LANE  --  closer 4, round 3` header.
+    //
+    // NOT ONE could reuse a symbol already in its file. Every one of those
+    // ten files was PURE f32 before this change -- `bandpass_kernel.cu` had
+    // two `__global__`s and both took `const float*`, `dma_kernel.cu` had
+    // seven, `buff_averages_kernel.cu` twelve -- so there was no f64 entry
+    // point to point a variant at, and the lane could not reach these
+    // indicators at all.
+    //
+    // ALL TEN ARE SEQUENTIAL. Every one carries state across bars: a 2-pole
+    // IIR (bandpass, prb's super-smoother), a variable-alpha EMA driven by a
+    // CMO ring plus a band ratchet (ott, otto), a weighted sliding sum rolled
+    // rather than rebuilt (buff_averages, cora_wave, dma), a Wilder ATR with a
+    // trend state machine (halftrend), a gap ledger with a trailing-stop
+    // ratchet (fvg_trailing_stop), or five interlocking recurrences
+    // (mod_god_mode). None can be made bar-parallel without changing the
+    // rounding, which is the whole reason this lane exists.
+    //
+    // FIVE ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy. Their CPU
+    // batch functions read NAMED parameters and NEVER `period`:
+    // unmitigated_fvg_lookback / smoothing_length / reset_on_cross for
+    // fvg_trailing_stop (cpu_batch.rs:14862), amplitude / channel_deviation /
+    // atr_period for halftrend (:14960), n1 / n2 / n3 / mode / use_volume for
+    // mod_god_mode (:15516), ott_period / ott_percent / fast_vidya_length /
+    // slow_vidya_length / correcting_constant / ma_type for otto (:15657), and
+    // smooth_data / smooth_period / regression_period / polynomial_order /
+    // regression_offset / ndev / equ_from for prb (:15833). A caller sweeping
+    // [7,21,50,100,200] gets five identical CPU columns for each, so the
+    // kernel writes five identical rows.
+    //
+    // THE FIVE THAT ARE SWEPT each map the swept int onto the window its own
+    // CPU entry point reads, and the mapping is NOT always `period`:
+    // `bandpass` and `ott` and `cora_wave` read a parameter literally named
+    // `period`, but `ma_batch.rs:593` sweeps buff_averages' SLOW period and
+    // `:1868` sweeps dma's HULL length. Mapping onto the other named window
+    // would compute a different indicator.
+    //
+    // FIVE SERVE MULTI-OUTPUT INDICATORS, and each emits the column the CPU
+    // batch produces for `output_id == "value"`: bandpass -> bp,
+    // buff_averages -> fast (the `output` default in ma_batch.rs:629),
+    // fvg_trailing_stop -> upper, halftrend -> halftrend, mod_god_mode ->
+    // wavetrend, otto -> hott, prb -> values. Never a different one silently.
+    /// Single price series, CPU source `close`. PERIOD-SWEPT.
+    Bandpass,
+    /// (close, volume). PERIOD-SWEPT -- the swept int is the SLOW period.
+    BuffAverages,
+    /// Single price series, CPU source `close`. PERIOD-SWEPT. Keeps a
+    /// smoothing ring of `round(sqrt(period))` entries, hence a `max_period`.
+    CoraWave,
+    /// Single price series, CPU source `close`. PERIOD-SWEPT -- the swept int
+    /// is the HULL length. Keeps a difference ring of `round(sqrt(hull))`
+    /// entries, hence a `max_period`.
+    Dma,
+    /// high / low / close. PERIOD-INVARIANT. Emits the UPPER band.
+    FvgTrailingStop,
+    /// high / low / close. PERIOD-INVARIANT. Emits the HALFTREND series.
+    Halftrend,
+    /// (high, low, close, volume). PERIOD-INVARIANT. Emits the WAVETREND
+    /// series.
+    ModGodMode,
+    /// Single price series, CPU source `close`. PERIOD-SWEPT.
+    Ott,
+    /// Single price series, CPU source `close`. PERIOD-INVARIANT. Emits the
+    /// HOTT series.
+    Otto,
+    /// Single price series, CPU source `close`. PERIOD-INVARIANT. Emits the
+    /// `values` series.
+    Prb,
 
     // ------------------------------------------------- closer 5, round 2
     //
@@ -1162,7 +1323,197 @@ pub enum F64Kernel {
     /// `kernels/cuda/oscillators/adosc_kernel.cu` previously contained ZERO
     /// double-pointer entry points -- the whole file was f32.
     Adosc,
+
+    // -------------------------------------------------- closer 6, round 3
+    //
+    // Six indicators with ZERO prior CUDA presence: no `.cu`, no wrapper, no
+    // row here, so `resolve_f64_kernel` answered `CudaF64KernelMissing` for
+    // every one of them. Each now has a from-scratch f64 kernel in its own
+    // translation unit under `kernels/cuda/moving_averages/`.
+    /// (hlcc4, volume). Sequential per column. Its CPU default source is
+    /// `hlcc4` (elastic_volume_weighted_moving_average.rs:113) and it takes
+    /// the `use_volume_sum == true` branch, because that is the branch the
+    /// period-sweeping route selects (ma.rs:1105-1113, registry.rs:608) and
+    /// the other branch never reads `length` at all.
+    ElasticVolumeWeightedMovingAverage,
+    /// Single price series (close). Sequential per column: six T3 cascade
+    /// stages, two deviation EMAs and the correction, nine carried scalars,
+    /// all reset by a non-finite bar. Emits the PRIMARY output, the corrected
+    /// line (registry.rs:537).
+    EmaDeviationCorrectedT3,
+    /// Single price series (close). Sequential per column -- a `run` counter
+    /// carries across bars and the window sum is accumulated in 8-wide chunks
+    /// (logarithmic_moving_average.rs:801), an association a bar-parallel
+    /// kernel could not reproduce. Emits the PRIMARY output, `lma`.
+    LogarithmicMovingAverage,
+    /// Single price series (close). Sequential per column: a first-order IIR
+    /// whose history is reset by a non-finite bar.
+    NOrderEma,
+    /// Single price series (close). Sequential per column: an EMA, two
+    /// monotonic deques over a 51-bar volatility window, and a rolling WMA(5),
+    /// three chained recurrences.
+    VolatilityAdjustedMa,
+    /// Single price series (close). Sequential per column: the pre-smoother
+    /// reads bar i and bar i-1 and the weighted sum runs over the last
+    /// `period + 1` smoothed values.
+    WaveSmoother,
+    // ------------------------------------------------- closer 5, round 3
+    //
+    // Nine indicators that had NO reachable f64 entry point before this round.
+    // Seven lived in files whose kernels were f32-only or MIXED (a `double*`
+    // accumulator feeding a `float*` consumer, which is an f64 ACCUMULATOR and
+    // not an f64 API); two -- `corrected_moving_average` and
+    // `ehlers_undersampled_double_moving_average` -- had no `.cu` file at all.
+    //
+    // Every one is SEQUENTIAL: each carries at least one scalar across bars.
+    // `Rsmk` and `CorrectedMovingAverage` are the only two that are genuinely
+    // PERIOD-SWEPT -- their CPU batches read a parameter literally named
+    // `period` (cpu_batch.rs:16479, ma.rs:263). The other seven pin every
+    // window at a CPU default and are declared period-invariant for that
+    // reason, not for convenience.
+    Rsmk,
+    SqueezeMomentum,
+    Uma,
+    Lpc,
+    Mab,
+    Macz,
+    Vwmacd,
+    CorrectedMovingAverage,
+    EhlersUndersampledDoubleMovingAverage,
+
+    // ------------------------------------------------ closer 3, round 3
+    //
+    // Ten more, every entry point written INTO THE .cu FILE ITS INDICATOR
+    // ALREADY SHIPS IN (see `module_stem`), beside the entry points the
+    // existing f32 and multi-output wrappers still call, and against the CPU
+    // reference named in that file's "f64 LANE  --  closer 3, round 3" header.
+    //
+    // ALL TEN ARE SEQUENTIAL. Every one carries state across bars: a Wilder or
+    // EMA recurrence, a six-stage smoothing cascade, a ratchet, a monotone
+    // deque, a pivot state machine, or a sliding sum maintained by
+    // subtract-then-add. None can be made bar-parallel without changing the
+    // rounding, which is the whole reason this lane exists.
+    //
+    // EIGHT ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy: their CPU
+    // batch functions read NAMED parameters and NEVER `period` --
+    // `lookback_period`/`confirmation_period`/`trend_ma_period`/
+    // `ma_step_period` for reversal_signals (cpu_batch.rs:7286-7295),
+    // `trend_period`/`ma_period`/`channel_rate_percent`/
+    // `linear_regression_period`/`matype` for trend_follower
+    // (trend_follower.rs:147-169), sixteen `fast_depth`/`slow_depth`/
+    // `show_*` names for vdubus (:5109-5209), `length`/`sensitivity` for
+    // volume_energy_reservoirs (:8984), `rsi_length`/`range_length`/
+    // `ma_length` for volume_weighted_relative_strength_index (:16340),
+    // `rsi_length`/`stoch_length`/`k_length`/`d_length` for
+    // volume_weighted_stochastic_rsi (:12413), `length`/`extend` for
+    // zig_zag_channels (:7365) and `fast_period`/`slow_period`/`multiplier`
+    // for avsl (:14126). A caller sweeping `[7,21,50,100,200]` gets five
+    // identical CPU columns for each of them, so the kernel emits five
+    // identical rows and `is_period_invariant` says so.
+    //
+    // THE TWO THAT ARE GENUINELY PERIOD-SWEPT read a parameter literally named
+    // `period`: `VolatilityRatioAdaptiveRsx` (cpu_batch.rs:9707) and
+    // `Alphatrend` (:13998). Both size a per-thread ring from it, so both
+    // carry a `max_period` bound.
+    //
+    // EVERY ONE DECLARES `F64FirstValidRule::Ignored` EXCEPT `Alphatrend`.
+    // That asymmetry is read from the CPU, not chosen: eight of these
+    // references walk every bar from 0 and RESET their whole state at an
+    // invalid one, so a global warmup index would be wrong after the first
+    // hole; `avsl` scans with a rule no variant expresses (the MAX of three
+    // INDEPENDENT first-non-NaN scans over close, low and volume,
+    // avsl.rs:272) and derives it inside the kernel; and `alphatrend` scans
+    // `close.iter().position(|x| !x.is_nan())` (alphatrend.rs:493), which is
+    // exactly the existing `HlcCloseOnly` rule that `adxr` already declares.
+    //
+    // EVERY ONE SERVES A MULTI-OUTPUT INDICATOR, and each emits the column its
+    // CPU batch produces for `output_id == "value"`: reversal_signals ->
+    // stepped_ma, trend_follower -> values, volatility_ratio_adaptive_rsx ->
+    // line, volume_energy_reservoirs -> momentum,
+    // volume_weighted_relative_strength_index -> rsi,
+    // volume_weighted_stochastic_rsi -> k, zig_zag_channels -> middle,
+    // alphatrend -> k1, avsl -> values. Never a different one silently.
+    //
+    // ONE HAS NO REACHABLE `value` ALIAS AT ALL and is named here for that
+    // reason: `compute_vdubus_divergence_wave_pattern_generator_batch`
+    // (cpu_batch.rs:5095) calls `expect_value_output`, which admits ONLY the
+    // literal "value", and then matches against twelve arms none of which is
+    // "value" -- so every request falls through to `UnknownOutput`. Its kernel
+    // emits `fast_standard`, output index 0 of the registry's list
+    // (registry.rs:1240), and a parity run must ask the CPU for that column by
+    // name.
+    /// (open, high, low, close, volume) -- OPEN is in the validity gate.
+    /// PERIOD-INVARIANT. Emits the STEPPED MA.
+    ReversalSignals,
+    /// (high, low, close, volume). PERIOD-INVARIANT. Emits `values`. Carries
+    /// BOTH CPU branches -- the clean sliding-linreg path and the
+    /// reset-on-NaN streaming path -- because they are different arithmetic.
+    TrendFollower,
+    /// high / low / close. PERIOD-INVARIANT. Emits `fast_standard`.
+    VdubusDivergenceWavePatternGenerator,
+    /// Single price series, CPU source `close`. PERIOD-SWEPT -- the swept int
+    /// sets both ring depths, hence a `max_period`. Emits `line`.
+    VolatilityRatioAdaptiveRsx,
+    /// (high, low, close, volume). PERIOD-INVARIANT. Emits `momentum`.
+    VolumeEnergyReservoirs,
+    /// (close, volume). PERIOD-INVARIANT. Emits `rsi`.
+    VolumeWeightedRelativeStrengthIndex,
+    /// (close, volume). PERIOD-INVARIANT. Emits `k`.
+    VolumeWeightedStochasticRsi,
+    /// open / high / low / close -- OPEN is in the validity gate.
+    /// PERIOD-INVARIANT. Emits `middle`.
+    ZigZagChannels,
+    /// (high, low, close, volume). PERIOD-SWEPT -- the swept int is BOTH the
+    /// true-range window AND the MFI period, hence a `max_period`. Emits `k1`.
+    Alphatrend,
+    /// (high, low, close, volume) with HIGH bound and unread. PERIOD-INVARIANT.
+    /// Emits `values`.
+    Avsl,
+
+    // ------------------------------------------------ closer 1, round 3
+    //
+    // Ten indicators whose `.cu` file ALREADY held a genuine
+    // double-in/double-out kernel that the lane could not call, because every
+    // one of those entry points is MULTI-OUTPUT with a bespoke parameter list
+    // -- `ichimoku_oscillator_batch_f64` declares 36 parameters and 20
+    // `double*`, `goertzel_cycle_composite_wave_batch_f64` declares 31 and
+    // takes two host scratch pointers, `macd_wave_signal_pro_batch_f64` takes
+    // no `periods` array at all. None of them is the lane ABI, so each file
+    // received a `*_neo_batch_f64` entry point beside what it already had.
+    // Every one of the ten is PERIOD-INVARIANT: its CPU batch reads named
+    // windows and never `period`.
+    /// open / high / low / close. Emits `basis` -- the CPU batch has no
+    /// `value` alias and every other column is derived from basis.
+    FibonacciEntryBands,
+    /// Single price series, CPU source `close`. Emits `value`. The ONLY
+    /// bar-parallel kernel of the ten: `compute_row` recomputes each 601-bar
+    /// window from scratch and carries NOTHING across bars, so the Goertzel
+    /// recurrence lives inside the window, not along the series.
+    GoertzelCycleCompositeWave,
+    /// (timestamps, close, volume). Emits `estimate`. Timestamps are an
+    /// INPUT -- the working CPU door infers `slots_per_day` from them and
+    /// takes VOLUME as the source; close is passed by the shape and unread.
+    HalfCausalEstimator,
+    /// high / low / close. Emits `signal`, which the CPU batch also aliases
+    /// as `value`.
+    IchimokuOscillator,
+    /// (high, low, close, volume). Emits its single `value` series. Ten
+    /// sub-indicators, all reset together on an invalid bar.
+    InsyncIndex,
+    /// Single price series, CPU source `close`. Emits `value`.
+    LinearRegressionIntensity,
+    /// open / high / low / close. Emits `diff`, which the CPU batch also
+    /// aliases as `value`.
+    MacdWaveSignalPro,
+    /// Single price series, CPU source `close`. Emits `mesa_1` -- the CPU
+    /// batch has no `value` alias and mesa_1 is the longest line.
+    MesaStochasticMultiLength,
+    /// Single price series, CPU source `close`. Emits `value`.
+    MovingAverageCrossProbability,
+    /// Single price series, CPU source `close`. Emits `value`.
+    MultiLengthStochasticAverage,
 }
+
 
 impl F64Kernel {
     /// The exact `__global__` entry point this variant launches.
@@ -1170,6 +1521,16 @@ impl F64Kernel {
         match self {
             F64Kernel::Sma => "neoethos_sma_batch_f64",
             F64Kernel::Adosc => "adosc_neo_batch_f64",
+            // ------------------------------------------ closer 5, round 3
+            F64Kernel::Rsmk => "rsmk_neo_batch_f64",
+            F64Kernel::SqueezeMomentum => "squeeze_momentum_neo_batch_f64",
+            F64Kernel::Uma => "uma_neo_batch_f64",
+            F64Kernel::Lpc => "lpc_neo_batch_f64",
+            F64Kernel::Mab => "mab_neo_batch_f64",
+            F64Kernel::Macz => "macz_neo_batch_f64",
+            F64Kernel::Vwmacd => "vwmacd_neo_batch_f64",
+            F64Kernel::CorrectedMovingAverage => "corrected_moving_average_neo_batch_f64",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average_neo_batch_f64",
             // ------------------------------------------- closer 5, round 2
             F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter_neo_batch_f64",
             F64Kernel::SpearmanCorrelation => "spearman_correlation_neo_batch_f64",
@@ -1499,6 +1860,77 @@ impl F64Kernel {
             F64Kernel::RogersSatchellVolatility => "rogers_satchell_volatility_neo_batch_f64",
             F64Kernel::RollingSkewnessKurtosis => "rolling_skewness_kurtosis_neo_batch_f64",
             F64Kernel::SmoothTheilSen => "smooth_theil_sen_neo_batch_f64",
+            // ------------------------------------------ closer 2, round 3
+            F64Kernel::NeighboringTrailingStop => "neighboring_trailing_stop_neo_batch_f64",
+            F64Kernel::NonlinearRegressionZeroLagMovingAverage => {
+                "nonlinear_regression_zero_lag_moving_average_neo_batch_f64"
+            }
+            F64Kernel::NormalizedResonator => "normalized_resonator_neo_batch_f64",
+            F64Kernel::NormalizedVolumeTrueRange => {
+                "normalized_volume_true_range_neo_batch_f64"
+            }
+            F64Kernel::PossibleRsi => "possible_rsi_neo_batch_f64",
+            F64Kernel::PriceMovingAverageRatioPercentile => {
+                "price_moving_average_ratio_percentile_neo_batch_f64"
+            }
+            F64Kernel::RangeBreakoutSignals => "range_breakout_signals_neo_batch_f64",
+            F64Kernel::RangeFilteredTrendSignals => {
+                "range_filtered_trend_signals_neo_batch_f64"
+            }
+            F64Kernel::RegressionSlopeOscillator => "regression_slope_oscillator_neo_batch_f64",
+            F64Kernel::RelativeStrengthIndexWaveIndicator => {
+                "relative_strength_index_wave_indicator_neo_batch_f64"
+            }
+            // ------------------------------------------ closer 4, round 3
+            F64Kernel::Bandpass => "bandpass_neo_batch_f64",
+            F64Kernel::BuffAverages => "buff_averages_neo_batch_f64",
+            F64Kernel::CoraWave => "cora_wave_neo_batch_f64",
+            F64Kernel::Dma => "dma_neo_batch_f64",
+            F64Kernel::FvgTrailingStop => "fvg_trailing_stop_neo_batch_f64",
+            F64Kernel::Halftrend => "halftrend_neo_batch_f64",
+            F64Kernel::ModGodMode => "mod_god_mode_neo_batch_f64",
+            F64Kernel::Ott => "ott_neo_batch_f64",
+            F64Kernel::Otto => "otto_neo_batch_f64",
+            F64Kernel::Prb => "prb_neo_batch_f64",
+            // ---------------------------------------------- closer 6, round 3
+            F64Kernel::ElasticVolumeWeightedMovingAverage => {
+                "elastic_volume_weighted_moving_average_neo_batch_f64"
+            }
+            F64Kernel::EmaDeviationCorrectedT3 => "ema_deviation_corrected_t3_neo_batch_f64",
+            F64Kernel::LogarithmicMovingAverage => "logarithmic_moving_average_neo_batch_f64",
+            F64Kernel::NOrderEma => "n_order_ema_neo_batch_f64",
+            F64Kernel::VolatilityAdjustedMa => "volatility_adjusted_ma_neo_batch_f64",
+            F64Kernel::WaveSmoother => "wave_smoother_neo_batch_f64",
+
+            // ------------------------------------------------ closer 3, round 3
+            F64Kernel::ReversalSignals => "reversal_signals_neo_batch_f64",
+            F64Kernel::TrendFollower => "trend_follower_neo_batch_f64",
+            F64Kernel::VdubusDivergenceWavePatternGenerator => {
+                "vdubus_divergence_wave_pattern_generator_neo_batch_f64"
+            }
+            F64Kernel::VolatilityRatioAdaptiveRsx => "volatility_ratio_adaptive_rsx_neo_batch_f64",
+            F64Kernel::VolumeEnergyReservoirs => "volume_energy_reservoirs_neo_batch_f64",
+            F64Kernel::VolumeWeightedRelativeStrengthIndex => {
+                "volume_weighted_relative_strength_index_neo_batch_f64"
+            }
+            F64Kernel::VolumeWeightedStochasticRsi => {
+                "volume_weighted_stochastic_rsi_neo_batch_f64"
+            }
+            F64Kernel::ZigZagChannels => "zig_zag_channels_neo_batch_f64",
+            F64Kernel::Alphatrend => "alphatrend_neo_batch_f64",
+            F64Kernel::Avsl => "avsl_neo_batch_f64",
+
+            // ------------------------------------------ closer 1, round 3
+            F64Kernel::FibonacciEntryBands => "fibonacci_entry_bands_neo_batch_f64",
+            F64Kernel::GoertzelCycleCompositeWave => "goertzel_cycle_composite_wave_neo_batch_f64",
+            F64Kernel::HalfCausalEstimator => "half_causal_estimator_neo_batch_f64",
+            F64Kernel::IchimokuOscillator => "ichimoku_oscillator_neo_batch_f64",
+            F64Kernel::InsyncIndex => "insync_index_neo_batch_f64",
+            F64Kernel::LinearRegressionIntensity => "linear_regression_intensity_neo_batch_f64",
+            F64Kernel::MacdWaveSignalPro => "macd_wave_signal_pro_neo_batch_f64",
+            F64Kernel::MesaStochasticMultiLength => "mesa_stochastic_multi_length_neo_batch_f64",
+            F64Kernel::MovingAverageCrossProbability => "moving_average_cross_probability_neo_batch_f64",
+            F64Kernel::MultiLengthStochasticAverage => "multi_length_stochastic_average_neo_batch_f64",
         }
     }
 
@@ -1605,6 +2037,43 @@ impl F64Kernel {
             // the SWEPT period.
             F64Kernel::DirectionalImbalanceIndex => Some(DII_MAX_PERIOD),
             F64Kernel::CandleStrengthOscillator => Some(CSO_MAX_PERIOD),
+            // ---------------------------------------------- closer 6, round 3
+            //
+            // Two of this closer's six. The other four hold no per-thread array
+            // whose length is a function of the SWEPT period:
+            // `volatility_adjusted_ma`'s deques are `vol_period` = 51, a CPU
+            // DEFAULT the sweep cannot move; `elastic_volume_weighted_moving_
+            // average` reads its rolling window straight out of the volume
+            // series instead of keeping a ring; and `n_order_ema` /
+            // `ema_deviation_corrected_t3` carry scalars only.
+            F64Kernel::LogarithmicMovingAverage => Some(LMA_MAX_PERIOD),
+            F64Kernel::WaveSmoother => Some(WS_MAX_PERIOD),
+            // ---------------------------------------------- closer 4, round 3
+            //
+            // Two of this round's ten. Both keep a per-thread ring whose depth
+            // is `round(sqrt(swept period))` -- cora_wave's smoothing WMA
+            // (cora_wave.rs:378) and dma's difference ring (dma.rs:420) -- so
+            // the bound belongs to the compiled kernel and an oversized period
+            // is REFUSED BY NAME rather than truncated or moved to the host.
+            // The numbers match the `#define`s in the two `.cu` files.
+            //
+            // The other eight hold no per-thread array whose length a caller
+            // can move: bandpass, ott and otto carry scalars and a NINE-wide
+            // CMO ring that is a constant of the indicator; buff_averages
+            // reads its window straight out of global memory; and
+            // fvg_trailing_stop, halftrend, mod_god_mode and prb are
+            // PERIOD-INVARIANT, so every window they keep is a CPU default the
+            // sweep cannot move.
+            F64Kernel::CoraWave => Some(CORA_WAVE_MAX_PERIOD),
+            F64Kernel::Dma => Some(DMA_MAX_PERIOD),
+            // ------------------------------------------------ closer 3, round 3
+            // Only TWO of this closer's ten carry a bound, and that asymmetry
+            // is the point: the other eight pin every window at a CPU DEFAULT,
+            // so no caller-supplied number reaches a per-thread array at all
+            // and there is nothing for a bound to refuse. These two size a ring
+            // from the SWEPT period.
+            F64Kernel::VolatilityRatioAdaptiveRsx => Some(VRARSX_MAX_PERIOD),
+            F64Kernel::Alphatrend => Some(ALPHATREND_MAX_PERIOD),
             _ => None,
         }
     }
@@ -1624,6 +2093,18 @@ impl F64Kernel {
             self,
             F64Kernel::Tsi
                 | F64Kernel::Adosc
+                // ------------------------------------ closer 5, round 3
+                // Seven of the nine. `Rsmk` reads a parameter literally named
+                // `period` (cpu_batch.rs:16479) and `CorrectedMovingAverage`
+                // reaches this crate through `ma(ma_type, period, ..)`
+                // (ma.rs:263); both are deliberately absent.
+                | F64Kernel::SqueezeMomentum
+                | F64Kernel::Uma
+                | F64Kernel::Lpc
+                | F64Kernel::Mab
+                | F64Kernel::Macz
+                | F64Kernel::Vwmacd
+                | F64Kernel::EhlersUndersampledDoubleMovingAverage
                 // -------------------------- closer 5, round 2 (invariant)
                 // Sixteen of the seventeen. `Supertrend` reads a parameter
                 // literally named `period` (cpu_batch.rs:6348) and is
@@ -1851,6 +2332,81 @@ impl F64Kernel {
                 | F64Kernel::RogersSatchellVolatility
                 | F64Kernel::RollingSkewnessKurtosis
                 | F64Kernel::SmoothTheilSen
+                // ------------------------------------ closer 4, round 3
+                //
+                // Five of this round's ten. Each CPU batch reads NAMED
+                // windows and never `period` -- see the enum note for the
+                // parameter list of each. The other five (Bandpass,
+                // BuffAverages, CoraWave, Dma, Ott) ARE swept and are
+                // deliberately absent.
+                | F64Kernel::FvgTrailingStop
+                | F64Kernel::Halftrend
+                | F64Kernel::ModGodMode
+                | F64Kernel::Otto
+                | F64Kernel::Prb
+                // ------------------------------------------ closer 2, round 3
+                //
+                // NINE of the ten. Every one of those nine CPU batches reads
+                // its own NAMED windows and never `period`:
+                // neighboring_trailing_stop reads buffer_size/k/percentile/
+                // smooth, nonlinear_regression_zero_lag_moving_average reads
+                // zlma_period/regression_period, normalized_resonator reads
+                // source/delta/lookback_mult/signal_length,
+                // normalized_volume_true_range reads true_range_style/
+                // outlier_range/atr_length/volume_length,
+                // price_moving_average_ratio_percentile reads ma_length/
+                // ma_type/pmarp_lookback/line_mode, range_breakout_signals
+                // reads range_length/confirmation_length,
+                // range_filtered_trend_signals reads the six kalman and
+                // supertrend names, regression_slope_oscillator reads
+                // min_range/max_range/step/signal_line, and
+                // relative_strength_index_wave_indicator reads rsi_length and
+                // length1..length4. Five swept periods therefore give five
+                // identical CPU columns and five identical kernel rows.
+                //
+                // `PossibleRsi` is DELIBERATELY ABSENT: its CPU batch reads a
+                // parameter literally named `period` (default 32) and that
+                // parameter is the RSI length, so every row of the sweep is a
+                // different column and the sweep does real work.
+                | F64Kernel::NeighboringTrailingStop
+                | F64Kernel::NonlinearRegressionZeroLagMovingAverage
+                | F64Kernel::NormalizedResonator
+                | F64Kernel::NormalizedVolumeTrueRange
+                | F64Kernel::PriceMovingAverageRatioPercentile
+                | F64Kernel::RangeBreakoutSignals
+                | F64Kernel::RangeFilteredTrendSignals
+                | F64Kernel::RegressionSlopeOscillator
+                | F64Kernel::RelativeStrengthIndexWaveIndicator
+                // ------------------------------- closer 3, round 3
+                // Eight of this closer's ten. Their CPU batch functions read
+                // NAMED parameters and never `period`, AND their kernels pin
+                // every window at the CPU DEFAULT rather than reading
+                // `periods[combo]` -- the two halves have to agree or the
+                // claim is false. `VolatilityRatioAdaptiveRsx` and
+                // `Alphatrend` are deliberately absent: both read a parameter
+                // literally named `period` and both size a ring from it.
+                | F64Kernel::ReversalSignals
+                | F64Kernel::TrendFollower
+                | F64Kernel::VdubusDivergenceWavePatternGenerator
+                | F64Kernel::VolumeEnergyReservoirs
+                | F64Kernel::VolumeWeightedRelativeStrengthIndex
+                | F64Kernel::VolumeWeightedStochasticRsi
+                | F64Kernel::ZigZagChannels
+                | F64Kernel::Avsl
+
+                // ------------------------------------ closer 1, round 3
+                // All ten. Every CPU batch reads NAMED windows and never
+                // `period` -- see the enum note.
+                | F64Kernel::FibonacciEntryBands
+                | F64Kernel::GoertzelCycleCompositeWave
+                | F64Kernel::HalfCausalEstimator
+                | F64Kernel::IchimokuOscillator
+                | F64Kernel::InsyncIndex
+                | F64Kernel::LinearRegressionIntensity
+                | F64Kernel::MacdWaveSignalPro
+                | F64Kernel::MesaStochasticMultiLength
+                | F64Kernel::MovingAverageCrossProbability
+                | F64Kernel::MultiLengthStochasticAverage
         )
     }
 
@@ -1858,6 +2414,16 @@ impl F64Kernel {
         match self {
             F64Kernel::Sma => "sma",
             F64Kernel::Adosc => "adosc",
+            // ------------------------------------------ closer 5, round 3
+            F64Kernel::Rsmk => "rsmk",
+            F64Kernel::SqueezeMomentum => "squeeze_momentum",
+            F64Kernel::Uma => "uma",
+            F64Kernel::Lpc => "lpc",
+            F64Kernel::Mab => "mab",
+            F64Kernel::Macz => "macz",
+            F64Kernel::Vwmacd => "vwmacd",
+            F64Kernel::CorrectedMovingAverage => "corrected_moving_average",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average",
             // ---------------------------------- closer 5, round 2 (ids)
             F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter",
             F64Kernel::SpearmanCorrelation => "spearman_correlation",
@@ -2164,6 +2730,71 @@ impl F64Kernel {
             F64Kernel::RogersSatchellVolatility => "rogers_satchell_volatility",
             F64Kernel::RollingSkewnessKurtosis => "rolling_skewness_kurtosis",
             F64Kernel::SmoothTheilSen => "smooth_theil_sen",
+            // ------------------------------------------ closer 2, round 3
+            F64Kernel::NeighboringTrailingStop => "neighboring_trailing_stop",
+            F64Kernel::NonlinearRegressionZeroLagMovingAverage => {
+                "nonlinear_regression_zero_lag_moving_average"
+            }
+            F64Kernel::NormalizedResonator => "normalized_resonator",
+            F64Kernel::NormalizedVolumeTrueRange => "normalized_volume_true_range",
+            F64Kernel::PossibleRsi => "possible_rsi",
+            F64Kernel::PriceMovingAverageRatioPercentile => {
+                "price_moving_average_ratio_percentile"
+            }
+            F64Kernel::RangeBreakoutSignals => "range_breakout_signals",
+            F64Kernel::RangeFilteredTrendSignals => "range_filtered_trend_signals",
+            F64Kernel::RegressionSlopeOscillator => "regression_slope_oscillator",
+            F64Kernel::RelativeStrengthIndexWaveIndicator => {
+                "relative_strength_index_wave_indicator"
+            }
+            // ------------------------------------------ closer 4, round 3
+            F64Kernel::Bandpass => "bandpass",
+            F64Kernel::BuffAverages => "buff_averages",
+            F64Kernel::CoraWave => "cora_wave",
+            F64Kernel::Dma => "dma",
+            F64Kernel::FvgTrailingStop => "fvg_trailing_stop",
+            F64Kernel::Halftrend => "halftrend",
+            F64Kernel::ModGodMode => "mod_god_mode",
+            F64Kernel::Ott => "ott",
+            F64Kernel::Otto => "otto",
+            F64Kernel::Prb => "prb",
+            // ---------------------------------------------- closer 6, round 3
+            F64Kernel::ElasticVolumeWeightedMovingAverage => {
+                "elastic_volume_weighted_moving_average"
+            }
+            F64Kernel::EmaDeviationCorrectedT3 => "ema_deviation_corrected_t3",
+            F64Kernel::LogarithmicMovingAverage => "logarithmic_moving_average",
+            F64Kernel::NOrderEma => "n_order_ema",
+            F64Kernel::VolatilityAdjustedMa => "volatility_adjusted_ma",
+            F64Kernel::WaveSmoother => "wave_smoother",
+
+            // ------------------------------------------------ closer 3, round 3
+            F64Kernel::ReversalSignals => "reversal_signals",
+            F64Kernel::TrendFollower => "trend_follower",
+            F64Kernel::VdubusDivergenceWavePatternGenerator => {
+                "vdubus_divergence_wave_pattern_generator"
+            }
+            F64Kernel::VolatilityRatioAdaptiveRsx => "volatility_ratio_adaptive_rsx",
+            F64Kernel::VolumeEnergyReservoirs => "volume_energy_reservoirs",
+            F64Kernel::VolumeWeightedRelativeStrengthIndex => {
+                "volume_weighted_relative_strength_index"
+            }
+            F64Kernel::VolumeWeightedStochasticRsi => "volume_weighted_stochastic_rsi",
+            F64Kernel::ZigZagChannels => "zig_zag_channels",
+            F64Kernel::Alphatrend => "alphatrend",
+            F64Kernel::Avsl => "avsl",
+
+            // ------------------------------------------ closer 1, round 3
+            F64Kernel::FibonacciEntryBands => "fibonacci_entry_bands",
+            F64Kernel::GoertzelCycleCompositeWave => "goertzel_cycle_composite_wave",
+            F64Kernel::HalfCausalEstimator => "half_causal_estimator",
+            F64Kernel::IchimokuOscillator => "ichimoku_oscillator",
+            F64Kernel::InsyncIndex => "insync_index",
+            F64Kernel::LinearRegressionIntensity => "linear_regression_intensity",
+            F64Kernel::MacdWaveSignalPro => "macd_wave_signal_pro",
+            F64Kernel::MesaStochasticMultiLength => "mesa_stochastic_multi_length",
+            F64Kernel::MovingAverageCrossProbability => "moving_average_cross_probability",
+            F64Kernel::MultiLengthStochasticAverage => "multi_length_stochastic_average",
         }
     }
 
@@ -2172,6 +2803,16 @@ impl F64Kernel {
     pub const ALL: &'static [F64Kernel] = &[
         F64Kernel::Sma,
         F64Kernel::Adosc,
+        // ------------------------------------------ closer 5, round 3
+        F64Kernel::Rsmk,
+        F64Kernel::SqueezeMomentum,
+        F64Kernel::Uma,
+        F64Kernel::Lpc,
+        F64Kernel::Mab,
+        F64Kernel::Macz,
+        F64Kernel::Vwmacd,
+        F64Kernel::CorrectedMovingAverage,
+        F64Kernel::EhlersUndersampledDoubleMovingAverage,
         // ----------------------------------------------- closer 5, round 2
         F64Kernel::SmoothedGaussianTrendFilter,
         F64Kernel::SpearmanCorrelation,
@@ -2471,6 +3112,58 @@ impl F64Kernel {
         F64Kernel::RogersSatchellVolatility,
         F64Kernel::RollingSkewnessKurtosis,
         F64Kernel::SmoothTheilSen,
+        // ------------------------------------------ closer 4, round 3
+        F64Kernel::Bandpass,
+        F64Kernel::BuffAverages,
+        F64Kernel::CoraWave,
+        F64Kernel::Dma,
+        F64Kernel::FvgTrailingStop,
+        F64Kernel::Halftrend,
+        F64Kernel::ModGodMode,
+        F64Kernel::Ott,
+        F64Kernel::Otto,
+        F64Kernel::Prb,
+        // --------------------------------------------------- closer 6, round 3
+        F64Kernel::ElasticVolumeWeightedMovingAverage,
+        F64Kernel::EmaDeviationCorrectedT3,
+        F64Kernel::LogarithmicMovingAverage,
+        F64Kernel::NOrderEma,
+        F64Kernel::VolatilityAdjustedMa,
+        F64Kernel::WaveSmoother,
+        // --------------------------------------------------- closer 2, round 3
+        F64Kernel::NeighboringTrailingStop,
+        F64Kernel::NonlinearRegressionZeroLagMovingAverage,
+        F64Kernel::NormalizedResonator,
+        F64Kernel::NormalizedVolumeTrueRange,
+        F64Kernel::PossibleRsi,
+        F64Kernel::PriceMovingAverageRatioPercentile,
+        F64Kernel::RangeBreakoutSignals,
+        F64Kernel::RangeFilteredTrendSignals,
+        F64Kernel::RegressionSlopeOscillator,
+        F64Kernel::RelativeStrengthIndexWaveIndicator,
+        // ---------------------------------------------- closer 3, round 3
+        F64Kernel::ReversalSignals,
+        F64Kernel::TrendFollower,
+        F64Kernel::VdubusDivergenceWavePatternGenerator,
+        F64Kernel::VolatilityRatioAdaptiveRsx,
+        F64Kernel::VolumeEnergyReservoirs,
+        F64Kernel::VolumeWeightedRelativeStrengthIndex,
+        F64Kernel::VolumeWeightedStochasticRsi,
+        F64Kernel::ZigZagChannels,
+        F64Kernel::Alphatrend,
+        F64Kernel::Avsl,
+
+        // ---------------------------------------------- closer 1, round 3
+        F64Kernel::FibonacciEntryBands,
+        F64Kernel::GoertzelCycleCompositeWave,
+        F64Kernel::HalfCausalEstimator,
+        F64Kernel::IchimokuOscillator,
+        F64Kernel::InsyncIndex,
+        F64Kernel::LinearRegressionIntensity,
+        F64Kernel::MacdWaveSignalPro,
+        F64Kernel::MesaStochasticMultiLength,
+        F64Kernel::MovingAverageCrossProbability,
+        F64Kernel::MultiLengthStochasticAverage,
     ];
 
     /// `true` when each output bar depends on the one before it, which is why
@@ -2481,6 +3174,16 @@ impl F64Kernel {
             self,
             F64Kernel::Sma
                 | F64Kernel::Adosc
+                // ------------------------------------ closer 5, round 3
+                | F64Kernel::Rsmk
+                | F64Kernel::SqueezeMomentum
+                | F64Kernel::Uma
+                | F64Kernel::Lpc
+                | F64Kernel::Mab
+                | F64Kernel::Macz
+                | F64Kernel::Vwmacd
+                | F64Kernel::CorrectedMovingAverage
+                | F64Kernel::EhlersUndersampledDoubleMovingAverage
                 // --------------------------------------- closer 5, round 2
                 | F64Kernel::SmoothedGaussianTrendFilter
                 | F64Kernel::SpearmanCorrelation
@@ -2805,6 +3508,101 @@ impl F64Kernel {
                 | F64Kernel::RogersSatchellVolatility
                 | F64Kernel::RollingSkewnessKurtosis
                 | F64Kernel::SmoothTheilSen
+                // ------------------------------------------ closer 4, round 3
+                //
+                // All ten. Every one carries state across bars -- a 2-pole
+                // IIR, a variable-alpha EMA plus a band ratchet, a weighted
+                // sliding sum rolled rather than rebuilt, a Wilder ATR with a
+                // trend state machine, a gap ledger with a trailing stop, or
+                // five interlocking recurrences. See the enum note.
+                | F64Kernel::Bandpass
+                | F64Kernel::BuffAverages
+                | F64Kernel::CoraWave
+                | F64Kernel::Dma
+                | F64Kernel::FvgTrailingStop
+                | F64Kernel::Halftrend
+                | F64Kernel::ModGodMode
+                | F64Kernel::Ott
+                | F64Kernel::Otto
+                | F64Kernel::Prb
+                // ------------------------------------------ closer 6, round 3
+                //
+                // All six. Every one of them carries at least one scalar from
+                // bar to bar -- an IIR history, a T3 cascade, an EMA plus two
+                // monotonic deques plus a rolling WMA, a rolling volume sum, a
+                // finite-run counter, or a 2-bar pre-smoother -- so each is one
+                // thread per column walking bars ascending.
+                | F64Kernel::ElasticVolumeWeightedMovingAverage
+                | F64Kernel::EmaDeviationCorrectedT3
+                | F64Kernel::LogarithmicMovingAverage
+                | F64Kernel::NOrderEma
+                | F64Kernel::VolatilityAdjustedMa
+                | F64Kernel::WaveSmoother
+                // ------------------------------------------ closer 2, round 3
+                //
+                // ALL TEN. Every one carries state from bar to bar and none can
+                // be made bar-parallel without changing the rounding:
+                // a 200-deep price window plus a stop ratchet
+                // (neighboring_trailing_stop); two cascaded rolling WMAs into a
+                // quadratic-regression moment triple updated from itself
+                // (nonlinear_regression_zero_lag_moving_average); a 2-pole
+                // resonator IIR plus an EMA plus a monotonic peak deque
+                // (normalized_resonator); an all-bars running mean plus two
+                // never-evicted variance sums plus two filled smoothing rings
+                // (normalized_volume_true_range); a Wilder RSI feeding a
+                // rolling min/max feeding a fisher recursion feeding a 74-deep
+                // nonlag ring (possible_rsi); a running SMA window sum plus an
+                // incremental sorted percentile window
+                // (price_moving_average_ratio_percentile); a breakout state
+                // machine over a median window, a Wilder ATR and two
+                // confirmation windows (range_breakout_signals); a Kalman
+                // covariance updated from itself plus a Wilder ATR plus a
+                // 200-deep WMA (range_filtered_trend_signals); two running
+                // prefix sums of logarithms (regression_slope_oscillator); and
+                // three Wilder recursions into a rolling WMA
+                // (relative_strength_index_wave_indicator).
+                | F64Kernel::NeighboringTrailingStop
+                | F64Kernel::NonlinearRegressionZeroLagMovingAverage
+                | F64Kernel::NormalizedResonator
+                | F64Kernel::NormalizedVolumeTrueRange
+                | F64Kernel::PossibleRsi
+                | F64Kernel::PriceMovingAverageRatioPercentile
+                | F64Kernel::RangeBreakoutSignals
+                | F64Kernel::RangeFilteredTrendSignals
+                | F64Kernel::RegressionSlopeOscillator
+                | F64Kernel::RelativeStrengthIndexWaveIndicator
+                // ------------------------------- closer 3, round 3
+                // ALL TEN. Every one carries a scalar, a ratchet, a monotone
+                // deque or a pivot ring across bars; none is bar-parallel.
+                | F64Kernel::ReversalSignals
+                | F64Kernel::TrendFollower
+                | F64Kernel::VdubusDivergenceWavePatternGenerator
+                | F64Kernel::VolatilityRatioAdaptiveRsx
+                | F64Kernel::VolumeEnergyReservoirs
+                | F64Kernel::VolumeWeightedRelativeStrengthIndex
+                | F64Kernel::VolumeWeightedStochasticRsi
+                | F64Kernel::ZigZagChannels
+                | F64Kernel::Alphatrend
+                | F64Kernel::Avsl
+
+                // ------------------------------------ closer 1, round 3
+                // Nine of the ten. Each carries state across bars: a double
+                // EMA cascade, a Chebyshev/Gaussian smoothing chain, a
+                // time-of-day store, a sliding Kendall counter, ten reset-
+                // together sub-indicators, two IIR poles, or a truncated-EMA
+                // pair with a drop-scale correction.
+                // `GoertzelCycleCompositeWave` is DELIBERATELY ABSENT: its
+                // CPU `compute_row` recomputes every window from scratch and
+                // carries nothing, so it is bar-parallel.
+                | F64Kernel::FibonacciEntryBands
+                | F64Kernel::HalfCausalEstimator
+                | F64Kernel::IchimokuOscillator
+                | F64Kernel::InsyncIndex
+                | F64Kernel::LinearRegressionIntensity
+                | F64Kernel::MacdWaveSignalPro
+                | F64Kernel::MesaStochasticMultiLength
+                | F64Kernel::MovingAverageCrossProbability
+                | F64Kernel::MultiLengthStochasticAverage
         )
     }
 
@@ -2830,6 +3628,16 @@ impl F64Kernel {
         match self {
             F64Kernel::Sqwma => "sqwma_kernel",
             F64Kernel::Adosc => "adosc_kernel",
+            // ------------------------------------------ closer 5, round 3
+            F64Kernel::Rsmk => "rsmk_kernel",
+            F64Kernel::SqueezeMomentum => "squeeze_momentum_kernel",
+            F64Kernel::Uma => "uma_kernel",
+            F64Kernel::Lpc => "lpc_kernel",
+            F64Kernel::Mab => "mab_kernel",
+            F64Kernel::Macz => "macz_kernel",
+            F64Kernel::Vwmacd => "vwmacd_kernel",
+            F64Kernel::CorrectedMovingAverage => "corrected_moving_average_kernel",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average_kernel",
             // ------------------------------ closer 5, round 2 (modules)
             F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter_kernel",
             F64Kernel::SpearmanCorrelation => "spearman_correlation_kernel",
@@ -3141,6 +3949,89 @@ impl F64Kernel {
             F64Kernel::RogersSatchellVolatility => "rogers_satchell_volatility_kernel",
             F64Kernel::RollingSkewnessKurtosis => "rolling_skewness_kurtosis_kernel",
             F64Kernel::SmoothTheilSen => "smooth_theil_sen_kernel",
+            // ------------------------------------------ closer 4, round 3
+            //
+            // Each of the ten is compiled into its OWN module, because its
+            // entry point was written into the `.cu` file its indicator
+            // already ships in. Five live under `moving_averages/`, but
+            // `compile_kernel` names the PTX after the file STEM, so the
+            // module is `dma_kernel`, not `moving_averages_dma_kernel`.
+            //
+            // These arms MUST stay above the `_ => NEOETHOS_F64_MODULE`
+            // catch-all below, for the reason spelled out under closer 1.
+            F64Kernel::Bandpass => "bandpass_kernel",
+            F64Kernel::BuffAverages => "buff_averages_kernel",
+            F64Kernel::CoraWave => "cora_wave_kernel",
+            F64Kernel::Dma => "dma_kernel",
+            F64Kernel::FvgTrailingStop => "fvg_trailing_stop_kernel",
+            F64Kernel::Halftrend => "halftrend_kernel",
+            F64Kernel::ModGodMode => "mod_god_mode_kernel",
+            F64Kernel::Ott => "ott_kernel",
+            F64Kernel::Otto => "otto_kernel",
+            F64Kernel::Prb => "prb_kernel",
+            // ---------------------------------------------- closer 6, round 3
+            // These arms MUST stay above the `_ => NEOETHOS_F64_MODULE`
+            // catch-all: none of these six kernels lives in
+            // `neoethos_f64_kernels.cu`, and falling through would look for
+            // the symbol in a module that does not contain it.
+            F64Kernel::ElasticVolumeWeightedMovingAverage => {
+                "elastic_volume_weighted_moving_average_kernel"
+            }
+            F64Kernel::EmaDeviationCorrectedT3 => "ema_deviation_corrected_t3_kernel",
+            F64Kernel::LogarithmicMovingAverage => "logarithmic_moving_average_kernel",
+            F64Kernel::NOrderEma => "n_order_ema_kernel",
+            F64Kernel::VolatilityAdjustedMa => "volatility_adjusted_ma_kernel",
+            F64Kernel::WaveSmoother => "wave_smoother_kernel",
+            // ------------------------------------------------ closer 3, round 3
+            F64Kernel::ReversalSignals => "reversal_signals_kernel",
+            F64Kernel::TrendFollower => "trend_follower_kernel",
+            F64Kernel::VdubusDivergenceWavePatternGenerator => {
+                "vdubus_divergence_wave_pattern_generator_kernel"
+            }
+            F64Kernel::VolatilityRatioAdaptiveRsx => "volatility_ratio_adaptive_rsx_kernel",
+            F64Kernel::VolumeEnergyReservoirs => "volume_energy_reservoirs_kernel",
+            F64Kernel::VolumeWeightedRelativeStrengthIndex => {
+                "volume_weighted_relative_strength_index_kernel"
+            }
+            F64Kernel::VolumeWeightedStochasticRsi => "volume_weighted_stochastic_rsi_kernel",
+            F64Kernel::ZigZagChannels => "zig_zag_channels_kernel",
+            F64Kernel::Alphatrend => "alphatrend_kernel",
+            F64Kernel::Avsl => "avsl_kernel",
+
+            // ------------------------------------------ closer 1, round 3
+            F64Kernel::FibonacciEntryBands => "fibonacci_entry_bands_kernel",
+            F64Kernel::GoertzelCycleCompositeWave => "goertzel_cycle_composite_wave_kernel",
+            F64Kernel::HalfCausalEstimator => "half_causal_estimator_kernel",
+            F64Kernel::IchimokuOscillator => "ichimoku_oscillator_kernel",
+            F64Kernel::InsyncIndex => "insync_index_kernel",
+            F64Kernel::LinearRegressionIntensity => "linear_regression_intensity_kernel",
+            F64Kernel::MacdWaveSignalPro => "macd_wave_signal_pro_kernel",
+            F64Kernel::MesaStochasticMultiLength => "mesa_stochastic_multi_length_kernel",
+            F64Kernel::MovingAverageCrossProbability => "moving_average_cross_probability_kernel",
+            F64Kernel::MultiLengthStochasticAverage => "multi_length_stochastic_average_kernel",
+            // ---------------------------------------------- closer 2, round 3
+            // Same rule as every block above: these arms MUST stay above the
+            // `_ => NEOETHOS_F64_MODULE` catch-all. Each of these ten entry
+            // points was written INTO the indicator's own `.cu` file, beside
+            // the bespoke-shaped f64 kernel its wrapper already loads, so
+            // falling through would look for the symbol in a module that does
+            // not contain it.
+            F64Kernel::NeighboringTrailingStop => "neighboring_trailing_stop_kernel",
+            F64Kernel::NonlinearRegressionZeroLagMovingAverage => {
+                "nonlinear_regression_zero_lag_moving_average_kernel"
+            }
+            F64Kernel::NormalizedResonator => "normalized_resonator_kernel",
+            F64Kernel::NormalizedVolumeTrueRange => "normalized_volume_true_range_kernel",
+            F64Kernel::PossibleRsi => "possible_rsi_kernel",
+            F64Kernel::PriceMovingAverageRatioPercentile => {
+                "price_moving_average_ratio_percentile_kernel"
+            }
+            F64Kernel::RangeBreakoutSignals => "range_breakout_signals_kernel",
+            F64Kernel::RangeFilteredTrendSignals => "range_filtered_trend_signals_kernel",
+            F64Kernel::RegressionSlopeOscillator => "regression_slope_oscillator_kernel",
+            F64Kernel::RelativeStrengthIndexWaveIndicator => {
+                "relative_strength_index_wave_indicator_kernel"
+            }
             _ => NEOETHOS_F64_MODULE,
 
         }
@@ -3477,6 +4368,32 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "rogers_satchell_volatility_kernel" => crate::load_cuda_embedded_module!("rogers_satchell_volatility_kernel")?,
         "rolling_skewness_kurtosis_kernel" => crate::load_cuda_embedded_module!("rolling_skewness_kurtosis_kernel")?,
         "smooth_theil_sen_kernel" => crate::load_cuda_embedded_module!("smooth_theil_sen_kernel")?,
+        // ------------------------------------------ closer 4, round 3
+        "bandpass_kernel" => crate::load_cuda_embedded_module!("bandpass_kernel")?,
+        "buff_averages_kernel" => crate::load_cuda_embedded_module!("buff_averages_kernel")?,
+        "cora_wave_kernel" => crate::load_cuda_embedded_module!("cora_wave_kernel")?,
+        "dma_kernel" => crate::load_cuda_embedded_module!("dma_kernel")?,
+        "fvg_trailing_stop_kernel" => crate::load_cuda_embedded_module!("fvg_trailing_stop_kernel")?,
+        "halftrend_kernel" => crate::load_cuda_embedded_module!("halftrend_kernel")?,
+        "mod_god_mode_kernel" => crate::load_cuda_embedded_module!("mod_god_mode_kernel")?,
+        "ott_kernel" => crate::load_cuda_embedded_module!("ott_kernel")?,
+        "otto_kernel" => crate::load_cuda_embedded_module!("otto_kernel")?,
+        "prb_kernel" => crate::load_cuda_embedded_module!("prb_kernel")?,
+        // ------------------------------------------------- closer 6, round 3
+        "elastic_volume_weighted_moving_average_kernel" => {
+            crate::load_cuda_embedded_module!("elastic_volume_weighted_moving_average_kernel")?
+        }
+        "ema_deviation_corrected_t3_kernel" => {
+            crate::load_cuda_embedded_module!("ema_deviation_corrected_t3_kernel")?
+        }
+        "logarithmic_moving_average_kernel" => {
+            crate::load_cuda_embedded_module!("logarithmic_moving_average_kernel")?
+        }
+        "n_order_ema_kernel" => crate::load_cuda_embedded_module!("n_order_ema_kernel")?,
+        "volatility_adjusted_ma_kernel" => {
+            crate::load_cuda_embedded_module!("volatility_adjusted_ma_kernel")?
+        }
+        "wave_smoother_kernel" => crate::load_cuda_embedded_module!("wave_smoother_kernel")?,
         // --------------------------------------------------- closer 5, round 2
         "smoothed_gaussian_trend_filter_kernel" => crate::load_cuda_embedded_module!("smoothed_gaussian_trend_filter_kernel")?,
         "spearman_correlation_kernel" => crate::load_cuda_embedded_module!("spearman_correlation_kernel")?,
@@ -3496,6 +4413,109 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "vwap_deviation_oscillator_kernel" => crate::load_cuda_embedded_module!("vwap_deviation_oscillator_kernel")?,
         "vwap_zscore_with_signals_kernel" => crate::load_cuda_embedded_module!("vwap_zscore_with_signals_kernel")?,
         "adosc_kernel" => crate::load_cuda_embedded_module!("adosc_kernel")?,
+        // ---------------------------------------------- closer 5, round 3
+        "rsmk_kernel" => crate::load_cuda_embedded_module!("rsmk_kernel")?,
+        "squeeze_momentum_kernel" => crate::load_cuda_embedded_module!("squeeze_momentum_kernel")?,
+        "uma_kernel" => crate::load_cuda_embedded_module!("uma_kernel")?,
+        "lpc_kernel" => crate::load_cuda_embedded_module!("lpc_kernel")?,
+        "mab_kernel" => crate::load_cuda_embedded_module!("mab_kernel")?,
+        "macz_kernel" => crate::load_cuda_embedded_module!("macz_kernel")?,
+        "vwmacd_kernel" => crate::load_cuda_embedded_module!("vwmacd_kernel")?,
+        "corrected_moving_average_kernel" => crate::load_cuda_embedded_module!("corrected_moving_average_kernel")?,
+        "ehlers_undersampled_double_moving_average_kernel" => crate::load_cuda_embedded_module!("ehlers_undersampled_double_moving_average_kernel")?,
+        // ---------------------------------------------- closer 3, round 3
+        "reversal_signals_kernel" => {
+            crate::load_cuda_embedded_module!("reversal_signals_kernel")?
+        }
+        "trend_follower_kernel" => {
+            crate::load_cuda_embedded_module!("trend_follower_kernel")?
+        }
+        "vdubus_divergence_wave_pattern_generator_kernel" => {
+            crate::load_cuda_embedded_module!("vdubus_divergence_wave_pattern_generator_kernel")?
+        }
+        "volatility_ratio_adaptive_rsx_kernel" => {
+            crate::load_cuda_embedded_module!("volatility_ratio_adaptive_rsx_kernel")?
+        }
+        "volume_energy_reservoirs_kernel" => {
+            crate::load_cuda_embedded_module!("volume_energy_reservoirs_kernel")?
+        }
+        "volume_weighted_relative_strength_index_kernel" => {
+            crate::load_cuda_embedded_module!("volume_weighted_relative_strength_index_kernel")?
+        }
+        "volume_weighted_stochastic_rsi_kernel" => {
+            crate::load_cuda_embedded_module!("volume_weighted_stochastic_rsi_kernel")?
+        }
+        "zig_zag_channels_kernel" => {
+            crate::load_cuda_embedded_module!("zig_zag_channels_kernel")?
+        }
+        "alphatrend_kernel" => {
+            crate::load_cuda_embedded_module!("alphatrend_kernel")?
+        }
+        "avsl_kernel" => {
+            crate::load_cuda_embedded_module!("avsl_kernel")?
+        }
+        // ---------------------------------------------------- closer 2, round 3
+        "neighboring_trailing_stop_kernel" => {
+            crate::load_cuda_embedded_module!("neighboring_trailing_stop_kernel")?
+        }
+        "nonlinear_regression_zero_lag_moving_average_kernel" => {
+            crate::load_cuda_embedded_module!("nonlinear_regression_zero_lag_moving_average_kernel")?
+        }
+        "normalized_resonator_kernel" => {
+            crate::load_cuda_embedded_module!("normalized_resonator_kernel")?
+        }
+        "normalized_volume_true_range_kernel" => {
+            crate::load_cuda_embedded_module!("normalized_volume_true_range_kernel")?
+        }
+        "possible_rsi_kernel" => {
+            crate::load_cuda_embedded_module!("possible_rsi_kernel")?
+        }
+        "price_moving_average_ratio_percentile_kernel" => {
+            crate::load_cuda_embedded_module!("price_moving_average_ratio_percentile_kernel")?
+        }
+        "range_breakout_signals_kernel" => {
+            crate::load_cuda_embedded_module!("range_breakout_signals_kernel")?
+        }
+        "range_filtered_trend_signals_kernel" => {
+            crate::load_cuda_embedded_module!("range_filtered_trend_signals_kernel")?
+        }
+        "regression_slope_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("regression_slope_oscillator_kernel")?
+        }
+        "relative_strength_index_wave_indicator_kernel" => {
+            crate::load_cuda_embedded_module!("relative_strength_index_wave_indicator_kernel")?
+        }
+        // ---------------------------------------------------- closer 1, round 3
+        "fibonacci_entry_bands_kernel" => {
+            crate::load_cuda_embedded_module!("fibonacci_entry_bands_kernel")?
+        }
+        "goertzel_cycle_composite_wave_kernel" => {
+            crate::load_cuda_embedded_module!("goertzel_cycle_composite_wave_kernel")?
+        }
+        "half_causal_estimator_kernel" => {
+            crate::load_cuda_embedded_module!("half_causal_estimator_kernel")?
+        }
+        "ichimoku_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("ichimoku_oscillator_kernel")?
+        }
+        "insync_index_kernel" => {
+            crate::load_cuda_embedded_module!("insync_index_kernel")?
+        }
+        "linear_regression_intensity_kernel" => {
+            crate::load_cuda_embedded_module!("linear_regression_intensity_kernel")?
+        }
+        "macd_wave_signal_pro_kernel" => {
+            crate::load_cuda_embedded_module!("macd_wave_signal_pro_kernel")?
+        }
+        "mesa_stochastic_multi_length_kernel" => {
+            crate::load_cuda_embedded_module!("mesa_stochastic_multi_length_kernel")?
+        }
+        "moving_average_cross_probability_kernel" => {
+            crate::load_cuda_embedded_module!("moving_average_cross_probability_kernel")?
+        }
+        "multi_length_stochastic_average_kernel" => {
+            crate::load_cuda_embedded_module!("multi_length_stochastic_average_kernel")?
+        }
         other => {
             return Err(CudaF64IndicatorError::InvalidInput {
                 indicator: "<module>",
@@ -4364,7 +5384,7 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), before, "two variants share an indicator id");
         assert_eq!(
-            before, 282,
+            before, 338,
             "F64Kernel::ALL has {before} entries. If a variant was added to the enum, add it here \
              too — otherwise entry_points_are_f64_and_unique silently stops covering it."
         );
@@ -4396,6 +5416,27 @@ mod tests {
         // backwards.
         assert_eq!(EHMA_MAX_PERIOD, 512);
         assert_eq!(F64Kernel::Ehma.max_period(), Some(EHMA_MAX_PERIOD));
+        // closer 6, round 3: two weight vectors built once per thread rather
+        // than per bar -- `logarithmic_moving_average`'s logarithmic weights
+        // and `wave_smoother`'s sin/cos wave weights. The .cu `#define` and the
+        // constant here must agree exactly; `wave_smoother`'s array is
+        // `WS_MAX_PERIOD + 1` long because its window is `period + 1`.
+        assert_eq!(LMA_MAX_PERIOD, 512);
+        assert_eq!(WS_MAX_PERIOD, 512);
+        assert_eq!(
+            F64Kernel::LogarithmicMovingAverage.max_period(),
+            Some(LMA_MAX_PERIOD)
+        );
+        assert_eq!(F64Kernel::WaveSmoother.max_period(), Some(WS_MAX_PERIOD));
+        // closer 4, round 3: cora_wave's smoothing ring and dma's difference
+        // ring are both `round(sqrt(period))` deep, so ONE 64-entry array
+        // admits every period up to 4160 -- `round(sqrt(4160))` is 64 and
+        // `round(sqrt(4161))` is 65. The two share the number for that reason
+        // and not by coincidence.
+        assert_eq!(CORA_WAVE_MAX_PERIOD, 4160);
+        assert_eq!(DMA_MAX_PERIOD, 4160);
+        assert_eq!(F64Kernel::CoraWave.max_period(), Some(CORA_WAVE_MAX_PERIOD));
+        assert_eq!(F64Kernel::Dma.max_period(), Some(DMA_MAX_PERIOD));
         // Every declared bound must be one of the three constants above. A
         // kernel that invents its own number would compile and then overrun a
         // local array for periods between the two values.
@@ -4409,7 +5450,11 @@ mod tests {
                         || m == HMA_MAX_PERIOD
                         || m == EDCF_MAX_PERIOD
                         || m == ALMA_MAX_PERIOD
-                        || m == EHMA_MAX_PERIOD,
+                        || m == EHMA_MAX_PERIOD
+                        || m == LMA_MAX_PERIOD
+                        || m == WS_MAX_PERIOD
+                        || m == CORA_WAVE_MAX_PERIOD
+                        || m == DMA_MAX_PERIOD,
                     "{}: period bound {m} is not one of the stated ring constants",
                     k.indicator_id()
                 );

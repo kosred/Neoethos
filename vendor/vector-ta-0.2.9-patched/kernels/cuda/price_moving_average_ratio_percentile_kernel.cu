@@ -512,3 +512,232 @@ extern "C" __global__ void price_moving_average_ratio_percentile_batch_f64(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 2, round 3
+//
+// WHY A SECOND ENTRY POINT
+//
+// price_moving_average_ratio_percentile_batch_f64 above is genuine
+// double-in/double-out, but it takes 19 parameters and writes SEVEN output
+// matrices plus six caller-allocated ring matrices. The f64 lane launches one
+// shape -- (price, volume, n, periods, n_combos, first_valid, out) -- and
+// allocates ONE output matrix, so that entry point cannot be reached from it.
+//
+// CPU REFERENCE
+//   src/indicators/price_moving_average_ratio_percentile.rs:715
+//     price_moving_average_ratio_percentile -> :629 compute_core
+//   compute_ma_series      :457  (ma_type Sma -> sma_into_slice)
+//   sma_into_slice         src/indicators/moving_averages/sma.rs:235
+//   sma_scalar             src/indicators/moving_averages/sma.rs:317
+//   compute_pmarp_percentile :601
+//   insert_pmar_window / remove_pmar_window :578 / :588
+//
+// THE COLUMN THIS EMITS is plotline, which is what output_id == "value"
+// resolves to (cpu_batch.rs -- "plotline" || "value").
+//
+// PINNED CPU DEFAULTS (compute_price_moving_average_ratio_percentile_batch):
+// source "close", ma_length 20, ma_type "sma", pmarp_lookback 350,
+// line_mode "pmar".
+//
+// WHERE THE ORDER STATISTIC WENT -- read this before concluding it was skipped.
+// compute_core :707-710 is a two-arm match on line_mode: in Pmar mode
+// `plotline_out.copy_from_slice(pmar_out)`, in Pmarp mode it copies pmarp_out.
+// The percentile rank feeds pmarp, and the CPU DEFAULT for line_mode is "pmar",
+// so on the lane's pinned parameters `plotline == pmar` and the percentile is
+// not on the path to the emitted column. It is implemented below anyway, under
+// PMARP_NEO_LINE_MODE, as a per-thread incremental sorted window over the
+// 350-bar lookback -- so flipping the pin gives a correct kernel rather than a
+// wrong one, and the order statistic is present rather than asserted to be
+// impossible.
+//
+// PERIOD-INVARIANT. The batch reads source, ma_length, ma_type,
+// pmarp_lookback, signal_ma_length, signal_ma_type and line_mode, and NEVER
+// `period`, so five swept periods give five identical CPU columns and five
+// identical kernel rows.
+//
+// SHAPE: one thread per combo, bars ascending. Sequential: the SMA is a running
+// window sum carried from `first` (sma.rs:340-343, NOT recomputed per bar, so
+// its rounding is path-dependent), and the percentile window is incremental.
+//
+// FIRST IS THE CPU'S OWN, NOT THE LANE'S. sma_prepare (sma.rs:274-277) takes
+// `position(|x| !x.is_nan())` -- which ACCEPTS an infinity -- and the running
+// sum then carries any interior NaN forward forever, which is the CPU's
+// behaviour and is reproduced exactly. The lane row therefore declares
+// F64FirstValidRule::Ignored: this kernel derives its own start index.
+//
+// VOLUME IS BOUND AND UNREAD. compute_ma_series passes volume only to the Vwma
+// arm (:457-462); with ma_type Sma it is never read. The pointer is taken so
+// the lane's (price, volume) arm cannot hand this kernel one series where it
+// asked for two.
+//
+// f64 END TO END: double literals, no f32-suffixed math function, no fast-math
+// intrinsic. The only epsilon in the CPU path is the literal 1e-12 at :562/:569
+// inside scaled_pmar_value, which serves the scaled_pmar column and not this
+// one, so no epsilon appears below.
+// ---------------------------------------------------------------------------
+
+#define PMARP_NEO_MA_LENGTH 20
+#define PMARP_NEO_LOOKBACK 350
+#define PMARP_NEO_LINE_MODE LINE_PMAR
+
+__device__ __forceinline__ double pmarp_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void price_moving_average_ratio_percentile_neo_batch_f64(
+    const double* __restrict__ price,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+    (void)volume;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    const double qnan = pmarp_neo_qnan();
+    for (int i = 0; i < n; ++i) {
+        row[i] = qnan;
+    }
+
+    const int ma_length = PMARP_NEO_MA_LENGTH;
+    if (ma_length > n) {
+        return;   // sma_prepare's InvalidPeriod -> the CPU errors, row stays NaN
+    }
+
+    // sma_prepare (sma.rs:274-283).
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(price[i])) {
+            first = i;
+            break;
+        }
+    }
+    if (first < 0 || n - first < ma_length) {
+        return;
+    }
+
+    // sma_scalar (sma.rs:332-343): seed the window sum over [first, first+period)
+    // and then roll it. `inv` is formed once and multiplied, NOT divided per bar.
+    double sum = 0.0;
+    for (int k = 0; k < ma_length; ++k) {
+        sum += price[first + k];
+    }
+    const double inv = 1.0 / static_cast<double>(ma_length);
+
+    // The 350-deep incremental percentile window (compute_pmarp_percentile
+    // :601-627). Sized at the CPU default, which is the compiled bound.
+    double sorted[PMARP_NEO_LOOKBACK];
+    int sorted_len = 0;
+    int invalid_count = 0;
+
+    double pmar_hist[PMARP_NEO_LOOKBACK];   // the values the window will evict
+    int hist_pos = 0;
+
+    for (int i = 0; i < n; ++i) {
+        // ---- ma[i] ------------------------------------------------------
+        double ma = qnan;
+        if (i == first + ma_length - 1) {
+            ma = sum * inv;
+        } else if (i >= first + ma_length) {
+            sum += price[i] - price[i - ma_length];
+            ma = sum * inv;
+        }
+
+        // ---- pmar[i] (compute_core :663-670) -----------------------------
+        double pmar = qnan;
+        const double p = price[i];
+        if (isfinite(p) && isfinite(ma) && ma != 0.0) {
+            pmar = p / ma;
+        }
+
+        // ---- pmarp[i] (compute_pmarp_percentile :607-616) -----------------
+        //
+        // Read BEFORE this bar joins the window: the window holds indices
+        // [i - lookback, i - 1] at this point, which is why `lookback` below is
+        // min(i, 350) and not the window's capacity.
+        double pmarp = qnan;
+        if (i >= ma_length) {
+            const double current = fabs(pmar);
+            const int lookback = (i < PMARP_NEO_LOOKBACK) ? i : PMARP_NEO_LOOKBACK;
+            if (isfinite(current) && lookback != 0) {
+                // partition_point(|v| *v <= current) -- the count of window
+                // values NOT GREATER than `current`.
+                int lo = 0;
+                int hi = sorted_len;
+                while (lo < hi) {
+                    const int mid = lo + ((hi - lo) >> 1);
+                    if (sorted[mid] <= current) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                pmarp = (static_cast<double>(lo + invalid_count) /
+                         static_cast<double>(lookback)) *
+                        100.0;
+            }
+        }
+
+        // ---- window maintenance (:617-624) --------------------------------
+        if (i >= PMARP_NEO_LOOKBACK) {
+            const double leaving = fabs(pmar_hist[hist_pos]);
+            if (isfinite(leaving)) {
+                int lo = 0;
+                int hi = sorted_len;
+                while (lo < hi) {
+                    const int mid = lo + ((hi - lo) >> 1);
+                    if (sorted[mid] < leaving) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                for (int k = lo; k + 1 < sorted_len; ++k) {
+                    sorted[k] = sorted[k + 1];
+                }
+                sorted_len -= 1;
+            } else {
+                invalid_count -= 1;
+            }
+        }
+        {
+            const double entering = fabs(pmar);
+            if (isfinite(entering)) {
+                int lo = 0;
+                int hi = sorted_len;
+                while (lo < hi) {
+                    const int mid = lo + ((hi - lo) >> 1);
+                    if (sorted[mid] < entering) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                for (int k = sorted_len; k > lo; --k) {
+                    sorted[k] = sorted[k - 1];
+                }
+                sorted[lo] = entering;
+                sorted_len += 1;
+            } else {
+                invalid_count += 1;
+            }
+        }
+        pmar_hist[hist_pos] = pmar;
+        hist_pos += 1;
+        if (hist_pos == PMARP_NEO_LOOKBACK) {
+            hist_pos = 0;
+        }
+
+        // ---- plotline (:707-710) ------------------------------------------
+        row[i] = (PMARP_NEO_LINE_MODE == LINE_PMARP) ? pmarp : pmar;
+    }
+}

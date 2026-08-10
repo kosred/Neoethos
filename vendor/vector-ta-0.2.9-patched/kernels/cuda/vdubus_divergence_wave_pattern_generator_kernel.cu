@@ -546,3 +546,389 @@ extern "C" __global__ void vdubus_divergence_wave_pattern_generator_batch_f64(
         }
     }
 }
+
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 3, round 3
+ *
+ * CPU REFERENCE: src/indicators/vdubus_divergence_wave_pattern_generator.rs
+ *   `VdubusDivergenceWavePatternGeneratorState::update` (:1280-1317), reached
+ *   from `compute_row` (:1715-1885), built out of `EmaState::update` (:809),
+ *   `MacdState::update` (:857), `PivotDetector::update` (:896-945),
+ *   `MomentumState` (:952-1030) and `StructureEngine` (:1096-1246).
+ *
+ * WHICH COLUMN: `fast_standard`, output index 0 of
+ *   `OUTPUTS_VDUBUS_DIVERGENCE_WAVE_PATTERN_GENERATOR` (registry.rs:1240).
+ *   THE CPU BATCH CANNOT ANSWER "value" AT ALL, and that is a defect in the
+ *   dispatcher rather than a choice made here: `compute_..._batch`
+ *   (cpu_batch.rs:5095) calls `expect_value_output` (:5099), which admits ONLY
+ *   the literal "value" (:17248), and then matches `output_id` against twelve
+ *   arms (:5240-5252) NONE of which is "value" -- so every request falls
+ *   through to `UnknownOutput`. A parity run must therefore ask the CPU for
+ *   "fast_standard" explicitly; this kernel emits that column, which is what
+ *   "value" resolves to under the registry's ordering.
+ *
+ * WHY A SECOND ENTRY POINT: `vdubus_divergence_wave_pattern_generator_batch_f64`
+ *   (:252) takes 37 parameters -- the widest signature in the crate -- and
+ *   emits twelve series. The lane launches
+ *   (high, low, close, n, periods, n_combos, first_valid, out).
+ *
+ * INPUT: high / low / close -- extract_ohlc_input (cpu_batch.rs:5100) --
+ *   F64InputKind::Hlc.
+ *
+ * WHY THE SLOW ENGINE IS ABSENT: `slow_engine` (:1300) feeds ONLY the four
+ *   `slow_*` outputs; it shares no state with `fast_engine`, with the MACD or
+ *   with the momentum tracker, and `MomentumState` is passed to it by
+ *   SHARED REFERENCE (`&self.momentum`), so it cannot mutate anything the
+ *   fast column reads. Omitting it is exact for this column, not an
+ *   approximation. `opposing_force` (:1010) is absent for the same reason.
+ *
+ * FIRST-VALID IGNORED: `compute_row` walks EVERY bar from 0 and `update`
+ *   (:1286) RESETS the whole machine -- both EMAs, the signal EMA, both pivot
+ *   ring buffers and every wave list -- on any non-finite bar. A global
+ *   first-valid index would be wrong after the first hole.
+ *
+ * PERIOD-INVARIANT: the CPU batch reads sixteen NAMED parameters
+ *   (cpu_batch.rs:5109-5209) -- `fast_depth`, `slow_depth`, `fast_length`,
+ *   `slow_length`, `signal_length`, `lookback`, `err_tol` and nine `show_*`
+ *   booleans -- and never `period`. All are pinned at the CPU defaults, so
+ *   every row of a sweep is byte-identical.
+ *
+ * SHAPE: ONE THREAD PER COLUMN, bars ascending. Three EMA recurrences, two
+ *   fixed-span pivot ring buffers and two front-pushed pivot lists all carry
+ *   across bars.
+ *
+ * THE SHORT-CIRCUIT THAT IS EASY TO MISS: `MacdState::update` (:857) is
+ *     let fast = self.fast.update(close)?;
+ *     let slow = self.slow.update(close)?;
+ *   -- Rust `?` RETURNS EARLY, so on every bar before the FAST ema is seeded
+ *   the SLOW ema is never updated at all. Its warm-up therefore does not start
+ *   at bar 0; it starts at the bar the fast ema first emits. Writing the two
+ *   updates unconditionally would seed the slow ema 21 bars early and shift
+ *   the whole MACD. The same applies to the signal ema.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the EMA seed is `sum / length` after exactly `length` FINITE updates
+ *     (:818); the step is `alpha.mul_add(value, (1 - alpha) * prev)` (:825) --
+ *     a fused multiply-add whose addend is itself a product, TWO roundings.
+ *     `fma` is used for exactly that shape.
+ *   * the pivot test is STRICT on both sides -- `center <= current` rejects
+ *     for a high, `center >= current` rejects for a low (:934, :939) -- so a
+ *     plateau is never a pivot.
+ *   * `harmonic_family_code` (:1046) compares `|ratio - k| < err_tol` with
+ *     err_tol 0.15, a MODEL TOLERANCE from the CPU parameter list, not a
+ *     floating-point epsilon: it is not rescaled and must not be.
+ *   * `xb_ratio` and `xd_ratio` fall back to 0.0 when `xa_len` is EXACTLY
+ *     zero (:1155-1160) -- an exact test, not a tolerance.
+ *
+ * EPSILON: there is no floating-point epsilon on this path. `err_tol` is a
+ *   harmonic-pattern tolerance in ratio units and is carried across unchanged.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* cpu_batch.rs:5109-5209 */
+#define NEO_VD_FAST_DEPTH    9
+#define NEO_VD_FAST_LENGTH   21
+#define NEO_VD_SLOW_LENGTH   34
+#define NEO_VD_SIGNAL_LENGTH 5
+#define NEO_VD_LOOKBACK      3
+#define NEO_VD_ERR_TOL       0.15
+#define NEO_VD_SHOW_STANDARD  1
+#define NEO_VD_SHOW_CLIMAX    1
+#define NEO_VD_SHOW_ROUNDED   1
+#define NEO_VD_SHOW_PREDATOR  1
+#define NEO_VD_SHOW_GARTLEY   0
+#define NEO_VD_SHOW_BAT       0
+#define NEO_VD_SHOW_BUTTERFLY 0
+#define NEO_VD_SHOW_CRAB      0
+#define NEO_VD_SHOW_DEEP      0
+#define NEO_VD_SHOW_HS        1
+
+/* :118-125 */
+#define NEO_VD_FAMILY_NONE           0.0
+#define NEO_VD_FAMILY_RETRACEMENT    1.0
+#define NEO_VD_FAMILY_GARTLEY        2.0
+#define NEO_VD_FAMILY_BAT            3.0
+#define NEO_VD_FAMILY_BUTTERFLY      4.0
+#define NEO_VD_FAMILY_CRAB           5.0
+#define NEO_VD_FAMILY_DEEP           6.0
+#define NEO_VD_FAMILY_HEAD_SHOULDERS 7.0
+
+#define NEO_VD_MOM_SPAN   NEO_VD_LOOKBACK
+#define NEO_VD_MOM_WIN    (2 * NEO_VD_MOM_SPAN + 1)
+#define NEO_VD_FAST_SPAN  NEO_VD_FAST_DEPTH
+#define NEO_VD_FAST_WIN   (2 * NEO_VD_FAST_SPAN + 1)
+/* push_front_cap (:945) keeps at most ten entries. */
+#define NEO_VD_LIST_CAP   10
+
+/* PivotDetector::update (:896). Returns true and writes the centre when the
+ * middle of the ring is a strict extremum of the whole span. */
+__device__ __forceinline__ bool neo_vd_pivot(double* __restrict__ win,
+                                             int wlen,
+                                             int span,
+                                             int* head,
+                                             int* count,
+                                             bool is_high,
+                                             double value,
+                                             double* centre_out)
+{
+    if (!isfinite(value)) {
+        *head = 0; *count = 0;
+        for (int k = 0; k < wlen; ++k) win[k] = NEO_F64_NAN;
+        return false;
+    }
+
+    win[*head] = value;
+    *head += 1; if (*head == wlen) *head = 0;
+    if (*count < wlen) *count += 1;
+    if (*count < wlen) return false;
+
+    const int start = *head;
+    const double centre = win[(start + span) % wlen];
+    if (!isfinite(centre)) return false;
+
+    for (int j = 0; j < wlen; ++j) {
+        if (j == span) continue;
+        const double cur = win[(start + j) % wlen];
+        if (!isfinite(cur)) return false;
+        if (is_high) { if (centre <= cur) return false; }
+        else         { if (centre >= cur) return false; }
+    }
+    *centre_out = centre;
+    return true;
+}
+
+/* push_front_cap (:945) -- insert at the front, drop the eleventh. */
+__device__ __forceinline__ void neo_vd_push_front(double* __restrict__ arr, int* cnt, double v)
+{
+    const int lim = (*cnt < NEO_VD_LIST_CAP) ? *cnt : (NEO_VD_LIST_CAP - 1);
+    for (int k = lim; k >= 1; --k) arr[k] = arr[k - 1];
+    arr[0] = v;
+    if (*cnt < NEO_VD_LIST_CAP) *cnt += 1;
+}
+
+/* harmonic_family_code (:1046) */
+__device__ __forceinline__ double neo_vd_family_code(double xb, double xd, double tol)
+{
+    if (fabs(xb - 0.618) < tol && fabs(xd - 0.786) < tol) return NEO_VD_FAMILY_GARTLEY;
+    if (xb >= 0.382 - tol && xb <= 0.5 + tol && fabs(xd - 0.886) < tol) return NEO_VD_FAMILY_BAT;
+    if (fabs(xb - 0.786) < tol && xd >= 1.27 - tol && xd <= 1.618 + tol) return NEO_VD_FAMILY_BUTTERFLY;
+    if (xb >= 0.382 - tol && xb <= 0.618 + tol && fabs(xd - 1.618) < tol) return NEO_VD_FAMILY_CRAB;
+    if (xd > 1.0) return NEO_VD_FAMILY_DEEP;
+    return NEO_VD_FAMILY_RETRACEMENT;
+}
+
+/* standard_family_from_filters (:1071) with the default show_* flags. */
+__device__ __forceinline__ double neo_vd_family_filter(double family, bool is_hs)
+{
+    if (is_hs) {
+#if NEO_VD_SHOW_HS
+        return NEO_VD_FAMILY_HEAD_SHOULDERS;
+#else
+        return NEO_VD_FAMILY_NONE;
+#endif
+    }
+    const int f = (int)family;
+    if (f == 1) return NEO_VD_FAMILY_RETRACEMENT;
+#if NEO_VD_SHOW_GARTLEY
+    if (f == 2) return NEO_VD_FAMILY_GARTLEY;
+#endif
+#if NEO_VD_SHOW_BAT
+    if (f == 3) return NEO_VD_FAMILY_BAT;
+#endif
+#if NEO_VD_SHOW_BUTTERFLY
+    if (f == 4) return NEO_VD_FAMILY_BUTTERFLY;
+#endif
+#if NEO_VD_SHOW_CRAB
+    if (f == 5) return NEO_VD_FAMILY_CRAB;
+#endif
+#if NEO_VD_SHOW_DEEP
+    if (f == 6) return NEO_VD_FAMILY_DEEP;
+#endif
+    return NEO_VD_FAMILY_NONE;
+}
+
+extern "C" __global__
+void vdubus_divergence_wave_pattern_generator_neo_batch_f64(const double* __restrict__ high,
+                                                            const double* __restrict__ low,
+                                                            const double* __restrict__ close,
+                                                            int n,
+                                                            const int* __restrict__ periods,
+                                                            int n_combos,
+                                                            int first_valid,
+                                                            double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant -- see header */
+    (void)first_valid; /* handled in place -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const double err_tol = NEO_VD_ERR_TOL;
+
+    /* Three EmaState instances (:779-786). */
+    const double a_fast = 2.0 / ((double)NEO_VD_FAST_LENGTH   + 1.0);
+    const double a_slow = 2.0 / ((double)NEO_VD_SLOW_LENGTH   + 1.0);
+    const double a_sig  = 2.0 / ((double)NEO_VD_SIGNAL_LENGTH + 1.0);
+    int    c_fast = 0, c_slow = 0, c_sig = 0;
+    double s_fast = 0.0, s_slow = 0.0, s_sig = 0.0;   /* seed sums */
+    double v_fast = 0.0, v_slow = 0.0, v_sig = 0.0;   /* levels */
+    bool   b_fast = false, b_slow = false, b_sig = false;
+
+    /* MomentumState (:958) */
+    double mom_hi_win[NEO_VD_MOM_WIN], mom_lo_win[NEO_VD_MOM_WIN];
+    for (int k = 0; k < NEO_VD_MOM_WIN; ++k) { mom_hi_win[k] = NEO_F64_NAN; mom_lo_win[k] = NEO_F64_NAN; }
+    int mom_hi_head = 0, mom_hi_count = 0, mom_lo_head = 0, mom_lo_count = 0;
+    double wave_highs[NEO_VD_LIST_CAP], wave_lows[NEO_VD_LIST_CAP];
+    int wave_highs_n = 0, wave_lows_n = 0;
+
+    /* StructureEngine, FAST only (:1103) */
+    double f_hi_win[NEO_VD_FAST_WIN], f_lo_win[NEO_VD_FAST_WIN];
+    for (int k = 0; k < NEO_VD_FAST_WIN; ++k) { f_hi_win[k] = NEO_F64_NAN; f_lo_win[k] = NEO_F64_NAN; }
+    int f_hi_head = 0, f_hi_count = 0, f_lo_head = 0, f_lo_count = 0;
+    double pivots[NEO_VD_LIST_CAP];
+    int pivots_n = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i], l = low[i], c = close[i];
+
+        if (!(isfinite(h) && isfinite(l) && isfinite(c))) {
+            /* State::reset (:1272) -- everything at once. */
+            c_fast = c_slow = c_sig = 0;
+            s_fast = s_slow = s_sig = 0.0;
+            v_fast = v_slow = v_sig = 0.0;
+            b_fast = b_slow = b_sig = false;
+            mom_hi_head = mom_hi_count = mom_lo_head = mom_lo_count = 0;
+            for (int k = 0; k < NEO_VD_MOM_WIN; ++k) { mom_hi_win[k] = NEO_F64_NAN; mom_lo_win[k] = NEO_F64_NAN; }
+            wave_highs_n = 0; wave_lows_n = 0;
+            f_hi_head = f_hi_count = f_lo_head = f_lo_count = 0;
+            for (int k = 0; k < NEO_VD_FAST_WIN; ++k) { f_hi_win[k] = NEO_F64_NAN; f_lo_win[k] = NEO_F64_NAN; }
+            pivots_n = 0;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        /* ---- MacdState::update (:857). The `?` SHORT-CIRCUITS -- see the
+         * header. `close` is finite here, so the EmaState non-finite arm
+         * cannot fire; the guard that matters is the seeding count. ---- */
+        bool   macd_ready = false;
+        double hist = 0.0;
+
+        bool fast_ok = false;
+        if (!b_fast) {
+            s_fast += c; c_fast += 1;
+            if (c_fast == NEO_VD_FAST_LENGTH) { v_fast = s_fast / (double)NEO_VD_FAST_LENGTH; b_fast = true; fast_ok = true; }
+        } else {
+            v_fast = fma(a_fast, c, (1.0 - a_fast) * v_fast);
+            fast_ok = true;
+        }
+
+        if (fast_ok) {
+            bool slow_ok = false;
+            if (!b_slow) {
+                s_slow += c; c_slow += 1;
+                if (c_slow == NEO_VD_SLOW_LENGTH) { v_slow = s_slow / (double)NEO_VD_SLOW_LENGTH; b_slow = true; slow_ok = true; }
+            } else {
+                v_slow = fma(a_slow, c, (1.0 - a_slow) * v_slow);
+                slow_ok = true;
+            }
+
+            if (slow_ok) {
+                const double macd = v_fast - v_slow;
+                bool sig_ok = false;
+                if (!b_sig) {
+                    s_sig += macd; c_sig += 1;
+                    if (c_sig == NEO_VD_SIGNAL_LENGTH) { v_sig = s_sig / (double)NEO_VD_SIGNAL_LENGTH; b_sig = true; sig_ok = true; }
+                } else {
+                    v_sig = fma(a_sig, macd, (1.0 - a_sig) * v_sig);
+                    sig_ok = true;
+                }
+                if (sig_ok) { macd_ready = true; hist = macd - v_sig; }
+            }
+        }
+
+        /* ---- MomentumState::update (:1000), only when the MACD emitted ---- */
+        if (macd_ready) {
+            double piv;
+            if (neo_vd_pivot(mom_hi_win, NEO_VD_MOM_WIN, NEO_VD_MOM_SPAN,
+                             &mom_hi_head, &mom_hi_count, true, hist, &piv)) {
+                neo_vd_push_front(wave_highs, &wave_highs_n, piv);
+            }
+            if (neo_vd_pivot(mom_lo_win, NEO_VD_MOM_WIN, NEO_VD_MOM_SPAN,
+                             &mom_lo_head, &mom_lo_count, false, hist, &piv)) {
+                neo_vd_push_front(wave_lows, &wave_lows_n, piv);
+            }
+        }
+
+        /* ---- StructureEngine::update (:1229), fast engine ---- */
+        double fast_standard = 0.0;   /* EngineSignals::default (:1090) */
+        {
+            double piv;
+            const bool hi_fired = neo_vd_pivot(f_hi_win, NEO_VD_FAST_WIN, NEO_VD_FAST_SPAN,
+                                               &f_hi_head, &f_hi_count, true, h, &piv);
+            if (hi_fired) {
+                neo_vd_push_front(pivots, &pivots_n, piv);
+                /* evaluate_bearish (:1113) */
+                fast_standard = 0.0;
+                if (pivots_n >= 5) {
+                    const double y_d = pivots[0], y_b = pivots[2], y_a = pivots[3], y_x = pivots[4];
+                    const double xa_len = fabs(y_a - y_x);
+                    const double ab_len = fabs(y_b - y_a);
+                    const double xb = (xa_len != 0.0) ? (ab_len / xa_len) : 0.0;
+                    const double xd = (xa_len != 0.0) ? (fabs(y_d - y_x) / xa_len) : 0.0;
+                    const double raw = neo_vd_family_code(xb, xd, err_tol);
+                    const bool is_hs = (NEO_VD_SHOW_HS != 0) && (y_b > y_x) && (y_b > y_d);
+                    /* standard_bearish (:1015) */
+                    const bool std_mom = (wave_highs_n >= 3)
+                                      && (wave_highs[1] < wave_highs[2])
+                                      && (wave_highs[0] <= wave_highs[1]);
+#if NEO_VD_SHOW_STANDARD
+                    if (std_mom) {
+                        const double fam = neo_vd_family_filter(raw, is_hs);
+                        if (fam != NEO_VD_FAMILY_NONE) fast_standard = -fam;
+                    }
+#endif
+                }
+            }
+
+            double piv2;
+            const bool lo_fired = neo_vd_pivot(f_lo_win, NEO_VD_FAST_WIN, NEO_VD_FAST_SPAN,
+                                               &f_lo_head, &f_lo_count, false, l, &piv2);
+            if (lo_fired) {
+                neo_vd_push_front(pivots, &pivots_n, piv2);
+                /* evaluate_bullish (:1170) -- OVERWRITES the bearish result
+                 * when both detectors fire on the same bar (:1234-1240). */
+                fast_standard = 0.0;
+                if (pivots_n >= 5) {
+                    const double y_d = pivots[0], y_b = pivots[2], y_a = pivots[3], y_x = pivots[4];
+                    const double xa_len = fabs(y_a - y_x);
+                    const double ab_len = fabs(y_b - y_a);
+                    const double xb = (xa_len != 0.0) ? (ab_len / xa_len) : 0.0;
+                    const double xd = (xa_len != 0.0) ? (fabs(y_d - y_x) / xa_len) : 0.0;
+                    const double raw = neo_vd_family_code(xb, xd, err_tol);
+                    const bool is_inv_hs = (NEO_VD_SHOW_HS != 0) && (y_b < y_x) && (y_b < y_d);
+                    /* standard_bullish (:1023) */
+                    const bool std_mom = (wave_lows_n >= 3)
+                                      && (wave_lows[1] > wave_lows[2])
+                                      && (wave_lows[0] >= wave_lows[1]);
+#if NEO_VD_SHOW_STANDARD
+                    if (std_mom) {
+                        const double fam = neo_vd_family_filter(raw, is_inv_hs);
+                        if (fam != NEO_VD_FAMILY_NONE) fast_standard = fam;
+                    }
+#endif
+                }
+            }
+        }
+
+        /* `let (macd, signal, hist) = macd_out?;` (:1303) -- the whole row is
+         * None, and therefore NaN, on a bar where the MACD has not emitted,
+         * EVEN THOUGH the engines above already advanced their state. */
+        o[i] = macd_ready ? fast_standard : NEO_F64_NAN;
+    }
+}

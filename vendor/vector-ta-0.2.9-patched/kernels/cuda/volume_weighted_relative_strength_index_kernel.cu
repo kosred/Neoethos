@@ -481,3 +481,156 @@ extern "C" __global__ void volume_weighted_relative_strength_index_batch_f64(
         row_bullish[i] = bullish_tp;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 3, round 3
+ *
+ * CPU REFERENCE: src/indicators/volume_weighted_relative_strength_index.rs
+ *   `volume_weighted_relative_strength_index_rsi_only_into` (:1144-1197),
+ *   which is the path `..._output_into_slice` (:1101) takes for the `Rsi`
+ *   field, and `RmaState::update` (:310-325).
+ *   Batch dispatcher: cpu_batch.rs:16302 -- output "value" is an ALIAS OF
+ *   "rsi" (:16309), so this kernel emits `rsi`. NOT rsi_ma, NOT the two
+ *   take-profit columns.
+ *
+ * WHY A SECOND ENTRY POINT: `volume_weighted_relative_strength_index_batch_f64`
+ *   (:263) takes 15 parameters and emits five series. The lane launches
+ *   (close, volume, n, periods, n_combos, first_valid, out) and consumes one.
+ *
+ * INPUT: (close, volume) -- extract_close_volume_input (cpu_batch.rs:16306)
+ *   with source "close" -- F64InputKind::CloseVolume.
+ *
+ * FIRST-VALID IGNORED: the loop walks EVERY bar from 0 and handles an invalid
+ *   bar IN PLACE (:1156-1163) by RESETTING all three RMA accumulators and
+ *   clearing prev_source. A global first-valid index would be wrong after the
+ *   first hole, because the CPU restarts the whole seed there.
+ *
+ * PERIOD-INVARIANT: the CPU batch reads NAMED parameters -- `rsi_length`,
+ *   `range_length`, `ma_length`, `ma_type` (cpu_batch.rs:16340-16362) -- and
+ *   never `period`. The rsi column depends only on `rsi_length`, pinned here
+ *   at the CPU default 14. Every row of a sweep is byte-identical, and
+ *   `is_period_invariant` says so.
+ *
+ * SHAPE: ONE THREAD PER COLUMN, bars ascending. Three Wilder (RMA)
+ *   recurrences run in lockstep and each carries a seed sum across bars.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the RMA seed is `sum / period` after exactly `period` UPDATES (:319) --
+ *     counted in updates, not in bars, so a reset restarts the count.
+ *   * the RMA step is `((prev * (period - 1)) + input) / period` (:312) --
+ *     one multiply, one add, one divide, in that order. NOT the algebraically
+ *     equal `prev + (input - prev)/period`, which rounds differently.
+ *   * `gain = delta.max(0.0) * volume` and `loss = (-delta).max(0.0) * volume`
+ *     (:1173-1174) -- f64::max, hence fmax.
+ *
+ * EPSILON: `EPS` is 1e-12 (:35) and it is ALREADY an f64-sized tolerance in
+ *   the CPU source -- carried across unchanged, not rescaled from an f32
+ *   value. It guards `vol_avg`, `down` and `up` by MAGNITUDE (`abs() <= EPS`),
+ *   which is what is reproduced.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:16340-16344. */
+#define NEO_VWRSI_RSI_LENGTH 14
+/* volume_weighted_relative_strength_index.rs:35 -- already f64-sized. */
+#define NEO_VWRSI_EPS 1e-12
+
+extern "C" __global__
+void volume_weighted_relative_strength_index_neo_batch_f64(const double* __restrict__ close,
+                                                           const double* __restrict__ volume,
+                                                           int n,
+                                                           const int* __restrict__ periods,
+                                                           int n_combos,
+                                                           int first_valid,
+                                                           double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant -- see header */
+    (void)first_valid; /* handled in place -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int period = NEO_VWRSI_RSI_LENGTH;
+    /* prepare_input refuses rsi_length > len. */
+    if (period > n) return;
+    const double pf = (double)period;
+
+    bool   has_prev = false;
+    double prev_source = 0.0;
+
+    /* Three RmaState instances (:1149-1151). */
+    int    up_count = 0,   dn_count = 0,   vol_count = 0;
+    double up_sum = 0.0,   dn_sum = 0.0,   vol_sum = 0.0;
+    bool   up_seeded = false, dn_seeded = false, vol_seeded = false;
+    double up_val = 0.0,   dn_val = 0.0,   vol_val = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double src = close[i];
+        const double vol = volume[i];
+
+        if (!isfinite(src) || !isfinite(vol)) {
+            has_prev = false;
+            up_count = 0;  up_sum = 0.0;  up_seeded = false;
+            dn_count = 0;  dn_sum = 0.0;  dn_seeded = false;
+            vol_count = 0; vol_sum = 0.0; vol_seeded = false;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        if (!has_prev) {
+            prev_source = src;
+            has_prev = true;
+            o[i] = NEO_F64_NAN;
+            continue;
+        }
+
+        const double delta = src - prev_source;
+        prev_source = src;
+
+        const double gain = fmax(delta, 0.0) * vol;
+        const double loss = fmax(-delta, 0.0) * vol;
+
+        /* RmaState::update (:310) -- gain, then loss, then volume. */
+        bool   up_ready = false; double up_num = 0.0;
+        if (up_seeded) {
+            up_val = ((up_val * (pf - 1.0)) + gain) / pf;
+            up_num = up_val; up_ready = true;
+        } else {
+            up_count += 1; up_sum += gain;
+            if (up_count == period) { up_val = up_sum / pf; up_seeded = true; up_num = up_val; up_ready = true; }
+        }
+
+        bool   dn_ready = false; double dn_num = 0.0;
+        if (dn_seeded) {
+            dn_val = ((dn_val * (pf - 1.0)) + loss) / pf;
+            dn_num = dn_val; dn_ready = true;
+        } else {
+            dn_count += 1; dn_sum += loss;
+            if (dn_count == period) { dn_val = dn_sum / pf; dn_seeded = true; dn_num = dn_val; dn_ready = true; }
+        }
+
+        bool   vol_ready = false; double vol_avg = 0.0;
+        if (vol_seeded) {
+            vol_val = ((vol_val * (pf - 1.0)) + vol) / pf;
+            vol_avg = vol_val; vol_ready = true;
+        } else {
+            vol_count += 1; vol_sum += vol;
+            if (vol_count == period) { vol_val = vol_sum / pf; vol_seeded = true; vol_avg = vol_val; vol_ready = true; }
+        }
+
+        if (!(up_ready && dn_ready && vol_ready)) { o[i] = NEO_F64_NAN; continue; }
+        if (fabs(vol_avg) <= NEO_VWRSI_EPS)       { o[i] = NEO_F64_NAN; continue; }
+
+        const double up   = up_num / vol_avg;
+        const double down = dn_num / vol_avg;
+
+        if (fabs(down) <= NEO_VWRSI_EPS)      o[i] = 100.0;
+        else if (fabs(up) <= NEO_VWRSI_EPS)   o[i] = 0.0;
+        else                                  o[i] = 100.0 - (100.0 / (1.0 + up / down));
+    }
+}

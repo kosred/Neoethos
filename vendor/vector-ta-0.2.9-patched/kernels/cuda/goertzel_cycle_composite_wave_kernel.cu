@@ -634,3 +634,359 @@ extern "C" __global__ void goertzel_cycle_composite_wave_batch_f64(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `goertzel_cycle_composite_wave_with_kernel`
+// (src/indicators/goertzel_cycle_composite_wave.rs:904) -> `compute_row`
+// (:886) -> `compute_window_wave` (:827), with `apply_detrend_mode` (:597),
+// `hodrick_prescott_filter` (:498), `hp_lambda` (:460), `extract_cycles`
+// (:713) and `current_wave_from_cycles` (:791).
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `goertzel_cycle_composite_wave_batch_f64` (:396) is double-clean but declares
+// thirty-one parameters -- three `const int*` per-row parameter arrays,
+// eighteen scalar knobs and TWO host-allocated scratch pointers (`double*
+// scratch`, `int* iscratch`). The f64 lane launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// and has no scratch to give, so the lane gets its own entry point here with
+// every buffer a fixed-size PER-THREAD array.
+//
+// WHICH COLUMN: `value`. `compute_goertzel_cycle_composite_wave_batch`
+// (cpu_batch.rs:7839) accepts `value` and `wave` and rejects everything else,
+// and both name the same series.
+//
+// SHAPE -- AND WHY THE BRIEF'S "SERIAL RECURRENCE, ONE THREAD PER COLUMN" IS
+// WRONG FOR THIS ONE. Goertzel IS a recurrence, but it runs INSIDE the window,
+// not across bars: `compute_row` (:891-901) takes `data[end+1-sample ..= end]`
+// for each `end` INDEPENDENTLY and calls `compute_window_wave` on it. Nothing
+// is carried from bar to bar -- no accumulator, no state, no reset. So the
+// correct shape is BAR-PARALLEL: one thread per (combo, bar), each thread
+// running the window's own serial recurrences (`hodrick_prescott_filter`'s
+// tridiagonal sweep and the Goertzel `w = coeff*x - y + detrended[i]` loop) by
+// itself. Registered NOT sequential for that reason; the lane's bar-parallel
+// launch arm accepts a single price series, which is what this indicator reads.
+//   Choosing one-thread-per-column instead would put 200k independent windows,
+// each ~50k flops, on FIVE threads. It would still be correct, and it would be
+// about five orders of magnitude slower.
+//
+// PER-THREAD MEMORY, STATED IN BYTES because it is the interesting constraint:
+// `sample_size` at the pinned defaults is `max(2*120, 5*120) + 1 = 601`
+// (`sample_size_for_params`, :334-340). The Hodrick-Prescott solve needs three
+// length-601 vectors, and the fast/slow difference needs the fast result kept
+// while the slow one is computed, so four: 4 * 601 * 8 = 19,232 bytes. After
+// `processed` exists, the three solve vectors are REUSED for `detrended`,
+// `amp_work` and `phase_work` (241 doubles each -- `2*max_period+1`), so
+// nothing is added. `mark_work` is not materialised at all: the CPU only reads
+// it back in ascending k immediately after writing it (:766-780), so the peak
+// test is folded into the cycle scan. `cyc_*` are not materialised either --
+// see the selection note below.
+//   That is a compile-time constant, not an allocation. It is also the reason
+// this kernel does not simply hold the whole CPU intermediate set.
+//
+// PERIOD-INVARIANT: the CPU batch reads `max_period`, `start_at_cycle`,
+// `use_top_cycles`, `bar_to_calculate`, `detrend_mode`, seven smoothing
+// lengths, five Bartels knobs and four booleans -- and NEVER `period`
+// (cpu_batch.rs:7851-7935), so every swept period gives the same CPU column and
+// this kernel writes identical rows. Pinned at the CPU defaults: max_period
+// 120, start_at_cycle 1, use_top_cycles 2, bar_to_calculate 1, detrend_mode
+// `hodrick_prescott_detrending`, dt_hp_per1 20, dt_hp_per2 80,
+// filter_bartels FALSE, sort_bartels FALSE, squared_amp TRUE, use_cosine TRUE,
+// subtract_noise FALSE, use_cycle_strength TRUE (:30-43, cpu_batch.rs:7853-
+// 7935).
+//   `filter_bartels` being false is what keeps the Bartels probability path --
+// the only part of this indicator that would need a second full detrend per
+// cycle -- out of the kernel entirely, exactly as it is out of the CPU's path.
+//
+// WHY THE TOP-TWO SELECTION IS NOT A SORT. `extract_cycles` collects the peaks
+// in ASCENDING k and then `cycles.sort_by(|a, b| b.amplitude.partial_cmp(...))`
+// (:782-786). Rust's `sort_by` is STABLE, so equal amplitudes keep ascending k.
+// `current_wave_from_cycles` then reads `cycles[start..end]` with start = 0 and
+// end = 2 (:791-822). Taking the two largest amplitudes with STRICT `>`
+// comparisons while scanning ascending k reproduces that prefix exactly -- a
+// tie leaves the earlier k in front, which is what stability means -- and
+// removes the need to materialise or sort the 122-slot cycle list. The sum is
+// then formed in the CPU's own order, `0.0 + trig(first) + trig(second)`.
+//
+// ROUNDING: every expression is transcribed operand for operand. The CPU writes
+// no `mul_add` anywhere in this indicator, so no `fma` is introduced -- the
+// Goertzel step stays `coeff * x - y + detrended[i]` (:747), three roundings,
+// and the detrend stays `src_rev[..] - (temp1 + trend_slope * (sample - k))`
+// (:740). `hp_lambda` is `0.0625 / sin(PI/period).powi(4)`; `powi(4)` lowers to
+// two squarings, written out as `s2 = s*s; s4 = s2*s2`, not `pow(s, 4.0)`.
+//
+// EPSILON: `f64::EPSILON` appears twice on this path -- the tridiagonal pivot
+// guard `z.abs() <= f64::EPSILON` (:535) and the Goertzel `real.abs() <=
+// f64::EPSILON` guard that substitutes 1e-7 (:753-755). BOTH are the CPU's own
+// f64 constants and both are kept verbatim, including the 1e-7 substitute,
+// which is a value the indicator's definition puts there and not a tolerance
+// this port invented.
+//
+// NaN SEMANTICS: the window is rejected outright if ANY of its 601 bars is
+// non-finite (:893) and again if any of the 601 detrended values is non-finite
+// (:614-618), so nothing downstream can see a NaN. No comparison chain stands
+// in for an `f64::max` here.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic. `sin`, `cos`, `atan`, `sqrt`, `fabs`, `round` are the double
+// overloads. The NaN is a DOUBLE quiet-NaN bit pattern.
+//
+// FIRST VALID IS NOT READ: `compute_row` (:887) fills the whole row with NaN
+// and writes only the bars whose 601-bar window is entirely finite, which is a
+// per-bar test and not a prefix. The lane row declares
+// `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+#define NEO_GZ_MAX_PERIOD 120
+#define NEO_GZ_BAR_TO_CALCULATE 1
+#define NEO_GZ_BART_NO_CYCLES 5
+#define NEO_GZ_SAMPLE_SIZE 601   // max(2*120, 5*120) + 1
+#define NEO_GZ_GSAMPLE 240       // 2 * max_period
+#define NEO_GZ_WORK 241          // 2 * max_period + 1
+#define NEO_GZ_DT_HP_PER1 20
+#define NEO_GZ_DT_HP_PER2 80
+#define NEO_GZ_USE_TOP_CYCLES 2
+#define NEO_GZ_F64_EPSILON 2.2204460492503131e-16
+#define NEO_GZ_PI 3.14159265358979323846
+
+__device__ inline double neo_gz_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// `hp_lambda`, :460. `powi(4)` is two squarings, not a `pow` call.
+__device__ inline double neo_gz_hp_lambda(int period) {
+    const double s = sin(NEO_GZ_PI / static_cast<double>(period));
+    const double s2 = s * s;
+    const double s4 = s2 * s2;
+    return 0.0625 / s4;
+}
+
+// `hodrick_prescott_filter`, :498-565, over `src_rev[i] = data[end - i]`.
+// The result is left in `a`; `b` and `c` are working vectors.
+__device__ void neo_gz_hp_filter(
+    const double* __restrict__ data,
+    int end_bar,
+    double lambda,
+    double* __restrict__ a,
+    double* __restrict__ b,
+    double* __restrict__ c
+) {
+    const int per = NEO_GZ_SAMPLE_SIZE;
+
+    for (int i = 0; i < per; ++i) {
+        a[i] = 0.0;
+        b[i] = 0.0;
+        c[i] = 0.0;
+    }
+
+    a[0] = 1.0 + lambda;
+    b[0] = -2.0 * lambda;
+    c[0] = lambda;
+    for (int i = 1; i < per - 2; ++i) {
+        a[i] = 6.0 * lambda + 1.0;
+        b[i] = -4.0 * lambda;
+        c[i] = lambda;
+    }
+    if (per > 1) {
+        a[1] = 5.0 * lambda + 1.0;
+        a[per - 2] = 5.0 * lambda + 1.0;
+        a[per - 1] = 1.0 + lambda;
+        b[per - 2] = -2.0 * lambda;
+    }
+
+    double h1 = 0.0, h2 = 0.0, h3 = 0.0, h4 = 0.0, h5 = 0.0;
+    double hh1 = 0.0, hh2 = 0.0, hh3 = 0.0, hh5 = 0.0;
+    (void)hh1;
+    (void)hh2;
+
+    for (int i = 0; i < per; ++i) {
+        const double z = a[i] - h4 * h1 - hh5 * h2;
+        if (fabs(z) <= NEO_GZ_F64_EPSILON) {
+            break;
+        }
+        const double hb = b[i];
+        hh1 = h1;
+        h1 = (hb - h4 * h2) / z;
+        b[i] = h1;
+        const double hc = c[i];
+        hh2 = h2;
+        h2 = hc / z;
+        c[i] = h2;
+        a[i] = (data[end_bar - i] - hh3 * hh5 - h3 * h4) / z;
+        hh3 = h3;
+        h3 = a[i];
+        h4 = hb - h5 * hh1;
+        hh5 = h5;
+        h5 = hc;
+    }
+
+    // Back-substitution, :557-563. `output` is written into `a` in place: each
+    // step reads a[i], b[i], c[i] and then overwrites a[i], so nothing needed
+    // later is destroyed.
+    double h1b = a[per - 1];
+    double h2b = 0.0;
+    a[per - 1] = h1b;
+    for (int i = per - 2; i >= 0; --i) {
+        const double value = a[i] - b[i] * h1b - c[i] * h2b;
+        a[i] = value;
+        h2b = h1b;
+        h1b = value;
+    }
+}
+
+extern "C" __global__ void goertzel_cycle_composite_wave_neo_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = blockIdx.y;
+    if (combo >= n_combos) {
+        return;
+    }
+    const int end = blockIdx.x * blockDim.x + threadIdx.x;
+    if (end >= n) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_gz_neo_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    if (end < NEO_GZ_SAMPLE_SIZE - 1) {
+        row[end] = nan_value;
+        return;
+    }
+    // `compute_row`, :893 -- any non-finite bar in the window skips it and
+    // leaves the NaN the row was filled with.
+    for (int j = 0; j < NEO_GZ_SAMPLE_SIZE; ++j) {
+        if (!isfinite(data[end - j])) {
+            row[end] = nan_value;
+            return;
+        }
+    }
+
+    double a[NEO_GZ_SAMPLE_SIZE];
+    double b[NEO_GZ_SAMPLE_SIZE];
+    double c[NEO_GZ_SAMPLE_SIZE];
+    double processed[NEO_GZ_SAMPLE_SIZE];
+
+    // `apply_detrend_mode`, HodrickPrescottDetrending arm, :620-624.
+    neo_gz_hp_filter(data, end, neo_gz_hp_lambda(NEO_GZ_DT_HP_PER1), a, b, c);
+    for (int i = 0; i < NEO_GZ_SAMPLE_SIZE; ++i) {
+        processed[i] = a[i];
+    }
+    neo_gz_hp_filter(data, end, neo_gz_hp_lambda(NEO_GZ_DT_HP_PER2), a, b, c);
+    for (int i = 0; i < NEO_GZ_SAMPLE_SIZE; ++i) {
+        processed[i] = processed[i] - a[i];
+        if (!isfinite(processed[i])) {
+            // `if out.iter().all(is_finite) { Some } else { None }`, :634-638;
+            // `compute_row` then leaves the bar NaN.
+            row[end] = nan_value;
+            return;
+        }
+    }
+
+    // The three solve vectors are free now -- reuse them.
+    double* detrended = a;
+    double* amp_work = b;
+    double* phase_work = c;
+    for (int i = 0; i < NEO_GZ_WORK; ++i) {
+        detrended[i] = 0.0;
+        amp_work[i] = 0.0;
+        phase_work[i] = 0.0;
+    }
+
+    // `extract_cycles`, :713-789.
+    const int per = NEO_GZ_MAX_PERIOD;
+    const int for_bar = NEO_GZ_BAR_TO_CALCULATE;
+    const int sample = NEO_GZ_GSAMPLE;
+
+    const double temp1 = processed[for_bar + sample - 1];
+    const double trend_slope =
+        (processed[for_bar] - temp1) / (static_cast<double>(sample) - 1.0);
+    for (int k = sample - 1; k >= 1; --k) {
+        detrended[k] = processed[for_bar + k - 1] -
+                       (temp1 + trend_slope * static_cast<double>(sample - k));
+    }
+
+    for (int k = 2; k <= per; ++k) {
+        const double z = 1.0 / static_cast<double>(k);
+        const double coeff = 2.0 * cos(2.0 * NEO_GZ_PI * z);
+        double w = 0.0;
+        double x = 0.0;
+        double y = 0.0;
+        for (int i = sample; i >= 1; --i) {
+            w = coeff * x - y + detrended[i];
+            y = x;
+            x = w;
+        }
+        double real = x - y * coeff / 2.0;
+        if (fabs(real) <= NEO_GZ_F64_EPSILON) {
+            real = 1e-7;
+        }
+        const double imag = y * sin(2.0 * NEO_GZ_PI * z);
+        // squared_amp = true, use_cycle_strength = true.
+        const double amplitude = real * real + imag * imag;
+        amp_work[k] = amplitude / static_cast<double>(k);
+        double phase = atan(imag / real);
+        if (real < 0.0) {
+            phase += NEO_GZ_PI;
+        } else if (imag < 0.0) {
+            phase += 2.0 * NEO_GZ_PI;
+        }
+        phase_work[k] = phase;
+    }
+
+    // `mark_work` folded into the cycle scan: the CPU sets `mark[k] = k * 1e-4`
+    // for a strict local maximum over k in 3..per (:766-770) and then walks
+    // i in 0..=per+1 in ASCENDING order taking those (:773-780). The stable
+    // descending sort by amplitude that follows means the first two encountered
+    // maxima, compared with strict `>`, are exactly `cycles[0..2]`.
+    int found = 0;
+    double best_amp_1 = 0.0, best_phase_1 = 0.0;
+    double best_amp_2 = 0.0, best_phase_2 = 0.0;
+    for (int k = 3; k < per; ++k) {
+        if (!(amp_work[k] > amp_work[k - 1] && amp_work[k] > amp_work[k + 1])) {
+            continue;
+        }
+        const double amp = amp_work[k];
+        const double phase = phase_work[k];
+        if (found == 0) {
+            best_amp_1 = amp;
+            best_phase_1 = phase;
+            found = 1;
+        } else if (amp > best_amp_1) {
+            best_amp_2 = best_amp_1;
+            best_phase_2 = best_phase_1;
+            best_amp_1 = amp;
+            best_phase_1 = phase;
+            if (found < 2) {
+                found = 2;
+            }
+        } else if (found == 1 || amp > best_amp_2) {
+            best_amp_2 = amp;
+            best_phase_2 = phase;
+            if (found < 2) {
+                found = 2;
+            }
+        }
+    }
+
+    // `current_wave_from_cycles`, :791-822: start = 0, count = 2,
+    // use_cosine = true, subtract_noise = false. Empty list gives 0.0.
+    double value = 0.0;
+    if (found >= 1) {
+        value = value + best_amp_1 * cos(best_phase_1);
+    }
+    if (found >= 2) {
+        value = value + best_amp_2 * cos(best_phase_2);
+    }
+    row[end] = value;
+}

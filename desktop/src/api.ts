@@ -344,11 +344,19 @@ export type RiskInfo = {
   // app could announce "Prop-firm" while `system.trading_mode` was `risky`.
   // Both screens now derive that display from `system.trading_mode`.
   //
-  // ⚠ The Rust half is NOT deleted by this change: `RiskDto`
-  // (`crates/neoethos-app/src/server/risk.rs:44`) and the config field
-  // (`RiskConfig::prop_firm_rules`) still exist and the endpoint still emits
-  // the key — it is now simply ignored. Deleting them is a neoethos-app +
-  // neoethos-core edit, routed as E-5/D6.
+  // UPDATE 2026-08-10 — D6 is DONE. The config field
+  // `RiskConfig::prop_firm_rules` is DELETED from `neoethos-core`, and
+  // `risk.prop_firm_rules` is now a `load_seal::RETIRED_KEYS` entry, so a
+  // config file that still carries the key loads with the key NAMED at WARN
+  // instead of being refused.
+  //
+  // The DTO still carries `propFirmRulesEnabled`
+  // (`crates/neoethos-app/src/server/risk.rs`) — but it is no longer a mirror
+  // of anything: it is DERIVED from `system.trading_mode` by
+  // `derive_prop_firm_rules_active`, the same switch the engine reads. It is
+  // omitted from this type because both screens compute the display from
+  // `system.trading_mode` directly; there is no longer a second opinion to
+  // disagree with.
   riskyModeCooldownRemainingSecs: number | null;
 };
 export const riskInfo = () => apiGet<RiskInfo>("/risk");

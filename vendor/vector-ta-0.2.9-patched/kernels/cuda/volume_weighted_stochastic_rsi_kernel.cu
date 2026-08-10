@@ -451,3 +451,207 @@ extern "C" __global__ void volume_weighted_stochastic_rsi_batch_f64(
     delete[] d_buf1;
     delete[] d_buf2;
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 3, round 3
+ *
+ * CPU REFERENCE: src/indicators/volume_weighted_stochastic_rsi.rs
+ *   `volume_weighted_stochastic_rsi_compute_k_into` (:877-898) -- the path
+ *   `..._output_into_slice` (:1068) takes for the `K` field -- built from
+ *   `WeightedRsiState::update` (:481-521), `StochState::update` (:544-581)
+ *   and `WeightedWsmaState::update` (:702-742).
+ *   Batch dispatcher: cpu_batch.rs:12385 -- output "value" is an ALIAS OF
+ *   "k" (:12392), so this kernel emits `k`, never `d`.
+ *
+ * WHY A SECOND ENTRY POINT: `volume_weighted_stochastic_rsi_batch_f64` (:372)
+ *   takes 11 parameters and emits two series. The lane launches
+ *   (close, volume, n, periods, n_combos, first_valid, out).
+ *
+ * INPUT: (close, volume) -- extract_close_volume_input (cpu_batch.rs:12389)
+ *   with source "close" -- F64InputKind::CloseVolume.
+ *
+ * FIRST-VALID IGNORED: `compute_k_into` walks EVERY bar from 0; an invalid
+ *   bar is handled inside `WeightedRsiState::update` (:482-489), which does
+ *   NOT reset the averages -- it only drops prev_source and returns NaN, and
+ *   the NaN then flows through StochState as a window entry. Reproducing that
+ *   requires walking every bar, so the caller's index is not read. Note
+ *   `first` is computed by `..._prepare` (:984) purely for the length check
+ *   and is explicitly discarded at :1021 (`let _ = first;`).
+ *
+ * PERIOD-INVARIANT: the CPU batch reads NAMED parameters -- `rsi_length`,
+ *   `stoch_length`, `k_length`, `d_length`, `ma_type` (cpu_batch.rs:12413-
+ *   12419) -- and never `period`. All are pinned at their CPU defaults here
+ *   (14 / 14 / 3 / "WSMA"), so every row of a sweep is byte-identical.
+ *
+ * MA TYPE: the default "WSMA" (:12419) parses to VwsrsiMaType::Wsma (:347),
+ *   which is the volume-weighted WILDER average, not an SMA. Only that arm is
+ *   compiled here; a caller asking for another ma_type is not on this lane.
+ *
+ * SHAPE: ONE THREAD PER COLUMN, bars ascending. A Wilder recurrence on
+ *   volume-weighted gains/losses feeds a rolling stochastic window which feeds
+ *   a second Wilder recurrence -- three carried states in a cascade.
+ *
+ * ARITHMETIC taken verbatim:
+ *   * the RSI seed divides the accumulated sums by `period` AFTER exactly
+ *     `period` deltas (:509-510); the step is
+ *     `(avg * (period - 1) + x) / period` (:518) -- multiply, add, divide.
+ *   * `rsi_from_avgs` (:438) is a four-way branch on `<= 0.0`, NOT a division
+ *     guarded by an epsilon: avg_loss <= 0 with avg_gain <= 0 gives 50.0.
+ *   * `StochState` scans the WHOLE window with f64::min / f64::max (:572-573)
+ *     -- hence fmin/fmax, which return the non-NaN operand. It refuses when
+ *     `count < period || valid < period || !value.is_finite()` (:565).
+ *   * the WSMA carries a numerator AND a denominator average, and divides
+ *     only when the denominator average is exactly non-zero (:738).
+ *
+ * EPSILON: there is none anywhere on this path. Every CPU guard is an exact
+ *   `== 0.0` / `<= 0.0` test, and no f32-sized tolerance is imported.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:12413-12419. */
+#define NEO_VWSRSI_RSI_LENGTH   14
+#define NEO_VWSRSI_STOCH_LENGTH 14
+#define NEO_VWSRSI_K_LENGTH     3
+
+extern "C" __global__
+void volume_weighted_stochastic_rsi_neo_batch_f64(const double* __restrict__ close,
+                                                  const double* __restrict__ volume,
+                                                  int n,
+                                                  const int* __restrict__ periods,
+                                                  int n_combos,
+                                                  int first_valid,
+                                                  double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant -- see header */
+    (void)first_valid; /* handled in place -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int rsi_len   = NEO_VWSRSI_RSI_LENGTH;
+    const int stoch_len = NEO_VWSRSI_STOCH_LENGTH;
+    const int k_len     = NEO_VWSRSI_K_LENGTH;
+    /* ..._prepare refuses any length > len. */
+    if (rsi_len > n || stoch_len > n || k_len > n) return;
+
+    const double rsi_pf = (double)rsi_len;
+    const double k_pf   = (double)k_len;
+
+    /* WeightedRsiState (:454) */
+    bool   has_prev = false;
+    double prev_source = 0.0;
+    double gain_sum = 0.0, loss_sum = 0.0;
+    int    rsi_count = 0;
+    double avg_gain = 0.0, avg_loss = 0.0;
+    bool   rsi_init = false;
+
+    /* StochState (:525) -- window is `vec![NAN; period]`. */
+    double win[NEO_VWSRSI_STOCH_LENGTH];
+    for (int k = 0; k < stoch_len; ++k) win[k] = NEO_F64_NAN;
+    int win_head = 0, win_count = 0, win_valid = 0;
+
+    /* WeightedWsmaState (:676) for the K smoothing. */
+    double k_num_sum = 0.0, k_den_sum = 0.0;
+    int    k_count = 0;
+    double k_num_avg = 0.0, k_den_avg = 0.0;
+    bool   k_init = false;
+
+    for (int i = 0; i < n; ++i) {
+        const double src = close[i];
+        const double vol = volume[i];
+
+        /* ---- WeightedRsiState::update (:481) ---- */
+        double rsi_value;
+        if (!(isfinite(src) && isfinite(vol))) {
+            /* :483 -- prev_source is KEPT when source alone is finite. */
+            if (isfinite(src)) { prev_source = src; has_prev = true; }
+            else               { has_prev = false; }
+            rsi_value = NEO_F64_NAN;
+        } else if (!has_prev) {
+            prev_source = src; has_prev = true;
+            rsi_value = NEO_F64_NAN;
+        } else {
+            const double change = src - prev_source;
+            const double gain = fmax(change, 0.0) * vol;
+            const double loss = fmax(-change, 0.0) * vol;
+            prev_source = src;
+
+            if (!rsi_init) {
+                gain_sum += gain;
+                loss_sum += loss;
+                rsi_count += 1;
+                if (rsi_count == rsi_len) {
+                    avg_gain = gain_sum / rsi_pf;
+                    avg_loss = loss_sum / rsi_pf;
+                    rsi_init = true;
+                    /* rsi_from_avgs (:438) */
+                    if (avg_loss <= 0.0)      rsi_value = (avg_gain <= 0.0) ? 50.0 : 100.0;
+                    else if (avg_gain <= 0.0) rsi_value = 0.0;
+                    else                      rsi_value = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss);
+                } else {
+                    rsi_value = NEO_F64_NAN;
+                }
+            } else {
+                avg_gain = (avg_gain * (rsi_pf - 1.0) + gain) / rsi_pf;
+                avg_loss = (avg_loss * (rsi_pf - 1.0) + loss) / rsi_pf;
+                if (avg_loss <= 0.0)      rsi_value = (avg_gain <= 0.0) ? 50.0 : 100.0;
+                else if (avg_gain <= 0.0) rsi_value = 0.0;
+                else                      rsi_value = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss);
+            }
+        }
+
+        /* ---- StochState::update (:544) ---- */
+        if (win_count == stoch_len) {
+            const double old = win[win_head];
+            if (isfinite(old)) win_valid -= 1;
+        } else {
+            win_count += 1;
+        }
+        win[win_head] = rsi_value;
+        win_head += 1; if (win_head == stoch_len) win_head = 0;
+        if (isfinite(rsi_value)) win_valid += 1;
+
+        double stoch;
+        if (win_count < stoch_len || win_valid < stoch_len || !isfinite(rsi_value)) {
+            stoch = NEO_F64_NAN;
+        } else {
+            double lowest = INFINITY, highest = -INFINITY;
+            for (int k = 0; k < stoch_len; ++k) {
+                lowest  = fmin(lowest,  win[k]);
+                highest = fmax(highest, win[k]);
+            }
+            const double denom = highest - lowest;
+            stoch = (!isfinite(denom) || denom == 0.0)
+                  ? NEO_F64_NAN
+                  : ((rsi_value - lowest) / denom * 100.0);
+        }
+
+        /* ---- WeightedWsmaState::update (:702), gated on a finite stoch ---- */
+        if (!isfinite(stoch)) { o[i] = NEO_F64_NAN; continue; }
+
+        const double numerator = stoch * vol;
+        double kv;
+        if (!k_init) {
+            k_num_sum += numerator;
+            k_den_sum += vol;
+            k_count += 1;
+            kv = NEO_F64_NAN;
+            if (k_count == k_len) {
+                k_num_avg = k_num_sum / k_pf;
+                k_den_avg = k_den_sum / k_pf;
+                k_init = true;
+                if (k_den_avg != 0.0) kv = k_num_avg / k_den_avg;
+            }
+        } else {
+            k_num_avg = (k_num_avg * (k_pf - 1.0) + numerator) / k_pf;
+            k_den_avg = (k_den_avg * (k_pf - 1.0) + vol) / k_pf;
+            kv = (k_den_avg != 0.0) ? (k_num_avg / k_den_avg) : NEO_F64_NAN;
+        }
+        o[i] = kv;
+    }
+}

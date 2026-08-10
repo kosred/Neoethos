@@ -362,6 +362,18 @@ pub enum F64FirstValidRule {
     /// (`qstick.rs:235`) by `is_finite` vs `!is_nan`, and distinct from every
     /// Hlc rule because high and low are never scanned at all.
     OpenCloseFinite,
+
+    // ------------------------------------------------------ closer 6, round 3
+    /// The PRICE series and VOLUME both `is_finite` at the same index --
+    /// `elastic_volume_weighted_moving_average.rs:308-317` (`find_first_valid`).
+    ///
+    /// Deliberately NOT [`Self::AllInputsNonNan`], which under a (price,
+    /// volume) shape resolves to a `!is_nan` scan. EVWMA divides by the rolling
+    /// volume sum at every bar, so an INFINITE volume is rejected by the CPU
+    /// scan and would be accepted by the non-NaN one -- and `first_valid` sets
+    /// both the NaN prefix and the point the recurrence seeds from, so the two
+    /// rules do not perturb the series by an ULP, they shift it.
+    PriceVolumeFinite,
 }
 
 /// The series shape an f64 kernel expects.
@@ -452,6 +464,21 @@ pub enum F64InputKind {
     /// The row that names this kind is `dvdiqqe` at :1353. Without the variant
     /// that row does not compile -- which is how the gap was found.
     OpenCloseVolume,
+
+    // ------------------------------------------------------ closer 6, round 3
+    /// (hlcc4, volume) -- `elastic_volume_weighted_moving_average` alone.
+    ///
+    /// A FIFTH price source paired with volume, and it is its own kind for the
+    /// reason [`Self::CloseVolume`] and [`Self::Hlc3Volume`] are two kinds over
+    /// one device shape: they differ only in WHICH price series is in the pair,
+    /// and swapping them computes a different indicator while passing every
+    /// length and device check on the way through.
+    ///
+    /// EVWMA's declared default source is `hlcc4`
+    /// (`elastic_volume_weighted_moving_average.rs:113`,
+    /// `with_default_candles`), the same evidence that put the `velocity`
+    /// family on [`Self::Hlcc4Slice`].
+    Hlcc4Volume,
 }
 
 /// Every indicator with a real f64 CUDA kernel in this crate, and the entry
@@ -464,6 +491,81 @@ pub enum F64InputKind {
 /// for each one. Adding a row without doing that work moves a silent wrongness
 /// from the f32 lane into the f64 lane.
 pub const F64_KERNELS: &[F64KernelSpec] = &[
+    // ---------------------------------------------------- closer 5, round 3
+    //
+    // Nine indicators that had no reachable f64 entry point until this round.
+    // The input kind and the first-valid rule below are each read from the CPU
+    // `*_prepare` / `compute_*_batch`, not inferred from the shape:
+    //
+    // * `rsmk` and `macz` are `Ignored` because their CPU index is NOT a scan
+    //   of the series this kind names. `rsmk` scans the LOG-RATIO series --
+    //   NaN when either leg is NaN OR the divisor is exactly zero
+    //   (rsmk.rs:322-334) -- and no rule here expresses the zero-divisor
+    //   clause. `macz` scans CLOSE ALONE (macz.rs:678-681) and handles a NaN
+    //   volume INSIDE the loop via `n_vwap_nan`, so adopting volume's first
+    //   non-NaN would shift every window on a frame whose volume starts late.
+    // * `corrected_moving_average` is `Ignored` because its CPU walks EVERY
+    //   bar from index 0 and RESETS the rolling window on any non-finite value
+    //   (corrected_moving_average.rs:236, :369) -- a start index would skip
+    //   bars the CPU processes.
+    // * `rsmk` pairs CLOSE with VOLUME as (main, compare). That is surprising
+    //   for a relative-strength indicator and it is what `compute_rsmk_batch`
+    //   does (cpu_batch.rs:16445-16447); the kernel computes what the CPU
+    //   computes.
+    F64KernelSpec {
+        indicator_id: "rsmk",
+        kernel: F64Kernel::Rsmk,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "squeeze_momentum",
+        kernel: F64Kernel::SqueezeMomentum,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    F64KernelSpec {
+        indicator_id: "uma",
+        kernel: F64Kernel::Uma,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    F64KernelSpec {
+        indicator_id: "lpc",
+        kernel: F64Kernel::Lpc,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    F64KernelSpec {
+        indicator_id: "mab",
+        kernel: F64Kernel::Mab,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    F64KernelSpec {
+        indicator_id: "macz",
+        kernel: F64Kernel::Macz,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "vwmacd",
+        kernel: F64Kernel::Vwmacd,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    F64KernelSpec {
+        indicator_id: "corrected_moving_average",
+        kernel: F64Kernel::CorrectedMovingAverage,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "ehlers_undersampled_double_moving_average",
+        kernel: F64Kernel::EhlersUndersampledDoubleMovingAverage,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
     // ------------------------------------------ closer 5, round 2 (adosc)
     F64KernelSpec {
         indicator_id: "adosc",
@@ -2934,6 +3036,528 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlc4,
         first_valid: F64FirstValidRule::Ignored,
     },
+
+    // ------------------------------------------------------ closer 6, round 3
+    //
+    // Six indicators that had NO CUDA presence at all before this round: no
+    // `.cu`, no wrapper, no row here. Each now has a from-scratch f64 kernel in
+    // its own translation unit under `kernels/cuda/moving_averages/`, written
+    // against the CPU reference named in the kernel header.
+
+    // (hlcc4, volume). `Hlcc4Volume` because the declared default source is
+    // `hlcc4` (:113) and volume is a second input, not metadata.
+    // `PriceVolumeFinite` because `find_first_valid` (:308-317) scans BOTH with
+    // `is_finite`. The kernel takes the `use_volume_sum == true` branch
+    // (:382), which is the branch the period-sweeping route selects --
+    // ma.rs:1105-1113 and registry.rs:608 -- and it is the only branch that
+    // reads `length` at all.
+    F64KernelSpec {
+        indicator_id: "elastic_volume_weighted_moving_average",
+        kernel: F64Kernel::ElasticVolumeWeightedMovingAverage,
+        input: F64InputKind::Hlcc4Volume,
+        first_valid: F64FirstValidRule::PriceVolumeFinite,
+    },
+    // Emits the PRIMARY output, the corrected line (registry.rs:537).
+    // `Ignored` because `compute_into_slices` (:353) walks from index 0 and
+    // RESETS the whole cascade on every non-finite bar -- there is no single
+    // warmup prefix for a first-valid index to name.
+    F64KernelSpec {
+        indicator_id: "ema_deviation_corrected_t3",
+        kernel: F64Kernel::EmaDeviationCorrectedT3,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // Emits the PRIMARY output, `lma` (:1165). `Ignored` for the same reason:
+    // `compute_lma` (:775) walks from index 0 behind a `run` counter that a
+    // non-finite bar resets, and `out_lma` is NaN-filled first (:1156).
+    // Bounded by `LMA_MAX_PERIOD`; a larger period is refused BY NAME.
+    F64KernelSpec {
+        indicator_id: "logarithmic_moving_average",
+        kernel: F64Kernel::LogarithmicMovingAverage,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `Ignored`: `n_order_ema_compute_into` (:781) walks the whole series and
+    // `IirCoreFilter::update` (:374) resets on a non-finite bar.
+    F64KernelSpec {
+        indicator_id: "n_order_ema",
+        kernel: F64Kernel::NOrderEma,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `AllInputsNonNan` over one close series: `vama_prepare` (:716) is
+    // `position(|x| !x.is_nan())`, the common rule exactly.
+    F64KernelSpec {
+        indicator_id: "volatility_adjusted_ma",
+        kernel: F64Kernel::VolatilityAdjustedMa,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+    // `CloseFinite`, NOT `AllInputsNonNan`: `prepare_input` (:242) scans with
+    // `is_finite`, so an INFINITE bar is skipped by the CPU and would be
+    // accepted by the non-NaN scan. Bounded by `WS_MAX_PERIOD`.
+    F64KernelSpec {
+        indicator_id: "wave_smoother",
+        kernel: F64Kernel::WaveSmoother,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::CloseFinite,
+    },
+    // ---------------------------------------------------- closer 3, round 3
+    //
+    // Ten rows. Every one names a `*_neo_batch_f64` entry point written into
+    // the indicator's OWN .cu file against the CPU reference quoted in that
+    // file's header, and every one emits the column the CPU batch produces for
+    // `output_id == "value"`.
+    //
+    // NINE DECLARE `Ignored` AND ONE DECLARES `HlcCloseOnly`, and the split is
+    // read from the CPU rather than chosen. Eight of the nine walk every bar
+    // from index 0 and RESET their whole state at an invalid bar, so a global
+    // warmup index would name the wrong seed after the first hole. The ninth,
+    // `avsl`, scans with a rule no variant here expresses: `first_valid_max3`
+    // (avsl.rs:272) is the MAX of THREE INDEPENDENT first-non-NaN scans over
+    // close, low and volume -- NOT "the first index at which all three are
+    // non-NaN", which is later whenever one series has a hole after another
+    // has started. Rather than add a variant one indicator would use, that
+    // kernel derives the index and declares the caller's value unused.
+    // `alphatrend` is the exception in the other direction: it scans
+    // `close.iter().position(|x| !x.is_nan())` (alphatrend.rs:493) and never
+    // looks at high, low or volume, which is exactly the rule `adxr` declares.
+    F64KernelSpec {
+        indicator_id: "reversal_signals",
+        kernel: F64Kernel::ReversalSignals,
+        input: F64InputKind::Ohlcv5,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `Hlcv`, not `Ohlcv5`: `trend_follower_prepare` binds open nowhere and
+    // `first_valid_bar` (:678) scans high, low and close only.
+    F64KernelSpec {
+        indicator_id: "trend_follower",
+        kernel: F64Kernel::TrendFollower,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "vdubus_divergence_wave_pattern_generator",
+        kernel: F64Kernel::VdubusDivergenceWavePatternGenerator,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "volatility_ratio_adaptive_rsx",
+        kernel: F64Kernel::VolatilityRatioAdaptiveRsx,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "volume_energy_reservoirs",
+        kernel: F64Kernel::VolumeEnergyReservoirs,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "volume_weighted_relative_strength_index",
+        kernel: F64Kernel::VolumeWeightedRelativeStrengthIndex,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "volume_weighted_stochastic_rsi",
+        kernel: F64Kernel::VolumeWeightedStochasticRsi,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `Ohlc4`, not `Hlc`: `is_valid_ohlc` (:240) tests OPEN, so a bar with a
+    // non-finite open BREAKS the run and the two segments either side are
+    // computed independently. A three-pointer shape would never see it.
+    F64KernelSpec {
+        indicator_id: "zig_zag_channels",
+        kernel: F64Kernel::ZigZagChannels,
+        input: F64InputKind::Ohlc4,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `HlcCloseOnly`: alphatrend_prepare (:493) scans CLOSE ALONE. Adopting
+    // the Hlc triple's index would shift the whole series on any frame where
+    // high or low starts later than close, and `first` sets BOTH the NaN
+    // prefix and the true-range seed window.
+    F64KernelSpec {
+        indicator_id: "alphatrend",
+        kernel: F64Kernel::Alphatrend,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::HlcCloseOnly,
+    },
+    // `Hlcv` with HIGH bound and unread: the CPU batch calls
+    // `extract_hlcv_input` and discards high (cpu_batch.rs:14123), and
+    // `avsl_scalar` reads close, low and volume only.
+    F64KernelSpec {
+        indicator_id: "avsl",
+        kernel: F64Kernel::Avsl,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    // ------------------------------------------------------ closer 4, round 3
+    //
+    // Ten rows. Every kernel behind them was written INTO the `.cu` file its
+    // indicator already ships in, beside the f32 entry points the f32 wrappers
+    // still call, against the CPU reference named in that file's
+    // "NEOETHOS f64 LANE  --  closer 4, round 3" header.
+    //
+    // ALL TEN FILES WERE PURE f32 BEFORE THIS CHANGE. `bandpass_kernel.cu` had
+    // two `__global__`s and both took `const float*`; `dma_kernel.cu` had
+    // seven; `buff_averages_kernel.cu` twelve; `halftrend_kernel.cu` did not
+    // contain the token `double` at all. There was no f64 symbol for a row to
+    // point at, so the lane could not reach these ten indicators and answered
+    // `CudaF64KernelMissing` for every one of them.
+
+    /// `bandpass.rs:303` -- the `bp` column, which is what `value` resolves to
+    /// (cpu_batch.rs:14152). `CloseFinite` because `bandpass_prepare:255`
+    /// scans with `is_finite`, not `!is_nan`: an infinite bar is SKIPPED by
+    /// the CPU and would be accepted by `AllInputsNonNan`.
+    F64KernelSpec {
+        indicator_id: "bandpass",
+        kernel: F64Kernel::Bandpass,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::CloseFinite,
+    },
+
+    /// `buff_averages.rs:599` -- the FAST buff, the `output` default in
+    /// `ma_batch.rs:629`. `Ignored` and derived in the kernel: `buff_averages_
+    /// prepare:470` scans PRICE ALONE, and under `AllInputsNonNan` a
+    /// `CloseVolume` shape resolves to a scan over BOTH series, which names a
+    /// later bar on any frame whose volume has a hole -- and first-valid sets
+    /// the NaN prefix AND the seed window, so that is a shifted series, not an
+    /// ULP.
+    F64KernelSpec {
+        indicator_id: "buff_averages",
+        kernel: F64Kernel::BuffAverages,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `cora_wave.rs:246`. `AllInputsNonNan` is exact here: `cora_wave_
+    /// prepare:325` is `position(|x| !x.is_nan())` over the single close
+    /// series.
+    F64KernelSpec {
+        indicator_id: "cora_wave",
+        kernel: F64Kernel::CoraWave,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+
+    /// `dma.rs:296`. `dma_prepare:395` is `!is_nan` over close.
+    F64KernelSpec {
+        indicator_id: "dma",
+        kernel: F64Kernel::Dma,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+
+    /// `fvg_trailing_stop.rs:1035` -- the UPPER band (cpu_batch.rs:14884).
+    /// `Ignored` because the batch takes `fvg_trailing_stop_with_kernel`
+    /// (:1040), which allocates with `alloc_uninit_f64` and applies NO warmup
+    /// prefix at all: the loop runs from bar 0 and writes every bar.
+    F64KernelSpec {
+        indicator_id: "fvg_trailing_stop",
+        kernel: F64Kernel::FvgTrailingStop,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `halftrend.rs:298` -- the `halftrend` column (cpu_batch.rs:14979).
+    /// `Ignored` and derived in the kernel: `first_valid_ohlc` (:291) takes
+    /// the MIN of three INDEPENDENT scans, which no declared rule expresses --
+    /// `HlcMaxOfIndependentFirsts` is the MAX and names a LATER bar, and the
+    /// index sets both the NaN prefix and the ATR and SMA seed windows.
+    F64KernelSpec {
+        indicator_id: "halftrend",
+        kernel: F64Kernel::Halftrend,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `mod_god_mode.rs:555` -- the WAVETREND column (cpu_batch.rs:15556).
+    /// `Hlcv` because the batch default is `use_volume = true`
+    /// (cpu_batch.rs:15521) and the money-flow term reads `volume[i]`.
+    /// `Ignored` and derived in the kernel: `mod_god_mode_into_slices:693`
+    /// scans CLOSE ALONE, while `AllInputsNonNan` over an `Hlcv` shape would
+    /// scan all four and name a later bar.
+    F64KernelSpec {
+        indicator_id: "mod_god_mode",
+        kernel: F64Kernel::ModGodMode,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `ott.rs:275`. `ott_prepare:349` is `!is_nan` over close, and the VAR
+    /// moving average rescans the same series to the same index, so the NaN
+    /// prefix is that index.
+    F64KernelSpec {
+        indicator_id: "ott",
+        kernel: F64Kernel::Ott,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+
+    /// `otto.rs:1599` -- the HOTT column (cpu_batch.rs:15680). `Ignored`
+    /// because `otto_with_kernel:1605` allocates with
+    /// `alloc_with_nan_prefix(len, 0)` -- there is NO warmup prefix, both
+    /// passes walk from bar 0, and a first-valid index would name a bar the
+    /// CPU never skips.
+    F64KernelSpec {
+        indicator_id: "otto",
+        kernel: F64Kernel::Otto,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `prb.rs:938` -- the `values` column (cpu_batch.rs:15857).
+    /// `prb_with_kernel:1385` is `!is_nan` over close.
+    F64KernelSpec {
+        indicator_id: "prb",
+        kernel: F64Kernel::Prb,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::AllInputsNonNan,
+    },
+
+    // ------------------------------------------------------ closer 2, round 3
+    //
+    // Ten indicators whose `.cu` file ALREADY held a real double-in/double-out
+    // kernel that this lane could not call, because every one of those entry
+    // points is MULTI-OUTPUT with a bespoke parameter list -- 21, 14, 10, 16,
+    // 28, 19, 22, 25, 11 and 15 parameters, writing between two and thirteen
+    // output matrices each, three of them also demanding caller-allocated
+    // scratch matrices and three more calling `new double[]` on the DEVICE.
+    // The lane launches one shape and allocates ONE output matrix, so each file
+    // now carries a lane-shaped `<id>_neo_batch_f64` twin written against the
+    // CPU reference named in that file's
+    // "NEOETHOS f64 LANE  --  closer 2, round 3" header.
+    //
+    // EVERY ONE DECLARES `Ignored`, for the same reason in all ten: the CPU row
+    // function writes EVERY index of the emitted column -- NaN wherever its
+    // state machine is not ready -- so whatever prefix `alloc_with_nan_prefix`
+    // laid down is overwritten wholesale and there is no start index for the
+    // two sides to disagree about. Each kernel derives its own readiness from
+    // its own counters, exactly as the CPU does. Two of them go further and
+    // derive a start index that NONE of the rules in `F64FirstValidRule` can
+    // express: `possible_rsi` and `price_moving_average_ratio_percentile` reach
+    // into `rsi.rs:284` / `sma.rs:274`, both of which scan with
+    // `position(|x| !x.is_nan())` -- which ACCEPTS an infinity. Declaring
+    // `AllInputsNonNan` for those two would be a claim the kernels do not
+    // honour.
+    //
+    // THREE INPUT KINDS ARE NARROWER THAN THEY LOOK, each read out of the CPU
+    // rather than assumed:
+    //
+    //  * `normalized_resonator` is `Hl2Slice`, not `CloseSlice`. Its
+    //    DEFAULT_SOURCE is "hl2" (normalized_resonator.rs:37) and the batch's
+    //    `get_enum_param` default is "hl2". Handing it close computes a
+    //    different indicator and passes every length check on the way through.
+    //  * `normalized_volume_true_range` and `range_breakout_signals` are
+    //    `Ohlcv5`, not `Hlcv`: both read OPEN at every bar -- the first because
+    //    its default Body style measures `close - open`
+    //    (normalized_volume_true_range.rs:511), the second because both the
+    //    bar's body and its signed-volume split compare `close` against `open`
+    //    (range_breakout_signals.rs:895, :1000) -- so a four-pointer shape
+    //    would drop the series they are built on.
+    //  * `relative_strength_index_wave_indicator` is `Hlc` because it runs
+    //    THREE independent Wilder RSIs -- on the source, on high and on low
+    //    (:601-603) -- and the third pointer is the SOURCE, which defaults to
+    //    close.
+    //
+    // TWO OF THE TEN HAVE NO `value` OUTPUT ON THE CPU AT ALL, so the column
+    // each kernel emits is named here rather than left to be discovered:
+    // `normalized_resonator`'s batch accepts only "oscillator" and "signal", so
+    // the kernel emits oscillator; `range_filtered_trend_signals`'s batch
+    // REJECTS "value" and accepts thirteen named columns, so the kernel emits
+    // kalman -- the first arm of its own CPU match and the filtered price the
+    // indicator is named after. The other eight emit what `output_id ==
+    // "value"` resolves to: trailing_stop, value, normalized_volume, value,
+    // plotline, range_top, value and rsi_ma1.
+
+    /// `neighboring_trailing_stop.rs:858` -- the `trailing_stop` column
+    /// (cpu_batch.rs:9043, `"trailing_stop" | "value"`).
+    F64KernelSpec {
+        indicator_id: "neighboring_trailing_stop",
+        kernel: F64Kernel::NeighboringTrailingStop,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `nonlinear_regression_zero_lag_moving_average.rs:729` -- the `value`
+    /// column (cpu_batch.rs:7666).
+    F64KernelSpec {
+        indicator_id: "nonlinear_regression_zero_lag_moving_average",
+        kernel: F64Kernel::NonlinearRegressionZeroLagMovingAverage,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `normalized_resonator.rs:731` -- the `oscillator` column. Source hl2.
+    F64KernelSpec {
+        indicator_id: "normalized_resonator",
+        kernel: F64Kernel::NormalizedResonator,
+        input: F64InputKind::Hl2Slice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `normalized_volume_true_range.rs:791` -- the `normalized_volume` column
+    /// (`"normalized_volume" || "value"`). Open is an input.
+    F64KernelSpec {
+        indicator_id: "normalized_volume_true_range",
+        kernel: F64Kernel::NormalizedVolumeTrueRange,
+        input: F64InputKind::Ohlcv5,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `possible_rsi.rs:1359` -- the `value` column. The ONLY row of this batch
+    /// that is period-SWEPT: its CPU batch reads a parameter literally named
+    /// `period` (default 32) and it is the RSI length.
+    F64KernelSpec {
+        indicator_id: "possible_rsi",
+        kernel: F64Kernel::PossibleRsi,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `price_moving_average_ratio_percentile.rs:715` -- the `plotline` column
+    /// (`"plotline" || "value"`), which at the CPU default `line_mode = "pmar"`
+    /// is `pmar` itself (:707-710). Volume is bound and unread at ma_type
+    /// "sma", and named so the launch cannot pass one series where the kernel
+    /// asked for two.
+    F64KernelSpec {
+        indicator_id: "price_moving_average_ratio_percentile",
+        kernel: F64Kernel::PriceMovingAverageRatioPercentile,
+        input: F64InputKind::CloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `range_breakout_signals.rs:1381` -- the `range_top` column
+    /// (`"range_top" || "value"`). Open and volume are inputs.
+    F64KernelSpec {
+        indicator_id: "range_breakout_signals",
+        kernel: F64Kernel::RangeBreakoutSignals,
+        input: F64InputKind::Ohlcv5,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `range_filtered_trend_signals.rs:744` -- the `kalman` column. Its CPU
+    /// batch REJECTS "value".
+    F64KernelSpec {
+        indicator_id: "range_filtered_trend_signals",
+        kernel: F64Kernel::RangeFilteredTrendSignals,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `regression_slope_oscillator.rs:564` -- the `value` column.
+    F64KernelSpec {
+        indicator_id: "regression_slope_oscillator",
+        kernel: F64Kernel::RegressionSlopeOscillator,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+
+    /// `relative_strength_index_wave_indicator.rs:708` -- the `rsi_ma1` column
+    /// (`"rsi_ma1" || "value"`). The third pointer is the SOURCE, default close.
+    F64KernelSpec {
+        indicator_id: "relative_strength_index_wave_indicator",
+        kernel: F64Kernel::RelativeStrengthIndexWaveIndicator,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // ------------------------------------------------ closer 1, round 3
+    //
+    // Ten indicators whose `.cu` file already shipped a genuine
+    // double-in/double-out kernel that this table could not name, because
+    // every one of those entry points is MULTI-OUTPUT with a bespoke
+    // parameter list rather than the lane ABI. Each file now carries a
+    // `*_neo_batch_f64` entry point beside what it had, written against the
+    // CPU reference named in that file's `NEOETHOS f64 LANE  --  closer 1,
+    // round 3` header. All ten are PERIOD-INVARIANT, so `first_valid` is
+    // `Ignored` and every swept period gives the same column.
+    // Emits `basis`. The CPU batch (cpu_batch.rs:8850-8946) accepts eighteen
+    // output ids and has NO `value` alias, so a parity run must name the column;
+    // `basis` is aliased `middle` there and is the series every band is offset
+    // from. `Ohlc4` because `valid_bar` reads all four and the source is hlc3.
+    F64KernelSpec {
+        indicator_id: "fibonacci_entry_bands",
+        kernel: F64Kernel::FibonacciEntryBands,
+        input: F64InputKind::Ohlc4,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // The ONLY bar-parallel row of this batch. `compute_row`
+    // (goertzel_cycle_composite_wave.rs:886-901) recomputes each 601-bar window
+    // independently and carries NOTHING between bars, so the recurrence is
+    // inside the window and the kernel is launched over (combo, bar).
+    F64KernelSpec {
+        indicator_id: "goertzel_cycle_composite_wave",
+        kernel: F64Kernel::GoertzelCycleCompositeWave,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // Emits `estimate`. `TimestampCloseVolume` because the CPU door that works
+    // at default parameters is the Candles one: it INFERS `slots_per_day` from
+    // the bar timestamps (half_causal_estimator.rs:1319) and takes VOLUME as the
+    // source. The Slice door needs an explicit `slots_per_day` and the batch
+    // passes None (cpu_batch.rs:9573), which is `MissingSlotsPerDay`.
+    F64KernelSpec {
+        indicator_id: "half_causal_estimator",
+        kernel: F64Kernel::HalfCausalEstimator,
+        input: F64InputKind::TimestampCloseVolume,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // Emits `signal`, which cpu_batch.rs:10906 also aliases as `value`.
+    F64KernelSpec {
+        indicator_id: "ichimoku_oscillator",
+        kernel: F64Kernel::IchimokuOscillator,
+        input: F64InputKind::Hlc,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // `insync_index` has NO `compute_*_batch` arm in cpu_batch.rs at all; the
+    // CPU reference is the scalar `insync_index_with_kernel`, one `values`
+    // vector. `Hlcv` -- the validity gate reads volume and requires it > 0.
+    F64KernelSpec {
+        indicator_id: "insync_index",
+        kernel: F64Kernel::InsyncIndex,
+        input: F64InputKind::Hlcv,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "linear_regression_intensity",
+        kernel: F64Kernel::LinearRegressionIntensity,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // Emits `diff`, which cpu_batch.rs:13600 also aliases as `value`. `Ohlc4`
+    // because the validity gate is four-way finite even though only `close`
+    // reaches this column.
+    F64KernelSpec {
+        indicator_id: "macd_wave_signal_pro",
+        kernel: F64Kernel::MacdWaveSignalPro,
+        input: F64InputKind::Ohlc4,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    // Emits `mesa_1`. cpu_batch.rs:10604-10629 accepts eight output ids --
+    // mesa_1..4 and trigger_1..4 -- and has NO `value` alias, so a parity run
+    // must name the column; mesa_1 is the longest line (length_1 = 48).
+    F64KernelSpec {
+        indicator_id: "mesa_stochastic_multi_length",
+        kernel: F64Kernel::MesaStochasticMultiLength,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "moving_average_cross_probability",
+        kernel: F64Kernel::MovingAverageCrossProbability,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
+    F64KernelSpec {
+        indicator_id: "multi_length_stochastic_average",
+        kernel: F64Kernel::MultiLengthStochasticAverage,
+        input: F64InputKind::CloseSlice,
+        first_valid: F64FirstValidRule::Ignored,
+    },
 ];
 
 
@@ -3000,6 +3624,113 @@ pub fn f64_kernel_for(indicator_id: &str) -> Option<&'static F64KernelSpec> {
 
 }
 
+// ---------------------------------------------------------------------------
+// The three MOVING-AVERAGE DISPATCHERS — closer 6, round 3
+// ---------------------------------------------------------------------------
+
+/// `ma`, `ma_batch` and `ma_stream` are not indicators and never will be.
+///
+/// `ma.rs:200` is `ma(ma_type: &str, data, period)`: a `match` over the name of
+/// a family member that forwards to that member's own implementation. It owns
+/// no arithmetic, which is why there is no `ma_kernel.cu` and no
+/// `F64KernelSpec` row for it — a row would have to name an entry point, and
+/// there is no entry point for "whichever moving average you meant".
+/// `ma_batch.rs:122` and `ma_stream.rs:199` are the same dispatcher over the
+/// batch and streaming shapes.
+///
+/// That is a STRUCTURAL obstruction, stated specifically: the id does not
+/// determine the computation. It is not a difficulty claim, and the remedy is
+/// not a kernel — it is ROUTING, which is what this section is.
+pub const MA_DISPATCHER_IDS: &[&str] = &["ma", "ma_batch", "ma_stream"];
+
+/// Is this id one of the three dispatchers rather than an indicator?
+pub fn is_ma_dispatcher(indicator_id: &str) -> bool {
+    MA_DISPATCHER_IDS.contains(&indicator_id)
+}
+
+/// The aliases `ma.rs` accepts that are NOT the family member's own id.
+///
+/// Read straight off the match arms rather than guessed: `"corrected_moving_
+/// average" | "cma"` (ma.rs:263), `"highpass2" | "highpass_2_pole"` (:503),
+/// `"volatility_adjusted_ma" | "vama"` (:1397). Every other arm's pattern is
+/// the id itself, so no table entry is needed for it.
+const MA_TYPE_ALIASES: &[(&str, &str)] = &[
+    ("cma", "corrected_moving_average"),
+    ("highpass2", "highpass_2_pole"),
+    ("vama", "volatility_adjusted_ma"),
+];
+
+/// Normalise an `ma_type` the way `ma.rs:201` does — `trim().to_lowercase()` —
+/// and then resolve the three aliases above.
+fn canonical_ma_type(ma_type: &str) -> String {
+    let lowered = ma_type.trim().to_lowercase();
+    for (alias, canonical) in MA_TYPE_ALIASES {
+        if lowered == *alias {
+            return (*canonical).to_string();
+        }
+    }
+    lowered
+}
+
+/// Route a dispatcher request to the f64 kernel of the family member named by
+/// `ma_type`.
+///
+/// This is what `ma` / `ma_batch` / `ma_stream` need instead of a kernel. The
+/// caller supplies the `ma_type` it would have handed `ma.rs:200`; the answer
+/// is the [`F64KernelSpec`] of that member, with its own input kind and its own
+/// first-valid rule — never a generic one, because the family members do not
+/// agree on either.
+///
+/// # Failure is loud and names what was asked for
+///
+/// * an `ma_type` this crate does not know, or one whose family member has no
+///   f64 kernel yet, produces an `Err` naming the requested type. There is no
+///   arm that substitutes `sma` for an unrecognised name — `ma.rs:1118` does
+///   exactly that on the CPU (`eprintln!` then "Defaulting to 'sma'"), and
+///   silently computing a different moving average is precisely the class of
+///   defect this lane exists to remove.
+/// * a `dispatcher_id` that is not one of the three is an `Err` too, rather
+///   than being quietly treated as one.
+pub fn resolve_f64_kernel_for_ma_type(
+    dispatcher_id: &str,
+    ma_type: &str,
+) -> Result<&'static F64KernelSpec, IndicatorDispatchError> {
+    if !is_ma_dispatcher(dispatcher_id) {
+        return Err(IndicatorDispatchError::InvalidParam {
+            indicator: dispatcher_id.to_string(),
+            key: "ma_type".to_string(),
+            reason: format!(
+                "'{dispatcher_id}' is not a moving-average dispatcher; the dispatchers are {}",
+                MA_DISPATCHER_IDS.join(", ")
+            ),
+        });
+    }
+
+    let canonical = canonical_ma_type(ma_type);
+    if canonical.is_empty() {
+        return Err(IndicatorDispatchError::InvalidParam {
+            indicator: dispatcher_id.to_string(),
+            key: "ma_type".to_string(),
+            reason: "empty; the dispatcher cannot pick a family member without one".to_string(),
+        });
+    }
+
+    f64_kernel_for(&canonical).ok_or_else(|| IndicatorDispatchError::InvalidParam {
+        indicator: dispatcher_id.to_string(),
+        key: "ma_type".to_string(),
+        reason: format!(
+            "'{ma_type}' resolves to '{canonical}', which has no f64 CUDA kernel. The f64 lane \
+             does not fall back to f32, does not fall back to the CPU, and does not substitute \
+             another moving average. Indicators with an f64 kernel: {}",
+            F64_KERNELS
+                .iter()
+                .map(|s| s.indicator_id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
 /// Resolve an indicator id to its `*_f64` entry point, or fail by name.
 ///
 /// This is the whole of item 2 of the f64 contract: an f64 request selects an
@@ -3009,6 +3740,24 @@ pub fn f64_kernel_for(indicator_id: &str) -> Option<&'static F64KernelSpec> {
 pub fn resolve_f64_kernel(
     indicator_id: &str,
 ) -> Result<&'static F64KernelSpec, IndicatorDispatchError> {
+    // closer 6, round 3: the three dispatchers get a reason, not the generic
+    // "no kernel" message. `CudaF64KernelMissing` reads as "this indicator is
+    // still owed a kernel", and for these three that would be false forever --
+    // they own no arithmetic. What they are owed is an `ma_type`, and
+    // `resolve_f64_kernel_for_ma_type` is the door.
+    if is_ma_dispatcher(indicator_id) {
+        return Err(IndicatorDispatchError::InvalidParam {
+            indicator: indicator_id.to_string(),
+            key: "ma_type".to_string(),
+            reason: format!(
+                "'{indicator_id}' is a moving-average DISPATCHER, not an indicator: \
+                 ma.rs:200 / ma_batch.rs:122 / ma_stream.rs:199 select a family member \
+                 and own no arithmetic, so there is no kernel by construction. Call \
+                 resolve_f64_kernel_for_ma_type with the ma_type you meant."
+            ),
+        });
+    }
+
     f64_kernel_for(indicator_id).ok_or_else(|| IndicatorDispatchError::CudaF64KernelMissing {
         indicator: indicator_id.to_string(),
         available: F64_KERNELS
@@ -3133,7 +3882,12 @@ fn inputs_for(
         // from close according to this same declaration. Two names for one
         // shape is the point — it makes the wrong pairing a compile-time
         // mismatch in the table rather than a plausible-looking number.
+        // closer 6, round 3: `Hlcc4Volume` joins the same shape for the same
+        // reason -- the pair carries hlcc4 rather than close or hlc3, and which
+        // one it is has already been settled by `GpuIndicatorEngine::data_ref`
+        // reading this very declaration.
         (F64InputKind::Hlc3Volume, IndicatorCudaDeviceDataRefF64::CloseVolume(r))
+        | (F64InputKind::Hlcc4Volume, IndicatorCudaDeviceDataRefF64::CloseVolume(r))
         | (F64InputKind::CloseVolume, IndicatorCudaDeviceDataRefF64::CloseVolume(r)) => {
             Ok(F64Inputs::PriceVolume {
                 price: r.close(),
@@ -3195,8 +3949,27 @@ fn inputs_for(
         (F64InputKind::Ohlc4, _) => Err(mismatch(
             "Ohlc or Ohlcv (open, high, low and close -- this indicator reads open)",
         )),
+        // closer 6, round 3
+        (F64InputKind::Hlcc4Volume, _) => Err(mismatch(
+            "CloseVolume built from HLCC4 and volume (the CPU default source here is \
+             hlcc4, not close and not hlc3)",
+        )),
         (F64InputKind::TimestampCloseVolume, _) => Err(mismatch(
             "TimestampCloseVolume — vwap is anchored by calendar bucket, so the bar timestamps are an input, not metadata",
+        )),
+        // THE ONE BUILD, round 2 — these two kinds were added by closer 5
+        // together with their `Slice` acceptance arm, but neither got the
+        // trailing mismatch arm every other kind has, so the match was
+        // non-exhaustive. rustc named only `Hlcc4Slice` (it reports one
+        // witness set); `VolumeSlice` was the same omission one arm later and
+        // would have failed the very next round. Both are closed here.
+        (F64InputKind::Hlcc4Slice, _) => Err(mismatch(
+            "an explicit Slice over the hlcc4 series (the CPU source for this indicator is \
+             hlcc4, not close and not hlc3)",
+        )),
+        (F64InputKind::VolumeSlice, _) => Err(mismatch(
+            "an explicit Slice over the VOLUME series (this indicator reads volume alone and \
+             never a price series)",
         )),
     }
 }
@@ -3623,6 +4396,34 @@ mod tests {
             //   same answer with one run, so there is no single first-valid
             //   index that describes the output.
             ("market_structure_trailing_stop", F64FirstValidRule::Ignored),
+            // ------------------------------------------- closer 4, round 3
+            // bandpass.rs:255 -- `position(|x| x.is_finite())`, not `!is_nan`.
+            //   An INFINITE bar is skipped by the CPU and would be accepted by
+            //   the common rule.
+            ("bandpass", F64FirstValidRule::CloseFinite),
+            // buff_averages.rs:470 -- PRICE ALONE, `!is_nan`. Volume is never
+            //   scanned, so the common rule over the (close, volume) pair this
+            //   row declares would name a later bar on any frame whose volume
+            //   has a hole. Derived in the kernel.
+            ("buff_averages", F64FirstValidRule::Ignored),
+            // fvg_trailing_stop.rs:1040 -- the batch takes
+            //   `fvg_trailing_stop_with_kernel`, which allocates with
+            //   `alloc_uninit_f64` and applies NO warmup prefix; the loop runs
+            //   from bar 0 and writes every bar.
+            ("fvg_trailing_stop", F64FirstValidRule::Ignored),
+            // halftrend.rs:291 `first_valid_ohlc` -- the MIN of three
+            //   INDEPENDENT scans, `fh.min(fl).min(fc)`. No variant expresses
+            //   it: HlcMaxOfIndependentFirsts is the MAX and names a LATER
+            //   bar. Derived in the kernel.
+            ("halftrend", F64FirstValidRule::Ignored),
+            // mod_god_mode.rs:693 -- CLOSE ALONE, `!is_nan`, while the row is
+            //   registered Hlcv; the common rule over that shape scans all
+            //   four series. Derived in the kernel.
+            ("mod_god_mode", F64FirstValidRule::Ignored),
+            // otto.rs:1605 -- `alloc_with_nan_prefix(len, 0)`. There is no
+            //   warmup prefix at all and both passes walk from bar 0, so a
+            //   first-valid index would name a bar the CPU never skips.
+            ("otto", F64FirstValidRule::Ignored),
         ];
 
         for spec in F64_KERNELS {

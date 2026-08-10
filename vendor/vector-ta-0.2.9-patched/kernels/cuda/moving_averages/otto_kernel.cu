@@ -268,3 +268,226 @@ void otto_many_series_one_param_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: otto_into_slices (src/indicators/otto.rs:1154-1420), the
+// general VAR arm, reached through otto_with_kernel (:1599).
+//
+// The all_finite fast path at :1183 (otto_var_clean_two_pass_into_slices,
+// :1427) is NOT a second formula: it is the general arm with the two NaN
+// guards removed -- `val = if x.is_nan() { 0.0 } else { x }` (:1217) and
+// `if !x.is_finite() || !prev_x.is_finite() { d = 0.0 }` (:1221). On a frame
+// where every bar is finite those guards are no-ops, so the general body
+// below reproduces BOTH paths bar for bar.
+//
+// OUTPUT: the HOTT column -- compute_otto_batch (cpu_batch.rs:15680) resolves
+// output_id == "value" to out.hott.
+//
+// PERIOD-INVARIANT: that batch reads ott_period (2), ott_percent (0.6),
+// fast_vidya_length (10), slow_vidya_length (25), correcting_constant
+// (100000.0) and ma_type ("VAR") and NEVER `period` (cpu_batch.rs:15657-15662).
+// A sweep of five periods gets five identical CPU columns, so this kernel
+// writes five identical rows.
+//
+// FIRST-VALID: Ignored, and that is the contract. Both otto arms walk from
+// bar 0 and write every bar; otto_with_kernel allocates with
+// alloc_with_nan_prefix(len, 0) (:1605), so there is no warmup prefix at all
+// and a first-valid index would name a bar the CPU never skips.
+//
+// SHAPE: one thread per combo, TWO ascending passes. The first builds lott
+// from three variable-alpha EMAs driven by a nine-wide CMO ring; the second
+// reads lott back, drives a second nine-wide CMO ring and a fourth EMA, and
+// ratchets the band. The second pass reads the first pass's whole output, so
+// lott is written into the row and read back before the row is overwritten.
+// ===========================================================================
+
+#define OTTO_NEO_CMO_P 9
+
+static __forceinline__ __device__ double otto_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void otto_neo_batch_f64(const double* __restrict__ data,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+    (void)periods;      // PERIOD-INVARIANT -- see the header.
+    (void)first_valid;  // Ignored -- see the header.
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = otto_neo_qnan();
+
+    const int ott_p = 2;                    // cpu_batch.rs:15657
+    const double ott_percent = 0.6;         // :15658
+    const int fast_vidya = 10;              // :15659
+    const int slow_vidya = 25;              // :15660
+    const double coco = 100000.0;           // :15661
+
+    // otto_prepare, :1121-1140. first_valid_idx_and_all_finite errors when
+    // every bar is NaN; `needed` is (slow * fast).max(10).
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(data[i])) { first = i; break; }
+    }
+    int needed = slow_vidya * fast_vidya;
+    if (needed < 10) needed = 10;
+
+    bool refused = false;
+    if (first < 0) refused = true;
+    if (ott_p <= 0 || ott_p > n) refused = true;
+    if (!refused && (n - first) < needed) refused = true;
+
+    const int p1 = slow_vidya / 2;
+    const int p2 = slow_vidya;
+    const int p3 = slow_vidya * fast_vidya;
+    if (p1 == 0 || p2 == 0 || p3 == 0) refused = true;   // :1174
+
+    if (refused) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    const double a1_base = 2.0 / ((double)p1 + 1.0);
+    const double a2_base = 2.0 / ((double)p2 + 1.0);
+    const double a3_base = 2.0 / ((double)p3 + 1.0);
+
+    double ring_up[OTTO_NEO_CMO_P];
+    double ring_dn[OTTO_NEO_CMO_P];
+    for (int k = 0; k < OTTO_NEO_CMO_P; ++k) { ring_up[k] = 0.0; ring_dn[k] = 0.0; }
+    double sum_up = 0.0, sum_dn = 0.0;
+    int head = 0;
+
+    double v1 = 0.0, v2 = 0.0, v3 = 0.0;
+    double prev_x = data[0];
+
+    // ---------------------------------------------------------------- pass 1
+    // :1215-1263 -- lott. Written into the row and read back by pass 2.
+    for (int i = 0; i < n; ++i) {
+        const double x = data[i];
+        const double val = isnan(x) ? 0.0 : x;
+
+        if (i > 0) {
+            double d = x - prev_x;
+            if (!isfinite(x) || !isfinite(prev_x)) d = 0.0;
+
+            if (i >= OTTO_NEO_CMO_P) {
+                sum_up -= ring_up[head];
+                sum_dn -= ring_dn[head];
+            }
+
+            const double up = (d > 0.0) ? d : 0.0;
+            const double dn = (d > 0.0) ? 0.0 : -d;
+            ring_up[head] = up;
+            ring_dn[head] = dn;
+            sum_up += up;
+            sum_dn += dn;
+
+            head += 1;
+            if (head == OTTO_NEO_CMO_P) head = 0;
+
+            prev_x = x;
+        }
+
+        double cmo_abs = 0.0;
+        if (i >= OTTO_NEO_CMO_P) {
+            const double denom = sum_up + sum_dn;
+            cmo_abs = (denom != 0.0) ? fabs((sum_up - sum_dn) / denom) : 0.0;
+        }
+
+        const double a1 = a1_base * cmo_abs;
+        const double a2 = a2_base * cmo_abs;
+        const double a3 = a3_base * cmo_abs;
+        v1 = a1 * val + (1.0 - a1) * v1;
+        v2 = a2 * val + (1.0 - a2) * v2;
+        v3 = a3 * val + (1.0 - a3) * v3;
+
+        const double denom_l = (v2 - v3) + coco;
+        row[i] = v1 / denom_l;
+    }
+
+    // ---------------------------------------------------------------- pass 2
+    // :1268-1360 -- the VAR moving average over lott, then the band ratchet.
+    const double fark = ott_percent * 0.01;
+    const double scale_up = (200.0 + ott_percent) / 200.0;
+    const double scale_dn = (200.0 - ott_percent) / 200.0;
+
+    double ring_up2[OTTO_NEO_CMO_P];
+    double ring_dn2[OTTO_NEO_CMO_P];
+    for (int k = 0; k < OTTO_NEO_CMO_P; ++k) { ring_up2[k] = 0.0; ring_dn2[k] = 0.0; }
+    double sum_up2 = 0.0, sum_dn2 = 0.0;
+    int head2 = 0;
+    double prev_lott = row[0];
+
+    const double a_base = 2.0 / ((double)ott_p + 1.0);
+    double ma_prev = 0.0;
+
+    double long_stop_prev = nn;
+    double short_stop_prev = nn;
+    int dir_prev = 1;
+
+    for (int i = 0; i < n; ++i) {
+        const double lott_i = row[i];
+
+        if (i > 0) {
+            double d = lott_i - prev_lott;
+            if (!isfinite(lott_i) || !isfinite(prev_lott)) d = 0.0;
+            if (i >= OTTO_NEO_CMO_P) {
+                sum_up2 -= ring_up2[head2];
+                sum_dn2 -= ring_dn2[head2];
+            }
+            const double up = (d > 0.0) ? d : 0.0;
+            const double dn = (d > 0.0) ? 0.0 : -d;
+            ring_up2[head2] = up;
+            ring_dn2[head2] = dn;
+            sum_up2 += up;
+            sum_dn2 += dn;
+            head2 += 1;
+            if (head2 == OTTO_NEO_CMO_P) head2 = 0;
+            prev_lott = lott_i;
+        }
+
+        double c_abs = 0.0;
+        if (i >= OTTO_NEO_CMO_P) {
+            const double denom = sum_up2 + sum_dn2;
+            c_abs = (denom != 0.0) ? fabs((sum_up2 - sum_dn2) / denom) : 0.0;
+        }
+
+        const double a = a_base * c_abs;
+        const double ma = a * lott_i + (1.0 - a) * ma_prev;
+        ma_prev = ma;
+
+        double hott;
+        if (i == 0) {
+            long_stop_prev = ma * (1.0 - fark);
+            short_stop_prev = ma * (1.0 + fark);
+            const double mt = long_stop_prev;
+            hott = (ma > mt) ? (mt * scale_up) : (mt * scale_dn);
+        } else {
+            const double ls = ma * (1.0 - fark);
+            const double ss = ma * (1.0 + fark);
+            // f64::max / f64::min at :1569 and :1574 -- they return the
+            // non-NaN operand, so fmax / fmin, never an if-chain.
+            const double long_stop = (ma > long_stop_prev) ? fmax(ls, long_stop_prev) : ls;
+            const double short_stop = (ma < short_stop_prev) ? fmin(ss, short_stop_prev) : ss;
+            int dir;
+            if (dir_prev == -1 && ma > short_stop_prev) dir = 1;
+            else if (dir_prev == 1 && ma < long_stop_prev) dir = -1;
+            else dir = dir_prev;
+            const double mt = (dir == 1) ? long_stop : short_stop;
+            hott = (ma > mt) ? (mt * scale_up) : (mt * scale_dn);
+            long_stop_prev = long_stop;
+            short_stop_prev = short_stop;
+            dir_prev = dir;
+        }
+        row[i] = hott;
+    }
+}

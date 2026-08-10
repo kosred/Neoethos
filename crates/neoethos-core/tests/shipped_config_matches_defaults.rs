@@ -173,6 +173,32 @@ const ROOT_REGISTERED: &[(&str, &str, &str)] = &[
          would turn a visibly wrong value into an invisible hardcode on the path that spends \
          real money.",
     ),
+    (
+        "models.tree_device_preference",
+        "gpu",
+        "2026-08-10. Default is `auto`. The repo profile asks for the card explicitly, which is \
+         the standing GPU invariant (#35): a machine WITH a card must run on it or fail loudly, \
+         never quietly fall back to CPU and report a number that took 20x longer. Registered \
+         rather than reconciled because `auto` and `gpu` are NOT the same request — the \
+         refuters overturned merging this with `models.tree_runtime.device`, and the two keys \
+         stay distinct.",
+    ),
+    (
+        "models.l1_feature_selection_enabled",
+        "true",
+        "2026-08-10. Default is false. This changes WHAT IS SEARCHED — L1 selection prunes the \
+         feature set before the GA sees it — so it is recorded, not reconciled. The value has \
+         been in this profile throughout the runs the current results came from; flipping it to \
+         match the default would silently change the search on the next run, which is precisely \
+         what this table exists to prevent.",
+    ),
+    (
+        "models.l1_feature_selection_per_regime",
+        "true",
+        "2026-08-10. Default is false. The per-regime half of the same decision; see above. \
+         Both move together — enabling selection globally while disabling it per regime is a \
+         combination nothing in the profile intended.",
+    ),
 ];
 
 /// Divergences in `%LOCALAPPDATA%\neoethos\config.yaml` — the only file a run
@@ -266,6 +292,40 @@ const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
         "true",
         "UNWIRED — see the root entry. Retained as intent.",
     ),
+    (
+        "models.l1_feature_selection_enabled",
+        "true",
+        "2026-08-10. Default is false. Matches the repo profile, so this is consistent rather \
+         than drifted — recorded on both sides so the decision is visible from either end. \
+         Changes WHAT IS SEARCHED; not corrected by code.",
+    ),
+    (
+        "models.l1_feature_selection_per_regime",
+        "true",
+        "2026-08-10. Default is false. The per-regime half of the same decision; matches the \
+         repo profile.",
+    ),
+    (
+        "models.tree_device_preference",
+        "gpu",
+        "2026-08-10. Default is `auto`. His box has a 3090 and the standing GPU invariant (#35) \
+         is that a card present means the card runs it or the run fails loudly. `gpu` is the \
+         stricter, louder side of `auto`, so the safer value is already the one in the file and \
+         nothing is being raised here.",
+    ),
+    (
+        "risk.total_drawdown_limit",
+        "0.07",
+        "MONEY. Default is 0.07000000104308128 — the SAME NUMBER, and the difference is an f32 \
+         constant widened to f64 by the code that wrote the default, not a decision by anyone. \
+         His file carries the clean 0.07, which is FTMO's 0.10 x the 0.7 internal buffer and is \
+         correct for the `preset: ftmo` this store runs. The gap is ~1.0e-9, which is ABOVE this \
+         test's 1e-12 tolerance, so it reports as a divergence and must be recorded. Registered \
+         rather than 'fixed': rewriting a live drawdown limit to a longer spelling of the same \
+         number is a money-path edit that buys nothing, and the f32 fingerprint belongs on the \
+         record — it is the signature that identified the writer behind the two WRONG drawdown \
+         numbers in the repo profile.",
+    ),
 ];
 
 fn repo_root() -> PathBuf {
@@ -332,6 +392,97 @@ fn default_leaves() -> BTreeMap<String, serde_yaml_ng::Value> {
     out
 }
 
+/// `min_sharpe` -> `minSharpe`. One segment only.
+fn snake_to_camel(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut upper_next = false;
+    for ch in segment.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The canonical (serialised) path for a key as it is spelled IN A FILE, or
+/// `None` when no field accepts that spelling.
+///
+/// ## Why this exists — it nearly cost five money-path thresholds
+///
+/// These checks compare file keys against the paths of `Settings::default()`
+/// SERIALISED. That silently assumes the serialised spelling is the only
+/// accepted one. It is not: `PromotionGateConfig` is
+/// `#[serde(rename_all = "camelCase")]` with a snake_case `alias` on every
+/// field, precisely so the operator's YAML reads like the rest of the file.
+/// Both spellings deserialise to the same field.
+///
+/// So `models.promotion_gate.min_sharpe` — a real, loaded, ENFORCED promotion
+/// threshold — did not match the serialised `...minSharpe` and was reported as
+/// "NOT a field of Settings", whose printed remedy is "delete the key from
+/// config.yaml". Following that remedy would have deleted the five thresholds
+/// the promotion gate is judged by, from the profile, on the grounds that they
+/// do not exist. They do.
+///
+/// Resolving the alias mechanically beats an exception list: any future field
+/// that follows the same camelCase-with-snake-alias convention is covered
+/// without anyone remembering to add it here.
+/// `rename_all` is per STRUCT, not per path: `ModelsConfig` keeps
+/// `promotion_gate` in snake_case while `PromotionGateConfig` renames its own
+/// fields to camelCase, so the real default path is
+/// `models.promotion_gate.minSharpe` — neither all-snake nor all-camel.
+/// Each segment is therefore resolved independently, and with paths at most a
+/// few levels deep, enumerating the 2^n spellings is the honest way to say
+/// "either spelling, at every level".
+fn canonical_path(defaults: &BTreeMap<String, serde_yaml_ng::Value>, path: &str) -> Option<String> {
+    if defaults.contains_key(path) {
+        return Some(path.to_string());
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    // Guard against a pathological path turning this into a huge search.
+    if segments.len() > 8 {
+        return None;
+    }
+    for mask in 0u32..(1u32 << segments.len()) {
+        let candidate = segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                if mask & (1 << i) == 0 {
+                    (*seg).to_string()
+                } else {
+                    snake_to_camel(seg)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        if defaults.contains_key(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The compiled default for a key spelled as a file spells it.
+fn default_for<'a>(
+    defaults: &'a BTreeMap<String, serde_yaml_ng::Value>,
+    path: &str,
+) -> Option<&'a serde_yaml_ng::Value> {
+    canonical_path(defaults, path).and_then(|p| defaults.get(&p))
+}
+
+/// Is this file key addressable at all — a field under some accepted spelling,
+/// or the contents of a free-form map?
+fn is_known_key(defaults: &BTreeMap<String, serde_yaml_ng::Value>, path: &str) -> bool {
+    canonical_path(defaults, path).is_some()
+        || OPAQUE_MAPS.contains(&path)
+        || OPAQUE_MAPS.iter().any(|m| path.starts_with(&format!("{m}.")))
+}
+
 /// Numeric-tolerant equality, so `0.8` and `0.80` do not read as a drift.
 fn same(a: &serde_yaml_ng::Value, b: &serde_yaml_ng::Value) -> bool {
     match (a.as_f64(), b.as_f64()) {
@@ -360,22 +511,16 @@ fn assert_no_unknown_keys(path: &Path, remedy: &str) {
     let file = leaves_of_file(path);
     let unknown: Vec<&String> = file
         .keys()
-        .filter(|k| {
-            !defaults.contains_key(*k)
-                // a key that IS an opaque map is fine even though its contents
-                // never appear in the defaults
-                && !OPAQUE_MAPS.contains(&k.as_str())
-                && !OPAQUE_MAPS.iter().any(|m| k.starts_with(&format!("{m}.")))
-        })
+        .filter(|k| !is_known_key(&defaults, k))
         .collect();
 
     assert!(
         unknown.is_empty(),
         "\n{} contains {} key(s) that are NOT fields of Settings:\n{}\n\n\
-         Today serde ignores these silently — no struct sets deny_unknown_fields, so a \
-         misspelled `trailing_enabeld:` parses, saves, and the raw-YAML editor reports \
-         'saved (verbatim)'. That editor is the only route to 364 of the 390 knobs.\n\n\
-         Once deny_unknown_fields lands these become a HARD LOAD FAILURE at startup.\n\n\
+         `deny_unknown_fields` is on, so at startup these are a HARD LOAD FAILURE unless the \
+         key is listed in `load_seal::RETIRED_KEYS` (which names it at WARN and ignores it). \
+         Before this guard existed a misspelled `trailing_enabeld:` parsed, saved, and the \
+         raw-YAML editor reported 'saved (verbatim)'.\n\n\
          {remedy}\n",
         path.display(),
         unknown.len(),
@@ -387,6 +532,31 @@ fn assert_no_unknown_keys(path: &Path, remedy: &str) {
     );
 }
 
+/// The end-to-end contract, asked of the component that actually enforces it.
+///
+/// The key-by-key check above compares against `Settings::default()` serialised
+/// and therefore cannot see two things the real loader does: `RETIRED_KEYS`
+/// (a key with no field that is deliberately accepted, named at WARN, and
+/// ignored) and `#[serde(alias)]`. That is the right check for the REPO
+/// profile, which we control and keep clean. It is the wrong check for the
+/// operator's live store, which legitimately carries retired keys from every
+/// release he has ever run.
+///
+/// So the live store is judged by the only question that matters: **does the
+/// app open?** This cannot drift from the loader, because it IS the loader.
+fn assert_the_loader_accepts(path: &Path, remedy: &str) {
+    if let Err(err) = Settings::from_yaml(path) {
+        panic!(
+            "\n{} DOES NOT LOAD.\n\n{err:?}\n\n\
+             This is a startup failure, not a lint: the app will not open with this file. A key \
+             that is neither a field nor a `RETIRED_KEYS` entry is refused by \
+             `deny_unknown_fields` — which is the intended behaviour for a typo, and a \
+             regression for a key some earlier release wrote.\n\n{remedy}\n",
+            path.display(),
+        );
+    }
+}
+
 #[test]
 fn repo_config_contains_no_key_that_is_not_a_settings_field() {
     let _guard = lock_root_config();
@@ -396,16 +566,29 @@ fn repo_config_contains_no_key_that_is_not_a_settings_field() {
     );
 }
 
+/// The operator's store must still OPEN THE APP.
+///
+/// Deliberately not `assert_no_unknown_keys`: his file carries 55 keys with no
+/// field, and every one of them is a `RETIRED_KEYS` entry that the loader names
+/// at WARN and ignores — which is the whole point of that table. Asserting
+/// "no key without a field" here would demand he delete lines the loader is
+/// explicitly designed to tolerate, and the printed remedy would send him to a
+/// migration script to fix a file that was never broken.
+///
+/// What must never happen is a key that is neither. That is a refused load and
+/// a dark app, and it is what this asks.
 #[test]
-fn the_live_store_contains_no_key_that_is_not_a_settings_field() {
+fn the_live_store_still_loads() {
     let Some(path) = live_store() else {
         return; // no live store on this machine — nothing to check
     };
-    assert_no_unknown_keys(
+    assert_the_loader_accepts(
         &path,
-        "Remedy: run `pwsh scripts/migrate_live_config.ps1` and accept the DROP section. It \
-         backs the file up first, shows the full diff before writing, refuses to run \
-         unattended, and lists money-path changes separately. Do NOT hand-edit the live store.",
+        "Remedy: add the key to `load_seal::RETIRED_KEYS` in config.rs if a past release wrote \
+         it (it will then be named at WARN and ignored), or restore the field it names. If it \
+         is a typo, run `pwsh scripts/migrate_live_config.ps1`, which backs the file up first, \
+         shows the full diff before writing, and refuses to run unattended. Do NOT hand-edit \
+         the live store.",
     );
 }
 
@@ -419,7 +602,7 @@ fn assert_pinned(path: &Path, table: &[(&str, &str, &str)], which: &str) {
     let mut failures: Vec<String> = Vec::new();
 
     for key in PINNED {
-        let Some(want_default) = defaults.get(*key) else {
+        let Some(want_default) = default_for(&defaults, key) else {
             // The path is not a field at all. Reported by its own test below.
             continue;
         };
@@ -527,6 +710,17 @@ fn the_repo_config_exists_and_parses() {
     assert!(p.exists(), "repo config missing: {}", p.display());
     let leaves = leaves_of_file(&p);
     assert!(!leaves.is_empty(), "{} parsed to nothing", p.display());
+
+    // Valid YAML is not the bar. `the_repo_profile_carries_only_its_overrides`
+    // REWRITES this file, and a developer reaches it with
+    // `$env:CONFIG_FILE = 'config.yaml'` — the one supported escape hatch. A
+    // rewrite that produced a file the loader refuses would break that hatch,
+    // and YAML-parses-fine is exactly the check that would not notice.
+    assert_the_loader_accepts(
+        &p,
+        "The repo profile must load through the same seal as any other config. If the collapse \
+         produced this, the collapse is wrong — do not hand-patch the file.",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -694,11 +888,7 @@ fn the_repo_profile_carries_only_its_overrides() {
     // redundant nor kept as an override. Refuse, and leave the file alone.
     let unknown: Vec<&String> = file
         .keys()
-        .filter(|k| {
-            !defaults.contains_key(*k)
-                && !OPAQUE_MAPS.contains(&k.as_str())
-                && !OPAQUE_MAPS.iter().any(|m| k.starts_with(&format!("{m}.")))
-        })
+        .filter(|k| !is_known_key(&defaults, k))
         .collect();
     assert!(
         unknown.is_empty(),
@@ -713,7 +903,9 @@ fn the_repo_profile_carries_only_its_overrides() {
     let mut kept: Vec<(&String, &serde_yaml_ng::Value)> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     for (key, value) in &file {
-        match defaults.get(key) {
+        // Alias-aware: a snake_case spelling of a camelCase field is the SAME
+        // key, and dropping it as "unknown" would delete a live override.
+        match default_for(&defaults, key) {
             // Identical to the compiled default: the line says nothing the code
             // does not already say, and removing it cannot change a value.
             Some(d) if same(value, d) => {

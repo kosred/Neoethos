@@ -45,10 +45,14 @@
 // The weights cannot be recomputed inside the lag loop: that would run
 // `2 * (period + 1)` sin/cos per BAR instead of per series. They are built
 // once per thread into a local array, which forces a compile-time bound.
-// WS_MAX_WINDOW is 512, so a period up to 511 is served. A larger period
-// produces an ALL-NaN ROW rather than a wrong number — the same shape
-// `tilson`'s `declined` branch uses, and the cap is restated in the
-// `F64_KERNELS` row so a caller sweeping past it can see why.
+// WS_MAX_PERIOD is 512 and the array is one longer, because the window is
+// `period + 1`.
+//
+// The bound is REFUSED BY NAME on the host: `F64Kernel::max_period` returns
+// `WS_MAX_PERIOD` and `CudaF64Indicators::sweep` (:3864) answers
+// `PeriodTooLarge { indicator, period, max }` before any launch. The in-kernel
+// guard below is the second lock on the same door — if the two constants ever
+// drift, the kernel writes NaN instead of overrunning a local array.
 //
 // ARITHMETIC
 // ----------
@@ -75,8 +79,9 @@
 // The CPU default, wave_smoother.rs:33.
 #define WS_DEFAULT_PHASE 70.0
 
-// See "THE ONE LOCAL ARRAY THAT REMAINS" above.
-#define WS_MAX_WINDOW 512
+// See "THE ONE LOCAL ARRAY THAT REMAINS" above. MUST equal
+// `neoethos_f64_wrapper::WS_MAX_PERIOD`.
+#define WS_MAX_PERIOD 512
 
 __device__ __forceinline__ double ws_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
@@ -115,7 +120,7 @@ extern "C" __global__ void wave_smoother_neo_batch_f64(
         (n <= 0) ||
         (first_valid < 0) || (first_valid >= n) ||
         (period <= 0) ||
-        (window > WS_MAX_WINDOW);
+        (period > WS_MAX_PERIOD);
     if (declined) {
         for (int i = 0; i < n; ++i) row[i] = ws_qnan();
         return;
@@ -123,7 +128,7 @@ extern "C" __global__ void wave_smoother_neo_batch_f64(
 
     // build_normalized_weights (:258). The sum is accumulated ASCENDING, one
     // term at a time, exactly as the CPU loop does.
-    double weights[WS_MAX_WINDOW];
+    double weights[WS_MAX_PERIOD + 1];
     const double phase_rad = WS_DEFAULT_PHASE * (M_PI / 180.0);
     const double period_f = (double)period;
     double sum = 0.0;

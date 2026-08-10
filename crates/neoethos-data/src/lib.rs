@@ -1445,6 +1445,28 @@ where
 pub(crate) static TEST_CUBE_MODE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
+/// Peak RAM the in-memory assembly needs for a cube of `cube_bytes`: the cube
+/// plus ONE timeframe block (~1.1x, demanded as 1.5x for margin) plus a 2 GB
+/// floor for the OS and the GA's working buffers.
+///
+/// Split out of [`should_build_cube_in_ram`] on 2026-08-10. The rule and the
+/// PROBE are two different things, and fusing them made the rule untestable:
+/// `in_ram_budget_tracks_available_memory` read `available_memory_bytes()` to
+/// compute a cube size that should just fail, and `should_build_cube_in_ram`
+/// then read the probe AGAIN. Free RAM moves between two calls on any busy
+/// machine — it moved during this very build — so the test failed on a
+/// correct implementation. A guard that fails when nothing is wrong gets
+/// deleted by the third person who sees it, and then the real regression ships.
+fn cube_ram_requirement_bytes(cube_bytes: u64) -> f64 {
+    (cube_bytes as f64) * 1.5 + 2.0e9
+}
+
+/// The whole decision, against a SUPPLIED reading. Deterministic: same inputs,
+/// same answer, on any machine and at any load.
+fn cube_fits_in(cube_bytes: u64, available_bytes: u64) -> bool {
+    available_bytes != 0 && cube_ram_requirement_bytes(cube_bytes) < available_bytes as f64
+}
+
 fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
     #[cfg(test)]
     {
@@ -1483,8 +1505,8 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
         );
         return false;
     }
-    let needed = (cube_bytes as f64) * 1.5 + 2.0e9;
-    let fits = needed < available as f64;
+    let needed = cube_ram_requirement_bytes(cube_bytes);
+    let fits = cube_fits_in(cube_bytes, available);
 
     tracing::info!(
         target: "neoethos_data::feature_cube",
@@ -2161,13 +2183,29 @@ mod cube_assembly_tests {
         assert!(should_build_cube_in_ram(1));
         assert!(!should_build_cube_in_ram(u64::MAX / 4));
 
-        // The 1.5x + 2 GB rule, checked against the real probe.
-        let available = neoethos_core::available_memory_bytes();
-        if available > 8_000_000_000 {
+        // The 1.5x + 2 GB rule, pinned against a FIXED reading.
+        //
+        // 2026-08-10: this used to read `available_memory_bytes()` to pick a
+        // cube size that should just fail, and then call
+        // `should_build_cube_in_ram`, which read the probe a SECOND time. Free
+        // RAM moves between two calls on a machine that is doing anything at
+        // all — it moved during the build that caught this — so the "must not
+        // fit" cube fit, and a correct implementation failed its own test.
+        // The rule is now checked where it is deterministic.
+        for available in [8_000_000_000u64, 32_000_000_000, 128_000_000_000] {
             let just_fits = (((available as f64) - 2.0e9) / 1.5) as u64;
-            assert!(should_build_cube_in_ram(just_fits.saturating_sub(1_000_000)));
-            assert!(!should_build_cube_in_ram(just_fits + 1_000_000_000));
+            assert!(
+                cube_fits_in(just_fits.saturating_sub(1_000_000), available),
+                "a cube just under the budget must fit at {available} bytes available"
+            );
+            assert!(
+                !cube_fits_in(just_fits + 1_000_000_000, available),
+                "a cube 1 GB over the budget must NOT fit at {available} bytes available"
+            );
         }
+
+        // A failed probe is the safe answer, never 'plenty of room'.
+        assert!(!cube_fits_in(1, 0), "a 0-byte probe must take the disk path");
 
         // An absurd cube can no longer be forced into RAM by any ambient
         // value — which is the never-OOM invariant, stated as a test.

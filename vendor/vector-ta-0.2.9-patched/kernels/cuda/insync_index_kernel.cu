@@ -450,61 +450,42 @@ __device__ __forceinline__ int insync_roc_update(InsyncRoc* s, double value, dou
 // ---------------------------------------------------------------------------
 // The kernel
 // ---------------------------------------------------------------------------
-extern "C" __global__ void insync_index_batch_f64(
+// ---------------------------------------------------------------------------
+// The per-row body, lifted OUT of `insync_index_batch_f64` so the f64 lane can
+// run the same code without the multi-row parameter arrays and the host
+// scratch pointers. Nothing in it changed except the two parameters that were
+// read straight out of a per-row array (`fast_length[row]`,
+// `slow_length[row]`) and are now scalars. One implementation, two callers --
+// the alternative was a second copy of 400 lines, which is the failure this
+// lane exists to remove.
+// ---------------------------------------------------------------------------
+__device__ void insync_index_row_f64(
     const double* __restrict__ high,
     const double* __restrict__ low,
     const double* __restrict__ close,
     const double* __restrict__ volume,
     int len,
-    const int* __restrict__ emo_divisor,
-    const int* __restrict__ emo_length,
-    const int* __restrict__ fast_length,
-    const int* __restrict__ slow_length,
-    const int* __restrict__ mfi_length,
-    const int* __restrict__ bb_length,
-    const double* __restrict__ bb_multiplier,
-    const int* __restrict__ cci_length,
-    const int* __restrict__ dpo_length,
-    const int* __restrict__ roc_length,
-    const int* __restrict__ rsi_length,
-    const int* __restrict__ stoch_length,
-    const int* __restrict__ stoch_d_length,
-    const int* __restrict__ stoch_k_length,
-    const int* __restrict__ sma_length,
-    int rows,
-    int slots,
+    int p_bb,
+    int p_cci,
+    int p_mfi,
+    int p_roc,
+    int p_emo,
+    int p_sma,
+    int p_dpo,
+    int p_rsi,
+    int p_st,
+    int p_std,
+    int p_stk,
+    int p_fast,
+    int p_slow,
+    double emo_div,
+    double bb_mult,
+    double* dbase,
+    int* ibase,
     int seg,
-    double* scratch,
-    int* iscratch,
-    double* out
+    double* row_out
 ) {
-    int slot = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (slot >= slots) {
-        return;
-    }
-
     const double nan_value = insync_qnan();
-    double* dbase = scratch + static_cast<size_t>(slot) * static_cast<size_t>(SEG_DOUBLE_N) *
-                                  static_cast<size_t>(seg);
-    int* ibase = iscratch + static_cast<size_t>(slot) * static_cast<size_t>(ISEG_INT_N) *
-                                static_cast<size_t>(seg);
-
-    for (int row = slot; row < rows; row += slots) {
-        double* row_out = out + static_cast<size_t>(row) * static_cast<size_t>(len);
-
-        int p_bb = bb_length[row];
-        int p_cci = cci_length[row];
-        int p_mfi = mfi_length[row];
-        int p_roc = roc_length[row];
-        int p_emo = emo_length[row];
-        int p_sma = sma_length[row];
-        int p_dpo = dpo_length[row];
-        int p_rsi = rsi_length[row];
-        int p_st = stoch_length[row];
-        int p_std = stoch_d_length[row];
-        int p_stk = stoch_k_length[row];
-        double emo_div = static_cast<double>(emo_divisor[row]);
-        double bb_mult = bb_multiplier[row];
         int barsback = p_dpo / 2 + 1;
         int hist_cap = barsback + 2;
 
@@ -513,8 +494,8 @@ extern "C" __global__ void insync_index_batch_f64(
         InsyncCci cci;
         insync_cci_init(&cci, dbase + SEG_CCI * seg, p_cci);
         InsyncEma macd_fast, macd_slow;
-        insync_ema_init(&macd_fast, fast_length[row]);
-        insync_ema_init(&macd_slow, slow_length[row]);
+        insync_ema_init(&macd_fast, p_fast);
+        insync_ema_init(&macd_slow, p_slow);
         InsyncSma macd_trend;
         insync_sma_init(&macd_trend, dbase + SEG_MACD_TREND * seg, p_sma);
         InsyncSma emo_sma, emo_avg_sma;
@@ -923,5 +904,190 @@ extern "C" __global__ void insync_index_batch_f64(
 
             row_out[i] = score;
         }
+}
+
+extern "C" __global__ void insync_index_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int len,
+    const int* __restrict__ emo_divisor,
+    const int* __restrict__ emo_length,
+    const int* __restrict__ fast_length,
+    const int* __restrict__ slow_length,
+    const int* __restrict__ mfi_length,
+    const int* __restrict__ bb_length,
+    const double* __restrict__ bb_multiplier,
+    const int* __restrict__ cci_length,
+    const int* __restrict__ dpo_length,
+    const int* __restrict__ roc_length,
+    const int* __restrict__ rsi_length,
+    const int* __restrict__ stoch_length,
+    const int* __restrict__ stoch_d_length,
+    const int* __restrict__ stoch_k_length,
+    const int* __restrict__ sma_length,
+    int rows,
+    int slots,
+    int seg,
+    double* scratch,
+    int* iscratch,
+    double* out
+) {
+    int slot = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (slot >= slots) {
+        return;
     }
+
+    double* dbase = scratch + static_cast<size_t>(slot) * static_cast<size_t>(SEG_DOUBLE_N) *
+                                  static_cast<size_t>(seg);
+    int* ibase = iscratch + static_cast<size_t>(slot) * static_cast<size_t>(ISEG_INT_N) *
+                                static_cast<size_t>(seg);
+
+    for (int row = slot; row < rows; row += slots) {
+        double* row_out = out + static_cast<size_t>(row) * static_cast<size_t>(len);
+
+        int p_bb = bb_length[row];
+        int p_cci = cci_length[row];
+        int p_mfi = mfi_length[row];
+        int p_roc = roc_length[row];
+        int p_emo = emo_length[row];
+        int p_sma = sma_length[row];
+        int p_dpo = dpo_length[row];
+        int p_rsi = rsi_length[row];
+        int p_st = stoch_length[row];
+        int p_std = stoch_d_length[row];
+        int p_stk = stoch_k_length[row];
+        double emo_div = static_cast<double>(emo_divisor[row]);
+        double bb_mult = bb_multiplier[row];
+        insync_index_row_f64(
+            high, low, close, volume, len,
+            p_bb, p_cci, p_mfi, p_roc, p_emo, p_sma, p_dpo, p_rsi, p_st, p_std,
+            p_stk, fast_length[row], slow_length[row], emo_div, bb_mult,
+            dbase, ibase, seg, row_out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `insync_index_with_kernel`
+// (src/indicators/insync_index.rs:1322) -> `insync_index_compute_into` (:1304)
+// -> `InsyncIndexStream::update_reset_on_nan`.
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `insync_index_batch_f64` (now :909) is double-clean AND already single-output
+// -- it writes ONE `row_out[i] = score` -- but its ABI is twenty-six parameters:
+// fifteen `const int*` / `const double*` per-row parameter arrays plus `slots`,
+// `seg` and two host-allocated scratch pointers. The f64 lane launches ONE
+// shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// with no scratch to give, so the lane gets its own entry point here.
+//
+// AND IT IS NOT A COPY. The 400-line per-row body was LIFTED into
+// `insync_index_row_f64` (:462) and both entry points now call it. The only
+// change to that body was turning `fast_length[row]` / `slow_length[row]` into
+// scalar parameters. Duplicating it would have put two implementations of one
+// indicator in one file, which is the failure this lane exists to remove.
+//
+// WHICH COLUMN: the single `value` series. `insync_index` has no `compute_*_
+// batch` arm in `cpu_batch.rs` at all -- the CPU reference is the scalar
+// `insync_index_with_kernel`, which returns one `values` vector.
+//
+// SHAPE: one thread per combo, bars ascending. Ten sub-indicators (Bollinger
+// %b, CCI, MACD, EMV, MFI, DPO, ROC, RSI, stochastic K and D) each with their
+// own carried state, and the CPU RESETS EVERY ONE of them at any bar that is
+// not `valid_bar` (insync_index.rs:409 -- four-way finite, volume > 0 and
+// high >= low). A bar-parallel form cannot know which segment it is in.
+//
+// SCRATCH IS PER-THREAD AND COMPILE-TIME BOUNDED. The lifted body lays every
+// ring out at a stride `seg`; the host computes that stride as the widest ring
+// any swept row asks for (insync_index_wrapper.rs:206-256). At the pinned
+// defaults the widest is 20 (`bb_length` and `mfi_length`), and this kernel
+// declares 24 -- above the widest and with headroom, so the same layout code
+// runs unchanged. That is 16 * 24 = 384 doubles and 4 * 24 = 96 ints per
+// thread: 3,456 bytes. Bounded at compile time, not allocated.
+//
+// PERIOD-INVARIANT: `insync_index` has no batch arm, so there is no `period`
+// axis to read at all; the fifteen knobs below are the CPU defaults
+// (insync_index.rs:28-42) and every swept period gives the same column. This
+// kernel writes identical rows.
+//
+// ROUNDING, NaN SEMANTICS, EPSILONS: unchanged from the lifted body, which was
+// written against the CPU reference and is f64 throughout. No f32 literal, no
+// f32-suffixed math function, no fast-math intrinsic is introduced here; the
+// NaN is `insync_qnan()`, the file's own DOUBLE quiet-NaN.
+//
+// FIRST VALID IS NOT READ: the CPU restarts all ten sub-indicators at every
+// invalid bar, so one global warmup index would be wrong after the first hole.
+// The lane row declares `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+#define NEO_INSYNC_SEG 24
+#define NEO_INSYNC_EMO_DIVISOR 10000
+#define NEO_INSYNC_EMO_LENGTH 14
+#define NEO_INSYNC_FAST_LENGTH 12
+#define NEO_INSYNC_SLOW_LENGTH 26
+#define NEO_INSYNC_MFI_LENGTH 20
+#define NEO_INSYNC_BB_LENGTH 20
+#define NEO_INSYNC_BB_MULTIPLIER 2.0
+#define NEO_INSYNC_CCI_LENGTH 14
+#define NEO_INSYNC_DPO_LENGTH 18
+#define NEO_INSYNC_ROC_LENGTH 10
+#define NEO_INSYNC_RSI_LENGTH 14
+#define NEO_INSYNC_STOCH_LENGTH 14
+#define NEO_INSYNC_STOCH_D_LENGTH 3
+#define NEO_INSYNC_STOCH_K_LENGTH 1
+#define NEO_INSYNC_SMA_LENGTH 10
+
+extern "C" __global__ void insync_index_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    const double nan_value = insync_qnan();
+    for (int i = 0; i < n; ++i) {
+        row[i] = nan_value;
+    }
+
+    double dbase[SEG_DOUBLE_N * NEO_INSYNC_SEG];
+    int ibase[ISEG_INT_N * NEO_INSYNC_SEG];
+
+    insync_index_row_f64(
+        high, low, close, volume, n,
+        NEO_INSYNC_BB_LENGTH,
+        NEO_INSYNC_CCI_LENGTH,
+        NEO_INSYNC_MFI_LENGTH,
+        NEO_INSYNC_ROC_LENGTH,
+        NEO_INSYNC_EMO_LENGTH,
+        NEO_INSYNC_SMA_LENGTH,
+        NEO_INSYNC_DPO_LENGTH,
+        NEO_INSYNC_RSI_LENGTH,
+        NEO_INSYNC_STOCH_LENGTH,
+        NEO_INSYNC_STOCH_D_LENGTH,
+        NEO_INSYNC_STOCH_K_LENGTH,
+        NEO_INSYNC_FAST_LENGTH,
+        NEO_INSYNC_SLOW_LENGTH,
+        static_cast<double>(NEO_INSYNC_EMO_DIVISOR),
+        NEO_INSYNC_BB_MULTIPLIER,
+        dbase,
+        ibase,
+        NEO_INSYNC_SEG,
+        row);
 }

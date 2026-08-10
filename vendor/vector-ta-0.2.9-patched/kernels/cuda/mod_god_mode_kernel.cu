@@ -904,3 +904,303 @@ extern "C" __global__ void mod_god_mode_batch_f32_shared_fast(
 }
 
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: mod_god_mode_scalar_fused_into_slices
+// (src/indicators/mod_god_mode.rs:1118-1600). mod_god_mode_with_kernel (:555)
+// maps Kernel::Auto to Kernel::Scalar (:611) and mod_god_mode_into_slices
+// (:717) then takes the fused scalar, so it is the only path this lane can
+// reach; the component-wise arm at :745 is unreachable from it.
+//
+// OUTPUT: the WAVETREND column -- compute_mod_god_mode_batch
+// (cpu_batch.rs:15556) resolves output_id == "value" to out.wavetrend.
+//
+// PERIOD-INVARIANT: that batch reads n1 (17), n2 (6), n3 (4), mode
+// ("tradition_mg") and use_volume (TRUE -- cpu_batch.rs:15521, not the input
+// struct default of false) and NEVER `period`. A sweep of five periods gets
+// five identical CPU columns, so this kernel writes five identical rows.
+//
+// MODE: TraditionMg alone is reproduced, because that is the only mode the
+// batch default selects. Its component set is tci + mf + rsi + cbci + lrsi
+// (:1541-1560); the Godmode arms compute csi and willr, which that set never
+// reads.
+//
+// FIRST-VALID: Ignored, and derived here. mod_god_mode_into_slices (:693)
+// scans CLOSE ALONE with !is_nan while this row is registered Hlcv, and under
+// AllInputsNonNan that shape resolves to a scan over high/low/close/volume --
+// a later bar on any frame whose volume or high has a hole, which would shift
+// both the NaN prefix and the seed.
+//
+// SHAPE: one thread per combo walking bars ASCENDING. Three EMAs, a Wilder
+// RSI, a four-stage Laguerre filter, a money-flow ring, an RSI ring feeding a
+// momentum term, a six-wide signal SMA and an EMA over the histogram are all
+// carried across bars.
+//
+// NaN SEMANTICS: the Laguerre cu/cd terms use f64::max against 0.0
+// (:1332-1333), which returns the non-NaN operand; fmax is used so a NaN
+// close cannot survive into the accumulation as it would through an if-chain.
+// ===========================================================================
+
+#define MGM_NEO_N1 17
+#define MGM_NEO_N2 6
+#define MGM_NEO_N3 4
+#define MGM_NEO_SIGP 6
+#define MGM_NEO_MAX_RING 64
+
+static __forceinline__ __device__ double mgm_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+static __forceinline__ __device__ double mgm_neo_inf() {
+    return __longlong_as_double(0x7ff0000000000000ULL);
+}
+
+static __forceinline__ __device__ double mgm_neo_ema_step(double x, double prev,
+                                                          double alpha, double beta) {
+    return fma(beta, prev, alpha * x);   // :1157
+}
+
+static __forceinline__ __device__ bool mgm_neo_nonzero(double v) {
+    return v != 0.0 && isfinite(v);      // :1161
+}
+
+extern "C" __global__
+void mod_god_mode_neo_batch_f64(const double* __restrict__ high,
+                                const double* __restrict__ low,
+                                const double* __restrict__ close,
+                                const double* __restrict__ volume,
+                                int n,
+                                const int* __restrict__ periods,
+                                int n_combos,
+                                int first_valid,
+                                double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+    (void)periods;      // PERIOD-INVARIANT -- see the header.
+    (void)first_valid;  // Ignored -- see the header.
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = mgm_neo_qnan();
+
+    const int n1 = MGM_NEO_N1, n2 = MGM_NEO_N2, n3 = MGM_NEO_N3;
+
+    // :693-696 -- close alone, !is_nan.
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(close[i])) { first = i; break; }
+    }
+    int need = n1;
+    if (n2 > need) need = n2;
+    if (n3 > need) need = n3;
+
+    if (first < 0 || (n - first) < need) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    const int warm = first + need - 1;
+    for (int i = 0; i < n; ++i) row[i] = nn;
+
+    // :1265 -- if the first close is not finite the CPU returns with nothing
+    // written, so the whole column is the NaN it was allocated as.
+    if (!isfinite(close[first])) return;
+
+    const double alpha1 = 2.0 / ((double)n1 + 1.0);
+    const double beta1 = 1.0 - alpha1;
+    const double alpha2 = 2.0 / ((double)n2 + 1.0);
+    const double beta2 = 1.0 - alpha2;
+    const double alpha3 = 2.0 / ((double)n3 + 1.0);
+    const double beta3 = 1.0 - alpha3;
+
+    double ema1_c = 0.0, ema2_abs = 0.0, ema3_ci = 0.0;
+    bool seed_ema1 = false, seed_ema2 = false, seed_ema3 = false;
+
+    double rs_avg_gain = 0.0, rs_avg_loss = 0.0;
+    bool rsi_seeded = false;
+    int rs_init_cnt = 0;
+    double prev_close = close[first];
+
+    const int rsi_len = n2 > 1 ? n2 : 1;
+    double rsi_ring[MGM_NEO_MAX_RING];
+    for (int k = 0; k < rsi_len; ++k) rsi_ring[k] = nn;
+    int rsi_ring_head = 0;
+    double rsi_ema = 0.0;
+    bool rsi_ema_seed = false;
+
+    const double alpha_l = 0.7;
+    const double one_m_l = 1.0 - alpha_l;
+    double l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+
+    const int mf_len = n3 > 1 ? n3 : 1;
+    double mf_ring_mf[MGM_NEO_MAX_RING];
+    int mf_ring_sgn[MGM_NEO_MAX_RING];
+    for (int k = 0; k < mf_len; ++k) { mf_ring_mf[k] = 0.0; mf_ring_sgn[k] = 0; }
+    double mf_pos_sum = 0.0, mf_neg_sum = 0.0;
+    int mf_head = 0;
+    double tp_prev = 0.0;
+    bool tp_has_prev = false;
+
+    double sig_ring[MGM_NEO_SIGP];
+    for (int k = 0; k < MGM_NEO_SIGP; ++k) sig_ring[k] = 0.0;
+    int sig_head = 0;
+    double sig_sum = 0.0;
+    const int sig_start = warm + MGM_NEO_SIGP - 1;
+    bool have_sig = false;
+
+    for (int i = first; i < n; ++i) {
+        const double c_i = close[i];
+
+        // :1272-1289 -- tci
+        if (!seed_ema1) { ema1_c = c_i; seed_ema1 = true; }
+        else { ema1_c = mgm_neo_ema_step(c_i, ema1_c, alpha1, beta1); }
+        const double abs_dev = fabs(c_i - ema1_c);
+        if (!seed_ema2) { ema2_abs = abs_dev; seed_ema2 = true; }
+        else { ema2_abs = mgm_neo_ema_step(abs_dev, ema2_abs, alpha1, beta1); }
+        double tci_val = nn;
+        if (mgm_neo_nonzero(ema2_abs)) {
+            const double ci = (c_i - ema1_c) / (0.025 * ema2_abs);
+            if (!seed_ema3) { ema3_ci = ci; seed_ema3 = true; }
+            else { ema3_ci = mgm_neo_ema_step(ci, ema3_ci, alpha2, beta2); }
+            tci_val = ema3_ci + 50.0;
+        }
+
+        // :1291-1325 -- the Wilder RSI over n3.
+        double rsi_val = nn;
+        if (i == first) {
+            rs_avg_gain = 0.0;
+            rs_avg_loss = 0.0;
+            rs_init_cnt = 0;
+        } else {
+            const double ch = c_i - prev_close;
+            const double gain = (ch > 0.0) ? ch : 0.0;
+            const double loss = (ch < 0.0) ? -ch : 0.0;
+            if (!rsi_seeded) {
+                rs_init_cnt += 1;
+                rs_avg_gain += gain;
+                rs_avg_loss += loss;
+                if (rs_init_cnt >= n3) {
+                    rs_avg_gain /= (double)n3;
+                    rs_avg_loss /= (double)n3;
+                    rsi_seeded = true;
+                    const double rs = (rs_avg_loss == 0.0)
+                        ? mgm_neo_inf() : (rs_avg_gain / rs_avg_loss);
+                    rsi_val = 100.0 - 100.0 / (1.0 + rs);
+                }
+            } else {
+                rs_avg_gain = ((rs_avg_gain * (double)(n3 - 1)) + gain) / (double)n3;
+                rs_avg_loss = ((rs_avg_loss * (double)(n3 - 1)) + loss) / (double)n3;
+                const double rs = (rs_avg_loss == 0.0)
+                    ? mgm_neo_inf() : (rs_avg_gain / rs_avg_loss);
+                rsi_val = 100.0 - 100.0 / (1.0 + rs);
+            }
+        }
+
+        // :1327-1340 -- the four-stage Laguerre filter.
+        {
+            const double prev_l0 = l0;
+            l0 = alpha_l * c_i + one_m_l * prev_l0;
+            const double prev_l1 = l1;
+            l1 = -one_m_l * l0 + prev_l0 + one_m_l * prev_l1;
+            const double prev_l2 = l2;
+            l2 = -one_m_l * l1 + prev_l1 + one_m_l * prev_l2;
+            l3 = -one_m_l * l2 + prev_l2 + one_m_l * l3;
+        }
+        const double cu = fmax(l0 - l1, 0.0) + fmax(l1 - l2, 0.0) + fmax(l2 - l3, 0.0);
+        const double cd = fmax(l1 - l0, 0.0) + fmax(l2 - l1, 0.0) + fmax(l3 - l2, 0.0);
+        const double lrsi_val = mgm_neo_nonzero(cu + cd) ? (100.0 * cu / (cu + cd)) : nn;
+
+        // :1342-1385 -- money flow. use_volume is TRUE at the batch default.
+        double mf_val = nn;
+        {
+            const double tp = (high[i] + low[i] + c_i) / 3.0;
+            if (tp_has_prev) {
+                int sign;
+                if (tp > tp_prev) sign = 1;
+                else if (tp < tp_prev) sign = -1;
+                else sign = 0;
+                const double mf_raw = tp * volume[i];
+                if (rsi_seeded) {
+                    const double old_mf = mf_ring_mf[mf_head];
+                    const int old_sign = mf_ring_sgn[mf_head];
+                    if (old_sign > 0) mf_pos_sum -= old_mf;
+                    else if (old_sign < 0) mf_neg_sum -= old_mf;
+                }
+                mf_ring_mf[mf_head] = mf_raw;
+                mf_ring_sgn[mf_head] = sign;
+                if (sign > 0) mf_pos_sum += mf_raw;
+                else if (sign < 0) mf_neg_sum += mf_raw;
+                mf_head += 1;
+                if (mf_head == mf_len) mf_head = 0;
+                if (rsi_seeded) {
+                    mf_val = (mf_neg_sum == 0.0)
+                        ? 100.0
+                        : (100.0 - 100.0 / (1.0 + (mf_pos_sum / mf_neg_sum)));
+                }
+            }
+            tp_prev = tp;
+            tp_has_prev = true;
+        }
+
+        // :1387-1421 -- cbci = momentum of the RSI plus an EMA of the RSI.
+        double cbci_val = nn;
+        if (rsi_seeded) {
+            const double old = rsi_ring[rsi_ring_head];
+            rsi_ring[rsi_ring_head] = rsi_val;
+            rsi_ring_head += 1;
+            if (rsi_ring_head == rsi_len) rsi_ring_head = 0;
+            const double mom = (isfinite(old) && isfinite(rsi_val)) ? (rsi_val - old) : nn;
+            if (!rsi_ema_seed && isfinite(rsi_val)) {
+                rsi_ema = rsi_val;
+                rsi_ema_seed = true;
+            } else if (isfinite(rsi_val)) {
+                rsi_ema = mgm_neo_ema_step(rsi_val, rsi_ema, alpha3, beta3);
+            }
+            if (isfinite(mom) && rsi_ema_seed) cbci_val = mom + rsi_ema;
+        }
+
+        // :1541-1560 -- TraditionMg: tci + mf + rsi + cbci + lrsi, in that
+        // order. The order sets the rounding of `sum`.
+        if (i >= warm) {
+            double sum = 0.0;
+            int cnt = 0;
+            if (isfinite(tci_val))  { sum += tci_val;  cnt += 1; }
+            if (isfinite(mf_val))   { sum += mf_val;   cnt += 1; }
+            if (isfinite(rsi_val))  { sum += rsi_val;  cnt += 1; }
+            if (isfinite(cbci_val)) { sum += cbci_val; cnt += 1; }
+            if (isfinite(lrsi_val)) { sum += lrsi_val; cnt += 1; }
+
+            if (cnt > 0) {
+                const double wt = sum / (double)cnt;
+                row[i] = wt;
+
+                // The signal and histogram columns are not this lane's output,
+                // but the six-wide ring must still advance because the CPU
+                // advances it only on bars where cnt > 0.
+                if (i >= sig_start) {
+                    if (!have_sig) {
+                        double s = 0.0;
+                        for (int k = 0; k < MGM_NEO_SIGP; ++k) {
+                            const double x = row[i + 1 - MGM_NEO_SIGP + k];
+                            sig_ring[k] = x;
+                            s += x;
+                        }
+                        sig_sum = s;
+                        have_sig = true;
+                        sig_head = 0;
+                    } else {
+                        const double old = sig_ring[sig_head];
+                        sig_ring[sig_head] = wt;
+                        sig_head += 1;
+                        if (sig_head == MGM_NEO_SIGP) sig_head = 0;
+                        sig_sum += wt - old;
+                    }
+                }
+            }
+        }
+        prev_close = c_i;
+    }
+}

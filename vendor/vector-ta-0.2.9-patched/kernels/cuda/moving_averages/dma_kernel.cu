@@ -1109,3 +1109,274 @@ __global__ void dma_ms1p_tiled_f32_tx1_ty4(const float* __restrict__ prices_tm,
                                       series_len, num_series, first_valids, sqrt_len, out_tm);
 }
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: dma_scalar (src/indicators/moving_averages/dma.rs:561-628),
+// reached through dma_with_kernel (:296) -> dma_compute_into.
+//
+// PERIOD-SWEPT, and the swept int is the HULL length: ma_batch.rs:1868
+// assigns sweep.hull_length = period_range while ema_length stays 20,
+// ema_gain_limit stays 50 and hull_ma_type is pinned to "WMA" (:1871). The
+// EMA-hull arm of dma_scalar (:700-737) is therefore unreachable from this
+// lane and is not reproduced; mapping the swept int onto ema_length instead
+// would compute a different indicator.
+//
+// SHAPE: one thread per combo walking bars ASCENDING. Five accumulators are
+// carried across bars -- the EMA of price, the two weighted sliding sums that
+// build the hull difference, the weighted sliding sum over the difference
+// ring, and the gain-limited EC recursion whose g is chosen by comparing two
+// candidate residuals. None of that can be rebuilt bar-parallel without
+// changing the rounding.
+//
+// The only per-thread array is the difference ring, whose length is
+// round(sqrt(hull_length)); DMA_NEO_MAX_SQRT bounds it and
+// F64Kernel::max_period REFUSES a larger period by name rather than
+// truncating the window or moving the row to the host.
+// ===========================================================================
+
+#define DMA_NEO_MAX_SQRT 64
+#define DMA_NEO_MAX_PERIOD 4160
+
+static __forceinline__ __device__ double dma_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// dma.rs:797 -- `target.floor() as i64`. Rust's float-to-int cast SATURATES
+// and maps NaN to 0; C's does neither, so the conversion is spelled out.
+static __forceinline__ __device__ long long dma_neo_floor_to_i64(double v) {
+    if (isnan(v)) return 0LL;
+    const double f = floor(v);
+    if (f <= -9223372036854775808.0) return -9223372036854775807LL - 1LL;
+    if (f >= 9223372036854775808.0) return 9223372036854775807LL;
+    return (long long)f;
+}
+
+extern "C" __global__
+void dma_neo_batch_f64(const double* __restrict__ data,
+                       int n,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = dma_neo_qnan();
+
+    const int hull_length = periods[combo];
+    const int ema_length = 20;      // ma_batch.rs:1865
+    const int ema_gain_limit = 50;  // ma_batch.rs:1866
+
+    // dma_prepare, :395-398 -- `!is_nan` over the single close series, which
+    // is exactly F64FirstValidRule::AllInputsNonNan for CloseSlice.
+    int first = first_valid;
+    if (first < 0) first = 0;
+
+    bool refused = false;
+    if (first >= n) refused = true;
+    if (hull_length <= 0 || hull_length > n) refused = true;   // :406
+    if (ema_length <= 0 || ema_length > n) refused = true;     // :412
+    if (hull_length > DMA_NEO_MAX_PERIOD) refused = true;
+
+    int sqrt_len = 0;
+    if (!refused) {
+        sqrt_len = (int)round(sqrt((double)hull_length));      // :420
+        const int longer = hull_length > ema_length ? hull_length : ema_length;
+        const long long needed = (long long)longer + (long long)sqrt_len;
+        if ((long long)(n - first) < needed) refused = true;   // :422
+        if (sqrt_len > DMA_NEO_MAX_SQRT) refused = true;
+    }
+
+    if (refused) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    const int longer = hull_length > ema_length ? hull_length : ema_length;
+    // :305 -- warmup_end = first + max(hull, ema) + sqrt_len - 1.
+    long long warm_ll = (long long)first + (long long)longer + (long long)sqrt_len - 1;
+    const int nan_end = warm_ll < (long long)n ? (int)warm_ll : n;
+    for (int i = 0; i < nan_end; ++i) row[i] = nn;
+    // Every bar past the warmup that dma_scalar does not write is left
+    // uninitialised by alloc_with_nan_prefix; NaN is the only honest value.
+    for (int i = nan_end; i < n; ++i) row[i] = nn;
+
+    const double alpha_e = 2.0 / ((double)ema_length + 1.0);
+    const double one_minus_alpha_e = 1.0 - alpha_e;
+    const int i0_e = first + (ema_length > 0 ? ema_length - 1 : 0);
+    double e0_prev = 0.0;
+    bool e0_init_done = false;
+    double ec_prev = 0.0;
+    bool ec_init_done = false;
+
+    const int half = hull_length / 2;
+    double hull_val = nn;
+
+    const int i0_half = first + (half > 0 ? half - 1 : 0);
+    const int i0_full = first + (hull_length > 0 ? hull_length - 1 : 0);
+
+    // :588 -- wsum(p) = (p * (p + 1)) as f64 / 2.0, then `.max(1.0)`.
+    const double wsum_half = (double)((long long)half * (long long)(half + 1)) / 2.0;
+    const double wsum_full =
+        (double)((long long)hull_length * (long long)(hull_length + 1)) / 2.0;
+    const double wsum_sqrt =
+        (double)((long long)sqrt_len * (long long)(sqrt_len + 1)) / 2.0;
+    const double den_half = fmax(wsum_half, 1.0);
+    const double den_full = fmax(wsum_full, 1.0);
+    const double den_sqrt = fmax(wsum_sqrt, 1.0);
+
+    double a_half = 0.0, s_half = 0.0;
+    bool half_ready = false;
+    double a_full = 0.0, s_full = 0.0;
+    bool full_ready = false;
+
+    double diff_ring[DMA_NEO_MAX_SQRT];
+    int diff_pos = 0;
+    int diff_filled = 0;
+    double a_diff = 0.0, s_diff = 0.0;
+
+    for (int i = first; i < n; ++i) {
+        const double x = data[i];
+
+        // :633-645 -- SMA seed, then the one-fma EMA.
+        if (!e0_init_done) {
+            if (i >= i0_e) {
+                const int start = i + 1 - ema_length;
+                double sum = 0.0;
+                for (int k = start; k <= i; ++k) sum += data[k];
+                e0_prev = sum / (double)ema_length;
+                e0_init_done = true;
+            }
+        } else {
+            e0_prev = fma(x, alpha_e, one_minus_alpha_e * e0_prev);
+        }
+
+        double diff_now = nn;
+
+        // :651-676 -- the half window.
+        if (half > 0) {
+            if (!half_ready) {
+                if (i >= i0_half) {
+                    const int start = i + 1 - half;
+                    double sum = 0.0;
+                    double wsum_local = 0.0;
+                    for (int j = 0; j < half; ++j) {
+                        const double w = (double)(j + 1);
+                        const double v = data[start + j];
+                        sum += v;
+                        wsum_local += w * v;
+                    }
+                    a_half = sum;
+                    s_half = wsum_local;
+                    half_ready = true;
+                }
+            } else {
+                const double a_prev = a_half;
+                a_half = a_prev + x - data[i - half];
+                s_half = s_half + (double)half * x - a_prev;
+            }
+        }
+
+        // :678-700 -- the full window.
+        if (hull_length > 0) {
+            if (!full_ready) {
+                if (i >= i0_full) {
+                    const int start = i + 1 - hull_length;
+                    double sum = 0.0;
+                    double wsum_local = 0.0;
+                    for (int j = 0; j < hull_length; ++j) {
+                        const double w = (double)(j + 1);
+                        const double v = data[start + j];
+                        sum += v;
+                        wsum_local += w * v;
+                    }
+                    a_full = sum;
+                    s_full = wsum_local;
+                    full_ready = true;
+                }
+            } else {
+                const double a_prev = a_full;
+                a_full = a_prev + x - data[i - hull_length];
+                s_full = s_full + (double)hull_length * x - a_prev;
+            }
+        }
+
+        if (half_ready && full_ready) {
+            const double w_half = s_half / den_half;
+            const double w_full = s_full / den_full;
+            diff_now = 2.0 * w_half - w_full;   // :700
+        }
+
+        // :735-781 -- the difference ring and its weighted sum.
+        if (isfinite(diff_now) && sqrt_len > 0) {
+            if (diff_filled < sqrt_len) {
+                diff_ring[diff_filled] = diff_now;
+                diff_filled += 1;
+                if (diff_filled == sqrt_len) {
+                    a_diff = 0.0;
+                    s_diff = 0.0;
+                    for (int j = 0; j < sqrt_len; ++j) {
+                        const double w = (double)(j + 1);
+                        const double v = diff_ring[j];
+                        a_diff += v;
+                        s_diff += w * v;
+                    }
+                    hull_val = s_diff / den_sqrt;
+                }
+            } else {
+                const double old = diff_ring[diff_pos];
+                diff_ring[diff_pos] = diff_now;
+                diff_pos = (diff_pos + 1) % sqrt_len;
+
+                const double a_prev = a_diff;
+                a_diff = a_prev + diff_now - old;
+                s_diff = s_diff + (double)sqrt_len * diff_now - a_prev;
+                hull_val = s_diff / den_sqrt;
+            }
+        }
+
+        // :783-820 -- the gain-limited EC recursion.
+        double ec_now = nn;
+        if (e0_init_done) {
+            if (!ec_init_done) {
+                ec_prev = e0_prev;
+                ec_init_done = true;
+                ec_now = ec_prev;
+            } else {
+                const double dx = x - ec_prev;
+                const double t = alpha_e * dx;
+                const double base = fma(e0_prev, alpha_e, one_minus_alpha_e * ec_prev);
+                const double r = x - base;
+
+                double g_sel;
+                if (t == 0.0) {
+                    g_sel = 0.0;
+                } else {
+                    const long long limit_i = (long long)ema_gain_limit;
+                    const double target = (r / t) * 10.0;
+                    long long i0 = dma_neo_floor_to_i64(target);
+                    if (i0 < 0) i0 = 0;
+                    else if (i0 > limit_i) i0 = limit_i;
+                    const long long i1 = (i0 < limit_i) ? (i0 + 1) : i0;
+                    const double g0 = (double)i0 * 0.1;
+                    const double g1 = (double)i1 * 0.1;
+                    const double e0 = fabs(r - t * g0);
+                    const double e1 = fabs(r - t * g1);
+                    g_sel = (e0 <= e1) ? g0 : g1;
+                }
+
+                ec_now = fma(e0_prev + g_sel * dx, alpha_e, one_minus_alpha_e * ec_prev);
+                ec_prev = ec_now;
+            }
+        }
+
+        if (isfinite(hull_val) && isfinite(ec_now)) {
+            row[i] = 0.5 * (hull_val + ec_now);   // :824
+        }
+    }
+}

@@ -400,3 +400,253 @@ extern "C" __global__ void range_filtered_trend_signals_batch_f64(
         has_prev_state = true;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 2, round 3
+//
+// WHY A SECOND ENTRY POINT
+//
+// range_filtered_trend_signals_batch_f64 above is genuine double-in/double-out,
+// but it takes 25 parameters, writes THIRTEEN output matrices and demands a
+// caller-allocated WMA scratch matrix. The f64 lane launches one shape --
+// (high, low, close, n, periods, n_combos, first_valid, out) -- and allocates
+// ONE output matrix, so that entry point cannot be reached from it.
+//
+// CPU REFERENCE
+//   src/indicators/range_filtered_trend_signals.rs:744
+//     range_filtered_trend_signals_with_kernel -> RangeFilteredTrendSignalsCore
+//     ::update :588
+//   KalmanState::update :335   AtrState::update :375   WmaState::update :438
+//
+// THE COLUMN THIS EMITS is kalman. This indicator's CPU batch has NO "value"
+// output -- compute_range_filtered_trend_signals_batch accepts kalman,
+// supertrend, upper_band/upper, lower_band/lower, trend, kalman_trend/
+// long_trend, state, market_trending, market_ranging and the four signal
+// columns, and REJECTS "value" outright -- so the lane declares the primary
+// series, which is the filtered price the whole indicator is named after and
+// the first arm of the CPU's own output match.
+//
+// PINNED CPU DEFAULTS (compute_range_filtered_trend_signals_batch):
+// kalman_alpha 0.01, kalman_beta 0.1, kalman_period 77, dev 1.2,
+// supertrend_factor 0.7, supertrend_atr_period 7; WMA_PERIOD is the module
+// constant 200 (:36).
+//
+// PERIOD-INVARIANT. The batch reads those six names and NEVER `period`, so five
+// swept periods give five identical CPU columns and five identical kernel rows.
+//
+// SHAPE: one thread per combo, bars ascending. The range filter carries a
+// smoothed range and a direction across bars: the Kalman gain is driven by a
+// covariance that is UPDATED FROM ITSELF every bar (:344, and note it advances
+// even on the seeding bar where no output is produced), the ATR is a Wilder
+// recursion, and the 200-deep volatility WMA is a rolling weighted sum whose
+// two accumulators are carried.
+//
+// WHY THE SUPERTREND IS NOT COMPUTED HERE, stated rather than skipped. In
+// RangeFilteredTrendSignalsCore::update (:604-609) the supertrend enters the
+// emitted `kalman` column through exactly one term: `supertrend_out` is
+// `Some(..)` if and only if `kalman` and `atr` are both `Some(..)`, and the
+// early return at :610-613 is the only thing it gates. Its VALUE feeds the
+// supertrend, trend, state and signal columns, none of which is this one. So
+// readiness is reproduced exactly and the band ratchet is not carried -- which
+// also side-steps a divergence in the 25-parameter kernel above, where
+// `prev_direction == 1` stands in for the CPU's `prev_supertrend ==
+// Some(prev_upper_band)` (:394); those disagree whenever a zero ATR makes the
+// two bands equal.
+//
+// ARITHMETIC ORDER:
+//   * KalmanState: `gain = covariance / (covariance + alpha*period)` is formed
+//     BEFORE the seed check (:336), and `covariance = (1 - gain)*covariance +
+//     beta/period` runs on EVERY bar including the one that returns None.
+//   * `next = prior + gain * (input - prior)` -- subtract, multiply, add. NOT
+//     an fma; -fmad=false stops the compiler contracting it into one.
+//   * AtrState seeds from a simple mean of the first `period` true ranges and
+//     then rolls `((prev * (period - 1)) + tr) / period` (:392) -- that is the
+//     CPU's literal expression, three roundings, and it is written as such.
+//     Rewriting it as a one-rounding fma would be a DIFFERENT number.
+//   * The first bar of a run has no previous close, and its true range is
+//     `high - low` alone, not the three-way max (:377-384).
+//   * WmaState on a full ring (:453-454) computes
+//     `weighted_sum = weighted_sum - old_sum + period*value` then
+//     `sum = old_sum - oldest + value`, both reading the PRE-update sum.
+//
+// FIRST VALID IS NOT READ: the core derives its own readiness from its window
+// counters and a non-finite bar resets everything (:594-597); the row writes
+// every index. The lane row declares F64FirstValidRule::Ignored.
+//
+// f64 END TO END: double literals, double fmax/fabs, no f32-suffixed math
+// function, no fast-math intrinsic, and no epsilon -- the CPU has none on this
+// path.
+// ---------------------------------------------------------------------------
+
+#define RFTS_NEO_KALMAN_ALPHA 0.01
+#define RFTS_NEO_KALMAN_BETA 0.1
+#define RFTS_NEO_KALMAN_PERIOD 77
+#define RFTS_NEO_ST_ATR_PERIOD 7
+
+__device__ __forceinline__ double rfts_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+extern "C" __global__ void range_filtered_trend_signals_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int row_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row_idx >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
+    const double qnan = rfts_neo_qnan();
+    for (int i = 0; i < n; ++i) {
+        row[i] = qnan;
+    }
+
+    // KalmanState::new (:318-320).
+    const double alpha_mul_period =
+        RFTS_NEO_KALMAN_ALPHA * static_cast<double>(RFTS_NEO_KALMAN_PERIOD);
+    const double beta_div_period =
+        RFTS_NEO_KALMAN_BETA / static_cast<double>(RFTS_NEO_KALMAN_PERIOD);
+    double kalman_value = 0.0;
+    bool kalman_has_value = false;
+    double covariance = 1.0;
+
+    // AtrState::new (:355-362).
+    int atr_count = 0;
+    double atr_sum = 0.0;
+    double atr_value = 0.0;
+    bool atr_seeded = false;
+    double atr_prev_close = 0.0;
+    bool atr_have_prev_close = false;
+
+    // WmaState::new(WMA_PERIOD) (:412-421). WMA_PERIOD is a module constant, so
+    // the ring depth is a property of the compiled kernel.
+    double wma_ring[WMA_PERIOD];
+    int wma_pos = 0;
+    int wma_len = 0;
+    double wma_sum = 0.0;
+    double wma_weighted_sum = 0.0;
+    const double wma_divisor =
+        static_cast<double>(WMA_PERIOD * (WMA_PERIOD + 1) / 2);
+
+    double prev_close = 0.0;
+    bool has_prev_close = false;
+
+    for (int i = 0; i < n; ++i) {
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
+            // :594-597 -- reset() clears every sub-state and the carried
+            // trend/prev values.
+            kalman_value = 0.0;
+            kalman_has_value = false;
+            covariance = 1.0;
+            atr_count = 0;
+            atr_sum = 0.0;
+            atr_value = 0.0;
+            atr_seeded = false;
+            atr_prev_close = 0.0;
+            atr_have_prev_close = false;
+            wma_pos = 0;
+            wma_len = 0;
+            wma_sum = 0.0;
+            wma_weighted_sum = 0.0;
+            has_prev_close = false;
+            prev_close = 0.0;
+            continue;
+        }
+
+        // KalmanState::update(close, prev_close) (:335-345).
+        double kalman_out = qnan;
+        bool kalman_ready = false;
+        {
+            const double gain = covariance / (covariance + alpha_mul_period);
+            if (!kalman_has_value && has_prev_close) {
+                kalman_value = prev_close;
+                kalman_has_value = true;
+            }
+            if (kalman_has_value) {
+                const double prior = kalman_value;
+                const double next = prior + gain * (c - prior);
+                kalman_value = next;
+                kalman_out = next;
+                kalman_ready = true;
+            }
+            // :344 -- the covariance advances on EVERY bar, including the one
+            // that produced no output.
+            covariance = (1.0 - gain) * covariance + beta_div_period;
+        }
+        prev_close = c;
+        has_prev_close = true;
+
+        // AtrState::update (:375-400).
+        bool atr_ready = false;
+        {
+            const double tr = atr_have_prev_close
+                ? fmax(h - l, fmax(fabs(h - atr_prev_close), fabs(l - atr_prev_close)))
+                : (h - l);
+            atr_prev_close = c;
+            atr_have_prev_close = true;
+            if (atr_seeded) {
+                atr_value =
+                    ((atr_value * (static_cast<double>(RFTS_NEO_ST_ATR_PERIOD) - 1.0)) + tr) /
+                    static_cast<double>(RFTS_NEO_ST_ATR_PERIOD);
+                atr_ready = true;
+            } else {
+                atr_count += 1;
+                atr_sum += tr;
+                if (atr_count == RFTS_NEO_ST_ATR_PERIOD) {
+                    atr_value = atr_sum / static_cast<double>(RFTS_NEO_ST_ATR_PERIOD);
+                    atr_seeded = true;
+                    atr_ready = true;
+                }
+            }
+        }
+
+        // WmaState::update(high - low) (:438-461).
+        bool vola_ready = false;
+        {
+            const double value = h - l;
+            if (wma_len < WMA_PERIOD) {
+                wma_ring[wma_pos] = value;
+                wma_pos = (wma_pos + 1) % WMA_PERIOD;
+                wma_len += 1;
+                wma_sum += value;
+                wma_weighted_sum += static_cast<double>(wma_len) * value;
+                if (wma_len == WMA_PERIOD) {
+                    vola_ready = true;
+                }
+            } else {
+                const double oldest = wma_ring[wma_pos];
+                const double old_sum = wma_sum;
+                wma_ring[wma_pos] = value;
+                wma_pos = (wma_pos + 1) % WMA_PERIOD;
+                wma_weighted_sum =
+                    wma_weighted_sum - old_sum + static_cast<double>(WMA_PERIOD) * value;
+                wma_sum = old_sum - oldest + value;
+                vola_ready = true;
+            }
+        }
+        // wma_divisor is read only through the columns this kernel does not
+        // emit; naming it keeps the transliteration complete.
+        (void)wma_divisor;
+
+        // :610-613 -- all three must be ready or the bar is NaN. supertrend_out
+        // is Some iff kalman and atr are, so it adds no term of its own.
+        if (!(kalman_ready && atr_ready && vola_ready)) {
+            continue;
+        }
+
+        row[i] = kalman_out;
+    }
+}

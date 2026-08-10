@@ -509,3 +509,394 @@ extern "C" __global__ void ichimoku_oscillator_batch_f64(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `ichimoku_oscillator_with_kernel`
+// (src/indicators/ichimoku_oscillator.rs:1043) -> `compute_core` (:787), with
+// `rolling_midpoint` (:589), `chebyshev_series` (:638),
+// `gaussian_kernel_series` (:657), `smooth_series` (:698), `shift_back` (:710),
+// `rolling_rms_window` (:723) and `normalize_value` (:753).
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `ichimoku_oscillator_batch_f64` (:278) is double-clean but declares
+// thirty-six parameters and TWENTY `double*` -- thirteen output matrices plus
+// scratch. The f64 lane launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// and reads back ONE matrix, so the lane gets its own entry point here.
+//
+// WHICH COLUMN: `signal`. `compute_ichimoku_oscillator_batch`
+// (cpu_batch.rs:10906) maps output_id "signal" AND "value" onto `out.signal`,
+// so this is the lane's `value` column, named rather than guessed.
+//
+// SHAPE -- AND WHY THE THIRTEEN FULL-LENGTH INTERMEDIATE VECTORS ARE NOT
+// NEEDED. `compute_core` is written as a dozen whole-array passes, which reads
+// like an algorithm that needs O(n) scratch per thread. It does not. Every
+// stage on the path to `signal` is either a FINITE-SUPPORT window over the raw
+// inputs or a CAUSAL filter with bounded state:
+//   * the three `rolling_midpoint`s read `high`/`low` directly out of global
+//     memory over a 9-, 26- and 52-bar window;
+//   * `chebyshev_series` is a ONE-POLE IIR -- one carried double each;
+//   * `gaussian_kernel_series` is a FIVE-TAP FIR over the Chebyshev output --
+//     a five-slot ring each;
+//   * `shift_back(kumo_center, displacement - 1)` is a 26-slot delay ring;
+//   * `rolling_rms_window(signal, 20)` is a 20-slot ring of squares.
+// So the whole chain is ONE forward pass with 3 + 3*(1 + 5) + 26 + 20 = 67
+// doubles of state, 536 bytes per thread. One thread per combo, bars
+// ascending. The Chebyshev poles alone make it non-bar-parallel.
+//
+// PERIOD-INVARIANT: the CPU batch reads `source`, `conversion_periods`,
+// `base_periods`, `lagging_span_periods`, `displacement`, `ma_length`,
+// `smoothing_length`, `extra_smoothing`, `normalize`, `window_size`, `clamp`,
+// `top_band` and `mid_band` -- and NEVER `period` (cpu_batch.rs:10853-10875),
+// so every swept period gives the same CPU column and this kernel writes
+// identical rows. Pinned at the CPU defaults: source `close`, conversion 9,
+// base 26, lagging span 52, displacement 26, smoothing_length 3,
+// extra_smoothing true, normalize `window`, window_size 20, clamp true,
+// top_band 2.0. `ma_length` and `mid_band` are read only by the `ma`,
+// `high_level` and `low_level` columns and are not on this path.
+//
+// ROUNDING: `chebyshev_series` writes `one_minus_c.mul_add(data[i], c * prev)`
+// (:651) -- ONE multiply and ONE FUSED multiply-add, TWO roundings -- so this
+// kernel writes `fma(one_minus_c, x, c * prev)`. Everywhere else the CPU
+// writes plain operators and so does this: the FIR accumulates
+// `sum += value * weights[j]` in ASCENDING j (:673), the RMS ring adds the new
+// square BEFORE subtracting the departing one (:735-741), and the midpoint is
+// `0.5 * (high + low)` (:631). No `fma` is introduced where the CPU has none.
+//
+// EPSILON: none. The gate is `min_level == max_level` (:761), an exact
+// comparison the CPU makes and this kernel makes, not a tolerance.
+//
+// NaN SEMANTICS: every stage the CPU guards with `is_finite` is guarded here
+// the same way, and the guards are what produce the NaN prefix -- the FIR
+// refuses a window containing one non-finite tap (:668-671), the RMS ring
+// CLEARS on a non-finite sample (:728-732), and `normalize_value` returns NaN
+// unless value, min and max are all finite and min != max (:757-763). There is
+// no `f64::max` on this path, so rule 4 has nothing to catch; the rolling
+// midpoint's max/min are over integer-indexed prices with the CPU's own
+// `<=`/`>=` monotone-deque predicate, reproduced as an exact scan below.
+//
+// WHY A SCAN AND NOT A DEQUE for the rolling midpoint: the CPU's monotone
+// deques (:591-629) compute the MAXIMUM high and MINIMUM low over the valid
+// indices in `[max(i+1-length, first), i]`. A direct scan over that same range,
+// skipping the same bars the CPU skips (`!high[j].is_finite() ||
+// !low[j].is_finite()`, :596), returns the same two values exactly -- max and
+// min are selections, not sums, so there is no accumulation order to preserve
+// and no rounding to differ. 87 comparisons per bar for the three windows.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic. `cosh`, `sinh`, `acosh`, `asinh`, `exp`, `sqrt` are the double
+// overloads. The NaN is a DOUBLE quiet-NaN bit pattern.
+//
+// FIRST VALID: the kernel derives it with the CPU's own rule
+// (`first_valid_hlcs`, :511 -- high, low, close all finite at the same index;
+// `source` is `close` at the pinned default, so the fourth scan is the same
+// series as the third). The lane row declares `F64FirstValidRule::Ignored`
+// because the kernel does not read the caller's value.
+// ---------------------------------------------------------------------------
+
+#define NEO_ICHI_CONVERSION 9
+#define NEO_ICHI_BASE 26
+#define NEO_ICHI_SPAN_B 52
+#define NEO_ICHI_DISPLACEMENT 26
+#define NEO_ICHI_SHIFT (NEO_ICHI_DISPLACEMENT - 1)
+#define NEO_ICHI_SMOOTHING 3
+#define NEO_ICHI_GAUSS_SIZE 4
+#define NEO_ICHI_GAUSS_TAPS (NEO_ICHI_GAUSS_SIZE + 1)
+#define NEO_ICHI_WINDOW_SIZE 20
+#define NEO_ICHI_TOP_BAND 2.0
+
+__device__ inline double neo_ichi_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+// `avg_if_finite`, :567.
+__device__ inline double neo_ichi_avg_if_finite(double a, double b) {
+    return (isfinite(a) && isfinite(b)) ? (0.5 * (a + b)) : neo_ichi_qnan();
+}
+
+// `diff_if_finite`, :576.
+__device__ inline double neo_ichi_diff_if_finite(double a, double b) {
+    return (isfinite(a) && isfinite(b)) ? (a - b) : neo_ichi_qnan();
+}
+
+// `gaussian_value`, :585.
+__device__ inline double neo_ichi_gaussian_value(double x, double bandwidth) {
+    const double t = x / bandwidth;
+    return exp(-(t * t) * 0.5) / sqrt(2.0 * 3.14159265358979323846);
+}
+
+// `rolling_midpoint`, :589-635, evaluated at ONE bar.
+__device__ inline double neo_ichi_rolling_midpoint(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int length,
+    int first,
+    int i
+) {
+    const int warm = first + length - 1;
+    if (i < warm) {
+        return neo_ichi_qnan();
+    }
+    int start = i + 1 - length;
+    if (start < first) {
+        start = first;
+    }
+    double highest = neo_ichi_qnan();
+    double lowest = neo_ichi_qnan();
+    bool seen = false;
+    for (int j = start; j <= i; ++j) {
+        const double h = high[j];
+        const double l = low[j];
+        if (!isfinite(h) || !isfinite(l)) {
+            continue;
+        }
+        if (!seen) {
+            highest = h;
+            lowest = l;
+            seen = true;
+        } else {
+            if (h > highest) {
+                highest = h;
+            }
+            if (l < lowest) {
+                lowest = l;
+            }
+        }
+    }
+    if (!seen) {
+        return neo_ichi_qnan();
+    }
+    return 0.5 * (highest + lowest);
+}
+
+// `smooth_series(data, 3, true)`, :698-704: a one-pole Chebyshev IIR followed
+// by a five-tap Gaussian FIR. Both stages carried as bounded state.
+struct NeoIchiSmoother {
+    double one_minus_c;
+    double c;
+    double prev_out;      // `out[i - 1]` of the Chebyshev stage
+    bool has_prev;
+    double taps[NEO_ICHI_GAUSS_TAPS];
+    int filled;           // how many Chebyshev outputs have been produced
+    int head;             // next slot to overwrite
+    const double* weights;
+    double weight_sum;
+
+    __device__ void init(const double* w, double wsum) {
+        // `chebyshev_series`, :639-642, with len = 3 and ripple = 0.5.
+        const double inv_len = 1.0 / static_cast<double>(NEO_ICHI_SMOOTHING);
+        const double a = cosh(inv_len * acosh(1.0 / (1.0 - 0.5)));
+        const double b = sinh(inv_len * asinh(1.0 / 0.5));
+        c = (a - b) / (a + b);
+        one_minus_c = 1.0 - c;
+        prev_out = neo_ichi_qnan();
+        has_prev = false;
+        filled = 0;
+        head = 0;
+        weights = w;
+        weight_sum = wsum;
+        for (int i = 0; i < NEO_ICHI_GAUSS_TAPS; ++i) {
+            taps[i] = neo_ichi_qnan();
+        }
+    }
+
+    __device__ double update(double x) {
+        // Chebyshev stage -- :644-653.
+        double cheb;
+        if (isfinite(x)) {
+            const double prev = (has_prev && isfinite(prev_out)) ? prev_out : 0.0;
+            cheb = fma(one_minus_c, x, c * prev);
+        } else {
+            cheb = neo_ichi_qnan();
+        }
+        prev_out = cheb;
+        has_prev = true;
+
+        taps[head] = cheb;
+        head += 1;
+        if (head == NEO_ICHI_GAUSS_TAPS) {
+            head = 0;
+        }
+        if (filled < NEO_ICHI_GAUSS_TAPS) {
+            filled += 1;
+        }
+        if (filled < NEO_ICHI_GAUSS_TAPS) {
+            // `for i in size..data.len()` -- :661, no output before bar `size`.
+            return neo_ichi_qnan();
+        }
+
+        // Gaussian stage -- :662-678. `j` counts BACKWARDS from the newest
+        // sample, so tap j is `data[i - j]`.
+        double sum = 0.0;
+        int idx = head - 1;
+        if (idx < 0) {
+            idx = NEO_ICHI_GAUSS_TAPS - 1;
+        }
+        for (int j = 0; j < NEO_ICHI_GAUSS_TAPS; ++j) {
+            const double value = taps[idx];
+            if (!isfinite(value)) {
+                return neo_ichi_qnan();
+            }
+            sum += value * weights[j];
+            idx -= 1;
+            if (idx < 0) {
+                idx = NEO_ICHI_GAUSS_TAPS - 1;
+            }
+        }
+        if (weight_sum == 0.0) {
+            return neo_ichi_qnan();
+        }
+        return sum / weight_sum;
+    }
+};
+
+// `normalize_value` with mode = Window and clamp = true, :753-770.
+__device__ inline double neo_ichi_normalize(double value, double min_level, double max_level) {
+    if (!isfinite(value) || !isfinite(min_level) || !isfinite(max_level) ||
+        min_level == max_level) {
+        return neo_ichi_qnan();
+    }
+    double scaled = (value - min_level) / (max_level - min_level);
+    if (scaled < 0.0) {
+        scaled = 0.0;
+    } else if (scaled > 1.0) {
+        scaled = 1.0;
+    }
+    return (scaled - 0.5) * 200.0;
+}
+
+extern "C" __global__ void ichimoku_oscillator_neo_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_ichi_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = nan_value;
+    }
+
+    // `first_valid_hlcs`, :511. `source` is `close` at the pinned default, so
+    // the CPU's fourth scan is the same series as its third.
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (isfinite(high[i]) && isfinite(low[i]) && isfinite(close[i])) {
+            first = i;
+            break;
+        }
+    }
+    if (first < 0) {
+        return;
+    }
+
+    // `gaussian_kernel_series` weights, :658-660: size 4, h 2.0, r 1.0.
+    double weights[NEO_ICHI_GAUSS_TAPS];
+    double weight_sum = 0.0;
+    for (int j = 0; j < NEO_ICHI_GAUSS_TAPS; ++j) {
+        const double x = static_cast<double>(j * j) / (2.0 * 2.0 * 1.0);
+        weights[j] = neo_ichi_gaussian_value(x, 1.0);
+        weight_sum += weights[j];
+    }
+
+    NeoIchiSmoother smooth_kumo_a;
+    NeoIchiSmoother smooth_kumo_b;
+    NeoIchiSmoother smooth_signal;
+    smooth_kumo_a.init(weights, weight_sum);
+    smooth_kumo_b.init(weights, weight_sum);
+    smooth_signal.init(weights, weight_sum);
+
+    // `shift_back(kumo_center, displacement - 1)`, :710-721. A ring of exactly
+    // `shift` slots read BEFORE it is written gives the value from `shift`
+    // bars back, which is `kumo_center[i - 25]`.
+    double center_delay[NEO_ICHI_SHIFT];
+    for (int i = 0; i < NEO_ICHI_SHIFT; ++i) {
+        center_delay[i] = nan_value;
+    }
+    int delay_head = 0;
+
+    // `rolling_rms_window(signal, 20)`, :723-746.
+    double rms_ring[NEO_ICHI_WINDOW_SIZE];
+    int rms_head = 0;
+    int rms_len = 0;
+    double rms_sum_sq = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double conversion_raw =
+            neo_ichi_rolling_midpoint(high, low, NEO_ICHI_CONVERSION, first, i);
+        const double base_raw =
+            neo_ichi_rolling_midpoint(high, low, NEO_ICHI_BASE, first, i);
+        const double span_b_raw =
+            neo_ichi_rolling_midpoint(high, low, NEO_ICHI_SPAN_B, first, i);
+
+        const double kumo_a = smooth_kumo_a.update(
+            neo_ichi_avg_if_finite(conversion_raw, base_raw));
+        const double kumo_b = smooth_kumo_b.update(span_b_raw);
+        const double kumo_center = neo_ichi_avg_if_finite(kumo_a, kumo_b);
+
+        // `shift_back` with shift = 25: the value 25 bars back, NaN before.
+        const double kumo_center_offset =
+            (i >= NEO_ICHI_SHIFT) ? center_delay[delay_head] : nan_value;
+        center_delay[delay_head] = kumo_center;
+        delay_head += 1;
+        if (delay_head == NEO_ICHI_SHIFT) {
+            delay_head = 0;
+        }
+
+        const double signal_input =
+            neo_ichi_diff_if_finite(close[i], kumo_center_offset);
+        const double signal = smooth_signal.update(signal_input);
+
+        // `rolling_rms_window`, :726-745.
+        double dev = nan_value;
+        if (!isfinite(signal)) {
+            rms_head = 0;
+            rms_len = 0;
+            rms_sum_sq = 0.0;
+        } else {
+            const double sq = signal * signal;
+            const double departing = rms_ring[rms_head];
+            rms_ring[rms_head] = sq;
+            rms_head += 1;
+            if (rms_head == NEO_ICHI_WINDOW_SIZE) {
+                rms_head = 0;
+            }
+            // The CPU pushes first and pops only when the queue EXCEEDS the
+            // window, so the add happens BEFORE the subtract.
+            rms_sum_sq += sq;
+            if (rms_len < NEO_ICHI_WINDOW_SIZE) {
+                rms_len += 1;
+            } else {
+                rms_sum_sq -= departing;
+            }
+            if (rms_len == NEO_ICHI_WINDOW_SIZE && NEO_ICHI_WINDOW_SIZE > 1) {
+                dev = sqrt(rms_sum_sq /
+                           (static_cast<double>(NEO_ICHI_WINDOW_SIZE) - 1.0));
+            }
+        }
+
+        double max_level = nan_value;
+        double min_level = nan_value;
+        if (isfinite(dev)) {
+            max_level = dev * NEO_ICHI_TOP_BAND;
+            min_level = -dev * NEO_ICHI_TOP_BAND;
+        }
+
+        row[i] = neo_ichi_normalize(signal, min_level, max_level);
+    }
+}

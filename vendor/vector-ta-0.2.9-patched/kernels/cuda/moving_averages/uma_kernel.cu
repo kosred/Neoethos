@@ -695,3 +695,335 @@ void uma_many_series_one_param_f32(const float* __restrict__ prices_tm,
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (uma)
+ *
+ * CPU reference: `uma_core_into` (src/indicators/moving_averages/uma.rs:747)
+ *   reached from `uma_with_kernel` (:1177), plus the three dependencies it
+ *   builds on -- `sma_scalar` (sma.rs:317),
+ *   `standard_deviation_rolling_into` (deviation.rs:1055) and `wma_scalar`
+ *   (wma.rs:305) for the trailing smooth.
+ *
+ * WHICH CPU PATH IS THE ORACLE, and why the question has an answer here:
+ *   `uma_core_into` has an AVX512 and an AVX2 accumulator (:944-1005) whose
+ *   only job is to fill `(xws, wsum)`. The scalar path runs when `wsum == 0.0`
+ *   after them -- and it is the whole computation on any build without
+ *   `nightly-avx`, which is this crate's default. The AVX paths chunk the same
+ *   weighted sum 8-wide and 4-wide, so they differ from scalar exactly the way
+ *   `wilders` and `vwap` do: a different summation tree, not different
+ *   arithmetic. Per the rule this workflow settled for those two, SCALAR IS
+ *   THE ORACLE, and this kernel accumulates j ascending as :1008-1035 does.
+ *
+ * Column: `ma_batch` routes "uma" through the MA family; the emitted series is
+ *   `UmaOutput::values`, i.e. the core series after the trailing WMA smooth.
+ *
+ * PERIOD-INVARIANT: the parameters are `accelerator` (1.0), `min_length` (5),
+ *   `max_length` (50) and `smooth_length` (4) (uma.rs:131-148). None is named
+ *   `period`, so five swept periods give five identical CPU columns.
+ *
+ * Input: ONE price series -> F64InputKind::CloseSlice. The lane hands no
+ *   volume, so `input.volume` is None and `candles_opt` is None, which selects
+ *   the `_ =>` arm of the money-flow match (:966-975): `rsi_wilder_last` over
+ *   a window of `2 * len_r` bars. The two volume arms above it are UNREACHABLE
+ *   on this lane and are deliberately not implemented -- implementing them
+ *   would be a different indicator that still returned plausible numbers.
+ *
+ * FIRST-VALID: `uma_prepare` :614-617 is `position(|x| !x.is_nan())` over the
+ *   single series -- F64FirstValidRule::AllInputsNonNan.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. `dyn_len` is carried across
+ *   every bar and is CLAMPED each time, so bar i's window LENGTH depends on
+ *   the whole history; there is no bar-parallel form at all, not merely none
+ *   that keeps the rounding.
+ *
+ * Roundings, counted against the CPU lines:
+ *   :904   let a = (-1.75f64).mul_add(sd, mu);      -- ONE fma (and b, c, d)
+ *   :977   let mf_scaled = mf.mul_add(2.0, -100.0); -- ONE fma
+ *   :978   let p = accelerator + (mf_scaled.abs() * 0.04);  -- plain
+ *   :1017  xws = x1.mul_add(w1, xws);               -- ONE fma per term
+ *   :1018  wsum += w1;                              -- plain
+ *   :850   avg_up = (avg_up * n_1 + up) / n;        -- plain, NOT an fma
+ *   :322   weight_sum += v * (k as f64 + 1.0);      -- plain (wma seed)
+ *   :333   weight_sum += v * period_f;              -- plain (wma step)
+ *   :1098  sumsq = v.mul_add(v, sumsq);             -- ONE fma (deviation)
+ *   The Wilder smoothing at :850 is deliberately NOT fused: unlike the Wilder
+ *   family behind rsi/atr, THIS one is written as a three-rounding
+ *   `(avg * (n-1) + x) / n`, and fusing it would silently change the money
+ *   flow that selects the weighting exponent.
+ *
+ * `exp` and `log`, never `expf`/`logf`: `exp_kernel` (:565) is `x.exp()` and
+ *   the weight table is `(k as f64).ln()` (:783). The weight is therefore
+ *   `exp(p * ln k)`, which is NOT rewritten as `pow(k, p)` -- `pow` is a
+ *   different rounding and this exponent selects the whole window shape.
+ *
+ * NaN semantics: `dyn_len.max(min_length as f64).min(max_length as f64)`
+ *   (:914) is `f64::max`/`f64::min`, which return the NON-NaN operand --
+ *   `fmax`/`fmin` are used for exactly that reason. `dyn_len` is CARRIED, so a
+ *   NaN admitted by an if-chain would fix the window length as NaN and every
+ *   later bar of the row would round it to garbage.
+ *
+ * Epsilon: none. Every comparison on this path is exact (`wsum == 0.0`,
+ *   `wsum > 0.0`, `avg_dn == 0.0`, `tot > 0.0`). The `1e-10`/`1e-30` pair
+ *   inside `standard_deviation_rolling_into` (:1111) is a RELATIVE
+ *   cancellation guard already sized for f64 and is carried across unchanged.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from uma.rs:131-148. `max_length` bounds nothing here -- the row
+ * keeps no per-thread array of that depth -- but it does bound the window the
+ * weighted sum walks, and it is a CPU DEFAULT rather than a swept parameter. */
+#define NEO_UMA_ACCELERATOR   1.0
+#define NEO_UMA_MIN_LENGTH    5
+#define NEO_UMA_MAX_LENGTH    50
+#define NEO_UMA_SMOOTH_LENGTH 4
+
+/* `rsi_wilder_last` -- uma.rs:812-863. Returns 50.0 on every degenerate case,
+ * exactly as the reference does. */
+__device__ double neo_uma_rsi_wilder_last(const double* __restrict__ data,
+                                          int start, int end, int period)
+{
+    if (period == 0 || end <= start || (end - start + 1) < (period + 1)) return 50.0;
+
+    double sum_up = 0.0, sum_dn = 0.0;
+    bool   has_nan = false;
+    double prev = data[start];
+    const int init_last = start + period;
+    for (int j = start + 1; j <= init_last; ++j) {
+        const double cur  = data[j];
+        const double diff = cur - prev;
+        if (!isfinite(diff)) { has_nan = true; break; }
+        if (diff > 0.0) sum_up += diff; else sum_dn -= diff;
+        prev = cur;
+    }
+    if (has_nan) return 50.0;
+
+    double avg_up = sum_up / (double)period;
+    double avg_dn = sum_dn / (double)period;
+
+    if (init_last < end) {
+        const double n_1 = (double)(period - 1);
+        const double nn  = (double)period;
+        for (int j = init_last + 1; j <= end; ++j) {
+            const double cur  = data[j];
+            const double diff = cur - prev;
+            const double up   = (diff > 0.0) ?  diff : 0.0;
+            const double dn   = (diff < 0.0) ? -diff : 0.0;
+            /* :850-851 -- THREE roundings each, as written. No fma. */
+            avg_up = (avg_up * n_1 + up) / nn;
+            avg_dn = (avg_dn * n_1 + dn) / nn;
+            prev = cur;
+        }
+    }
+
+    if (avg_dn == 0.0) return 100.0;
+    if (avg_up + avg_dn == 0.0) return 50.0;
+    return 100.0 * avg_up / (avg_up + avg_dn);
+}
+
+extern "C" __global__
+void uma_neo_batch_f64(const double* __restrict__ prices,
+                       int n,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods; /* period-invariant -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const double accelerator = NEO_UMA_ACCELERATOR;
+    const int    min_length  = NEO_UMA_MIN_LENGTH;
+    const int    max_length  = NEO_UMA_MAX_LENGTH;
+    const int    smooth      = NEO_UMA_SMOOTH_LENGTH;
+
+    /* `uma_prepare` :623-649. */
+    if (max_length == 0 || max_length > n) return;
+    if (min_length == 0 || min_length > max_length) return;
+    if (smooth == 0) return;
+    if (accelerator < 1.0) return;
+
+    const int first = first_valid;
+    if (first < 0 || first >= n) return;
+    if (n - first < max_length) return;                  /* NotEnoughValidData */
+
+    const int warmup_end = first + max_length - 1;       /* :799-804 */
+    if (warmup_end >= n) return;
+
+    /* ---- the trailing WMA(smooth) is streamed, not applied as a second pass.
+     * `wma_scalar` reads `data[i]` and `data[i - lookback]`, so a ring
+     * `lookback + 1` deep carries everything it needs and the raw series never
+     * has to be materialised in device memory. ---------------------------- */
+    const int    lookback = smooth - 1;
+    const double period_f = (double)smooth;
+    const double weights  = period_f * (period_f + 1.0) * 0.5;   /* wma.rs:310 */
+    double wma_ring[NEO_UMA_SMOOTH_LENGTH];
+    for (int k = 0; k < smooth; ++k) wma_ring[k] = 0.0;
+    double wma_sum = 0.0, wma_wsum = 0.0;
+    int    wma_seen = 0;                 /* bars fed since the first non-NaN  */
+
+    /* ---- sma(max_length) and deviation(max_length, devtype 0), both rolled
+     * forward in this same ascending pass ---------------------------------- */
+    const double nlen    = (double)max_length;
+    const double inv_len = 1.0 / nlen;
+
+    double sma_sum = 0.0;
+    for (int k = 0; k < max_length; ++k) sma_sum += prices[first + k];   /* sma.rs:333 */
+
+    double dev_sum = 0.0, dev_sumsq = 0.0;
+    int    dev_bad = 0;
+    for (int j = first; j < first + max_length; ++j) {                   /* deviation.rs:1090 */
+        const double v = prices[j];
+        if (!isfinite(v)) dev_bad += 1;
+        else { dev_sum += v; dev_sumsq = fma(v, v, dev_sumsq); }
+    }
+
+    double dyn_len = (double)max_length;
+
+    for (int i = warmup_end; i < n; ++i) {
+        /* --- advance the two rolling statistics to bar i, in CPU order --- */
+        if (i > warmup_end) {
+            sma_sum += prices[i] - prices[i - max_length];                /* sma.rs:341 */
+
+            const double v_in  = prices[i];
+            const double v_out = prices[i - max_length];
+            if (!isfinite(v_in)) dev_bad += 1;
+            else { dev_sum += v_in; dev_sumsq = fma(v_in, v_in, dev_sumsq); }
+            if (!isfinite(v_out)) { if (dev_bad > 0) dev_bad -= 1; }
+            else { dev_sum -= v_out; dev_sumsq -= v_out * v_out; }
+        }
+
+        const double mu = sma_sum * inv_len;
+
+        double sd;
+        if (dev_bad > 0 || !isfinite(dev_sum) || !isfinite(dev_sumsq)) {
+            if (dev_bad == 0) {
+                /* deviation.rs:1147-1160 -- rebuild the window from scratch. */
+                double s = 0.0, s2 = 0.0;
+                for (int k = i + 1 - max_length; k <= i; ++k) {
+                    const double v = prices[k];
+                    s += v; s2 = fma(v, v, s2);
+                }
+                if (isfinite(s) && isfinite(s2)) {
+                    const double m   = s / nlen;
+                    double       var = (s2 / nlen) - m * m;
+                    const double sc  = fabs(s2 / nlen);
+                    if (fabs(var) / fmax(sc, 1e-30) < 1e-10) {
+                        double v2 = 0.0;
+                        for (int k = i + 1 - max_length; k <= i; ++k) {
+                            const double d = prices[k] - m;
+                            v2 = fma(d, d, v2);
+                        }
+                        var = v2 / nlen;
+                    }
+                    if (var < 0.0) var = 0.0;
+                    sd = sqrt(var);
+                } else {
+                    sd = NEO_F64_NAN;
+                }
+            } else {
+                sd = NEO_F64_NAN;
+            }
+        } else {
+            const double m   = dev_sum / nlen;
+            double       var = (dev_sumsq / nlen) - m * m;
+            const double sc  = fabs(dev_sumsq / nlen);
+            /* deviation.rs:1111 -- a RELATIVE cancellation guard, already f64
+             * sized. Not an f32 epsilon and not rescaled. */
+            if (fabs(var) / fmax(sc, 1e-30) < 1e-10) {
+                double v2 = 0.0;
+                for (int k = i + 1 - max_length; k <= i; ++k) {
+                    const double d = prices[k] - m;
+                    v2 = fma(d, d, v2);
+                }
+                var = v2 / nlen;
+            }
+            if (var < 0.0) var = 0.0;
+            sd = sqrt(var);
+        }
+
+        /* --- the core, uma.rs:895-1039 --------------------------------- */
+        double raw = NEO_F64_NAN;
+        bool   have_raw = false;
+
+        if (!(isnan(mu) || isnan(sd))) {          /* :898-900 `continue` */
+            const double src = prices[i];
+
+            const double a = fma(-1.75, sd, mu);  /* :904-907 -- four fmas */
+            const double b = fma(-0.25, sd, mu);
+            const double c = fma( 0.25, sd, mu);
+            const double d = fma( 1.75, sd, mu);
+
+            if (src >= b && src <= c)      dyn_len += 1.0;
+            else if (src < a || src > d)   dyn_len -= 1.0;
+
+            /* `f64::max` then `f64::min`: a NaN would be REPLACED, not kept. */
+            dyn_len = fmin(fmax(dyn_len, (double)min_length), (double)max_length);
+            const int len_r = (int)round(dyn_len);
+
+            if (i + 1 >= len_r) {             /* :917-919 `continue` */
+                /* Slice input, no volume -> the `_ =>` arm at :966-975. */
+                const int end   = i;
+                const int rstart = (end + 1 >= 2 * len_r) ? (end + 1 - 2 * len_r) : 0;
+                const double mf = neo_uma_rsi_wilder_last(prices, rstart, end, len_r);
+
+                const double mf_scaled = fma(mf, 2.0, -100.0);       /* :977 */
+                const double p = accelerator + (fabs(mf_scaled) * 0.04);
+
+                const int start = i + 1 - len_r;
+                double xws = 0.0, wsum = 0.0;
+                /* :1008-1035 -- j ASCENDING, k = len_r - j, weight exp(p*ln k). */
+                for (int j = 0; j < len_r; ++j) {
+                    const int    k = len_r - j;
+                    const double w = exp(p * log((double)k));
+                    const double x = prices[start + j];
+                    if (!isnan(x)) { xws = fma(x, w, xws); wsum += w; }
+                }
+
+                raw = (wsum > 0.0) ? (xws / wsum) : src;             /* :1037 */
+                have_raw = true;
+            }
+        }
+
+        /* --- stream the trailing WMA(smooth) over the raw series -------- */
+        if (!have_raw) {
+            /* The CPU leaves this bar unwritten and the trailing WMA then
+             * scans the whole series for its FIRST non-NaN index
+             * (`wma_prepare`), so a leading run of skipped bars MOVES the
+             * smooth's start rather than poisoning it. That is why nothing is
+             * fed here until the first raw value exists. Once the stream HAS
+             * started, `wma_scalar` carries `sum` with no NaN handling at all,
+             * so a hole makes every later bar NaN -- reproduced literally. */
+            if (wma_seen == 0) continue;
+            wma_ring[wma_seen % smooth] = NEO_F64_NAN;
+            wma_sum  += NEO_F64_NAN;
+            wma_wsum += NEO_F64_NAN;
+            wma_seen += 1;
+            continue;
+        }
+
+        if (wma_seen < lookback) {
+            /* wma.rs:319-325 -- the seed accumulates `v * (k + 1)` and `v`. */
+            wma_ring[wma_seen % smooth] = raw;
+            wma_wsum += raw * ((double)wma_seen + 1.0);
+            wma_sum  += raw;
+            wma_seen += 1;
+            continue;
+        }
+
+        wma_ring[wma_seen % smooth] = raw;
+        wma_wsum += raw * period_f;                 /* wma.rs:333 */
+        wma_sum  += raw;
+        o[i] = wma_wsum / weights;                  /* wma.rs:336 */
+        wma_wsum -= wma_sum;                        /* wma.rs:338 */
+        wma_sum  -= wma_ring[(wma_seen - lookback) % smooth];  /* wma.rs:339 */
+        wma_seen += 1;
+    }
+}

@@ -568,6 +568,128 @@ const F64_LANE_SOURCES: &[&str] = &[
     "kernels/cuda/adaptive_schaff_trend_cycle_kernel.cu",
     "kernels/cuda/ehlers_linear_extrapolation_predictor_kernel.cu",
     "kernels/cuda/ehlers_autocorrelation_periodogram_kernel.cu",
+    // ------------------------------------------------------ closer 6, round 3
+    //
+    // Six indicators that had NO CUDA presence at all -- no `.cu`, no wrapper,
+    // no `F64_KERNELS` row -- and now carry a from-scratch f64 kernel written
+    // against the CPU reference. These are f64-ONLY translation units: there is
+    // no f32 entry point in any of them to be affected. Listing them is still
+    // the only way to opt out of `--use_fast_math`, and it matters in every one:
+    //
+    //  * `n_order_ema` and `ema_deviation_corrected_t3` divide inside a
+    //    recurrence, where an approximate reciprocal walks forward through
+    //    every later bar rather than perturbing one;
+    //  * `wave_smoother` runs `sin`/`cos` to build its weight vector;
+    //  * `logarithmic_moving_average` runs `log` per weight slot and divides
+    //    the window sum by the weight total on every emitted bar;
+    //  * `volatility_adjusted_ma` carries three chained recurrences and calls
+    //    `fma` explicitly at :411 of its CPU reference;
+    //  * `elastic_volume_weighted_moving_average` divides by the rolling volume
+    //    sum at every bar and feeds the quotient back in as the next `base`.
+    //
+    // `moving_averages/vama_kernel.cu` is NOT listed here and is NOT touched:
+    // it holds the f32 entry points `vama_wrapper.rs` still loads, and it
+    // belongs to shard S1.
+    "kernels/cuda/moving_averages/elastic_volume_weighted_moving_average_kernel.cu",
+    "kernels/cuda/moving_averages/ema_deviation_corrected_t3_kernel.cu",
+    "kernels/cuda/moving_averages/logarithmic_moving_average_kernel.cu",
+    "kernels/cuda/moving_averages/n_order_ema_kernel.cu",
+    "kernels/cuda/moving_averages/volatility_adjusted_ma_kernel.cu",
+    "kernels/cuda/moving_averages/wave_smoother_kernel.cu",
+    // ------------------------------------------------------ closer 2, round 3
+    //
+    // Each of these now carries an `<id>_neo_batch_f64` entry point (search the
+    // file for "NEOETHOS f64 LANE  --  closer 2, round 3") beside the
+    // bespoke-shaped f64 entry point its own wrapper already calls. Listing the
+    // FILE here opts its WHOLE compilation out of `--use_fast_math`, which is
+    // the only correct granularity: nvcc has no per-entry flag.
+    //
+    // `possible_rsi_kernel.cu` also received one but is ALREADY listed in the
+    // from-scratch block above and is NOT repeated -- listing a file twice
+    // would be a second claim about the same translation unit rather than a
+    // stronger one.
+    //
+    // Two of these matter beyond the general rule. `normalized_resonator`
+    // derives its resonator gain from `tan()` and multiplies it into every
+    // later bar of a 2-pole recurrence, and `regression_slope_oscillator`
+    // forms every slope as the DIFFERENCE of two running sums of `log()` that
+    // reach ~1e10 after 800k bars -- an approximate `log` or reciprocal does
+    // not perturb one bar in either, it walks forward through the whole series.
+    "kernels/cuda/neighboring_trailing_stop_kernel.cu",
+    "kernels/cuda/nonlinear_regression_zero_lag_moving_average_kernel.cu",
+    "kernels/cuda/normalized_resonator_kernel.cu",
+    "kernels/cuda/normalized_volume_true_range_kernel.cu",
+    "kernels/cuda/price_moving_average_ratio_percentile_kernel.cu",
+    "kernels/cuda/range_breakout_signals_kernel.cu",
+    "kernels/cuda/range_filtered_trend_signals_kernel.cu",
+    "kernels/cuda/regression_slope_oscillator_kernel.cu",
+    "kernels/cuda/relative_strength_index_wave_indicator_kernel.cu",
+    // ------------------------------------------------ closer 3, round 3
+    // Same contract as every block above: the f64 entry point the lane
+    // launches lives in the indicator's OWN file, beside the f32 entry points
+    // the f32 wrappers still call, so listing the file opts the WHOLE
+    // translation unit out of `--use_fast_math` -- a per-entry flag does not
+    // exist. Search these files for "f64 LANE  --  closer 3, round 3".
+    //
+    // `alphatrend_kernel.cu` and
+    // `vdubus_divergence_wave_pattern_generator_kernel.cu` are ALREADY in this
+    // list (from the closer-6 and stub blocks above) and are not repeated.
+    //
+    // TWO OF THESE FILES ARE STILL PURE f32 IN THEIR EXISTING ENTRY POINTS and
+    // that is deliberate rather than unfinished: every one of the seven
+    // `alphatrend_*_f32` symbols and both `avsl_*_f32` symbols is still called
+    // by a live wrapper (`alphatrend_wrapper.rs:514, 559, 706, 800, 846, 1235,
+    // 1340, 1465`; `avsl_wrapper.rs:264, 581, 759, 840`), so converting them in
+    // place would break those callers. The rule is "add the f64 entry point
+    // beside it and route our lane to the f64 one", which is what the new
+    // `*_neo_batch_f64` entries do. Listing the files here DOES change the f32
+    // entry points -- they stop being compiled with fast math -- and that is an
+    // accuracy improvement, not a regression: `alphatrend_kernel.cu:50-52` was
+    // reaching for `fabsf`/`fmaxf` under `--use_fast_math`, and
+    // `avsl_kernel.cu:47` was building its NaN as an f32 bit pattern.
+    "kernels/cuda/reversal_signals_kernel.cu",
+    "kernels/cuda/trend_follower_kernel.cu",
+    "kernels/cuda/volatility_ratio_adaptive_rsx_kernel.cu",
+    "kernels/cuda/volume_energy_reservoirs_kernel.cu",
+    "kernels/cuda/volume_weighted_relative_strength_index_kernel.cu",
+    "kernels/cuda/volume_weighted_stochastic_rsi_kernel.cu",
+    "kernels/cuda/zig_zag_channels_kernel.cu",
+    "kernels/cuda/moving_averages/avsl_kernel.cu",
+    // ---------------------------------------------------- closer 5, round 3
+    //
+    // Three files that already existed and now carry an `<id>_neo_batch_f64`
+    // entry point (search each for "NEOETHOS f64 LANE"), plus two written from
+    // scratch. Listing a file here opts its WHOLE compilation out of
+    // `--use_fast_math`, which is the only way the opt-out can be correct: in
+    // the first three the f32 and f64 entry points share one translation unit,
+    // so a per-entry flag does not exist.
+    //
+    // `moving_averages/mab_kernel.cu`, `moving_averages/vwmacd_kernel.cu`,
+    // `lpc_kernel.cu`, `moving_averages/macz_kernel.cu` and
+    // `pattern_recognition_kernel.cu` are ALREADY listed above and are
+    // deliberately not repeated.
+    "kernels/cuda/moving_averages/rsmk_kernel.cu",
+    "kernels/cuda/oscillators/squeeze_momentum_kernel.cu",
+    "kernels/cuda/moving_averages/uma_kernel.cu",
+    "kernels/cuda/moving_averages/corrected_moving_average_kernel.cu",
+    "kernels/cuda/moving_averages/ehlers_undersampled_double_moving_average_kernel.cu",
+    // ------------------------------------------------ closer 1, round 3
+    // Each of these now carries a lane-shaped `*_neo_batch_f64` entry point
+    // (search the file for "NEOETHOS f64 LANE  --  closer 1, round 3").
+    // Listing the FILE here opts its WHOLE compilation out of
+    // `--use_fast_math`, which is the only way the opt-out can be correct:
+    // the existing multi-output entry point and the new lane one share one
+    // translation unit, so a per-entry flag does not exist.
+    // `goertzel_cycle_composite_wave_kernel.cu`, `ichimoku_oscillator_kernel.cu`
+    // and `insync_index_kernel.cu` are already listed above and are not
+    // repeated.
+    "kernels/cuda/fibonacci_entry_bands_kernel.cu",
+    "kernels/cuda/half_causal_estimator_kernel.cu",
+    "kernels/cuda/linear_regression_intensity_kernel.cu",
+    "kernels/cuda/macd_wave_signal_pro_kernel.cu",
+    "kernels/cuda/mesa_stochastic_multi_length_kernel.cu",
+    "kernels/cuda/moving_average_cross_probability_kernel.cu",
+    "kernels/cuda/multi_length_stochastic_average_kernel.cu",
 ];
 
 fn is_f64_lane_source(rel_src: &str) -> bool {
@@ -1141,6 +1263,18 @@ fn compile_cuda_kernels() {
         &cuda_path,
         "kernels/cuda/moving_averages/swma_kernel.cu",
         "swma_kernel.ptx",
+    );
+    // ---------------------------------------------------- closer 5, round 3
+    // Two indicators that had NO `.cu` file at all before this round.
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/corrected_moving_average_kernel.cu",
+        "corrected_moving_average_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/ehlers_undersampled_double_moving_average_kernel.cu",
+        "ehlers_undersampled_double_moving_average_kernel.ptx",
     );
     compile_kernel(
         &cuda_path,
@@ -2029,6 +2163,41 @@ fn compile_cuda_kernels() {
         &cuda_path,
         "kernels/cuda/ehlers_autocorrelation_periodogram_kernel.cu",
         "ehlers_autocorrelation_periodogram_kernel.ptx",
+    );
+
+    // ------------------------------------------------------ closer 6, round 3
+    // The six from-scratch f64 kernels. Each is listed in `F64_LANE_SOURCES`
+    // above, so each is compiled `-prec-div=true -prec-sqrt=true -fmad=false
+    // -ftz=false` and never with `--use_fast_math`.
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/elastic_volume_weighted_moving_average_kernel.cu",
+        "elastic_volume_weighted_moving_average_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/ema_deviation_corrected_t3_kernel.cu",
+        "ema_deviation_corrected_t3_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/logarithmic_moving_average_kernel.cu",
+        "logarithmic_moving_average_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/n_order_ema_kernel.cu",
+        "n_order_ema_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/volatility_adjusted_ma_kernel.cu",
+        "volatility_adjusted_ma_kernel.ptx",
+    );
+    compile_kernel(
+        &cuda_path,
+        "kernels/cuda/moving_averages/wave_smoother_kernel.cu",
+        "wave_smoother_kernel.ptx",
     );
     compile_kernel(
         &cuda_path,
