@@ -663,20 +663,41 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
         } else {
             let models_root =
                 parse_flag(args, "--models-root").unwrap_or_else(|| "models".to_string());
-            let mut blend = neoethos_trader::BlendConfig {
+            // Both multipliers go through `BlendConfig::from_config_values` —
+            // the ONE constructor that validates them. Writing the fields
+            // directly (what this did until 2026-08-10) bypassed the inversion
+            // refusal, so the CLI could hand the replay a blend the constructor
+            // would have rejected: `--veto-below 0.80 --gate-floor 0.10` used to
+            // be accepted silently and vetoes every bar the floor exists to keep
+            // tradeable. The old `.clamp(0.0, 1.0)` was the other half of the
+            // problem — it turned `--gate-floor 1.5` into 1.0 with no message.
+            let requested_gate_floor = parse_blend_knob(args, "--gate-floor")?;
+            let requested_veto_below = parse_blend_knob(args, "--veto-below")?;
+            let blend = neoethos_trader::BlendConfig::from_config_values(
                 mode,
-                ..Default::default()
-            };
-            if let Some(f) = parse_flag(args, "--gate-floor").and_then(|v| v.parse::<f64>().ok()) {
-                blend.gate_floor = f.clamp(0.0, 1.0);
-            }
-            if let Some(v) = parse_flag(args, "--veto-below").and_then(|v| v.parse::<f64>().ok()) {
-                blend.veto_below = v.clamp(0.0, 1.0);
-            }
+                requested_gate_floor,
+                requested_veto_below,
+            );
+            // Print the EFFECTIVE numbers next to what was asked for, so a
+            // refusal (also logged at warn by the constructor, with both values)
+            // is visible on stdout too — this replay's every position size
+            // depends on which of the two won.
             println!(
                 "  blend mode={blend_arg} models_root={models_root} gate_floor={:.2} veto_below={:.2}",
                 blend.gate_floor, blend.veto_below
             );
+            for (name, requested, used) in [
+                ("gate-floor", requested_gate_floor, blend.gate_floor),
+                ("veto-below", requested_veto_below, blend.veto_below),
+            ] {
+                if let Some(req) = requested {
+                    if req != used {
+                        println!(
+                            "  WARNING: --{name} {req} REFUSED (out of [0,1] or inverted pair) — using {used}"
+                        );
+                    }
+                }
+            }
             neoethos_trader::replay_blend_from_dir(
                 &root,
                 &portfolio,
@@ -831,26 +852,48 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("blend-test requires --portfolio <live_portfolio.json>"))?;
     let models_root =
         parse_flag(args, "--models-root").unwrap_or_else(|| "models_oos_locked".to_string());
-    let gate_floor = parse_flag(args, "--gate-floor")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.34)
-        .clamp(0.0, 1.0);
-    let veto_below = parse_flag(args, "--veto-below")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.15)
-        .clamp(0.0, 1.0);
+    // Same rule as `trader-replay`: the flags are handed to
+    // `BlendConfig::from_config_values`, never written into the fields. This
+    // site used to carry its OWN copies of the shipped defaults (0.34 / 0.15)
+    // and its own `.clamp(0.0, 1.0)` — three ways to drift from
+    // `DEFAULT_BLEND_GATE_FLOOR` / `DEFAULT_BLEND_VETO_BELOW` and one way
+    // (an inverted pair) to run all three arms of the comparison with a blend
+    // that vetoes every bar, which reads as "the blend is safe, it opened
+    // nothing".
+    let requested_gate_floor = parse_blend_knob(args, "--gate-floor")?;
+    let requested_veto_below = parse_blend_knob(args, "--veto-below")?;
+    let validated = neoethos_trader::BlendConfig::from_config_values(
+        neoethos_trader::BlendMode::GenesOnly,
+        requested_gate_floor,
+        requested_veto_below,
+    );
+    let (gate_floor, veto_below) = (validated.gate_floor, validated.veto_below);
+    for (name, requested, used) in [
+        ("gate-floor", requested_gate_floor, gate_floor),
+        ("veto-below", requested_veto_below, veto_below),
+    ] {
+        if let Some(req) = requested {
+            if req != used {
+                println!(
+                    "  WARNING: --{name} {req} REFUSED (out of [0,1] or inverted pair) — using {used}"
+                );
+            }
+        }
+    }
 
+    // All three arms get the SAME validated multipliers — only `mode` differs,
+    // which is the entire point of the comparison.
     let run = |mode| -> Result<neoethos_trader::EngineStats> {
         neoethos_trader::replay_blend_from_dir(
             &root,
             &portfolio,
             &models_root,
             replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
-            neoethos_trader::BlendConfig {
+            neoethos_trader::BlendConfig::from_config_values(
                 mode,
-                gate_floor,
-                veto_below,
-            },
+                Some(gate_floor),
+                Some(veto_below),
+            ),
         )
     };
     let genes = run(neoethos_trader::BlendMode::GenesOnly)?;
@@ -2684,6 +2727,27 @@ fn warn_retired_env_vars() {
             replacement = %replacement,
             "a deleted environment variable is still set; its value was ignored"
         );
+    }
+}
+
+/// Parse an optional blend-multiplier flag (`--gate-floor` / `--veto-below`).
+///
+/// An unparseable value is a HARD ERROR, never a silent `None`. The previous
+/// `.and_then(|v| v.parse().ok())` turned `--gate-floor 0,34` (comma) or a typo
+/// into "operator said nothing" and ran the default — on a knob that scales
+/// every position in the replay. Absent still means absent; RANGE and inversion
+/// validation belong to `BlendConfig::from_config_values`, which logs both the
+/// configured and the used number when it refuses.
+fn parse_blend_knob(args: &[String], name: &str) -> Result<Option<f64>> {
+    match parse_flag(args, name) {
+        None => Ok(None),
+        Some(raw) => match raw.trim().parse::<f64>() {
+            Ok(v) => Ok(Some(v)),
+            Err(err) => anyhow::bail!(
+                "{name} expects a number in [0,1] (got '{raw}'): {err}. This value \
+                 scales every position's size — refusing to guess."
+            ),
+        },
     }
 }
 

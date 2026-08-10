@@ -500,6 +500,36 @@ fn risk_based_lots(
     lots.clamp(min_lot, max_lot)
 }
 
+/// The operator's `models.blend_gate_floor`, if he has set one.
+///
+/// PENDING RECIPIENT — READ THIS BEFORE BELIEVING THE WIRING. The field does
+/// NOT exist in `neoethos-core/src/config.rs` yet: that file belongs to another
+/// shard this wave, and the exact field list (name, type, default, doc line) is
+/// written down in `docs/pending-edits-forbidden-territory.md` under
+/// "`models.blend_*` — the live blend multipliers need a config recipient".
+/// Until those fields land this
+/// returns `None`, and [`neoethos_trader::BlendConfig::from_config_values`]
+/// yields the shipped `DEFAULT_BLEND_GATE_FLOOR` (0.34) — the SAME number the
+/// old `..Default::default()` produced. So the live sizing path is
+/// behaviour-identical today; what changed is that the number now arrives
+/// through the validating constructor instead of a struct literal, and one line
+/// here is all that stands between the operator's YAML and the live multiplier.
+///
+/// When the field lands: `settings.map(|s| s.models.blend_gate_floor)`. Nothing
+/// else in this file moves.
+fn operator_blend_gate_floor(settings: Option<&neoethos_core::Settings>) -> Option<f64> {
+    let _ = settings; // recipient pending — see the doc comment above
+    None
+}
+
+/// The operator's `models.blend_veto_below`, if he has set one.
+/// See [`operator_blend_gate_floor`] — same pending recipient, same file, and
+/// the same "returns `None` ⇒ shipped `DEFAULT_BLEND_VETO_BELOW` (0.15)" story.
+fn operator_blend_veto_below(settings: Option<&neoethos_core::Settings>) -> Option<f64> {
+    let _ = settings; // recipient pending — see `operator_blend_gate_floor`
+    None
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 async fn run(
@@ -629,6 +659,29 @@ async fn run(
         .as_ref()
         .map(|s| s.models.live_ml_gate)
         .unwrap_or(false);
+    // The two multipliers that gate SCALES EVERY ENTRY'S SIZE by. Built ONCE
+    // here, through `BlendConfig::from_config_values` — the single validating
+    // constructor — instead of `..Default::default()` at the per-entry call
+    // site. Two reasons for building it here and not in the loop: a refusal is
+    // then logged ONCE at engine start (a per-bar warn is a warn nobody reads),
+    // and the operator sees the effective numbers before the first order.
+    let live_blend_cfg = neoethos_trader::BlendConfig::from_config_values(
+        neoethos_trader::BlendMode::MlScale,
+        operator_blend_gate_floor(sizing.as_ref()),
+        operator_blend_veto_below(sizing.as_ref()),
+    );
+    if live_ml_gate {
+        tracing::info!(
+            target: "neoethos_app::live_trading",
+            %symbol,
+            gate_floor = live_blend_cfg.gate_floor,
+            veto_below = live_blend_cfg.veto_below,
+            mode = ?live_blend_cfg.mode,
+            "LIVE ML blend multipliers resolved — these two numbers scale every \
+             entry's risk; any refused operator value was logged above with both \
+             the configured and the used number"
+        );
+    }
     // Journal location + the account this engine trades — the inputs to the
     // ACCOUNT-WIDE risky-mode loss ledger consulted at the pre-send check.
     // Resolved once: `data_dir` does not move at runtime, and the account id is
@@ -2014,11 +2067,13 @@ async fn run(
                                 regime_gate: d.regime_gate,
                                 anomaly_scale: d.anomaly_scale,
                             };
-                            let cfg = neoethos_trader::BlendConfig {
-                                mode: neoethos_trader::BlendMode::MlScale,
-                                ..Default::default()
-                            };
-                            let (out_dir, conf) = neoethos_trader::blend_decision(direction, &ml, &cfg);
+                            // `live_blend_cfg` was built ONCE at engine start via
+                            // `BlendConfig::from_config_values` (see there). This
+                            // used to be a `..Default::default()` struct literal,
+                            // which hardcoded gate_floor 0.34 / veto_below 0.15
+                            // onto the live sizing path with no seam for config.
+                            let (out_dir, conf) =
+                                neoethos_trader::blend_decision(direction, &ml, &live_blend_cfg);
                             if matches!(out_dir, Direction::Flat) {
                                 tracing::warn!(
                                     target: "neoethos_app::live_trading",

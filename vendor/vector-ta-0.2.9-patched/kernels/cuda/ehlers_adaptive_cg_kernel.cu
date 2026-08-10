@@ -1,6 +1,40 @@
 #include <cmath>
 #include <cstddef>
 
+/* THE CPU'S CONSTANT, NOT A CHOSEN ONE.
+ *
+ * `ehlers_adaptive_cg.rs:396` guards the quadrature ratio with
+ * `q.abs() > f64::EPSILON && prev_q.abs() > f64::EPSILON`, and :448 guards the
+ * centre-of-gravity divide with `denominator.abs() > f64::EPSILON`. That is
+ * `f64::EPSILON` = 2^-52 = 2.220446049250313e-16.
+ *
+ * BOTH SITES IN THIS FILE USED 1e-12 UNTIL closer 7, and the header below
+ * claimed the constants were "the crate's own guard ... NOT an f32 epsilon
+ * carried forward". That claim was false: the crate's own guard is
+ * 2.220446049250313e-16. The two numbers are FOUR ORDERS OF MAGNITUDE apart,
+ * so every |q1|, |prev_q| or |denominator| in
+ *
+ *     (2.220446049250313e-16, 1e-12]
+ *
+ * took the DIVIDE branch on the CPU and the FALLBACK branch on the card --
+ * dp pinned at 0.1 instead of the clamped ratio, cg forced to 0.0 instead of
+ * the quotient. `denominator` is a running SUM of up to 100 prices, so it
+ * lands in that band whenever a window very nearly cancels; that is not an
+ * ULP-sized disagreement, it is a different value.
+ *
+ * The reference wins, and the wider guard is deleted rather than kept: this
+ * lane exists to reproduce the CPU column, and a guard the CPU does not have
+ * is a substitution, not a safety margin. Nothing overflows by removing it --
+ * the `raw` ratio is clamped to [0.1, 1.1] on the very next lines in both
+ * kernels, and the `cg_cur` quotient is exactly what the CPU already writes.
+ *
+ * BOTH KERNELS IN THIS FILE USE IT: `ehlers_adaptive_cg_batch_f64` (the alpha
+ * sweep) and `ehlers_adaptive_cg_neo_batch_f64` (the period sweep), two guard
+ * sites each. Grep `NEO_EACG_DIV_EPS` -- there must be four, and there must be
+ * no bare `1e-12` left in the arithmetic.
+ */
+#define NEO_EACG_DIV_EPS 2.220446049250313e-16
+
 static __device__ inline double ehlers_adaptive_cg_median3(double a, double b, double c) {
     return (a + b + c) - fmin(a, fmin(b, c)) - fmax(a, fmax(b, c));
 }
@@ -102,7 +136,7 @@ extern "C" __global__ void ehlers_adaptive_cg_batch_f64(
                     double i1 = cycle_hist[(i - 3) % 7];
                     double prev_i1 = cycle_hist[(i - 4) % 7];
                     double prev_q = q1_hist[(i - 1) % 2];
-                    if (fabs(q1_cur) > 1e-12 && fabs(prev_q) > 1e-12) {
+                    if (fabs(q1_cur) > NEO_EACG_DIV_EPS && fabs(prev_q) > NEO_EACG_DIV_EPS) {
                         double raw = (i1 / q1_cur - prev_i1 / prev_q) /
                             (1.0 + i1 * prev_i1 / (q1_cur * prev_q));
                         if (raw < 0.1) {
@@ -159,7 +193,7 @@ extern "C" __global__ void ehlers_adaptive_cg_batch_f64(
                         denominator += value;
                     }
                     if (!has_nan) {
-                        if (fabs(denominator) > 1e-12) {
+                        if (fabs(denominator) > NEO_EACG_DIV_EPS) {
                             cg_cur = -numerator / denominator +
                                 (static_cast<double>(window) + 1.0) * 0.5;
                         } else {
@@ -210,9 +244,14 @@ extern "C" __global__ void ehlers_adaptive_cg_batch_f64(
 // row declares F64FirstValidRule::Ignored.
 //
 // f64 END TO END: double literals, double fabs/fmin/fmax/llround, no
-// f32-suffixed math function and no fast-math intrinsic. The two 1e-12 guards
-// are f64-sized -- they are the crate's own guard for a ratio whose
-// denominator is a filtered price, NOT an f32 epsilon carried forward.
+// f32-suffixed math function and no fast-math intrinsic.
+//
+// THE TWO DIVISION GUARDS ARE `NEO_EACG_DIV_EPS` (:31), which is the literal
+// value of `f64::EPSILON` and is the constant the CPU reference itself uses at
+// ehlers_adaptive_cg.rs:396 and :448. They were 1e-12 until closer 7 and this
+// comment asserted that 1e-12 WAS the crate's own constant; it is not, and the
+// two are four orders apart. See the block at the top of this file for what
+// that cost and why the reference's value wins.
 // ---------------------------------------------------------------------------
 
 #define NEO_EACG_ALPHA 0.07
@@ -309,7 +348,7 @@ extern "C" __global__ void ehlers_adaptive_cg_neo_batch_f64(
                     const double i1 = cycle_hist[(i - 3) % 7];
                     const double prev_i1 = cycle_hist[(i - 4) % 7];
                     const double prev_q = q1_hist[(i - 1) % 2];
-                    if (fabs(q1_cur) > 1e-12 && fabs(prev_q) > 1e-12) {
+                    if (fabs(q1_cur) > NEO_EACG_DIV_EPS && fabs(prev_q) > NEO_EACG_DIV_EPS) {
                         double raw = (i1 / q1_cur - prev_i1 / prev_q) /
                             (1.0 + i1 * prev_i1 / (q1_cur * prev_q));
                         if (raw < 0.1) {
@@ -366,7 +405,7 @@ extern "C" __global__ void ehlers_adaptive_cg_neo_batch_f64(
                         denominator += value;
                     }
                     if (!has_nan) {
-                        if (fabs(denominator) > 1e-12) {
+                        if (fabs(denominator) > NEO_EACG_DIV_EPS) {
                             cg_cur = -numerator / denominator +
                                 (static_cast<double>(window) + 1.0) * 0.5;
                         } else {

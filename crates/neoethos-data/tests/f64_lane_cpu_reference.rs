@@ -36,13 +36,25 @@ use vector_ta::indicators::dispatch::{
 use vector_ta::utilities::data_loader::Candles;
 use vector_ta::utilities::enums::Kernel;
 
-/// Every indicator the f64 device lane claims.
+/// Every indicator THIS CRATE's f64 device lane can launch, plus the moving
+/// averages and volatility ids kept ahead of it.
 ///
-/// This list is duplicated from `cuda_f64::F64_KERNELS` on purpose: that table
-/// lives behind vector-ta's `cuda` feature, and the whole value of this test is
-/// that it runs on a machine with no CUDA at all. `table_matches_vector_ta`
-/// below asserts the two are identical whenever the feature IS enabled, so the
-/// duplication cannot rot silently.
+/// # This is NOT a mirror of `cuda_f64::F64_KERNELS`, and it never was
+///
+/// It used to say it was, and `claimed_list_matches_vector_ta_f64_kernels`
+/// below used to assert equality. That assertion could not have passed since
+/// vector-ta's f64 lane grew past its first two batches: the real table now
+/// carries 338 rows against this list's ~29, so the test was a red gate waiting
+/// for the first `--features gpu-cuda` build to trip it, on this machine that
+/// build cannot even be attempted (no nvcc, no driver), and no card build has
+/// run since. The equality was corrected to the two containments that are
+/// actually true and actually load-bearing — see that test.
+///
+/// What this list is FOR: `cuda_f64::F64_KERNELS` lives behind vector-ta's
+/// `cuda` feature, and the whole value of the tests in this file is that they
+/// run on a machine with no CUDA at all. So the ids this crate actually
+/// launches are named here in plain text, and the containments below tie them
+/// back to the real table whenever the feature IS enabled.
 const CLAIMED: &[&str] = &[
     // batch 1
     "sma", "ema", "rsi", "roc", "mom", "atr", "adx", "willr", "cci", "mfi",
@@ -114,10 +126,11 @@ fn candles(n: usize) -> Candles {
 /// a reassociating AVX reduction and its scalar sibling are MOST likely to
 /// agree, because much of what separates them is how each handles a non-finite
 /// operand. The two divergences the clean fixture found (`vwap` at 1 ULP,
-/// `wilders` at its seed bar) are therefore the floor, not the ceiling — and 22
-/// of the 27 registered indicators have genuinely distinct AVX bodies rather
-/// than `*_avx2` wrappers that call `*_scalar`. Every one of those was admitted
-/// to the table on the strength of a NaN-free fixture.
+/// `wilders` at its seed bar — both since fixed upstream, in the CPU) are
+/// therefore the floor, not the ceiling: most ids in [`CLAIMED`] have genuinely
+/// distinct AVX bodies rather than `*_avx2` wrappers that call `*_scalar`, and
+/// every one of them was admitted to the table on the strength of a NaN-free
+/// fixture.
 ///
 /// The gaps are placed to separate the three first-valid rules the CPU uses:
 ///
@@ -496,18 +509,74 @@ fn every_claimed_indicator_is_reachable_with_no_output_id() {
     }
 }
 
-/// The duplicated list above must match vector-ta's real table. Only compiled
-/// when the CUDA feature is on, which is exactly when the real table exists.
+/// The two containments that are true, in place of the equality that was not.
+///
+/// # What changed and why
+///
+/// This test used to assert `CLAIMED == F64_KERNELS`. That is false by two
+/// orders of magnitude — the real table carries 338 rows and this list ~29 —
+/// and it had been false for as long as vector-ta's f64 lane has been growing
+/// past its first batches. Nothing caught it because the test is
+/// `gpu-cuda`-gated and no card build has run since.
+///
+/// The equality was never the property that mattered. Two containments are:
+///
+/// 1. **Every id in `GPU_SWEEP_SPECS` must be in `CLAIMED`.** `GPU_SWEEP_SPECS`
+///    is what `hpc_ta` actually launches, so an id there that this file does
+///    not exercise is an id whose CPU oracle has never been checked for
+///    self-consistency — which is precisely the hazard the whole file exists
+///    for. This direction is the one that would have caught `vwap` being
+///    claimed without being measured.
+/// 2. **Every id in `CLAIMED` must have a row in `F64_KERNELS`.** An id checked
+///    here that vector-ta has no f64 kernel for is a test spending time on
+///    something no device will ever run — and, worse, reads as coverage.
+///
+/// The counts of both sets are printed rather than asserted. A number in a test
+/// message ages honestly; a number in an `assert_eq!` becomes a chore.
 #[cfg(feature = "gpu-cuda")]
 #[test]
-fn claimed_list_matches_vector_ta_f64_kernels() {
+fn claimed_list_is_consistent_with_vector_ta_f64_kernels() {
+    use neoethos_data::core::gpu_indicators::GPU_SWEEP_SPECS;
     use vector_ta::indicators::dispatch::cuda_f64::F64_KERNELS;
-    let mut real: Vec<&str> = F64_KERNELS.iter().map(|s| s.indicator_id).collect();
-    let mut mine: Vec<&str> = CLAIMED.to_vec();
-    real.sort_unstable();
-    mine.sort_unstable();
-    assert_eq!(
-        mine, real,
-        "the CLAIMED list in this test has drifted from cuda_f64::F64_KERNELS"
+
+    let real: Vec<&str> = F64_KERNELS.iter().map(|s| s.indicator_id).collect();
+
+    let unmeasured: Vec<&str> = GPU_SWEEP_SPECS
+        .iter()
+        .map(|s| s.id)
+        .filter(|id| !CLAIMED.contains(id))
+        .collect();
+    assert!(
+        unmeasured.is_empty(),
+        "hpc_ta launches these on the device but this file never measures their CPU oracle for \
+         scalar-vs-auto self-consistency: {unmeasured:?}. Add them to CLAIMED. \
+         (CLAIMED={}, GPU_SWEEP_SPECS={}, F64_KERNELS={})",
+        CLAIMED.len(),
+        GPU_SWEEP_SPECS.len(),
+        real.len()
+    );
+
+    let phantom: Vec<&str> = CLAIMED
+        .iter()
+        .copied()
+        .filter(|id| !real.contains(id))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "CLAIMED names ids with no row in cuda_f64::F64_KERNELS, so no device will ever run them \
+         and their presence here reads as coverage it is not: {phantom:?}. \
+         (CLAIMED={}, GPU_SWEEP_SPECS={}, F64_KERNELS={})",
+        CLAIMED.len(),
+        GPU_SWEEP_SPECS.len(),
+        real.len()
+    );
+
+    eprintln!(
+        "f64 lane sets: CLAIMED={} (measured card-lessly here), GPU_SWEEP_SPECS={} (launched by \
+         hpc_ta), F64_KERNELS={} (registered by vector-ta). The last is deliberately much larger: \
+         most of it is base-vocabulary indicators this crate has no device lane for at all.",
+        CLAIMED.len(),
+        GPU_SWEEP_SPECS.len(),
+        real.len()
     );
 }

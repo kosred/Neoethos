@@ -70,9 +70,22 @@ pub enum BlendMode {
 /// they are greppable and so a config field can bind to them without moving
 /// the number; the values themselves are UNCHANGED.
 ///
-/// The config recipient (`models.blend.gate_floor` / `.veto_below`) still does
-/// not exist — `neoethos-core/src/config.rs` is owned by another workflow this
-/// wave. [`BlendConfig::from_config_values`] is the seam it plugs into.
+/// WIRING (2026-08-10). Every production construction site now goes through
+/// [`BlendConfig::from_config_values`] rather than a struct literal:
+/// * `neoethos-app/src/app_services/live_trading.rs` — built ONCE at engine
+///   start (`live_blend_cfg`), consumed by `blend_decision` on every entry bar.
+/// * `neoethos-cli/src/main.rs` `cmd_trader_replay` — `--gate-floor` /
+///   `--veto-below` are handed to the constructor instead of being written into
+///   the fields, so the CLI can no longer build a blend the constructor rejects.
+///
+/// The YAML recipient (`models.blend_gate_floor` / `models.blend_veto_below`)
+/// still does not
+/// exist — `neoethos-core/src/config.rs` is owned by another workflow this wave,
+/// and the exact field list is written down in
+/// `docs/pending-edits-forbidden-territory.md`. The live readers
+/// (`operator_blend_gate_floor` / `operator_blend_veto_below` in
+/// `live_trading.rs`) therefore pass `None` today and land on these defaults.
+/// The CLI flags are already live operator input.
 pub const DEFAULT_BLEND_GATE_FLOOR: f64 = 0.34;
 
 /// Default effective-multiplier floor below which the trade is SKIPPED.
@@ -105,8 +118,12 @@ impl Default for BlendConfig {
 }
 
 impl BlendConfig {
-    /// Build a config from OPTIONAL operator-supplied values — the seam a
-    /// config recipient plugs into (audit #232).
+    /// Build a config from OPTIONAL operator-supplied values — the ONLY
+    /// sanctioned way production code builds a [`BlendConfig`] with non-default
+    /// multipliers (audit #232). Callers: `live_trading.rs` (live sizing) and
+    /// `neoethos-cli` `cmd_trader_replay` (`--gate-floor` / `--veto-below`).
+    /// Writing `gate_floor` / `veto_below` directly bypasses every refusal
+    /// below; the struct literal form is reserved for tests.
     ///
     /// SAFETY POSTURE: a value that is absent, non-finite, or outside `[0,1]`
     /// does NOT silently become something else. It falls back to the shipped
@@ -410,6 +427,35 @@ mod tests {
         let unset = BlendConfig::from_config_values(BlendMode::GenesOnly, None, None);
         assert_eq!(unset.gate_floor, DEFAULT_BLEND_GATE_FLOOR);
         assert_eq!(unset.veto_below, DEFAULT_BLEND_VETO_BELOW);
+    }
+
+    /// The live path (`live_trading.rs`) and the CLI now build their
+    /// `BlendConfig` through `from_config_values` instead of
+    /// `BlendConfig { mode, ..Default::default() }`. That swap is only safe if
+    /// the two forms are IDENTICAL when the operator has configured nothing —
+    /// this pins it for every mode, so the 2026-08-10 rewiring cannot have
+    /// moved a live position size by accident.
+    #[test]
+    fn unset_config_is_byte_identical_to_the_old_default_literal() {
+        for mode in [BlendMode::GenesOnly, BlendMode::MlConfirm, BlendMode::MlScale] {
+            let via_ctor = BlendConfig::from_config_values(mode, None, None);
+            let via_literal = BlendConfig { mode, ..Default::default() };
+            assert_eq!(
+                via_ctor, via_literal,
+                "from_config_values(None, None) must reproduce the shipped default for {mode:?}"
+            );
+        }
+    }
+
+    /// NaN is not "no value" — it is a value that would make every comparison
+    /// in `blend_decision` false. It must be REFUSED, not propagated.
+    #[test]
+    fn non_finite_blend_knobs_are_refused() {
+        let d = BlendConfig::default();
+        let nan = BlendConfig::from_config_values(BlendMode::MlScale, Some(f64::NAN), None);
+        assert_eq!(nan.gate_floor, d.gate_floor);
+        let inf = BlendConfig::from_config_values(BlendMode::MlScale, None, Some(f64::INFINITY));
+        assert_eq!(inf.veto_below, d.veto_below);
     }
 
     #[test]

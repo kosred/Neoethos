@@ -8,8 +8,20 @@
 //! release pipeline cannot fail because of a typo nobody noticed.
 //!
 //! The actual binary-artifact build is validated by running
-//! `packaging/portable/build-portable.sh` (the simplest "at least one
-//! of" path per the ship-gate) which only requires `cargo` + `tar`.
+//! `packaging/appimage/build.sh` — the ship-gate's "at least one of
+//! (.deb, .AppImage, .tar.gz)" path, and the only artifact script this
+//! repository still ships.
+//!
+//! THIS PARAGRAPH USED TO NAME `packaging/portable/build-portable.sh`, and
+//! `portable_build_script_is_present_and_executable` below pinned that file.
+//! Commit `11b43d70` (2026-06-20) DELETED the script as unused and left the
+//! test behind, so this integration binary has been RED on every host since
+//! — invisible for as long as the build phase ran `--lib` only. The
+//! deletion was the decision; the test was its undragged leftover, so the
+//! test is deleted rather than the script resurrected, and the property it
+//! stood for (an artifact path that exists, parses, and runs a release
+//! build) is now asserted against the AppImage script that actually ships,
+//! by `an_artifact_build_script_is_present_and_builds_a_release`.
 //!
 //! Run: `cargo test -p neoethos-app --test packaging_smoke`
 
@@ -44,31 +56,50 @@ fn packaging_directory_exists() {
     );
 }
 
+/// The ship-gate's "at least one of (.deb, .AppImage, .tar.gz)" path must
+/// exist, parse, and actually build the release binary.
+///
+/// REPLACES `portable_build_script_is_present_and_executable`, which pinned
+/// `packaging/portable/build-portable.sh`. Commit `11b43d70` (2026-06-20)
+/// deleted that script — its own message calls it "(unused)" — and did not
+/// delete this test with it, so `--test packaging_smoke` has failed on every
+/// host from that day to 2026-08-10. Nothing caught it because the file is
+/// an INTEGRATION target: a `--lib` test run never builds it.
+///
+/// The script is not resurrected. The June decision stands; what was missing
+/// was the drag. So the property is re-anchored on the artifact script the
+/// repository still ships and still lists in `release-installers.yml`, and
+/// the assertions below were each checked against its real text rather than
+/// carried over: `packaging/appimage/build.sh:1` is the shebang and `:54` is
+/// the `cargo build --release -p neoethos-app` this asserts.
+///
+/// If the AppImage path is ever deleted too, this test must be deleted or
+/// re-anchored IN THE SAME CHANGE — not left to rot the way its predecessor
+/// did. An empty ship-gate is worse than a loud one.
 #[test]
-fn portable_build_script_is_present_and_executable() {
-    // The simplest "at least one of (.deb, .AppImage, .tar.gz)" path —
-    // shipped so that a developer with only `cargo` and `tar` on PATH
-    // can still produce a release artifact.
-    let script = packaging_dir().join("portable").join("build-portable.sh");
+fn an_artifact_build_script_is_present_and_builds_a_release() {
+    let script = packaging_dir().join("appimage").join("build.sh");
     assert!(
         script.is_file(),
-        "expected portable build script at {}",
+        "no release-artifact build script left under packaging/: expected {}. The ship-gate \
+         requires at least one of (.deb, .AppImage, .tar.gz) to be buildable from this tree.",
         script.display()
     );
 
     // Cross-platform exec check: bash shebang plus a meaningful body.
-    let body = fs::read_to_string(&script).expect("read portable script");
+    let body = fs::read_to_string(&script).expect("read AppImage build script");
     assert!(
         body.starts_with("#!/usr/bin/env bash") || body.starts_with("#!/bin/bash"),
-        "portable script must start with a bash shebang"
+        "artifact script must start with a bash shebang"
     );
     assert!(
         body.contains("cargo build --release"),
-        "portable script must invoke a release build"
+        "artifact script must invoke a release build — otherwise it packages whatever debug \
+         binary happens to be lying in target/"
     );
     assert!(
-        body.contains("tar czf"),
-        "portable script must emit a .tar.gz"
+        body.contains("AppImage"),
+        "artifact script must emit an .AppImage"
     );
 }
 

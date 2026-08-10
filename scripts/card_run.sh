@@ -1,11 +1,26 @@
 #!/usr/bin/env bash
-# The card run. One command, unattended, everything logged.
+# The card run — TWO STAGES, because they answer different questions and the
+# second is worthless until the first is clean.
 #
-#   ./scripts/card_run.sh 2>&1 | tee card_run.console.log
+#   ./scripts/card_run.sh cuda     # stage A: build, parity, tests. STOPS there.
+#   ./scripts/card_run.sh search   # stage B: the M15 run + the verdict.
 #
-# Answers exactly one question: is it, finally, everything on the card from
-# start to finish. Every step writes a full log to $LOGS and the run stops at
-# the first step that cannot honestly be called a pass.
+# The operator's sequencing, and the reason for the split: all repairs and the
+# single config land FIRST, on the dev box. THEN the card, and the card is for
+# SOLVING CUDA PROBLEMS — 253 changed .cu files that no compiler has ever seen,
+# plus four wrapper edits under cfg(feature="cuda"). Expect stage A to fail the
+# first time; that is what it is for. Read the log, fix, re-run stage A. Only
+# when it is clean does stage B run the actual searches.
+#
+# Running them as one command would burn hours of card time on a discovery run
+# launched from a build nobody had read.
+#
+# THE CONFIG MIGRATION IS NOT HERE ANY MORE. It rewrites the only file a run
+# reads, it calls Read-Host by design, and it belongs to the "one config" work
+# that happens BEFORE the card is rented:
+#     pwsh -File scripts/migrate_live_config.ps1          # report, read the diff
+#     pwsh -File scripts/migrate_live_config.ps1 -Apply   # then apply
+# Stage A refuses to start if the store still carries the pre-migration values.
 #
 # HOST REQUIREMENTS, learned the expensive way:
 #   - AMD host. Building features on an Intel Xeon SIGILLs.
@@ -16,7 +31,13 @@
 
 set -uo pipefail
 
-LOGS="${LOGS:-$PWD/card-logs-$(date -u +%Y%m%d-%H%M%S)}"
+STAGE="${1:-cuda}"
+case "$STAGE" in
+  cuda|search) ;;
+  *) echo "usage: $0 [cuda|search]"; echo "  cuda   — build, parity, tests. Fix CUDA here."; echo "  search — the M15 run. Only after cuda is clean."; exit 2 ;;
+esac
+
+LOGS="${LOGS:-$PWD/card-logs-$STAGE-$(date -u +%Y%m%d-%H%M%S)}"
 mkdir -p "$LOGS"
 COMMIT="$(git rev-parse HEAD)"
 step=0
@@ -41,36 +62,11 @@ grep -qi amd /proc/cpuinfo || echo "WARNING: not an AMD host — feature buildin
 # The live store is the ONLY file a run reads. Skipping this means searching
 # under whatever numbers that file last had — which on the operator's box means
 # the payoff gate OFF and no portfolio cap.
-step=2; say "the config this run will actually use"
+step=2; say "the config this run will use — the migration must already have happened"
 
-# migrate_live_config.ps1 is [CmdletBinding()] with ONE switch, -Apply. It has no
-# SupportsShouldProcess, so -WhatIf and -Confirm are parameter-binding ERRORS.
-# The first version of this script passed both, swallowed the error into the diff
-# file, and printed "diff written to ..." over a file containing nothing but a
-# PowerShell binding failure. Report-only is the default; -Apply is the other mode.
-#
-# And the apply path does not belong in an unattended script at all: the migration
-# calls Assert-Interactive and Read-Host by design, because it rewrites the only
-# file a run reads. Run it yourself, before this script, and re-run this script
-# afterwards.
-if [ -f scripts/migrate_live_config.ps1 ] && command -v pwsh >/dev/null; then
-  pwsh -File scripts/migrate_live_config.ps1 > "$LOGS/02-migration-report.txt" 2>&1
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    head -20 "$LOGS/02-migration-report.txt"
-    fail "the migration report itself failed (exit $rc). Fix that before spending card time."
-  fi
-  echo "migration report: $LOGS/02-migration-report.txt"
-fi
-
-# WHICH FILE WILL Settings::load() OPEN, AND WHAT IS IN IT.
-# The cwd-relative fallback was deleted, so on a fresh box with no user store the
-# run takes COMPILED DEFAULTS — and that is not a neutral outcome. Against the repo
-# profile it flips trading_mode and discovery_mode risky->prop_firm, preset
-# none->ftmo, require_walkforward_for_export false->true, prop_firm_min_pass_rate
-# 0.0->0.40, multi_resolution_enabled false->true, prop_search_generations
-# 20000->50, portfolio_size 50->3000, and max_portfolio_risk 0.34->0.0 = NO CAP.
-# The old version of this step let that pass with `|| true` and an empty report.
+# The migration is NOT run here. It rewrites the only file a run reads and calls
+# Read-Host by design; it belongs to the "one config" work that lands BEFORE the
+# card is rented. This step only REFUSES to proceed if it clearly never ran.
 STORE="${CONFIG_FILE:-}"
 if [ -z "$STORE" ]; then
   case "$(uname -s)" in
@@ -82,19 +78,39 @@ fi
 {
   echo "resolved store path: $STORE"
   if [ -f "$STORE" ]; then
-    echo "EXISTS — this run searches under the values below"
+    echo "EXISTS — this run uses the values below"
     grep -nE 'prop_search_min_payoff_ratio|prefilter_top_k|max_portfolio_risk|require_walkforward_for_export|adaptive_thresholds|normalize_features|prop_search_device|trading_mode|discovery_mode|prop_firm_min_pass_rate' "$STORE"
   else
-    echo "ABSENT — Settings::load() will fall through to COMPILED DEFAULTS."
+    echo "ABSENT — Settings::load() falls through to COMPILED DEFAULTS."
   fi
 } > "$LOGS/02-effective.txt" 2>&1
 cat "$LOGS/02-effective.txt"
 
 if [ ! -f "$STORE" ] && [ "${ALLOW_COMPILED_DEFAULTS:-0}" != "1" ]; then
-  fail "no config store at $STORE. This run would search under compiled defaults —
-        prop_firm rules on, 50 generations instead of 20000, and max_portfolio_risk
-        0.0 which means NO CAP. Copy a config there, or set
+  fail "no config store at $STORE. This run would use compiled defaults —
+        prop_firm rules on, 50 generations instead of 20000, and
+        max_portfolio_risk 0.0 which means NO CAP. Copy a config there, or set
         ALLOW_COMPILED_DEFAULTS=1 if that is genuinely what you want measured."
+fi
+
+# The three fingerprints of a store the migration never touched. Each is a value
+# the migration asks about by name, and each makes a search meaningless: the
+# payoff gate off, no portfolio cap, and a prefilter keeping a fifth of what it
+# should. Stage B refuses on these; stage A only warns, because a CUDA build does
+# not care what the search thresholds say.
+if [ -f "$STORE" ]; then
+  stale=0
+  grep -qE '^\s*prop_search_min_payoff_ratio:\s*0\.0*\s*$' "$STORE" && { echo "STALE: prop_search_min_payoff_ratio is 0.0 — the payoff gate is OFF"; stale=1; }
+  grep -qE '^\s*max_portfolio_risk:\s*0\.0*\s*$'          "$STORE" && { echo "STALE: max_portfolio_risk is 0.0 — that means NO CAP, not no risk"; stale=1; }
+  grep -qE '^\s*prefilter_top_k:\s*50\s*$'                 "$STORE" && { echo "STALE: prefilter_top_k is 50 against a ~1795-column vocabulary"; stale=1; }
+  if [ "$stale" = "1" ]; then
+    echo
+    echo "The migration has not been applied to this store. Run it on the dev box:"
+    echo "    pwsh -File scripts/migrate_live_config.ps1          # read the diff"
+    echo "    pwsh -File scripts/migrate_live_config.ps1 -Apply"
+    [ "$STAGE" = "search" ] && fail "refusing to search under pre-migration values — the answer would be about the config, not the market"
+    echo "(stage cuda continues: a CUDA build does not depend on these.)"
+  fi
 fi
 
 # ── 3. THE BUILD. This is the only compiler that has ever seen the kernels ───
@@ -159,6 +175,27 @@ if [ "${SKIP_BURN_AB:-0}" != "1" ]; then
   echo "If WITH is now faster, add burn-cuda-backend to the gpu-cuda aggregate and"
   echo "say the 2026-06-10 measurement expired. If it is still slower, leave the"
   echo "exclusion and record the new number beside the old one."
+fi
+
+# ═══ END OF STAGE A ═══════════════════════════════════════════════════════════
+# Everything above answers "does this build, and does the card agree with the
+# CPU". That is the CUDA-fixing loop: run stage A, read the whole log, fix, run
+# it again. Nothing below runs until it is clean, because a discovery run
+# launched from a shaky build costs hours and proves nothing.
+if [ "$STAGE" = "cuda" ]; then
+  say "STAGE A COMPLETE — build, parity and suites are green"
+  cat <<'NEXT'
+
+Read these before going further:
+  03-build.log            every warning, not just the errors
+  04-parity-summary.txt   the card agreeing with the CPU
+  05b-burn-*.log          with vs without burn-cuda — the gate on model scale
+
+When stage A is clean and the migration has been applied on the dev box:
+  ./scripts/card_run.sh search 2>&1 | tee card_search.console.log
+NEXT
+  tar czf "${LOGS}.tar.gz" -C "$(dirname "$LOGS")" "$(basename "$LOGS")" 2>/dev/null     && echo "archive: ${LOGS}.tar.gz"
+  exit 0
 fi
 
 # ── 6. THE RUN. M15, end to end ──────────────────────────────────────────────

@@ -84,8 +84,15 @@ pub fn validate_news_calendar_source(raw: &str) -> Result<String, String> {
 }
 
 /// System-level configuration
+///
+/// **Sealed against a second load path.** `remote = "Self"` makes the derive
+/// emit an *inherent* `SystemConfig::deserialize` instead of an
+/// `impl Deserialize for SystemConfig`, so this type cannot be reached by
+/// `serde_*::from_str::<SystemConfig>` nor by a `#[derive(Deserialize)]`
+/// struct that merely holds one. See the SUB-STRUCT SEAL block further down
+/// this file, above the hand-written `Serialize` impls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(remote = "Self", default, deny_unknown_fields)]
 pub struct SystemConfig {
     pub symbol: String,
     /// Market Watch live-tick subscription set (F-338). Empty → the spot
@@ -332,8 +339,37 @@ impl SystemConfig {
 }
 
 /// Risk management configuration
+///
+/// **Sealed against a second load path — and this is the one that was proved to
+/// be a MONEY divergence.** The same bytes `risk: {preset: the5ers}` gave
+/// `daily_drawdown_limit` 0.032 through [`Settings`] (which re-derives the
+/// preset seeds, see `reconcile_preset`) and 0.040 through a
+/// `#[derive(Deserialize)] struct Bypass { risk: RiskConfig }` that never runs
+/// it — total 0.042 vs 0.070. **The bypass got the LOOSER limit under the
+/// correct firm label.** `remote = "Self"` makes the derive emit an *inherent*
+/// `RiskConfig::deserialize` instead of an `impl Deserialize for RiskConfig`,
+/// so that bypass no longer compiles:
+///
+/// ```compile_fail
+/// // The verifier's own bypass. It must NOT compile.
+/// #[derive(serde::Deserialize)]
+/// struct Bypass {
+///     risk: neoethos_core::config::RiskConfig,
+/// }
+/// ```
+///
+/// The control: a `#[derive(Deserialize)]` container is otherwise perfectly
+/// legal here, so the block above fails for the seal and not for the
+/// environment.
+///
+/// ```
+/// #[derive(serde::Deserialize)]
+/// struct Control {
+///     a: String,
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(remote = "Self", default, deny_unknown_fields)]
 pub struct RiskConfig {
     /// Named prop-firm preset that seeds every other field in this
     /// struct. The runtime is firm-agnostic; this field just selects
@@ -2598,8 +2634,10 @@ impl NewsTradingMode {
 }
 
 /// News and LLM configuration
+///
+/// Sealed against a second load path — see the SUB-STRUCT SEAL block below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(remote = "Self", default, deny_unknown_fields)]
 pub struct NewsConfig {
     /// How the trading gate handles incoming high-impact news.
     /// Operator-controlled; default `block_on_news` preserves the
@@ -2642,8 +2680,10 @@ impl Default for NewsConfig {
 /// these into its `env_overrides` cache at startup so the trading layer reads
 /// the single config instead of `std::env`. Clamping is applied by the
 /// getters (same bounds the env readers used).
+///
+/// Sealed against a second load path — see the SUB-STRUCT SEAL block below.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(remote = "Self", default, deny_unknown_fields)]
 pub struct AppRuntimeConfig {
     /// HTTP server bind address `host:port` (default `127.0.0.1:7423`).
     pub server_bind: String,
@@ -2684,6 +2724,98 @@ impl Default for AppRuntimeConfig {
     }
 }
 
+// ─── THE SUB-STRUCT SEAL ────────────────────────────────────────────────────
+//
+// `load_seal` seals `Settings`. Until 2026-08-10 it sealed the WRONG BOUNDARY:
+// the sub-structs it is made of were `pub` with a DERIVED `Deserialize`, so a
+// second load path built out of them COMPILED —
+//
+//     #[derive(Deserialize)]
+//     struct Bypass { risk: RiskConfig, system: SystemConfig }
+//     serde_yaml_ng::from_str::<Bypass>(bytes)
+//
+// — and it DIVERGED ON MONEY. The same bytes `risk: {preset: the5ers}` yield
+// `daily_drawdown_limit` 0.032 / `total_drawdown_limit` 0.042 through the seal
+// and 0.040 / 0.070 through the bypass, because the bypass never runs
+// `reconcile_preset`. The bypass got the LOOSER limit under the correct firm
+// label. No consumer existed in the tree, so it was latent; it is closed here
+// before one appears.
+//
+// THE MECHANISM. `#[serde(remote = "Self")]` makes `#[derive(Deserialize)]`
+// emit an *inherent* `fn X::deserialize<D>(D) -> Result<X, D::Error>` INSTEAD
+// OF `impl Deserialize for X`. With no trait impl:
+//
+//   * `serde_yaml_ng::from_str::<RiskConfig>(..)` does not compile (E0277);
+//   * a `#[derive(Deserialize)]` struct holding one does not compile either —
+//     that is the exact bypass the verifier built, and it is a `compile_fail`
+//     doctest on `RiskConfig` plus a source guard in
+//     `tests/config_single_load_path.rs`.
+//
+// The ONE caller of each inherent parser is `SettingsWire`, via
+// `#[serde(deserialize_with = ...)]`. That is the whole point: the parser still
+// exists, but the only route into it is the loader, which then runs
+// `reconcile_preset`, `validate_safety_bounds` and the money-path reports.
+//
+// WHAT IS STILL OPEN, NAMED RATHER THAN HIDDEN. The inherent fn inherits the
+// struct's visibility, so it is `pub`: code that explicitly builds a
+// `Deserializer` and names the inherent parser can still get a raw, un-
+// reconciled value. That is a deliberate act naming the loader's private door,
+// not the accidental `from_str` that shipped before, and
+// `no_second_caller_of_the_inherent_parsers` in
+// `tests/config_single_load_path.rs` fails the build if a second call site
+// appears anywhere in the workspace.
+//
+// `ModelsConfig` is NOT sealed. Five `serde_yaml_ng::from_str::<ModelsConfig>`
+// call sites live in `domain/demo_gate.rs` and `domain/promotion_gate.rs`
+// (their own `#[cfg(test)]` blocks), which this change does not own. Sealing it
+// without moving them is a build break, so the edit is written out in
+// `docs/pending-edits-forbidden-territory.md`. `ModelsConfig` carries no
+// preset re-derivation, so the divergence it exposes is the missing top-level
+// retired-key prune, not a money number.
+//
+// The `Serialize` side is UNCHANGED behaviour: `remote` removes that trait impl
+// too, so each is hand-written below to delegate to the inherent serializer.
+// `X::serialize(self, s)` resolves to the INHERENT associated fn — inherent
+// items are selected before trait items in `Type::name` path resolution — so
+// this is delegation, not recursion. Serialization was never a load path and
+// nothing about `Settings::save` changes.
+
+impl Serialize for SystemConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SystemConfig::serialize(self, serializer)
+    }
+}
+
+impl Serialize for RiskConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        RiskConfig::serialize(self, serializer)
+    }
+}
+
+impl Serialize for NewsConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        NewsConfig::serialize(self, serializer)
+    }
+}
+
+impl Serialize for AppRuntimeConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        AppRuntimeConfig::serialize(self, serializer)
+    }
+}
+
 pub use load_seal::{ConfigProvenance, ConfigSource, Settings};
 
 /// **THE SINGLE RESOLUTION POINT.** The only place in the workspace where a
@@ -2720,6 +2852,18 @@ pub use load_seal::{ConfigProvenance, ConfigSource, Settings};
 ///
 /// The compiler enforces all three; there is no derived `Deserialize` left to
 /// fall back to.
+///
+/// ## The boundary this originally got wrong (fixed 2026-08-10)
+///
+/// Sealing `Settings` is not the same as sealing the config. The five
+/// sub-structs it is made of were `pub` with derived `Deserialize`, so a
+/// `#[derive(Deserialize)] struct Bypass { risk: RiskConfig }` compiled and
+/// read the same bytes to a DIFFERENT drawdown limit — it never ran
+/// `reconcile_preset`, so `preset: the5ers` gave it FTMO's looser 0.040 under
+/// The5%ers' label. Four of the five now have no `Deserialize` impl at all and
+/// are parsed only by `SettingsWire`'s `deserialize_with` attributes; see the
+/// SUB-STRUCT SEAL block above this module for the mechanism, the one door left
+/// open by design, and why `ModelsConfig` is still unsealed.
 mod load_seal {
     use super::{
         user_config_path, AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig,
@@ -2871,13 +3015,24 @@ mod load_seal {
     /// The wire shape. Private, so nothing outside can deserialize around the
     /// seal. `deny_unknown_fields` here is what catches a stale TOP-LEVEL key
     /// such as the `secrets_file:` in the operator's live store.
+    ///
+    /// **These `deserialize_with` attributes are the sub-struct seal's ONE call
+    /// site.** Four of the five sections have no `impl Deserialize` at all (see
+    /// the SUB-STRUCT SEAL block above `pub use load_seal`); their parser is an
+    /// inherent fn that only this struct names. Deleting an attribute here does
+    /// not fall back to a derive — it stops compiling, which is the point.
+    /// `models` is the exception and is ledgered there.
     #[derive(Deserialize)]
     #[serde(default, deny_unknown_fields)]
     struct SettingsWire {
+        #[serde(deserialize_with = "SystemConfig::deserialize")]
         system: SystemConfig,
+        #[serde(deserialize_with = "RiskConfig::deserialize")]
         risk: RiskConfig,
         models: ModelsConfig,
+        #[serde(deserialize_with = "NewsConfig::deserialize")]
         news: NewsConfig,
+        #[serde(deserialize_with = "AppRuntimeConfig::deserialize")]
         app_runtime: AppRuntimeConfig,
     }
 

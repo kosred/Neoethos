@@ -39,8 +39,20 @@ pub enum IndicatorLane {
     /// The feature is compiled in and the caller allowed the card, but the
     /// card could not serve this frame. `why` is the propagated device error.
     CpuDeviceUnavailable { why: String },
-    /// The indicator has no device dispatch in vector-ta at all, so it stays
-    /// on the CPU by construction. Enumerated, not discovered at run time.
+    /// The indicator is not in `gpu_indicators::GPU_SWEEP_SPECS`, so it stays
+    /// on the CPU by construction. Enumerated up front from that table, never
+    /// discovered by a failed launch mid-run.
+    ///
+    /// The name says "not portable" and the doc used to say "has no device
+    /// dispatch in vector-ta at all". That is NOT why any id lands here today,
+    /// and the correction matters because the old wording invited the reader to
+    /// stop looking. Every id that reaches this variant — `stoch`, `macd`,
+    /// `bollinger_bands`, `keltner`, `supertrend` — HAS a row in
+    /// `cuda_f64::F64_KERNELS`. They stay on the CPU because they are
+    /// MULTI-OUTPUT and `hpc_ta` calls `compute_cpu` with `output_id: None`,
+    /// which returns `Err(InvalidParam)` for them (`cpu_batch.rs:2185`) and is
+    /// swallowed at `hpc_ta.rs:291` — so they emit ZERO columns on EITHER lane.
+    /// The device kernel is not the missing piece; the CPU call is.
     CpuIndicatorNotPortable,
 }
 

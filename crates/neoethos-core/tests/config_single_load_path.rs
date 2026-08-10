@@ -345,6 +345,190 @@ fn the_construction_seal_is_still_in_place() {
     );
 }
 
+// ── the sub-struct seal ─────────────────────────────────────────────────────
+
+/// The five sections of `Settings`, and whether the type is sealed against
+/// being deserialized outside the loader.
+///
+/// Sealing `Settings` alone sealed the WRONG BOUNDARY: the sections were `pub`
+/// with a derived `Deserialize`, so this compiled —
+///
+/// ```text
+/// #[derive(Deserialize)]
+/// struct Bypass { risk: RiskConfig }
+/// ```
+///
+/// — and read the SAME BYTES to a DIFFERENT LIMIT, because nothing outside
+/// `Settings::from_raw` runs `reconcile_preset`.
+const SUBSTRUCTS: &[(&str, bool)] = &[
+    ("SystemConfig", true),
+    ("RiskConfig", true),
+    // NOT sealed: five `from_str::<ModelsConfig>` call sites live in
+    // `domain/demo_gate.rs` and `domain/promotion_gate.rs` test modules, which
+    // the change that sealed the other four did not own. Ledgered in
+    // `docs/pending-edits-forbidden-territory.md` and named in config.rs.
+    ("ModelsConfig", false),
+    ("NewsConfig", true),
+    ("AppRuntimeConfig", true),
+];
+
+/// The ~8 lines of attributes directly above `pub struct <name> {`.
+fn struct_header(src: &str, name: &str) -> String {
+    let decl = format!("\npub struct {name} {{");
+    assert!(
+        src.contains(&decl),
+        "`pub struct {name}` is gone from config.rs. If a section of Settings was renamed or \
+         removed, update SUBSTRUCTS in this file — an unlisted section is an unguarded one."
+    );
+    let head = src.split(&decl).next().unwrap_or_default();
+    head.rsplit('\n').take(8).collect::<Vec<_>>().join("\n")
+}
+
+/// Every `.rs` file under `dir`, skipping build output.
+fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if path.is_dir() {
+            if matches!(name.as_str(), "target" | "node_modules" | ".git") {
+                continue;
+            }
+            rust_sources(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The mechanism is a compile error — a test that compiles cannot execute the
+/// bypass — so this asserts the mechanism is present, exactly as the `Settings`
+/// seal is asserted above. The bypass itself is a `compile_fail` doctest on
+/// `RiskConfig` in `config.rs`, with a plain-`String` control block beside it so
+/// it cannot pass because the doctest environment is broken.
+#[test]
+fn a_sealed_substruct_has_no_deserialize_impl_to_route_around() {
+    let src = config_rs();
+
+    for (name, sealed) in SUBSTRUCTS {
+        let header = struct_header(&src, name);
+        let remote = header.contains("remote = \"Self\"");
+        if *sealed {
+            assert!(
+                remote,
+                "`{name}` lost `#[serde(remote = \"Self\")]`, so `#[derive(Deserialize)]` is \
+                 emitting an `impl Deserialize for {name}` again. That impl IS the second load \
+                 path: `from_str::<{name}>` and any struct that merely holds one both compile \
+                 again, and neither runs reconcile_preset. Header was:\n{header}"
+            );
+            assert!(
+                !src.contains(&format!("Deserialize<'de> for {name}")),
+                "`{name}` has a hand-written `Deserialize` impl. The seal is that there is NO \
+                 trait impl at all — the parser must stay an inherent fn that only SettingsWire \
+                 names."
+            );
+        } else {
+            assert!(
+                !remote,
+                "`{name}` is now sealed. Flip its flag in SUBSTRUCTS, delete its entry from \
+                 docs/pending-edits-forbidden-territory.md, and drop it from the exception named \
+                 in the SUB-STRUCT SEAL block in config.rs."
+            );
+            assert!(
+                src.contains(&format!("`{name}` is NOT sealed")),
+                "`{name}` is the unsealed exception and config.rs must say so out loud in the \
+                 SUB-STRUCT SEAL block. An unsealed section that nothing names is exactly the \
+                 latent second load path this suite exists to prevent."
+            );
+        }
+    }
+}
+
+/// A gate that is written must be called. The inherent parsers are reachable
+/// only through `SettingsWire`, and this is what keeps it that way: the needle
+/// is built at run time so this file does not match itself.
+#[test]
+fn no_second_caller_of_the_inherent_parsers() {
+    let root = repo_root();
+    let loader = root
+        .join("crates")
+        .join("neoethos-core")
+        .join("src")
+        .join("config.rs");
+    let loader_src = std::fs::read_to_string(&loader).expect("read config.rs");
+
+    let mut files = Vec::new();
+    for sub in ["crates", "desktop"] {
+        rust_sources(&root.join(sub), &mut files);
+    }
+    assert!(
+        files.len() > 50,
+        "the workspace scan found only {} .rs files — it is not scanning the tree, so its silence \
+         means nothing",
+        files.len()
+    );
+    // Read once; four needles are checked against it.
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .filter(|f| **f != loader)
+        .filter_map(|f| {
+            std::fs::read_to_string(f)
+                .ok()
+                .map(|text| (f.display().to_string(), text))
+        })
+        .collect();
+
+    for (name, sealed) in SUBSTRUCTS {
+        if !*sealed {
+            continue;
+        }
+        let call = format!("deserialize_with = \"{name}::{}\"", "deserialize");
+        assert!(
+            loader_src.contains(&call),
+            "SettingsWire no longer routes `{name}` through its inherent parser (`{call}` is \
+             gone). Without that attribute the loader is not the caller of the gate it installed."
+        );
+
+        let needle = format!("{name}::{}", "deserialize");
+        let strays: Vec<&str> = sources
+            .iter()
+            .filter(|(_, text)| text.contains(&needle))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "`{needle}` is named outside config.rs, in {strays:?}. That inherent fn is the RAW \
+             parse — it does not run reconcile_preset, validate_safety_bounds or the money-path \
+             reports. It is the loader's private door; a second caller is a second load path with \
+             a different drawdown limit."
+        );
+    }
+}
+
+/// The money the seal is worth, in both readings.
+///
+/// Through the loader `preset: the5ers` re-derives the seeds it is documented
+/// to seed. Through the bypass that used to compile it did not, and the file
+/// got FTMO's LOOSER numbers under The5%ers' label: daily 0.040 instead of
+/// 0.032, total 0.070 instead of 0.042.
+#[test]
+fn the_preset_seeds_reach_the_money_fields_through_the_only_door() {
+    let loaded = load_yaml("substruct-money", "risk:\n  preset: the5ers\n").expect("load");
+    assert_eq!(
+        loaded.risk.daily_drawdown_limit, 0.032,
+        "The5%ers' daily stop is 0.032. 0.040 is FTMO's, and reading it here means the preset \
+         re-derivation did not run — which is what every path except this one used to do."
+    );
+    assert!(
+        (loaded.risk.total_drawdown_limit - 0.042).abs() < 1e-6,
+        "The5%ers' total cap is 0.06 * 0.7 = 0.042; got {}. 0.070 is FTMO's.",
+        loaded.risk.total_drawdown_limit
+    );
+}
+
 #[test]
 fn every_config_struct_denies_unknown_fields() {
     let src = config_rs();

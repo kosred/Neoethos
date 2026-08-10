@@ -1458,7 +1458,15 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "ui",
         kernel: F64Kernel::Ui,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // ui.rs:1036 (batch) and :1266 (sweep) scan
+        // `position(|x| x.is_finite())`, NOT `!is_nan`. The two differ on an
+        // INFINITE bar: the CPU skips it, `AllInputsNonNan` accepts it. This
+        // row declared the common rule until closer 7 and the kernel CONSUMES
+        // the value -- `ui_kernel.cu:389` runs `for (i = first_valid; ...)`
+        // and `:376` derives `warmup_end = first_valid + (period * 2 - 2)` --
+        // so the disagreement SHIFTED the whole column rather than moving its
+        // last bits.
+        first_valid: F64FirstValidRule::CloseFinite,
     },
     // bollinger_bands.rs:285 (`bb_prepare`). Emits the UPPER band,
     // which is what cpu_batch.rs:5514 maps output_id "value" to.
@@ -1866,7 +1874,12 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "psychological_line",
         kernel: F64Kernel::PsychologicalLine,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // psychological_line.rs:218 `first_valid_index` is
+        // `position(|x| x.is_finite())`, and :231 / :605 / :687 all take it.
+        // `psychological_line_kernel.cu:199` copies the caller's value into
+        // `first` and :214 starts the run counter there, so an infinite bar
+        // the CPU skips would have started the device column one bar early.
+        first_valid: F64FirstValidRule::CloseFinite,
     },
     // rank_correlation_index.rs:224 scans the single series; :251 for the
     // value. Warmup `first + length - 1`.
@@ -1874,7 +1887,12 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "rank_correlation_index",
         kernel: F64Kernel::RankCorrelationIndex,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // rank_correlation_index.rs:215 `first_valid_index` is
+        // `position(|x| x.is_finite())`; :219 `is_fast_path_clean` then
+        // re-scans `data[first..]` with `is_finite` too, so nothing downstream
+        // repairs a too-early index. `rank_correlation_index_kernel.cu:121`
+        // copies it into `first` and :129 starts the loop there.
+        first_valid: F64FirstValidRule::CloseFinite,
     },
     // moving_averages/sinwma.rs:307 scans the single series; :494 for the
     // value, :273 for the weights. Warmup `first + period - 1`.
@@ -2108,21 +2126,34 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "ehlers_detrending_filter",
         kernel: F64Kernel::EhlersDetrendingFilter,
         input: F64InputKind::Hlc,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // ehlers_detrending_filter_kernel.cu:174 is `(void)first_valid;` --
+        // the CPU driver walks from index 0 and RESETS the stream on a
+        // non-finite value (:216 scans `is_finite`, which the common rule does
+        // not express anyway). Declaring AllInputsNonNan here was a claim the
+        // kernel does not honour, and it made this row invisible to
+        // `departures_from_the_common_rule_are_declared_by_name`.
+        first_valid: F64FirstValidRule::Ignored,
     },
     /// CPU source is hl2 (:27), not close. Column `cycle` (cpu_batch.rs:10196).
     F64KernelSpec {
         indicator_id: "ehlers_simple_cycle_indicator",
         kernel: F64Kernel::EhlersSimpleCycleIndicator,
         input: F64InputKind::Hl2Slice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // ehlers_simple_cycle_indicator_kernel.cu:149 is
+        // `(void)first_valid;` -- the CPU (:225, `is_finite`) emits NaN for a
+        // non-finite bar WITHOUT advancing any index or ring, so no
+        // caller-supplied index describes the output.
+        first_valid: F64FirstValidRule::Ignored,
     },
     /// CPU source is hl2 (:31), not close.
     F64KernelSpec {
         indicator_id: "ehlers_smoothed_adaptive_momentum",
         kernel: F64Kernel::EhlersSmoothedAdaptiveMomentum,
         input: F64InputKind::Hl2Slice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // ehlers_smoothed_adaptive_momentum_kernel.cu:271 is
+        // `(void)first_valid;` -- see its header :207. The CPU scan at :286 is
+        // `is_finite` and the stream resets on a non-finite bar.
+        first_valid: F64FirstValidRule::Ignored,
     },
     /// The series cannot start before a RETURN can be formed: `valid_sq_return`
     /// (ewma_volatility.rs:274) needs two consecutive finite, strictly positive
@@ -2431,7 +2462,11 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "forward_backward_exponential_oscillator",
         kernel: F64Kernel::ForwardBackwardExponentialOscillator,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        // forward_backward_exponential_oscillator_kernel.cu:238 is
+        // `(void)first_valid;` -- see its header :196. The CPU resets both
+        // passes' states on a non-finite value (:550-554); the :440 scan is
+        // `is_finite` and is not the common rule either.
+        first_valid: F64FirstValidRule::Ignored,
     },
     /// PERIOD-INVARIANT (cpu_batch.rs:7577-7580 read gmma_type / smooth_length /
     /// signal_length / anchor_minutes). Column `oscillator` (:7610). anchor_minutes
@@ -4064,35 +4099,75 @@ mod tests {
             );
         }
 
-        // The probe used to be `stoch`. Closer 6 gave stoch an f64 kernel
-        // (`stoch_batch_f64`, oscillators/stoch_kernel.cu), so it is no longer
-        // an example of a missing one and asserting that it fails would now
-        // assert the opposite of the truth.
+        // THE PROBE HAS MOVED TWICE, BECAUSE ITS SUBJECT KEPT GETTING A
+        // KERNEL. That is the probe working as designed, and the moves are
+        // recorded here so nobody re-adopts a subject that is now served:
         //
-        // `rogers_satchell_volatility` replaces it, and it is the STRONGEST
-        // remaining example rather than an arbitrary one: it has no `.cu` file
-        // at all, and its wrapper
-        // (`src/cuda/rogers_satchell_volatility_wrapper.rs`) computes on the
-        // HOST and uploads the result with `DeviceBuffer::from_slice`
-        // (:263, :309, :372) without a single `get_function` call -- the
-        // disguise this lane exists to make impossible. The f64 lane must say
-        // "no kernel" by name rather than quietly serving that.
+        //   * `stoch` was the original. Closer 6 gave it `stoch_batch_f64`
+        //     (oscillators/stoch_kernel.cu).
+        //   * `rogers_satchell_volatility` replaced it and is ALSO served
+        //     now: closer 4 round 2 wrote
+        //     `kernels/cuda/rogers_satchell_volatility_kernel.cu` and
+        //     registered the row above (`F64Kernel::RogersSatchellVolatility`,
+        //     Ohlc4, `Ignored`). Asserting that it fails would assert the
+        //     opposite of the truth and would PANIC on `unwrap_err` the first
+        //     time this suite runs on a CUDA box. The old comment beside it
+        //     also claimed it "has no .cu file at all" and that its wrapper
+        //     "computes on the HOST and uploads"; the first is false since
+        //     that kernel landed, and the second describes the legacy f32
+        //     wrapper (`src/cuda/rogers_satchell_volatility_wrapper.rs`),
+        //     which is not what this lane resolves.
         //
-        // WHEN THAT KERNEL IS WRITTEN, THIS PROBE MOVES -- it does not get
+        // `pattern_recognition` is the subject now, and it is a STRUCTURAL
+        // example rather than a not-yet-written one. It is a real, reachable
+        // indicator id -- `registry.rs:12259` seeds it, `get_indicator`
+        // returns it, and `crates/neoethos-data/src/core/all_indicators.rs`
+        // asks for it by name -- but its output is `OUTPUTS_MATRIX_BOOL`, a
+        // per-bar boolean matrix, and every entry point in
+        // `kernels/cuda/pattern_recognition_kernel.cu` is `*_f32` or `*_u8`.
+        // There is no f64 value column for this lane to carry, so it has no
+        // row in `F64_KERNELS` and is not owed one.
+        //
+        // It is also the ONLY unregistered id that still reaches this error:
+        // `ma`, `ma_batch` and `ma_stream` are the other three, and
+        // `resolve_f64_kernel` intercepts them above with `InvalidParam`
+        // because they are dispatchers, not indicators.
+        //
+        // IF IT EVER GAINS A ROW, THIS PROBE MOVES AGAIN -- it does not get
         // deleted. An empty probe would let the "fails by name" guarantee rot
         // silently.
-        let err = resolve_f64_entry_point("rogers_satchell_volatility").unwrap_err();
-        let text = format!("{err}");
-        assert!(
-            text.contains("rogers_satchell_volatility"),
-            "the error must name the indicator: {text}"
+        let err = resolve_f64_entry_point("pattern_recognition").unwrap_err();
+
+        // ASSERT THE FIELD, NOT A SUBSTRING OF THE MESSAGE. The Display for
+        // `CudaF64KernelMissing` (dispatch/error.rs:44-47) interpolates
+        // `{available}`, which is EVERY registered id joined with ", ". So a
+        // bare `text.contains(id)` is satisfied by the availability list
+        // whenever the id is registered -- which is exactly the case this
+        // probe exists to catch, and is how the previous subject was able to
+        // stay in this assertion after it gained a kernel. Matching the
+        // `indicator` field is the only check that cannot pass vacuously.
+        let (indicator, available) = match &err {
+            IndicatorDispatchError::CudaF64KernelMissing {
+                indicator,
+                available,
+            } => (indicator, available),
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert_eq!(
+            indicator, "pattern_recognition",
+            "the error must name the indicator it refused"
         );
         assert!(
-            matches!(
-                err,
-                IndicatorDispatchError::CudaF64KernelMissing { .. }
-            ),
-            "wrong variant: {err:?}"
+            !available.split(", ").any(|id| id == "pattern_recognition"),
+            "the probe subject is registered after all; move the probe"
+        );
+
+        // The rendered message must still carry the name, because that string
+        // is what an operator reads out of a log.
+        let text = format!("{err}");
+        assert!(
+            text.contains("'pattern_recognition'"),
+            "the error must name the indicator: {text}"
         );
     }
 
@@ -4424,6 +4499,56 @@ mod tests {
             //   warmup prefix at all and both passes walk from bar 0, so a
             //   first-valid index would name a bar the CPU never skips.
             ("otto", F64FirstValidRule::Ignored),
+            // ------------------------------------------------------- closer 7
+            //
+            // Seven rows that declared `AllInputsNonNan` while their CPU
+            // reference scanned with `is_finite`. `AllInputsNonNan` is served
+            // on the host by `position(|x| !x.is_nan())`
+            // (`crates/neoethos-data/src/core/gpu_indicators.rs:343-344`),
+            // which is STRICTLY WEAKER: it accepts an INFINITE bar the CPU
+            // skips and therefore names a bar at or before the CPU's.
+            //
+            // They split by whether the kernel READS the value, and the
+            // declaration follows the kernel rather than the other way round:
+            //
+            //   * THREE CONSUME IT, so the wrong declaration shifted the whole
+            //     column rather than perturbing its last bits. Now
+            //     `CloseFinite`, which is exactly "one price series scanned
+            //     with is_finite" and is answered on the host by
+            //     `first_valid_close_finite`.
+            //   * FOUR DISCARD IT with `(void)first_valid;`. Runtime was
+            //     unaffected, but `AllInputsNonNan` is the one value this test
+            //     SKIPS, so those four rows were invisible here and a later
+            //     edit that started consuming the index would have drifted
+            //     silently. Now `Ignored`, which is what the crate already
+            //     uses for vwap, garman_klass_volatility, adosc, mod_god_mode
+            //     and otto.
+            //
+            // ui.rs:1036 (batch) / :1266 (sweep) -- `position(|x|
+            //   x.is_finite())`. LOAD-BEARING: ui_kernel.cu:389 starts the
+            //   walk at `first_valid` and :376 sets
+            //   `warmup_end = first_valid + (period * 2 - 2)`.
+            ("ui", F64FirstValidRule::CloseFinite),
+            // psychological_line.rs:218 `first_valid_index` -- `is_finite`;
+            //   taken at :231, :605, :687. LOAD-BEARING:
+            //   psychological_line_kernel.cu:199/:211.
+            ("psychological_line", F64FirstValidRule::CloseFinite),
+            // rank_correlation_index.rs:215 `first_valid_index` -- `is_finite`.
+            //   LOAD-BEARING: rank_correlation_index_kernel.cu:121/:129.
+            ("rank_correlation_index", F64FirstValidRule::CloseFinite),
+            // ehlers_detrending_filter_kernel.cu:174 `(void)first_valid;`
+            ("ehlers_detrending_filter", F64FirstValidRule::Ignored),
+            // ehlers_simple_cycle_indicator_kernel.cu:149 `(void)first_valid;`
+            ("ehlers_simple_cycle_indicator", F64FirstValidRule::Ignored),
+            // ehlers_smoothed_adaptive_momentum_kernel.cu:271
+            //   `(void)first_valid;`
+            ("ehlers_smoothed_adaptive_momentum", F64FirstValidRule::Ignored),
+            // forward_backward_exponential_oscillator_kernel.cu:238
+            //   `(void)first_valid;`
+            (
+                "forward_backward_exponential_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
         ];
 
         for spec in F64_KERNELS {

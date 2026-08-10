@@ -348,10 +348,16 @@ pub fn compute_classic_ta_columns_sized(
     //    ROUTING (task #22): this is the sweep-shaped part of the feature
     //    build — 18 indicators × 5 periods = 90 independent full-series scans
     //    over the same OHLCV — and therefore the part a card wins. When the
-    //    CUDA lane is compiled in, present and arch-compatible, the ten
-    //    indicators in `gpu_indicators::GPU_SWEEP_SPECS` are swept on the
-    //    device against ONE resident upload; the remaining eight stay on the
-    //    CPU and are reported by name as `CpuIndicatorNotPortable`.
+    //    CUDA lane is compiled in, present and arch-compatible, every id in
+    //    `gpu_indicators::GPU_SWEEP_SPECS` is swept on the device against ONE
+    //    resident upload; the rest stay on the CPU and are reported by name as
+    //    `CpuIndicatorNotPortable`. That remainder is now exactly the five
+    //    MULTI-OUTPUT ids (stoch, macd, bollinger_bands, keltner, supertrend),
+    //    which emit ZERO columns on EITHER lane because `compute_cpu` with
+    //    `output_id: None` returns `Err(InvalidParam)` and line 291 below
+    //    swallows it. No count is written here on purpose: the membership rule
+    //    is asserted by
+    //    `gpu_indicators::tests::every_reachable_multi_period_id_with_an_f64_kernel_is_claimed`.
     //
     //    ORDER IS LOAD-BEARING: column order feeds `effective_feature_names`
     //    and every discovery artifact. The per-indicator results are collected
@@ -2425,8 +2431,9 @@ mod tests {
     //
     //   1. `device_types_f64.rs` adds the f64 device vocabulary,
     //      `upload_ohlcv_f64` uploads without narrowing, and
-    //      `kernels/cuda/neoethos_f64_kernels.cu` holds real f64 kernels for
-    //      all ten indicators in `GPU_SWEEP_SPECS`;
+    //      `kernels/cuda/neoethos_f64_kernels.cu` holds a real f64 kernel for
+    //      EVERY id in `GPU_SWEEP_SPECS` — asserted, not counted, by
+    //      `gpu_indicators::tests::every_spec_has_an_f64_kernel_with_a_matching_input_contract`;
     //   2. that file is listed in vector-ta build.rs's `F64_LANE_SOURCES`, so
     //      it is compiled with `-prec-div=true -prec-sqrt=true -fmad=false
     //      -ftz=false` and NEVER with `--use_fast_math` — the flag is no
@@ -2541,18 +2548,27 @@ mod tests {
             // Every f64 kernel in `neoethos_f64_kernels.cu` was written against
             // the crate's `*_scalar` implementation, bar for bar, in its exact
             // accumulation order. `neoethos-data` enables vector-ta's
-            // `nightly-avx`, so on x86_64 `Auto` resolves to Avx2/Avx512 — and
-            // the crate's own scalar and AVX paths are NOT bit-identical for
-            // every indicator: `vwap` differs at index 136 and `wilders` at its
-            // seed bar, 1 ULP each, measured card-lessly by
-            // `tests/f64_lane_cpu_reference.rs` (both are withheld from the
-            // kernel table over it).
+            // `nightly-avx`, so on x86_64 `Auto` resolves to Avx2/Avx512 for
+            // several of these ids — a DIFFERENT function body from the one the
+            // kernel was transcribed from, even where the two agree today.
             //
-            // Measuring against `Auto` therefore measures the AVX divergence on
-            // top of the device divergence, and a future AVX reassociation
-            // would fail this test against a CORRECT kernel — burning a rented
-            // card on a phantom. The sweep that runs in PRODUCTION still uses
-            // `Auto`; only the oracle pins Scalar.
+            // They do agree today, and that is measured rather than assumed:
+            // `tests/f64_lane_cpu_reference.rs` runs both kernels over every
+            // claimed id on clean AND gapped bars and demands BIT equality. It
+            // used to fail for two ids — `vwap` at index 136 and `wilders` at
+            // its seed bar, 1 ULP each — and both were withheld from
+            // `F64_KERNELS` over it. vector-ta has since fixed BOTH at the
+            // source (`vwap_row_scalar_pv` deleted; the wilders warm-up seed
+            // association unified on the 4-wide scalar tree), so
+            // `WITHHELD_PENDING_CPU_SELF_CONSISTENCY` is `&[]` and `vwap` is
+            // now claimed by `GPU_SWEEP_SPECS`.
+            //
+            // Pinning Scalar here SURVIVES that fix and is still the right
+            // oracle: it is the reference the kernels were written against, so
+            // a future AVX reassociation fails the card-less test by name
+            // instead of failing this one against a CORRECT kernel and burning
+            // a rented card on a phantom. The sweep that runs in PRODUCTION
+            // still uses `Auto`; only the oracle pins Scalar.
             let cpu = cpu_multi_period_columns(&candles, spec.id, &ALT_PERIODS, n, Kernel::Scalar);
 
             // Structural equality first — a mismatch here is a bug, never a

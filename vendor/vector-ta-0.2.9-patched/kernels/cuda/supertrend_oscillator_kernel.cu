@@ -221,9 +221,34 @@ extern "C" __global__ void supertrend_oscillator_batch_f64(
  *   * the band clamps ARE f64::min / f64::max (:730, :736), so fmin/fmax are
  *     used: they return the non-NaN operand where an if-chain would let a NaN
  *     through into the next bar's band.
- *   * clamp_unit is f64::clamp(-1, 1) (:390), which is fmin(fmax(x,-1),1) and
- *     PANICS on a NaN bound rather than propagating — the value here is a
- *     finite quotient, and fmin/fmax reproduce the ordered case exactly.
+ *   * clamp_unit is f64::clamp(-1, 1) (:390). `supertrend_oscillator_batch_f64`
+ *     writes it as the if-chain at :57-59; the neo kernel below writes it as
+ *     fmin(fmax(x,-1),1) at :351, and THAT SUBSTITUTION NEEDS AN ARGUMENT.
+ *
+ *     The argument this comment used to give was that `f64::clamp` "PANICS on
+ *     a NaN bound". True, and irrelevant: the bounds here are the literals
+ *     -1.0 and 1.0, so no bound can ever be NaN and the panic can never fire.
+ *     Worse, it pointed at the wrong property and would license the same
+ *     rewrite somewhere it is NOT safe.
+ *
+ *     The property that actually differs is the NaN VALUE.
+ *     `x.clamp(-1.0, 1.0)` RETURNS NaN for a NaN x — its `if self < min` and
+ *     `else if self > max` both compare false, so it falls through to `self`.
+ *     `fmin(fmax(NaN, -1.0), 1.0)` returns -1.0, because IEEE fmax/fmin
+ *     DISCARD a NaN operand and return the other one. On a NaN input the two
+ *     forms disagree by a whole value, not by an ULP.
+ *
+ *     The substitution is sound here ONLY because `raw` cannot be NaN. :349
+ *     admits the divide only when `isfinite(width) && width != 0.0`, and the
+ *     bar reached that line through the validity gate above, which requires hi,
+ *     lo and src all finite; `atr` is a finite accumulation of finite true
+ *     ranges, so `supertrend`, and therefore `src - supertrend`, is finite.
+ *     A finite numerator over a finite non-zero denominator is finite, or ±inf
+ *     if it overflows — and on ±inf the two forms still agree (both give ±1).
+ *     0/0 is the only route to NaN and `width != 0.0` closes it.
+ *
+ *     IF A FUTURE EDIT LETS A NaN REACH :351, fmin/fmax will silently emit
+ *     -1.0 where the CPU emits NaN. Use the :57 if-chain there instead.
  *   * the two smoothers are prev + alpha * (x - prev) (:757, :764) — NOT an
  *     fma, because the CPU line contains none.
  *   * OUTPUT_SCALE is 100.0 (:33) and multiplies the value last (:770 ->

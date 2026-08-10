@@ -20,7 +20,7 @@
 //! This lane used to narrow f64 → f32 on upload and widen f32 → f64 on return,
 //! because vector-ta's shared device layer (`CudaDeviceVectorF32`,
 //! `upload_f32`, `IndicatorCudaSeries::HostF32`) has no f64 in it at all, and
-//! because none of the ten indicators below had an f64 kernel: their
+//! because NO indicator in the table below had an f64 kernel: their
 //! `*_kernel.cu` files are f32 in and f32 out. (`sma_kernel.cu` LOOKS f64
 //! because five entry points carry a `_f64` suffix, but that names an f64
 //! ACCUMULATOR inside an f32 pipeline — `sma_prefix_stage1_scan_f64` takes
@@ -32,7 +32,7 @@
 //!   f64 device vocabulary alongside the f32 one, and
 //!   `CudaRuntime::upload_ohlcv_f64` / `upload_f64` upload without narrowing;
 //! * `vendor/vector-ta-0.2.9-patched/kernels/cuda/neoethos_f64_kernels.cu`
-//!   holds ten `*_batch_f64` kernels written against this crate's own f64 CPU
+//!   holds `*_batch_f64` kernels written against this crate's own f64 CPU
 //!   implementations, compiled with `-prec-div=true -prec-sqrt=true
 //!   -fmad=false -ftz=false` and NEVER with `--use_fast_math` regardless of
 //!   `CUDA_FAST_MATH`.
@@ -79,8 +79,8 @@
 //!
 //! The rest of `MULTI_PERIOD_IDS` stays on the CPU and is reported as
 //! [`IndicatorLane::CpuIndicatorNotPortable`] — enumerated up front from this
-//! table, never discovered by a failed launch mid-run. There are now two
-//! distinct reasons an id is in that group, and they are not the same problem:
+//! table, never discovered by a failed launch mid-run. There is now exactly ONE
+//! reason an id is in that group:
 //!
 //! * `stoch`, `macd`, `bollinger_bands`, `keltner`, `supertrend` are
 //!   MULTI-OUTPUT. `resolve_output_id` (cpu_batch.rs:2185) returns
@@ -89,15 +89,32 @@
 //!   So these five emit ZERO columns on EITHER lane today. A device kernel for
 //!   them would have no CPU column to be checked against; the thing to fix
 //!   first is the CPU call, not the kernel.
-//! * `vwap` is single-output and its f64 kernel is written and compiled, but
-//!   vector-ta's own `vwap_scalar` and `vwap_avx2` disagree by 1 ULP and
-//!   `hpc_ta` runs the CPU with `Kernel::Auto` — so there is no single CPU
-//!   answer for the device to match. See
-//!   `cuda_f64::WITHHELD_PENDING_CPU_SELF_CONSISTENCY` and the card-less test
-//!   `tests/f64_lane_cpu_reference.rs`, which measures it.
 //!
-//! `tsi` and `obv` were in this group and are now on the device, which makes
-//! the reachable sweep 12 of 13.
+//! There used to be a second reason and it is GONE (2026-08-10). `vwap` was
+//! withheld because vector-ta answered "what is vwap" two ways — a second
+//! implementation, `vwap_row_scalar_pv`, reached only by the `Kernel::Scalar`
+//! arm of `vwap_batch_inner`, accumulated `price * volume` with TWO roundings
+//! where `vwap_scalar` uses one `mul_add` — so there was no single CPU answer
+//! for the device to match. vector-ta fixed that AT THE SOURCE rather than by
+//! tolerance: `vwap_row_scalar_pv` was deleted, both batch arms now call
+//! `vwap_row_scalar`, `vwap` (and `wilders`, the other withheld id, whose
+//! warm-up seed association was settled the same way) carry rows in
+//! `cuda_f64::F64_KERNELS`, and `cuda_f64::WITHHELD_PENDING_CPU_SELF_CONSISTENCY`
+//! is now `&[]`. The card-less test
+//! `tests/f64_lane_cpu_reference.rs::scalar_and_auto_agree_for_every_claimed_indicator`
+//! is what measures the agreement, on clean AND on gapped bars.
+//!
+//! So `tsi`, `obv` and now `vwap` have all left the CPU group, and EVERY
+//! single-output id in `MULTI_PERIOD_IDS` is on the device — the whole
+//! reachable sweep, with only the multi-output five left on the CPU emitting
+//! nothing on either lane.
+//!
+//! No count is written here, and none should be added. That relationship is
+//! ASSERTED instead, by
+//! `tests::every_reachable_multi_period_id_with_an_f64_kernel_is_claimed`,
+//! which fails the day vector-ta registers a kernel this table has not picked
+//! up — which is exactly how `vwap` was allowed to sit written, compiled,
+//! registered and still computed on the CPU. Counts rot; assertions do not.
 
 use super::super::Ohlcv;
 use crate::core::indicator_telemetry::{IndicatorLane, VECTOR_TA_ARCHS, VECTOR_TA_PTX_ARCH};
@@ -234,8 +251,29 @@ pub struct GpuSweepSpec {
 }
 
 /// The indicators of `hpc_ta`'s `MULTI_PERIOD_IDS` that have a real f64 CUDA
-/// kernel — exactly the ten in
-/// `vector_ta::indicators::dispatch::cuda_f64::F64_KERNELS`.
+/// kernel.
+///
+/// THE RELATIONSHIP, NOT A COUNT. This table is the INTERSECTION of two sets
+/// that are each maintained elsewhere:
+///
+/// ```text
+///   GPU_SWEEP_SPECS  ==  MULTI_PERIOD_IDS  ∩  single-output  ∩  F64_KERNELS
+/// ```
+///
+/// `vector_ta::indicators::dispatch::cuda_f64::F64_KERNELS` is far LARGER than
+/// this table and grows independently of it — it registers every indicator in
+/// vector-ta with an f64 kernel, most of which this crate never sweeps by
+/// period. `hpc_ta::MULTI_PERIOD_IDS` is what this crate sweeps. So a row here
+/// is a member of both, and neither number is written down: both directions of
+/// the equation above are asserted in `tests` below, which is the only form
+/// that cannot rot. A previous version of this comment claimed "exactly the ten
+/// in F64_KERNELS"; the table held 12 and F64_KERNELS held 338.
+///
+/// This is also why `wilders` is NOT here even though vector-ta registered its
+/// f64 kernel in the same round as `vwap`'s: `wilders` is not in
+/// `MULTI_PERIOD_IDS`, so this crate never period-sweeps it, so a row here
+/// would name an indicator no caller asks for. It reaches the CPU through the
+/// base vocabulary (`all_indicators.rs`), which has no device lane at all.
 ///
 /// ORDER IS LOAD-BEARING but only within this table: the caller re-assembles
 /// columns in `MULTI_PERIOD_IDS` order regardless, so the pure-CPU column order
@@ -285,9 +323,10 @@ pub const GPU_SWEEP_SPECS: &[GpuSweepSpec] = &[
     // ids; five of them (stoch, macd, bollinger_bands, keltner, supertrend) are
     // multi-output, and `compute_cpu` with `output_id: None` returns
     // `Err(InvalidParam)` for those, which `hpc_ta.rs:291` swallows — so they
-    // emit ZERO columns on either lane and cannot be swept. The reachable
-    // sweep is therefore 13 ids, and with these three it is 13/13 on the card:
-    // a frame's period sweep no longer leaves the device at any point.
+    // emit ZERO columns on either lane and cannot be swept. Every id that is
+    // left is here, so a frame's period sweep no longer leaves the device at
+    // any point. `every_reachable_multi_period_id_with_an_f64_kernel_is_claimed`
+    // is what holds that, not this comment.
     GpuSweepSpec {
         id: "tsi",
         input: DeviceInput::CloseFromOhlcv,
@@ -296,14 +335,31 @@ pub const GPU_SWEEP_SPECS: &[GpuSweepSpec] = &[
         id: "obv",
         input: DeviceInput::CloseVolume,
     },
-    // `vwap` is NOT here, and its kernel exists. `vwap_scalar` and `vwap_avx2`
-    // disagree by 1 ULP, and `hpc_ta` runs the CPU with `Kernel::Auto`, so
-    // there is no single CPU answer for the device to match — see
-    // `cuda_f64::WITHHELD_PENDING_CPU_SELF_CONSISTENCY` and the card-less test
-    // `f64_lane_cpu_reference::scalar_and_auto_agree_for_every_claimed_indicator`,
-    // which measures it. That makes the reachable sweep 12 of 13 on the card,
-    // not 13 of 13, and saying otherwise would be the kind of claim this lane
-    // exists to stop making.
+    // `vwap` — CLAIMED 2026-08-10, and nothing but this row changed to claim
+    // it. The engine has carried the whole shape since the `TimestampCloseVolume`
+    // arm landed: the bar timestamps are uploaded once as i64 (`new`, the
+    // `upload_i64` call), `data_ref` builds the three-pointer ref from them,
+    // and `first_valid_for` answers `F64FirstValidRule::Ignored` with 0 because
+    // `vwap_with_kernel` calls `alloc_with_nan_prefix(n, 0)` and has no warmup.
+    // The kernel `neoethos_vwap_batch_f64` was written against `vwap_scalar`
+    // and compiled all along; the row was the only thing missing, so the work
+    // sat unreachable.
+    //
+    // What made it unclaimable was a SECOND CPU implementation, not a
+    // precision question: `vwap_row_scalar_pv` consumed a precomputed
+    // `pv[i] = price * volume` (two roundings) where `vwap_scalar` writes
+    // `vol_price_sum = p.mul_add(v, vol_price_sum)` (one), and only the
+    // `Kernel::Scalar` arm of `vwap_batch_inner` reached it. vector-ta deleted
+    // it — both batch arms now call `vwap_row_scalar`, so `Kernel::Auto` (what
+    // `hpc_ta` runs in production) and `Kernel::Scalar` (what the kernel was
+    // written against, and what the parity oracle pins) are the same numbers.
+    // `WITHHELD_PENDING_CPU_SELF_CONSISTENCY` is now `&[]`, and
+    // `f64_lane_cpu_reference::scalar_and_auto_agree_for_every_claimed_indicator`
+    // measures the agreement on clean and on gapped bars without a card.
+    GpuSweepSpec {
+        id: "vwap",
+        input: DeviceInput::TimestampCloseVolume,
+    },
 ];
 
 /// Is this indicator id served by the device lane?
@@ -1350,6 +1406,88 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    /// THE ANTI-ROT ASSERTION, and the reason no count appears in this file's
+    /// prose any more.
+    ///
+    /// `GPU_SWEEP_SPECS` is the intersection of three sets maintained in three
+    /// different places, and the failure mode this project keeps repeating is
+    /// that one of them grows and the intersection does not — the kernel gets
+    /// written, compiled, registered upstream, and then computed on the CPU
+    /// anyway because nobody added the row. `vwap` sat like that: kernel
+    /// written, `F64_KERNELS` row present, `WITHHELD_PENDING_CPU_SELF_CONSISTENCY`
+    /// emptied upstream, and this table still excluded it on the stale
+    /// justification.
+    ///
+    /// So the relationship is asserted in BOTH directions:
+    ///
+    /// * every id in `MULTI_PERIOD_IDS` that is single-output AND has an f64
+    ///   kernel MUST be claimed — this is the direction that catches a
+    ///   newly-registered kernel still being run on the CPU;
+    /// * every id claimed MUST be in `MULTI_PERIOD_IDS` — this is the direction
+    ///   that catches a row for an indicator no caller ever sweeps, which would
+    ///   be dead weight the parity test still pays for.
+    ///
+    /// Registry queries and table lookups only. No card, no launch — this fails
+    /// at `cargo test --features gpu-cuda` on the build host, not mid-run on a
+    /// rented box.
+    #[test]
+    fn every_reachable_multi_period_id_with_an_f64_kernel_is_claimed() {
+        use crate::core::hpc_ta::MULTI_PERIOD_IDS;
+
+        let mut should_be_claimed: Vec<&str> = Vec::new();
+        let mut multi_output: Vec<&str> = Vec::new();
+        let mut no_kernel: Vec<&str> = Vec::new();
+
+        for &id in MULTI_PERIOD_IDS.iter() {
+            let info = get_indicator(id)
+                .unwrap_or_else(|| panic!("{id}: in MULTI_PERIOD_IDS but not in the vector-ta \
+                                           registry — the CPU sweep cannot compute it either"));
+            if info.outputs.len() > 1 {
+                // Emits ZERO columns on EITHER lane (`hpc_ta.rs:291` swallows
+                // the `InvalidParam` from `output_id: None`), so it is not a
+                // device gap.
+                multi_output.push(id);
+                continue;
+            }
+            if f64_kernel_for(id).is_none() {
+                no_kernel.push(id);
+                continue;
+            }
+            should_be_claimed.push(id);
+        }
+
+        let claimed: Vec<&str> = GPU_SWEEP_SPECS.iter().map(|s| s.id).collect();
+
+        let missing: Vec<&str> = should_be_claimed
+            .iter()
+            .copied()
+            .filter(|id| !claimed.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these ids are period-swept by hpc_ta, are single-output, and vector-ta HAS an f64 \
+             kernel for them — but GPU_SWEEP_SPECS does not claim them, so a card is present, a \
+             working registered kernel exists, and hpc_ta computes them on the CPU anyway: {missing:?}\n\
+             (multi-output, correctly not claimed: {multi_output:?}; no f64 kernel in vector-ta: \
+             {no_kernel:?})\n\
+             Add a GpuSweepSpec row. Do NOT add a justification comment instead — that is exactly \
+             how `vwap` stayed on the CPU after its kernel was registered upstream."
+        );
+
+        let unswept: Vec<&str> = claimed
+            .iter()
+            .copied()
+            .filter(|id| !MULTI_PERIOD_IDS.contains(id))
+            .collect();
+        assert!(
+            unswept.is_empty(),
+            "GPU_SWEEP_SPECS claims ids that hpc_ta never period-sweeps, so nothing ever launches \
+             them: {unswept:?}. Either add them to MULTI_PERIOD_IDS or drop the rows. (`wilders` \
+             is the live example of an f64 kernel this crate deliberately does NOT claim: it is \
+             not in MULTI_PERIOD_IDS.)"
+        );
     }
 
     /// No duplicate ids — a duplicate would emit the same column twice and
