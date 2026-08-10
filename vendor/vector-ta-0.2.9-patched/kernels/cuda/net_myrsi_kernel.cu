@@ -70,9 +70,9 @@ void net_myrsi_batch_f32_warp_dbl(const float* __restrict__ prices,
     if (lane == 0) out_row[warm] = (period > 1) ? 0.0f : qnan32();
 
 
-    extern __shared__ double smem_dbl[];
-    double* diffs = smem_dbl + (size_t)warp * (size_t)max_period;
-    double* myr = smem_dbl + (size_t)warps_per_block * (size_t)max_period +
+    extern __shared__ double smem_dbl_f64[];
+    double* diffs = smem_dbl_f64 + (size_t)warp * (size_t)max_period;
+    double* myr = smem_dbl_f64 + (size_t)warps_per_block * (size_t)max_period +
                   (size_t)warp * (size_t)max_period;
 
     for (int j = lane; j < period; j += 32) {
@@ -316,9 +316,9 @@ void net_myrsi_batch_f32_shared_dbl(const float* __restrict__ prices,
     out_row[warm] = (period > 1) ? 0.0f : qnan32();
 
 
-    extern __shared__ double smem_dbl[];
+    extern __shared__ double smem_dbl_f64[];
     const int pitch = (int)blockDim.x;
-    double* diffs = smem_dbl;
+    double* diffs = smem_dbl_f64;
     double* myr   = diffs + (size_t)max_period * pitch;
 
 

@@ -186,9 +186,9 @@ void sgf_batch_f64(const double* __restrict__ prices,
     const int warm = warm_indices[combo];
     const int out_base = combo * series_len;
 
-    extern __shared__ double smem[];
-    double* w_sh = smem;
-    double* tile = smem + max_period;
+    extern __shared__ double smem_f64[];
+    double* w_sh = smem_f64;
+    double* tile = smem_f64 + max_period;
 
     for (int k = threadIdx.x; k < period; k += blockDim.x) {
         w_sh[k] = weights_flat[combo * max_period + k];
@@ -230,10 +230,10 @@ void sgf_multi_series_one_param_f64(const double* __restrict__ prices_tm,
     const int s = series_block_base + s_local;
     if (s >= num_series) return;
 
-    extern __shared__ double smem[];
-    double* tile = smem;
+    extern __shared__ double smem_f64[];
+    double* tile = smem_f64;
 #if !SGF_USE_CONST_WEIGHTS
-    double* w_sh = smem;
+    double* w_sh = smem_f64;
     tile = w_sh + period;
     for (int k = threadIdx.x; k < period; k += blockDim.x) {
         w_sh[k] = weights[k];

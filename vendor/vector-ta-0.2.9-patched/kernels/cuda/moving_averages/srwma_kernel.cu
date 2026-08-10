@@ -237,9 +237,9 @@ void srwma_batch_f64(const double* __restrict__ prices,
     const int row_offset = combo * series_len;
     const double inv_norm = inv_norms[combo];
 
-    extern __shared__ double smem[];
-    double* __restrict__ w_rev = smem;
-    double* __restrict__ tile  = smem + max_wlen;
+    extern __shared__ double smem_f64[];
+    double* __restrict__ w_rev = smem_f64;
+    double* __restrict__ tile  = smem_f64 + max_wlen;
 
 
     const int wbase = combo * max_wlen;
@@ -319,9 +319,9 @@ void srwma_many_series_one_param_f64(const double* __restrict__ prices_tm,
 
     const int stride = num_series;
 
-    extern __shared__ double smem[];
-    double* __restrict__ w_rev = smem;
-    double* __restrict__ tile  = smem + wlen;
+    extern __shared__ double smem_f64[];
+    double* __restrict__ w_rev = smem_f64;
+    double* __restrict__ tile  = smem_f64 + wlen;
 
 
 #if SRWMA_USE_CONST_WEIGHTS

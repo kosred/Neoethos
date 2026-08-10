@@ -313,14 +313,14 @@ void trima_batch_f64(const double* __restrict__ prices,
 
     const int warm = warm_indices[combo];
 
-    extern __shared__ double weights[];
+    extern __shared__ double weights_f64[];
     const int m1 = (period + 1) / 2;
     const int m2 = period - m1 + 1;
     const double inv_norm = 1.0 / double(m1 * m2);
     for (int idx = threadIdx.x; idx < period; idx += blockDim.x) {
         int w = (idx < m1) ? (idx + 1) : (idx < m2 ? m1 : (m1 + m2 - 1) - idx);
         if (w < 0) w = 0;
-        weights[idx] = double(w) * inv_norm;
+        weights_f64[idx] = double(w) * inv_norm;
     }
     __syncthreads();
 
@@ -335,7 +335,7 @@ void trima_batch_f64(const double* __restrict__ prices,
             double acc = 0.0;
 #pragma unroll 4
             for (int k = 0; k < period; ++k) {
-                acc = fma(prices[start + k], weights[k], acc);
+                acc = fma(prices[start + k], weights_f64[k], acc);
             }
             out[base_out + t] = acc;
         }
@@ -360,9 +360,9 @@ void trima_batch_f64_tiled(const double* __restrict__ prices,
     const int warm = warm_indices[combo];
 
 
-    extern __shared__ double smem[];
-    double* __restrict__ weights = smem;
-    double* __restrict__ tile    = smem + max_period;
+    extern __shared__ double smem_f64[];
+    double* __restrict__ weights = smem_f64;
+    double* __restrict__ tile    = smem_f64 + max_period;
 
 
     const int m1 = (period + 1) / 2;
@@ -419,8 +419,8 @@ void trima_multi_series_one_param_f64(const double* __restrict__ prices_tm,
                                       int series_len,
                                       const int* __restrict__ first_valids,
                                       double* __restrict__ out_tm) {
-    extern __shared__ double shared_weights[];
-    for (int i = threadIdx.x; i < period; i += blockDim.x) shared_weights[i] = weights[i];
+    extern __shared__ double shared_weights_f64[];
+    for (int i = threadIdx.x; i < period; i += blockDim.x) shared_weights_f64[i] = weights[i];
     __syncthreads();
 
     const int series_idx = blockIdx.y;
@@ -439,7 +439,7 @@ void trima_multi_series_one_param_f64(const double* __restrict__ prices_tm,
 #pragma unroll 4
             for (int k = 0; k < period; ++k) {
                 const int in_idx = (start + k) * num_series + series_idx;
-                acc = fma(prices_tm[in_idx], shared_weights[k], acc);
+                acc = fma(prices_tm[in_idx], shared_weights_f64[k], acc);
             }
             out_tm[out_idx] = acc;
         }
@@ -455,9 +455,9 @@ void trima_multi_series_one_param_f64_tm_tiled(const double* __restrict__ prices
                                                const int* __restrict__ first_valids,
                                                double* __restrict__ out_tm) {
 
-    extern __shared__ double smem[];
-    double* __restrict__ w    = smem;
-    double* __restrict__ tile = smem + period;
+    extern __shared__ double smem_f64[];
+    double* __restrict__ w    = smem_f64;
+    double* __restrict__ tile = smem_f64 + period;
 
 
     for (int i = threadIdx.x; i < period; i += blockDim.x) w[i] = weights_in[i];

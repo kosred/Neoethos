@@ -233,8 +233,8 @@ void sinwma_batch_f64(const double* __restrict__ prices,
     if (period <= 0) return;
 
 
-    extern __shared__ double shmem[];
-    double* __restrict__ weights = shmem;
+    extern __shared__ double shmem_f64[];
+    double* __restrict__ weights = shmem_f64;
     double* __restrict__ tile    = weights + period;
 
     const int warm     = first_valid + period - 1;
@@ -305,8 +305,8 @@ void sinwma_many_series_one_param_time_major_f64(
     const int series_idx = blockIdx.y;
     if (series_idx >= num_series) return;
 
-    extern __shared__ double shmem[];
-    double* __restrict__ weights = shmem;
+    extern __shared__ double shmem_f64[];
+    double* __restrict__ weights = shmem_f64;
     double* __restrict__ tile    = weights + period;
 
     const int warm = first_valids[series_idx] + period - 1;

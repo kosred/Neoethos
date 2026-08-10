@@ -272,7 +272,7 @@ __global__ void kaufmanstop_one_series_many_params_time_major_f64(
     int base_is_low,
     double* __restrict__ out_pm
 ) {
-    extern __shared__ double s_base[];
+    extern __shared__ double s_base_f64[];
     const double* __restrict__ base = base_is_low ? low : high;
 
 
@@ -283,7 +283,7 @@ __global__ void kaufmanstop_one_series_many_params_time_major_f64(
     for (int t = t0; t < rows; t += t_stride) {
 
         if (threadIdx.y == 0) {
-            s_base[threadIdx.x] = base[t];
+            s_base_f64[threadIdx.x] = base[t];
         }
         __syncthreads();
 
@@ -293,7 +293,7 @@ __global__ void kaufmanstop_one_series_many_params_time_major_f64(
             if (t < warm_ps[p]) {
                 out = CUDART_NAN;
             } else {
-                out = fma(ma_pm[idx], signed_mults[p], s_base[threadIdx.x]);
+                out = fma(ma_pm[idx], signed_mults[p], s_base_f64[threadIdx.x]);
             }
             out_pm[idx] = out;
         }
