@@ -41,23 +41,61 @@ grep -qi amd /proc/cpuinfo || echo "WARNING: not an AMD host — feature buildin
 # The live store is the ONLY file a run reads. Skipping this means searching
 # under whatever numbers that file last had — which on the operator's box means
 # the payoff gate OFF and no portfolio cap.
-step=2; say "config migration (dry run first)"
+step=2; say "the config this run will actually use"
+
+# migrate_live_config.ps1 is [CmdletBinding()] with ONE switch, -Apply. It has no
+# SupportsShouldProcess, so -WhatIf and -Confirm are parameter-binding ERRORS.
+# The first version of this script passed both, swallowed the error into the diff
+# file, and printed "diff written to ..." over a file containing nothing but a
+# PowerShell binding failure. Report-only is the default; -Apply is the other mode.
+#
+# And the apply path does not belong in an unattended script at all: the migration
+# calls Assert-Interactive and Read-Host by design, because it rewrites the only
+# file a run reads. Run it yourself, before this script, and re-run this script
+# afterwards.
 if [ -f scripts/migrate_live_config.ps1 ] && command -v pwsh >/dev/null; then
-  pwsh -File scripts/migrate_live_config.ps1 -WhatIf > "$LOGS/02-migration-diff.txt" 2>&1
-  echo "diff written to $LOGS/02-migration-diff.txt"
-  if [ "${APPLY_MIGRATION:-0}" = "1" ]; then
-    pwsh -File scripts/migrate_live_config.ps1 -Confirm:$false >> "$LOGS/02-migration-diff.txt" 2>&1 \
-      || fail "migration refused — read $LOGS/02-migration-diff.txt"
-  else
-    echo "NOT APPLIED. Re-run with APPLY_MIGRATION=1 once the diff has been read."
+  pwsh -File scripts/migrate_live_config.ps1 > "$LOGS/02-migration-report.txt" 2>&1
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    head -20 "$LOGS/02-migration-report.txt"
+    fail "the migration report itself failed (exit $rc). Fix that before spending card time."
   fi
-else
-  echo "no pwsh or no migration script — the run will use the config as it stands"
+  echo "migration report: $LOGS/02-migration-report.txt"
 fi
-echo "--- the values this run will search under ---" > "$LOGS/02-effective.txt"
-grep -nE 'prop_search_min_payoff_ratio|prefilter_top_k|max_portfolio_risk|require_walkforward_for_export|adaptive_thresholds|normalize_features|prop_search_device' \
-  "${CONFIG_FILE:-$HOME/.local/share/neoethos/config.yaml}" >> "$LOGS/02-effective.txt" 2>&1 || true
+
+# WHICH FILE WILL Settings::load() OPEN, AND WHAT IS IN IT.
+# The cwd-relative fallback was deleted, so on a fresh box with no user store the
+# run takes COMPILED DEFAULTS — and that is not a neutral outcome. Against the repo
+# profile it flips trading_mode and discovery_mode risky->prop_firm, preset
+# none->ftmo, require_walkforward_for_export false->true, prop_firm_min_pass_rate
+# 0.0->0.40, multi_resolution_enabled false->true, prop_search_generations
+# 20000->50, portfolio_size 50->3000, and max_portfolio_risk 0.34->0.0 = NO CAP.
+# The old version of this step let that pass with `|| true` and an empty report.
+STORE="${CONFIG_FILE:-}"
+if [ -z "$STORE" ]; then
+  case "$(uname -s)" in
+    Linux)  STORE="${XDG_DATA_HOME:-$HOME/.local/share}/neoethos/config.yaml" ;;
+    Darwin) STORE="$HOME/Library/Application Support/neoethos/config.yaml" ;;
+    *)      STORE="${LOCALAPPDATA:-$HOME}/neoethos/config.yaml" ;;
+  esac
+fi
+{
+  echo "resolved store path: $STORE"
+  if [ -f "$STORE" ]; then
+    echo "EXISTS — this run searches under the values below"
+    grep -nE 'prop_search_min_payoff_ratio|prefilter_top_k|max_portfolio_risk|require_walkforward_for_export|adaptive_thresholds|normalize_features|prop_search_device|trading_mode|discovery_mode|prop_firm_min_pass_rate' "$STORE"
+  else
+    echo "ABSENT — Settings::load() will fall through to COMPILED DEFAULTS."
+  fi
+} > "$LOGS/02-effective.txt" 2>&1
 cat "$LOGS/02-effective.txt"
+
+if [ ! -f "$STORE" ] && [ "${ALLOW_COMPILED_DEFAULTS:-0}" != "1" ]; then
+  fail "no config store at $STORE. This run would search under compiled defaults —
+        prop_firm rules on, 50 generations instead of 20000, and max_portfolio_risk
+        0.0 which means NO CAP. Copy a config there, or set
+        ALLOW_COMPILED_DEFAULTS=1 if that is genuinely what you want measured."
+fi
 
 # ── 3. THE BUILD. This is the only compiler that has ever seen the kernels ───
 step=3; say "release build, full GPU feature set"

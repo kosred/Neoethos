@@ -179,11 +179,12 @@ $script:MoneyItems = @(
     @{
         Path    = 'risk.max_portfolio_risk'
         Live    = '0.0'
-        Default = '(see repo profile: 0.34)'
+        Default = '0.34'
         Means   = 'READ THIS TWICE: 0.0 on a knob named max_ means NO CAP AT ALL, not "no risk". There is no portfolio-wide ceiling on concurrent risk today.'
         IfSet   = 'Any positive value caps total concurrent risk. The ambiguity itself is being turned into a LOUD STARTUP ERROR naming both readings (shard A) rather than silently re-interpreted, because picking either meaning changes how much of the account can be at risk at once.'
     }
     @{
+        NoAutoWrite = $true
         Path    = 'risk.trailing_enabled'
         Live    = 'true'
         Default = '(no value this tool can write here changes anything)'
@@ -648,7 +649,13 @@ if ($moneyPresent.Count -gt 0) {
     Write-Host '=============================================================================' -ForegroundColor Red
     foreach ($mp in $moneyPresent) {
         $item = $mp.Item
-        if ($item.Default -notmatch '^[-0-9]') {
+        # Was `-notmatch '^[-0-9]'`. That guard existed for risk.trailing_enabled,
+        # whose orphaned copy genuinely has no value worth writing — but it also
+        # caught risk.max_portfolio_risk, whose Default was the parenthetical
+        # '(see repo profile: 0.34)'. So the one tool built to surface money items
+        # told the operator, about the ONLY unbounded risk knob in his file, that
+        # nothing could be written that changes anything. Key the skip off intent.
+        if ($item.PSObject.Properties.Name -contains 'NoAutoWrite' -and $item.NoAutoWrite) {
             Write-Host ''
             Write-Host ("  {0}: there is no value this tool can write that changes anything." -f $item.Path) -ForegroundColor Yellow
             Write-Host '  Left exactly as it is.'
