@@ -347,26 +347,46 @@ fn base_type(ty: &str) -> String {
 }
 
 /// Parse `pub struct X { pub f: T, ... }` blocks out of `config.rs`.
+///
+/// INDENTATION-AGNOSTIC, deliberately. This used to anchor both the `pub
+/// struct` opener and the closing `}` at column 0. When `Settings` moved
+/// inside the private loader module (the compiler-enforced single load path),
+/// its declaration gained four spaces of indent and this parser stopped seeing
+/// it — so `Settings` had zero fields, nothing was reachable from it, and all
+/// three tests in this file failed with messages that pointed at the config
+/// rather than at the parser. The panic at the bottom of
+/// `every_settings_field_reaches_a_qualified_consumer` ("parsed only 0 config
+/// fields — the struct parser is broken, not the config") exists precisely for
+/// that failure mode and it fired correctly.
+///
+/// A struct block now closes on the first `}` at or left of the indent its own
+/// declaration had, so a nested brace inside the body cannot end it early.
 fn parse_config_model(src: &str) -> ConfigModel {
     let mut model = ConfigModel::default();
-    let mut current: Option<String> = None;
+    let mut current: Option<(String, usize)> = None;
     for line in src.lines() {
-        if let Some(rest) = line.strip_prefix("pub struct ") {
+        let trimmed_start = line.trim_start();
+        let indent = line.len() - trimmed_start.len();
+        if let Some(rest) = trimmed_start.strip_prefix("pub struct ") {
             let name = rest
                 .split(|c: char| !c.is_alphanumeric() && c != '_')
                 .next()
                 .unwrap_or_default();
             if !name.is_empty() && rest.contains('{') {
                 model.structs.entry(name.to_string()).or_default();
-                current = Some(name.to_string());
+                current = Some((name.to_string(), indent));
             }
             continue;
         }
-        if line.starts_with('}') {
+        if trimmed_start.starts_with('}')
+            && current.as_ref().is_some_and(|(_, open)| indent <= *open)
+        {
             current = None;
             continue;
         }
-        let Some(owner) = current.clone() else { continue };
+        let Some(owner) = current.as_ref().map(|(name, _)| name.clone()) else {
+            continue;
+        };
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("pub ") else { continue };
         let Some((name, ty)) = rest.split_once(':') else { continue };
@@ -1206,9 +1226,24 @@ fn every_settings_field_reaches_a_qualified_consumer() {
         "only {} config structs are reachable from `Settings` — the graph walk is broken",
         model.reachable.len()
     );
-    // Nothing in config.rs may sit outside the Settings graph unnoticed.
-    let orphan_structs: Vec<&String> =
-        model.structs.keys().filter(|s| !model.reachable.contains(*s)).collect();
+    // Nothing in config.rs that CARRIES OPERATOR KNOBS may sit outside the
+    // Settings graph unnoticed.
+    //
+    // The filter on `pub` fields is load-bearing, not a loophole. This check
+    // exists so an operator-settable struct cannot be added and quietly go
+    // unchecked. A struct with no `pub` fields carries nothing an operator can
+    // set — `ConfigProvenance` (which records WHICH file a Settings came from,
+    // fields `source`/`path`, both private) is the case that forced this: it is
+    // internal machinery of the single load path, deliberately unreachable from
+    // `Settings`, and flagging it says nothing about knob coverage. If a struct
+    // ever gains a `pub` field it re-enters this assertion immediately, which is
+    // the property worth keeping.
+    let orphan_structs: Vec<&String> = model
+        .structs
+        .iter()
+        .filter(|(name, fields)| !model.reachable.contains(*name) && !fields.is_empty())
+        .map(|(name, _)| name)
+        .collect();
     assert!(
         orphan_structs.is_empty(),
         "config.rs declares struct(s) unreachable from `Settings`, so their fields are \
