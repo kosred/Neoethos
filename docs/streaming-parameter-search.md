@@ -243,3 +243,70 @@ and counted; the working-set width is read from `VocabularyBudget` and never
 from a config constant; and the run artifact records the cursor and the batch
 list, because a result that cannot say which parameter region produced it is not
 a result.
+
+---
+
+## The cross-batch portfolio question — settled 2026-08-10
+
+**Verdict: neither of the two options that were on the table. The problem as
+posed does not exist, and the real one is one field wide.**
+
+The concern was that survivors from different batches cannot share a cube, so a
+portfolio assembled from batch 3 and batch 11 would reference columns no cube
+ever held. Two options were offered: (A) rebuild a union cube of the surviving
+batches' columns at the final stage, or (B) forbid cross-batch portfolios.
+
+### What the code actually does
+
+**Correlation pruning already works across batches.** It operates on `Vec<i8>`
+signal vectors — per-bar direction — built once by
+`screen_candidates_by_signal_count(features, ...)` (discovery.rs ~7570) and never
+touching the cube again. `pearson_corr_i8` / `spearman_corr_i8` (discovery.rs:9213)
+consume only those vectors. Survivors from different batches carry signals over
+the SAME BARS — batches differ in feature columns, not in the time axis — so the
+comparison is valid as it stands. No union cube is required for selection.
+
+**The live path projects BY NAME**, not by index:
+`live_portfolio::project_features_to_effective(raw, effective_feature_names)`
+(live_portfolio.rs:204) hard-errors on a missing name. Given correct names, live
+needs nothing else.
+
+### The actual defect, and it is one field
+
+`effective_feature_names` is **one list per run** — `DiscoveryResult`
+(discovery.rs:1447) and `LivePortfolioArtifact` (live_portfolio.rs:45) — and its
+own doc says "Gene indices refer to columns in this list". A gene's
+`indices: Vec<usize>` (strategy_gene.rs:8) are POSITIONS into it. Two batches
+produce two different lists, so index 47 denotes a different column in batch 3
+than in batch 11. That is the whole of the problem.
+
+### Option C — make the index self-describing
+
+At batch exit, translate each survivor's indices from the batch's local name list
+into a **run-level canonical list** that grows as batches contribute names.
+
+Cost: a gene carries at most `prop_search_max_indicators` = **12** indices
+(config.rs:2331). For a few dozen survivors per batch that is a few hundred hash
+lookups. No cube is rebuilt, no combination is lost, and the final
+`effective_feature_names` becomes exactly the union of names some survivor
+actually references — naturally small, because survivors are few, and precisely
+what the live artifact needs.
+
+|  | union cube | combinations lost | work |
+|---|---|---|---|
+| A | yes, expensive | none | large |
+| B | no | **yes** | small |
+| **C** | **no** | **none** | ~50 lines |
+
+### Implement it with these invariants
+
+1. The canonical list is **append-only** within a run. An index, once issued,
+   never changes meaning — that is the property the whole defect comes from.
+2. Remap at **batch exit**, not at portfolio assembly, so nothing downstream ever
+   sees a local index. A local index that escapes is indistinguishable from a
+   canonical one and will be silently wrong.
+3. A name that fails to resolve is a **hard error naming the gene and the name**,
+   never a skipped term — a gene missing one of twelve terms is still a valid
+   gene structurally, and would trade on a strategy nobody designed.
+4. Assert at run end that every index in every portfolio gene is `<
+   effective_feature_names.len()`. Cheap, and it closes the class.
