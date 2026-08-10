@@ -15,10 +15,13 @@
 //!   45 of them, e.g. every `perplexity_*` knob but the enable flag, all four
 //!   `auto_rescore_*`, `smc_freshness_limit`, `vortex_memory_map`. Deleted.
 //! * **UNWIRED** — a consumer mechanism exists but nothing connects the config
-//!   to it. `challenge_phase` is the specimen: `PropFirmPhaseRiskDefaults::
-//!   for_preset(preset, phase)` takes exactly that string and only tests call
-//!   it. Kept, documented, and listed in [`NO_QUALIFIED_READER`] below —
-//!   because wiring them would change live sizing and must be a deliberate act.
+//!   to it. `challenge_phase` was the specimen: `PropFirmPhaseRiskDefaults::
+//!   for_preset(preset, phase)` takes exactly that string and, until
+//!   2026-08-10, only tests called it. Such knobs are kept, documented, and
+//!   listed in [`NO_QUALIFIED_READER`] below — because wiring them changes live
+//!   sizing and must be a deliberate act. `challenge_phase` shows how the entry
+//!   is meant to end: the operator decided (#137 "WIRE IT"), `RiskManager` got
+//!   a production constructor, and the entry was deleted in the SAME change.
 //! * **STORED** — validated, persisted, displayed, then ignored. The purest
 //!   defect, because it is indistinguishable from working. `ui_locale` offered
 //!   an English/Ελληνικά picker in an app with no i18n layer;
@@ -54,8 +57,12 @@
 //!
 //! **Measured on the day of the rewrite**: the loose scanner reported 3
 //! orphans, all three of them WRONG (`backtest_spread_pips_asian/overlap/
-//! late_ny` are read by `RiskConfig::session_spread_pips()`, which it could not
-//! see because it skipped `config.rs` wholesale). The strict scanner clears
+//! late_ny` were read by `RiskConfig::session_spread_pips()`, which it could
+//! not see because it skipped `config.rs` wholesale; those three keys were
+//! themselves DELETED on 2026-08-10 by #69 — one global triple cannot span
+//! EURUSD 0.16 pips to GBPTRY 552 — and replaced by
+//! `risk.session_spread_source` + `risk.session_spread_pips_by_symbol`, read by
+//! the same accessor). The strict scanner clears
 //! those three and reports **10 knobs it previously passed**, every one
 //! verified by hand against the code and written into [`NO_QUALIFIED_READER`]
 //! below with the site that fooled the old rule. Six of the ten are worse than
@@ -166,51 +173,55 @@ enum Inert {
 /// and an entry that has since acquired a qualified production reader fails as
 /// stale. Adding one is a code change in this file, reviewed like any other.
 const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
-    // ─────────────────── kept on purpose: real mechanism, unwired ───────────
-    (
-        "RiskConfig::challenge_phase",
-        Inert::Unwired,
-        "domain::prop_firm::PropFirmPhaseRiskDefaults::for_preset(preset, phase) takes this \
-         string; only its own #[cfg(test)] block calls it. OWNER: operator — wiring it changes \
-         live position sizing on a funded account.",
-    ),
-    (
-        "RiskConfig::recovery_mode_enabled",
-        Inert::Unwired,
-        "domain::risk::RiskManager::update_recovery_state flips recovery_mode from drawdown \
-         alone and consults no toggle; RiskManager has no production constructor at all. \
-         OWNER: operator — honouring the toggle changes drawdown behaviour mid-trade.",
-    ),
-    (
-        "ModelsConfig::rl_population_size",
-        Inert::Unwired,
-        "evolution::neat_impl::NeatTrainer::population_size is hardcoded (96 default / 24 \
-         floor); this field's default of 5 would collapse it 19-fold. OWNER: operator — \
-         wiring it silently would change every NEAT run.",
-    ),
+    // REMOVED 2026-08-10 (audit #137/#294, operator decision "WIRE IT"):
+    // `RiskConfig::challenge_phase`, `RiskConfig::challenge_mode` and
+    // `RiskConfig::recovery_mode_enabled`.
+    //
+    // All three were inert for exactly ONE reason — `domain::risk::RiskManager`
+    // had no production constructor, so the mechanism that reads them was never
+    // built. It has one now: `RiskManager::from_settings(&Settings, live_equity)`,
+    // the only constructor the type has, called by
+    // `neoethos-app/src/app_services/live_trading.rs` for every engine whose
+    // `system.trading_mode` is not `risky`. Each of the three reaches a live
+    // decision:
+    //
+    // * `challenge_phase` selects `PropFirmPhaseRiskDefaults::for_preset`, whose
+    //   `max_risk_per_trade` is min-ed with the operator's ceiling to produce the
+    //   per-trade clamp every prop-firm entry passes through, and whose
+    //   `min_confidence_threshold` is the gate's confidence floor.
+    // * `challenge_mode` chooses the total-drawdown ANCHOR (the fixed challenge
+    //   start, or the running equity peak) and which profit target stops trading.
+    // * `recovery_mode_enabled` arms the drawdown-recovery halt band, the
+    //   recovery entry cap and the recovery size multipliers.
+    //
+    // ⚠ If this test reports any of the three as an orphan again, the WIRING was
+    // removed — restore the reader, do not re-add the entry.
+    //
+    // REMOVED 2026-08-10 (audit #294): `ModelsConfig::rl_population_size` is
+    // WIRED. The operator's decision was "GO WITH 96" — the default moved from
+    // 5 to 96 and `training_orchestrator::default_model_params("neat")` reads
+    // it, in the same change that deleted the 96 literals from
+    // `NeatExpert::new` and the orchestrator's param fallback. Naively wiring
+    // the old default of 5 would have collapsed every NEAT run 19-fold, which
+    // is precisely why this entry existed rather than a silent connection.
+    //
     // ─── 2026-08-09: found the moment the scanner started resolving receivers.
     // Every one of these PASSED the old guard on a same-named field belonging to
     // some other struct. Each was checked by hand against the code before being
     // written down; the site that fooled the old scanner is named.
-    (
-        "RiskConfig::challenge_mode",
-        Inert::Unwired,
-        "the only `challenge_mode` reads are `domain::risk::RiskManager::challenge_mode` \
-         (risk.rs:506,509), a DIFFERENT struct whose value arrives as the second argument to \
-         `RiskManager::new` — and every `RiskManager::new` call in the workspace is inside a \
-         test module, so there is no live call site to pass the config value to. Same root \
-         cause as `recovery_mode_enabled` above. OWNER: operator — deciding challenge vs \
-         monthly-target gating changes when live trading stops.",
-    ),
-    (
-        "RiskConfig::high_quality_confidence",
-        Inert::Unwired,
-        "the consumer is `eval.rs:736 let hq = settings.high_quality_confidence`, but that \
-         `settings` is a `BacktestSettings`, whose field defaults to 0.65 at eval.rs:389 and is \
-         assigned nowhere outside #[cfg(test)]. The two 0.65s agree today, which is exactly why \
-         nobody noticed: changing the config moves nothing and looks like it worked. OWNER: \
-         operator — it scales position size per signal confidence.",
-    ),
+    // (`RiskConfig::challenge_mode` was here; see the block at the head of this
+    // list — it went out with `challenge_phase` and `recovery_mode_enabled` when
+    // `RiskManager` got its production constructor.)
+    //
+    // REMOVED 2026-08-10 (audit #294): `RiskConfig::high_quality_confidence` is
+    // CONNECTED. The consumer was `eval.rs let hq = settings.high_quality_confidence`
+    // on a `BacktestSettings` whose field defaulted to 0.65 and was assigned
+    // nowhere outside `#[cfg(test)]`; the two 0.65s agreed, so editing the
+    // config moved nothing and looked like it had worked. It now travels the
+    // same route as its two neighbours in the same sizing formula —
+    // `DiscoveryConfig::from_settings` → `discovery_backtest_settings` —
+    // validated on the way in and recorded in `DiscoveryRunProfile`.
+    //
     // ─── the four trailing shadows: DELETED 2026-08-10 (audit #206). ────────
     //
     // `RiskConfig::trailing_enabled` / `trailing_atr_multiplier` /
@@ -236,61 +247,32 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
     // This is the shape this ledger exists to catch in the USEFUL direction: the
     // knob was never garbage, it was a capability with no consumer, and deleting
     // it at any point in the last months would have deleted the goal.
-    // ─── the three hardware-derived fields. RECLASSIFIED 2026-08-10 from
-    // `WrittenNeverRead` to `Unwired`, because the claim stopped being true:
-    // the writer that made them written — `AutoTuner::apply`, which had zero
-    // callers — went out with the `NEOETHOS_BOT_*` layer (`system.rs:1354`
-    // records the removal). Nothing assigns them any more, so `WrittenNeverRead`
-    // would now be a false statement about the code, and this ledger is checked
-    // in both directions precisely so a stale claim cannot sit here.
+    // ─── the three hardware-derived fields: DELETED 2026-08-10 (audit #294).
     //
-    // They are still SCHEDULED FOR DELETION and are not deleted yet.
-    // `pending-A.md` §A3: all three are `#[serde(skip)]` and listed in
-    // `load_seal::RETIRED_KEYS` as `Derived`, so a value for them in a file is
-    // NAMED AT WARN and ignored and `Settings::save` no longer writes them —
-    // but the struct fields survive until the shard that owns `system.rs`
-    // lands the removal. The honest source for all three is the hardware probe
-    // (`HardwareExecutionPlan`), not a config file.
+    // `SystemConfig::n_jobs`, `SystemConfig::num_gpus` and
+    // `ModelsConfig::inference_batch_size` are no longer struct fields, so
+    // there is nothing left for this ledger to record. They were never inputs:
+    // `Settings::save` serialised the detector's own answer back into the YAML
+    // and it was then carried to machines it was not measured on — `n_jobs: 11`
+    // is `available_parallelism() - 1` on a 12-core box; `num_gpus: 0` was
+    // frozen on a box with no card and shipped to a 3090; `inference_batch_size:
+    // 32` is a number the hardware plan never emits (it emits
+    // 128/1024/2048/4096/8192). Every consumer already read the probe
+    // (`AutoTuneHints` / `HardwareProfile` / `HardwareExecutionPlan`).
     //
-    // ⚠ WHEN THE FIELD GOES, DELETE ITS ENTRY HERE IN THE SAME CHANGE. This
-    // ledger is checked BOTH ways: an entry naming a field that no longer exists
-    // fails as stale, exactly so that a half-landed deletion cannot pass
-    // quietly. If this test fails with "ledger entry for an unknown field", the
-    // fix is to remove the entry, not to re-add the field.
-    (
-        "SystemConfig::n_jobs",
-        Inert::Unwired,
-        "the mechanism is the hardware probe, not this field. Its former writer — \
-         `AutoTuner::apply`, `self.settings.system.n_jobs = hints.n_jobs` — was DELETED with \
-         the NEOETHOS_BOT_* layer, so this is no longer WrittenNeverRead; it is simply unread. \
-         Every consumer reads `AutoTuneHints::n_jobs`/`available_parallelism()`. One of the two \
-         false passes that motivated the 2026-08-09 rewrite. The value in the shipped config \
-         (11) is the fingerprint of `available_parallelism() - 1` on a 12-core box, pickled into \
-         YAML by `Settings::save` and then shipped to every other machine; it is now \
-         `#[serde(skip)]` + a `Derived` entry in `load_seal::RETIRED_KEYS`, so a file that still \
-         carries `n_jobs:` is named at WARN and ignored rather than obeyed. OWNER: operator — \
-         DELETE the field; rayon width is a property of the box, not of a config file.",
-    ),
-    (
-        "SystemConfig::num_gpus",
-        Inert::Unwired,
-        "same removed writer, same reason it is Unwired rather than WrittenNeverRead. Every \
-         reader is `HardwareProfile::num_gpus` (scheduler.rs, cli/main.rs), probed from the \
-         machine. The shipped `0` is a detector result frozen on a box with no card and then \
-         carried to a 3090; it is now `#[serde(skip)]` + `Derived`, so the frozen value is named \
-         at WARN and ignored. OWNER: operator — DELETE the field, the probe is the honest \
-         source.",
-    ),
-    (
-        "ModelsConfig::inference_batch_size",
-        Inert::Unwired,
-        "same removed writer; the consumers use `AutoTuneHints::inference_batch_size` / \
-         `HardwareExecutionPlan::inference_batch_size`. The second of the two false passes that \
-         motivated the rewrite. Ships 32 in both repo files — a value the hardware plan would \
-         never produce (it emits 128/1024/2048/4096/8192) — now `#[serde(skip)]` + `Derived`. \
-         OWNER: operator — DELETE the field; wiring it would let a config value override a \
-         hardware-derived batch size, which has NEVER-OOM implications.",
-    ),
+    // The three keys REMAIN in `load_seal::RETIRED_KEYS` as `Derived` and in
+    // `system::RETIRED_DERIVED_KEYS`, so the operator's existing store still
+    // loads: each key is NAMED at WARN, told what the machine computes instead,
+    // and pointed at the knob that is still his
+    // (`system.hardware.cpu_budget`, `system.enable_gpu_preference`).
+    // `config_single_load_path::a_hardware_derived_key_in_a_file_is_ignored`
+    // is the test that keeps that true.
+    //
+    // ⚠ THE RULE THAT PRODUCED THIS DELETION, for the next field that goes:
+    // this ledger is checked BOTH ways. An entry naming a field that no longer
+    // exists fails as stale, exactly so a half-landed deletion cannot pass
+    // quietly. If this test fails with "ledger entry for an unknown field",
+    // the fix is to remove the entry, not to re-add the field.
 ];
 
 // ──────────────────── reads that are reports, not recipients ────────────────────
@@ -329,9 +311,11 @@ const REPORTING_ONLY: &[(&str, &str, &str)] = &[
         "crates/neoethos-search/src/discovery.rs",
         "log_gate_states",
         "prints every gate flag with its configured and default value at run start. Its \
-         `settings.risk.challenge_mode` read is accompanied, in the same call, by the text \
-         `UNWIRED: … this arms nothing today` — the reporter says out loud that it is not a \
-         recipient.",
+         `settings.risk.challenge_mode` read says out loud, in the same call, that the SEARCH \
+         consumes nothing here — the key's live recipient is \
+         `domain::risk::RiskManager::from_settings` (#137, 2026-08-10), which is in the app \
+         crate, not in this function. Crediting a printer would have cleared the knob months \
+         before anything read it.",
     ),
 ];
 
@@ -381,6 +365,17 @@ struct ConfigModel {
     /// can build from the operator's YAML, and therefore the only ones that
     /// can carry a knob he sets.
     deserializable: BTreeSet<String>,
+    /// struct name -> config structs that appear only as GENERIC ARGUMENTS of
+    /// one of its fields (`HashMap<String, SessionSpreadCurve>` ->
+    /// `SessionSpreadCurve`).
+    ///
+    /// Serde parses those out of the operator's YAML exactly like a plain
+    /// field — `risk.session_spread_pips_by_symbol.EURUSD.asian` is a number he
+    /// types — so they must be reachable, or their knobs go unchecked. They are
+    /// kept OUT of `installs`: a receiver chain that ends at the map
+    /// (`cfg.session_spread_pips_by_symbol`) has a `HashMap`, not a curve, and
+    /// crediting `.asian` to it would invent a reader that does not exist.
+    nested_in_generics: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl ConfigModel {
@@ -489,7 +484,23 @@ fn parse_config_model(src: &str) -> ConfigModel {
         {
             continue;
         }
-        let ty = base_type(ty.trim_end().trim_end_matches(','));
+        let raw_ty = ty.trim_end().trim_end_matches(',').to_string();
+        let ty = base_type(&raw_ty);
+        // Everything inside the angle brackets, so a container field cannot
+        // hide a config struct from the reachability walk. Filtered against the
+        // declared struct names below, once they are all known.
+        if let Some(open) = raw_ty.find('<') {
+            let inner = &raw_ty[open + 1..];
+            for tok in inner.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if !tok.is_empty() {
+                    model
+                        .nested_in_generics
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(tok.rsplit("::").next().unwrap_or(tok).to_string());
+                }
+            }
+        }
         model.structs.entry(owner).or_default().push((name.to_string(), ty));
     }
 
@@ -498,6 +509,9 @@ fn parse_config_model(src: &str) -> ConfigModel {
         model.declares.insert(owner.clone(), set);
     }
     let struct_names: BTreeSet<String> = model.structs.keys().cloned().collect();
+    for nested in model.nested_in_generics.values_mut() {
+        nested.retain(|ty| struct_names.contains(ty));
+    }
     for fields in model.structs.values() {
         for (f, ty) in fields {
             if struct_names.contains(ty) {
@@ -516,6 +530,9 @@ fn parse_config_model(src: &str) -> ConfigModel {
             if struct_names.contains(fty) {
                 stack.push(fty.clone());
             }
+        }
+        for nested in model.nested_in_generics.get(&ty).into_iter().flatten() {
+            stack.push(nested.clone());
         }
     }
     model
@@ -1381,17 +1398,96 @@ struct ReadIndex {
     called_in_scaffolding: BTreeSet<String>,
 }
 
+/// Functions defined in `config.rs` that a live caller reaches: the `seed`
+/// names (called from outside `config.rs`), plus everything those call, walked
+/// to a fixed point through `config.rs`'s own call graph.
+///
+/// Two deliberate narrowings keep this from becoming a blanket amnesty for
+/// `config.rs`:
+///
+/// * only callees that are themselves **defined in `config.rs`** are edges, so
+///   a helper that exists nowhere in this file cannot drag anything in;
+/// * the ubiquitous trait-impl names are never followed. `default`/`new`/`from`
+///   and friends are called from everywhere in the workspace, so they are in
+///   the seed set by construction; letting the walk descend through the dozens
+///   of `impl Default` bodies in `config.rs` would mark nearly every function
+///   in the file live and hollow out the caller check entirely.
+fn live_config_rs_functions(code: &str, seed: &BTreeSet<String>) -> BTreeSet<String> {
+    const NEVER_FOLLOWED: &[&str] = &[
+        "default", "new", "from", "into", "clone", "fmt", "deserialize", "serialize",
+        "to_string", "eq", "hash", "drop",
+    ];
+
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut current_fn: Option<String> = None;
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("pub fn ").or_else(|| trimmed.strip_prefix("fn ")) {
+            current_fn = ident_at(rest.as_bytes(), 0).map(|(n, _)| n);
+            if let Some(name) = current_fn.as_ref() {
+                defined.insert(name.clone());
+            }
+            continue;
+        }
+        let Some(caller) = current_fn.as_ref() else { continue };
+        let b = line.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            let Some((name, end)) = ident_at(b, i) else {
+                i += 1;
+                continue;
+            };
+            if i > 0 && is_ident_byte(b[i - 1]) {
+                i = end;
+                continue;
+            }
+            if end < b.len() && b[end] == b'(' {
+                calls.entry(caller.clone()).or_default().insert(name);
+            }
+            i = end.max(i + 1);
+        }
+    }
+
+    let mut live: BTreeSet<String> = seed.iter().cloned().collect();
+    let mut stack: Vec<String> = live.iter().cloned().collect();
+    while let Some(func) = stack.pop() {
+        for callee in calls.get(&func).into_iter().flatten() {
+            if NEVER_FOLLOWED.contains(&callee.as_str()) || !defined.contains(callee) {
+                continue;
+            }
+            if live.insert(callee.clone()) {
+                stack.push(callee.clone());
+            }
+        }
+    }
+    live
+}
+
 /// Credit fields read by an accessor **defined inside `config.rs`** — but only
 /// when something outside `config.rs` actually calls that accessor.
 ///
-/// `RiskConfig::session_spread_pips()` is the specimen: the three
-/// `backtest_spread_pips_*` keys are read only by that method, and
-/// `discovery.rs:616` calls it. Skipping `config.rs` wholesale (which both the
+/// `RiskConfig::session_spread_pips()` is the specimen: the
+/// `session_spread_source` / `session_spread_pips_by_symbol` /
+/// `session_spread_min_samples` keys are read only by that method, and
+/// `discovery.rs` calls it once per run. Skipping `config.rs` wholesale (which both the
 /// old scanner and the first cut of this one did) reports all three as orphans.
 /// Crediting `config.rs` wholesale would let a private helper nobody calls
 /// vouch for a knob. The caller check is the difference.
 fn credit_config_rs_accessors(src: &str, model: &ConfigModel, index: &mut ReadIndex) {
     let code = strip_noncode(src);
+    // A live accessor's own helpers are live too. `SessionSpreadCurve::validated`
+    // is the specimen: `discovery.rs` calls `RiskConfig::session_spread_pips`,
+    // which calls `validated`, which is the only place `asian`/`overlap`/
+    // `late_ny` are read. Without this closure the scanner reports three knobs
+    // as orphans while a production path demonstrably reads them, and the only
+    // way to go green would be to write a lie into NO_QUALIFIED_READER.
+    //
+    // The closure starts ONLY from names production code outside config.rs
+    // actually calls, and walks ONLY edges between functions defined in
+    // config.rs, so a private helper nobody calls still vouches for nothing.
+    let live = live_config_rs_functions(&code, &index.called_in_production);
+    let live_scaffolding = live_config_rs_functions(&code, &index.called_in_scaffolding);
     let mut current_impl: Option<String> = None;
     let mut current_fn: Option<String> = None;
     for line in code.lines() {
@@ -1425,9 +1521,9 @@ fn credit_config_rs_accessors(src: &str, model: &ConfigModel, index: &mut ReadIn
                 continue;
             }
             let key = (owner.clone(), field);
-            if index.called_in_production.contains(func) {
+            if live.contains(func) {
                 index.production.insert(key);
-            } else if index.called_in_scaffolding.contains(func) {
+            } else if live_scaffolding.contains(func) {
                 index.scaffolding.insert(key);
             }
         }

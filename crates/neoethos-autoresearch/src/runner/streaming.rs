@@ -1031,6 +1031,14 @@ fn oos_backtest_settings(
         kill_zones_enabled: config.kill_zones_enabled,
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
+        // #294 (2026-08-10): the same reason the two above are here. This
+        // mirror must size identically to the in-sample builder
+        // (`discovery_backtest_settings`), and until this date BOTH inherited
+        // the field from `BacktestSettings::default()`. Now that the in-sample
+        // side reads the operator's `risk.high_quality_confidence`, an
+        // unmirrored default here would make the out-of-sample touch a
+        // DIFFERENT simulation from the one that scored the gene.
+        high_quality_confidence: config.high_quality_confidence,
         ..neoethos_search::eval::BacktestSettings::default()
     }
 }

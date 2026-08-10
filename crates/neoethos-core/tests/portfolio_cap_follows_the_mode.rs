@@ -162,3 +162,49 @@ fn the_shipped_default_carries_a_real_ceiling() {
         d.risk.daily_drawdown_limit
     );
 }
+
+/// An ABSENT key must mean the compiled default, on every field.
+///
+/// These four `Option<f64>` risk bands carried a field-level
+/// `#[serde(default)]` until 2026-08-10, which overrode the container's and
+/// made absence mean `None` instead of the struct default. The overrides-only
+/// store is built on the opposite promise: a key is deleted from the file
+/// precisely BECAUSE it equals the default, and must come back as that default.
+///
+/// The failure this catches is silent and it is money: with the field absent,
+/// `prop_firm_max_risk_per_trade` fell back to `risk_per_trade` — 3% where the
+/// operator had ruled 1%, on every entry.
+#[test]
+fn an_absent_risk_band_takes_the_compiled_default_not_none() {
+    let d = Settings::default();
+    let loaded = load("system:\n  trading_mode: prop_firm\nrisk:\n  preset: ftmo\n");
+
+    assert_eq!(
+        loaded.risk.prop_firm_max_risk_per_trade, d.risk.prop_firm_max_risk_per_trade,
+        "an absent prop_firm_max_risk_per_trade must be the default, not None"
+    );
+    assert_eq!(
+        loaded.risk.risky_max_risk_per_trade, d.risk.risky_max_risk_per_trade,
+        "an absent risky_max_risk_per_trade must be the default, not None"
+    );
+    assert_eq!(
+        loaded.risk.risky_min_risk_per_trade, d.risk.risky_min_risk_per_trade,
+        "an absent risky_min_risk_per_trade must be the default, not None"
+    );
+    assert_eq!(
+        loaded.risk.prop_firm_min_risk_per_trade, d.risk.prop_firm_min_risk_per_trade,
+        "an absent prop_firm_min_risk_per_trade must be the default, not None"
+    );
+
+    // And the values themselves are the operator's 2026-08-10 ruling.
+    assert_eq!(
+        loaded.risk.prop_firm_max_risk_per_trade,
+        Some(0.01),
+        "1% for prop firm"
+    );
+    assert_eq!(
+        loaded.risk.risky_max_risk_per_trade,
+        Some(0.30),
+        "30% for risky mode"
+    );
+}

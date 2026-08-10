@@ -80,14 +80,14 @@ risk:
   risky_min_risk_per_trade: null
   risky_max_risk_per_trade: 0.3
   prop_firm_min_risk_per_trade: null
-  prop_firm_max_risk_per_trade: null
+  prop_firm_max_risk_per_trade: 0.01
   max_portfolio_risk: 0.04
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0
   max_lot_size: 10.0
   require_stop_loss: true
-  challenge_mode: false
+  challenge_mode: true
   challenge_phase: phase_1
   kill_zones_enabled: true
   max_trades_per_day: 15
@@ -102,9 +102,9 @@ risk:
   commission_per_lot: 7.0
   commission_per_lot_is_per_side: true
   backtest_spread_pips: 1.5
-  backtest_spread_pips_asian: null
-  backtest_spread_pips_overlap: null
-  backtest_spread_pips_late_ny: null
+  session_spread_source: flat
+  session_spread_pips_by_symbol: {}
+  session_spread_min_samples: 30
   cost_band_optimistic_pips: 1.6
   cost_band_pessimistic_pips: 2.4
   conformal_enabled: true
@@ -139,7 +139,7 @@ models:
   rllib_num_workers: 0
   auto_enable_rllib: true
   use_neuroevolution: true
-  rl_population_size: 5
+  rl_population_size: 96
   rl_timesteps: 10000000
   rl_eval_episodes: 15
   rl_network_arch:
@@ -162,7 +162,7 @@ models:
   rl_reward_horizon: 0
   rl_episode_len: 0
   rl_train_seconds: 3600
-  exit_agent_hidden_dim: 64
+  exit_agent_hidden_dim: 128
   exit_agent_gamma: 0.99
   exit_agent_epsilon: 0.2
   exit_agent_epsilon_min: 0.05
@@ -173,34 +173,34 @@ models:
   evo_train_seconds: 3600
   evo_hidden_size: 64
   evo_population: 32
-  evo_islands: 4
+  evo_islands: 8
   evo_sigma: 0.25
-  prop_search_enabled: false
+  prop_search_enabled: true
   prop_search_population: 100
   prop_search_population_auto: false
-  prop_search_generations: 50
-  prop_search_max_hours: 0.5
+  prop_search_generations: 1000
+  prop_search_max_hours: 24.0
   prop_search_max_rows: 0
   prop_search_max_rows_by_tf: {}
   prop_search_portfolio_size: 3000
   prop_search_max_indicators: 12
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: auto
-  prop_search_train_years: 0
-  prop_search_val_years: 0
+  prop_search_train_years: 8
+  prop_search_val_years: 1
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
-  prop_search_val_min_trades_per_month: 0
-  prop_search_val_min_trades_per_day: 0.0
+  prop_search_val_min_trades_per_month: 15
+  prop_search_val_min_trades_per_day: 1.0
   prop_search_min_win_rate: 0.0
   prop_search_min_payoff_ratio: 2.0
   prop_search_min_net_expectancy_per_trade: 0.0
   prop_search_min_expectancy_t_stat: 0.0
-  prop_search_max_in_market: 0.0
+  prop_search_max_in_market: 0.35
   prop_search_val_min_monthly_profit_pct: 0.0
-  prop_search_val_log_trades: false
-  prop_search_val_trade_log_max: 20
-  prop_search_async: false
+  prop_search_val_log_trades: true
+  prop_search_val_trade_log_max: 50
+  prop_search_async: true
   prop_search_async_wait: false
   tree_device_preference: auto
   regularized_model_defaults: true
@@ -211,7 +211,7 @@ models:
   prop_search_survivor_fraction: 0.1
   prop_search_immigrant_fraction: 0.18
   prop_search_selection_temperature: 0.75
-  prop_search_tournament_size: 0
+  prop_search_tournament_size: 10
   prop_search_opportunistic_enabled: true
   prop_search_opportunistic_min_positive_months: 3
   prop_search_opportunistic_min_trades_per_month: 10
@@ -228,7 +228,7 @@ models:
   transformer_heads: 8
   transformer_layers: 4
   transformer_hidden_dim: 256
-  transformer_dropout: 0.2
+  transformer_dropout: 0.1
   transformer_seq_len: 64
   transformer_train_seconds: 3600
   nbeats_train_seconds: 3600
@@ -261,7 +261,7 @@ models:
     xgboost_rf: 6
   hpo_max_rows: 1000000
   max_epochs_by_model: {}
-  ray_tune_max_concurrency: 1
+  ray_tune_max_concurrency: 8
   calibration_enabled: true
   calibration_method: platt
   calibration_min_rows: 300
@@ -269,7 +269,7 @@ models:
   blend_gate_floor: 0.34
   blend_veto_below: 0.15
   model_param_overrides: {}
-  regime_router_enabled: false
+  regime_router_enabled: true
   regime_router_min_models: 2
   regime_trend_models:
   - transformer
@@ -292,8 +292,8 @@ models:
   - online_pa
   - online_hoeffding
   regime_neutral_models: []
-  l1_feature_selection_enabled: false
-  l1_feature_selection_per_regime: false
+  l1_feature_selection_enabled: true
+  l1_feature_selection_per_regime: true
   l1_feature_selection_min_features: 20
   l1_feature_selection_max_features: 256
   l1_feature_selection_sample_limit: 200000
@@ -310,7 +310,7 @@ models:
   label_neutral_band_atr_fraction: 0.25
   label_stop_atr_multiplier: 0.0
   label_take_profit_rr: 0.0
-  walkforward_splits: 10
+  walkforward_splits: 20
   embargo_minutes: 120
   discovery_mode: prop_firm
   require_walkforward_for_export: true
@@ -381,7 +381,6 @@ models:
     min_trades_per_month: 4
     trading_days_per_month: 21.0
   backtest_runtime:
-    initial_equity: 100000.0
     month_capacity: 240
     rayon_threads: null
   stop_target_runtime:

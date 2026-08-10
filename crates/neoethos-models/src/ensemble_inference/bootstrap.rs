@@ -23,16 +23,17 @@
 //!
 //! [`build_ensemble_for_symbol`]:
 //!  1. Builds an [`super::ExpertRegistry`] with every default
-//!     loader pre-registered (32 canonical names — all wired
-//!     families from D1.2.1-D1.2.7, the 34th model `hmm_regime`,
-//!     and the evolutionary voters neat/neuro_evo restored in the
-//!     F-319 revision 2026-07-11).
+//!     loader pre-registered (34 canonical names — all wired
+//!     families from D1.2.1-D1.2.7, `hmm_regime`, the evolutionary
+//!     voters neat/neuro_evo restored in the F-319 revision
+//!     2026-07-11, and the exit-axis `exit_agent` restored by
+//!     audit #174/#310 on 2026-08-10).
 //!  2. Calls [`super::ExpertRegistry::load_with_partial_replica_aware`]
 //!     against the operator's `<models_root>/<symbol>/<tf>/` directory
 //!     with the full canonical name list. Missing/degraded
 //!     artifacts are reported in the outcome (per option β —
 //!     no fail-loud) so the operator can run the bot with
-//!     whatever subset of the 32 experts has been trained; replica
+//!     whatever subset of the 34 experts has been trained; replica
 //!     dirs (`transformer_01/…`) load as independent voters and
 //!     orphan artifact dirs are warned about loudly.
 //!  3. Constructs a [`super::SoftVotingEnsemble`] with the
@@ -41,7 +42,7 @@
 //!     strategy discoverer it is search-side, never registered here).
 //!
 //! Returns the ensemble plus the load outcome so the caller's
-//! chrome / system pane can render "Loaded X/32 experts —
+//! chrome / system pane can render "Loaded X/34 experts —
 //! Y missing, Z degraded".
 //!
 //! ## What it does NOT do
@@ -58,7 +59,11 @@
 //!   matches the runtime feature pipeline. That cross-check
 //!   happens at first `predict` call — if a column-layout drift
 //!   is detected the expert's predict_proba returns an error
-//!   which the SoftVotingEnsemble surfaces verbatim.
+//!   which the SoftVotingEnsemble surfaces verbatim. EXCEPTION
+//!   (audit #174/#310): a drifted EXIT-side expert is contained —
+//!   it is refused by name at `error` and the exit opinion
+//!   abstains, rather than taking the direction chain down with
+//!   it. See `ensemble_feature_dataframe`.
 
 use std::path::Path;
 
@@ -79,7 +84,6 @@ use super::{
 /// [`crate::runtime::capabilities::KNOWN_MODEL_NAMES`] minus:
 ///   - `genetic` — the strategy DISCOVERER (the GA in `neoethos-search`);
 ///     the operator's search-only exemption applies to it alone.
-///   - `exit_agent` — F-318 (no production exit-side consumer).
 ///
 /// `neat` + `neuro_evo` REJOINED 2026-07-11 (F-319 revision, operator
 /// directive "every trained model votes"): both are trained through the
@@ -88,17 +92,16 @@ use super::{
 /// day (D1.2.8): last-row-only forecast voter — see the `swarm_adapter`
 /// module doc for the honesty constraints.
 ///
-/// **33 names total** (KNOWN_MODEL_NAMES − genetic − exit_agent).
+/// **34 names total** (KNOWN_MODEL_NAMES − genetic).
 ///
-/// `exit_agent` was removed in F-318 (2026-05-29): the model trains
-/// successfully and emits `ExitDecision3` probabilities, but
-/// `SoftVotingEnsemble` actively filters those outputs (Classification3
-/// only votes) and no auto-trade exit-side pipeline consumes them in
-/// production. Keeping it in the bootstrap list reserved memory + disk
-/// for an artifact that no production code path reads. The source
-/// (`exit_agent.rs`, `ExitAgentAdapter`, `ExitAgentLoader`) stays for
-/// future revival once an exit-side decision loop ships, but the
-/// registry no longer wires it in until then.
+/// `exit_agent` REJOINED 2026-08-10 (audit #174 + #310, operator decision
+/// "CONNECT IT, visible even in the back/forward test process"). F-318 had
+/// removed it on 2026-05-29 with a correct reason at the time — its
+/// `ExitDecision3` output was filtered out of the vote and nothing read it, so
+/// loading it reserved memory and disk for nobody. The reason is gone: the
+/// exit-side combiner (`soft_voting.rs::exit_opinions`) consumes it and its
+/// verdict rides on `EnsembleDecision::exit`. It does NOT enter the direction
+/// vote — an exit opinion is a different axis from an entry direction.
 pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     // Tree (7)
     "lightgbm",
@@ -133,11 +136,12 @@ pub const DEFAULT_BOOTSTRAP_EXPERT_NAMES: &[&str] = &[
     "online_pa",
     "online_hoeffding",
     "isolation_forest",
-    // RL (2) — exit_agent removed in F-318 (consumers never wired).
-    // `sac` (discrete Soft Actor-Critic) is an entry/direction voter
-    // that emits Classification3 probs and soft-votes like `dqn`.
+    // RL (3). `dqn` + `sac` (discrete Soft Actor-Critic) are ENTRY/direction
+    // voters that emit Classification3 probs and soft-vote together.
+    // `exit_agent` is the EXIT-axis voter — audit #174/#310, 2026-08-10.
     "dqn",
     "sac",
+    "exit_agent",
     // Evolutionary voters (2) — rejoined 2026-07-11 (F-319 revision):
     // trained via the shared expert path with 3-class heads; their
     // artifacts were being produced and never read.
@@ -165,7 +169,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     debug_assert_eq!(
         registry.registered_names().len(),
         DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(),
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 33 canonical names"
+        "DEFAULT_BOOTSTRAP_EXPERT_NAMES + registry must list the same 34 canonical names"
     );
     Ok(registry)
 }
@@ -181,7 +185,7 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
 /// [`SoftVotingEnsembleConfig`] argument: `build_ensemble_for_symbol_with_config`
 /// existed, was called by nothing, and was the reason the
 /// live ensemble ran on `SoftVotingEnsembleConfig::default()` —
-/// all ~33 experts at weight 1.0 — on every install. It is
+/// all ~34 experts at weight 1.0 — on every install. It is
 /// deleted; this is the only way to build the live ensemble,
 /// and it reads the operator's file.
 pub fn build_ensemble_for_symbol(
@@ -253,13 +257,18 @@ pub fn load_experts_for_symbol(
 /// feature-column CONTRACT so the trader never feeds mis-columned data to the
 /// experts.
 ///
-/// Builds the symbol's ensemble, reads the experts' shared `feature_columns()`
-/// (asserting all loaded experts agree), selects the FeatureFrame columns to
-/// EXACTLY that set BY NAME (the experts bail unless the DataFrame columns equal
-/// their trained set), runs [`SoftVotingEnsemble::predict_with_roles`], and
-/// returns one decision per row. FAILS LOUD on any column mismatch / missing
-/// feature — the caller (the trader) then falls back to gene-only rather than
-/// trading on a wrong-columned ensemble.
+/// Builds the symbol's ensemble, reads the DIRECTION-side experts' shared
+/// `feature_columns()` (asserting they agree), selects the FeatureFrame columns
+/// to EXACTLY that set BY NAME (the experts bail unless the DataFrame columns
+/// equal their trained set), runs [`SoftVotingEnsemble::predict_with_roles`],
+/// and returns one decision per row. FAILS LOUD on any column mismatch /
+/// missing feature — the caller (the trader) then falls back to gene-only
+/// rather than trading on a wrong-columned ensemble.
+///
+/// THIS IS THE BACKTEST ENTRY POINT (`neoethos-trader::data_replay::
+/// replay_blend_from_dir`). Since audit #174/#310 it also prints an
+/// [`ExitCensus`] — the operator required the exit signal to be visible in the
+/// back/forward test, not only live.
 pub fn role_decisions_from_feature_frame(
     models_root: &Path,
     symbol: &str,
@@ -268,7 +277,100 @@ pub fn role_decisions_from_feature_frame(
 ) -> Result<Vec<super::EnsembleDecision>> {
     let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
     let df = ensemble_feature_dataframe(&ensemble, features, FrameRows::All)?;
-    ensemble.predict_with_roles(&df)
+    let decisions = ensemble.predict_with_roles(&df)?;
+    // BACKTEST VISIBILITY (audit #174 + #310, operator's explicit requirement:
+    // "visible even in the back/forward test process"). This is the entry point
+    // the offline replay uses (`neoethos-trader::data_replay::
+    // replay_blend_from_dir`), so every backtest now prints what the exit chain
+    // did over the whole run — its voters, and how often it wanted out. A
+    // signal he cannot see in a backtest is a signal he cannot evaluate before
+    // it costs money.
+    ExitCensus::of(&decisions).log(symbol, timeframe, ensemble.exit_expert_count());
+    Ok(decisions)
+}
+
+/// Run-level summary of what the exit-side chain said, so a BACKTEST reports
+/// the exit signal instead of hiding it inside per-row structs nobody prints.
+///
+/// Every field is a count or a mean of values the chain actually produced —
+/// there is no threshold, no score and no invented number here.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ExitCensus {
+    /// Rows the combiner returned.
+    pub rows: usize,
+    /// Rows carrying an exit opinion (`EnsembleDecision::exit.is_some()`).
+    pub rows_with_opinion: usize,
+    /// Mean [`super::ExitOpinion::close_pressure`] over `rows_with_opinion`
+    /// (0.0 when there are none).
+    pub mean_close_pressure: f32,
+    /// Highest close pressure seen on any row.
+    pub max_close_pressure: f32,
+    /// Rows where the exit chain would keep LESS than the whole position
+    /// (`keep_fraction < 1.0`) — i.e. rows on which it had any effect at all.
+    pub rows_wanting_less: usize,
+}
+
+impl ExitCensus {
+    /// Summarise a run's decisions.
+    pub fn of(decisions: &[super::EnsembleDecision]) -> Self {
+        let mut census = Self {
+            rows: decisions.len(),
+            ..Self::default()
+        };
+        let mut sum = 0.0_f64;
+        for d in decisions {
+            let Some(exit) = d.exit else { continue };
+            census.rows_with_opinion += 1;
+            let pressure = exit.close_pressure();
+            sum += pressure as f64;
+            if pressure > census.max_close_pressure {
+                census.max_close_pressure = pressure;
+            }
+            if exit.keep_fraction() < 1.0 {
+                census.rows_wanting_less += 1;
+            }
+        }
+        if census.rows_with_opinion > 0 {
+            census.mean_close_pressure = (sum / census.rows_with_opinion as f64) as f32;
+        }
+        census
+    }
+
+    /// Print the census. WARN when the chain produced nothing despite experts
+    /// being loaded — that is the exact failure mode audit #310 named (a built
+    /// mechanism reaching nothing) and it must not read as a benign info line.
+    pub fn log(&self, symbol: &str, timeframe: &str, exit_experts: usize) {
+        if exit_experts == 0 {
+            tracing::info!(
+                target: "neoethos_models::ensemble",
+                %symbol, %timeframe, rows = self.rows,
+                "exit chain: no exit-side expert LOADED — no exit opinion in this run. Either \
+                 `exit_agent` is untrained for this symbol/timeframe, it is on \
+                 `models.ensemble_voting.excluded_experts`, or the numeric sanity screen \
+                 REFUSED its artifact (that refusal is logged by name at load time)."
+            );
+        } else if self.rows_with_opinion == 0 {
+            tracing::warn!(
+                target: "neoethos_models::ensemble",
+                %symbol, %timeframe, rows = self.rows, exit_experts,
+                "exit chain: {exit_experts} exit expert(s) LOADED but produced ZERO opinions — \
+                 the exit signal reached nothing this run (audit #174/#310). Check the error \
+                 lines above for a refused exit expert."
+            );
+        } else {
+            tracing::info!(
+                target: "neoethos_models::ensemble",
+                %symbol, %timeframe,
+                rows = self.rows,
+                rows_with_opinion = self.rows_with_opinion,
+                rows_wanting_less = self.rows_wanting_less,
+                mean_close_pressure = self.mean_close_pressure,
+                max_close_pressure = self.max_close_pressure,
+                exit_experts,
+                "exit chain census (RL exit output, backtest-visible)"
+            );
+        }
+    }
 }
 
 /// LIVE-path variant: one role-aware decision for the LAST row of `features`,
@@ -298,10 +400,30 @@ pub fn role_decision_for_last_row(
         FrameRows::Tail(LIVE_DECISION_TAIL_ROWS),
     )?;
     let decisions = ensemble.predict_with_roles(&df)?;
-    decisions
+    let decision = decisions
         .into_iter()
         .next_back()
-        .ok_or_else(|| anyhow::anyhow!("ensemble returned no decision for the last feature row"))
+        .ok_or_else(|| anyhow::anyhow!("ensemble returned no decision for the last feature row"))?;
+    // FORWARD-TEST / LIVE VISIBILITY (audit #174 + #310). One line per closed
+    // bar — the same cadence the caller already logs at — so the operator can
+    // watch the exit chain on a demo forward test exactly as he watches it in a
+    // backtest. `exit == None` is reported as an ABSENCE, never as a hold.
+    match decision.exit {
+        Some(exit) => tracing::info!(
+            target: "neoethos_models::ensemble",
+            exit_voters = exit.voters,
+            exit_close_pressure = exit.close_pressure(),
+            exit_keep_fraction = exit.keep_fraction(),
+            "exit chain opinion for this bar"
+        ),
+        None if ensemble.exit_expert_count() > 0 => tracing::warn!(
+            target: "neoethos_models::ensemble",
+            exit_experts = ensemble.exit_expert_count(),
+            "exit chain: expert(s) loaded but NO opinion for this bar — see the refusal above"
+        ),
+        None => {}
+    }
+    Ok(decision)
 }
 
 /// How much trailing history the live gate feeds the experts per bar.
@@ -331,28 +453,44 @@ fn ensemble_feature_dataframe(
     // `load_outcome` is an `EnsemblePredictor` trait method.
     use super::EnsemblePredictor;
 
-    // Determine the experts' shared feature-column set; assert all loaded
-    // experts that expose columns agree on them.
-    let mut expected: Option<Vec<String>> = None;
+    // Determine the DIRECTION-side experts' shared feature-column set; assert
+    // all loaded direction-side experts that expose columns agree on them.
+    //
+    // Audit #174/#310: the quorum is deliberately taken over the direction
+    // experts ONLY. A stale/mis-columned `exit_agent` artifact must not be able
+    // to fail this contract, because a failure here makes the whole ensemble
+    // unavailable and the trader then sizes GENE-ONLY — i.e. without the ML
+    // shrink, which moves money the wrong way. The exit expert is checked
+    // against the same frame by its own `predict_runtime` (it bails by name on
+    // a column mismatch), and `SoftVotingEnsemble::exit_opinions` turns that
+    // into a loud, contained abstention.
+    let mut expected: Option<(&str, Vec<String>)> = None;
     for expert in &ensemble.load_outcome().loaded {
+        if expert.output_kind() == super::ExpertOutputKind::ExitDecision3 {
+            continue;
+        }
         let cols = expert.feature_columns();
         if cols.is_empty() {
             continue;
         }
         match &expected {
-            None => expected = Some(cols.to_vec()),
-            Some(prev) => {
+            None => expected = Some((expert.name(), cols.to_vec())),
+            Some((first_name, prev)) => {
                 if prev.as_slice() != cols {
                     bail!(
-                        "ensemble experts disagree on feature columns; \
-                         refusing to feed mis-columned data"
+                        "ensemble experts disagree on feature columns: '{}' expects {} columns \
+                         and '{}' expects {}; refusing to feed mis-columned data",
+                        first_name,
+                        prev.len(),
+                        expert.name(),
+                        cols.len()
                     );
                 }
             }
         }
     }
-    let expected =
-        expected.ok_or_else(|| anyhow!("no loaded expert exposes feature_columns"))?;
+    let (_, expected) = expected
+        .ok_or_else(|| anyhow!("no loaded direction-side expert exposes feature_columns"))?;
 
     // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
     let mut columns = Vec::with_capacity(expected.len());
@@ -408,8 +546,8 @@ mod tests {
 
     #[test]
     fn default_bootstrap_names_match_known_model_names_minus_swarm() {
-        // 33 voters = KNOWN_MODEL_NAMES minus genetic and exit_agent.
-        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 33);
+        // 34 experts = KNOWN_MODEL_NAMES minus genetic.
+        assert_eq!(DEFAULT_BOOTSTRAP_EXPERT_NAMES.len(), 34);
         let names: std::collections::HashSet<&str> =
             DEFAULT_BOOTSTRAP_EXPERT_NAMES.iter().copied().collect();
         // F-319 REVISED (2026-07-11, operator directive "every trained
@@ -424,14 +562,13 @@ mod tests {
                 "{present} is trained — it must vote (swarm: last-row-only, D1.2.8)"
             );
         }
-        // F-318 (2026-05-29): exit_agent's ExitDecision3 outputs are
-        // filtered out by SoftVotingEnsemble (Classification3 only) and
-        // no production exit-side pipeline consumes them. Removed from
-        // the bootstrap to stop reserving memory + disk for an artifact
-        // no live code path reads.
+        // REGRESSION GUARD for audit #174 + #310. `exit_agent` must be in the
+        // bootstrap list or nothing loads it, the exit chain is empty, and the
+        // RL exit output goes back to reaching zero trades — which is what it
+        // did for sixteen months while the mechanism sat fully built.
         assert!(
-            !names.contains("exit_agent"),
-            "exit_agent removed in F-318 — consumers never wired"
+            names.contains("exit_agent"),
+            "exit_agent must load — the exit-side combiner is its consumer (audit #174/#310)"
         );
         // Sample required canonical names.
         for required in [
@@ -447,10 +584,10 @@ mod tests {
     }
 
     #[test]
-    fn build_default_registry_installs_all_33_loaders() {
+    fn build_default_registry_installs_all_34_loaders() {
         let registry = build_default_registry().expect("build default registry");
         let registered = registry.registered_names();
-        assert_eq!(registered.len(), 33);
+        assert_eq!(registered.len(), 34);
         for required in DEFAULT_BOOTSTRAP_EXPERT_NAMES {
             assert!(
                 registry.has_loader(required),
@@ -467,7 +604,7 @@ mod tests {
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.degraded_count(), 0);
-        assert_eq!(outcome.missing_count(), 33);
+        assert_eq!(outcome.missing_count(), 34);
         assert!(!outcome.has_any_loaded());
     }
 
@@ -524,6 +661,56 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -- Backtest visibility of the exit chain (audit #174 + #310) -----
+
+    fn decision_with_close(p_close: f32) -> super::super::EnsembleDecision {
+        super::super::EnsembleDecision {
+            exit: Some(super::super::ExitOpinion {
+                close_probs: [1.0 - p_close, 0.0, p_close],
+                voters: 1,
+            }),
+            ..super::super::EnsembleDecision::neutral()
+        }
+    }
+
+    /// The operator asked for the exit signal to be VISIBLE in the back/forward
+    /// test, not only live. This pins the summary the backtest entry point
+    /// prints — a signal he cannot see in a backtest is a signal he cannot
+    /// evaluate before it costs money.
+    #[test]
+    fn exit_census_counts_what_the_chain_actually_said() {
+        let decisions = vec![
+            decision_with_close(0.0),
+            decision_with_close(0.5),
+            decision_with_close(1.0),
+            super::super::EnsembleDecision::neutral(), // no opinion
+        ];
+        let census = ExitCensus::of(&decisions);
+        assert_eq!(census.rows, 4);
+        assert_eq!(census.rows_with_opinion, 3);
+        // 0.5 and 1.0 keep less than the whole position; 0.0 keeps all of it.
+        assert_eq!(census.rows_wanting_less, 2);
+        assert!((census.mean_close_pressure - 0.5).abs() < 1e-6);
+        assert!((census.max_close_pressure - 1.0).abs() < 1e-6);
+    }
+
+    /// The failure this whole item is about: a mechanism that is built and
+    /// reaches nothing. If every row comes back without an opinion, the census
+    /// must show zero — that is what makes "it reached nothing" READABLE in a
+    /// backtest instead of invisible.
+    #[test]
+    fn exit_census_reports_zero_when_the_chain_reached_nothing() {
+        let decisions = vec![super::super::EnsembleDecision::neutral(); 128];
+        let census = ExitCensus::of(&decisions);
+        assert_eq!(census.rows, 128);
+        assert_eq!(census.rows_with_opinion, 0);
+        assert_eq!(census.rows_wanting_less, 0);
+        assert_eq!(census.mean_close_pressure, 0.0);
+        // Must not panic on an all-absent run.
+        census.log("EURUSD", "H1", 1);
+        census.log("EURUSD", "H1", 0);
+    }
+
     #[test]
     fn bootstrap_paths_match_training_orchestrator_save_layout() {
         // Pin the directory convention: <models_root>/<symbol>/<tf>/
@@ -536,8 +723,8 @@ mod tests {
         // Create the expected dir so the load can scan it.
         fs::create_dir_all(&expected).expect("mkdir");
         let outcome = load_experts_for_symbol(&root, "EURUSD", "H1").expect("load");
-        // Still 33 missing because the dir is empty, but the
+        // Still 34 missing because the dir is empty, but the
         // function didn't error out → path resolution worked.
-        assert_eq!(outcome.missing_count(), 33);
+        assert_eq!(outcome.missing_count(), 34);
     }
 }

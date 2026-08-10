@@ -16,9 +16,10 @@
 //!   `RuntimePrediction` with `class_probabilities: [hold,
 //!   neutral, close]`. Tagged with
 //!   [`super::ExpertOutputKind::ExitDecision3`] so the
-//!   trade-direction aggregators (SoftVoting, MoE classifier head)
-//!   SKIP it — the exit-side pipeline (close existing positions
-//!   on signal) is its own future consumer.
+//!   trade-direction combiner keeps it OUT of the entry vote —
+//!   and, since audit #174/#310 (2026-08-10), so the EXIT-SIDE
+//!   combiner picks it up. It is a wired voter on the exit axis,
+//!   not a future consumer's problem.
 //!
 //! ## Deferred to D1.2.8: SwarmForecaster
 //!
@@ -189,11 +190,12 @@ impl ExpertLoader for DqnLoader {
 /// [`ExpertModel`] adapter for [`ExitAgent`].
 ///
 /// Exposes the agent's `[hold, neutral, close]` exit-decision
-/// distribution tagged with
-/// [`ExpertOutputKind::ExitDecision3`]. The trade-direction
-/// aggregator (SoftVoting / MoE classifier head) silently skips
-/// ExitDecision3 outputs; the exit-side pipeline (which closes
-/// open positions on signal) is the consumer.
+/// distribution tagged with [`ExpertOutputKind::ExitDecision3`].
+/// The trade-direction combiner keeps it out of the entry vote (two
+/// different axes); the EXIT-side combiner
+/// (`SoftVotingEnsemble::exit_opinions`, audit #174/#310) consumes it
+/// and its verdict rides on `EnsembleDecision::exit` through both the
+/// backtest and the live/forward path.
 pub struct ExitAgentAdapter {
     inner: ExitAgent,
 }
@@ -267,8 +269,8 @@ impl ExpertLoader for ExitAgentLoader {
 /// canonical 3-class `[neutral, buy, sell]` distribution tagged
 /// [`super::ExpertOutputKind::Classification3`] so the trade-direction
 /// aggregators (SoftVoting / MoE classifier head) treat it as a regular
-/// soft voter — exactly like [`DqnAdapter`], and unlike the exit agent
-/// whose `ExitDecision3` outputs are filtered out.
+/// soft voter — exactly like [`DqnAdapter`], and unlike the exit agent,
+/// whose `ExitDecision3` outputs go to the exit-side combiner instead.
 pub struct SacAgentAdapter {
     inner: SoftActorCritic,
 }
@@ -337,20 +339,26 @@ impl ExpertLoader for SacAgentLoader {
 // Convenience: register-all-rl-exit-loaders
 // ---------------------------------------------------------------------------
 
-/// Register the RL entry-voter loaders: `dqn` + `sac` (2 names).
+/// Register the RL loaders: the entry voters `dqn` + `sac`, and the exit
+/// voter `exit_agent` (3 names).
 ///
-/// **F-318 (2026-05-29)**: the exit-side `exit_agent` is NOT wired in —
-/// its `ExitDecision3` outputs are filtered out by `SoftVotingEnsemble`
-/// (Classification3 only) and no production exit-side pipeline reads
-/// them. `ExitAgentLoader` is kept in the module for future revival.
+/// **Audit #174 + #310 (2026-08-10)** — F-318 IS REVERSED, and its
+/// justification is deleted rather than left standing beside this. F-318
+/// (2026-05-29) unregistered `exit_agent` because `SoftVotingEnsemble`
+/// filtered `ExitDecision3` out and nothing consumed it. Both halves of that
+/// are now false: the exit-side combiner exists
+/// (`soft_voting.rs::exit_opinions`) and its verdict rides on
+/// `EnsembleDecision::exit` through the backtest, the forward test and the
+/// live path alike. The model trained on every run for sixteen months and its
+/// output reached nothing; it reaches something now.
 ///
-/// **SAC (Christodoulou 2019)**: a real discrete Soft Actor-Critic entry
+/// **SAC (Christodoulou 2019)**: a real discrete Soft Actor-Critic ENTRY
 /// policy. Unlike the exit agent it emits a `Classification3`
-/// `[neutral, buy, sell]` distribution and soft-votes like `dqn`, so it
-/// IS registered here.
+/// `[neutral, buy, sell]` distribution and soft-votes like `dqn`.
 pub fn register_rl_exit_loaders(registry: &mut super::ExpertRegistry) -> Result<()> {
     registry.register(Box::new(DqnLoader))?;
     registry.register(Box::new(SacAgentLoader))?;
+    registry.register(Box::new(ExitAgentLoader))?;
     Ok(())
 }
 
@@ -373,14 +381,17 @@ mod tests {
         assert_eq!(ExitAgentLoader.name(), "exit_agent");
     }
 
+    /// REGRESSION GUARD for audit #174 + #310. If `exit_agent` ever falls out
+    /// of this registry again, the exit-side chain has no experts and the RL
+    /// exit output goes back to reaching nothing — silently, because an empty
+    /// exit chain is not an error by design.
     #[test]
-    fn register_rl_exit_loaders_installs_two_names() {
+    fn register_rl_exit_loaders_installs_the_two_entry_voters_and_the_exit_voter() {
         let mut reg = ExpertRegistry::new();
         register_rl_exit_loaders(&mut reg).expect("register");
         let mut names = reg.registered_names();
         names.sort_unstable();
-        // dqn + sac entry voters (exit_agent stays unwired — F-318).
-        assert_eq!(names, vec!["dqn", "sac"]);
+        assert_eq!(names, vec!["dqn", "exit_agent", "sac"]);
     }
 
     #[test]
@@ -392,10 +403,11 @@ mod tests {
 
     #[test]
     fn output_kinds_are_distinct() {
-        // DQN softmaxes to Classification3 (votes), exit_agent
-        // tags ExitDecision3 (doesn't vote). Pin that they are
-        // intentionally different so the SoftVoting aggregator
-        // skip-logic stays correct.
+        // DQN softmaxes to Classification3 (votes on DIRECTION), exit_agent
+        // tags ExitDecision3 (votes on the EXIT axis). Pin that they are
+        // intentionally different so the two combiners keep routing them to
+        // separate chains — the whole point of audit #174/#310 was that
+        // collapsing them into one vote would be worse than dropping one.
         let inner_dqn = TradingReinforcementLearner::new();
         let dqn = DqnAdapter::new(inner_dqn);
         assert_eq!(dqn.output_kind(), ExpertOutputKind::Classification3);
@@ -413,12 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn full_30_loaders_coexist() {
-        // **F-319 (2026-05-29)**: genetic/neuro_evo/neat removed — they
-        // are strategy discoverers in `neoethos-search`, not voters.
-        // **F-318 (2026-05-29)**: exit_agent removed — `ExitDecision3`
-        // outputs are filtered out by SoftVotingEnsemble and no
-        // production exit-side pipeline consumes them.
+    fn full_31_loaders_coexist() {
+        // **F-319 (2026-05-29)**: genetic removed — it is the strategy
+        // discoverer in `neoethos-search`, not a voter.
+        // **Audit #174/#310 (2026-08-10)**: exit_agent is REGISTERED again —
+        // the exit-side combiner consumes its `ExitDecision3` output.
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
         super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
@@ -429,10 +440,10 @@ mod tests {
         super::super::mixed_adapters::register_mixed_loaders(&mut reg).expect("mixed");
         register_rl_exit_loaders(&mut reg).expect("rl");
         // 7 tree + 3 deep-cls + 7 deep-ts + 8 meta (incl. hmm_regime) +
-        // 3 mixed + 2 rl (dqn + sac) = 30
-        // (swarm_forecaster deferred to D1.2.8;
-        //  3 evolutionary removed in F-319; exit_agent removed in F-318)
-        assert_eq!(reg.registered_names().len(), 30);
+        // 3 mixed + 3 rl (dqn + sac entry, exit_agent exit) = 31
+        // (this PARTIAL registry omits the evolutionary + swarm loaders,
+        //  which live in their own modules — see the note below.)
+        assert_eq!(reg.registered_names().len(), 31);
         for required in [
             "lightgbm",
             "xgboost",
@@ -464,6 +475,7 @@ mod tests {
             "isolation_forest",
             "dqn",
             "sac",
+            "exit_agent",
         ] {
             assert!(
                 reg.has_loader(required),
@@ -474,8 +486,8 @@ mod tests {
         // registers the evolutionary or swarm loaders — those live in
         // `evolution_adapters` / `swarm_adapter` and ARE part of
         // `build_default_registry` since 2026-07-11 (F-319 revision +
-        // D1.2.8). `genetic`/`exit_agent` stay out everywhere.
-        for absent in ["genetic", "neuro_evo", "neat", "exit_agent", "swarm_forecaster"] {
+        // D1.2.8). Only `genetic` stays out everywhere.
+        for absent in ["genetic", "neuro_evo", "neat", "swarm_forecaster"] {
             assert!(
                 !reg.has_loader(absent),
                 "partial registry unexpectedly has loader for '{absent}'"

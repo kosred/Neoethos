@@ -427,8 +427,11 @@ fn log_gate_states(settings: &neoethos_core::Settings) {
         "risk.challenge_mode",
         settings.risk.challenge_mode,
         d.risk.challenge_mode,
-        "prop-firm challenge mode. UNWIRED: domain::risk::RiskManager has no production \
-         constructor, so this arms nothing today — it is retained as recorded intent."
+        "prop-firm challenge mode. WIRED LIVE 2026-08-10 (#137): \
+         domain::risk::RiskManager::from_settings reads it in \
+         neoethos-app live_trading, where it chooses the total-drawdown ANCHOR (the fixed \
+         challenge start vs the running equity peak) and which profit target stops trading. \
+         It still arms nothing in the SEARCH — this line reports it, it does not consume it."
     );
     gate_bool!(
         "risk.max_trades_per_day_enabled",
@@ -571,6 +574,27 @@ pub struct DiscoveryConfig {
     /// search at the aggressive size it exists for.
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
+    /// The THIRD term of the same sizing formula, and the one that decided
+    /// nothing until 2026-08-10 (audit #294):
+    ///
+    /// ```text
+    /// risk_pct = min + (max - min) * min(confidence / high_quality_confidence, 1)
+    /// ```
+    ///
+    /// From `risk.high_quality_confidence`. Its two neighbours were wired on
+    /// 2026-07-21; this one was left behind, so the evaluator kept taking it
+    /// from `BacktestSettings::default()` — 0.65, assigned nowhere outside
+    /// `#[cfg(test)]`. The config default is 0.65 too, which is exactly why it
+    /// went unnoticed: editing the knob moved nothing and looked like it had
+    /// worked.
+    ///
+    /// Always in (0, 1] here: [`Self::from_settings`] REFUSES anything else
+    /// back to 0.65 and logs both numbers. The reason it refuses rather than
+    /// clamps is the shape of the consumer — `risk_based_pos_lots` treats a
+    /// non-finite or non-positive normaliser as "every signal is maximum
+    /// quality", i.e. sizes EVERY trade at `risk_per_trade_max`. A typo would
+    /// silently buy the loosest sizing in the system.
+    pub high_quality_confidence: f64,
     /// Per-mode overrides of the band above, resolved by
     /// [`Self::apply_mode_overrides`]. `None` = inherit the shared band.
     /// Risky and Prop-firm are different products; one shared sizing knob
@@ -673,6 +697,39 @@ pub struct PropFirmGateOverrides {
     pub pass_rate: f64,
 }
 
+/// The shipped `risk.high_quality_confidence`, and the value a refused one
+/// falls back to. Numerically equal to `BacktestSettings::default()`'s field,
+/// which is what the evaluator used for the whole time this knob reached
+/// nothing (audit #294).
+pub(crate) const DEFAULT_HIGH_QUALITY_CONFIDENCE: f64 = 0.65;
+
+/// Resolve `risk.high_quality_confidence` for the search, REFUSING a value the
+/// sizing math would turn into "size everything at the maximum".
+///
+/// The consumer (`eval::risk_based_pos_lots`, and the identical branch in every
+/// GPU kernel) computes `min(confidence / hq, 1.0)` and, when `hq` is not
+/// finite-and-positive, substitutes 1.0 — i.e. treats every signal as maximum
+/// quality and sizes every trade at `risk_per_trade_max`. That is the LOOSEST
+/// outcome in the system, and before this knob was wired it could only be
+/// reached by editing code. Now that a config value flows, a typo could buy it,
+/// so a value outside (0, 1] is refused back to the shipped default and BOTH
+/// numbers are logged: silently clamping would hide which number ran.
+fn resolve_high_quality_confidence(configured: f64) -> f64 {
+    if configured.is_finite() && configured > 0.0 && configured <= 1.0 {
+        return configured;
+    }
+    tracing::warn!(
+        target: "neoethos_search::discovery",
+        configured,
+        used = DEFAULT_HIGH_QUALITY_CONFIDENCE,
+        "risk.high_quality_confidence must be in (0, 1] — it is the confidence at which a \
+         trade is sized at risk.max_risk_per_trade. REFUSED back to the default; the \
+         configured value would have made the sizing treat EVERY signal as maximum quality \
+         and size every trade at the maximum"
+    );
+    DEFAULT_HIGH_QUALITY_CONFIDENCE
+}
+
 /// Resolve one trading mode's per-trade risk band from its config pair.
 ///
 /// A band counts as SET only when a positive, finite max is given; the min
@@ -762,6 +819,12 @@ impl Default for DiscoveryConfig {
             // DiscoveryConfig::default() behaves exactly as before.
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
+            // Same rule: `BacktestSettings::default()` and `RiskConfig::default()`
+            // both say 0.65, so a config-less DiscoveryConfig sizes identically
+            // to before the wire. Kept in lockstep by
+            // `discovery_tests::risk_band_is_clamped_and_ordered`, which now
+            // asserts all THREE sizing inputs against `BacktestSettings::default()`.
+            high_quality_confidence: DEFAULT_HIGH_QUALITY_CONFIDENCE,
             // Decision default (2026-08-09): the Risky 30% ceiling is operator
             // intent, so the config-less fallback carries the same band as
             // `from_settings` derives from `risk.risky_max_risk_per_trade`
@@ -913,58 +976,112 @@ impl DiscoveryConfig {
              it once per closed trade"
         );
 
-        // The session-spread curve. `Err` is a partial / malformed curve and is
-        // refused rather than repaired: a cost model configured for two of the
-        // three UTC buckets charges an unchosen number for a third of every
-        // trading day. `Ok(None)` is the shipped state and gets a WARN naming
-        // what it costs, because the curve existing-but-never-populated is the
-        // exact defect this field was added to end.
-        let session_spread_pips: Option<[f64; 3]> = match settings.risk.session_spread_pips() {
-            Ok(Some(curve)) => {
-                let slip = settings.risk.slippage_pips.max(0.0);
-                // Slippage rides on each bucket exactly as it rides on the flat
-                // `evaluation_spread_pips` below, so the two paths charge the
-                // same thing when the curve is uniform.
-                let with_slip = [curve[0] + slip, curve[1] + slip, curve[2] + slip];
-                tracing::info!(
-                    target: "neoethos_search::cost_model",
-                    symbol = %symbol,
-                    asian_pips = with_slip[0],
-                    overlap_pips = with_slip[1],
-                    late_ny_pips = with_slip[2],
-                    slippage_pips = slip,
-                    "session spread curve ACTIVE — spread is now resolved per bar from its \
-                     UTC hour on the CPU path and in the CUDA kernel alike"
-                );
-                Some(with_slip)
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    target: "neoethos_search::cost_model",
-                    symbol = %symbol,
-                    flat_spread_pips = settings.risk.backtest_spread_pips.max(0.0)
-                        + settings.risk.slippage_pips.max(0.0),
-                    "no session spread curve configured — a FLAT spread is charged at 03:00 \
-                     Tokyo and at the London open alike. The per-bar lookup exists on both the \
-                     CPU path and the CUDA kernel and is simply unpopulated. Measure your \
-                     broker's per-hour spread and set risk.backtest_spread_pips_{{asian,\
-                     overlap,late_ny}}. Until then, any result that depends on WHEN it trades \
-                     is measured at the wrong cost."
-                );
-                None
-            }
-            Err(reason) => {
-                // Not a panic and not a silent flat fall-back: the run continues
-                // on the flat spread, but the operator is told their curve was
-                // rejected and why, in the same words the config doc uses.
-                tracing::error!(
-                    target: "neoethos_search::cost_model",
-                    symbol = %symbol,
-                    reason = %reason,
-                    "session spread curve REFUSED — falling back to the flat spread. Fix the \
-                     three risk.backtest_spread_pips_* keys or remove all three."
-                );
-                None
+        // The session-spread curve, resolved PER SYMBOL (#69, 2026-08-10).
+        //
+        // It used to be ONE GLOBAL TRIPLE — `risk.backtest_spread_pips_{asian,
+        // overlap,late_ny}` — while the broker's own recorded curve spans
+        // EURUSD ≈ 0.16 pips to GBPTRY ≈ 552. A single triple is not a cost
+        // model, it is one symbol's cost charged to every symbol, so the three
+        // keys are deleted and `RiskConfig::session_spread_pips(symbol, data_dir)`
+        // is the single resolution point.
+        //
+        // Four outcomes, all said out loud, none of them a guess:
+        //   Flat              — configured flat; WARN what that costs.
+        //   Curve             — this symbol's curve, with its source and (when
+        //                       measured) the tick count behind each bucket.
+        //   NoCurveForSymbol  — the source has no measurement for THIS symbol.
+        //                       The flat spread is charged, which at the shipped
+        //                       1.5 pips is the MORE expensive number, and the
+        //                       symbol and the file are named. Absent is
+        //                       correct; invented is not.
+        //   Err               — a configuration fault (a map nothing reads, an
+        //                       unusable number, an unreadable stats file). The
+        //                       run continues on the flat spread and says so at
+        //                       ERROR.
+        let session_spread_pips: Option<[f64; 3]> = {
+            let slip = settings.risk.slippage_pips.max(0.0);
+            let flat_total =
+                settings.risk.backtest_spread_pips.max(0.0) + settings.risk.slippage_pips.max(0.0);
+            match settings
+                .risk
+                .session_spread_pips(&symbol, &settings.system.data_dir)
+            {
+                Ok(neoethos_core::config::SessionSpreadDecision::Curve {
+                    pips,
+                    source,
+                    samples,
+                }) => {
+                    // Slippage rides on each bucket exactly as it rides on the
+                    // flat `evaluation_spread_pips` below, so the two paths
+                    // charge the same thing when the curve is uniform.
+                    let with_slip = [pips[0] + slip, pips[1] + slip, pips[2] + slip];
+                    tracing::info!(
+                        target: "neoethos_search::cost_model",
+                        symbol = %symbol,
+                        source = ?source,
+                        asian_pips = with_slip[0],
+                        overlap_pips = with_slip[1],
+                        late_ny_pips = with_slip[2],
+                        asian_samples = samples.map(|s| s[0]).unwrap_or(0),
+                        overlap_samples = samples.map(|s| s[1]).unwrap_or(0),
+                        late_ny_samples = samples.map(|s| s[2]).unwrap_or(0),
+                        slippage_pips = slip,
+                        flat_spread_pips_not_charged = flat_total,
+                        "session spread curve ACTIVE for THIS symbol — spread is resolved per \
+                         bar from its UTC hour on the CPU path and in the CUDA kernel alike. \
+                         This is CHEAPER than the flat spread whenever the measured curve is \
+                         tighter, so it changes which strategies rank"
+                    );
+                    Some(with_slip)
+                }
+                Ok(neoethos_core::config::SessionSpreadDecision::Flat) => {
+                    tracing::warn!(
+                        target: "neoethos_search::cost_model",
+                        symbol = %symbol,
+                        flat_spread_pips = flat_total,
+                        "no session spread curve configured — a FLAT spread is charged at 03:00 \
+                         Tokyo and at the London open alike. The per-bar lookup exists on both \
+                         the CPU path and the CUDA kernel and is simply unpopulated. Set \
+                         risk.session_spread_source: measured to price this symbol from the \
+                         broker's OWN recorded ticks. Until then, any result that depends on \
+                         WHEN it trades is measured at the wrong cost."
+                    );
+                    None
+                }
+                Ok(neoethos_core::config::SessionSpreadDecision::NoCurveForSymbol {
+                    symbol: missing,
+                    source,
+                    detail,
+                }) => {
+                    tracing::error!(
+                        target: "neoethos_search::cost_model",
+                        symbol = %missing,
+                        source = ?source,
+                        detail = %detail,
+                        flat_spread_pips = flat_total,
+                        "NO SESSION SPREAD MEASURED FOR THIS SYMBOL. A curve was asked for and \
+                         this symbol has none, so the flat spread is charged and nothing was \
+                         invented for it. Every other symbol in this run may be priced from its \
+                         own measured curve while this one is not — compare their results \
+                         knowing that."
+                    );
+                    None
+                }
+                Err(reason) => {
+                    // Not a panic and not a silent flat fall-back: the run
+                    // continues on the flat spread, but the operator is told
+                    // their configuration was rejected and why.
+                    tracing::error!(
+                        target: "neoethos_search::cost_model",
+                        symbol = %symbol,
+                        reason = %reason,
+                        flat_spread_pips = flat_total,
+                        "session spread configuration REFUSED — falling back to the flat \
+                         spread. Fix risk.session_spread_source / \
+                         risk.session_spread_pips_by_symbol."
+                    );
+                    None
+                }
             }
         };
 
@@ -1027,6 +1144,54 @@ impl DiscoveryConfig {
         // key that has been telling the truth in the log for a run or two is
         // safe to remove, a key removed while it still looked live is not.
         resolve_and_log_duplicate_knobs(settings);
+
+        // ── #265: WHERE THE BALANCE STILL LEAKS INTO THE RANKING ─────────────
+        //
+        // With one balance (above), the risk-based lane is scale-invariant by
+        // construction: `pos_lots = risk_pct × equity / (sl × pip_value_per_lot)`,
+        // so every PnL, cost and carry term scales with equity and
+        // `net_profit / initial_equity` is the same number whether the account
+        // is 100 or 100 000. That is the property that makes demo and live rank
+        // strategies identically, which is the whole point of the decision.
+        //
+        // TWO places break it, both in `eval.rs`, both OUTSIDE this change:
+        //
+        //   1. `risk_based_pos_lots` ends with `pos_lots.clamp(0.0, 100.0)` — an
+        //      ABSOLUTE lot cap inside a fraction-of-equity formula. Above the
+        //      equity printed below, the position stops growing with the account
+        //      and the compounding curve is truncated, so the same strategy
+        //      scores differently on a big account than on a small one.
+        //   2. The GA population lanes and the walk-forward lane force
+        //      `risk_based_sizing = false` (fixed 1 lot). With a fixed lot,
+        //      `net_return_pct` is (fixed dollars / balance) and is therefore
+        //      NOT scale-invariant at all — halving the account doubles every
+        //      percentage those lanes report.
+        //
+        // Neither is repaired here, because both change what the search admits
+        // and neither can be measured from a config read. They are PRINTED, with
+        // the exact equity at which (1) starts to bite, so nobody has to
+        // rediscover why a 100 → 50 000 growth run stops compounding.
+        {
+            let risk_pct = settings.risk.max_risk_per_trade.max(1e-9);
+            // equity at which pos_lots would exceed the hardcoded 100-lot cap,
+            // per unit of (sl_pips × pip_value_per_lot). Multiply by the real
+            // sl × pip value for the symbol to get the account size.
+            let clamp_equity_per_unit = 100.0 / risk_pct;
+            tracing::info!(
+                target: "neoethos_search::cost_model",
+                account_balance = settings.risk.initial_balance,
+                max_risk_per_trade = risk_pct,
+                lot_clamp = 100.0,
+                clamp_binds_above_equity_per_sl_pip_value = clamp_equity_per_unit,
+                "SCALE INVARIANCE (#265). One balance now drives both the equity curve and the \
+                 prop-firm / regime gates, so the risk-sized lane ranks a strategy the same on \
+                 any account size. Two residual leaks, both in eval.rs and both unchanged here: \
+                 the hardcoded 100-lot clamp in risk_based_pos_lots (binds above \
+                 clamp_binds_above_equity_per_sl_pip_value x sl_pips x pip_value_per_lot), and \
+                 the fixed-1-lot lanes (GA population, walk-forward) whose percentage returns \
+                 are inversely proportional to the balance"
+            );
+        }
 
         // ── GATE STATE, AND WHERE IT CAME FROM ───────────────────────────────
         //
@@ -1121,6 +1286,19 @@ impl DiscoveryConfig {
             // raw YAML, not one careless click).
             max_pbo: 0.5,
             filtering,
+            // #265 — THE SAME BALANCE the evaluator compounds from.
+            //
+            // This field is the denominator of the prop-firm rule summary
+            // (`compute_prop_firm_risk_summary`), the walk-forward daily-loss
+            // gate and `validate_regime_robustness`'s absolute loss limit. Until
+            // 2026-08-10 it read `risk.initial_balance` (10 000) while
+            // `fast_evaluate_strategy_core` compounded the SAME trade stream
+            // from `models.backtest_runtime.initial_equity` (100 000): two
+            // denominators over one set of PnLs, so those three gates measured
+            // every loss as ten times its share of equity. That second key is
+            // now deleted and `BacktestRuntimeOverrides::from_settings` reads
+            // this same field, so both sides divide by the account —which at
+            // demo/live time is the balance the broker reports.
             initial_balance: settings.risk.initial_balance.max(1.0),
             // The operator's own risk band now reaches the search. Clamped to
             // a sane [0, 100%] and ordered so a mis-set min can never exceed
@@ -1130,6 +1308,11 @@ impl DiscoveryConfig {
                 .risk
                 .max_risk_per_trade
                 .clamp(settings.risk.min_risk_per_trade.clamp(0.0, 1.0), 1.0),
+            // #294 — the third term of the same formula, finally on the same
+            // wire as the two above.
+            high_quality_confidence: resolve_high_quality_confidence(
+                settings.risk.high_quality_confidence,
+            ),
             risky_risk_band: resolve_mode_risk_band(
                 settings.risk.risky_min_risk_per_trade,
                 settings.risk.risky_max_risk_per_trade,
@@ -1762,6 +1945,11 @@ pub struct DiscoveryRunProfile {
     pub initial_balance: f64,
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
+    /// Confidence at which a trade was sized at `risk_per_trade_max` — the
+    /// third term of the sizing formula, RESOLVED (a refused config value is
+    /// recorded as the 0.65 that actually ran, not as what was typed). Two
+    /// runs that differ on it sized differently and are not comparable.
+    pub high_quality_confidence: f64,
     pub risky_risk_band: Option<(f64, f64)>,
     pub prop_firm_risk_band: Option<(f64, f64)>,
     pub max_regime_loss_pct: f64,
@@ -2137,6 +2325,11 @@ fn discovery_backtest_settings(
         kill_zones_enabled: config.kill_zones_enabled,
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
+        // #294. This was inherited from `BacktestSettings::default()` by the
+        // `..` below — the third term of the sizing formula arriving by a
+        // different route from the two above it, which is how the operator's
+        // `risk.high_quality_confidence` changed nothing for months.
+        high_quality_confidence: config.high_quality_confidence,
         ..crate::eval::BacktestSettings::default()
     }
 }
@@ -8898,9 +9091,9 @@ where
                     "PER-SESSION EXPOSURE at an UNPRICED spread. Every one of these trades was \
                      charged the same flat spread regardless of the hour. The Asian share is \
                      the part of this run's result that depends on a cost nobody measured. \
-                     Fix: average the hourly means already recorded in spread_stats.json over \
-                     22-07 / 07-16 / 16-22 UTC into risk.backtest_spread_pips_{{asian,overlap,\
-                     late_ny}}."
+                     Fix: set risk.session_spread_source: measured — the hourly means are \
+                     already recorded per symbol in <data_dir>/spread_stats.json and are \
+                     sample-weighted over 22-07 / 07-16 / 16-22 UTC for THIS symbol."
                 );
             } else {
                 tracing::info!(
@@ -10657,6 +10850,7 @@ pub fn build_discovery_profile(
         initial_balance,
         risk_per_trade_min,
         risk_per_trade_max,
+        high_quality_confidence,
         risky_risk_band,
         prop_firm_risk_band,
         max_regime_loss_pct,
@@ -10804,6 +10998,7 @@ pub fn build_discovery_profile(
         initial_balance: *initial_balance,
         risk_per_trade_min: *risk_per_trade_min,
         risk_per_trade_max: *risk_per_trade_max,
+        high_quality_confidence: *high_quality_confidence,
         risky_risk_band: *risky_risk_band,
         prop_firm_risk_band: *prop_firm_risk_band,
         max_regime_loss_pct: *max_regime_loss_pct,

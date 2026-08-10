@@ -884,19 +884,16 @@ fn build_catalog() -> Vec<KnobEntry> {
         },
 
         // ── Section 6 — Backtest runtime ───────────────────────────────
-        KnobEntry {
-            id: "backtest.initial_equity",
-            section: "Backtest runtime",
-            label: "Initial equity",
-            kind: KnobKind::Float { min: Some(100.0), max: Some(10_000_000.0) },
-            default: "100000.0",
-            current: format!("{}", neoethos_search::current_backtest_runtime_overrides().initial_equity),
-            help_short: "Starting equity for the backtest simulation, independent of any live account.",
-            help_long: "100k USD is the prop-firm baseline (most challenges fund at $100k). Use 10k for a smaller-account stress test, or 1M to see how compounding scales.",
-            preset_conservative: "100000.0",
-            preset_balanced: "100000.0",
-            preset_aggressive: "100000.0",
-        },
+        //
+        // `backtest.initial_equity` was REMOVED here on 2026-08-10 (#265). It
+        // offered a SECOND starting balance — shipped at 100 000 while the
+        // account was 10 000 — and it was the denominator of every percentage
+        // the search ranks on, so this screen let an operator change what
+        // "net return %" means without touching the account he trades. The key
+        // it wrote (`models.backtest_runtime.initial_equity`) is deleted; the
+        // one balance is `risk.initial_balance`, which at demo/live time is the
+        // broker's own account balance, and it is surfaced by the Risk screen.
+        // Do not add a backtest-side twin back.
         KnobEntry {
             id: "backtest.max_month_buckets",
             section: "Backtest runtime",

@@ -421,7 +421,9 @@ pub fn materialise(
 
     money_path_audit(&reference, &cfg)
         .map_err(|violations| ProposalRefused::MoneyPath { violations })?;
-    verify_applied(proposal, &cfg)?;
+    let spec_plan = proposal.axis_a.streaming_plan();
+    let spec_cursor = proposal.axis_a.cursor_policy();
+    verify_applied(proposal, &cfg, &spec_plan, spec_cursor)?;
 
     // THE CONFIG-IDENTITY GATE. A floor above what this configuration's own
     // geometry can produce is a run whose answer is fixed before a bar is read.
@@ -465,7 +467,12 @@ pub fn materialise(
 /// Prove, field by field, that the resolved config carries what the proposal
 /// declared. Anything downstream that overwrote a proposed value shows up here
 /// as a refusal instead of as a sweep whose label and content disagree.
-fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), ProposalRefused> {
+fn verify_applied(
+    proposal: &Proposal,
+    cfg: &DiscoveryConfig,
+    plan: &StreamingPlan,
+    cursor: CursorPolicy,
+) -> Result<(), ProposalRefused> {
     macro_rules! want {
         ($field:literal, $expected:expr, $actual:expr) => {
             if $expected != $actual {
@@ -500,6 +507,16 @@ fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), Prop
     let (psize, corr) = a.portfolio_shape();
     want!("portfolio_size", psize, cfg.portfolio_size);
     want!("corr_threshold", corr, cfg.corr_threshold);
+
+    // The streaming plan is not a `DiscoveryConfig` field, and until 2026-08-10
+    // that meant these two were the only factors whose application was never
+    // proven — a sweep could be labelled `streaming_batches=12` while the plan
+    // handed to the runner said something else, and nothing would notice. They
+    // are proven here against the same source the spec is built from, so the
+    // label and the plan cannot disagree.
+    want!("streaming_plan.max_batches", a.streaming_plan().max_batches, plan.max_batches);
+    want!("streaming_plan.enabled", a.streaming_plan().enabled, plan.enabled);
+    want!("streaming_plan.start_cursor", a.cursor_policy(), cursor);
 
     let r = proposal.refusals();
     want!(
@@ -910,4 +927,59 @@ mod tests {
             assert_ne!(base.key(), other.key(), "{} is invisible to ProposalKey", d.label());
         }
     }
+}
+
+#[cfg(test)]
+mod applied_coverage_tests {
+    use crate::space::FactorId;
+
+    /// Every field an axis-A factor declares it writes must be PROVEN applied.
+    ///
+    /// `verify_applied` is the promise that a sweep's label and its content
+    /// agree. That promise is only worth the fields it actually checks, and
+    /// nothing tied the two lists together — so a factor added tomorrow could
+    /// declare a field, never be verified, and produce sweeps whose recorded
+    /// configuration is fiction. The loop's entire output is an attribution of
+    /// outcomes to configurations; an unapplied knob does not make it noisier,
+    /// it makes it WRONG, and confidently so.
+    ///
+    /// Read from the source rather than a hand-kept list, for the same reason
+    /// `config_has_recipient` does: a list someone must remember to update is a
+    /// list that goes stale.
+    #[test]
+    fn every_field_a_factor_writes_is_proven_applied() {
+        let src = include_str!("proposal.rs");
+        let checked: Vec<&str> = src
+            .match_indices("want!(")
+            .filter_map(|(i, _)| {
+                let rest = &src[i + "want!(".len()..];
+                let rest = rest.trim_start();
+                let rest = rest.strip_prefix('"')?;
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect();
+        assert!(
+            checked.len() >= 12,
+            "the want!() scan found only {} fields; the parser is broken and this test would \
+             pass vacuously",
+            checked.len()
+        );
+
+        let mut unproven = Vec::new();
+        for f in FactorId::ALL {
+            for field in f.writes() {
+                if checked.contains(field) {
+                    continue;
+                }
+                unproven.push(format!("{} writes `{field}`", f.label()));
+            }
+        }
+        assert!(
+            unproven.is_empty(),
+            "these axis-A factors declare a field that verify_applied never proves was \
+             applied, so a sweep could be labelled with a configuration it did not run:\n  {}",
+            unproven.join("\n  ")
+        );
+    }
+
 }

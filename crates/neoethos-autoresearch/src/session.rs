@@ -1213,6 +1213,33 @@ impl Session {
         self.blocks.iter().filter(|b| b.indistinguishable).count()
     }
 
+    /// Searches the judge actually reached a verdict on — `Passed` or `Failed`,
+    /// never `Unavailable`.
+    ///
+    /// This is the denominator that lets silence mean something. "Nothing beat
+    /// the bar" is a refutation only if the searches RAN and were judged; if
+    /// they never ran, or ran and could not be read, the same silence is a
+    /// wiring finding and says nothing about the market. `Unavailable` is
+    /// excluded for exactly that reason — it means the null was not ready, so
+    /// the judge declined to rule rather than ruling against.
+    ///
+    /// Used by R2's U2 condition, which before 2026-08-10 could not tell the
+    /// two apart and therefore refused to conclude anything at all — leaving a
+    /// no-signal session running until its budget ran out.
+    pub fn screens_evaluated(&self) -> usize {
+        self.screens
+            .values()
+            .flatten()
+            .filter(|s| {
+                matches!(
+                    s,
+                    crate::judge::ScreenResult::Passed { .. }
+                        | crate::judge::ScreenResult::Failed { .. }
+                )
+            })
+            .count()
+    }
+
     /// The proposals of a sweep, in draw order — what the shuffle control
     /// re-runs byte for byte.
     pub fn proposals_of(&self, sweep: SweepId) -> Option<&[crate::proposal::Proposal]> {

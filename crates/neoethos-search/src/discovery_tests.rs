@@ -2044,6 +2044,60 @@ fn operator_risk_band_reaches_the_discovery_backtest() {
     assert!((settings_out.risk_per_trade_min - 0.05).abs() < 1e-12);
 }
 
+/// #294 — the THIRD term of the same formula, wired 2026-08-10.
+///
+/// `risk.high_quality_confidence` had no consumer: the evaluator read
+/// `BacktestSettings::high_quality_confidence`, which defaulted to 0.65 and was
+/// assigned nowhere outside `#[cfg(test)]`. The config default is 0.65 too, so
+/// editing the knob moved nothing and looked like it had worked. This test
+/// moves it OFF the default in both directions so agreement-by-luck cannot
+/// pass it.
+#[test]
+fn operator_high_quality_confidence_reaches_the_discovery_backtest() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.high_quality_confidence = 0.40;
+
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert!(
+        (config.high_quality_confidence - 0.40).abs() < 1e-12,
+        "the operator's value must reach DiscoveryConfig, got {}",
+        config.high_quality_confidence
+    );
+
+    let gene = Gene {
+        sl_pips: 20.0,
+        tp_pips: 40.0,
+        ..Default::default()
+    };
+    let settings_out = PopulationTemplateResolver::new(&config, Some(1.25)).template(&gene);
+    assert!(
+        (settings_out.high_quality_confidence - 0.40).abs() < 1e-12,
+        "the backtest must normalise confidence against the operator's 0.40, got {}",
+        settings_out.high_quality_confidence
+    );
+}
+
+/// A `high_quality_confidence` outside (0, 1] is REFUSED, not obeyed and not
+/// silently clamped.
+///
+/// The consumer treats a non-finite or non-positive normaliser as "every signal
+/// is maximum quality" and sizes EVERY trade at `risk_per_trade_max` — the
+/// loosest outcome in the system. Before this knob was wired that was
+/// unreachable from config; now that a value flows, a typo must not buy it.
+#[test]
+fn an_out_of_range_high_quality_confidence_is_refused_to_the_default() {
+    for bad in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+        let mut settings = neoethos_core::Settings::default();
+        settings.risk.high_quality_confidence = bad;
+        let config = DiscoveryConfig::from_settings(&settings);
+        assert!(
+            (config.high_quality_confidence - 0.65).abs() < 1e-12,
+            "high_quality_confidence = {bad} must be refused back to 0.65, got {}",
+            config.high_quality_confidence
+        );
+    }
+}
+
 /// SLICE-2 GUARD (2026-08-08). The raw builder `discovery_backtest_settings`
 /// leaves the adaptive-stop fields at fixed defaults; 9 of its 13 former call
 /// sites — including the quality screen — therefore backtested adaptive genes
@@ -2172,6 +2226,19 @@ fn risk_band_is_clamped_and_ordered() {
     let d = DiscoveryConfig::default();
     assert!((d.risk_per_trade_min - 0.005).abs() < 1e-12);
     assert!((d.risk_per_trade_max - 0.03).abs() < 1e-12);
+    // …and so does the third term (#294). All three sizing inputs must match
+    // `BacktestSettings::default()` on a config-less DiscoveryConfig, or
+    // wiring one of them silently moved the size of every trade in a bare run.
+    let b = crate::eval::BacktestSettings::default();
+    assert!((d.risk_per_trade_min - b.risk_per_trade_min).abs() < 1e-12);
+    assert!((d.risk_per_trade_max - b.risk_per_trade_max).abs() < 1e-12);
+    assert!(
+        (d.high_quality_confidence - b.high_quality_confidence).abs() < 1e-12,
+        "DiscoveryConfig::default() and BacktestSettings::default() must agree on \
+         high_quality_confidence; got {} vs {}",
+        d.high_quality_confidence,
+        b.high_quality_confidence
+    );
 }
 
 /// Risky and Prop-firm must NOT share one sizing knob. Before 2026-07-21 they
@@ -3179,6 +3246,46 @@ fn redact_fields(rendered: &str, fields: &[&str]) -> String {
         idx += 1;
     }
     out.join("\n")
+}
+
+/// #265 — THE regression test: the search has exactly ONE starting balance,
+/// and it is the account.
+///
+/// Two denominators over one trade stream is not a safety margin, it is
+/// arithmetic error: until 2026-08-10 the equity curve compounded from
+/// `models.backtest_runtime.initial_equity` (100 000) while the prop-firm rule
+/// summary, the walk-forward daily-loss gate and `validate_regime_robustness`
+/// divided the SAME PnLs by `risk.initial_balance` (10 000), so those three
+/// gates saw every loss as ten times its true share of equity.
+///
+/// If this ever fails, someone has reintroduced a second balance. That is the
+/// bug, not the test.
+#[test]
+fn the_search_has_exactly_one_starting_balance_and_it_is_the_account() {
+    let mut settings = neoethos_core::Settings::default();
+    // A value that is neither of the two historical constants, so a
+    // reintroduced 10 000 or 100 000 cannot pass by coincidence.
+    settings.risk.initial_balance = 37_500.0;
+
+    let gates = DiscoveryConfig::from_settings(&settings).initial_balance;
+    let curve = crate::eval::BacktestRuntimeOverrides::from_settings(&settings).initial_equity;
+
+    assert!(
+        (gates - 37_500.0).abs() < 1e-9,
+        "the prop-firm / regime / walk-forward gates must divide by the ACCOUNT \
+         (risk.initial_balance = 37500), got {gates}"
+    );
+    assert!(
+        (curve - 37_500.0).abs() < 1e-9,
+        "the equity curve every ranked percentage is computed against must be the ACCOUNT \
+         (risk.initial_balance = 37500), got {curve}"
+    );
+    assert!(
+        (gates - curve).abs() < 1e-9,
+        "the gates divide by {gates} and the equity curve compounds from {curve}. One trade \
+         stream, two denominators — every drawdown and daily-loss percentage those gates \
+         measure is wrong by the ratio between them."
+    );
 }
 
 #[test]

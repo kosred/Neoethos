@@ -231,6 +231,12 @@ pub const MONEY_PATH_FIELDS: &[&str] = &[
     "initial_balance",
     "risk_per_trade_min",
     "risk_per_trade_max",
+    // #294 (2026-08-10). The third term of the sizing formula reached the
+    // evaluator for the first time on that date; before it, it was a config
+    // value with no consumer and there was nothing here to freeze. It decides
+    // how fast a trade grows to `risk_per_trade_max`, so it belongs beside its
+    // two neighbours: a loop that could lower it would be sizing bigger.
+    "high_quality_confidence",
     "risky_risk_band",
     "prop_firm_risk_band",
     "risky_start_balance",
@@ -284,6 +290,12 @@ pub const FROZEN_FIELDS: &[&str] = &[
     "initial_balance",
     "risk_per_trade_min",
     "risk_per_trade_max",
+    // #294 (2026-08-10). The third term of the sizing formula reached the
+    // evaluator for the first time on that date; before it, it was a config
+    // value with no consumer and there was nothing here to freeze. It decides
+    // how fast a trade grows to `risk_per_trade_max`, so it belongs beside its
+    // two neighbours: a loop that could lower it would be sizing bigger.
+    "high_quality_confidence",
     "risky_risk_band",
     "prop_firm_risk_band",
     "risky_start_balance",
@@ -393,6 +405,11 @@ pub fn money_path_audit(
     cmpf!("initial_balance", reference.initial_balance, proposed.initial_balance);
     cmpf!("risk_per_trade_min", reference.risk_per_trade_min, proposed.risk_per_trade_min);
     cmpf!("risk_per_trade_max", reference.risk_per_trade_max, proposed.risk_per_trade_max);
+    cmpf!(
+        "high_quality_confidence",
+        reference.high_quality_confidence,
+        proposed.high_quality_confidence
+    );
     cmp!(
         "risky_risk_band",
         reference.risky_risk_band.map(|(a, b)| (a.to_bits(), b.to_bits())),

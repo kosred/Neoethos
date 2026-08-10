@@ -25,7 +25,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Named prop-firm preset. Drives the default values in `RiskConfig`,
-/// `PropFirmRules`, and the discovery-side challenge gate. The runtime
+/// `domain::risk::RiskManager`, and the discovery-side challenge gate. (The
+/// `PropFirmRules` struct that used to be named here was deleted 2026-08-10
+/// with audit #137 — `RiskManager::from_settings` resolves those thresholds
+/// from `Settings` plus this preset instead.) The runtime
 /// itself is firm-agnostic — it just reads numeric thresholds from
 /// whichever preset is active.
 ///

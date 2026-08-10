@@ -72,9 +72,11 @@
 //! Q-values). The trait normalises on [`ExpertPrediction`] which
 //! carries an [`ExpertOutputKind`] tag plus the native values; the
 //! aggregating [`EnsemblePredictor`] decides how to combine them:
-//! - `SoftVotingEnsemble` (D1.3) only averages
-//!   `Classification3` and `ActionValues3` outputs (the others
-//!   sit unused for naive voting).
+//! - `SoftVotingEnsemble` (D1.3) runs TWO combiners in one pass:
+//!   the direction vote over `Classification3` experts, and — since
+//!   audit #174/#310 (2026-08-10) — the exit-side close vote over
+//!   `ExitDecision3` experts, landing in [`EnsembleDecision::exit`].
+//!   `Forecast1` / `AnomalyScore` producers still sit outside both.
 //! - `MoeEnsemble` (D1.6) feeds the heterogeneous outputs to its
 //!   gating network as features and combines them learnt-fashion.
 
@@ -122,7 +124,7 @@ pub mod swarm_adapter;
 pub mod tree_adapters;
 
 pub use bootstrap::{
-    DEFAULT_BOOTSTRAP_EXPERT_NAMES, build_default_registry, build_ensemble_for_symbol,
+    DEFAULT_BOOTSTRAP_EXPERT_NAMES, ExitCensus, build_default_registry, build_ensemble_for_symbol,
     load_experts_for_symbol,
 };
 pub use deep_classification_adapters::{
@@ -203,9 +205,15 @@ pub enum ExpertOutputKind {
     /// SHAPE-COMPATIBLE with [`Self::Classification3`] but
     /// SEMANTICALLY DIFFERENT: this is "should I close my open
     /// position?" not "should I open a new long/short?".
-    /// Aggregators that vote on trade DIRECTION (SoftVoting, MoE
-    /// classifier-head) ignore it; the exit-side pipeline (which
-    /// closes existing positions on signal) consumes it directly.
+    ///
+    /// **2026-08-10 (audit #174 + #310, operator decision "CONNECT IT,
+    /// visible even in the back/forward test process").** These outputs are
+    /// no longer dropped. They are combined by the EXIT-SIDE chain — a
+    /// second combiner with its own roles ([`ExitRole`]) and its own gate
+    /// ([`ExitOpinion::keep_fraction`]) — that runs in the same pass as the
+    /// direction vote and lands in [`EnsembleDecision::exit`]. They are
+    /// still kept OUT of the direction vote: mixing an exit opinion into an
+    /// entry-direction average would blend two different axes.
     ExitDecision3,
 }
 
@@ -312,15 +320,104 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
     }
 }
 
+/// The role an expert plays in the EXIT-side combiner
+/// ([`super::soft_voting::SoftVotingEnsemble::predict_with_roles`], second
+/// pass). Deliberately a SEPARATE enum from [`ExpertRole`]: an expert cannot
+/// hold a direction role and an exit role at once, and a compile error is the
+/// only reliable way to stop a future edit from feeding one axis into the
+/// other.
+///
+/// **Audit #174 + #310 (2026-08-10).** Before this, every
+/// [`ExpertOutputKind::ExitDecision3`] output was dropped by a bare `continue`
+/// in the direction combiner, so `exit_agent` trained on every run and NO RL
+/// EXIT OUTPUT HAD EVER REACHED A TRADE. The operator's decision was "CONNECT
+/// IT" — with its own chain, not by removing the `continue`, which would have
+/// mixed exit opinions into the entry-direction vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitRole {
+    /// Genuine exit-decision expert: contributes to the close vote. Today the
+    /// only member is `exit_agent`. A second exit policy (an exit-side SAC,
+    /// say) joins here by adding its name to [`exit_expert_role`].
+    CloseVote,
+}
+
+/// Canonical expert-name -> EXIT role map, the exit-side twin of
+/// [`expert_role`]. Declared in ONE place so a future exit expert cannot
+/// silently fall into no chain at all — the combiner FAILS LOUD on a loaded
+/// `ExitDecision3` expert with no mapping.
+///
+/// Returns `None` for an unmapped name (the caller decides whether to bail).
+pub fn exit_expert_role(name: &str) -> Option<ExitRole> {
+    // Replica dirs (`exit_agent_01`, `exit_agent_02`, …) inherit the canonical
+    // model's role, exactly as `expert_role` does for `transformer_NN`.
+    let canonical = match name.strip_prefix("exit_agent_") {
+        Some(suffix) if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) => {
+            "exit_agent"
+        }
+        _ => name,
+    };
+    match canonical {
+        "exit_agent" => Some(ExitRole::CloseVote),
+        _ => None,
+    }
+}
+
+/// Per-row output of the EXIT-side combiner: what the exit experts think of an
+/// ALREADY-OPEN position on this bar.
+///
+/// **This structure can only reduce exposure.** [`Self::keep_fraction`] is a
+/// bounded `[0,1]` multiplier on the position a consumer is already holding —
+/// there is no arm that returns more than 1.0, so an exit opinion can bring an
+/// exit FORWARD and can never postpone one, enlarge a position, or open one.
+/// That asymmetry is the exit-side twin of the direction chain's "ML can only
+/// shrink or veto" invariant, and it is what makes wiring this chain a SAFER
+/// change rather than a looser one.
+///
+/// There is deliberately NO threshold knob here. "Close above p = x" is a
+/// policy the position-holding consumer owns; inventing a number in the model
+/// crate would be a second, hidden resolution point for a money decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExitOpinion {
+    /// `[p_hold, p_neutral, p_close]` — the weighted average over the loaded
+    /// [`ExitRole::CloseVote`] experts. Same shape as
+    /// [`ExpertOutputKind::Classification3`], different axis entirely.
+    pub close_probs: [f32; 3],
+    /// How many exit experts actually contributed to this row. Never 0 — a row
+    /// with no contributor is reported as [`EnsembleDecision::exit`] `= None`
+    /// rather than as a neutral-looking `[1/3, 1/3, 1/3]`, because an
+    /// abstention that reads like an opinion is exactly the ambiguous sentinel
+    /// this codebase keeps getting bitten by.
+    pub voters: u16,
+}
+
+impl ExitOpinion {
+    /// Probability mass on CLOSE — the raw exit pressure, `[0,1]`.
+    pub fn close_pressure(&self) -> f32 {
+        self.close_probs[2].clamp(0.0, 1.0)
+    }
+
+    /// THE EXIT GATE: the fraction of an open position the exit chain would
+    /// KEEP on this bar, `1 - p_close`, bounded to `[0,1]`.
+    ///
+    /// 1.0 = hold the whole position, 0.0 = close it, in between = scale out.
+    /// Bounded above by 1.0 by construction, so a consumer multiplying its held
+    /// size by this value can only ever hold less, never more.
+    pub fn keep_fraction(&self) -> f32 {
+        (1.0 - self.close_pressure()).clamp(0.0, 1.0)
+    }
+}
+
 /// Per-row output of the role-aware combiner: a direction vote plus two bounded
-/// [0,1] confidence factors. The blend (Stage 3) and the OOS re-validation
-/// (Stage 4) consume `dir_probs` for the ML agreement on the gene's side and
-/// multiply the confidence by `regime_gate * anomaly_scale`. ML can therefore
-/// only SHRINK conviction or veto — never flip direction or manufacture a trade.
+/// [0,1] confidence factors, plus the parallel exit-side opinion. The blend
+/// (Stage 3) and the OOS re-validation (Stage 4) consume `dir_probs` for the ML
+/// agreement on the gene's side and multiply the confidence by
+/// `regime_gate * anomaly_scale`. ML can therefore only SHRINK conviction or
+/// veto — never flip direction or manufacture a trade.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EnsembleDecision {
     /// `[p_neutral, p_buy, p_sell]` from the directional voters only
-    /// (hmm_regime / isolation_forest removed from this vote).
+    /// (hmm_regime / isolation_forest removed from this vote; exit experts
+    /// never enter it).
     pub dir_probs: [f32; 3],
     /// Regime gate g ∈ [0,1] from `hmm_regime` (1.0 when absent — never a
     /// veto-by-accident on missing data).
@@ -328,16 +425,26 @@ pub struct EnsembleDecision {
     /// Anomaly scale s ∈ [0,1] from `isolation_forest` (1.0 when absent;
     /// 0.0 = hard veto on an extreme anomaly).
     pub anomaly_scale: f32,
+    /// The EXIT-side chain's opinion on an already-open position (audit #174 +
+    /// #310). `None` means the chain did not run — no exit expert was loaded,
+    /// all were excluded/zero-weighted, or an exit expert was REFUSED at
+    /// predict time (logged at `error`). `None` is an honest absence, NOT
+    /// "hold": a consumer that treats it as an opinion is reading a sentinel.
+    /// The direction fields above are unaffected either way — a broken exit
+    /// expert must never take the direction chain down with it, because the
+    /// trader's response to a dead ensemble is to size WITHOUT the ML shrink.
+    pub exit: Option<ExitOpinion>,
 }
 
 impl EnsembleDecision {
-    /// Neutral decision (no directional lean, no gate, no veto) — used for
-    /// warmup/NaN rows where the ensemble abstains.
+    /// Neutral decision (no directional lean, no gate, no veto, no exit
+    /// opinion) — used for warmup/NaN rows where the ensemble abstains.
     pub fn neutral() -> Self {
         Self {
             dir_probs: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
             regime_gate: 1.0,
             anomaly_scale: 1.0,
+            exit: None,
         }
     }
 }
@@ -900,29 +1007,15 @@ impl ExpertRegistry {
                 if claimed.contains(dir_name) {
                     continue;
                 }
-                // Known non-voters, documented: `genetic` discovers
-                // strategies (search-only exemption), `exit_agent` is
-                // exit-pipeline-only (F-318). (`swarm_forecaster` votes
-                // since D1.2.8 — no longer exempt.)
-                let by_design = matches!(dir_name, "genetic" | "exit_agent");
-                if dir_name == "exit_agent" {
-                    // Audit #173/#175 — MAKE THE WASTE VISIBLE, do not decide it.
-                    // `exit_agent` is pushed into the training plan on EVERY run
-                    // (`training_orchestrator.rs:547`), is absent from
-                    // DEFAULT_BOOTSTRAP_EXPERT_NAMES (`bootstrap.rs:102-149`),
-                    // and is whitelisted here as a non-voter. So it trains every
-                    // run and NOTHING consumes its `ExitDecision3` output. That
-                    // is either an unshipped exit-side loop or wasted training
-                    // time, and only the operator can say which — but until he
-                    // does it must not read as a benign `info!` line.
-                    tracing::warn!(
-                        target: "neoethos_models::ensemble",
-                        artifact = %dir_name,
-                        "exit_agent was TRAINED and has NO CONSUMER — it emits ExitDecision3 and \
-                         no production path reads it (audit #173/#175, decision pending: ship the \
-                         exit-side loop or stop training it). Its training time is spent every run."
-                    );
-                } else if by_design {
+                // The ONE remaining known non-voter: `genetic` discovers
+                // strategies (search-only exemption). (`swarm_forecaster` votes
+                // since D1.2.8; `exit_agent` votes on the EXIT axis since audit
+                // #174/#310, 2026-08-10 — it is a claimed, loaded expert now,
+                // so it can no longer reach this orphan branch at all. The
+                // "exit_agent was TRAINED and has NO CONSUMER" warning that
+                // used to live here is DELETED with the defect it described.)
+                let by_design = dir_name == "genetic";
+                if by_design {
                     tracing::info!(
                         target: "neoethos_models::ensemble",
                         artifact = %dir_name,

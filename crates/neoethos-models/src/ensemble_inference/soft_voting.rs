@@ -39,6 +39,31 @@
 //! baseline that lets the bot generate real signals from real
 //! trained models from day one.
 //!
+//! ## The exit-side chain (audit #174 + #310, 2026-08-10)
+//!
+//! `predict_with_roles` runs a SECOND combiner in the same pass, over the
+//! [`ExpertOutputKind::ExitDecision3`] experts, with its own role map
+//! ([`super::exit_expert_role`]) and its own gate
+//! ([`super::ExitOpinion::keep_fraction`]). Its result lands in
+//! [`EnsembleDecision::exit`].
+//!
+//! Until this landed, `soft_voting.rs:230-233` dropped every non-Classification3
+//! expert with a bare `continue`, so `exit_agent` trained on every run and ZERO
+//! RL EXIT OUTPUT HAD EVER REACHED A TRADE. The fix is deliberately NOT "remove
+//! the `continue`": `ExitDecision3` is shape-compatible with `Classification3`
+//! but is an EXIT opinion (hold / close / scale), not an entry direction, and
+//! averaging the two axes together would be worse than dropping one.
+//!
+//! Two invariants make this a SAFE addition:
+//! - the exit chain writes ONLY `EnsembleDecision::exit`; `dir_probs`,
+//!   `regime_gate` and `anomaly_scale` are byte-identical to what they were
+//!   before it existed;
+//! - a broken/mismatched exit expert is REFUSED (loudly, at `error`) and the
+//!   exit opinion becomes `None` — it never turns into an `Err` from the whole
+//!   combiner. That matters for money: the trader's response to an ensemble
+//!   error is to fall back to GENE-ONLY sizing, i.e. without the ML shrink, so
+//!   a new way to fail the ensemble would be a LOOSER change, not a safer one.
+//!
 //! ## Honest limitations
 //!
 //! - **Heterogeneous output kinds**: experts that emit
@@ -46,7 +71,8 @@
 //!   averaged with Classification3 directly. SoftVotingEnsemble
 //!   silently SKIPS them — they sit unused at the voting layer,
 //!   counted in `experts_unused_for_voting()`. The MoE (D1.5+)
-//!   is the right consumer for those signal types.
+//!   is the right consumer for those signal types. `ExitDecision3`
+//!   is no longer one of them — see above.
 //! - **No confidence calibration**: averaging produces sharper
 //!   distributions when experts agree and flatter ones when they
 //!   disagree, but the resulting probabilities are NOT calibrated
@@ -69,8 +95,9 @@ use anyhow::Result;
 use polars::prelude::DataFrame;
 
 use super::{
-    EnsembleDecision, EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction,
-    ExpertRole, anomaly_scale_from_score, expert_role, regime_gate_from_posterior,
+    EnsembleDecision, EnsemblePredictor, ExitOpinion, ExpertLoadOutcome, ExpertOutputKind,
+    ExpertPrediction, ExpertRole, anomaly_scale_from_score, exit_expert_role, expert_role,
+    regime_gate_from_posterior,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,33 +156,51 @@ impl Default for SoftVotingEnsembleConfig {
 pub struct SoftVotingEnsemble {
     outcome: ExpertLoadOutcome,
     config: SoftVotingEnsembleConfig,
-    /// Names of experts whose output_kind is NOT Classification3.
-    /// Cached at construction so the aggregator doesn't pay the
-    /// per-predict cost of re-checking. Surfaced via
-    /// [`Self::experts_unused_for_voting`] for the chrome banner.
+    /// Names of experts that reach NEITHER chain — wrong output kind for
+    /// both, or excluded by the operator. Cached at construction so the
+    /// aggregator doesn't pay the per-predict cost of re-checking. Surfaced
+    /// via [`Self::experts_unused_for_voting`] for the chrome banner.
+    ///
+    /// **Audit #174/#310**: `ExitDecision3` experts are NO LONGER counted
+    /// here. They were, and the banner therefore told the operator that
+    /// `exit_agent` was unused — which was true then and would be a lie now.
     unused_for_voting: HashSet<String>,
+    /// Names of loaded, non-excluded experts that feed the EXIT-side chain.
+    exit_chain: HashSet<String>,
 }
 
 impl SoftVotingEnsemble {
     /// Build from a load outcome + config. Errors if NO loaded
-    /// expert can contribute to voting after applying both filters
-    /// (output_kind == Classification3 AND name not in excluded).
+    /// expert can contribute to the DIRECTION vote after applying both
+    /// filters (output_kind == Classification3 AND name not in excluded).
+    ///
+    /// An empty exit chain is NOT an error: the exit side is an addition,
+    /// and an operator with no trained `exit_agent` must keep getting exactly
+    /// the ensemble he had before.
     pub fn new(outcome: ExpertLoadOutcome, config: SoftVotingEnsembleConfig) -> Result<Self> {
         let mut unused = HashSet::new();
+        let mut exit_chain = HashSet::new();
         let mut votable = 0;
         for e in &outcome.loaded {
             let name = e.name();
-            // An expert is "unused" if EITHER its output kind isn't
-            // Classification3 (Forecast1, AnomalyScore, ExitDecision3,
-            // ActionValues3) OR its name is in the operator's
-            // exclusion list (strategy discoverers like genetic,
-            // neuro_evo by default).
-            let wrong_kind = e.output_kind() != ExpertOutputKind::Classification3;
             let excluded = config.excluded_names.contains(name);
-            if wrong_kind || excluded {
+            if excluded {
+                // The operator's exclusion list drops an expert from BOTH
+                // chains — it is a per-name "do not use this model", not a
+                // per-axis one.
                 unused.insert(name.to_string());
-            } else {
-                votable += 1;
+                continue;
+            }
+            match e.output_kind() {
+                ExpertOutputKind::Classification3 => votable += 1,
+                ExpertOutputKind::ExitDecision3 => {
+                    exit_chain.insert(name.to_string());
+                }
+                // Forecast1 / AnomalyScore / ActionValues3 producers still
+                // reach neither combiner.
+                _ => {
+                    unused.insert(name.to_string());
+                }
             }
         }
         if votable == 0 {
@@ -163,29 +208,41 @@ impl SoftVotingEnsemble {
                 "SoftVotingEnsemble requires at least one votable Classification3 expert in \
                  the load outcome AFTER applying the exclusion list. Loaded {} experts, all \
                  of which were either heterogeneous-output-kind or excluded by name. Unused: \
-                 {:?}",
+                 {:?}; exit-side only: {:?}",
                 outcome.loaded.len(),
-                unused
+                unused,
+                exit_chain
             );
         }
         Ok(Self {
             outcome,
             config,
             unused_for_voting: unused,
+            exit_chain,
         })
     }
 
-    /// Names of loaded experts whose `output_kind` is not
-    /// Classification3 — they're held in the outcome (so the
-    /// chrome can list them) but the soft-voting layer doesn't use
-    /// their predictions. The MoE will (D1.5+).
+    /// Names of loaded experts that reach NEITHER combiner — they're held in
+    /// the outcome (so the chrome can list them) but nothing consumes their
+    /// predictions. The MoE will (D1.5+).
     pub fn experts_unused_for_voting(&self) -> Vec<&str> {
         self.unused_for_voting.iter().map(String::as_str).collect()
     }
 
-    /// Count of experts that actually participate in voting.
+    /// Names of loaded experts feeding the EXIT-side chain (audit #174/#310).
+    /// Empty when no exit expert is trained/loaded.
+    pub fn experts_in_exit_chain(&self) -> Vec<&str> {
+        self.exit_chain.iter().map(String::as_str).collect()
+    }
+
+    /// Count of experts that actually participate in the DIRECTION vote.
     pub fn voting_expert_count(&self) -> usize {
-        self.outcome.loaded.len() - self.unused_for_voting.len()
+        self.outcome.loaded.len() - self.unused_for_voting.len() - self.exit_chain.len()
+    }
+
+    /// Count of experts that participate in the EXIT-side chain.
+    pub fn exit_expert_count(&self) -> usize {
+        self.exit_chain.len()
     }
 
     /// v0.5 ML-integration Stage 2 — role-aware combiner. THE aggregator:
@@ -202,6 +259,11 @@ impl SoftVotingEnsemble {
     /// - `regime_gate` ∈ [0,1] from `hmm_regime` (1.0 when absent);
     /// - `anomaly_scale` ∈ [0,1] from `isolation_forest` (1.0 when absent,
     ///   0.0 hard-veto at an extreme score).
+    ///
+    /// It ALSO runs the parallel EXIT-side chain (audit #174/#310) over the
+    /// `ExitDecision3` experts and puts its verdict in
+    /// [`EnsembleDecision::exit`]. That chain never touches `dir_probs` /
+    /// `regime_gate` / `anomaly_scale`.
     ///
     /// FAILS LOUD if a loaded, non-excluded expert name is unmapped (a new
     /// expert must be assigned a role in [`expert_role`]) or if the direction
@@ -227,8 +289,10 @@ impl SoftVotingEnsemble {
             if self.config.excluded_names.contains(name) {
                 continue;
             }
-            // Non-Classification3 kinds (Forecast1, ExitDecision3, …) are not
-            // consumed by this combiner; the role map only covers voting kinds.
+            // Only Classification3 experts vote on DIRECTION. `ExitDecision3`
+            // is handled by `exit_opinions` below — it is a different axis, and
+            // that is exactly why it is a second pass and not a relaxed filter
+            // here. Forecast1 / AnomalyScore producers reach neither.
             if expert.output_kind() != ExpertOutputKind::Classification3 {
                 continue;
             }
@@ -304,6 +368,10 @@ impl SoftVotingEnsemble {
             );
         }
 
+        // The parallel exit-side chain. Runs after the direction vote and
+        // cannot influence it — see `exit_opinions`.
+        let exit = self.exit_opinions(df, n_rows);
+
         let mut out = Vec::with_capacity(n_rows);
         for row_idx in 0..n_rows {
             let total = dir_weight_totals[row_idx];
@@ -332,9 +400,118 @@ impl SoftVotingEnsemble {
                 dir_probs,
                 regime_gate,
                 anomaly_scale,
+                exit: exit.as_ref().and_then(|e| e[row_idx]),
             });
         }
         Ok(out)
+    }
+
+    /// THE EXIT-SIDE COMBINER (audit #174 + #310, operator decision 2026-08-10
+    /// "CONNECT IT, visible even in the back/forward test process").
+    ///
+    /// Weighted average of the loaded [`super::ExitRole::CloseVote`] experts'
+    /// `[p_hold, p_neutral, p_close]` vectors, using the SAME
+    /// `models.ensemble_voting.expert_weights` the direction vote uses — one
+    /// config, one place, and `exit_agent: 0.0` is already a working "load it
+    /// but do not let it speak" lever without a new knob existing anywhere.
+    ///
+    /// Returns `None` when the chain did not run at all, and `None` in an
+    /// individual row when no expert produced a usable vector for it. Never an
+    /// `Err`: see the module doc — turning an exit-expert fault into a whole-
+    /// ensemble error would drop the trader to gene-only sizing, i.e. remove
+    /// the ML shrink, which moves money the WRONG way. A refusal is logged at
+    /// `error` with the expert named, so it is loud without being contagious.
+    fn exit_opinions(&self, df: &DataFrame, n_rows: usize) -> Option<Vec<Option<ExitOpinion>>> {
+        if self.exit_chain.is_empty() {
+            return None;
+        }
+        let mut sums: Vec<[f32; 3]> = vec![[0.0; 3]; n_rows];
+        let mut weight_totals: Vec<f32> = vec![0.0; n_rows];
+        let mut voters: Vec<u16> = vec![0; n_rows];
+        let mut contributors = 0usize;
+
+        for expert in &self.outcome.loaded {
+            let name = expert.name();
+            if !self.exit_chain.contains(name) {
+                continue;
+            }
+            // Same fail-loud contract as the direction map: a new
+            // ExitDecision3 expert MUST be given a role, or it is refused by
+            // name rather than quietly averaged in.
+            if exit_expert_role(name).is_none() {
+                tracing::error!(
+                    target: "neoethos_models::ensemble",
+                    expert = %name,
+                    "exit chain: loaded ExitDecision3 expert has no role mapping; add it to \
+                     `exit_expert_role`. REFUSED — it will not contribute to the exit opinion."
+                );
+                continue;
+            }
+            let weight = self.config.expert_weights.get(name).copied().unwrap_or(1.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            let preds: Vec<ExpertPrediction> = match expert.predict(df) {
+                Ok(preds) => preds,
+                Err(error) => {
+                    tracing::error!(
+                        target: "neoethos_models::ensemble",
+                        expert = %name,
+                        %error,
+                        "exit chain: expert REFUSED at predict (feature-column mismatch or a \
+                         broken artifact). The exit opinion abstains for this frame; the \
+                         direction vote is unaffected."
+                    );
+                    continue;
+                }
+            };
+            if preds.len() != n_rows {
+                tracing::error!(
+                    target: "neoethos_models::ensemble",
+                    expert = %name,
+                    returned = preds.len(),
+                    expected = n_rows,
+                    "exit chain: expert returned the wrong number of predictions. REFUSED."
+                );
+                continue;
+            }
+            contributors += 1;
+            for (row_idx, p) in preds.iter().enumerate() {
+                if p.kind != ExpertOutputKind::ExitDecision3 || p.values.len() != 3 {
+                    continue;
+                }
+                sums[row_idx][0] += weight * p.values[0];
+                sums[row_idx][1] += weight * p.values[1];
+                sums[row_idx][2] += weight * p.values[2];
+                weight_totals[row_idx] += weight;
+                voters[row_idx] = voters[row_idx].saturating_add(1);
+            }
+        }
+
+        if contributors == 0 {
+            return None;
+        }
+        Some(
+            (0..n_rows)
+                .map(|row_idx| {
+                    let total = weight_totals[row_idx];
+                    // No contributor for THIS row -> honest absence, not a
+                    // neutral-looking vector a consumer could mistake for
+                    // "hold". Ambiguous sentinels are defects.
+                    if total <= 0.0 || voters[row_idx] == 0 {
+                        return None;
+                    }
+                    Some(ExitOpinion {
+                        close_probs: [
+                            sums[row_idx][0] / total,
+                            sums[row_idx][1] / total,
+                            sums[row_idx][2] / total,
+                        ],
+                        voters: voters[row_idx],
+                    })
+                })
+                .collect(),
+        )
     }
 }
 
@@ -397,6 +574,58 @@ mod tests {
                 });
             }
             Ok(out)
+        }
+    }
+
+    /// In-test ExpertModel emitting a constant ExitDecision3 vector
+    /// `[p_hold, p_neutral, p_close]` for every row — the exit-side twin of
+    /// [`ConstantClassifier`].
+    struct ConstantExitAgent {
+        name: String,
+        probs: [f32; 3],
+    }
+
+    impl ExpertModel for ConstantExitAgent {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn family(&self) -> ModelFamily {
+            ModelFamily::Exit
+        }
+        fn output_kind(&self) -> ExpertOutputKind {
+            ExpertOutputKind::ExitDecision3
+        }
+        fn feature_columns(&self) -> &[String] {
+            &[]
+        }
+        fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+            Ok((0..df.height())
+                .map(|_| ExpertPrediction {
+                    kind: ExpertOutputKind::ExitDecision3,
+                    values: self.probs.to_vec(),
+                })
+                .collect())
+        }
+    }
+
+    /// An exit expert that FAILS at predict — the stale-artifact /
+    /// column-mismatch case. Must be contained, never contagious.
+    struct BrokenExitAgent;
+    impl ExpertModel for BrokenExitAgent {
+        fn name(&self) -> &str {
+            "exit_agent"
+        }
+        fn family(&self) -> ModelFamily {
+            ModelFamily::Exit
+        }
+        fn output_kind(&self) -> ExpertOutputKind {
+            ExpertOutputKind::ExitDecision3
+        }
+        fn feature_columns(&self) -> &[String] {
+            &[]
+        }
+        fn predict(&self, _df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+            anyhow::bail!("exit-agent prediction feature-column mismatch: expected [..], got [..]")
         }
     }
 
@@ -475,13 +704,19 @@ mod tests {
 
     #[test]
     fn role_map_covers_all_bootstrap_experts() {
+        use crate::ensemble_inference::exit_expert_role;
         for name in crate::ensemble_inference::bootstrap::DEFAULT_BOOTSTRAP_EXPERT_NAMES {
+            // Every bootstrap expert must carry a role in ONE of the two maps.
+            // Audit #174/#310 added the exit-side map; `exit_agent` lives there
+            // and deliberately has NO direction role — that separation is the
+            // whole point, so this asserts coverage across both, not just one.
             assert!(
-                expert_role(name).is_some(),
-                "bootstrap expert '{name}' has no role in expert_role(); the role-aware \
-                 combiner would fail loud on it in production"
+                expert_role(name).is_some() || exit_expert_role(name).is_some(),
+                "bootstrap expert '{name}' has no role in expert_role() OR \
+                 exit_expert_role(); the combiners would refuse it in production"
             );
         }
+        assert_eq!(expert_role("exit_agent"), None, "exit_agent must never vote on direction");
         assert_eq!(expert_role("hmm_regime"), Some(ExpertRole::RegimeGate));
         assert_eq!(expert_role("isolation_forest"), Some(ExpertRole::AnomalyScale));
         assert_eq!(expert_role("dqn"), Some(ExpertRole::DirectionalConfirm));
@@ -773,6 +1008,205 @@ mod tests {
             "a zero-weight expert must not pull the vote, got {:?}",
             d.dir_probs
         );
+    }
+
+    // -- The EXIT-side chain (audit #174 + #310) ----------------------
+    //
+    // THE regression these pin: `soft_voting.rs:230-233` dropped every
+    // non-Classification3 expert with a bare `continue`, so ZERO RL EXIT
+    // OUTPUT HAD EVER REACHED A TRADE while `exit_agent` trained on every run.
+
+    /// THE test for #174 + #310. An ExitDecision3 expert must reach the exit
+    /// chain — and must NOT reach the direction vote, which is the reason the
+    /// `continue` was not simply deleted.
+    #[test]
+    fn exit_expert_reaches_the_exit_chain_and_never_the_direction_vote() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantExitAgent {
+                name: "exit_agent".into(),
+                probs: [0.2, 0.1, 0.7], // strong CLOSE
+            }),
+        ]);
+        let ens = default_ensemble(outcome).expect("ok");
+        assert_eq!(ens.exit_expert_count(), 1, "exit expert must be in the chain");
+        assert_eq!(ens.voting_expert_count(), 1, "exit expert must not be a direction voter");
+        assert!(
+            !ens.experts_unused_for_voting().contains(&"exit_agent"),
+            "a wired exit expert must not be reported as unused: {:?}",
+            ens.experts_unused_for_voting()
+        );
+        assert!(ens.experts_in_exit_chain().contains(&"exit_agent"));
+
+        let d = ens.predict_with_roles(&small_df(3)).expect("roles");
+        assert_eq!(d.len(), 3);
+        for row in &d {
+            // Direction vote is EXACTLY the sole classifier — the exit vector
+            // [0.2, 0.1, 0.7] must not have moved it toward "sell".
+            assert!((row.dir_probs[0] - 0.1).abs() < 1e-6, "{row:?}");
+            assert!((row.dir_probs[1] - 0.7).abs() < 1e-6, "{row:?}");
+            assert!((row.dir_probs[2] - 0.2).abs() < 1e-6, "{row:?}");
+            let exit = row.exit.expect("the exit chain must produce an opinion");
+            assert_eq!(exit.voters, 1);
+            assert!((exit.close_pressure() - 0.7).abs() < 1e-6, "{exit:?}");
+            assert!((exit.keep_fraction() - 0.3).abs() < 1e-6, "{exit:?}");
+        }
+    }
+
+    /// No exit expert loaded ⇒ honest absence, not a neutral-looking vector a
+    /// consumer could read as "hold". Ambiguous sentinels are defects.
+    #[test]
+    fn no_exit_expert_means_none_not_a_neutral_opinion() {
+        let outcome = outcome_with(vec![Box::new(ConstantClassifier {
+            name: "xgboost".into(),
+            probs: [0.1, 0.7, 0.2],
+        })]);
+        let ens = default_ensemble(outcome).expect("ok");
+        assert_eq!(ens.exit_expert_count(), 0);
+        let d = ens.predict_with_roles(&small_df(2)).expect("roles");
+        for row in &d {
+            assert!(row.exit.is_none(), "absence must be None, got {row:?}");
+        }
+    }
+
+    /// A broken/mis-columned exit expert must NOT fail the whole combiner.
+    /// If it did, the trader would fall back to gene-only sizing — i.e. drop
+    /// the ML shrink — which moves money the WRONG way. Containment is the
+    /// safe behaviour here, and it is loud (an `error!` names the expert).
+    #[test]
+    fn a_broken_exit_expert_abstains_and_leaves_the_direction_vote_intact() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(BrokenExitAgent),
+        ]);
+        let ens = default_ensemble(outcome).expect("ok");
+        let d = ens
+            .predict_with_roles(&small_df(2))
+            .expect("a broken EXIT expert must never fail the whole combiner");
+        for row in &d {
+            assert!(row.exit.is_none(), "refused exit expert must abstain: {row:?}");
+            assert!((row.dir_probs[1] - 0.7).abs() < 1e-6, "direction damaged: {row:?}");
+            assert_eq!(row.regime_gate, 1.0);
+            assert_eq!(row.anomaly_scale, 1.0);
+        }
+    }
+
+    /// The operator's ONE config reaches the exit chain too: the same
+    /// `expert_weights` map weights exit voters, and 0.0 silences one — no new
+    /// knob exists or is needed.
+    #[test]
+    fn operator_weights_and_exclusions_reach_the_exit_chain() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantExitAgent {
+                name: "exit_agent".into(),
+                probs: [0.1, 0.1, 0.8],
+            }),
+        ]);
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.expert_weights.insert("exit_agent".into(), 0.0);
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        assert!(d.exit.is_none(), "weight 0 must silence the exit voter, got {d:?}");
+
+        // And the exclusion list drops it from the chain entirely.
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantExitAgent {
+                name: "exit_agent".into(),
+                probs: [0.1, 0.1, 0.8],
+            }),
+        ]);
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.insert("exit_agent".to_string());
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        assert_eq!(ens.exit_expert_count(), 0);
+        assert!(ens.experts_unused_for_voting().contains(&"exit_agent"));
+        assert!(
+            ens.predict_with_roles(&small_df(1)).expect("roles")[0]
+                .exit
+                .is_none()
+        );
+    }
+
+    /// Two exit voters average, weighted, exactly like the direction pool.
+    #[test]
+    fn two_exit_voters_average_with_weights() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantExitAgent {
+                name: "exit_agent".into(),
+                probs: [0.8, 0.1, 0.1],
+            }),
+            Box::new(ConstantExitAgent {
+                name: "exit_agent_02".into(), // replica -> same canonical role
+                probs: [0.2, 0.2, 0.6],
+            }),
+        ]);
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.expert_weights.insert("exit_agent".into(), 3.0);
+        cfg.expert_weights.insert("exit_agent_02".into(), 1.0);
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        let exit = d.exit.expect("two exit voters must produce an opinion");
+        assert_eq!(exit.voters, 2);
+        // (3*0.8 + 1*0.2)/4 = 0.65 ; (3*0.1+1*0.2)/4 = 0.125 ; (3*0.1+1*0.6)/4 = 0.225
+        assert!((exit.close_probs[0] - 0.65).abs() < 1e-5, "{exit:?}");
+        assert!((exit.close_probs[1] - 0.125).abs() < 1e-5, "{exit:?}");
+        assert!((exit.close_probs[2] - 0.225).abs() < 1e-5, "{exit:?}");
+        assert!((exit.keep_fraction() - 0.775).abs() < 1e-5, "{exit:?}");
+    }
+
+    /// The exit gate is bounded ABOVE by 1.0 for every possible input, which is
+    /// what makes wiring this chain a SAFER change: a consumer multiplying its
+    /// held size by `keep_fraction` can only ever hold less, never more.
+    #[test]
+    fn the_exit_gate_can_never_increase_exposure() {
+        for close in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let opinion = ExitOpinion {
+                close_probs: [1.0 - close, 0.0, close],
+                voters: 1,
+            };
+            let keep = opinion.keep_fraction();
+            assert!(
+                (0.0..=1.0).contains(&keep),
+                "keep_fraction {keep} out of [0,1] for p_close {close}"
+            );
+            assert!(keep <= 1.0, "the exit gate must never exceed 1.0");
+        }
+    }
+
+    /// The exit-side role map must cover every exit expert the bootstrap loads,
+    /// or the combiner refuses it by name at runtime.
+    #[test]
+    fn exit_role_map_covers_the_bootstrap_exit_experts() {
+        use crate::ensemble_inference::{ExitRole, exit_expert_role};
+        assert_eq!(exit_expert_role("exit_agent"), Some(ExitRole::CloseVote));
+        assert_eq!(exit_expert_role("exit_agent_07"), Some(ExitRole::CloseVote));
+        assert_eq!(exit_expert_role("xgboost"), None);
+        assert_eq!(exit_expert_role("not_a_real_model"), None);
+        // And the two maps must not overlap — one expert, one axis.
+        for name in crate::ensemble_inference::bootstrap::DEFAULT_BOOTSTRAP_EXPERT_NAMES {
+            assert!(
+                expert_role(name).is_some() != exit_expert_role(name).is_some(),
+                "'{name}' must belong to EXACTLY ONE chain (direction or exit)"
+            );
+        }
     }
 
     #[test]

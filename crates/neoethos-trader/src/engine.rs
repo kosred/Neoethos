@@ -17,40 +17,43 @@ use crate::decision::DecisionEngine;
 use crate::portfolio::PortfolioRegistry;
 use crate::position::PositionManager;
 
-/// The replay's SYNTHETIC starting balance (audit #265).
+/// The replay's balance when there is no account to read (audit #265).
 ///
-/// This is the third of three numbers in the tree for one concept:
-///   - `neoethos-core config.rs:528` `risk.initial_balance` = 10_000.0
-///   - `neoethos-core config.rs:1767` `backtest_runtime.initial_equity` = 100_000.0
-///     — and THAT one is the GPU kernel's compounding denominator, so every
-///     percentage return the search ranks on is computed against a balance
-///     ten times the operator's real account
+/// **#265 is CLOSED on the config side as of 2026-08-10.** There used to be
+/// three numbers in the tree for one concept:
+///   - `risk.initial_balance` = 10 000 — the ACCOUNT
+///   - `models.backtest_runtime.initial_equity` = 100 000 — the denominator
+///     every percentage the search ranked on was computed against
 ///   - this one, the replay's
 ///
-/// **2026-08-10 (#229/#265): this is now a FALLBACK, not a default in use.**
-/// Both replay front-ends build their config through
-/// [`EngineConfig::for_replay_from_settings`], which takes
-/// `risk.initial_balance`, so a replay reaches this constant only when
-/// `Settings` could not be read at all or the configured balance is unusable —
-/// and in both cases it says so at WARN and `common_warnings` marks the run
-/// synthetic.
+/// The operator's decision: **the balance is READ FROM THE REAL ACCOUNT at
+/// demo/live time, and there is no second constant.** So
+/// `models.backtest_runtime.initial_equity` is DELETED (it is in
+/// `load_seal::RETIRED_KEYS`), and
+/// `neoethos_search::eval::BacktestRuntimeOverrides::from_settings` takes the
+/// search's denominator from `risk.initial_balance` — the same field the live
+/// drawdown floor reads, and the field the broker's reported balance belongs in.
 ///
-/// The remaining disagreement is between the OTHER two: `risk.initial_balance`
-/// (the account) and `models.backtest_runtime.initial_equity` (what the SEARCH
-/// divides every percentage by). It is not reconciled by fiat, because they are
-/// not obviously one concept and substituting one for the other would move every
-/// ranked percentage without anybody choosing it. It is reported instead, once
-/// per process, with both numbers, by
-/// `neoethos_search::eval::install_backtest_runtime_overrides_from_settings`.
+/// This constant is NOT a third balance. Both replay front-ends build their
+/// config through [`EngineConfig::for_replay_from_settings`], which takes
+/// `risk.initial_balance`, so a replay reaches this value only when `Settings`
+/// could not be read at all or the configured balance is unusable — and in both
+/// cases it says so at WARN and `common_warnings` marks the run synthetic. It is
+/// the "there was no account" value, not an alternative to one.
 pub const DEFAULT_REPLAY_STARTING_BALANCE: f64 = 10_000.0;
 
 /// Engine-wide knobs (Phase 1).
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Notional starting balance for the P&L/equity bookkeeping.
-    /// Defaults to [`DEFAULT_REPLAY_STARTING_BALANCE`], which is NOT the
-    /// operator's account balance — front-ends holding `Settings` should pass
-    /// `risk.initial_balance` instead.
+    /// Starting balance for the P&L/equity bookkeeping.
+    ///
+    /// **#265: this is `risk.initial_balance` — the ACCOUNT — on every path a
+    /// front-end can actually take.** [`EngineConfig::for_replay_from_settings`]
+    /// fills it, and at demo/live time that field carries the balance the broker
+    /// reports, so a demo account and a live account run the SAME engine on the
+    /// SAME number and nothing about the models or strategies changes between
+    /// them. `Default` falls back to [`DEFAULT_REPLAY_STARTING_BALANCE`], which
+    /// means "no account could be read" and is reported as a synthetic run.
     pub starting_balance: f64,
     /// Max bars retained per (symbol, tf) rolling window (indicator warmup).
     pub window_cap: usize,

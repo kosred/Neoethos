@@ -40,29 +40,10 @@
 # (unannotated keys are ordinary developer tuning; the ones with a
 #  reason are decisions that neither side may move alone)
 #
-#   models.l1_feature_selection_enabled
-#     2026-08-10. Default is false. This changes WHAT IS SEARCHED — L1
-#     selection prunes the feature set before the GA sees it — so it is
-#     recorded, not reconciled. The value has been in this profile throughout
-#     the runs the current results came from; flipping it to match the
-#     default would silently change the search on the next run, which is
-#     precisely what this table exists to prevent.
-#
-#   models.l1_feature_selection_per_regime
-#     2026-08-10. Default is false. The per-regime half of the same decision;
-#     see above. Both move together — enabling selection globally while
-#     disabling it per regime is a combination nothing in the profile
-#     intended.
-#
 #   models.prop_firm_min_pass_rate
 #     Same 2026-06-06 mandate: 0.65 -> 0.40 -> 0.0, where 0.0 is RANKING-ONLY
 #     (the window pass-rate still orders candidates, it kills none). Default
 #     is 0.40.
-#
-#   models.regime_router_enabled
-#     Shipped on against a Default of false. Enabling a router is the
-#     stricter, more selective side, so the safer value wins here and the
-#     disagreement is recorded rather than reconciled.
 #
 #   models.require_walkforward_for_export
 #     2026-06-06 regime-diversity mandate, quoted verbatim in the file: a
@@ -80,13 +61,6 @@
 #     because `auto` and `gpu` are NOT the same request — the refuters
 #     overturned merging this with `models.tree_runtime.device`, and the two
 #     keys stay distinct.
-#
-#   risk.challenge_mode
-#     UNWIRED — RiskManager has no production constructor and fills its
-#     challenge targets from a hardcoded FTMO_STANDARD. Default is false;
-#     both repo files shipped true, i.e. an armed mode that does not exist.
-#     RETAINED AS INTENT: deleting it deletes the prop-firm goal, not
-#     garbage.
 #
 #   risk.daily_drawdown_limit
 #     CORRECTED 2026-08-10 from 0.10000000149011612 — an f32 value widened
@@ -129,10 +103,6 @@
 models:
   cpcv_n_splits: 8
   discovery_mode: risky
-  evo_islands: 8
-  exit_agent_hidden_dim: 128
-  l1_feature_selection_enabled: true
-  l1_feature_selection_per_regime: true
   max_epochs_by_model:
     tabnet: 200
     tide: 200
@@ -154,22 +124,11 @@ models:
   - swarm_forecaster
   - isolation_forest
   prop_firm_min_pass_rate: 0.0
-  prop_search_async: true
-  prop_search_enabled: true
   prop_search_generations: 20000
   prop_search_max_hours: 1.0
   prop_search_max_indicators: 16
   prop_search_population: 200
   prop_search_portfolio_size: 50
-  prop_search_tournament_size: 10
-  prop_search_train_years: 8
-  prop_search_val_log_trades: true
-  prop_search_val_min_trades_per_day: 1.0
-  prop_search_val_min_trades_per_month: 15
-  prop_search_val_trade_log_max: 50
-  prop_search_val_years: 1
-  ray_tune_max_concurrency: 8
-  regime_router_enabled: true
   require_walkforward_for_export: false
   rl_network_arch:
   - 256
@@ -179,11 +138,9 @@ models:
     novelty_weight: 0.2
     smc_gate_end: 0.35
     smc_gate_stagnation_step: 0.03
-  transformer_dropout: 0.1
   tree_device_preference: gpu
   walkforward_splits: 15
 risk:
-  challenge_mode: true
   daily_drawdown_limit: 0.08
   max_portfolio_risk: 0.34
   max_trades_per_day: 8

@@ -325,24 +325,23 @@ pub async fn update_preset(
 
     settings.risk.daily_drawdown_limit = next_daily;
     settings.risk.total_drawdown_limit = next_total;
-    // #294 — `monthly_profit_target_pct` is WrittenNeverRead: this line assigns
-    // it and the only readers (`domain::risk::PropFirmRules` /
-    // `RiskManager::monthly_profit_target_pct`) build from `PropFirmConstraints`
-    // directly, never from `Settings`. DECISION TAKEN 2026-08-09: **keep the
-    // write, do not wire a reader here.** Reasons, in order:
-    //   1. The value is a firm-published constraint, not an operator preference,
-    //      so seeding it from the preset matches `config.rs:531` exactly — the
-    //      loader and this writer agree, which is the property #213 lost.
-    //   2. The only candidate reader is `RiskManager` (`domain/risk.rs:332`),
-    //      which has **no production constructor at all** (#137) and is under an
-    //      explicit operator hold: wiring it changes live position sizing on a
-    //      funded account. Giving this field a reader means wiring that, and
-    //      that is not a code-tidying decision.
-    // Consequence to be honest about: setting a monthly profit target from the
-    // UI still changes nothing at runtime, and a preset switch still overwrites
-    // whatever was there. The ledger entry in
-    // `crates/neoethos-core/tests/config_has_recipient.rs:200-207` remains
-    // accurate (`Inert::WrittenNeverRead`, OWNER: operator) and needs no edit.
+    // `monthly_profit_target_pct` is re-seeded from the chosen preset here. The
+    // 2026-08-09 note that used to sit on this line called the field
+    // WrittenNeverRead and said "setting a monthly profit target from the UI
+    // still changes nothing at runtime". BOTH HALVES ARE NOW FALSE and the note
+    // is replaced rather than left beside the truth:
+    //   * `neoethos-autoresearch/src/goals.rs` reads it as the target the loop
+    //     optimises toward, and refuses to start when it is 0.0;
+    //   * `domain::risk::RiskManager::from_settings` reads it (#137,
+    //     2026-08-10) as a live STOP — with `risk.challenge_mode: false`, once
+    //     the account is up this much on the UTC month the prop-firm gate
+    //     refuses new entries until the month rolls.
+    // The WRITE stays, and it is still the right write: the number is a
+    // firm-published constraint, not an operator preference, so seeding it from
+    // the preset keeps this writer and the loader agreeing (the property #213
+    // lost). Be honest about the consequence, which is now real money: choosing
+    // a preset here OVERWRITES whatever monthly target was in the store, and
+    // that number is what stops live trading for the rest of the month.
     settings.risk.monthly_profit_target_pct = constraints.monthly_profit_target();
 
     if let Err(err) = settings.save(config_path()) {

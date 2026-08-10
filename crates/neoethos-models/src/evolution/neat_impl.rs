@@ -38,6 +38,25 @@ const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 const NEAT_CUDA_FITNESS_BACKEND: &str = "symbios_neat_cuda_fitness";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
 
+/// Floor on the NEAT search population, and on its generation count.
+///
+/// These are FLOORS, not defaults. The population a run actually searches with
+/// comes from `models.rl_population_size` through
+/// `training_orchestrator::default_model_params("neat")` — audit #294 wired it
+/// there and DELETED the `96` that used to sit in `NeatExpert::new` and in the
+/// orchestrator's parameter fallback, so there is now exactly one place the
+/// number comes from.
+///
+/// ⚠ Both numbers are still arbitrary. Model CAPACITY — population, layer
+/// widths, epochs — is something to MEASURE per model on real data, not to
+/// type into a constructor. What a floor legitimately encodes is the point
+/// below which the algorithm stops being itself (a NEAT population under ~24
+/// cannot sustain speciation); anything above the floor is a search question
+/// and belongs to the goal loop, not to this file. `NeatArtifact::validate`
+/// enforces exactly these two numbers, so an artifact and a fresh run agree.
+const MIN_NEAT_POPULATION: usize = 24;
+const MIN_NEAT_GENERATIONS: usize = 8;
+
 fn default_neat_requested_device_policy() -> String {
     "auto".to_string()
 }
@@ -96,8 +115,15 @@ impl Default for NeatArtifact {
         let config = NeatConfig::minimal(1, 3);
         Self {
             config: config.clone(),
-            generations: 48,
-            population_size: 96,
+            // Serde fallback for an artifact file that does not record its own
+            // topology. The floors, not a training population: an artifact
+            // that never said what it searched with must not be read as
+            // claiming 96 (audit #294 — one source for that number, and it is
+            // `models.rl_population_size`). `validate` enforces exactly these
+            // two, so a silent artifact is the weakest legal claim, not a
+            // fabricated one.
+            generations: MIN_NEAT_GENERATIONS,
+            population_size: MIN_NEAT_POPULATION,
             mutation_rate: 0.85,
             species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
@@ -456,15 +482,25 @@ impl NeatExpert {
         &self.feature_columns
     }
 
+    /// Placeholder constructor for the ARTIFACT LOADER only.
+    ///
+    /// `NeatAdapterLoader::load` builds one of these and immediately calls
+    /// [`Self::load`], which overwrites every dimension, the scaler, the genome,
+    /// the feature columns AND the recorded topology from the artifact on disk.
+    /// Nothing here survives, so it carries the floors rather than a training
+    /// population: the `96` that used to sit here was a second, silent source
+    /// for a number the operator now sets once
+    /// (`models.rl_population_size`, audit #294). A run that actually searches
+    /// goes through [`Self::with_config`].
     pub fn new(input_dim: usize) -> Self {
-        Self::with_config(input_dim, 96, 48)
+        Self::with_config(input_dim, MIN_NEAT_POPULATION, MIN_NEAT_GENERATIONS)
     }
 
     pub fn with_config(input_dim: usize, population_size: usize, generations: usize) -> Self {
         Self {
             config: build_neat_config(input_dim),
-            generations: generations.max(8),
-            population_size: population_size.max(24),
+            generations: generations.max(MIN_NEAT_GENERATIONS),
+            population_size: population_size.max(MIN_NEAT_POPULATION),
             mutation_rate: 0.85,
             species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
@@ -923,7 +959,9 @@ impl NeatExpert {
             bail!("NEAT artifact scaler contains non-finite or non-positive stds");
         }
 
-        if artifact.population_size < 24 || artifact.generations < 8 {
+        if artifact.population_size < MIN_NEAT_POPULATION
+            || artifact.generations < MIN_NEAT_GENERATIONS
+        {
             bail!(
                 "NEAT artifact search topology is invalid: generations={}, population_size={}",
                 artifact.generations,

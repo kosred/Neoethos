@@ -6,15 +6,19 @@
 //! allow path) plus a tiny max-concurrent-positions cap so the reject path is
 //! exercised end-to-end.
 //!
-//! **CORRECTION 2026-08-09 (audit #137).** This header also named
+//! **UPDATED 2026-08-10 (audit #137).** The other real gate is
 //! `neoethos_core::domain::risk::RiskManager::check_trade_allowed` (the
-//! PropFirm daily-loss / max-DD / drawdown-recovery tiers) as the other real
-//! gate. That type has **no production constructor anywhere in the workspace** —
-//! all three `RiskManager::new` call sites are inside its own `#[cfg(test)]`
-//! module — so it is not something this crate can be "wired to" today. Whether
-//! it gets wired or deleted is an open operator decision recorded on the struct
-//! itself. Until then, do not read this file as "the real thing exists, we just
-//! haven't plugged it in".
+//! prop-firm daily-loss / total-drawdown / drawdown-recovery /
+//! revenge-trade tiers). On 2026-08-09 this header recorded that the type had
+//! **no production constructor anywhere in the workspace**; the operator then
+//! decided "WIRE IT", so it now has exactly one —
+//! `RiskManager::from_settings(&Settings, live_equity)` — and
+//! `neoethos-app/src/app_services/live_trading.rs` calls it for every engine
+//! whose `system.trading_mode` is not `risky`.
+//!
+//! What has NOT changed is this crate: nothing here constructs either manager.
+//! The gates in this file are still the Phase-1 stubs, and a replay run is
+//! still risk-free by construction.
 //!
 //! [`PermissiveRiskGate`] is what every `data_replay::replay_*` path actually
 //! uses, which is why every replay reports it in

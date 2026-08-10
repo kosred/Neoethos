@@ -14,7 +14,7 @@
 //! | Seam ([`contracts`]) | Phase 1 stub | Wired later |
 //! |---|---|---|
 //! | [`SignalEngine`] | [`signal::MomentumStubSignal`] | Gene + `SoftVotingEnsemble` blend (P4) |
-//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | `RiskyModeManager` (P5). NOT the core `RiskManager` — it has no production constructor; see [`risk`] |
+//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | `RiskyModeManager` or the core `RiskManager`, whichever `system.trading_mode` selects (P5). Both are constructed by `neoethos-app`'s live loop, not by this crate; see [`risk`] |
 //! | [`ExecutionAdapter`] | [`execution::MockExecutionAdapter`] | cTrader `broker_api` (P5; demo vs live = the account) |
 //! | [`portfolio::PortfolioRegistry`] | explicit list / JSON manifest | promotion-artifact scan + hot-reload (P2) |
 //!

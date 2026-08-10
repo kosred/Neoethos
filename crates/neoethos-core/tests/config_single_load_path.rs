@@ -228,14 +228,24 @@ fn a_retired_key_is_accepted_and_ignored() {
 
 #[test]
 fn a_hardware_derived_key_in_a_file_is_ignored() {
-    // `n_jobs: 11` is a detector output that `Settings::save` pickled back in
-    // as an input. A file must not be able to freeze it.
-    let loaded = load_yaml("derived", "system:\n  n_jobs: 1\n  num_gpus: 7\n")
-        .expect("derived keys are ignored, not fatal");
-    assert_ne!(
-        loaded.system.num_gpus, 7,
-        "a hardware-derived field must NOT be settable from a file"
-    );
+    // `n_jobs: 11` was a detector output that `Settings::save` pickled back in
+    // as an input. The THREE hardware-derived fields — `system.n_jobs`,
+    // `system.num_gpus`, `models.inference_batch_size` — were DELETED from the
+    // structs on 2026-08-10 (audit #294); the honest source is the hardware
+    // probe. What must survive is the operator's file: his store still carries
+    // those keys, and a real store must keep loading — each key NAMED at WARN
+    // by `RETIRED_KEYS` and ignored, never fatal, and never a nameless
+    // "unknown field" refusal.
+    //
+    // There is deliberately nothing left to assert about a resulting field:
+    // the strongest statement is that the field does not exist, and the
+    // compiler makes it. If someone re-adds one, `config_has_recipient`'s
+    // ledger — which no longer names them — is what fails.
+    load_yaml(
+        "derived",
+        "system:\n  n_jobs: 1\n  num_gpus: 7\nmodels:\n  inference_batch_size: 32\n",
+    )
+    .expect("derived keys are named at WARN and ignored, not fatal");
 }
 
 // ── the prop-firm preset ordering bug ───────────────────────────────────────

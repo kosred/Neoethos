@@ -137,10 +137,12 @@ const ROOT_REGISTERED: &[(&str, &str, &str)] = &[
     (
         "risk.challenge_mode",
         "true",
-        "UNWIRED — RiskManager has no production constructor and fills its challenge targets \
-         from a hardcoded FTMO_STANDARD. Default is false; both repo files shipped true, i.e. \
-         an armed mode that does not exist. RETAINED AS INTENT: deleting it deletes the \
-         prop-firm goal, not garbage.",
+        "WIRED LIVE 2026-08-10 (#137). Default is false; both repo files ship true, and as of \
+         today that is an ACTIVE regime rather than recorded intent: \
+         `domain::risk::RiskManager::from_settings` reads it, and it chooses the anchor total \
+         drawdown is measured from (fixed challenge start vs running equity peak) and which \
+         profit target stops trading. Registered because the two sides disagree and the \
+         disagreement is now a live decision, not a dormant one.",
     ),
     (
         "risk.daily_drawdown_limit",
@@ -230,7 +232,7 @@ const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
     (
         "risk.challenge_mode",
         "true",
-        "UNWIRED — see the root entry. Retained as intent.",
+        "WIRED LIVE 2026-08-10 (#137) — see the root entry.",
     ),
     (
         "models.l1_feature_selection_enabled",

@@ -169,6 +169,83 @@ impl UnreachableCheck {
     }
 }
 
+/// U2, extracted so both of its hard cases can be tested directly.
+///
+/// `evaluated` is how many searches the judge actually ruled on. It is the
+/// number that separates a REFUTATION from a WIRING FINDING when nothing ever
+/// passed, and before 2026-08-10 nothing consulted it — so the two were the
+/// same answer and the answer was always "cannot say".
+fn u2_condition(
+    best: Option<f64>,
+    q95: Option<f64>,
+    null_obs: usize,
+    evaluated: usize,
+) -> UnreachableCondition {
+    match (best, q95) {
+        (Some(b), Some(q)) => UnreachableCondition {
+            id: "U2".to_string(),
+            satisfied: b <= q,
+            detail: format!(
+                "best live E_screen_pess {b:+.4} pips vs Q_0.95(shuffle null) {q:+.4} pips"
+            ),
+        },
+        // NOTHING EVER PASSED THE SCREEN.
+        //
+        // This arm returned `satisfied: false` unconditionally until
+        // 2026-08-10, and that is why the loop COULD NOT STOP on the one input
+        // it exists for. Driven on a no-signal world it reached 43 live sweeps
+        // with U1, U3 and U4 all satisfied, 10 of 10 blocks ruled
+        // indistinguishable from noise, zero screens passed — and ran on to its
+        // budget, because U2 read "no champion" as "no evidence". The
+        // `loop_no_signal` test did not fail; it never terminated, and was still
+        // running an hour later holding a linker lock.
+        //
+        // It is the opposite. A screen that nothing clears, after enough
+        // searching, with the control saying the blocks are noise, IS the
+        // evidence. Refusing to say so is not caution — it is a machine that can
+        // only ever ask for more compute.
+        //
+        // The distinction that keeps this honest is WHY nothing passed:
+        //   * every search RAN and none cleared the bar  -> a real refutation.
+        //   * the searches never ran, or ran and could not be read -> a wiring
+        //     or data finding, and still not evidence about the market.
+        // `screens_evaluated` counts screens the judge actually reached a
+        // verdict on, so the second case cannot borrow the first's conclusion.
+        (None, Some(q)) => {
+            let ran = evaluated >= crate::K_MIN * crate::SWEEP_SEARCHES;
+            UnreachableCondition {
+                id: "U2".to_string(),
+                satisfied: ran,
+                detail: if ran {
+                    format!(
+                        "{evaluated} searches were screened and NOT ONE produced a champion, \
+                         against a shuffle null whose Q_0.95 is {q:+.4} pips. Nothing beating \
+                         the bar is the refutation, not the absence of one."
+                    )
+                } else {
+                    format!(
+                        "no sweep produced a screened E_screen_pess and only {evaluated} \
+                         search(es) were ever screened, short of the {} this session must \
+                         evaluate before silence can mean anything. Q_0.95 = {q:+.4}. That is a \
+                         wiring or data finding, NOT evidence that the space holds no edge.",
+                        crate::K_MIN * crate::SWEEP_SEARCHES
+                    )
+                },
+            }
+        }
+        (_, None) => UnreachableCondition {
+            id: "U2".to_string(),
+            satisfied: false,
+            detail: format!(
+                "the shuffle null holds {} observation(s) and needs {}, so 'never beat its own \
+                 noise' is not yet a statement that can be made.",
+                null_obs,
+                crate::MIN_NULL_OBS
+            ),
+        },
+    }
+}
+
 /// Evaluate U1–U4, each checkable, each with its numbers.
 ///
 /// **Every condition is evaluated even after one fails.** A short-circuit would
@@ -198,34 +275,12 @@ pub fn check_unreachable(session: &Session, _th: &JudgeThresholds) -> Unreachabl
     // an unsupported claim is not a refutation.
     let null = ShuffleNull::from_session(session);
     let best = session.best_ever.as_ref().map(|b| b.e_screen_pess);
-    conditions.push(match (best, null.quantile_95()) {
-        (Some(b), Some(q)) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: b <= q,
-            detail: format!(
-                "best live E_screen_pess {b:+.4} pips vs Q_0.95(shuffle null) {q:+.4} pips"
-            ),
-        },
-        (None, Some(q)) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: false,
-            detail: format!(
-                "no sweep ever produced a screened E_screen_pess, so there is nothing to compare \
-                 against Q_0.95 = {q:+.4}. That is a wiring or data finding, NOT evidence that \
-                 the space holds no edge."
-            ),
-        },
-        (_, None) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: false,
-            detail: format!(
-                "the shuffle null holds {} observation(s) and needs {}, so 'never beat its own \
-                 noise' is not yet a statement that can be made.",
-                null.len(),
-                crate::MIN_NULL_OBS
-            ),
-        },
-    });
+    conditions.push(u2_condition(
+        best,
+        null.quantile_95(),
+        null.len(),
+        session.screens_evaluated(),
+    ));
 
     // U3 — the blocks were mostly indistinguishable from their controls.
     let blocks = session.blocks.len();
@@ -1229,5 +1284,66 @@ mod tests {
         let text = serde_json::to_string(&v).expect("verdict serialises");
         let back: SessionVerdict = serde_json::from_str(&text).expect("verdict deserialises");
         assert_eq!(v, back);
+    }
+}
+
+#[cfg(test)]
+mod unreachable_can_fire_tests {
+    use super::*;
+
+    /// A no-signal session MUST be able to say so, and the failure this catches
+    /// is not a wrong answer — it is NO ANSWER.
+    ///
+    /// Until 2026-08-10 U2 returned `satisfied: false` whenever `best_ever` was
+    /// `None`, which is precisely the state a space with no edge produces:
+    /// nothing passes the screen, so nothing becomes a champion, so there is no
+    /// best. R2 could therefore never fire, and the loop ran to its budget
+    /// instead of stopping. Measured, driven: 43 live sweeps, U1/U3/U4
+    /// satisfied, 10 of 10 blocks indistinguishable from noise, zero passes —
+    /// and no verdict. The `loop_no_signal` test did not fail either; it simply
+    /// never terminated.
+    ///
+    /// The rule now is: silence is a refutation ONLY once enough searches were
+    /// actually judged. Both halves are asserted here, because a version that
+    /// always says "unreachable" is as useless as one that never can.
+    #[test]
+    fn silence_is_a_refutation_once_enough_searches_were_judged() {
+        let enough = crate::K_MIN * crate::SWEEP_SEARCHES;
+
+        // Enough judged, nothing passed -> the loop is entitled to conclude.
+        let ran = u2_condition(None, Some(0.5), crate::MIN_NULL_OBS, enough);
+        assert!(
+            ran.satisfied,
+            "after {enough} judged screens with no champion, U2 must be satisfiable — \
+             otherwise the loop cannot state the one result it exists for. detail: {}",
+            ran.detail
+        );
+
+        // Too few judged -> the same silence proves nothing about the market.
+        let starved = u2_condition(None, Some(0.5), crate::MIN_NULL_OBS, enough.saturating_sub(1));
+        assert!(
+            !starved.satisfied,
+            "one screen short of the bar, silence is a wiring finding, not a refutation"
+        );
+        assert!(
+            starved.detail.contains("wiring or data finding"),
+            "the starved case must say WHY it is not evidence; got: {}",
+            starved.detail
+        );
+
+        // And with a champion, U2 goes back to being the comparison it always
+        // was: beating the null keeps the loop running.
+        let beat = u2_condition(Some(9.0), Some(0.5), crate::MIN_NULL_OBS, enough);
+        assert!(!beat.satisfied, "a champion above the null is not a refutation");
+        let lost = u2_condition(Some(0.1), Some(0.5), crate::MIN_NULL_OBS, enough);
+        assert!(lost.satisfied, "a champion below the null is one");
+    }
+
+    /// No null, no claim — unchanged, and still the right refusal.
+    #[test]
+    fn without_a_null_there_is_nothing_to_have_failed_to_beat() {
+        let c = u2_condition(None, None, 0, crate::K_MIN * crate::SWEEP_SEARCHES * 10);
+        assert!(!c.satisfied);
+        assert!(c.detail.contains("not yet a statement that can be made"));
     }
 }

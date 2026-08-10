@@ -138,7 +138,11 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     // ── backtest arithmetic ──
     (
         "NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY",
-        "models.backtest_runtime.initial_equity",
+        // #265 (2026-08-10): the replacement is the ACCOUNT, not a
+        // backtest-only twin. `models.backtest_runtime.initial_equity` was
+        // itself deleted — it was a second starting balance, and it was the
+        // denominator every ranked percentage was computed against.
+        "risk.initial_balance",
     ),
     (
         "NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS",

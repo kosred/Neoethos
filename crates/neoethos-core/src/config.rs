@@ -161,18 +161,18 @@ pub struct SystemConfig {
     pub poll_interval_seconds: u64,
     pub metrics_db_path: PathBuf,
     pub cache_dir: PathBuf,
-    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]` since
-    /// 2026-08-10: nothing reads this field (`config_has_recipient.rs:210-233`),
-    /// and `Settings::save` serialises the WHOLE struct on every write, so one
-    /// click on any control used to pickle the detector's answer into the YAML
-    /// as a literal. `n_jobs: 11` in the operator's live store is
-    /// `available_parallelism() - 1` on a 12-core box, frozen - and then
-    /// carried to a machine with different cores. The value is detected at
-    /// runtime; an `n_jobs:` key in a file is now named at WARN and ignored
-    /// (see `RETIRED_KEYS`). Deleting the field is blocked on `system.rs`
-    /// (AutoTuner still assigns it) - routed to `pending-A.md`.
-    #[serde(skip)]
-    pub n_jobs: usize,
+    // `n_jobs` DELETED 2026-08-10 (audit #294). It was hardware-derived, not an
+    // input: `Settings::save` serialised the detector's answer back into the
+    // YAML as a literal, so `n_jobs: 11` in the operator's store was
+    // `available_parallelism() - 1` on a 12-core box, frozen and then carried
+    // to machines with different cores. Every consumer already read
+    // `AutoTuneHints::n_jobs` / `available_parallelism()`; the field itself had
+    // no reader at all. The honest source is the hardware probe.
+    //
+    // The key stays in `load_seal::RETIRED_KEYS` (Derived) and in
+    // `system::RETIRED_DERIVED_KEYS`, so a file that still carries `n_jobs:`
+    // loads with the key NAMED at WARN, told what the machine computes instead,
+    // and pointed at `system.hardware.cpu_budget` — the knob that IS his.
     pub enable_gpu_preference: String,
     // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
     // (`discovery_auto_cap` / `discovery_max_rows` / `discovery_stream`). They
@@ -187,11 +187,13 @@ pub struct SystemConfig {
     // `load_seal::RETIRED_KEYS`, so a file that still carries them loads with
     // each one NAMED at WARN; anything not on that list is refused.
     pub enable_gpu: bool,
-    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. See `n_jobs` above.
-    /// `num_gpus: 0` in the operator's live store, on a box with a 3090, is
-    /// the same frozen detector output. `#[serde(skip)]` 2026-08-10.
-    #[serde(skip)]
-    pub num_gpus: usize,
+    // `num_gpus` DELETED 2026-08-10 (audit #294), same reason as `n_jobs`
+    // above. Every reader was already `HardwareProfile::num_gpus`
+    // (`scheduler.rs`, `cli/main.rs`), probed from the machine; the config
+    // field had none. The shipped `0` was a detector result frozen on a box
+    // with no card and then carried to a 3090. The key stays in
+    // `load_seal::RETIRED_KEYS` (Derived) and `system::RETIRED_DERIVED_KEYS`,
+    // which points the operator at `system.enable_gpu_preference`.
     pub device: String,
     pub max_training_rows_per_tf: usize,
     /// Hardware / accelerator runtime knobs. See [`HardwareConfig`].
@@ -234,10 +236,9 @@ pub struct HardwareConfig {
 
 impl Default for SystemConfig {
     fn default() -> Self {
-        let n_jobs = std::thread::available_parallelism()
-            .map(|n| (n.get() - 1).max(1))
-            .unwrap_or(1);
-
+        // No `available_parallelism()` probe here any more: `n_jobs` is gone
+        // (audit #294). A default that reads the machine is exactly how a
+        // detector output ended up serialised into the operator's YAML.
         Self {
             // F-129 fix (2026-05-25): the previous defaults hardcoded
             // `symbol = "EURUSD"` + `symbols = vec!["EURUSD"]`. Both
@@ -278,12 +279,10 @@ impl Default for SystemConfig {
             poll_interval_seconds: 60,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
             cache_dir: PathBuf::from("cache"),
-            n_jobs,
             enable_gpu_preference: "auto".to_string(),
             // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
             // (see struct decl). The real row cap is `models.prop_search_max_rows`.
             enable_gpu: false,
-            num_gpus: 0,
             device: "cpu".to_string(),
             max_training_rows_per_tf: 0,
             hardware: HardwareConfig::default(),
@@ -380,11 +379,15 @@ pub struct RiskConfig {
     #[serde(default)]
     pub preset: PropFirmPreset,
     pub initial_balance: f64,
-    /// WARNING UNWIRED - `RiskManager` has no production constructor; every
-    /// `RiskManager::new` in the workspace is inside its own test module. This
-    /// is RETAINED AS INTENT (it records the operator's monthly floor and is
-    /// seeded from the active preset) but no live decision reads it.
-    /// See `tests/config_has_recipient.rs::UNWIRED`.
+    /// The operator's monthly net-profit target, seeded from the active preset.
+    ///
+    /// Two live readers, both added after this doc said "UNWIRED":
+    /// `neoethos-autoresearch/src/goals.rs` optimises the loop TOWARD it and
+    /// refuses to start when it is 0.0, and — since 2026-08-10 (audit #137) —
+    /// `domain::risk::RiskManager` uses it as a STOP: with
+    /// `challenge_mode: false`, once the account is up this much on the month
+    /// the prop-firm gate refuses new entries until the next UTC month. A
+    /// target that is reached is a reason to stop, not to keep pressing.
     pub monthly_profit_target_pct: f64,
     pub min_risk_per_trade: f64,
     pub max_risk_per_trade: f64,
@@ -401,13 +404,26 @@ pub struct RiskConfig {
     /// every candidate break the firm's daily rule on its first loss, so the
     /// search could never return anything — with nothing on screen explaining
     /// why. Set these once and each mode keeps its own sizing forever.
-    #[serde(default)]
+    /// NO FIELD-LEVEL `#[serde(default)]` ON THESE FOUR — deleted 2026-08-10,
+    /// and it is not a tidy-up.
+    ///
+    /// `RiskConfig` already carries `#[serde(default)]` at the container, which
+    /// fills a missing field from `RiskConfig::default()`. A field-level
+    /// `#[serde(default)]` OVERRIDES that with `Option::<f64>::default()`, i.e.
+    /// `None` — so for these four, and only these four, an ABSENT KEY COULD NOT
+    /// MEAN THE DEFAULT. It meant `None`.
+    ///
+    /// That silently broke the overrides-only store: pruning
+    /// `prop_firm_max_risk_per_trade: 0.01` because it equalled the new default
+    /// wrote a file that reloaded as `None`, which then fell back to
+    /// `risk_per_trade` — 3%, not the 1% the operator ruled. Caught by
+    /// `config normalize`'s round-trip check, which restored the backup rather
+    /// than leave a store whose meaning had changed.
+    ///
+    /// Two rules for "what does absence mean" is one rule too many.
     pub risky_min_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub risky_max_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub prop_firm_min_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub prop_firm_max_risk_per_trade: Option<f64>,
     /// Portfolio-level cap on TOTAL concurrent risk across all running live
     /// engines, as a balance fraction (e.g. 0.05 = at most ~5% of the account
@@ -434,19 +450,36 @@ pub struct RiskConfig {
     /// autopilot, which always places a bracket (the gene's, or the kernel's
     /// 20/40-pip defaults).
     pub require_stop_loss: bool,
-    /// WARNING UNWIRED - `RiskManager` has no production constructor, so
-    /// nothing reads this. Both repo YAMLs ship `challenge_mode: true` against
-    /// a `Default` of `false`: a mode that does not exist has been deliberately
-    /// armed. RETAINED AS INTENT; do not read the `true` as an active regime.
-    pub challenge_mode: bool,
-    /// ⚠ UNWIRED — nothing reads this field.
+    /// WIRED LIVE 2026-08-10 (audit #137). Read by
+    /// `domain::risk::RiskManager::from_settings`, which
+    /// `neoethos-app/src/app_services/live_trading.rs` builds for every engine
+    /// whose `system.trading_mode` is not `risky`.
     ///
-    /// The mechanism it was written for exists:
-    /// `PropFirmPhaseRiskDefaults::for_preset(preset, challenge_phase)` in
-    /// `domain/prop_firm.rs` takes exactly this string and returns per-phase
-    /// risk defaults. Its only callers are that module's own `#[cfg(test)]`
-    /// block. Wiring the two together would change live sizing, so it is NOT
-    /// done silently here — see `tests/config_has_recipient.rs::UNWIRED`.
+    /// It decides TWO things, both of which change what is refused:
+    ///
+    /// * the anchor total drawdown is measured from — `true` uses the FIXED
+    ///   challenge starting equity (how FTMO measures it), `false` uses the
+    ///   running equity PEAK, which is a trailing drawdown and therefore the
+    ///   stricter of the two once the account is in profit;
+    /// * which profit target stops trading — the preset's challenge target
+    ///   (`true`) or `monthly_profit_target_pct` (`false`).
+    ///
+    /// Both repo YAMLs ship `true` against a `Default` of `false`; from today
+    /// that is an ACTIVE regime, not recorded intent.
+    pub challenge_mode: bool,
+    /// WIRED LIVE 2026-08-10 (audit #137). Selects
+    /// `PropFirmPhaseRiskDefaults::for_preset(preset, challenge_phase)` inside
+    /// `domain::risk::RiskManager::from_settings`, which uses two of its
+    /// numbers on the live prop-firm path:
+    ///
+    /// * `max_risk_per_trade` — min-ed with the operator's own ceiling
+    ///   (`prop_firm_max_risk_per_trade`, falling back to
+    ///   `max_risk_per_trade`) to produce the per-trade clamp EVERY prop-firm
+    ///   entry passes through. THE LOWER ONE BINDS, so changing the phase can
+    ///   only ever shrink an entry relative to the other number, never lift it.
+    /// * `min_confidence_threshold` — the entry gate's confidence floor. It can
+    ///   only be evaluated when `models.live_ml_gate` measures a confidence;
+    ///   with that gate off nothing does, and no stand-in value is invented.
     pub challenge_phase: String,
     // `prop_firm_rules: bool` DELETED 2026-08-10 (knob-second-pass D6). It was
     // literally `preset != PropFirmPreset::None` — one write from the Risk
@@ -473,18 +506,42 @@ pub struct RiskConfig {
     /// `max_trades_per_day: 0` disables the cap like the other risk caps.
     #[serde(default)]
     pub max_trades_per_day_enabled: bool,
-    /// ⚠ UNWIRED — nothing reads this field; setting it `false` does NOT
-    /// disable recovery mode.
+    /// WIRED LIVE 2026-08-10 (audit #137). Arms the drawdown-RECOVERY
+    /// behaviour of `domain::risk::RiskManager` on the prop-firm path:
+    /// `update_recovery_state` (which halves the per-trade ceiling once the
+    /// day's loss passes the warning level), the early HALT band, the recovery
+    /// entry cap, and the caution/defensive/recovery size multipliers. All of
+    /// their thresholds come from the selected preset's
+    /// `PropFirmRuntimeDefaults`.
     ///
-    /// `RiskManager::update_recovery_state` (domain/risk.rs) flips
-    /// `RiskManager.recovery_mode` purely from the drawdown vs
-    /// `daily_dd_warning_pct`, consulting no operator toggle. `RiskManager`
-    /// has no production constructor at all — every `RiskManager::new` call
-    /// in the workspace is inside its own test module — so there is no live
-    /// call site to wire this into. See
-    /// `tests/config_has_recipient.rs::UNWIRED`.
+    /// Setting it `false` is the LOOSER direction: it removes the early halt
+    /// and the recovery tapering. It does NOT touch `daily_drawdown_limit` or
+    /// `total_drawdown_limit` — those are the operator's own caps and are never
+    /// optional, so the hard stops stand either way.
     pub recovery_mode_enabled: bool,
     pub feature_drift_threshold: f64,
+    /// Confidence at/above which a trade is sized at `max_risk_per_trade`.
+    /// The third term of the confidence-scaled sizing formula the search
+    /// backtests with, beside `min_risk_per_trade` / `max_risk_per_trade`:
+    ///
+    /// ```text
+    /// risk_pct = min + (max - min) * min(confidence / high_quality_confidence, 1)
+    /// ```
+    ///
+    /// WIRED 2026-08-10 (audit #294). Before that the consumer read
+    /// `BacktestSettings::high_quality_confidence`, which defaulted to 0.65
+    /// and was assigned nowhere outside `#[cfg(test)]`. The two 0.65s agreed,
+    /// which is exactly why nobody noticed: editing this value moved nothing
+    /// and looked like it had worked. It now reaches the evaluator through
+    /// `DiscoveryConfig::from_settings` → `discovery_backtest_settings`, the
+    /// same route its two neighbours take, and is recorded in the run profile.
+    ///
+    /// Range (0, 1]. A value outside it is REFUSED back to 0.65 and logged
+    /// with both numbers: the sizing math treats a non-positive or non-finite
+    /// normaliser as "every signal is max quality", i.e. every trade at
+    /// `max_risk_per_trade` — the loosest possible outcome, arrived at by a
+    /// typo. LOWER values are LOOSER (max risk reached sooner); higher values
+    /// are tighter.
     pub high_quality_confidence: f64,
     pub atr_period: usize,
     pub atr_stop_multiplier: f64,
@@ -540,35 +597,44 @@ pub struct RiskConfig {
     /// not create edge, it stops the search from selecting on a subsidy.
     pub commission_per_lot_is_per_side: bool,
     pub backtest_spread_pips: f64,
-    /// Session-aware backtest spread, in pips, for the three UTC buckets the
-    /// evaluator resolves per bar (`eval::SessionSpreadProfile::spread_pips_at`):
-    /// Asian = hours 22–07, Overlap (London/NY) = 07–16, Late NY = 16–22.
+    /// Where the session-spread curve comes from. **One knob, one source** —
+    /// see [`SessionSpreadSource`].
     ///
-    /// The mechanism has existed on both the CPU path (`eval.rs:843`) and the
-    /// CUDA kernel (`prototype_b_population.cu:47 spread_pips_for_bar`) for
-    /// months, and **it was never populated outside `#[cfg(test)]`**: every
-    /// production construction site left `session_spread_profile: None`, so a
-    /// flat `backtest_spread_pips` was charged at 03:00 Tokyo and at the London
-    /// open alike. Setting all three of these keys is what turns the curve on.
+    /// **Replaces `backtest_spread_pips_{asian,overlap,late_ny}` (audit #69,
+    /// 2026-08-10).** Those three were ONE GLOBAL TRIPLE. The broker's own
+    /// recorded curve spans EURUSD ≈ 0.16 pips to GBPTRY ≈ 552 pips, so a
+    /// single triple is not a cost model — it is one symbol's cost charged to
+    /// every symbol. The three keys are DELETED and listed in
+    /// `load_seal::RETIRED_KEYS`, so a store that still carries them loads with
+    /// each one named at WARN.
+    pub session_spread_source: SessionSpreadSource,
+    /// The operator's own per-symbol curves, in pips, read ONLY when
+    /// `session_spread_source == Explicit`.
     ///
-    /// All three must be set together, or none. A partial setting is a config
-    /// ERROR, not a silent fall-back to flat — half a curve is a cost model
-    /// nobody can reason about. `slippage_pips` is added to each bucket exactly
-    /// as it is added to `backtest_spread_pips`.
+    /// Keys are symbol names as the broker spells them (matched
+    /// case-insensitively). Each value carries all three buckets as MANDATORY
+    /// fields, so a half-configured curve is a load ERROR rather than a silent
+    /// fall-back to flat — that refusal is the one thing the old three-key
+    /// shape got right and it is kept, now enforced by the type.
     ///
-    /// Left unset by default because this project does not invent broker
-    /// numbers (see the F-301 fail-loud note on the synthetic-spread removal).
+    /// A symbol that is not in this map has NO curve: the run charges the flat
+    /// `backtest_spread_pips` for it and says so. Absent is correct; invented
+    /// is not.
     ///
-    /// The measurement already exists: `neoethos-app`'s `spread_stats` service
-    /// samples the live tick cache once a minute and accumulates per-(symbol,
-    /// UTC-hour) mean and max spread into `<data_dir>/spread_stats.json`. Its
-    /// module header names the eval kernels as its intended consumer — this is
-    /// that consumer. Average the hourly means over 22–07, 07–16 and 16–22 and
-    /// set the three keys. Until you do, the run WARNs that it is charging a
-    /// flat spread.
-    pub backtest_spread_pips_asian: Option<f64>,
-    pub backtest_spread_pips_overlap: Option<f64>,
-    pub backtest_spread_pips_late_ny: Option<f64>,
+    /// Setting this while `session_spread_source` is not `Explicit` is a
+    /// refusal, not a warning — a map that reaches nothing is exactly the
+    /// "saved value, green config, no change in behaviour" defect.
+    #[serde(serialize_with = "serialize_sorted_map")]
+    pub session_spread_pips_by_symbol: HashMap<String, SessionSpreadCurve>,
+    /// Minimum recorded ticks a bucket must have before `Measured` will adopt
+    /// it, per symbol per bucket.
+    ///
+    /// `0` means "any bucket that has at least one sample" — it does NOT mean
+    /// unlimited and it does NOT admit a bucket with zero samples, because a
+    /// bucket with no ticks has no mean to adopt. A symbol whose 22–07 / 07–16
+    /// / 16–22 buckets are not ALL at or above this floor has no measured
+    /// curve at all; it does not get a partial one.
+    pub session_spread_min_samples: u64,
     /// Round-trip cost band, in pips, that every reported result is measured
     /// against — never a single "true cost" number.
     ///
@@ -633,7 +699,7 @@ impl Default for RiskConfig {
             risky_min_risk_per_trade: None,
             risky_max_risk_per_trade: Some(0.30),
             prop_firm_min_risk_per_trade: None,
-            prop_firm_max_risk_per_trade: None,
+            prop_firm_max_risk_per_trade: Some(0.01),  // LOCKED 2026-08-10: his ruling: 1% for prop firm. Was None, which fell back to risk_per_trade 0.03
             // Portfolio-level concurrent-risk cap. WAS 0.0 UNTIL 2026-08-10,
             // where 0 meant "disabled" — i.e. a knob named max_ shipped meaning
             // NO CAP AT ALL, on every install, chosen by nobody. Nothing about
@@ -663,7 +729,7 @@ impl Default for RiskConfig {
             min_risk_reward: 2.0,
             max_lot_size: runtime.max_lot_size,
             require_stop_loss: true,
-            challenge_mode: false,
+            challenge_mode: true,  // LOCKED 2026-08-10: prop_firm is the default trading_mode; a prop-firm install IS in a challenge
             challenge_phase: "phase_1".to_string(),
             kill_zones_enabled: true,
             // Cap is preset-driven. FTMO defaults to 15; The5%ers is
@@ -687,11 +753,18 @@ impl Default for RiskConfig {
             // this changes.
             commission_per_lot_is_per_side: true,
             backtest_spread_pips: 1.5,
-            // Unset: no broker per-hour curve has been measured for this
-            // install. The run WARNs and charges the flat spread.
-            backtest_spread_pips_asian: None,
-            backtest_spread_pips_overlap: None,
-            backtest_spread_pips_late_ny: None,
+            // FLAT by default: adopting the recorded broker curve makes every
+            // backtest CHEAPER (the measured EURUSD overlap mean is 0.156 pips
+            // against the flat 1.5 charged here — roughly one seventh), which
+            // changes which strategies rank. That is the operator's call to
+            // make, not a default that arrives with an update. The run WARNs,
+            // once, that it is charging a flat spread.
+            session_spread_source: SessionSpreadSource::Flat,
+            session_spread_pips_by_symbol: HashMap::new(),
+            // 30 ticks per bucket. The sampler records one tick per symbol per
+            // minute, so 30 is half an hour of that UTC bucket actually
+            // observed — below that the "mean" is an anecdote.
+            session_spread_min_samples: 30,
             cost_band_optimistic_pips: 1.6,
             cost_band_pessimistic_pips: 2.4,
             conformal_enabled: true,
@@ -715,62 +788,314 @@ impl Default for RiskConfig {
 /// late_ny]`, matching the UTC buckets 22–07 / 07–16 / 16–22.
 pub type SessionSpreadPips = [f64; 3];
 
-impl RiskConfig {
-    /// Resolve the operator's session-spread curve.
-    ///
-    /// - `Ok(None)` — none of the three keys is set. The evaluator charges the
-    ///   flat `backtest_spread_pips` at every hour of the day. This is the
-    ///   shipped default and the caller is expected to say so out loud.
-    /// - `Ok(Some(curve))` — all three set, finite and non-negative.
-    /// - `Err(reason)` — a PARTIAL curve, or a non-finite / negative bucket.
-    ///   Refused rather than repaired: a cost model that is two-thirds
-    ///   configured charges numbers nobody chose.
-    pub fn session_spread_pips(&self) -> Result<Option<SessionSpreadPips>, String> {
-        let named = [
-            ("backtest_spread_pips_asian", self.backtest_spread_pips_asian),
-            (
-                "backtest_spread_pips_overlap",
-                self.backtest_spread_pips_overlap,
-            ),
-            (
-                "backtest_spread_pips_late_ny",
-                self.backtest_spread_pips_late_ny,
-            ),
-        ];
-        let set: Vec<&str> = named
-            .iter()
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-        if set.is_empty() {
-            return Ok(None);
-        }
-        if set.len() != named.len() {
-            let missing: Vec<&str> = named
-                .iter()
-                .filter(|(_, v)| v.is_none())
-                .map(|(k, _)| *k)
-                .collect();
-            return Err(format!(
-                "session spread curve is partially configured: {} set, {} missing. All three \
-                 buckets must be given together (Asian 22–07 UTC, Overlap 07–16, Late NY 16–22) \
-                 or none — a partial curve would charge an unchosen number for a third of every \
-                 trading day.",
-                set.join(", "),
-                missing.join(", ")
-            ));
-        }
-        let mut out = [0.0f64; 3];
-        for (slot, (key, value)) in out.iter_mut().zip(named.iter()) {
-            let v = value.unwrap_or(f64::NAN);
+/// Where a session-spread curve is allowed to come from. Exactly one source,
+/// chosen by the operator — there is no precedence ladder and no fallback from
+/// one source to another, because "which of my two spread settings won?" is the
+/// question this key exists to make unaskable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSpreadSource {
+    /// No curve. The flat `backtest_spread_pips` is charged at 03:00 Tokyo and
+    /// at the London open alike. Shipped default; the run says so at WARN.
+    #[default]
+    Flat,
+    /// The broker's OWN recorded ticks:
+    /// `<system.data_dir>/spread_stats.json`, written by `neoethos-app`'s
+    /// `spread_stats` sampler (one tick per symbol per minute, accumulated per
+    /// UTC hour with a sample count). Sample-weighted means over 22–07 / 07–16
+    /// / 16–22, per symbol. A symbol with no samples gets NO curve.
+    Measured,
+    /// `session_spread_pips_by_symbol`, typed by the operator.
+    Explicit,
+}
+
+/// One symbol's session-spread curve, in pips.
+///
+/// All three buckets are mandatory fields with no `Default`, so a YAML entry
+/// that gives two of them fails the load by name. That is deliberate: half a
+/// curve charges a number nobody chose for a third of every trading day.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSpreadCurve {
+    /// UTC 22:00–07:00.
+    pub asian: f64,
+    /// UTC 07:00–16:00 (London/NY overlap).
+    pub overlap: f64,
+    /// UTC 16:00–22:00.
+    pub late_ny: f64,
+}
+
+impl SessionSpreadCurve {
+    /// `[asian, overlap, late_ny]`, or the reason this curve is unusable.
+    pub fn validated(&self, who: &str) -> Result<SessionSpreadPips, String> {
+        for (name, v) in [
+            ("asian", self.asian),
+            ("overlap", self.overlap),
+            ("late_ny", self.late_ny),
+        ] {
             if !v.is_finite() || v < 0.0 {
                 return Err(format!(
-                    "{key} = {v} is not a usable spread (must be finite and >= 0)"
+                    "{who}.{name} = {v} is not a usable spread (must be finite and >= 0)"
                 ));
             }
-            *slot = v;
         }
-        Ok(Some(out))
+        Ok([self.asian, self.overlap, self.late_ny])
+    }
+}
+
+/// What a per-symbol session-spread lookup decided, and where it came from.
+///
+/// Every arm is reportable: the caller is expected to print which one it got.
+/// There is no arm that means "I guessed".
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSpreadDecision {
+    /// `session_spread_source: flat`. Charge the flat spread, and say so.
+    Flat,
+    /// A curve for THIS symbol, in pips, `[asian, overlap, late_ny]`.
+    Curve {
+        pips: SessionSpreadPips,
+        source: SessionSpreadSource,
+        /// Ticks behind each bucket. `Some` only for [`SessionSpreadSource::Measured`].
+        samples: Option<[u64; 3]>,
+    },
+    /// The source was asked for a curve and this symbol has none.
+    ///
+    /// NOT an error and NOT an invented number: the caller charges the flat
+    /// spread — which at the shipped 1.5 pips is the MORE expensive number, so
+    /// the missing measurement costs the candidate money rather than earning it
+    /// any — and reports the symbol and the file by name.
+    NoCurveForSymbol {
+        symbol: String,
+        source: SessionSpreadSource,
+        detail: String,
+    },
+}
+
+/// Hours belonging to each bucket, in the contract order `[asian, overlap,
+/// late_ny]`. Asian wraps midnight; every hour 0..24 appears exactly once, which
+/// the `session_spread_buckets_partition_the_day` test pins.
+const SESSION_SPREAD_BUCKET_HOURS: [&[usize]; 3] = [
+    &[22, 23, 0, 1, 2, 3, 4, 5, 6],
+    &[7, 8, 9, 10, 11, 12, 13, 14, 15],
+    &[16, 17, 18, 19, 20, 21],
+];
+
+/// The on-disk shape of `<data_dir>/spread_stats.json`, as written by
+/// `neoethos_app::app_services::spread_stats`.
+///
+/// Declared here — in the crate that has to READ it to price a backtest —
+/// rather than reaching into the app crate, which `neoethos-core` does not (and
+/// must not) depend on. The field names are the contract; the
+/// `spread_stats_field_names_match_the_recorder` test pins them against a
+/// literal sample of the real file so a rename on the writing side fails a test
+/// instead of silently resolving every symbol to "no measurement".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpreadStatsFileWire {
+    symbols: HashMap<String, SymbolSpreadStatsWire>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SymbolSpreadStatsWire {
+    /// Index = UTC hour, 24 entries once the symbol has been touched.
+    hourly: Vec<HourSpreadStatsWire>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HourSpreadStatsWire {
+    samples: u64,
+    mean_pips: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_pips: f64,
+}
+
+impl RiskConfig {
+    /// Resolve the session-spread curve **for one symbol** (audit #69).
+    ///
+    /// This is the single resolution point for the per-bar spread the
+    /// evaluators charge. `data_dir` is `system.data_dir` — the `Measured`
+    /// source reads `<data_dir>/spread_stats.json`, which is where the app's
+    /// sampler writes the broker's own recorded ticks. It is a parameter and
+    /// not a second config key: there is exactly one data root and
+    /// `SystemConfig` owns it.
+    ///
+    /// `Err` is a configuration the operator has to fix — a map that reaches
+    /// nothing, a source that was asked for a map and given none, an unusable
+    /// number, or a stats file that exists but cannot be parsed. It is never a
+    /// missing measurement: that is [`SessionSpreadDecision::NoCurveForSymbol`],
+    /// which charges the flat spread and names the symbol.
+    ///
+    /// The returned pips are the SPREAD ONLY. `slippage_pips` is added by the
+    /// caller to every bucket, exactly as it is added to the flat
+    /// `backtest_spread_pips`, so the two paths charge the same thing when the
+    /// curve is uniform.
+    pub fn session_spread_pips(
+        &self,
+        symbol: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<SessionSpreadDecision, String> {
+        let source = self.session_spread_source;
+        let map = &self.session_spread_pips_by_symbol;
+
+        // A knob that changes nothing is a lie to the operator: a per-symbol map
+        // typed under a source that does not read it is refused by name, not
+        // ignored with a green config.
+        if !map.is_empty() && source != SessionSpreadSource::Explicit {
+            return Err(format!(
+                "risk.session_spread_pips_by_symbol has {} entr{} but \
+                 risk.session_spread_source is {:?}, which never reads it. Set \
+                 session_spread_source: explicit to use the map, or delete the map.",
+                map.len(),
+                if map.len() == 1 { "y" } else { "ies" },
+                source
+            ));
+        }
+
+        match source {
+            SessionSpreadSource::Flat => Ok(SessionSpreadDecision::Flat),
+            SessionSpreadSource::Explicit => {
+                if map.is_empty() {
+                    return Err(
+                        "risk.session_spread_source is `explicit` but \
+                         risk.session_spread_pips_by_symbol is empty — there is no curve to \
+                         charge. Give at least the symbols you search, or set \
+                         session_spread_source: flat / measured."
+                            .to_string(),
+                    );
+                }
+                let hit = map
+                    .iter()
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case(symbol.trim()));
+                match hit {
+                    Some((key, curve)) => Ok(SessionSpreadDecision::Curve {
+                        pips: curve.validated(&format!(
+                            "risk.session_spread_pips_by_symbol.{key}"
+                        ))?,
+                        source,
+                        samples: None,
+                    }),
+                    None => Ok(SessionSpreadDecision::NoCurveForSymbol {
+                        symbol: symbol.to_string(),
+                        source,
+                        detail: format!(
+                            "risk.session_spread_pips_by_symbol has no entry for this symbol \
+                             (it has: {})",
+                            {
+                                let mut names: Vec<&str> =
+                                    map.keys().map(String::as_str).collect();
+                                names.sort_unstable();
+                                names.join(", ")
+                            }
+                        ),
+                    }),
+                }
+            }
+            SessionSpreadSource::Measured => {
+                let path = data_dir.join("spread_stats.json");
+                let raw = match std::fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(SessionSpreadDecision::NoCurveForSymbol {
+                            symbol: symbol.to_string(),
+                            source,
+                            detail: format!(
+                                "{} does not exist — nothing has recorded this broker's \
+                                 per-hour spread yet. Run the app connected to the broker; \
+                                 the sampler writes one tick per symbol per minute.",
+                                path.display()
+                            ),
+                        });
+                    }
+                    // A file that exists and cannot be read is a real fault, not
+                    // an absent measurement. Refuse rather than quietly pricing
+                    // the run flat and calling it "measured".
+                    Err(e) => {
+                        return Err(format!(
+                            "risk.session_spread_source is `measured` but {} could not be \
+                             read: {e}",
+                            path.display()
+                        ));
+                    }
+                };
+                let file: SpreadStatsFileWire = serde_json::from_str(&raw).map_err(|e| {
+                    format!(
+                        "risk.session_spread_source is `measured` but {} is not parseable \
+                         spread statistics: {e}",
+                        path.display()
+                    )
+                })?;
+                let hit = file
+                    .symbols
+                    .iter()
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case(symbol.trim()));
+                let Some((_, stats)) = hit else {
+                    return Ok(SessionSpreadDecision::NoCurveForSymbol {
+                        symbol: symbol.to_string(),
+                        source,
+                        detail: format!(
+                            "{} has no samples for this symbol. NEVER invent a spread for a \
+                             symbol nobody measured — the flat spread is charged instead.",
+                            path.display()
+                        ),
+                    });
+                };
+                let min_samples = self.session_spread_min_samples;
+                let mut pips = [0.0f64; 3];
+                let mut samples = [0u64; 3];
+                for (bucket, hours) in SESSION_SPREAD_BUCKET_HOURS.iter().enumerate() {
+                    // Sample-WEIGHTED mean: each hour's recorded mean carries the
+                    // weight of the ticks behind it, so a thin 03:00 hour cannot
+                    // out-vote a dense 09:00 one.
+                    let mut weighted = 0.0f64;
+                    let mut count = 0u64;
+                    for &h in hours.iter() {
+                        let Some(entry) = stats.hourly.get(h) else {
+                            continue;
+                        };
+                        if entry.samples == 0
+                            || !entry.mean_pips.is_finite()
+                            || entry.mean_pips < 0.0
+                        {
+                            continue;
+                        }
+                        weighted += entry.mean_pips * entry.samples as f64;
+                        count += entry.samples;
+                    }
+                    if count == 0 || count < min_samples {
+                        return Ok(SessionSpreadDecision::NoCurveForSymbol {
+                            symbol: symbol.to_string(),
+                            source,
+                            detail: format!(
+                                "the {} bucket has {count} recorded tick(s) in {}, below \
+                                 risk.session_spread_min_samples = {min_samples}. A symbol \
+                                 does not get a partial curve: two measured buckets and one \
+                                 guessed one is the defect this key replaced.",
+                                ["22-07 UTC", "07-16 UTC", "16-22 UTC"][bucket],
+                                path.display()
+                            ),
+                        });
+                    }
+                    pips[bucket] = weighted / count as f64;
+                    samples[bucket] = count;
+                }
+                let curve = SessionSpreadCurve {
+                    asian: pips[0],
+                    overlap: pips[1],
+                    late_ny: pips[2],
+                };
+                Ok(SessionSpreadDecision::Curve {
+                    pips: curve.validated(&format!("{} [{symbol}]", path.display()))?,
+                    source,
+                    samples: Some(samples),
+                })
+            }
+        }
     }
 
     /// The commission this account pays for a COMPLETE round trip on one lot,
@@ -815,13 +1140,27 @@ pub struct ModelsConfig {
     pub rllib_num_workers: usize,
     pub auto_enable_rllib: bool,
     pub use_neuroevolution: bool,
-    /// ⚠ UNWIRED — nothing reads this field.
+    /// Population size of the neuro-evolution (NEAT) expert's search.
     ///
-    /// `NeatTrainer` has a `population_size`, but it is hardcoded (96 in
-    /// `NeatConfig::default`, floored at 24 in `with_config`) and never
-    /// sourced from config. Connecting this field's default of 5 to it would
-    /// collapse the NEAT population 19-fold, so it is NOT wired silently —
-    /// see `tests/config_has_recipient.rs::UNWIRED`.
+    /// WIRED 2026-08-10 (audit #294). Until then this field had no reader at
+    /// all: `NeatExpert` carried a hardcoded 96 and the orchestrator's NEAT
+    /// params were derived from `evo_population` — a knob whose name says
+    /// CR-FM-NES. Connecting the old default of 5 would have collapsed every
+    /// NEAT run 19-fold, so the default moved to 96 in the SAME change that
+    /// wired it (`training_orchestrator::default_model_params("neat")` is the
+    /// single reader; `NeatExpert::with_config` still floors it at 24).
+    ///
+    /// ⚠ 96 IS AN ARBITRARY SMALL NUMBER, and this comment is here so the next
+    /// reader knows it. Model CAPACITY — population, layer widths, epochs —
+    /// is a property that should be MEASURED per model on real data, not
+    /// written as a literal by whoever typed the constructor first. The seam
+    /// that makes it searchable is already here: this is one config field with
+    /// one reader, so the goal-driven loop
+    /// (`neoethos-autoresearch`, whose factor space already carries a
+    /// `population` axis) can propose values for it exactly the way it
+    /// proposes search population, and the run profile records what was used.
+    /// That search is NOT built here — wiring the knob and searching the knob
+    /// are two different changes, and this one is the wiring.
     pub rl_population_size: usize,
     pub rl_timesteps: usize,
     pub rl_eval_episodes: usize,
@@ -1023,14 +1362,15 @@ pub struct ModelsConfig {
     /// it. Previously hardcoded $7/lot in discovery.rs.
     pub prop_search_sensitivity_commission_per_lot: f64,
     pub train_batch_size: usize,
-    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]`
-    /// 2026-08-10. Zero readers (`config_has_recipient.rs:210-233`);
-    /// `HardwareExecutionPlan::inference_batch_size` (`system.rs:1466-1477`)
-    /// computes it from the probe and hands it to the consumer as a parameter
-    /// rather than writing it back into `Settings`. Deleting the field is
-    /// blocked on `system.rs` - routed to `pending-A.md`.
-    #[serde(skip)]
-    pub inference_batch_size: usize,
+    // `inference_batch_size` DELETED 2026-08-10 (audit #294), the third
+    // hardware-derived field. `HardwareExecutionPlan::inference_batch_size`
+    // computes it from the probe and hands it to the consumer as a parameter;
+    // the config field had no reader. It shipped 32 in both repo files — a
+    // value the hardware plan would never produce (it emits
+    // 128/1024/2048/4096/8192) — and wiring it would have let a config value
+    // override a hardware-derived batch size, which has NEVER-OOM
+    // implications. The key stays in `load_seal::RETIRED_KEYS` (Derived) and
+    // `system::RETIRED_DERIVED_KEYS`.
     pub enable_transformer_expert: bool,
     /// WARNING ARITHMETIC TWIN of `transformer_n_heads` (below): both are read
     /// and collapsed by `.max()` at `training_orchestrator.rs:886-892`, with no
@@ -2064,8 +2404,21 @@ impl EnsembleVotingConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BacktestRuntimeConfig {
-    /// Starting equity for canonical backtest PnL accounting (> 0).
-    pub initial_equity: f64,
+    // `initial_equity` DELETED 2026-08-10 (audit #265). It was a SECOND
+    // starting balance: 100 000 here against `risk.initial_balance` 10 000, and
+    // this one was the denominator of every percentage the search ranks on —
+    // net return %, max drawdown %, max daily loss %, and the slot-7
+    // "4% of the month's starting equity" bar. Out of the box the search
+    // therefore ranked candidates by percentages of a balance ten times the
+    // account, while the prop-firm and regime gates in `discovery.rs` divided
+    // the SAME trade stream by `risk.initial_balance`. Two denominators, one
+    // trade stream, and nothing said so.
+    //
+    // The operator's decision: the balance is READ FROM THE REAL ACCOUNT at
+    // demo/live time, so it is `risk.initial_balance` and there is no second
+    // one. `neoethos_search::eval::BacktestRuntimeOverrides::from_settings`
+    // takes it from there. The key is in `RETIRED_KEYS`, so a store that still
+    // carries it loads with the key NAMED at WARN.
     /// Max monthly PnL buckets retained for consistency math (> 0).
     pub month_capacity: usize,
     /// Explicit rayon thread-pool size. `None` → one worker per logical
@@ -2076,7 +2429,6 @@ pub struct BacktestRuntimeConfig {
 impl Default for BacktestRuntimeConfig {
     fn default() -> Self {
         Self {
-            initial_equity: 100_000.0,
             month_capacity: 240,
             rayon_threads: None,
         }
@@ -2458,7 +2810,17 @@ impl Default for ModelsConfig {
             rllib_num_workers: 0,
             auto_enable_rllib: true,
             use_neuroevolution: true,
-            rl_population_size: 5,
+            // 96 (audit #294, operator decision "GO WITH 96"): the number
+            // `NeatExpert::new` and `NeatArtifact::default` carried as a
+            // literal before this field reached them. NOT the old default of
+            // 5 — wiring that would have collapsed every NEAT run 19-fold.
+            //
+            // Honest about what this moves: at the shipped defaults the NEAT
+            // expert previously trained at `evo_population.max(48)` = 48, so
+            // this doubles its population to 96. That costs TRAINING TIME per
+            // generation and nothing else — it does not touch position size,
+            // refusals, or any live decision.
+            rl_population_size: 96,
             rl_timesteps: 10_000_000,
             rl_eval_episodes: 15,
             rl_network_arch: vec![4096, 4096, 4096, 2048, 1024],
@@ -2476,7 +2838,7 @@ impl Default for ModelsConfig {
             rl_reward_horizon: 0,
             rl_episode_len: 0,
             rl_train_seconds: 3600,
-            exit_agent_hidden_dim: 64,
+            exit_agent_hidden_dim: 128,  // LOCKED 2026-08-10: model capacity: 64 was another arbitrary small number
             exit_agent_gamma: 0.99,
             exit_agent_epsilon: 0.20,
             exit_agent_epsilon_min: 0.05,
@@ -2487,13 +2849,13 @@ impl Default for ModelsConfig {
             evo_train_seconds: 3600,
             evo_hidden_size: 64,
             evo_population: 32,
-            evo_islands: 4,
+            evo_islands: 8,  // LOCKED 2026-08-10
             evo_sigma: 0.25,
-            prop_search_enabled: false,
+            prop_search_enabled: true,  // LOCKED 2026-08-10: the search is the product; shipping it off is shipping nothing
             prop_search_population: 100,
             prop_search_population_auto: false,
-            prop_search_generations: 50,
-            prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
+            prop_search_generations: 1000,  // LOCKED 2026-08-10: 50 generations is a smoke test, not a search
+            prop_search_max_hours: 24.0,  // LOCKED 2026-08-10: 0.5h is a smoke test; a real search runs for a day.
             prop_search_max_rows: 0,
             prop_search_max_rows_by_tf: HashMap::new(),
             prop_search_portfolio_size: 3000,
@@ -2504,12 +2866,12 @@ impl Default for ModelsConfig {
             // pinned the whole GA (~97% of a run) to the CPU while validation
             // used the card, the 8-month asymmetry. Falls back to CPU with no card.
             prop_search_device: "auto".to_string(),
-            prop_search_train_years: 0,
-            prop_search_val_years: 0,
+            prop_search_train_years: 8,  // LOCKED 2026-08-10: 0 meant no declared training span
+            prop_search_val_years: 1,  // LOCKED 2026-08-10: 0 meant no declared validation span
             prop_search_val_candidates: 0,
             prop_search_val_min_positive_months: 0,
-            prop_search_val_min_trades_per_month: 0,
-            prop_search_val_min_trades_per_day: 0.0,
+            prop_search_val_min_trades_per_month: 15,  // LOCKED 2026-08-10: AMBIGUOUS SENTINEL: 0 = no trade floor at all
+            prop_search_val_min_trades_per_day: 1.0,  // LOCKED 2026-08-10: AMBIGUOUS SENTINEL: 0.0 = no floor
             // Off by default: these express one operator's target, not a
             // universal truth about what a good strategy looks like.
             prop_search_min_win_rate: 0.0,
@@ -2529,11 +2891,11 @@ impl Default for ModelsConfig {
             // Sign only, by default. Raising this is an operator decision about
             // how much in-sample noise to tolerate, not a correctness bound.
             prop_search_min_expectancy_t_stat: 0.0,
-            prop_search_max_in_market: 0.0,
+            prop_search_max_in_market: 0.35,  // LOCKED 2026-08-10: AMBIGUOUS SENTINEL on a knob named max_: 0.0 = NO CAP on time in market
             prop_search_val_min_monthly_profit_pct: 0.0,
-            prop_search_val_log_trades: false,
-            prop_search_val_trade_log_max: 20,
-            prop_search_async: false,
+            prop_search_val_log_trades: true,  // LOCKED 2026-08-10: a validation you cannot inspect is a number you must take on trust
+            prop_search_val_trade_log_max: 50,  // LOCKED 2026-08-10
+            prop_search_async: true,  // LOCKED 2026-08-10
             prop_search_async_wait: false,
             tree_device_preference: "auto".to_string(),
             regularized_model_defaults: true,
@@ -2544,7 +2906,7 @@ impl Default for ModelsConfig {
             prop_search_survivor_fraction: 0.10,
             prop_search_immigrant_fraction: 0.18,
             prop_search_selection_temperature: 0.75,
-            prop_search_tournament_size: 0,
+            prop_search_tournament_size: 10,  // LOCKED 2026-08-10: 0 is not a tournament size
             prop_search_opportunistic_enabled: true,
             prop_search_opportunistic_min_positive_months: 3,
             prop_search_opportunistic_min_trades_per_month: 10,
@@ -2561,12 +2923,11 @@ impl Default for ModelsConfig {
             prop_search_sensitivity_spread_pips: 2.0,
             prop_search_sensitivity_commission_per_lot: 7.0,
             train_batch_size: 32,
-            inference_batch_size: 32,
             enable_transformer_expert: true,
             transformer_heads: 8,
             transformer_layers: 4,
             transformer_hidden_dim: 256,
-            transformer_dropout: 0.20,
+            transformer_dropout: 0.10,  // LOCKED 2026-08-10
             transformer_seq_len: 64,
             transformer_train_seconds: 3600,
             nbeats_train_seconds: 3600,
@@ -2587,7 +2948,7 @@ impl Default for ModelsConfig {
             hpo_trials_by_model,
             hpo_max_rows: 1_000_000,
             max_epochs_by_model: HashMap::new(),
-            ray_tune_max_concurrency: 1,
+            ray_tune_max_concurrency: 8,  // LOCKED 2026-08-10: 1 serialises every trial
             calibration_enabled: true,
             calibration_method: "platt".to_string(),
             calibration_min_rows: 300,
@@ -2598,7 +2959,7 @@ impl Default for ModelsConfig {
             blend_gate_floor: 0.34,
             blend_veto_below: 0.15,
             model_param_overrides: HashMap::new(),
-            regime_router_enabled: false,
+            regime_router_enabled: true,  // LOCKED 2026-08-10: already registered as the safer, more selective side
             regime_router_min_models: 2,
             regime_trend_models: vec![
                 "transformer",
@@ -2629,8 +2990,8 @@ impl Default for ModelsConfig {
             .map(String::from)
             .collect(),
             regime_neutral_models: Vec::new(),
-            l1_feature_selection_enabled: false,
-            l1_feature_selection_per_regime: false,
+            l1_feature_selection_enabled: true,  // LOCKED 2026-08-10
+            l1_feature_selection_per_regime: true,  // LOCKED 2026-08-10
             l1_feature_selection_min_features: 20,
             l1_feature_selection_max_features: 256,
             l1_feature_selection_sample_limit: 200_000,
@@ -2650,7 +3011,7 @@ impl Default for ModelsConfig {
             label_neutral_band_atr_fraction: 0.25,
             label_stop_atr_multiplier: 0.0,
             label_take_profit_rr: 0.0,
-            walkforward_splits: 10, // 2026-06-05: robust OOS default (was 20, slow); config-overridable
+            walkforward_splits: 20,  // LOCKED 2026-08-10: 10 was chosen for speed; 20 is the robust OOS split count.
             embargo_minutes: 120,
             discovery_mode: "prop_firm".to_string(),
             // walk-forward export gate ON (robustness). prop-firm pass-rate floor
@@ -3437,6 +3798,38 @@ mod load_seal {
             note: "deleted 2026-08-10: replaced by models.exit_policy.trailing_min_lock_pips, \
                    same name and same meaning (absolute pip floor on the profit the armed trail \
                    locks)",
+        },
+        // ── risk.* — the ONE GLOBAL session-spread triple, deleted 2026-08-10
+        //    (#69). It was one symbol's cost charged to every symbol.
+        RetiredKey {
+            path: "risk.backtest_spread_pips_asian",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10 (#69): one global triple cannot span EURUSD ~0.16 pips to \
+                   GBPTRY ~552. Replaced by risk.session_spread_source (flat | measured | \
+                   explicit) plus risk.session_spread_pips_by_symbol.<SYMBOL>.asian; \
+                   `measured` reads the broker's own recorded ticks from \
+                   <data_dir>/spread_stats.json",
+        },
+        RetiredKey {
+            path: "risk.backtest_spread_pips_overlap",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10 (#69): see risk.backtest_spread_pips_asian — replaced by \
+                   risk.session_spread_pips_by_symbol.<SYMBOL>.overlap",
+        },
+        RetiredKey {
+            path: "risk.backtest_spread_pips_late_ny",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10 (#69): see risk.backtest_spread_pips_asian — replaced by \
+                   risk.session_spread_pips_by_symbol.<SYMBOL>.late_ny",
+        },
+        RetiredKey {
+            path: "models.backtest_runtime.initial_equity",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10 (#265): it was a SECOND starting balance (100 000) beside \
+                   risk.initial_balance (10 000), and it was the denominator of every percentage \
+                   the search ranks on while the prop-firm and regime gates divided the same \
+                   trades by risk.initial_balance. There is one balance and it is the ACCOUNT: \
+                   risk.initial_balance, taken from the broker at demo/live time",
         },
         RetiredKey {
             path: "risk.meta_label_tp_pips",
@@ -4855,6 +5248,241 @@ mod tests {
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
     }
 
+    // ── #69 — the session-spread curve is PER SYMBOL ─────────────────────
+
+    /// The three buckets must tile the day exactly once. A gap would price
+    /// some hours at the flat spread while claiming a curve; an overlap would
+    /// double-count ticks into the sample-weighted mean.
+    #[test]
+    fn session_spread_buckets_partition_the_day() {
+        let mut seen = [0usize; 24];
+        for hours in SESSION_SPREAD_BUCKET_HOURS.iter() {
+            for &h in hours.iter() {
+                seen[h] += 1;
+            }
+        }
+        assert!(
+            seen.iter().all(|c| *c == 1),
+            "every UTC hour must belong to exactly one bucket, got {seen:?}"
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos-spread-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The field names in `spread_stats.json` are a CONTRACT between the app's
+    /// sampler (the writer) and this resolver (the reader), and the two live in
+    /// crates that cannot see each other's types. A rename on the writing side
+    /// would otherwise turn every symbol into "no measurement" in silence, and
+    /// every backtest would quietly go back to the flat spread.
+    ///
+    /// The literal below is a trimmed copy of the real
+    /// `%LOCALAPPDATA%/neoethos/data/spread_stats.json` (EURUSD, 2026-08-10).
+    #[test]
+    fn spread_stats_field_names_match_the_recorder() {
+        let raw = r#"{"symbols":{"EURUSD":{"hourly":[
+            {"samples":371,"meanPips":0.231,"maxPips":0.6}
+        ]}},"updatedMs":1754800000000}"#;
+        let parsed: SpreadStatsFileWire =
+            serde_json::from_str(raw).expect("the recorder's camelCase shape must parse");
+        let sym = parsed.symbols.get("EURUSD").expect("EURUSD");
+        assert_eq!(sym.hourly.len(), 1);
+        assert_eq!(sym.hourly[0].samples, 371);
+        assert!((sym.hourly[0].mean_pips - 0.231).abs() < 1e-12);
+    }
+
+    /// The shipped default charges the flat spread and nothing else. Adopting a
+    /// curve is a deliberate act, never something that arrives with an update.
+    #[test]
+    fn session_spread_defaults_to_flat() {
+        let s = Settings::default();
+        assert_eq!(s.risk.session_spread_source, SessionSpreadSource::Flat);
+        assert!(s.risk.session_spread_pips_by_symbol.is_empty());
+        let decided = s
+            .risk
+            .session_spread_pips("EURUSD", &s.system.data_dir)
+            .expect("the default configuration must resolve");
+        assert_eq!(decided, SessionSpreadDecision::Flat);
+    }
+
+    /// THE regression this item exists for: two symbols, two different curves,
+    /// from ONE configuration. The old global triple could not express this.
+    #[test]
+    fn explicit_curves_are_resolved_per_symbol() {
+        let mut s = Settings::default();
+        s.risk.session_spread_source = SessionSpreadSource::Explicit;
+        s.risk.session_spread_pips_by_symbol.insert(
+            "EURUSD".to_string(),
+            SessionSpreadCurve { asian: 0.211, overlap: 0.156, late_ny: 1.126 },
+        );
+        s.risk.session_spread_pips_by_symbol.insert(
+            "XAUUSD".to_string(),
+            SessionSpreadCurve { asian: 9.56, overlap: 9.29, late_ny: 8.50 },
+        );
+
+        let eur = s.risk.session_spread_pips("eurusd", &s.system.data_dir).expect("EURUSD");
+        let xau = s.risk.session_spread_pips("XAUUSD", &s.system.data_dir).expect("XAUUSD");
+        match (eur, xau) {
+            (
+                SessionSpreadDecision::Curve { pips: e, .. },
+                SessionSpreadDecision::Curve { pips: x, .. },
+            ) => {
+                assert!((e[1] - 0.156).abs() < 1e-12, "EURUSD overlap: {e:?}");
+                assert!((x[1] - 9.29).abs() < 1e-12, "XAUUSD overlap: {x:?}");
+                assert!(
+                    x[1] > e[1] * 10.0,
+                    "the whole point: one global triple cannot carry both, {e:?} vs {x:?}"
+                );
+            }
+            other => panic!("both symbols must resolve to their own curve, got {other:?}"),
+        }
+
+        // A symbol nobody configured gets NO curve — not the other symbol's.
+        match s.risk.session_spread_pips("GBPTRY", &s.system.data_dir).expect("GBPTRY") {
+            SessionSpreadDecision::NoCurveForSymbol { symbol, .. } => assert_eq!(symbol, "GBPTRY"),
+            other => panic!("an unmeasured symbol must not inherit a curve, got {other:?}"),
+        }
+    }
+
+    /// A map that reaches nothing is refused by name. This is the "saved value,
+    /// green config, no change in behaviour" class the audit is about.
+    #[test]
+    fn a_curve_map_under_the_wrong_source_is_refused() {
+        let mut s = Settings::default();
+        s.risk.session_spread_pips_by_symbol.insert(
+            "EURUSD".to_string(),
+            SessionSpreadCurve { asian: 0.2, overlap: 0.2, late_ny: 1.1 },
+        );
+        // source is still Flat.
+        let err = s
+            .risk
+            .session_spread_pips("EURUSD", &s.system.data_dir)
+            .expect_err("a map nothing reads must be refused, not ignored");
+        assert!(err.contains("never reads it"), "{err}");
+
+        s.risk.session_spread_source = SessionSpreadSource::Explicit;
+        s.risk.session_spread_pips_by_symbol.clear();
+        let err = s
+            .risk
+            .session_spread_pips("EURUSD", &s.system.data_dir)
+            .expect_err("`explicit` with an empty map has no curve to charge");
+        assert!(err.contains("is empty"), "{err}");
+    }
+
+    /// A partially-configured curve is a LOAD error, by name. The old three-key
+    /// shape enforced this at runtime; the typed shape enforces it at parse
+    /// time, which is earlier and cannot be routed around.
+    #[test]
+    fn a_partial_curve_fails_the_load() {
+        let err = serde_yaml_ng::from_str::<SessionSpreadCurve>("asian: 0.2\noverlap: 0.15\n")
+            .expect_err("two of three buckets must not parse");
+        assert!(format!("{err}").contains("late_ny"), "{err}");
+    }
+
+    /// `measured` reads the broker's own recorded ticks and takes a
+    /// SAMPLE-WEIGHTED mean per bucket, so a thin hour cannot out-vote a dense
+    /// one.
+    #[test]
+    fn measured_curve_is_sample_weighted_per_bucket() {
+        let dir = scratch_dir("weighted");
+        // Overlap bucket (07..16): hour 7 has 1 tick at 10.0, hour 8 has 99 at
+        // 0.1. The straight mean would be ~5.05; the weighted mean is ~0.199.
+        let mut hourly = vec![String::from(r#"{"samples":100,"meanPips":1.0,"maxPips":2.0}"#); 24];
+        hourly[7] = r#"{"samples":1,"meanPips":10.0,"maxPips":10.0}"#.to_string();
+        for h in 8..16 {
+            hourly[h] = r#"{"samples":99,"meanPips":0.1,"maxPips":0.2}"#.to_string();
+        }
+        let raw = format!(
+            r#"{{"symbols":{{"EURUSD":{{"hourly":[{}]}}}},"updatedMs":1}}"#,
+            hourly.join(",")
+        );
+        std::fs::write(dir.join("spread_stats.json"), raw).expect("write stats");
+
+        let mut s = Settings::default();
+        s.risk.session_spread_source = SessionSpreadSource::Measured;
+        s.system.data_dir = dir.clone();
+
+        match s.risk.session_spread_pips("EURUSD", &s.system.data_dir).expect("EURUSD") {
+            SessionSpreadDecision::Curve { pips, samples, .. } => {
+                let expected = (1.0 * 10.0 + 8.0 * 99.0 * 0.1) / (1.0 + 8.0 * 99.0);
+                assert!(
+                    (pips[1] - expected).abs() < 1e-9,
+                    "overlap must be sample-weighted ({expected}), got {}",
+                    pips[1]
+                );
+                assert_eq!(samples.expect("tick counts")[1], 1 + 8 * 99);
+            }
+            other => panic!("expected a measured curve, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// NEVER invent a number for a symbol with no samples. Absent is correct.
+    #[test]
+    fn measured_refuses_to_invent_a_curve_for_an_unsampled_symbol() {
+        let dir = scratch_dir("unsampled");
+        let hourly = vec![String::from(r#"{"samples":100,"meanPips":1.0,"maxPips":2.0}"#); 24];
+        std::fs::write(
+            dir.join("spread_stats.json"),
+            format!(
+                r#"{{"symbols":{{"EURUSD":{{"hourly":[{}]}}}},"updatedMs":1}}"#,
+                hourly.join(",")
+            ),
+        )
+        .expect("write stats");
+
+        let mut s = Settings::default();
+        s.risk.session_spread_source = SessionSpreadSource::Measured;
+        s.system.data_dir = dir.clone();
+
+        match s.risk.session_spread_pips("GBPTRY", &s.system.data_dir).expect("GBPTRY") {
+            SessionSpreadDecision::NoCurveForSymbol { symbol, detail, .. } => {
+                assert_eq!(symbol, "GBPTRY");
+                assert!(detail.contains("no samples"), "{detail}");
+            }
+            other => panic!("an unsampled symbol must get NO curve, got {other:?}"),
+        }
+
+        // And a symbol whose buckets are too thin gets no curve either — not a
+        // partial one.
+        let thin = vec![String::from(r#"{"samples":1,"meanPips":1.0,"maxPips":2.0}"#); 24];
+        std::fs::write(
+            dir.join("spread_stats.json"),
+            format!(
+                r#"{{"symbols":{{"EURUSD":{{"hourly":[{}]}}}},"updatedMs":1}}"#,
+                thin.join(",")
+            ),
+        )
+        .expect("write thin stats");
+        match s.risk.session_spread_pips("EURUSD", &s.system.data_dir).expect("EURUSD") {
+            SessionSpreadDecision::NoCurveForSymbol { detail, .. } => {
+                assert!(detail.contains("session_spread_min_samples"), "{detail}");
+            }
+            other => panic!("a bucket below the sample floor must yield no curve, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store that still carries the deleted global triple loads, with each
+    /// key named, instead of failing — and the three keys are gone from the
+    /// struct, so nothing can read them again.
+    #[test]
+    fn the_retired_global_spread_triple_is_named_not_refused() {
+        let yaml = "risk:\n  backtest_spread_pips_asian: 1.8\n  \
+                    backtest_spread_pips_overlap: 0.6\n  \
+                    backtest_spread_pips_late_ny: 1.2\n";
+        let s: Settings =
+            serde_yaml_ng::from_str(yaml).expect("retired keys must warn, not fail the load");
+        assert_eq!(s.risk.session_spread_source, SessionSpreadSource::Flat);
+        assert!(s.risk.session_spread_pips_by_symbol.is_empty());
+    }
 }
 
 /// Profit the trail locks once it engages, in pips.

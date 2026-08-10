@@ -340,6 +340,91 @@ impl TrainingOrchestrator {
         Ok(())
     }
 
+    /// #240 — NEVER AGAIN THROWN-AWAY MODELS.
+    ///
+    /// The operator's ruling, in his words: "33 experts trained and dropped
+    /// every run is not acceptable." Training something and discarding it is
+    /// pure waste, and it had been happening on every run — `models.live_ml_gate`
+    /// is `false` in the code default, in the shipped seed and in his own
+    /// store, and with it false the live engine never even LOADS the ensemble.
+    /// The trained fleet reached nobody.
+    ///
+    /// So this run stops before it starts unless something will read what it
+    /// builds. There are exactly two readers of a trained expert fleet in the
+    /// workspace, and this checks for both:
+    ///
+    /// 1. `models.live_ml_gate == true` — the live autopilot loads the
+    ///    symbol's soft-voting ensemble at engine start and scales per-trade
+    ///    risk by it (`neoethos-app::live_trading`).
+    /// 2. `Self::with_oos_lock_from_ms` was set — this is a LEAK-LOCKED run
+    ///    training to a separate root specifically so the blend can be
+    ///    validated out-of-sample (`trader-replay --blend`). That validation is
+    ///    the evidence needed before the gate can honestly be flipped, so
+    ///    refusing it would make the gate unreachable.
+    ///
+    /// Neither ⇒ REFUSE, naming every model by name. This is deliberately not
+    /// a warning: a warning is what the live engine already logs, and a run
+    /// that burns hours to produce artifacts nothing opens is not improved by
+    /// being described accurately while it happens.
+    ///
+    /// It does NOT flip the gate for him. Turning `live_ml_gate` on is coupled
+    /// to audit #299/#310 (three numerically divergent artifacts — `tide`
+    /// best_loss 1 308 811.5, `tide_nf` 51 699 690, `sac` final_alpha 5.69e9 —
+    /// sit in `DEFAULT_BOOTSTRAP_EXPERT_NAMES` with no sanity check between
+    /// "on disk" and "votes") and to #315 (`expert_weights` empty ⇒ every
+    /// voter weighs 1.0). Flipping it here would put those artifacts into a
+    /// vote that SCALES REAL POSITION SIZE, silently, on every install. This
+    /// change costs CPU hours and gains nothing on the money path; the other
+    /// direction spends the operator's money on his behalf.
+    fn refuse_to_train_what_nothing_will_read(&self, planned_models: &[String]) -> Result<()> {
+        if self.settings.models.live_ml_gate {
+            return Ok(());
+        }
+        if self.oos_lock_from_ms.is_some() {
+            info!(
+                "models.live_ml_gate is OFF, but this is a LEAK-LOCKED run (oos_from set): the \
+                 {} experts are trained for the out-of-sample blend validation that has to \
+                 happen BEFORE the gate can be turned on",
+                planned_models.len()
+            );
+            return Ok(());
+        }
+
+        let count = planned_models.len();
+        let named = if planned_models.is_empty() {
+            "(none — the dispatch plan selected no models)".to_string()
+        } else {
+            planned_models.join(", ")
+        };
+        tracing::error!(
+            target: "neoethos_models::training",
+            planned_model_count = planned_models.len(),
+            planned_models = %named,
+            "REFUSING to train: nothing in this install reads a trained expert"
+        );
+        anyhow::bail!(
+            "REFUSED to train {count} experts that nothing will read: {named}.\n\
+             \n\
+             `models.live_ml_gate` is false, so the live engine never loads the soft-voting \
+             ensemble — it trades on genes alone and reads NOTHING from these artifacts. \
+             Training them would spend the hours and discard the result.\n\
+             \n\
+             Pick one:\n\
+             • set `models.live_ml_gate: true` so the live autopilot actually consults the \
+               ensemble (it can only SHRINK size or skip a bar — genes always pick the \
+               direction). Read audit #299/#310 and #315 first: three artifacts on disk are \
+               numerically divergent and there is no sanity check between \"trained\" and \
+               \"voting\", so turning this on today lets them scale real position size; or\n\
+             • train LEAK-LOCKED for the out-of-sample blend validation \
+               (`--oos-from <date>`, i.e. `TrainingOrchestrator::with_oos_lock_from_ms`), \
+               which is the evidence that makes flipping the gate an informed act; or\n\
+             • stop training. Turning `models.use_*` off in config removes these models from \
+               the plan.\n\
+             \n\
+             This refusal is audit #240. It changes no position size and places no order."
+        )
+    }
+
     pub fn train_symbol_with_progress<R>(
         &self,
         symbol: &str,
@@ -356,6 +441,7 @@ impl TrainingOrchestrator {
         let configs = self.build_training_configs(&dispatch_plan)?;
         let planned_models: Vec<String> =
             configs.iter().map(|config| config.name.clone()).collect();
+        self.refuse_to_train_what_nothing_will_read(&planned_models)?;
 
         let data_root = self.data_root();
         let dataset = load_symbol_dataset(&data_root, symbol)?;
@@ -596,22 +682,17 @@ impl TrainingOrchestrator {
             // existing configs still train both the SAC entry policy and
             // the exit-decision agent.
             //
-            // ⚠ AUDIT #173/#175 — CORRECTING THIS COMMENT. It used to end
-            // "…but the artifact stays available for the exit-side pipeline",
-            // which reads as though a consumer exists. NONE DOES. `exit_agent`
-            // is absent from `DEFAULT_BOOTSTRAP_EXPERT_NAMES`
-            // (`ensemble_inference/bootstrap.rs:102-149`) and explicitly
-            // whitelisted as a non-voter at `ensemble_inference/mod.rs:907`, so
-            // its `ExitDecision3` output is read by nothing in production. It
-            // trains every run for nobody. Whether to ship the exit-side
-            // decision loop or stop training it is the OPERATOR'S call; this
-            // code does not decide it, it only refuses to hide the cost.
+            // AUDIT #174 + #310 (2026-08-10) — THE CONSUMER SHIPPED, so the
+            // "NOTHING CONSUMES IT" warning that stood here is DELETED with the
+            // defect it described. `exit_agent` is back in
+            // `DEFAULT_BOOTSTRAP_EXPERT_NAMES`, its loader is registered
+            // (`ensemble_inference/rl_exit_adapters.rs::register_rl_exit_loaders`),
+            // and the exit-side combiner
+            // (`ensemble_inference/soft_voting.rs::exit_opinions`) reads its
+            // `ExitDecision3` output into `EnsembleDecision::exit` on the
+            // backtest, forward-test and live paths alike. Its training time
+            // now buys something.
             requested_models.push("exit_agent".to_string());
-            warn!(
-                "exit_agent queued for training and NOTHING CONSUMES IT — its ExitDecision3 \
-                 output has no production reader (audit #173/#175, decision pending: ship the \
-                 exit-side loop or stop training it). This costs training time on every run."
-            );
         }
         if self.settings.models.use_rl_agent || self.settings.models.use_rllib_agent {
             requested_models.push("dqn".to_string());
@@ -2298,9 +2379,19 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "neat" => HashMap::from([
+                // THE ONE SOURCE for the NEAT population (audit #294).
+                //
+                // Before 2026-08-10 this read `evo_population` — the CR-FM-NES
+                // knob — floored at 48, while `models.rl_population_size` had
+                // no reader anywhere and `NeatExpert` carried a hardcoded 96.
+                // Three numbers for one quantity, none of them the field named
+                // after it. The operator's decision was "GO WITH 96": the
+                // default moved to 96 and this is now the only place it is
+                // read. `evo_population` keeps its own consumer (`neuro_evo`,
+                // above) and no longer shadows this one.
                 (
                     "population".to_string(),
-                    self.settings.models.evo_population.max(48).to_string(),
+                    self.settings.models.rl_population_size.to_string(),
                 ),
                 (
                     "generations".to_string(),
@@ -2798,6 +2889,39 @@ fn parse_usize_param(params: &HashMap<String, String>, key: &str, default: usize
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+/// A positive `usize` parameter with NO fallback literal.
+///
+/// [`parse_usize_param`] takes a default, and a default is where a second
+/// source for a configured number hides: `parse_usize_param(params,
+/// "population", 96)` silently substituted 96 whenever the key was missing or
+/// unusable, which is how the NEAT population had three different origins
+/// (audit #294). This one refuses instead, naming the model, the key and what
+/// it found — a training run that cannot say what capacity it was asked for
+/// must stop, not pick a number.
+fn require_usize_param(
+    params: &HashMap<String, String>,
+    key: &str,
+    model: &str,
+) -> Result<usize> {
+    match params.get(key) {
+        None => anyhow::bail!(
+            "{model}: required parameter `{key}` is missing. It is set by \
+             `default_model_params(\"{model}\")` from the operator's config; there is no \
+             fallback literal for it on purpose"
+        ),
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => Ok(value),
+            Ok(_) => anyhow::bail!(
+                "{model}: parameter `{key}` is 0, which is not a usable capacity. Set a \
+                 positive value in config"
+            ),
+            Err(err) => anyhow::bail!(
+                "{model}: parameter `{key}` = `{raw}` is not a positive integer: {err}"
+            ),
+        },
+    }
 }
 
 fn parse_u64_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
@@ -3596,10 +3720,14 @@ fn build_expert_model(
                 parse_usize_param(params, "islands", 1),
             ),
         )),
+        // #294 — the population is REQUIRED, not defaulted. The `96` that used
+        // to sit here was the third source for one number (config field with no
+        // reader, `evo_population`, and this literal); it is deleted, and
+        // `models.rl_population_size` is the only origin left.
         ModelType::Neat => Ok(Box::new(
             NeatExpert::with_config(
                 input_dim.max(1),
-                parse_usize_param(params, "population", 96),
+                require_usize_param(params, "population", "neat")?,
                 parse_usize_param(params, "generations", 48),
             )
             .with_device_policy(
@@ -4999,6 +5127,106 @@ mod tests {
         settings.models.use_neuroevolution = false;
         settings.risk.conformal_enabled = false;
         TrainingOrchestrator::new(settings, PathBuf::from("models"))
+    }
+
+    // ── #240: never again thrown-away models ────────────────────────────────
+
+    #[test]
+    fn training_refuses_when_nothing_will_read_the_trained_fleet() {
+        // The shipped default: `models.live_ml_gate` is false, no OOS lock.
+        // Every expert in the plan would be trained and then read by nobody.
+        let orch = orchestrator_with_models(&["lightgbm", "xgboost"]);
+        assert!(
+            !orch.settings.models.live_ml_gate,
+            "this test is about the SHIPPED default; if the gate now defaults on, \
+             the refusal is dead and this test must be rewritten, not deleted"
+        );
+
+        let planned = vec!["lightgbm".to_string(), "xgboost".to_string()];
+        let err = orch
+            .refuse_to_train_what_nothing_will_read(&planned)
+            .expect_err("a run whose output nothing reads must be refused");
+        let text = format!("{err:#}");
+
+        // Loudly, BY NAME — the operator must see which models were about to
+        // be trained for nothing, not just a count.
+        for name in &planned {
+            assert!(
+                text.contains(name.as_str()),
+                "the refusal must name every model it refused to train; `{name}` missing \
+                 from: {text}"
+            );
+        }
+        assert!(
+            text.contains("models.live_ml_gate"),
+            "the refusal must name the knob that would arm a consumer: {text}"
+        );
+        assert!(
+            text.contains("oos-from") || text.contains("oos_lock_from_ms"),
+            "the refusal must name the leak-locked validation path, or the gate can \
+             never be earned: {text}"
+        );
+    }
+
+    #[test]
+    fn training_is_allowed_when_the_live_gate_will_read_it() {
+        let mut orch = orchestrator_with_models(&["lightgbm"]);
+        orch.settings.models.live_ml_gate = true;
+        orch.refuse_to_train_what_nothing_will_read(&["lightgbm".to_string()])
+            .expect("with the live ML gate on, the live engine loads the ensemble");
+    }
+
+    #[test]
+    fn training_is_allowed_for_a_leak_locked_oos_validation_run() {
+        // `--oos-from` trains to a separate root precisely so the blend can be
+        // validated out-of-sample. That validation is the evidence that makes
+        // flipping the gate an informed act; refusing it would make the gate
+        // unreachable.
+        let orch = orchestrator_with_models(&["lightgbm"]).with_oos_lock_from_ms(1_600_000_000_000);
+        assert!(!orch.settings.models.live_ml_gate);
+        orch.refuse_to_train_what_nothing_will_read(&["lightgbm".to_string()])
+            .expect("a leak-locked OOS run has a consumer: the blend validation");
+    }
+
+    // ── #294: the NEAT population has ONE source ────────────────────────────
+
+    #[test]
+    fn neat_population_comes_from_rl_population_size() {
+        let mut orch = orchestrator_with_models(&["neat"]);
+        orch.settings.models.rl_population_size = 137;
+        // The knob that used to feed NEAT. It must no longer move it.
+        orch.settings.models.evo_population = 999;
+
+        let params = orch.default_model_params("neat");
+        assert_eq!(
+            params.get("population").map(String::as_str),
+            Some("137"),
+            "models.rl_population_size is the only source for the NEAT population"
+        );
+    }
+
+    #[test]
+    fn building_a_neat_expert_without_a_population_is_refused() {
+        // The `96` fallback is deleted: a NEAT build that cannot say what
+        // capacity it was asked for must stop, not pick a number.
+        let config = ModelConfig {
+            name: "neat".to_string(),
+            model_type: ModelType::Neat,
+            capability_family: crate::runtime::capabilities::ModelFamily::Evolutionary,
+            capability_state: CapabilityState::Verified,
+            params: HashMap::new(),
+        };
+        // `expect_err` would need `Box<dyn ExpertModel>: Debug`, which the trait
+        // deliberately does not require. Match instead of loosening the trait.
+        let err = match build_expert_model(&config, 4, &HashMap::new()) {
+            Ok(_) => panic!("a missing `population` must be refused, not defaulted"),
+            Err(err) => err,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("population"),
+            "the refusal must name the missing parameter: {text}"
+        );
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

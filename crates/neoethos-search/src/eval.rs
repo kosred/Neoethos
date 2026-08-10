@@ -487,6 +487,15 @@ impl BacktestSettings {
 pub struct BacktestRuntimeOverrides {
     /// Starting equity used for canonical backtest PnL accounting. Must be
     /// strictly positive.
+    ///
+    /// **#265 (2026-08-10): this is the ACCOUNT balance, `risk.initial_balance`,
+    /// and there is no other.** It used to come from a second config key,
+    /// `models.backtest_runtime.initial_equity`, which shipped at 100 000
+    /// against an account of 10 000 — so every percentage the search ranked on
+    /// was measured against a balance ten times the one being traded, while the
+    /// prop-firm and regime gates in `discovery.rs` divided the SAME trades by
+    /// `risk.initial_balance`. That key is deleted; this field is filled from
+    /// the account, which at demo/live time is what the broker reports.
     pub initial_equity: f64,
     /// Maximum number of monthly PnL buckets retained for consistency math.
     /// Must be non-zero.
@@ -506,6 +515,17 @@ pub struct BacktestRuntimeOverrides {
 impl Default for BacktestRuntimeOverrides {
     fn default() -> Self {
         Self {
+            // NOT an operator balance and NOT reachable from any config file
+            // (#265): the only key that could set it —
+            // `models.backtest_runtime.initial_equity` — is deleted, and every
+            // production binary reaches
+            // `install_backtest_runtime_overrides_from_settings`, which fills
+            // this from `risk.initial_balance`. What is left is the value an
+            // UNCONFIGURED process gets: unit tests constructing
+            // `BacktestSettings::default()` with no install. It is deliberately
+            // NOT the account default, so a production run that somehow reached
+            // an evaluator without installing settings produces obviously
+            // different numbers instead of plausible ones.
             initial_equity: 100_000.0,
             month_capacity: 240,
             rayon_threads: None,
@@ -529,18 +549,33 @@ impl BacktestRuntimeOverrides {
 
     /// Config-driven constructor (was the `NEOETHOS_BOT_BACKTEST_*` env
     /// vars). Numeric fields are validated (equity > 0, capacity > 0,
-    /// threads > 0) exactly like the env reader. A
-    /// `backtest_from_settings_default_matches_env_default` test guarantees
-    /// a fresh `Settings` reproduces [`Self::default`].
+    /// threads > 0) exactly like the env reader.
+    ///
+    /// **#265: `initial_equity` comes from `risk.initial_balance` — the
+    /// ACCOUNT — and from nowhere else.** `models.backtest_runtime
+    /// .initial_equity` is deleted. An unusable account balance is not
+    /// substituted quietly: it is reported at ERROR, by name, with the value.
     pub fn from_settings(s: &neoethos_core::Settings) -> Self {
         let c = &s.models.backtest_runtime;
         let d = Self::default();
+        let account = s.risk.initial_balance;
+        let initial_equity = if account.is_finite() && account > 0.0 {
+            account
+        } else {
+            tracing::error!(
+                target: "neoethos_search::cost_model",
+                configured_account_balance = account,
+                fallback = d.initial_equity,
+                "risk.initial_balance is not a usable balance, and it is the denominator of \
+                 every percentage this search ranks on — net return %, max drawdown %, max \
+                 daily loss %, and the slot-7 monthly-target bar. The unconfigured-process \
+                 fallback is used instead, so NOTHING this run reports is a percentage of \
+                 your account. Set risk.initial_balance to the account you trade."
+            );
+            d.initial_equity
+        };
         Self {
-            initial_equity: if c.initial_equity.is_finite() && c.initial_equity > 0.0 {
-                c.initial_equity
-            } else {
-                d.initial_equity
-            },
+            initial_equity,
             month_capacity: if c.month_capacity > 0 {
                 c.month_capacity
             } else {
@@ -589,57 +624,23 @@ pub fn install_backtest_runtime_overrides_from_env() {
 pub fn install_backtest_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
     crate::execution_profile::report_retired_env_vars();
     let resolved = BacktestRuntimeOverrides::from_settings(s);
-    report_equity_denominator_disagreement(s, resolved.initial_equity);
-    let _ = BACKTEST_RUNTIME_OVERRIDES.set(resolved);
-}
-
-/// #265 — TWO starting balances, and this is the one the search ranks on.
-///
-/// `risk.initial_balance` is the operator's account. `models.backtest_runtime
-/// .initial_equity` is the denominator every percentage this search reports is
-/// computed against — net return %, max drawdown %, max daily loss %, and the
-/// slot-7 `monthly_target_hit_rate` bar of "4% of the month's starting equity".
-/// The shipped defaults are 10 000 and 100 000, so out of the box the search
-/// ranks candidates by percentages of a balance ten times the account, and
-/// nothing said so.
-///
-/// This does NOT reconcile them, deliberately. They are not obviously one
-/// concept — a funded prop-firm challenge really is a different balance from
-/// the operator's own account — and silently substituting one for the other
-/// would move every ranked percentage without anybody choosing it. What it does
-/// is make the disagreement impossible to run past unnoticed: both numbers, the
-/// ratio, and the list of metrics that depend on it, once per process, at the
-/// single point every production binary passes through before any evaluation.
-///
-/// Making them agree is a one-line config edit; the operator makes it.
-fn report_equity_denominator_disagreement(s: &neoethos_core::Settings, initial_equity: f64) {
-    let account = s.risk.initial_balance;
-    if !account.is_finite() || account <= 0.0 {
-        tracing::error!(
-            target: "neoethos_search::cost_model",
-            configured_account_balance = account,
-            search_initial_equity = initial_equity,
-            "risk.initial_balance is not a usable balance, so it cannot be compared with the \
-             search's equity denominator. Every percentage this run ranks on is computed \
-             against models.backtest_runtime.initial_equity"
-        );
-        return;
-    }
-    if (account - initial_equity).abs() <= f64::EPSILON * account.abs().max(1.0) {
-        return;
-    }
-    tracing::warn!(
+    // #265: `report_equity_denominator_disagreement` was DELETED here on
+    // 2026-08-10 together with the key it reported on. It named two starting
+    // balances and asked the operator to reconcile them; there is now one, so a
+    // report that can never fire would be dead code wearing the costume of a
+    // safeguard. What replaces it is the line below: the ONE balance, its
+    // source, and the metrics it divides — printed whether or not anything is
+    // wrong, because the number a run ranks on should never have to be inferred.
+    tracing::info!(
         target: "neoethos_search::cost_model",
-        account_balance = account,
-        search_initial_equity = initial_equity,
-        ratio = initial_equity / account,
-        "TWO STARTING BALANCES (#265). risk.initial_balance is your account; \
-         models.backtest_runtime.initial_equity is what THIS SEARCH divides by. Net return %, \
-         max drawdown %, max daily loss % and the slot-7 monthly-target hit rate (>=4% of the \
-         month's starting equity) are all measured against the SECOND number, so a candidate \
-         ranked here is ranked against a balance that is not the one you trade. Set them equal \
-         in config.yaml if that is not what you want — nothing here changes either value"
+        initial_equity = resolved.initial_equity,
+        source = "risk.initial_balance",
+        "ONE starting balance (#265). Net return %, max drawdown %, max daily loss % and the \
+         slot-7 monthly-target bar are all measured against this, and so are the prop-firm and \
+         regime gates in discovery — the same number on both sides. At demo/live time this is \
+         the broker's own account balance, so demo and live rank strategies identically"
     );
+    let _ = BACKTEST_RUNTIME_OVERRIDES.set(resolved);
 }
 
 /// Returns the currently installed backtest runtime overrides, or the
@@ -3316,14 +3317,37 @@ mod overrides_tests {
         assert_eq!(defaults.month_capacity, 240);
     }
 
+    /// #265 — THE regression test for "one starting balance".
+    ///
+    /// `initial_equity` is the denominator of every percentage the search ranks
+    /// on. It must be the ACCOUNT (`risk.initial_balance`) and must TRACK it: a
+    /// second constant reappearing anywhere in this chain is the defect coming
+    /// back. The old assertion here compared `from_settings` against
+    /// `Default::default()`, which is exactly what let a 100 000 config key sit
+    /// beside a 10 000 account for months and still look "preserved".
     #[test]
-    fn backtest_from_settings_default_matches_env_default() {
-        // Behavior-preservation gate (config-consolidation S2d): a fresh
-        // `Settings` reproduces the engine backtest defaults exactly.
+    fn backtest_initial_equity_is_the_account_balance_and_tracks_it() {
         let s = neoethos_core::Settings::default();
-        assert_eq!(
-            BacktestRuntimeOverrides::from_settings(&s),
-            BacktestRuntimeOverrides::default()
+        let resolved = BacktestRuntimeOverrides::from_settings(&s);
+        assert!(
+            (resolved.initial_equity - s.risk.initial_balance).abs() < 1e-9,
+            "the search's equity denominator must BE risk.initial_balance ({}), got {}",
+            s.risk.initial_balance,
+            resolved.initial_equity
+        );
+        // Everything that is not the balance still comes from
+        // `models.backtest_runtime` and still matches the compiled defaults.
+        let d = BacktestRuntimeOverrides::default();
+        assert_eq!(resolved.month_capacity, d.month_capacity);
+        assert_eq!(resolved.rayon_threads, d.rayon_threads);
+
+        // Move the account; the denominator moves with it. No other key can.
+        let mut moved = neoethos_core::Settings::default();
+        moved.risk.initial_balance = 25_000.0;
+        assert!(
+            (BacktestRuntimeOverrides::from_settings(&moved).initial_equity - 25_000.0).abs()
+                < 1e-9,
+            "changing risk.initial_balance must change the search's denominator"
         );
     }
 

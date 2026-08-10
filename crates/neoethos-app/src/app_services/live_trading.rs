@@ -1131,29 +1131,122 @@ async fn run(
         None
     };
 
-    // Session-level circuit breakers (audit S03, 2026-07-13): the config has
-    // always carried `risk.daily_drawdown_limit` / `risk.total_drawdown_limit`
-    // (fractions of balance), but NOTHING enforced them live — the autopilot
-    // had per-trade sizing caps yet could bleed the account all day with no
-    // automatic stop. Enforced below at entry time, on the fresh broker
-    // balance (realized PnL — equity-based tracking is a follow-up). The
-    // breakers only BLOCK NEW ENTRIES; exit management is untouched.
-    // `0.0` disables, matching the other risk caps.
-    let daily_dd_limit = sizing
-        .as_ref()
-        .map(|s| s.risk.daily_drawdown_limit)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let total_dd_limit = sizing
-        .as_ref()
-        .map(|s| s.risk.total_drawdown_limit)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let initial_balance_cfg = sizing
-        .as_ref()
-        .map(|s| s.risk.initial_balance)
-        .filter(|b| b.is_finite() && *b > 0.0)
-        .unwrap_or(account_balance);
+    // ── Prop-firm risk manager (audit #137/#192/#294, 2026-08-10) ─────────────
+    //
+    // THIS IS THE SESSION-LEVEL CIRCUIT BREAKER. It replaces the two inline
+    // blocks that used to live here (audit S03, 2026-07-13) and read
+    // `risk.daily_drawdown_limit` / `risk.total_drawdown_limit` against the
+    // broker balance. Those blocks are DELETED, not left beside this: two
+    // implementations of one operator key is the defect, and
+    // `neoethos_core::domain::risk::RiskManager` is the same two rules plus the
+    // intraday give-back from the day's peak, the drawdown-recovery bands, the
+    // revenge-trade detector, the profit-target stop and the per-trade size
+    // clamp — all of it previously compiled and unreachable, every
+    // `RiskManager::new` call in the workspace sitting inside its own test
+    // module.
+    //
+    // Exactly ONE of the two managers runs per engine. Risky Mode has its own
+    // rulebook (30-50% of bankroll per trade, its own kill-switch tiers); the
+    // prop-firm tiers judge a few percent of daily loss and would refuse every
+    // Risky entry on the first bar. `risky_mode.rs` says the same thing in its
+    // header: "operators wanting a more conservative profile should disable
+    // Risky Mode and rely on the standard RiskManager path".
+    //
+    // WHAT THIS CHANGES, PLAINLY: on the prop-firm path entries are now also
+    // refused for revenge-trade patterns, for the intraday give-back from the
+    // day's peak, for the recovery bands (when `risk.recovery_mode_enabled`),
+    // for the monthly/challenge profit target, and — when the ML gate measures
+    // a confidence — for the `risk.challenge_phase` confidence floor. And every
+    // entry's risk fraction is clamped by `calculate_position_size`, whose
+    // ceiling is the LOWER of the operator's `risk.prop_firm_max_risk_per_trade`
+    // (falling back to `risk.max_risk_per_trade`) and the phase table's. All of
+    // those move in one direction: fewer entries, smaller size.
+    //
+    // FAIL CLOSED. If the config cannot be read, or the resolved limits cannot
+    // bound anything, the engine REFUSES TO START rather than trade the
+    // prop-firm mode with no session breaker at all.
+    let mut prop_firm_manager: Option<neoethos_core::domain::risk::RiskManager> = None;
+    if !trading_mode_risky {
+        let settings = sizing.as_ref().with_context(|| {
+            format!(
+                "prop-firm mode is ON (system.trading_mode is not \"risky\") but the config at \
+                 {} could not be read, so risk.daily_drawdown_limit / \
+                 risk.total_drawdown_limit / risk.challenge_phase cannot be resolved. REFUSING \
+                 TO START: this loop will not trade an account whose session breakers are \
+                 unknown",
+                crate::server::state::current_config_path().display()
+            )
+        })?;
+        // Anchor equity: the LIVE balance when the broker answered, else the
+        // balance the operator declared. Named out loud either way — an anchor
+        // is what every drawdown percentage below is a percentage OF.
+        let anchor_equity = if account_balance.is_finite() && account_balance > 0.0 {
+            account_balance
+        } else {
+            tracing::warn!(
+                target: "neoethos_app::live_trading",
+                %symbol,
+                account_balance,
+                declared = settings.risk.initial_balance,
+                "the broker balance is unusable — anchoring the prop-firm drawdown limits on \
+                 risk.initial_balance instead. Every drawdown percentage below is measured \
+                 against that declared number until the broker answers"
+            );
+            settings.risk.initial_balance
+        };
+        let manager = neoethos_core::domain::risk::RiskManager::from_settings(
+            settings,
+            anchor_equity,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "prop-firm mode is ON but its risk manager could not be built: {e}. REFUSING \
+                 TO START — an engine with no daily/total drawdown stop is exactly the shape \
+                 this manager exists to prevent"
+            )
+        })?;
+        tracing::warn!(
+            target: "neoethos_app::live_trading",
+            %symbol,
+            preset = ?manager.preset,
+            challenge_phase = %manager.challenge_phase,
+            challenge_mode = manager.challenge_mode,
+            recovery_mode_enabled = manager.recovery_mode_enabled,
+            anchor_equity,
+            daily_drawdown_limit = manager.daily_dd_stop_trading_pct,
+            total_drawdown_limit = manager.max_total_loss_pct,
+            daily_dd_warning_pct = manager.daily_dd_warning_pct,
+            operator_max_risk_per_trade = manager.operator_max_risk_per_trade,
+            phase_max_risk_per_trade = manager.phase_max_risk_per_trade,
+            effective_max_risk_per_trade = manager.max_risk_per_trade,
+            min_confidence_threshold = manager.min_confidence_threshold,
+            monthly_profit_target_pct = manager.monthly_profit_target_pct,
+            challenge_target_return_pct = manager.challenge_target_return_pct,
+            confidence_measured = live_ml_gate,
+            "PROP-FIRM RISK MANAGER ARMED — every entry is gated and every entry's risk \
+             fraction is clamped by these numbers. The per-trade ceiling is the LOWER of the \
+             operator's and the challenge phase's, so risk.challenge_phase now binds live \
+             sizing. The confidence floor only bites when models.live_ml_gate measures a \
+             confidence; with the gate off nothing measures one and that single rule is inert \
+             (no confidence is invented to stand in for it)."
+        );
+        if manager.max_risk_per_trade < manager.operator_max_risk_per_trade {
+            tracing::warn!(
+                target: "neoethos_app::live_trading",
+                %symbol,
+                configured = manager.operator_max_risk_per_trade,
+                phase = %manager.challenge_phase,
+                phase_ceiling = manager.phase_max_risk_per_trade,
+                effective = manager.max_risk_per_trade,
+                bound_by = "risk.challenge_phase",
+                "PROP-FIRM SIZING DISAGREEMENT — the configured per-trade ceiling and the \
+                 challenge phase's table name different numbers. The LOWER one binds, so \
+                 entries size DOWN. Change risk.challenge_phase, or lower \
+                 risk.prop_firm_max_risk_per_trade to make the two agree"
+            );
+        }
+        prop_firm_manager = Some(manager);
+    }
     // Account-wide daily entry cap (2026-08-08): `risk.max_trades_per_day`
     // sat in the operator config with NOTHING on the entry path reading it —
     // his engines took 20-47 entries/day each against a configured 8. Armed
@@ -1177,11 +1270,6 @@ async fn run(
              restart"
         );
     }
-    // (UTC date id, balance at first entry-consideration of that day).
-    let mut day_start: Option<(u32, f64)> = None;
-    // Log-once latches so a tripped breaker doesn't flood the log every bar.
-    let mut daily_tripped_on: Option<u32> = None;
-    let mut total_tripped = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1391,6 +1479,47 @@ async fn run(
                                 daily_loss = m.daily_loss_accumulated_usd(),
                                 monthly_loss = m.monthly_loss_accumulated_usd(),
                                 "risky-mode kill switch: trade outcome recorded"
+                            );
+                        }
+                        // #137: the prop-firm manager's ONLY inputs. Without
+                        // this its equity peaks never move, recovery mode can
+                        // never arm, and the revenge detector — the one gate in
+                        // it that judges BEHAVIOUR rather than balance — sees an
+                        // empty window forever. Same shape as the risky-mode
+                        // hook above, and the same unit: this engine's realized
+                        // PnL in the account's deposit currency.
+                        //
+                        // Size and direction come from the entry snapshot. When
+                        // that is missing (the app restarted while the position
+                        // was open) they are absent rather than guessed; every
+                        // detector rule that uses them is guarded so an absent
+                        // value can only make the detector quieter.
+                        if let Some(m) = prop_firm_manager.as_mut() {
+                            let snapshot = pending_experience.get(&deal.position_id);
+                            m.record_closed_trade(
+                                neoethos_core::domain::risk::ClosedTrade {
+                                    entry_time_sec: snapshot
+                                        .map(|e| (e.entry_ts_ms.max(0) / 1000) as u64)
+                                        .unwrap_or_else(|| {
+                                            (deal.execution_timestamp_ms.max(0) / 1000) as u64
+                                        }),
+                                    exit_time_sec: (deal.execution_timestamp_ms.max(0) / 1000)
+                                        as u64,
+                                    pnl: net,
+                                    size: snapshot.map(|e| e.lots).unwrap_or(0.0),
+                                    direction: snapshot.map(|e| e.direction as i32),
+                                },
+                                runtime.trader.balance,
+                            );
+                            tracing::info!(
+                                target: "neoethos_app::live_trading",
+                                position_id = deal.position_id,
+                                net_profit = net,
+                                balance = runtime.trader.balance,
+                                recovery_mode = m.recovery_mode,
+                                circuit_breaker_latched = m.circuit_breaker_triggered,
+                                had_entry_snapshot = snapshot.is_some(),
+                                "prop-firm risk manager: trade outcome recorded"
                             );
                         }
                         if net < 0.0 {
@@ -1898,68 +2027,26 @@ async fn run(
                     _ => (account_balance, None),
                 };
 
-                // ── Session circuit breakers (audit S03) — NEW ENTRIES only ──
-                // Total-drawdown halt: balance at/below
-                // initial_balance × (1 − total_drawdown_limit) stops every
-                // further entry until restart (a blown account must not keep
-                // trading itself deeper). Daily-loss stop: losing more than
-                // daily_drawdown_limit of the day's starting balance blocks
-                // entries until the next UTC day.
+                // The UTC day key. ONE spelling, shared by the account-wide
+                // entry cap, the risky-mode accumulators and the prop-firm
+                // manager's day roll, so no two rules can disagree about which
+                // day an entry belongs to.
                 let today: u32 = {
                     use chrono::Datelike;
                     let d = chrono::Utc::now().date_naive();
                     (d.year().max(0) as u32) * 10_000 + d.month() * 100 + d.day()
                 };
-                match day_start {
-                    Some((d, _)) if d == today => {}
-                    _ => day_start = Some((today, entry_balance)),
-                }
-                if total_dd_limit > 0.0 {
-                    let floor = initial_balance_cfg * (1.0 - total_dd_limit);
-                    if entry_balance <= floor {
-                        if !total_tripped {
-                            total_tripped = true;
-                            tracing::error!(
-                                target: "neoethos_app::live_trading",
-                                %symbol, balance = entry_balance,
-                                initial_balance = initial_balance_cfg,
-                                limit = total_dd_limit,
-                                "CIRCUIT BREAKER: total drawdown limit hit — ALL new \
-                                 entries halted (exit management continues). Restart \
-                                 the engine after reviewing the account."
-                            );
-                        }
-                        if let Ok(mut s) = status.lock() {
-                            s.last_signal =
-                                Some("HALTED: total drawdown limit hit".to_string());
-                        }
-                        continue;
-                    }
-                }
-                if daily_dd_limit > 0.0
-                    && let Some((d, start_bal)) = day_start
-                    && d == today
-                    && start_bal > 0.0
-                {
-                    let floor = start_bal * (1.0 - daily_dd_limit);
-                    if entry_balance <= floor {
-                        if daily_tripped_on != Some(today) {
-                            daily_tripped_on = Some(today);
-                            tracing::warn!(
-                                target: "neoethos_app::live_trading",
-                                %symbol, balance = entry_balance,
-                                day_start_balance = start_bal,
-                                limit = daily_dd_limit,
-                                "CIRCUIT BREAKER: daily loss limit hit — new entries \
-                                 blocked until the next UTC day (exits continue)"
-                            );
-                        }
-                        if let Ok(mut s) = status.lock() {
-                            s.last_signal =
-                                Some("blocked: daily loss limit (resumes next UTC day)".to_string());
-                        }
-                        continue;
-                    }
+                let this_month: u32 = {
+                    use chrono::Datelike;
+                    let d = chrono::Utc::now().date_naive();
+                    (d.year().max(0) as u32) * 100 + d.month()
+                };
+                // Roll the prop-firm manager's day/month anchors on the SAME
+                // key. A new day re-seeds the day's starting and peak equity —
+                // that is what makes the daily stop resume next UTC day rather
+                // than latch — and a new month re-seeds the monthly target.
+                if let Some(m) = prop_firm_manager.as_mut() {
+                    m.roll_periods(today, this_month, entry_balance);
                 }
                 // ── Risky Mode kill switch: period rollover + persisted halt ──
                 // (W3, 2026-08-09). Two things happen here, both before a slot
@@ -2119,6 +2206,13 @@ async fn run(
                 // ensemble may only SHRINK the size (agreement × regime ×
                 // anomaly, MlScale mode) or skip the bar on a hard collapse.
                 // Any ensemble error ⇒ loud log + unchanged gene-only sizing.
+                //
+                // `measured_confidence` stays `None` unless the ensemble
+                // actually produced one. It is fed to the prop-firm gate below,
+                // where an absent confidence means the phase's confidence floor
+                // cannot be evaluated — NOT that the signal scored 1.00. A
+                // stand-in number there would silently retire the floor.
+                let mut measured_confidence: Option<f64> = None;
                 let base_risk = if let Some(ens) = live_ensemble.as_deref() {
                     match neoethos_models::ensemble_inference::bootstrap::role_decision_for_last_row(
                         ens,
@@ -2167,6 +2261,7 @@ async fn run(
                             if let Ok(mut s) = status.lock() {
                                 s.last_signal = Some(format!("{direction:?} · ML×{conf:.2}"));
                             }
+                            measured_confidence = Some(conf);
                             base_risk * conf
                         }
                         Err(err) => {
@@ -2178,6 +2273,115 @@ async fn run(
                             base_risk
                         }
                     }
+                } else {
+                    base_risk
+                };
+
+                // ── Prop-firm risk manager: THE GATE, then THE CLAMP (#137) ──
+                //
+                // Placed here, after the ML pass, because the phase confidence
+                // floor can only judge a confidence that has been measured, and
+                // this is where one exists. A refusal releases the daily entry
+                // slot it reserved above — the cap counts ENTRIES, not attempts.
+                //
+                // This block is the only enforcement of risk.daily_drawdown_limit
+                // and risk.total_drawdown_limit on this path; the inline blocks
+                // that used to do it were deleted with this change.
+                let base_risk = if let Some(m) = prop_firm_manager.as_mut() {
+                    // FAIL CLOSED, WITHOUT LATCHING. A balance of 0 is what the
+                    // account-runtime fetch returns when the broker did not
+                    // answer, not a blown account. Handing it to the gate would
+                    // read as a 100% drawdown and latch the circuit breaker for
+                    // the life of the engine on a transient network failure —
+                    // so the entry is refused here and the manager is not asked.
+                    if !entry_balance.is_finite() || entry_balance <= 0.0 {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.balance_unresolvable",
+                            balance = entry_balance,
+                            "entry refused — the broker balance could not be read, so no \
+                             drawdown percentage can be computed. NOT treated as a drawdown: \
+                             the circuit breaker is left unlatched and the next bar retries"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some("blocked: broker balance unreadable".to_string());
+                        }
+                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        continue;
+                    }
+                    // Entries ALREADY opened on the account today, not counting
+                    // this attempt. `try_reserve` above has already taken a slot
+                    // for the order we are about to send, so the raw count is
+                    // one too high here — a `>= 2` recovery cap read off it
+                    // would bind at 1 entry, which is not the number the log
+                    // line would print.
+                    let entries_today =
+                        ACCOUNT_DAILY_ENTRIES.count_for(today).saturating_sub(1) as usize;
+                    if let Err(refusal) = m.check_trade_allowed(
+                        neoethos_core::domain::risk::TradeGateInput {
+                            equity: entry_balance,
+                            confidence: measured_confidence,
+                            current_time_sec: (chrono::Utc::now().timestamp().max(0)) as u64,
+                            current_hour: {
+                                use chrono::Timelike;
+                                chrono::Utc::now().hour()
+                            },
+                            entries_today,
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = refusal.rule,
+                            detail = %refusal.detail,
+                            balance = entry_balance,
+                            entries_today,
+                            circuit_breaker_latched = m.circuit_breaker_triggered,
+                            recovery_mode = m.recovery_mode,
+                            "ENTRY REFUSED BY THE PROP-FIRM RISK MANAGER (exits and trailing \
+                             continue normally)"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some(format!("REFUSED by {}: {}", refusal.rule, refusal.detail));
+                        }
+                        // No entry happened — release the daily entry slot.
+                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        continue;
+                    }
+                    // THE CLAMP (#192). `calculate_position_size` returns the
+                    // risk fraction this account may put on THIS entry, given
+                    // the resolved per-trade ceiling, the drawdown bands and the
+                    // measured confidence. Applied with `min`, so it can only
+                    // ever make the order SMALLER — it never lifts a size the
+                    // caller had already decided.
+                    let allowed = m.calculate_position_size(
+                        neoethos_core::domain::risk::PositionSizingInput {
+                            equity: entry_balance,
+                            base_risk_pct: base_risk,
+                            confidence: measured_confidence,
+                        },
+                    );
+                    let clamped = base_risk.min(allowed);
+                    if clamped < base_risk {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            intended_risk_pct = base_risk,
+                            allowed_risk_pct = allowed,
+                            effective_risk_pct = clamped,
+                            per_trade_ceiling = m.max_risk_per_trade,
+                            recovery_mode = m.recovery_mode,
+                            bound_by = "domain::risk::RiskManager::calculate_position_size",
+                            "prop-firm entry CLAMPED — the per-trade ceiling \
+                             (min of risk.prop_firm_max_risk_per_trade / \
+                             risk.max_risk_per_trade and the risk.challenge_phase table) \
+                             and/or the drawdown bands bind below the intended size"
+                        );
+                    }
+                    clamped
                 } else {
                     base_risk
                 };

@@ -68,13 +68,19 @@
 //! - `risk_gate::prop_firm_pre_trade_check` **does not exist**
 //!   anywhere in `crates/`, `desktop/`, `mesh/` or `mcp/`.
 //! - [`crate::domain::risk::RiskManager`], which owns the prop-firm
-//!   tiers, has **no production constructor** — see the warning on
-//!   that struct. Nothing downstream of this manager applies them.
+//!   tiers, had **no production constructor**. Nothing downstream of
+//!   this manager applied them.
 //!
-//! So `RiskyModeManager` is not the outer of two gates. On the live
-//! path it is, together with the breakers in
-//! `neoethos-app/src/app_services/live_trading.rs`, the ONLY gate.
-//! Read it that way.
+//! **SETTLED 2026-08-10 (audit #137).** `RiskManager` now has one
+//! constructor, `RiskManager::from_settings`, and
+//! `neoethos-app/src/app_services/live_trading.rs` builds it — but
+//! the two managers are ALTERNATIVES, not layers. Exactly one runs
+//! per engine, chosen by `system.trading_mode`: `RiskyModeManager`
+//! for `risky`, `RiskManager` for everything else. They are not
+//! composable, because the prop-firm tiers judge a few percent of
+//! daily loss and would refuse every Risky entry on its first bar.
+//! So in Risky Mode this manager is still, together with the checks
+//! in that file, the ONLY gate. Read it that way.
 //!
 //! ## Numeric convention (operator directive §7.2)
 //!
