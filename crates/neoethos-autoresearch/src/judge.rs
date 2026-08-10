@@ -163,6 +163,36 @@ impl JudgeThresholds {
         }
         format!("fnv64:{:016x}", fnv1a64(&b))
     }
+
+    /// Every threshold, by name, for the `SessionOpened` header.
+    ///
+    /// **In `judge_hash`'s declaration order, and covering every field it
+    /// hashes.** The header is what an auditor reads to learn what judged the
+    /// session; a header that listed nine of the eleven numbers would let a
+    /// threshold change the hash — and therefore refuse the resume — without
+    /// ever appearing in the artifact that says why.
+    ///
+    /// The two `usize` trade floors are included even though they are derived
+    /// per session: they are derived ONCE, they enter `judge_hash`, and a reader
+    /// cannot re-derive them without the window.
+    pub fn named_values(&self) -> crate::journal::NamedValues {
+        crate::journal::NamedValues(vec![
+            ("pbo_max".into(), format!("{:?}", self.pbo_max)),
+            ("dsr_min".into(), format!("{:?}", self.dsr_min)),
+            ("p_reach_min".into(), format!("{:?}", self.p_reach_min)),
+            ("p_ruin_max".into(), format!("{:?}", self.p_ruin_max)),
+            ("oos_fraction".into(), format!("{:?}", self.oos_fraction)),
+            ("oos_t_stat_min".into(), format!("{:?}", self.oos_t_stat_min)),
+            (
+                "oos_touches_total".into(),
+                self.oos_touches_total.to_string(),
+            ),
+            ("min_null_obs".into(), self.min_null_obs.to_string()),
+            ("n_min_screen".into(), self.n_min_screen.to_string()),
+            ("n_min_oos".into(), self.n_min_oos.to_string()),
+            ("judge_hash".into(), self.judge_hash()),
+        ])
+    }
 }
 
 /// Derive a trade floor from the window it will be applied to.

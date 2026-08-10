@@ -99,6 +99,20 @@ pub struct Proposal {
     pub replicate_seed: u64,
     pub origin: ProposalOrigin,
     /// Slot within the sweep, in draw order. Part of the replay coordinates.
+    ///
+    /// **This is an IDENTITY, not a position.** It names this proposal for the
+    /// whole life of the sweep: the `ProposalDrawn` record, the `Screened`
+    /// record, the per-slot ledger directory (`slot_042/`), the trial-returns
+    /// matrix (`slot_042.bin`), the partial-trials ledger and — at the end — the
+    /// single out-of-sample touch are all keyed by it.
+    ///
+    /// Nothing may look a proposal up by its position in a `Vec`. The runner
+    /// refuses proposals whose resolution fails (routinely: `Proposal::resolve`
+    /// bails on every non-zero `streaming_batches` and every non-`Start`
+    /// cursor), so any vector that drops a refusal renumbers every entry after
+    /// it — and the first place that renumbering lands is the one irreplaceable
+    /// resource in the whole design. Look up BY THIS FIELD — the runner's
+    /// `proposal_named_by` is the one place that does it — never by index.
     pub slot: usize,
     /// `ResolvedConfigStamp::config_hash` for the configuration this proposal
     /// resolves to, filled at S3 by the proposer before the proposal is

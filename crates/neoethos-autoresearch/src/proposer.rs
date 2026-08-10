@@ -68,7 +68,7 @@ use neoethos_search::run_identity::{PayoffCeilingInputs, payoff_inputs_for_confi
 
 use crate::journal::PosteriorCredit;
 use crate::objective::{
-    ObjectiveChoice, ObjectiveVariant, RefusalDim, RefusalLevels, ScenarioKind,
+    ObjectiveChoice, ObjectiveError, ObjectiveVariant, RefusalDim, RefusalLevels, ScenarioKind,
 };
 use crate::proposal::{
     Proposal, ProposalKey, ProposalOrigin, ProposalRefused, ProposedRunSpec, ProposerCensus,
@@ -77,9 +77,95 @@ use crate::proposal::{
 use crate::session::Session;
 use crate::space::{
     B_MIN_DRAWS, Capabilities, EXPLORATION_FLOOR, FACTOR_COUNT, FactorId, MAX_DELTA_FACTORS,
-    PROPOSER_RETRIES, SWEEP_SEARCHES, SearchConfigDelta, SpaceReport, axis_a_report,
+    PROPOSER_RETRIES, SWEEP_SEARCHES, SearchConfigDelta, SpaceError, SpaceReport, axis_a_report,
     identity_source, lane_horizon_conflict,
 };
+
+/// How many named examples the proposer's own census keeps before it stops
+/// appending. `proposal::ProposerCensus::record_refusal` enforces the same bound
+/// on the refusal path; this one exists because the *repair* paths
+/// (`trust_region_reverted`, `constraint_resampled`) push their names directly,
+/// and an unbounded example list on a days-long session would turn the census
+/// into the artifact. `ProposerCensus::absorb` re-applies the bound on the way
+/// up, so this is a floor on cost, never the thing that decides what is kept.
+const CENSUS_EXAMPLES_MAX: usize = 32;
+
+/// Push a named example, bounded. A count says how many were abandoned; the name
+/// says which question to ask next, and requirement (b) is BOTH.
+fn note_example(census: &mut ProposerCensus, what: String, which: String) {
+    if census.examples.len() < CENSUS_EXAMPLES_MAX {
+        census.examples.push((what, which));
+    }
+}
+
+/// Journal an identity refusal under the record that is TRUE of it.
+///
+/// The two facts are separate and `ProposerCensus` already keeps separate
+/// counters for them, but the JOURNAL used to conflate them — and the journal is
+/// the only durable record, since the proposer's census lives in memory and dies
+/// with the process.
+///
+/// A `Record::ProposalDuplicate` needs a real `first_seen_sweep`. A
+/// **replicate-budget exhaustion has none**: the cell was never run under this
+/// key. The old code wrote `first_seen.unwrap_or(sweep)` — naming the CURRENT
+/// sweep as the first sighting of a configuration that had never been run — so
+/// on the fold it became `census.duplicates_refused` and "we have enough
+/// variance estimates for this cell" and "we ran this exact experiment before"
+/// became one number under a fabricated attribution. Now the first is a
+/// duplicate record and the second is a refusal record carrying its own reason
+/// text.
+fn record_identity_refusal(
+    out: &mut DrawnSweep,
+    slot: usize,
+    config_hash: &str,
+    describe: &str,
+    reason: ProposalRefused,
+    first_seen: Option<SweepId>,
+) {
+    out.census.record_refusal(&reason, describe);
+    match first_seen {
+        Some(first_seen_sweep) => out.duplicates.push(DuplicateDraw {
+            slot,
+            config_hash: config_hash.to_string(),
+            first_seen_sweep,
+        }),
+        None => out.refused.push(RefusedDraw {
+            slot,
+            config_hash: config_hash.to_string(),
+            reason,
+        }),
+    }
+}
+
+/// U5 fired at `from_slot`: count and name every slot the sweep will now never
+/// draw.
+///
+/// `break 'slots` used to be the whole of it. The sweep came back with fewer
+/// than [`SWEEP_SEARCHES`] proposals and the ONLY trace of the abandoned slots
+/// was the difference between the declared size and the actual one — inside the
+/// same function whose other early exit says, in as many words, *"Refusing to
+/// shorten the sweep silently — a sweep of fewer than 100 searches is not the
+/// experiment the judge is told it is."* One record per abandoned slot, so the
+/// journal carries them and the session's own census folds them.
+fn abandon_remaining_slots(
+    out: &mut DrawnSweep,
+    from_slot: usize,
+    consecutive_collisions: usize,
+) {
+    out.exhausted = true;
+    out.slots_abandoned = SWEEP_SEARCHES.saturating_sub(from_slot);
+    let drawn = out.proposals.len();
+    for abandoned in from_slot..SWEEP_SEARCHES {
+        let reason = ProposalRefused::Space(SpaceError::SpaceEnumerated {
+            slot: abandoned,
+            drawn,
+            of: SWEEP_SEARCHES,
+            consecutive_collisions,
+        });
+        out.census.record_refusal(&reason, "<never drawn: the space is enumerated (U5)>");
+        out.refused.push(RefusedDraw { slot: abandoned, config_hash: String::new(), reason });
+    }
+}
 
 /// Replicates of one cell before it counts as exhausted.
 ///
@@ -122,12 +208,15 @@ pub trait ScreenSignal {
     fn null_unavailable(&self) -> bool;
 }
 
-impl ScreenSignal for crate::judge::ScreenOutcome {
+// The judge's concrete result type is `ScreenResult` (`judge.rs`), a three-way
+// enum — Passed / Failed / Unavailable. The trait above takes exactly the two
+// bits the reward channel needs and nothing else.
+impl ScreenSignal for crate::judge::ScreenResult {
     fn passed(&self) -> bool {
-        crate::judge::ScreenOutcome::passed(self)
+        crate::judge::ScreenResult::passed(self)
     }
     fn null_unavailable(&self) -> bool {
-        crate::judge::ScreenOutcome::null_unavailable(self)
+        crate::judge::ScreenResult::null_unavailable(self)
     }
 }
 
@@ -167,7 +256,37 @@ pub struct DrawnSweep {
     /// reachable space is enumerated — a result about a searched space, not a
     /// failure.
     pub exhausted: bool,
+    /// Slots the sweep never drew, because U5 fired part-way through.
+    ///
+    /// **Counted here AND emitted into `refused`**, one record per slot, so the
+    /// journal carries them. Before this existed, `break 'slots` returned a
+    /// short sweep and the only trace of the abandoned slots was the difference
+    /// between [`SWEEP_SEARCHES`] and `proposals.len()` — a silent drop of up to
+    /// 99 slots inside the one code path that the surrounding `bail!` says it
+    /// refuses to take: *"a sweep of fewer than 100 searches is not the
+    /// experiment the judge is told it is."*
+    pub slots_abandoned: usize,
     pub census: ProposerCensus,
+}
+
+/// A refusal raised part way through a draw, carrying the partial configuration
+/// it was raised on.
+///
+/// Requirement (b) is *counted **and named***. A refusal that never reached a
+/// whole [`Proposal`] has no `describe()` to quote, and the census used to
+/// record the literal string `"<draw>"` for it: eleven deaths, no names, and no
+/// way to tell which levels killed them. `drawn_so_far` is every decision the
+/// sampler had made when it hit the wall, in decision order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawRefusal {
+    pub reason: ProposalRefused,
+    pub drawn_so_far: String,
+}
+
+impl DrawRefusal {
+    fn new(reason: ProposalRefused, trace: &[String]) -> Self {
+        Self { reason, drawn_so_far: trace.join(" ") }
+    }
 }
 
 /// The baseline a posterior draw is a delta from.
@@ -247,28 +366,18 @@ impl Proposer {
             ),
         };
         let caps = Capabilities::compiled();
-        let drawable: Vec<_> =
-            ObjectiveVariant::ALL.into_iter().filter(|v| v.drawable(&caps, scenario)).collect();
-        if drawable.is_empty() {
-            let detail = ObjectiveVariant::ALL
-                .into_iter()
-                .filter_map(|v| {
-                    v.exclusion_reason(&caps, scenario).map(|r| {
-                        crate::objective::ObjectiveError::VariantNotDrawable {
-                            variant: v,
-                            reason: r,
-                        }
-                        .to_string()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            bail!(
-                "no axis-B objective is drawable for the {scenario:?} scenario, so the loop would \
-                 sweep axis A under one implicit objective while reporting that it explored the \
-                 objective space. {detail}"
-            );
-        }
+        // THE AXIS-B LIVENESS GATE.
+        //
+        // `drawable.is_empty()` was the old test and it was too weak by exactly
+        // the amount that mattered: a set containing only `ModeNative` variants
+        // is not empty, and it is also not an axis — every sweep would run the
+        // mode's own objective while the coverage table recorded an objective
+        // variant per proposal. `axis_b_live_check` requires at least one
+        // uncapped variant that OVERRIDES something, and names every missing
+        // symbol when there is none. The operator asked for BOTH axes; this is
+        // where "both" stops being a comment.
+        let drawable = crate::objective::axis_b_live_check(&caps, scenario)
+            .map_err(|inert| anyhow::anyhow!("{inert}"))?;
 
         let pip_value_per_lot = base_config.evaluation_config(None).pip_value_per_lot;
         let mut me = Self {
@@ -401,14 +510,18 @@ impl Proposer {
 
     /// U4 — *a space is not refuted if it was not searched* — evaluated over the
     /// DRAWABLE space only, against the session's own coverage fold.
+    ///
+    /// The axis-B half goes through [`crate::objective::axis_b_coverage`], the
+    /// same function `verdict::check_unreachable` uses, so the proposer's view
+    /// of "is the space searched" and the judge's cannot drift. Reading the
+    /// coverage counters directly is what let an axis that produced NO runs pass
+    /// this check: an axis with no credited keys has no under-drawn key.
     pub fn u4_satisfied(&self, session: &Session) -> bool {
-        for v in ObjectiveVariant::coverage_set() {
-            if !v.drawable(&self.caps, self.scenario) {
-                continue;
-            }
-            if session.coverage.get("objective", v.label()).sweeps < B_MIN_DRAWS {
-                return false;
-            }
+        let axis_b = crate::objective::axis_b_coverage(&self.caps, B_MIN_DRAWS, &|label| {
+            session.coverage.get("objective", label).sweeps
+        });
+        if !axis_b.satisfied() {
+            return false;
         }
         for f in FactorId::ALL {
             for l in 0..f.arity() as u8 {
@@ -516,6 +629,7 @@ impl Proposer {
             refused: Vec::new(),
             trust_region_reverted: 0,
             exhausted: false,
+            slots_abandoned: 0,
             census: ProposerCensus::default(),
         };
         let mut debt = self.coverage_debt(session);
@@ -548,8 +662,14 @@ impl Proposer {
                     &mut out.census,
                 ) {
                     Ok(c) => c,
-                    Err(reason) => {
-                        out.census.record_refusal(&reason, "<draw>");
+                    Err(DrawRefusal { reason, drawn_so_far }) => {
+                        // `drawn_so_far` and not `"<draw>"`. The census line for
+                        // a refusal that never reached a whole proposal used to
+                        // be the literal string `<draw>`, which counted the
+                        // abandonment and named nothing: a reader could see that
+                        // eleven draws died in the space and could not tell which
+                        // levels killed them. The partial draw is the name.
+                        out.census.record_refusal(&reason, &drawn_so_far);
                         out.refused.push(RefusedDraw {
                             slot,
                             config_hash: String::new(),
@@ -599,18 +719,33 @@ impl Proposer {
                         Some(first_seen) => ProposalRefused::Duplicate { first_seen },
                         None => ProposalRefused::CellReplicatesExhausted { replicates: replicate },
                     };
-                    out.census.record_refusal(&reason, &candidate.describe());
-                    out.duplicates.push(DuplicateDraw {
+                    record_identity_refusal(
+                        &mut out,
                         slot,
-                        config_hash: candidate.config_hash.clone(),
-                        first_seen_sweep: first_seen.unwrap_or(sweep),
-                    });
+                        &candidate.config_hash,
+                        &candidate.describe(),
+                        reason,
+                        first_seen,
+                    );
                     if force_uniform {
                         out.census.uniform_collisions += 1;
                         consecutive_uniform_collisions += 1;
                         if consecutive_uniform_collisions >= PROPOSER_RETRIES {
-                            // U5. The reachable space is enumerated.
-                            out.exhausted = true;
+                            abandon_remaining_slots(
+                                &mut out,
+                                slot,
+                                consecutive_uniform_collisions,
+                            );
+                            tracing::warn!(
+                                target: "neoethos_autoresearch::proposer",
+                                %sweep,
+                                drawn = out.proposals.len(),
+                                of = SWEEP_SEARCHES,
+                                slots_abandoned = out.slots_abandoned,
+                                "U5 — the reachable space is enumerated. The sweep stops short; \
+                                 every slot it never drew is journalled as a ProposalRefused so \
+                                 nothing leaves without a record."
+                            );
                             break 'slots;
                         }
                     }
@@ -735,8 +870,23 @@ impl Proposer {
         forced_variant: Option<ObjectiveVariant>,
         parent: Option<&ParentReference>,
         census: &mut ProposerCensus,
-    ) -> Result<Proposal, ProposalRefused> {
+    ) -> Result<Proposal, DrawRefusal> {
         let evidence = |factor: &str, level: &str| beta_params(session, factor, level);
+
+        // Everything decided so far, in decision order. A refusal raised part
+        // way through a draw is attached to it, so the census can name the
+        // configuration that was abandoned instead of printing `<draw>`.
+        let mut trace: Vec<String> = Vec::with_capacity(FACTOR_COUNT + 8);
+        trace.push(format!("slot={slot}"));
+        trace.push(format!("origin={}", if force_uniform { "uniform" } else { "posterior" }));
+        macro_rules! named {
+            ($trace:expr, $e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(reason) => return Err(DrawRefusal::new(reason, &$trace)),
+                }
+            };
+        }
 
         // ── axis A ─────────────────────────────────────────────────────────
         let mut levels = [0u8; FACTOR_COUNT];
@@ -748,9 +898,12 @@ impl Proposer {
             } else {
                 argmax_sampled(rng, &available, |l| evidence(f.label(), &f.level_label(l)))
             };
+            trace.push(format!("{}={}", f.label(), f.level_label(levels[f.index()])));
         }
-        let mut axis_a =
-            SearchConfigDelta::new(levels, &self.caps).map_err(ProposalRefused::Space)?;
+        let mut axis_a = named!(
+            trace,
+            SearchConfigDelta::new(levels, &self.caps).map_err(ProposalRefused::Space)
+        );
 
         // ── trust region ───────────────────────────────────────────────────
         //
@@ -762,7 +915,13 @@ impl Proposer {
         if !force_uniform
             && let Some(parent) = parent
         {
-            axis_a = apply_trust_region(axis_a, &parent.axis_a, &self.caps, &evidence, census)?;
+            axis_a = named!(
+                trace,
+                apply_trust_region(axis_a, &parent.axis_a, &self.caps, &evidence, census)
+            );
+            for f in FactorId::ALL {
+                trace.push(format!("{}'={}", f.label(), f.level_label(axis_a.level(f))));
+            }
         }
 
         // ── axis B ─────────────────────────────────────────────────────────
@@ -778,7 +937,33 @@ impl Proposer {
                         None => true,
                     })
                     .collect();
-                let pool = if pool.is_empty() { self.drawable_variants.clone() } else { pool };
+                // NO FALLBACK. This used to read
+                //   `if pool.is_empty() { self.drawable_variants.clone() }`
+                // which, when every drawable variant had spent its
+                // `max_draws_per_session`, silently re-admitted the capped
+                // control and drew it again — and again — past its declared
+                // ceiling, with no counter and no census line. A cap that the
+                // sampler quietly steps over is a configuration nobody chose
+                // running under a name somebody did, which is the exact sin the
+                // module header forbids.
+                //
+                // `axis_b_live_check` guarantees at least one UNCAPPED
+                // overriding variant is drawable, so this branch is unreachable
+                // in a session that started; if it is ever reached the space
+                // declaration and the liveness gate have come apart, and the
+                // honest answer is a named refusal that the slot loop counts.
+                if pool.is_empty() {
+                    return Err(DrawRefusal::new(
+                        ProposalRefused::Objective(ObjectiveError::AllVariantsCapped {
+                            drawable: self
+                                .drawable_variants
+                                .iter()
+                                .map(|v| v.label().to_string())
+                                .collect(),
+                        }),
+                        &trace,
+                    ));
+                }
                 if force_uniform {
                     pool[rng.random_range(0..pool.len())]
                 } else {
@@ -791,6 +976,7 @@ impl Proposer {
             }
         };
         let mut param = rng.random_range(0..variant.param_count()) as u8;
+        trace.push(format!("objective={}[{}]", variant.label(), variant.param_label(param)));
 
         // ── the lane / horizon pairing rule ────────────────────────────────
         //
@@ -808,13 +994,24 @@ impl Proposer {
             .map_err(ProposalRefused::Objective)?
             .label_horizon_bars(0))
         };
-        let mut horizon = horizon_of(param)?;
+        let mut horizon = named!(trace, horizon_of(param));
         if lane_horizon_conflict(axis_a.base_timeframe(), axis_a.higher_lanes(), horizon).is_err() {
+            // The pairing that was DRAWN and is about to be replaced. Counted
+            // AND named: `constraint_resampled` alone said that N draws were
+            // repaired and left no way to see which ones, so the configuration
+            // the sampler actually chose vanished. (b) asks for both.
+            let abandoned = format!(
+                "{} + lanes[{}] with objective {}[{}] (horizon {horizon} base bars)",
+                axis_a.base_timeframe(),
+                axis_a.higher_lanes().join("+"),
+                variant.label(),
+                variant.param_label(param),
+            );
             census.constraint_resampled += 1;
             let mut fixed = false;
             if variant == ObjectiveVariant::B4LabelHorizon {
                 for p in (0..variant.param_count() as u8).rev() {
-                    let h = horizon_of(p)?;
+                    let h = named!(trace, horizon_of(p));
                     if lane_horizon_conflict(axis_a.base_timeframe(), axis_a.higher_lanes(), h)
                         .is_ok()
                     {
@@ -825,11 +1022,19 @@ impl Proposer {
                     }
                 }
             }
+            let mut repair = if fixed {
+                format!("horizon raised to {horizon} base bars")
+            } else {
+                "unrepaired".to_string()
+            };
             if !fixed {
                 for l in (0..FactorId::HigherLanes.arity() as u8).rev() {
-                    let candidate = axis_a
-                        .with_level(FactorId::HigherLanes, l, &self.caps)
-                        .map_err(ProposalRefused::Space)?;
+                    let candidate = named!(
+                        trace,
+                        axis_a
+                            .with_level(FactorId::HigherLanes, l, &self.caps)
+                            .map_err(ProposalRefused::Space)
+                    );
                     if lane_horizon_conflict(
                         candidate.base_timeframe(),
                         candidate.higher_lanes(),
@@ -838,10 +1043,19 @@ impl Proposer {
                     .is_ok()
                     {
                         axis_a = candidate;
+                        repair = format!(
+                            "higher_lanes reduced to [{}]",
+                            axis_a.higher_lanes().join("+")
+                        );
                         break;
                     }
                 }
             }
+            note_example(
+                census,
+                format!("constraint_resampled: {repair}"),
+                abandoned,
+            );
         }
 
         // ── the refusal vector ─────────────────────────────────────────────
@@ -856,7 +1070,13 @@ impl Proposer {
                 argmax_sampled(rng, &available, |l| evidence(d.label(), &d.level_label(l)))
             };
         }
-        let refusals = RefusalLevels::new(refusal_levels).map_err(ProposalRefused::Objective)?;
+        for d in RefusalDim::ALL {
+            trace.push(format!("{}={}", d.label(), d.level_label(refusal_levels[d.index()])));
+        }
+        let refusals = named!(
+            trace,
+            RefusalLevels::new(refusal_levels).map_err(ProposalRefused::Objective)
+        );
 
         let origin = if force_uniform {
             ProposalOrigin::ExplorationFloor
@@ -866,21 +1086,23 @@ impl Proposer {
             ProposalOrigin::Posterior
         };
 
-        crate::proposal::build(
-            axis_a,
-            variant,
-            param,
-            refusals,
-            // Replaced in `draw_sweep` by the cell's own replicate seed.
-            0,
-            origin,
-            slot,
-            if force_uniform { None } else { parent.map(|p| p.sweep) },
-            &self.caps,
-            self.scenario,
-        )
+        Ok(named!(
+            trace,
+            crate::proposal::build(
+                axis_a,
+                variant,
+                param,
+                refusals,
+                // Replaced in `draw_sweep` by the cell's own replicate seed.
+                0,
+                origin,
+                slot,
+                if force_uniform { None } else { parent.map(|p| p.sweep) },
+                &self.caps,
+                self.scenario,
+            )
+        ))
     }
-
 }
 
 /// `Beta(1 + successes, 1 + failures)` for one arm.
@@ -922,8 +1144,20 @@ where
     });
     let revert = differing.len() - MAX_DELTA_FACTORS;
     for f in differing.into_iter().take(revert) {
+        // Counted AND named. The drawn level is a configuration the sampler
+        // chose and the trust region then discarded; `trust_region_reverted`
+        // alone recorded that N of them died and left no way to see which
+        // factors kept losing to the parent — which is precisely the question a
+        // reader of the census asks next.
+        let drawn = f.level_label(axis_a.level(f));
+        let reverted_to = f.level_label(parent.level(f));
         axis_a = axis_a.with_level(f, parent.level(f), caps).map_err(ProposalRefused::Space)?;
         census.trust_region_reverted += 1;
+        note_example(
+            census,
+            format!("trust_region_reverted: {} -> {reverted_to}", f.label()),
+            format!("{}={drawn} (drawn), outside the {MAX_DELTA_FACTORS}-factor trust region", f.label()),
+        );
     }
     Ok(axis_a)
 }
@@ -1330,5 +1564,219 @@ mod tests {
             payoff_ceiling: None,
             census: ProposerCensus::default(),
         }
+    }
+
+    fn empty_drawn_sweep() -> DrawnSweep {
+        DrawnSweep {
+            proposals: Vec::new(),
+            duplicates: Vec::new(),
+            refused: Vec::new(),
+            trust_region_reverted: 0,
+            exhausted: false,
+            slots_abandoned: 0,
+            census: ProposerCensus::default(),
+        }
+    }
+
+    // ── DEFECT 3: the axis-B liveness gate lives in `restore` ───────────────
+
+    #[test]
+    fn the_proposer_refuses_a_session_whose_objective_axis_cannot_vary() {
+        // `restore` used to bail only when the drawable set was EMPTY. A set of
+        // ModeNative variants is not empty and is also not an axis: every sweep
+        // would run the mode's own objective while the coverage table recorded
+        // an objective variant per proposal, and U4 would then certify a space
+        // that was never searched on axis B.
+        //
+        // The gate is `objective::axis_b_live_check`; this asserts the proposer
+        // routes through it and that the shipped build passes it.
+        let caps = Capabilities::compiled();
+        for scenario in crate::objective::SCENARIOS {
+            let drawable = crate::objective::axis_b_live_check(&caps, scenario)
+                .expect("the shipped build must present a varying objective axis");
+            assert!(crate::objective::carries_the_axis(&drawable));
+        }
+        // …and the rule the gate applies rejects a ModeNative-only set.
+        assert!(!crate::objective::carries_the_axis(&[ObjectiveVariant::B5TerminalWealth]));
+    }
+
+    #[test]
+    fn u4_is_false_while_the_objective_axis_has_no_runs() {
+        // `Proposer::u4_satisfied` and `verdict::check_unreachable` must agree,
+        // and neither may certify an axis that produced nothing. A default
+        // Session has an empty coverage fold: every objective variant reads 0.
+        let mut p = test_proposer();
+        p.caps = Capabilities::compiled();
+        p.drawable_variants =
+            crate::objective::axis_b_live_check(&p.caps, ScenarioKind::Risky).unwrap();
+        assert!(
+            !p.u4_satisfied(&Session::default()),
+            "U4 certified a space whose objective axis produced no runs"
+        );
+    }
+
+    // ── DEFECT 4: no abandoned configuration may vanish ─────────────────────
+
+    #[test]
+    fn a_partial_draw_that_is_refused_names_what_it_had_drawn() {
+        // HOLE: the census line for a refusal raised inside `draw_one` was the
+        // literal string `"<draw>"`. The abandonment was counted and the
+        // configuration was never named, so a reader could see that N draws died
+        // in the objective and could not tell which levels killed them.
+        //
+        // Forced through the one refusal `draw_one` can raise on its own: a
+        // drawable set consisting of a single capped control whose cap is spent.
+        let mut p = test_proposer();
+        p.drawable_variants = vec![ObjectiveVariant::B0ScoringTable];
+        p.b0_drawn = 1; // B0's max_draws_per_session is 1, and it is spent.
+        let mut rng = ChaCha20Rng::seed_from_u64(3);
+        let mut census = ProposerCensus::default();
+        let err = p
+            .draw_one(&Session::default(), &mut rng, 7, true, None, None, &mut census)
+            .expect_err("every drawable variant is capped and spent");
+
+        // Counted AND named: the partial draw, not a placeholder.
+        assert_ne!(err.drawn_so_far, "<draw>");
+        assert!(err.drawn_so_far.contains("slot=7"), "{}", err.drawn_so_far);
+        assert!(err.drawn_so_far.contains("population="), "{}", err.drawn_so_far);
+        assert!(err.drawn_so_far.contains("base_timeframe="), "{}", err.drawn_so_far);
+        // …and the reason names the cap rather than the sampler silently
+        // re-admitting the control past its own ceiling.
+        assert!(
+            matches!(
+                err.reason,
+                ProposalRefused::Objective(ObjectiveError::AllVariantsCapped { .. })
+            ),
+            "{:?}",
+            err.reason
+        );
+        assert!(err.reason.to_string().contains("max_draws_per_session"));
+    }
+
+    #[test]
+    fn a_capped_control_is_never_re_admitted_past_its_ceiling() {
+        // The other half of the same hole: the old code read
+        //   `if pool.is_empty() { self.drawable_variants.clone() }`
+        // so a spent cap produced a draw of the capped variant anyway, with no
+        // counter and no census line. It must refuse instead.
+        let mut p = test_proposer();
+        p.drawable_variants = vec![ObjectiveVariant::B0ScoringTable];
+        p.b0_drawn = ObjectiveVariant::B0ScoringTable.spec().max_draws_per_session.unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(5);
+        let mut census = ProposerCensus::default();
+        for slot in 0..8 {
+            assert!(
+                p.draw_one(&Session::default(), &mut rng, slot, true, None, None, &mut census)
+                    .is_err(),
+                "slot {slot} drew a variant whose per-session cap was already spent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_replicate_budget_is_not_journalled_as_a_duplicate() {
+        // HOLE: both were pushed to `duplicates`, and a replicate exhaustion has
+        // no first sighting — the code wrote `first_seen.unwrap_or(sweep)`, i.e.
+        // it named the CURRENT sweep as the sweep that first ran a configuration
+        // that had never been run. The fold then counted it as
+        // `duplicates_refused`. Two different facts, one bucket, one fabricated
+        // attribution — and the journal is the only durable record.
+        let mut out = empty_drawn_sweep();
+        record_identity_refusal(
+            &mut out,
+            3,
+            "fnv64:aaaa",
+            "population=512 objective=B1_selectivity[max_in_market=0.10]",
+            ProposalRefused::CellReplicatesExhausted { replicates: MAX_REPLICATES_PER_CELL },
+            None,
+        );
+        assert!(out.duplicates.is_empty(), "a spent replicate budget is not a duplicate");
+        assert_eq!(out.refused.len(), 1);
+        assert_eq!(out.refused[0].slot, 3);
+        assert_eq!(out.refused[0].config_hash, "fnv64:aaaa");
+        assert!(out.refused[0].reason.to_string().contains("replicate budget"));
+        assert_eq!(out.census.cell_replicates_exhausted, 1);
+        assert_eq!(out.census.duplicates_refused, 0);
+        // …and the example names the configuration, not a placeholder.
+        assert!(out.census.examples[0].1.contains("B1_selectivity"));
+
+        // A real duplicate still journals as one, with the REAL first sighting.
+        let mut out = empty_drawn_sweep();
+        record_identity_refusal(
+            &mut out,
+            4,
+            "fnv64:bbbb",
+            "population=512",
+            ProposalRefused::Duplicate { first_seen: SweepId(2) },
+            Some(SweepId(2)),
+        );
+        assert_eq!(out.duplicates.len(), 1);
+        assert_eq!(out.duplicates[0].first_seen_sweep, SweepId(2));
+        assert!(out.refused.is_empty());
+        assert_eq!(out.census.duplicates_refused, 1);
+    }
+
+    #[test]
+    fn u5_counts_and_names_every_slot_the_sweep_never_drew() {
+        // HOLE: `break 'slots` returned a short sweep. Slots `slot..100` were
+        // never drawn and left NO record — the only trace was the difference
+        // between SWEEP_SEARCHES and `proposals.len()`, in the same function
+        // whose other early exit refuses "to shorten the sweep silently".
+        let mut out = empty_drawn_sweep();
+        abandon_remaining_slots(&mut out, 12, PROPOSER_RETRIES);
+
+        assert!(out.exhausted);
+        assert_eq!(out.slots_abandoned, SWEEP_SEARCHES - 12);
+        // Every abandoned slot has exactly one journal record, in order, and no
+        // drawn slot has one.
+        assert_eq!(out.refused.len(), SWEEP_SEARCHES - 12);
+        let slots: Vec<usize> = out.refused.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, (12..SWEEP_SEARCHES).collect::<Vec<_>>());
+        // Counted in the census, and named with the reason.
+        assert_eq!(out.census.space_refused, SWEEP_SEARCHES - 12);
+        let text = out.refused[0].reason.to_string();
+        assert!(text.contains("ABANDONED"), "{text}");
+        assert!(text.contains("enumerated"), "{text}");
+        assert!(text.contains(&format!("{PROPOSER_RETRIES} consecutive")), "{text}");
+        // The accounting identity the whole fix exists for: every slot of the
+        // sweep is either drawn or named. In `draw_sweep` the slots before
+        // `from_slot` each pushed exactly one proposal (the inner loop leaves no
+        // other way out), so `from_slot + slots_abandoned == SWEEP_SEARCHES` is
+        // the same statement as `proposals + abandoned == SWEEP_SEARCHES`.
+        assert_eq!(12 + out.slots_abandoned, SWEEP_SEARCHES);
+    }
+
+    #[test]
+    fn a_trust_region_revert_names_the_level_it_discarded() {
+        // HOLE: `trust_region_reverted` was a bare count. The level the sampler
+        // actually chose — a configuration the loop abandoned — was never named,
+        // so "which factors keep losing to the parent" was unanswerable from the
+        // report.
+        let caps = Capabilities::all_for_tests();
+        let parent = SearchConfigDelta::new([0; FACTOR_COUNT], &caps).unwrap();
+        let mut far = parent;
+        for f in FactorId::ALL {
+            far = far.with_level(f, 1, &caps).unwrap();
+        }
+        let mut census = ProposerCensus::default();
+        apply_trust_region(far, &parent, &caps, &evidence_uniform(), &mut census).unwrap();
+        assert_eq!(census.trust_region_reverted, FACTOR_COUNT - MAX_DELTA_FACTORS);
+        assert_eq!(
+            census.examples.len(),
+            FACTOR_COUNT - MAX_DELTA_FACTORS,
+            "every revert must be named, not only counted"
+        );
+        assert!(census.examples.iter().all(|(what, which)| {
+            what.starts_with("trust_region_reverted:") && which.contains("(drawn)")
+        }));
+    }
+
+    #[test]
+    fn the_named_examples_are_bounded_so_a_long_session_cannot_become_its_own_census() {
+        let mut census = ProposerCensus::default();
+        for i in 0..(CENSUS_EXAMPLES_MAX * 4) {
+            note_example(&mut census, format!("what{i}"), format!("which{i}"));
+        }
+        assert_eq!(census.examples.len(), CENSUS_EXAMPLES_MAX);
     }
 }

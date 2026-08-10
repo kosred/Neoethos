@@ -26,6 +26,20 @@
 //! from the sweep's partial ledger — **still counts into `N_session`**. A trial
 //! that ran is a trial that ran.
 //!
+//! ## A slot NAMES its proposal
+//!
+//! Every `slot` in this module — in the journal, in the per-slot ledger
+//! directory, in the trial-returns filename, in the best-ever record and in the
+//! promotion candidate — is [`crate::proposal::Proposal::slot`], **not** a
+//! position in any vector. Refusals at S4 are the norm rather than the
+//! exception: `Proposal::resolve` bails on every non-zero `streaming_batches`
+//! draw and every non-`Start` cursor draw, both of which the proposer samples
+//! uniformly. So a refused proposal keeps its row (see
+//! `SearchOutcome::refused_before_running`) instead of being dropped, the rows
+//! carry their slot explicitly, and the two places the judge hands back a
+//! POSITION — `SweepScreen::per_slot` and `SweepScreen::champion_slot` — are
+//! translated back into slots in exactly one function, `align_screen`.
+//!
 //! ## What this module will not do
 //!
 //! It never places an order, never contacts a broker, never writes
@@ -93,6 +107,10 @@ impl RunArgs {
 #[derive(Debug, Clone)]
 pub struct SearchRequest<'a> {
     pub sweep: SweepId,
+    /// The slot that NAMES this proposal — [`crate::proposal::Proposal::slot`],
+    /// not a position in any vector. The executor keys its per-slot ledger
+    /// directory by it and must echo it back unchanged in
+    /// [`SearchOutcome::slot`].
     pub slot: usize,
     /// The proposal's delta already applied to the session's baseline.
     pub config: &'a DiscoveryConfig,
@@ -112,6 +130,11 @@ pub struct SearchRequest<'a> {
 /// consumes it and returns verdicts. Neither side reaches across.
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
+    /// The slot that names the PROPOSAL this outcome belongs to — echoed back
+    /// from [`SearchRequest::slot`] unchanged. The runner checks it and FAILS
+    /// the sweep on a mismatch: an outcome that renames itself would attribute
+    /// this search's statistics, its trial matrix and possibly the one
+    /// out-of-sample touch to a different configuration.
     pub slot: usize,
     pub config_hash: String,
     /// Every screened candidate this search offered. The honest N contribution,
@@ -139,7 +162,60 @@ pub struct SearchOutcome {
     pub error: Option<String>,
 }
 
+/// How the `error` of a row that never ran begins. Written into the journal so
+/// a census reader can tell "this search failed" from "this search never
+/// happened" without holding the runner's source.
+pub const NOT_RUN_PREFIX: &str = "NOT RUN — ";
+
 impl SearchOutcome {
+    /// The row for a slot whose proposal could not be resolved into a runnable
+    /// configuration.
+    ///
+    /// **It exists so `per_search` keeps one row per PROPOSAL.** The moment a
+    /// refusal removes a row, every index after it names a different experiment
+    /// than it did before — and refusals are the NORM here, not an edge case:
+    /// [`crate::proposal::Proposal::resolve`] bails on every non-zero
+    /// `streaming_batches` draw and every non-`Start` cursor draw, both of which
+    /// the proposer samples uniformly. Keeping the row is what makes "position"
+    /// and "identity" the same number again, and the identity is also carried
+    /// explicitly in `slot` so that even a compacted vector can be re-keyed.
+    ///
+    /// The row is honest about itself: zero trials, an unreadable statistics
+    /// report, a cost band that does not discriminate, and a named `error` that
+    /// begins with [`NOT_RUN_PREFIX`]. The judge therefore screens it as a
+    /// FAILURE rather than scoring a search that never happened, and the runner
+    /// excludes it from the posterior credit — an arm that was never tested is
+    /// not evidence about that arm.
+    fn refused_before_running(slot: usize, config_hash: &str, reason: &str) -> Self {
+        let detail = format!(
+            "{NOT_RUN_PREFIX}the proposal was refused before a bar was read and NO SEARCH TOOK \
+             PLACE, so this row carries no evidence about the configuration it names. It is kept \
+             so the sweep's rows stay one-per-proposal and slot {slot} still names slot {slot}. \
+             Reason: {reason}"
+        );
+        Self {
+            slot,
+            config_hash: config_hash.to_string(),
+            trials_offered: 0,
+            statistics: TrialStatisticsReport::unreadable(detail.clone()),
+            // `discriminates: false`, so screen conjunct S3 refuses it. A row
+            // that never ran must never inherit a passing band verdict.
+            cost_band: CostBandCounts::default(),
+            rejections: Vec::new(),
+            survivors: 0,
+            e_screen_pess: None,
+            n_trades: 0,
+            champion_returns: Vec::new(),
+            champion_period_keys: Vec::new(),
+            champion_strategy_id: String::new(),
+            streamed: false,
+            batch_columns: 0,
+            next_cursor: 0,
+            wall_ms: 0,
+            error: Some(detail),
+        }
+    }
+
     /// The compact journal row.
     pub fn to_record(&self) -> SearchRecord {
         SearchRecord {
@@ -456,7 +532,7 @@ pub fn run_with_executor(
         // report shape as a success. An abort that produces no `verdict.json`
         // is the multi-hour run that ended with no artifact — the failure mode
         // this repository has actually lived through.
-        let evidence = match run_sweep(
+        let run = match run_sweep(
             &mut ctx,
             &mut writer,
             executor,
@@ -465,7 +541,7 @@ pub fn run_with_executor(
             &drawn.proposals,
             None,
         ) {
-            Ok(evidence) => evidence,
+            Ok(run) => run,
             Err(err) => {
                 return stop(
                     &mut ctx,
@@ -476,6 +552,33 @@ pub fn run_with_executor(
                 );
             }
         };
+        let evidence = &run.evidence;
+
+        // Refusals at S4 are routine — `Proposal::resolve` bails on every
+        // non-zero `streaming_batches` and every non-`Start` cursor, both of
+        // which the proposer samples — so a sweep with SOME refusals is normal
+        // and each one is journalled by name. A sweep with NOTHING left is not:
+        // it means the runner cannot express the space the proposer draws from,
+        // which is a wiring finding and not a research result.
+        if run.not_run.len() == drawn.proposals.len() {
+            let (first_slot, first_reason) = run
+                .not_run
+                .first()
+                .map(|(s, r)| (*s, r.clone()))
+                .unwrap_or((0, "<unnamed>".to_string()));
+            return stop(
+                &mut ctx,
+                &mut writer,
+                crate::verdict::StopReason::InfrastructureAbort {
+                    detail: format!(
+                        "every one of {sweep}'s {} proposals was refused before it ran, so the \
+                         sweep produced no evidence at all. The first was slot {first_slot}: \
+                         {first_reason}",
+                        drawn.proposals.len()
+                    ),
+                },
+            );
+        }
 
         // §13.2.5 — on the FIRST live sweep, an unreadable matrix everywhere
         // means the DSR/PBO wiring is ABSENT, not that the configuration was
@@ -503,36 +606,76 @@ pub fn run_with_executor(
         // ── S6 SCREEN (in-sample only; never touches OOS) ────────────────────
         let null = crate::shuffle::ShuffleNull::from_session(writer.session());
         let screen = crate::judge::screen_sweep(
-            &evidence,
+            evidence,
             &ctx.thresholds,
             writer.session().n_session(),
             &null,
         );
 
+        // The judge returns POSITIONS; every record below is keyed by the SLOT
+        // that names a proposal. This is the one place the two are related, and
+        // it refuses rather than guessing.
+        let aligned = match align_screen(
+            sweep,
+            &drawn.proposals,
+            evidence,
+            &screen,
+            &run.not_run,
+        ) {
+            Ok(aligned) => aligned,
+            Err(err) => {
+                return stop(
+                    &mut ctx,
+                    &mut writer,
+                    crate::verdict::StopReason::InfrastructureAbort {
+                        detail: format!("{sweep}: {err:#}"),
+                    },
+                );
+            }
+        };
+
         // ── S7 RECORD ───────────────────────────────────────────────────────
-        for (slot, result) in screen.per_slot.iter().enumerate() {
+        for (slot, result) in &aligned.rows {
             writer.append(Record::Screened {
                 sweep,
-                slot,
+                slot: *slot,
                 screen_result: result.clone(),
                 failing_conjunct: result.failing_conjunct_label(),
             })?;
         }
-        let credits = proposer.credits_for(&drawn.proposals, &screen.per_slot);
+        let credits =
+            proposer.credits_for(&aligned.credit_proposals, &aligned.credit_screens);
         writer.append(Record::PosteriorUpdated { sweep, credits })?;
 
         if let Some(champion) = screen.champion.clone() {
-            writer.session_mut().push_champion(champion.clone());
+            // A champion with no slot is a champion nobody can find again: the
+            // best-ever record, the GC's keep-set and the promotion candidate
+            // are all keyed by it. `unwrap_or(0)` here would silently name slot
+            // 0's configuration as the session's best.
+            let Some(champion_slot) = aligned.champion_slot else {
+                return stop(
+                    &mut ctx,
+                    &mut writer,
+                    crate::verdict::StopReason::InfrastructureAbort {
+                        detail: format!(
+                            "{sweep} produced a champion row but the screen named no slot for it, \
+                             so nothing could say WHICH configuration the session's best-ever \
+                             result belongs to."
+                        ),
+                    },
+                );
+            };
+            writer.push_champion(champion.clone())?;
             ctx.store.write_champions(&writer.session().champions)?;
-            writer.session_mut().offer_best_ever(BestEver {
+            writer.offer_best_ever(BestEver {
                 sweep,
-                slot: screen.champion_slot.unwrap_or(0),
+                slot: champion_slot,
                 config_hash: champion.config_hash.clone(),
                 e_screen_pess: champion.e_screen_pess,
                 n_trades: screen.champion_n_trades,
                 dsr: screen.champion_dsr,
                 pbo: screen.champion_pbo,
-            });
+            })?;
         }
 
         // ── S8 BLOCK BOUNDARY ───────────────────────────────────────────────
@@ -845,8 +988,193 @@ fn ctx_n_min_oos(config: &DiscoveryConfig, oos_window: OosWindow) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// A SLOT NAMES ITS PROPOSAL — it is never a position in a vector
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The proposer emits exactly one proposal per slot `0..SWEEP_SEARCHES`, and the
+// slot is carried on the proposal itself, in every journal record, in the
+// per-slot ledger directory and in the trial-returns filename. Everything below
+// looks a slot up BY THAT VALUE. Nothing indexes a vector with it without first
+// proving the vector is dense, because the one vector that is NOT dense —
+// `per_search`, which drops a row for every proposal the runner could not
+// resolve — used to be indexed with a number that came from a different vector,
+// and the place that mismatch landed was the single out-of-sample touch.
+
+/// Prove a sweep's proposals are one-per-slot in draw order.
+///
+/// A gap here means a `ProposalDrawn` record is missing from the journal, and
+/// the journal is the memory: with a gap, `session.proposals_of()` back-fills
+/// the hole with a CLONE of a neighbour, so a slot that was never drawn would
+/// answer with somebody else's configuration. Refused, loudly, before a bar is
+/// read.
+fn assert_draw_order_is_dense(
+    sweep: SweepId,
+    proposals: &[crate::proposal::Proposal],
+) -> Result<()> {
+    for (position, proposal) in proposals.iter().enumerate() {
+        if proposal.slot != position {
+            bail!(
+                "{sweep}'s proposal at position {position} names slot {}. The draw order IS the \
+                 slot: the proposer emits one proposal per slot and the journal, the ledger \
+                 directory, the trial-returns matrix and the out-of-sample touch are all keyed by \
+                 it. Refusing to run a sweep whose positions and slots disagree — that \
+                 disagreement is invisible until it spends the one window this design exists to \
+                 protect.",
+                proposal.slot
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The proposal a slot NAMES, cross-checked against the `config_hash` the
+/// record carried.
+///
+/// The hash check is the belt: if the two ever disagree, two different
+/// configurations are wearing one slot and the caller refuses rather than
+/// running whichever one an index happened to reach.
+fn proposal_named_by<'a>(
+    sweep: SweepId,
+    proposals: &'a [crate::proposal::Proposal],
+    slot: usize,
+    expected_hash: Option<&str>,
+) -> Result<&'a crate::proposal::Proposal> {
+    let proposal = proposals
+        .iter()
+        .find(|p| p.slot == slot)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{sweep} has no proposal naming slot {slot}. A slot names its proposal; it is \
+                 never a position in a vector. Slots present: {:?}",
+                proposals.iter().map(|p| p.slot).collect::<Vec<_>>()
+            )
+        })?;
+    if let Some(expected) = expected_hash
+        && !expected.is_empty()
+        && !proposal.config_hash.is_empty()
+        && proposal.config_hash != expected
+    {
+        bail!(
+            "{sweep} slot {slot} names the proposal stamped {} but the record carried {expected}. \
+             Two different configurations are wearing one slot. Refusing rather than running \
+             whichever one the index reached — this check exists because a compacted vector \
+             indexed by a dense number is exactly how the wrong configuration would be handed the \
+             single out-of-sample touch.",
+            proposal.config_hash
+        );
+    }
+    Ok(proposal)
+}
+
+/// Refuse an outcome that renames the slot it was asked to run.
+fn assert_outcome_names_its_request(
+    sweep: SweepId,
+    requested: usize,
+    returned: usize,
+) -> Result<()> {
+    if requested != returned {
+        bail!(
+            "{sweep}: the executor was asked to run slot {requested} and returned an outcome \
+             naming slot {returned}. A slot names its proposal, so an outcome that renames itself \
+             would file this search's statistics, its trial-returns matrix and possibly the one \
+             out-of-sample touch under a different configuration."
+        );
+    }
+    Ok(())
+}
+
+/// The screen, re-keyed from POSITIONS in `per_search` to the SLOTS that name
+/// the proposals.
+///
+/// The judge returns positions because it iterates the evidence it was handed;
+/// the runner owns the mapping back to identity, and does it in exactly one
+/// place so a future change to either side cannot reintroduce the drift.
+struct AlignedScreen {
+    /// `(slot, result)` for every screened row.
+    rows: Vec<(usize, crate::judge::ScreenResult)>,
+    /// The proposals whose searches ACTUALLY RAN, index-aligned with
+    /// `credit_screens` — the posterior's input. Slots that never ran are
+    /// excluded: an arm that was never tested is not evidence about that arm,
+    /// and crediting it a failure would teach the loop to avoid a region it
+    /// never looked at.
+    credit_proposals: Vec<crate::proposal::Proposal>,
+    credit_screens: Vec<crate::judge::ScreenResult>,
+    /// The slot naming this sweep's champion, translated out of its position.
+    champion_slot: Option<usize>,
+}
+
+fn align_screen(
+    sweep: SweepId,
+    proposals: &[crate::proposal::Proposal],
+    evidence: &SweepEvidence,
+    screen: &crate::judge::SweepScreen,
+    not_run: &[(usize, String)],
+) -> Result<AlignedScreen> {
+    if screen.per_slot.len() != evidence.per_search.len() {
+        bail!(
+            "{sweep}: the screen returned {} results for {} search records. They are index-aligned \
+             by contract, so a length disagreement means a result would be filed against a search \
+             it did not judge.",
+            screen.per_slot.len(),
+            evidence.per_search.len()
+        );
+    }
+
+    let mut rows = Vec::with_capacity(screen.per_slot.len());
+    let mut credit_proposals = Vec::new();
+    let mut credit_screens = Vec::new();
+    for (position, result) in screen.per_slot.iter().enumerate() {
+        let record = &evidence.per_search[position];
+        let slot = record.slot;
+        let proposal =
+            proposal_named_by(sweep, proposals, slot, Some(record.config_hash.as_str()))?;
+        rows.push((slot, result.clone()));
+        if not_run.iter().any(|(s, _)| *s == slot) {
+            continue;
+        }
+        credit_proposals.push(proposal.clone());
+        credit_screens.push(result.clone());
+    }
+
+    let champion_slot = match screen.champion_slot {
+        None => None,
+        Some(position) => Some(
+            evidence
+                .per_search
+                .get(position)
+                .map(|r| r.slot)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{sweep}: the screen named position {position} as its champion but there \
+                         are only {} search records. The champion's slot is what the best-ever \
+                         record, the GC's keep-set and the promotion candidate are all keyed by.",
+                        evidence.per_search.len()
+                    )
+                })?,
+        ),
+    };
+
+    Ok(AlignedScreen {
+        rows,
+        credit_proposals,
+        credit_screens,
+        champion_slot,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // S4 / S5
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One sweep, as the runner observed it.
+///
+/// `SweepEvidence` is what the judge is handed; `not_run` is what only the
+/// runner knows — the slots whose proposal could not be resolved into a runnable
+/// configuration. Counted and NAMED, never dropped.
+struct SweepRun {
+    evidence: SweepEvidence,
+    not_run: Vec<(usize, String)>,
+}
 
 /// Run one sweep's 100 searches. `SweepStarted` is fsynced BEFORE any work.
 fn run_sweep(
@@ -857,7 +1185,11 @@ fn run_sweep(
     kind: SweepKind,
     proposals: &[crate::proposal::Proposal],
     permutation: Option<&crate::shuffle::FeaturePermutation>,
-) -> Result<SweepEvidence> {
+) -> Result<SweepRun> {
+    // Before a single record is written: the positions and the slots must be the
+    // same numbers, or nothing downstream can be trusted to name what it means.
+    assert_draw_order_is_dense(sweep, proposals)?;
+
     let sweep_hash = sweep_hash_of(proposals);
     ctx.store.prepare_sweep(sweep)?;
     ctx.store
@@ -874,20 +1206,35 @@ fn run_sweep(
 
     let began = Instant::now();
     let mut outcomes: Vec<SearchOutcome> = Vec::with_capacity(proposals.len());
+    let mut not_run: Vec<(usize, String)> = Vec::new();
     let mut trials_offered = 0usize;
 
-    for (slot, proposal) in proposals.iter().enumerate() {
+    for proposal in proposals {
+        // The slot comes from the PROPOSAL, never from the loop counter. The two
+        // are equal — `assert_draw_order_is_dense` proved it above — and taking
+        // it from the proposal is what keeps them equal when somebody later
+        // filters this loop.
+        let slot = proposal.slot;
         let config = match proposal.resolve(&ctx.base_config) {
             Ok(config) => config,
             Err(err) => {
                 // A proposal that cannot be resolved is a refusal, not a
-                // silently skipped slot.
+                // silently skipped slot — and NOT a dropped row either. It is
+                // journalled by name AND keeps its place in `per_search`, so
+                // every slot after it still names the proposal it named before.
+                let reason = format!("{err:#}");
                 writer.append(Record::ProposalRefused {
                     sweep,
                     slot,
                     config_hash: proposal.config_hash.clone(),
-                    reason: format!("delta could not be applied: {err:#}"),
+                    reason: format!("delta could not be applied: {reason}"),
                 })?;
+                outcomes.push(SearchOutcome::refused_before_running(
+                    slot,
+                    &proposal.config_hash,
+                    &reason,
+                ));
+                not_run.push((slot, reason));
                 continue;
             }
         };
@@ -900,7 +1247,13 @@ fn run_sweep(
             permutation,
         };
 
-        match executor.execute(&request) {
+        let executed = match executor.execute(&request) {
+            Ok(outcome) => assert_outcome_names_its_request(sweep, slot, outcome.slot)
+                .map(|()| outcome),
+            Err(err) => Err(err),
+        };
+
+        match executed {
             Ok(outcome) => {
                 trials_offered += outcome.trials_offered;
                 // The partial ledger is what makes a crashed sweep's
@@ -929,6 +1282,28 @@ fn run_sweep(
     let statistics: Vec<TrialStatisticsReport> =
         outcomes.iter().map(|o| o.statistics.clone()).collect();
 
+    // The rows are one-per-proposal by construction. Checked rather than
+    // asserted in a comment, and checked BEFORE the outcome record is written,
+    // because "by construction" is what this defect was wearing the last time.
+    if per_search.len() != proposals.len() {
+        let recovered = ctx.store.recover_partial_trials(sweep);
+        let detail = format!(
+            "{sweep} produced {} search records for {} proposals. Every proposal contributes \
+             exactly one row — a refused one contributes a NOT-RUN row — so a short vector means a \
+             slot was dropped and every slot after it now names a different experiment.",
+            per_search.len(),
+            proposals.len()
+        );
+        // The sweep is closed rather than left open: a crash loses one sweep,
+        // and so does a wiring fault.
+        writer.append(Record::SweepFailed {
+            sweep,
+            trials_offered: recovered.max(trials_offered),
+            error: detail.clone(),
+        })?;
+        bail!(detail);
+    }
+
     ctx.store
         .write_sweep_artifact(sweep, "statistics.json", &statistics)?;
     ctx.store
@@ -944,15 +1319,18 @@ fn run_sweep(
 
     let champion = best_champion(sweep, &outcomes);
 
-    Ok(SweepEvidence {
-        sweep,
-        kind,
-        sweep_hash,
-        per_search,
-        statistics,
-        champion,
-        trials_offered,
-        wall_ms,
+    Ok(SweepRun {
+        evidence: SweepEvidence {
+            sweep,
+            kind,
+            sweep_hash,
+            per_search,
+            statistics,
+            champion,
+            trials_offered,
+            wall_ms,
+        },
+        not_run,
     })
 }
 
@@ -1006,10 +1384,15 @@ fn journal_draw(
             reason: refused.reason.to_string(),
         })?;
     }
-    for (slot, proposal) in drawn.proposals.iter().enumerate() {
+    // The slot journalled is the PROPOSAL's slot, not its position in this
+    // vector. They are equal — proved right here — and taking the value from the
+    // proposal is what keeps the journal's key an identity rather than an
+    // accident of iteration order.
+    assert_draw_order_is_dense(sweep, &drawn.proposals)?;
+    for proposal in &drawn.proposals {
         writer.append(Record::ProposalDrawn {
             sweep,
-            slot,
+            slot: proposal.slot,
             proposal: proposal.clone(),
             origin: format!("{:?}", proposal.origin),
         })?;
@@ -1056,6 +1439,10 @@ fn run_block_control(
     );
 
     let control_sweep = writer.session().next_sweep();
+    // The control re-runs the source sweep's proposals BYTE FOR BYTE, so the
+    // same proposals are refused at S4 in the same slots and the two sweeps'
+    // rows stay comparable slot by slot. That comparability is why the refused
+    // rows are kept rather than dropped.
     let evidence = run_sweep(
         ctx,
         writer,
@@ -1068,7 +1455,8 @@ fn run_block_control(
         },
         &proposals,
         Some(&permutation),
-    )?;
+    )?
+    .evidence;
 
     let control_best = evidence
         .per_search
@@ -1149,11 +1537,23 @@ fn promote(
                 candidate.sweep
             )
         })?;
-    let proposal = proposals.get(candidate.slot).ok_or_else(|| {
-        anyhow::anyhow!(
-            "{} has no proposal at slot {}",
-            candidate.sweep,
-            candidate.slot
+    // THE ONE PLACE A MISNAMED SLOT COULD NOT BE TAKEN BACK.
+    //
+    // `candidate.slot` NAMES a proposal; it is not an offset into this vector.
+    // The lookup is by identity and it is cross-checked against the
+    // `config_hash` the screen recorded, so if the two ever disagree the touch
+    // is REFUSED rather than spent on whichever configuration an index reached.
+    let proposal = proposal_named_by(
+        candidate.sweep,
+        &proposals,
+        candidate.slot,
+        Some(candidate.config_hash.as_str()),
+    )
+    .with_context(|| {
+        format!(
+            "resolving the promotion candidate for {} slot {} before spending the single \
+             out-of-sample touch",
+            candidate.sweep, candidate.slot
         )
     })?;
     let config = proposal.resolve(&ctx.base_config)?;

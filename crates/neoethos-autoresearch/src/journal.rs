@@ -44,7 +44,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::session::{BlockId, SessionId, SweepId};
+use crate::session::{BestEver, BlockId, ChampionRow, SessionId, SweepId};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialisable mirrors of upstream types
@@ -315,6 +315,42 @@ pub enum Record {
         failing_conjunct: Option<String>,
     },
 
+    /// The session's best screened result advanced.
+    ///
+    /// **This record exists because `Session::best_ever` is a FOLD PRODUCT and
+    /// not session state.** It was, briefly, a field the runner assigned through
+    /// a `&mut Session`, and the consequence was exact and severe: a debug build
+    /// tripped the §11.4 fold-equality assertion on the very next append, and a
+    /// release build lost the pointer on every restart. Losing it disables the
+    /// one thing this project has never been able to say — R2's U2 condition
+    /// reads `best_ever` and, with `None` on the left of the comparison, cannot
+    /// be satisfied, so THE LOOP CAN NO LONGER REPORT THE GOAL UNREACHABLE. It
+    /// also un-keeps the previous best sweep's trial matrices at the next GC,
+    /// which takes the evidence with it.
+    ///
+    /// Written ONLY when the candidate strictly improves on the current best, so
+    /// the record's name is true; the fold applies the same comparison
+    /// ([`crate::session::advances_best`]) rather than assigning blind, which
+    /// makes the folded pointer monotone whatever order a reader replays in.
+    BestEverAdvanced {
+        best: BestEver,
+    },
+
+    /// One sweep's champion row — the `pbo_session` input.
+    ///
+    /// Journalled for the same reason as [`Record::BestEverAdvanced`]: the
+    /// session champion matrix is the input to PBO of the loop's OWN selection
+    /// procedure, and a matrix that restarts empty on every resume means
+    /// `pbo_session` refuses forever and NO PROMOTION IS POSSIBLE. The row is
+    /// carried whole — it is small, and re-deriving it would need the sweep's
+    /// full statistics, which the GC is allowed to delete.
+    ///
+    /// The row carries its own `sweep`, so there is no second copy of that id to
+    /// disagree with it.
+    ChampionRecorded {
+        row: ChampionRow,
+    },
+
     PosteriorUpdated {
         sweep: SweepId,
         credits: Vec<PosteriorCredit>,
@@ -394,6 +430,8 @@ impl Record {
             | Self::Promoted { sweep, .. }
             | Self::PromotionRefused { sweep, .. } => Some(*sweep),
             Self::ShuffleControlCompleted { source_sweep, .. } => Some(*source_sweep),
+            Self::BestEverAdvanced { best } => Some(best.sweep),
+            Self::ChampionRecorded { row } => Some(row.sweep),
             Self::SessionOpened { .. }
             | Self::PosteriorRetracted { .. }
             | Self::BlockJudged { .. }
@@ -414,6 +452,8 @@ impl Record {
             Self::SweepFailed { .. } => "SweepFailed",
             Self::SweepAbandoned { .. } => "SweepAbandoned",
             Self::Screened { .. } => "Screened",
+            Self::BestEverAdvanced { .. } => "BestEverAdvanced",
+            Self::ChampionRecorded { .. } => "ChampionRecorded",
             Self::PosteriorUpdated { .. } => "PosteriorUpdated",
             Self::PosteriorRetracted { .. } => "PosteriorRetracted",
             Self::ShuffleControlCompleted { .. } => "ShuffleControlCompleted",
@@ -457,6 +497,11 @@ pub struct ReplayReport {
 /// Holds every record in memory as well as on disk, because
 /// [`crate::session::Session`] is defined as a pure fold over exactly this
 /// sequence and the equality between the two is asserted after every append.
+// `Debug` because the refusal tests assert on `Journal::open(..).expect_err(..)`,
+// and `expect_err` has to be able to print the Ok value it did NOT get. A
+// refusal test that cannot name what came back instead is a test that reports
+// "expected an error" and nothing else.
+#[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -676,6 +721,29 @@ mod tests {
         }
     }
 
+    fn best_ever(sweep: u64, e: f64) -> BestEver {
+        BestEver {
+            sweep: SweepId(sweep),
+            slot: 3,
+            config_hash: format!("fnv64:{sweep:016x}"),
+            e_screen_pess: e,
+            n_trades: 250,
+            dsr: Some(0.97),
+            pbo: Some(0.31),
+        }
+    }
+
+    fn champion(sweep: u64) -> ChampionRow {
+        ChampionRow {
+            sweep: SweepId(sweep),
+            config_hash: format!("fnv64:{sweep:016x}"),
+            strategy_id: format!("g{sweep}"),
+            period_keys: vec![24_300, 24_301, 24_302],
+            monthly_returns: vec![0.01, -0.02, 0.03],
+            e_screen_pess: 0.4,
+        }
+    }
+
     #[test]
     fn records_survive_a_close_and_reopen() {
         let dir = tmp();
@@ -777,6 +845,12 @@ mod tests {
         // judge rests on.
         let noise = vec![
             Record::TruncatedTail { bytes: 12 },
+            // The two records that carry `best_ever` and the champion matrix
+            // into the fold. They are STATE, not trials: neither may move N.
+            Record::BestEverAdvanced {
+                best: best_ever(1, 0.4),
+            },
+            Record::ChampionRecorded { row: champion(1) },
             Record::BlockJudged {
                 block: BlockId(0),
                 delta_expectancy: -1.0,
@@ -795,6 +869,41 @@ mod tests {
         let mut with_a_sweep = noise.clone();
         with_a_sweep.push(completed(9, 100));
         assert_eq!(n_session(&with_a_sweep), 100);
+    }
+
+    /// `best_ever` and the champion matrix are journalled, so they survive the
+    /// process that produced them.
+    ///
+    /// Pinned at the JOURNAL level as well as the fold level because the failure
+    /// this closes was that they were never written at all: a session that lost
+    /// them on restart could no longer satisfy R2's U2 condition (so it could
+    /// never report the goal unreachable) and restarted `pbo_session` with an
+    /// empty matrix (so no promotion was possible). Both are floating-point
+    /// payloads, so this also pins that they survive JSON round-tripping
+    /// bit-for-bit rather than approximately.
+    #[test]
+    fn best_ever_and_champions_survive_a_close_and_reopen() {
+        let dir = tmp();
+        let path = dir.path().join("journal.jsonl");
+        let best = best_ever(7, -0.019_531_25);
+        let row = champion(7);
+        {
+            let mut j = Journal::open(&path).unwrap();
+            j.append(Record::ChampionRecorded { row: row.clone() }).unwrap();
+            j.append(Record::BestEverAdvanced { best: best.clone() }).unwrap();
+        }
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened.records(),
+            [
+                Record::ChampionRecorded { row },
+                Record::BestEverAdvanced { best },
+            ]
+            .as_slice(),
+            "the two pieces of state that were once held outside the journal must come back \
+             from it unchanged"
+        );
+        assert_eq!(reopened.replay_report().truncated_tail_bytes, 0);
     }
 
     #[test]

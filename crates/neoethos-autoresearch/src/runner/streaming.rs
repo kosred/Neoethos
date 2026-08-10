@@ -265,7 +265,7 @@ impl SweepExecutor for StreamingSweepExecutor {
                 // are untouched — only the relationship between the features
                 // and the future is destroyed.
                 if let Some(permutation) = permutation {
-                    permutation.apply(&mut frame).context(
+                    apply_shuffle_control(&permutation, &mut frame).context(
                         "applying the shuffle control's permutation to the feature block",
                     )?;
                 }
@@ -608,30 +608,118 @@ fn load_promotion_genes(scratch: &std::path::Path, sweep: SweepId, slot: usize) 
         .with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Apply a control sweep's permutation to a feature block, in place.
+///
+/// **The features move; nothing else does.** `timestamps` are copied across
+/// untouched and prices, labels, costs, exit geometry and the GA seed are not
+/// reachable from here at all — that asymmetry *is* the experiment. Every
+/// feature keeps its marginal distribution and (under `CircularRotation`) its
+/// autocorrelation; the only thing destroyed is its alignment with the future.
+///
+/// The frame is `[samples × features]` and dense in ROW-major order, hence
+/// [`crate::shuffle::BlockLayout::RowMajor`]. A layout mistake here would rotate
+/// across features instead of across time and quietly produce a control that is
+/// not a control, so the shape is asserted rather than assumed: if the rebuilt
+/// array does not take the original `(rows, cols)`, this returns an error and
+/// the sweep FAILS. It never falls back to the unpermuted frame — a control
+/// that silently ran live data is the one result that would poison the null.
+fn apply_shuffle_control(
+    permutation: &crate::shuffle::FeaturePermutation,
+    frame: &mut neoethos_data::FeatureFrame,
+) -> Result<()> {
+    let rows = frame.n_samples();
+    let cols = frame.n_features();
+    if rows == 0 || cols == 0 {
+        bail!(
+            "the shuffle control was handed a {rows}x{cols} feature block. There is nothing to \
+             permute, so the control sweep would be a second live run wearing the control's label."
+        );
+    }
+
+    let dense = frame.to_dense_samples_major();
+    let src = dense.as_slice().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the dense [samples x features] block is not in standard row-major order, so the \
+             rotation would move data across features instead of across time"
+        )
+    })?;
+
+    let rotated = permutation
+        .apply(src, rows, cols, crate::shuffle::BlockLayout::RowMajor)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let array = ndarray::Array2::from_shape_vec((rows, cols), rotated)
+        .context("rebuilding the permuted feature block at its original shape")?;
+
+    *frame = neoethos_data::FeatureFrame::from_array(
+        frame.timestamps.clone(),
+        frame.names.clone(),
+        array,
+    );
+    Ok(())
+}
+
 /// Backtest settings for an already-selected gene on the OOS window.
 ///
 /// Only reached when adaptive stops are OFF — see the refusal in
 /// [`StreamingSweepExecutor::evaluate_oos`] — so the gene's own `sl_pips` /
 /// `tp_pips` are the effective stops, exactly as they were when it was scored.
+///
+/// **This mirrors `discovery::discovery_backtest_settings` field for field.**
+/// That function is private to `neoethos-search`, so the mirror is by hand, and
+/// a hand-written mirror is exactly where a policy drifts apart one field at a
+/// time. It matters more here than anywhere else in the crate: the one
+/// out-of-sample touch is spent through this function, so any field that is
+/// cheaper here than it was in-sample turns "it survived out of sample" into
+/// "it survived a cheaper simulation out of sample" — and the touch cannot be
+/// taken back.
+///
+/// `max_hold_bars` comes from the EVALUATION CONFIG, not from the gene: `Gene`
+/// carries no `max_hold_bars` field at all (`genetic/strategy_gene.rs`) — the
+/// hold limit is a policy of the run, identical for every candidate in it.
+///
+/// REQUIRED ELSEWHERE (see `docs/autoresearch-loop.md` §14): make
+/// `discovery_backtest_settings` `pub` in `crates/neoethos-search/src/discovery.rs`
+/// so the OOS touch calls THE settings builder instead of a copy of it.
 fn oos_backtest_settings(
     config: &DiscoveryConfig,
     gene: &Gene,
 ) -> neoethos_search::eval::BacktestSettings {
     let evaluation = config.evaluation_config(None);
-    let mut settings = neoethos_search::eval::BacktestSettings::default();
-    settings.sl_pips = if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
-        gene.sl_pips
-    } else {
-        20.0
-    };
-    settings.tp_pips = if gene.tp_pips.is_finite() && gene.tp_pips > 0.0 {
-        gene.tp_pips
-    } else {
-        40.0
-    };
-    settings.max_hold_bars = gene.max_hold_bars;
-    settings.pip_value_per_lot = evaluation.pip_value_per_lot;
-    settings.spread_pips = config.evaluation_spread_pips;
-    settings.commission_per_trade = config.evaluation_commission_per_trade;
-    settings
+    neoethos_search::eval::BacktestSettings {
+        sl_pips: if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
+            gene.sl_pips
+        } else {
+            20.0
+        },
+        tp_pips: if gene.tp_pips.is_finite() && gene.tp_pips > 0.0 {
+            gene.tp_pips
+        } else {
+            40.0
+        },
+        max_hold_bars: evaluation.max_hold_bars,
+        // All four exit-geometry fields together, as in-sample.
+        trailing_enabled: evaluation.trailing_enabled,
+        trailing_atr_multiplier: evaluation.trailing_atr_multiplier,
+        trailing_be_trigger_r: evaluation.trailing_be_trigger_r,
+        trailing_min_lock_pips: evaluation.trailing_min_lock_pips,
+        pip_value: evaluation.pip_value,
+        pip_value_per_lot: evaluation.pip_value_per_lot,
+        // Every cost the screen charged, charged again out of sample.
+        spread_pips: evaluation.spread_pips,
+        commission_per_trade: evaluation.commission_per_trade,
+        session_spread_profile: config.session_spread_pips.map(|curve| {
+            neoethos_search::eval::SessionSpreadProfile {
+                asian_pips: curve[0],
+                overlap_pips: curve[1],
+                late_ny_pips: curve[2],
+            }
+        }),
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        kill_zones_enabled: true,
+        risk_per_trade_min: config.risk_per_trade_min,
+        risk_per_trade_max: config.risk_per_trade_max,
+        ..neoethos_search::eval::BacktestSettings::default()
+    }
 }

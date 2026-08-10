@@ -165,6 +165,262 @@ fn a_sweep_with_no_survivors_contributes_no_champion_row() {
     assert!(best_champion(SweepId(1), &outcomes).is_none());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// A SLOT NAMES ITS PROPOSAL
+//
+// `per_search` used to DROP a row for every proposal the runner could not
+// resolve, while `proposals` and the per-slot ledger directory stayed dense. The
+// screen's position was then used against both — and refusals are the NORM, not
+// an edge case: the proposer draws `streaming_batches` from {0,4,12,32} and the
+// cursor from {Start, Resumed, RandomOffset}, and `Proposal::resolve` bails on
+// every non-zero and every non-Start draw. The mismatch therefore fired
+// routinely, and it landed on the single out-of-sample touch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn caps() -> crate::space::Capabilities {
+    crate::space::Capabilities::all_for_tests()
+}
+
+fn proposal_at(slot: usize, hash: &str) -> crate::proposal::Proposal {
+    let delta =
+        crate::space::SearchConfigDelta::new([0u8; crate::space::FACTOR_COUNT], &caps()).unwrap();
+    let mut proposal = crate::proposal::build(
+        delta,
+        crate::objective::ObjectiveVariant::B5TerminalWealth,
+        0,
+        crate::objective::RefusalLevels::new([0u8; 4]).unwrap(),
+        7,
+        crate::proposal::ProposalOrigin::ExplorationFloor,
+        slot,
+        None,
+        &caps(),
+        crate::objective::ScenarioKind::Risky,
+    )
+    .expect("a buildable proposal");
+    proposal.config_hash = hash.to_string();
+    proposal
+}
+
+fn record_at(slot: usize, hash: &str, e: Option<f64>) -> SearchRecord {
+    let mut outcome = outcome_with(slot, e, "x");
+    outcome.config_hash = hash.to_string();
+    outcome.to_record()
+}
+
+fn evidence_of(sweep: SweepId, per_search: Vec<SearchRecord>) -> SweepEvidence {
+    let statistics = per_search
+        .iter()
+        .map(|_| TrialStatisticsReport::unreadable("test fixture".to_string()))
+        .collect();
+    SweepEvidence {
+        sweep,
+        kind: SweepKind::Live,
+        sweep_hash: "fnv64:sweep".to_string(),
+        per_search,
+        statistics,
+        champion: None,
+        trials_offered: 0,
+        wall_ms: 0,
+    }
+}
+
+fn failed() -> crate::judge::ScreenResult {
+    crate::judge::ScreenResult::Failed {
+        conjunct: crate::judge::ScreenConjunct::S1Pbo,
+        detail: "test fixture".to_string(),
+    }
+}
+
+fn screen_of(
+    per_slot: Vec<crate::judge::ScreenResult>,
+    champion_position: Option<usize>,
+) -> crate::judge::SweepScreen {
+    crate::judge::SweepScreen {
+        per_slot,
+        champion: None,
+        champion_slot: champion_position,
+        champion_n_trades: 0,
+        champion_dsr: None,
+        champion_pbo: None,
+    }
+}
+
+#[test]
+fn a_refused_proposal_never_shifts_the_slot_that_names_the_out_of_sample_touch() {
+    let proposals: Vec<_> = (0usize..5)
+        .map(|s| proposal_at(s, &format!("fnv64:h{s}")))
+        .collect();
+
+    // The evidence as the judge sees it if slots 1 and 3 were refused — the
+    // COMPACTED shape this defect lived in. Even in that shape, every row still
+    // carries the slot that names its proposal, so the mapping is recoverable.
+    let evidence = evidence_of(
+        SweepId(3),
+        vec![
+            record_at(0, "fnv64:h0", Some(0.10)),
+            record_at(2, "fnv64:h2", Some(0.90)),
+            record_at(4, "fnv64:h4", Some(0.20)),
+        ],
+    );
+    // The judge names POSITION 1 as its champion.
+    let screen = screen_of(vec![failed(), failed(), failed()], Some(1));
+
+    let aligned = align_screen(SweepId(3), &proposals, &evidence, &screen, &[]).unwrap();
+
+    assert_eq!(
+        aligned.rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![0, 2, 4],
+        "the Screened records must be keyed by the slot that names the proposal"
+    );
+    // Position 1 is SLOT 2. Indexing the dense proposals vector with the
+    // position would have reached h1 — a configuration that was never screened.
+    assert_eq!(aligned.champion_slot, Some(2));
+    assert_eq!(aligned.credit_proposals[1].config_hash, "fnv64:h2");
+
+    // And the promotion lookup, the one that spends the OOS window, resolves
+    // the same configuration the screen actually judged.
+    let promoted = proposal_named_by(SweepId(3), &proposals, 2, Some("fnv64:h2")).unwrap();
+    assert_eq!(promoted.slot, 2);
+    assert_eq!(promoted.config_hash, "fnv64:h2");
+}
+
+#[test]
+fn two_configurations_wearing_one_slot_refuse_the_touch_instead_of_guessing() {
+    let proposals: Vec<_> = (0usize..3)
+        .map(|s| proposal_at(s, &format!("fnv64:h{s}")))
+        .collect();
+
+    let err = proposal_named_by(SweepId(1), &proposals, 1, Some("fnv64:h2")).unwrap_err();
+    assert!(format!("{err:#}").contains("wearing one slot"), "{err:#}");
+
+    // A slot nobody drew is named, never silently absent.
+    let err = proposal_named_by(SweepId(1), &proposals, 9, None).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no proposal naming slot 9"),
+        "{err:#}"
+    );
+
+    // The honest case still resolves.
+    assert_eq!(
+        proposal_named_by(SweepId(1), &proposals, 1, Some("fnv64:h1"))
+            .unwrap()
+            .slot,
+        1
+    );
+}
+
+#[test]
+fn a_gap_in_the_draw_order_is_refused_before_a_bar_is_read() {
+    // With a gap, `session.proposals_of()` back-fills the hole with a CLONE of a
+    // neighbour, so a slot that was never drawn would answer with somebody
+    // else's configuration.
+    let dense: Vec<_> = (0usize..3).map(|s| proposal_at(s, "fnv64:h")).collect();
+    assert!(assert_draw_order_is_dense(SweepId(1), &dense).is_ok());
+
+    let gapped = vec![proposal_at(0, "fnv64:h"), proposal_at(2, "fnv64:h")];
+    let err = assert_draw_order_is_dense(SweepId(1), &gapped).unwrap_err();
+    assert!(format!("{err:#}").contains("names slot 2"), "{err:#}");
+}
+
+#[test]
+fn a_slot_that_never_ran_is_named_kept_and_never_credited_to_the_posterior() {
+    let proposals: Vec<_> = (0usize..3)
+        .map(|s| proposal_at(s, &format!("fnv64:h{s}")))
+        .collect();
+
+    let refused = SearchOutcome::refused_before_running(
+        1,
+        "fnv64:h1",
+        "the proposal carries a streaming plan, which is not a DiscoveryConfig field",
+    );
+    assert_eq!(refused.slot, 1);
+    assert_eq!(refused.trials_offered, 0, "a row that never ran offers no trials");
+    assert!(refused.e_screen_pess.is_none());
+    assert!(!refused.cost_band.discriminates);
+    assert!(
+        refused.error.as_deref().unwrap().starts_with(NOT_RUN_PREFIX),
+        "a census reader must be able to tell 'failed' from 'never happened'"
+    );
+    // It never becomes the champion, whatever else is in the sweep.
+    assert!(best_champion(SweepId(1), std::slice::from_ref(&refused)).is_none());
+
+    let evidence = evidence_of(
+        SweepId(1),
+        vec![
+            record_at(0, "fnv64:h0", Some(0.10)),
+            refused.to_record(),
+            record_at(2, "fnv64:h2", Some(0.30)),
+        ],
+    );
+    let screen = screen_of(vec![failed(), failed(), failed()], None);
+    let aligned = align_screen(
+        SweepId(1),
+        &proposals,
+        &evidence,
+        &screen,
+        &[(1, "not resolvable".to_string())],
+    )
+    .unwrap();
+
+    // The row is KEPT, so the census sees it and no slot after it shifts…
+    assert_eq!(aligned.rows.len(), 3);
+    assert_eq!(
+        aligned.rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    // …and the arm is not credited a failure it never earned.
+    assert_eq!(aligned.credit_proposals.len(), 2);
+    assert_eq!(aligned.credit_screens.len(), 2);
+    assert!(aligned.credit_proposals.iter().all(|p| p.slot != 1));
+}
+
+#[test]
+fn an_outcome_that_renames_its_slot_fails_the_sweep() {
+    assert!(assert_outcome_names_its_request(SweepId(1), 7, 7).is_ok());
+    let err = assert_outcome_names_its_request(SweepId(1), 7, 8).unwrap_err();
+    assert!(format!("{err:#}").contains("out-of-sample"), "{err:#}");
+}
+
+#[test]
+fn a_screen_that_does_not_cover_every_search_is_refused_rather_than_zipped() {
+    // A shorter screen zipped against the searches would file every verdict
+    // after the first gap against a search it did not judge.
+    let proposals: Vec<_> = (0usize..2)
+        .map(|s| proposal_at(s, &format!("fnv64:h{s}")))
+        .collect();
+    let evidence = evidence_of(
+        SweepId(1),
+        vec![
+            record_at(0, "fnv64:h0", None),
+            record_at(1, "fnv64:h1", None),
+        ],
+    );
+    assert!(
+        align_screen(
+            SweepId(1),
+            &proposals,
+            &evidence,
+            &screen_of(vec![failed()], None),
+            &[]
+        )
+        .is_err()
+    );
+
+    // And a champion position with no search behind it is refused too: that
+    // position is what the best-ever record and the promotion candidate are
+    // keyed by.
+    assert!(
+        align_screen(
+            SweepId(1),
+            &proposals,
+            &evidence,
+            &screen_of(vec![failed(), failed()], Some(9)),
+            &[]
+        )
+        .is_err()
+    );
+}
+
 fn outcome_with(slot: usize, e: Option<f64>, id: &str) -> SearchOutcome {
     SearchOutcome {
         slot,

@@ -7151,6 +7151,7 @@ version = "0.5.6"
 dependencies = [
  "anyhow",
  "chrono",
+ "ndarray 0.17.2",
  "neoethos-core",
  "neoethos-data",
  "neoethos-search",

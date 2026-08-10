@@ -727,11 +727,41 @@ mod tests {
         assert_ne!(b3.kind(), other.kind());
     }
 
+    /// The band is `τ ∈ [0.05·T, 0.95·T]` (design §9, `TAU_LO_FRAC` /
+    /// `TAU_HI_FRAC`), so "too short" means *the band contains no integer* — and
+    /// under this band that is `T ≤ 1`, not any small `T`.
+    ///
+    /// Asserted in BOTH directions on purpose. A one-sided test would pass just
+    /// as happily against a function that refused everything, which is the
+    /// mirror-image bug: a control that never runs makes the shuffle null empty,
+    /// S6 permanently `Unavailable`, and the loop unfalsifiable — the exact
+    /// failure this module exists to prevent.
     #[test]
     fn a_window_too_short_to_rotate_is_named_not_clamped() {
         let s = Session::default();
         let p = FeaturePermutation::draw(ControlKind::CircularRotation, &s, BlockId(0));
-        assert!(p.offset_rows(4).unwrap_err().contains("REFUSED"));
+
+        // No integer offset exists in [0.05·T, 0.95·T]: named, not clamped to 0.
+        for rows in [0usize, 1] {
+            let err = p.offset_rows(rows).expect_err(
+                "a block the band admits no integer offset for must be refused, not clamped",
+            );
+            assert!(err.contains("REFUSED"), "rows={rows}: got {err}");
+        }
+
+        // A block that DOES admit an offset gets one, strictly inside the band.
+        for rows in [4usize, 100, 5_000] {
+            let tau = p
+                .offset_rows(rows)
+                .unwrap_or_else(|e| panic!("rows={rows} admits an offset but was refused: {e}"));
+            assert!(tau > 0, "rows={rows}: a rotation of zero is not a control");
+            assert!(tau < rows, "rows={rows}: tau={tau} would wrap to a no-op");
+            assert!(
+                tau as f64 >= TAU_LO_FRAC * rows as f64
+                    && tau as f64 <= TAU_HI_FRAC * rows as f64,
+                "rows={rows}: tau={tau} left the band"
+            );
+        }
     }
 
     #[test]

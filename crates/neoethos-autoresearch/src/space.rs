@@ -686,6 +686,22 @@ pub enum SpaceError {
     /// A higher lane whose candle is longer than the label horizon: the feature
     /// would be asked to predict an outcome shorter than its own bar.
     LaneHorizonConflict { lane: String, lane_bars_in_base: u32, horizon_bars: usize },
+    /// **U5.** The reachable space is enumerated: every uniform draw collided
+    /// with a configuration already run, so this slot had no unexplored point
+    /// left to draw.
+    ///
+    /// It is a `SpaceError` and not a proposer bookkeeping flag because that is
+    /// exactly what it is — a statement about the SPACE, not about the sampler.
+    /// Carrying it here means the proposer emits one refusal record **per
+    /// abandoned slot**, so the slots a shortened sweep never drew are counted
+    /// in the journal and named with the reason, instead of vanishing into the
+    /// difference between `SWEEP_SEARCHES` and `proposals.len()`.
+    SpaceEnumerated {
+        slot: usize,
+        drawn: usize,
+        of: usize,
+        consecutive_collisions: usize,
+    },
 }
 
 impl std::fmt::Display for SpaceError {
@@ -717,6 +733,15 @@ impl std::fmt::Display for SpaceError {
                  horizon is {horizon_bars} bars: the label resolves inside a single {lane} \
                  candle, so the lane's columns would be ranked on an outcome shorter than \
                  their own bar (docs/higher-timeframe-lane-2026-08-09.md §3-4)"
+            ),
+            Self::SpaceEnumerated { slot, drawn, of, consecutive_collisions } => write!(
+                f,
+                "slot {slot} was ABANDONED: {consecutive_collisions} consecutive uniform draws \
+                 all collided with configurations this session has already run, so the reachable \
+                 space is enumerated (U5, ProposerExhausted). The sweep stopped at {drawn} of \
+                 {of} searches; slots {slot}..{of} were never drawn. Counted and named here, one \
+                 record per abandoned slot, rather than left as the difference between a sweep's \
+                 declared size and its actual one"
             ),
         }
     }
@@ -1115,6 +1140,25 @@ mod tests {
         assert!(identity_source(&c).contains("carries ga_seed"));
         c.stamp_ga_seed = false;
         assert!(identity_source(&c).contains("lacks ga_seed"));
+    }
+
+    #[test]
+    fn an_abandoned_slot_names_itself_and_the_size_of_the_shortfall() {
+        // The U5 record. `break 'slots` used to leave the abandoned slots as the
+        // difference between the sweep's declared size and its actual one, which
+        // is the silent drop the surrounding `bail!` explicitly refuses to make
+        // on the other early-exit path.
+        let e = SpaceError::SpaceEnumerated {
+            slot: 12,
+            drawn: 12,
+            of: SWEEP_SEARCHES,
+            consecutive_collisions: PROPOSER_RETRIES,
+        };
+        let text = e.to_string();
+        assert!(text.contains("slot 12 was ABANDONED"), "{text}");
+        assert!(text.contains(&format!("{PROPOSER_RETRIES} consecutive")), "{text}");
+        assert!(text.contains(&format!("12 of {SWEEP_SEARCHES}")), "{text}");
+        assert!(text.contains("enumerated"), "{text}");
     }
 
     #[test]

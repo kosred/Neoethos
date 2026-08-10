@@ -59,7 +59,14 @@ pub struct RiskyScenario {
     pub horizon_days: u32,
     /// The config field path each number came from, so a reader can check it
     /// against the file rather than trust this struct.
-    pub source: &'static str,
+    ///
+    /// `Cow<'static, str>` and not `&'static str`: `Scenario` is an internally
+    /// tagged enum, so serde buffers the variant content and requires the
+    /// variant type to be `DeserializeOwned`. A borrowed `&'static str` field
+    /// forces `'de: 'static` and the derive fails. `Cow` deserializes as owned
+    /// with no lifetime bound, and every construction site here is still a
+    /// zero-cost `Cow::Borrowed` over a literal.
+    pub source: std::borrow::Cow<'static, str>,
 }
 
 impl RiskyScenario {
@@ -301,8 +308,10 @@ impl GoalSet {
                     start_balance_usd: start,
                     target_balance_usd: target,
                     horizon_days: horizon,
-                    source: "system.risky_start_balance_usd / \
-                             system.risky_target_balance_usd / system.risky_horizon_days",
+                    source: std::borrow::Cow::Borrowed(
+                        "system.risky_start_balance_usd / system.risky_target_balance_usd / \
+                         system.risky_horizon_days",
+                    ),
                 };
 
                 // ── THE SECOND SCENARIO IS NOT IN THE CONFIG ────────────────

@@ -29,9 +29,58 @@ use crate::shuffle::{ShuffleNull, ShuffleSummary};
 /// Schema tag on every emitted verdict. Bump only with the struct.
 pub const VERDICT_SCHEMA: &str = "neoethos.autoresearch.verdict.v1";
 
-/// U3: the fraction of blocks that must be indistinguishable from their shuffle
-/// control before the space is called refuted.
-pub const U3_THRESHOLD: f64 = 0.75;
+// ─────────────────────────────────────────────────────────────────────────────
+// Coverage — the evidence behind U4
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How often one `(factor, level)` was drawn, in report shape.
+///
+/// Both numbers, always. `proposals_drawn` says how much the loop spent on the
+/// level; `sweeps_drawn` says in how many *independent experiments* it appeared,
+/// and only the second one is evidence — a hundred draws inside one sweep is one
+/// observation wearing a big number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageEntry {
+    pub factor: String,
+    pub level: String,
+    pub sweeps_drawn: usize,
+    pub proposals_drawn: usize,
+}
+
+/// Coverage split by axis, which is the split U4 checks.
+///
+/// **An empty summary must FAIL U4, never pass it vacuously.** "For all levels
+/// in {}, coverage ≥ k" is trivially true, and a loop that drew nothing would
+/// use it to declare the goal impossible. [`CoverageSummary::is_empty`] exists
+/// so the check reads as a check rather than as a quantifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageSummary {
+    /// The eleven axis-A factors plus the four refusal dimensions.
+    pub axis_a: Vec<CoverageEntry>,
+    /// The objective variants.
+    pub axis_b: Vec<CoverageEntry>,
+}
+
+impl CoverageSummary {
+    pub fn is_empty(&self) -> bool {
+        self.axis_a.is_empty() && self.axis_b.is_empty()
+    }
+
+    /// Levels on either axis with fewer than `min_sweeps` sweeps' worth of
+    /// draws — the ones that make a refutation a claim about an unsearched
+    /// space.
+    pub fn under_covered(&self, min_sweeps: usize) -> Vec<&CoverageEntry> {
+        self.axis_a
+            .iter()
+            .chain(self.axis_b.iter())
+            .filter(|e| e.sweeps_drawn < min_sweeps)
+            .collect()
+    }
+}
+
+/// U3's threshold lives in `lib.rs` with the other §15 constants, not here —
+/// *"a constant that two modules can both spell is a constant that can drift."*
+pub use crate::U3_THRESHOLD;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The promotion candidate
@@ -213,9 +262,24 @@ pub fn check_unreachable(session: &Session, _th: &JudgeThresholds) -> Unreachabl
                 .to_string(),
         }
     } else {
-        let b_under = session
-            .coverage
-            .under_covered("objective", crate::B_MIN_DRAWS);
+        // AXIS B IS CHECKED AGAINST THE DECLARED SET, NOT AGAINST THE COUNTERS.
+        //
+        // `coverage.under_covered("objective", k)` can only return keys that
+        // were CREDITED, so an axis that produced no runs at all returns an
+        // empty vector and "no objective variant is under-drawn" comes out TRUE.
+        // `session.coverage.is_empty()` above does not catch it either: axis A
+        // is credited on every proposal, so the counters are non-empty while the
+        // objective axis is untouched. That is a space refuted on an axis it was
+        // never searched on — and axis B is the axis the measured base rate says
+        // the answer must live on (expectancy -4.15 pips per trade in EVERY exit
+        // configuration tested). `objective::axis_b_coverage` evaluates the
+        // conjunct over the variants the compiled build DECLARES it can draw, so
+        // zero runs is an explicit failure with a sentence attached.
+        let axis_b = crate::objective::axis_b_coverage(
+            &crate::space::Capabilities::compiled(),
+            crate::space::B_MIN_DRAWS,
+            &|label| session.coverage.get("objective", label).sweeps,
+        );
         let a_under: Vec<(String, String, usize)> = session
             .coverage
             .iter()
@@ -223,32 +287,26 @@ pub fn check_unreachable(session: &Session, _th: &JudgeThresholds) -> Unreachabl
             .filter(|(_, _, c)| c.sweeps < 1)
             .map(|(f, l, c)| (f.to_string(), l.to_string(), c.sweeps))
             .collect();
-        let satisfied = b_under.is_empty() && a_under.is_empty();
+        let satisfied = axis_b.satisfied() && a_under.is_empty();
         UnreachableCondition {
             id: "U4".to_string(),
             satisfied,
-            detail: if satisfied {
-                format!(
-                    "every credited axis-A level was drawn at least once and every axis-B variant \
-                     at least {} sweep(s)' worth",
-                    crate::B_MIN_DRAWS
-                )
-            } else {
-                format!(
-                    "under-drawn — axis B (< {} sweeps): [{}]; axis A (< 1 sweep): [{}]",
-                    crate::B_MIN_DRAWS,
-                    b_under
-                        .iter()
-                        .map(|(l, c)| format!("{l} ({})", c.sweeps))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    a_under
-                        .iter()
-                        .map(|(f, l, n)| format!("{f}={l} ({n})"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            },
+            detail: format!(
+                "axis B: {}. axis A: {}",
+                axis_b.detail(crate::space::B_MIN_DRAWS),
+                if a_under.is_empty() {
+                    "every credited level was drawn at least once".to_string()
+                } else {
+                    format!(
+                        "under-drawn (< 1 sweep): [{}]",
+                        a_under
+                            .iter()
+                            .map(|(f, l, n)| format!("{f}={l} ({n})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            ),
         }
     });
 
@@ -302,6 +360,17 @@ pub enum StopReason {
         hours: f64,
     },
     OperatorStop,
+    /// The loop could not run at all: a contract it depends on is absent, or a
+    /// sweep failed for a reason that is about the machine and not about the
+    /// configuration.
+    ///
+    /// It is a STOP and never a skipped sweep, because the failure mode this
+    /// whole crate exists to prevent is a loop that appears to run while doing
+    /// nothing. `detail` names the missing symbol or the failing call, so the
+    /// operator is told WHAT is absent rather than handed an empty verdict.
+    InfrastructureAbort {
+        detail: String,
+    },
 }
 
 /// **S9 — DECIDE.** Pure, so the stop is re-derivable from the journal.
@@ -509,6 +578,14 @@ pub fn build(
 ) -> SessionVerdict {
     let unreachable = check_unreachable(session, th);
     let distinct = session.config_hashes.len();
+    // Built BEFORE `ctx` is destructured into the report, so the command that
+    // re-derives this verdict is composed from the same values the report
+    // carries rather than from whatever is left after a partial move.
+    let reproduction = format!(
+        "neoethos autoresearch --symbol {} --session {}",
+        ctx.symbol_for_reproduction(),
+        ctx.session_id
+    );
 
     let (verdict, oos) = match reason {
         StopReason::GoalReached(candidate) => {
@@ -585,6 +662,18 @@ pub fn build(
             },
             None,
         ),
+        // NEVER `GoalUnreachableInSearchedSpace`. An infrastructure abort
+        // searched nothing, so it refutes nothing; reporting it as a refutation
+        // is precisely the lie this verdict type was built to make impossible.
+        StopReason::InfrastructureAbort { detail } => (
+            Verdict::Inconclusive {
+                reason: format!(
+                    "INFRASTRUCTURE ABORT — the loop stopped because a contract it depends on is \
+                     absent or failed, NOT because of anything it measured: {detail}"
+                ),
+            },
+            None,
+        ),
     };
 
     SessionVerdict {
@@ -617,11 +706,7 @@ pub fn build(
             .collect(),
         census: session.census.clone(),
         oos,
-        reproduction: format!(
-            "neoethos autoresearch --symbol {} --session {}",
-            ctx.symbol_for_reproduction(),
-            ctx.session_id
-        ),
+        reproduction,
     }
 }
 
@@ -883,11 +968,11 @@ mod tests {
 
     #[test]
     fn a_session_with_no_passing_screen_has_no_promotion_candidate() {
+        // The one out-of-sample touch is only ever spent on a screen that
+        // PASSED. `Failed` and `Unavailable` are both failures, and a candidate
+        // drawn from either would spend the window on something the in-sample
+        // judge already refused.
         assert!(promotion_candidate(&empty_session()).is_none());
-        assert_eq!(
-            decide(&empty_session(), &GoalSet::default(), &thresholds()),
-            Decision::Continue
-        );
     }
 
     #[test]

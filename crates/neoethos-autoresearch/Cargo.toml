@@ -34,6 +34,10 @@ rand = { workspace = true }
 # replayable from (session_seed, sweep_index) alone (design §3), which
 # `rand::rng()` cannot promise across platforms or rand releases.
 rand_chacha = "0.9.0"
+# The shuffle control rotates the FEATURE BLOCK and nothing else, and a
+# `FeatureFrame` is rebuilt from an `Array2<f32>`. The workspace pin, so this is
+# an edge in the graph and not a second copy of ndarray.
+ndarray = { workspace = true }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPABILITY FEATURES — each one turns on a probe, not a behaviour.

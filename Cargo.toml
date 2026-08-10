@@ -41,15 +41,13 @@ default-members = [
   "crates/neoethos-trader",
   "crates/neoethos-gpu-contracts",
   "crates/neoethos-mcp",
+  # ADDED 2026-08-10, on the condition this list itself set: all three concurrent
+  # module groups (loop / proposer / judge, docs/autoresearch-loop.md §2) have
+  # landed and the crate compiles and tests clean (142 lib + 3 integration). It
+  # is in the default build from here on because an engine crate that no default
+  # build compiles is a crate whose breakage is invisible.
+  "crates/neoethos-autoresearch",
 ]
-# `crates/neoethos-autoresearch` is in `members` but DELIBERATELY not here yet.
-# Three workflows are writing that crate's modules concurrently (loop / proposer
-# / judge, docs/autoresearch-loop.md §2); until all three have landed, a plain
-# `cargo build` would fail on half-written sibling modules that have nothing to
-# do with what the operator is building. `cargo build -p neoethos-autoresearch`
-# and `--workspace` still compile it. ADD THIS LINE once the three modules are
-# in — an engine crate that no default build compiles is a crate whose breakage
-# is invisible.
 # The P2P mesh sidecar (Federation Phase 1+) is DELIBERATELY isolated: its own
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
 # tree can never conflict with this workspace's pinned GPU/ML stack. Excluded

@@ -35,7 +35,14 @@ mod required_symbols {
         BatchSearchResult, StreamingPlan, StreamingRunOutcome, run_streaming_working_set,
     };
     // Canonical indices — what makes a cross-batch portfolio self-describing.
-    use neoethos_search::batch_ledger::{
+    //
+    // PATH NOTE (2026-08-10): the module is declared inside `orchestration.rs`
+    // as `#[path = "batch_ledger.rs"] pub mod batch_ledger;`, not at the crate
+    // root — `crates/neoethos-search/src/orchestration.rs:5`, whose own comment
+    // says `lib.rs` may hoist it to a top-level `pub mod batch_ledger;` later.
+    // If that hoist lands, this `use` breaks LOUDLY at compile time, which is
+    // the point of this module.
+    use neoethos_search::orchestration::batch_ledger::{
         BatchLedgerEntry, BatchOutcome, CanonicalFeatureIndex, CanonicalSurvivor,
         StreamingRunLedger,
     };

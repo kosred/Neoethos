@@ -38,20 +38,74 @@ use crate::journal::{Journal, OosWindow, PosteriorCredit, Record, SearchRecord, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The three identifiers are DEFINED IN `verdict` and re-exported here.
+// The three identifiers are DEFINED HERE and imported everywhere else.
 //
-// One definition, not two. `proposal.rs` re-exports `crate::session::SweepId`
-// and `shuffle.rs` imports `crate::verdict::{BlockId, SweepId}`; if each module
-// defined its own, the proposer's `Session` and the shuffle's block bookkeeping
-// would be talking about different types with the same name — the kind of split
-// that compiles in each file and fails only where they meet.
+// One definition, not two. `journal.rs`, `runner.rs`, `shuffle.rs`, `judge.rs`,
+// `verdict.rs` and `proposal.rs` all name `crate::session::{SweepId, BlockId,
+// SessionId}`; if each module defined its own, the proposer's `Session` and the
+// shuffle's block bookkeeping would be talking about different types with the
+// same name — the kind of split that compiles in each file and fails only where
+// they meet.
 //
-// `verdict` owns them because they appear in `SessionVerdict`, which is the
-// artifact a reader holds. The session's own constructors and validation are
-// added below as inherent impls, which is legal from any module of the defining
-// crate.
+// `session` owns them because the session IS the thing they index: a sweep id is
+// a position in the fold, a block id is derived from `live_sweeps_run()`, and a
+// session id names the journal the fold reads. `verdict` renders them; rendering
+// is not ownership.
 // ─────────────────────────────────────────────────────────────────────────────
-pub use crate::verdict::{BlockId, SessionId, SweepId};
+
+/// One sweep — `SWEEP_SEARCHES` proposals drawn, run and judged as a single
+/// experiment. Monotone within a session and never reused across a resume:
+/// [`Session::next_sweep`] derives it from the highest id the fold ever saw.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct SweepId(pub u64);
+
+/// `sweep-<n>`, and the format is LOAD-BEARING: [`SessionStore::sweep_dir`] is
+/// `sweeps/{sweep}`, so this string is a DIRECTORY NAME, and
+/// [`SessionStore::gc_trial_matrices`] reads those directories back by
+/// `strip_prefix("sweep-")`. A prettier rendering with a space or a `#` in it
+/// would produce directories the GC silently skips — every matrix kept forever,
+/// no error, and a store that grows without bound over a multi-day session.
+impl std::fmt::Display for SweepId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sweep-{}", self.0)
+    }
+}
+
+/// One block — [`crate::SHUFFLE_PERIOD`] live sweeps, after which the block's
+/// best sweep is re-run against rotated features (§9). Derived from the live
+/// sweep count, never stored, so it cannot drift from the sweeps it names.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct BlockId(pub u32);
+
+/// `block-<n>`, matching [`SweepId`]'s rendering so both are safe path
+/// components even where only one of them is used as one today.
+impl std::fmt::Display for BlockId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "block-{}", self.0)
+    }
+}
+
+/// A session — one goal set, one judge, one out-of-sample window, one journal.
+///
+/// The inner `String` is deliberately NOT public: it is also a directory name
+/// under the autoresearch store, so every value must have come through
+/// [`SessionId::new`] or [`SessionId::parse`], and [`SessionId::parse`] rejects
+/// anything that is not a safe path component.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Construction and validation for [`SessionId`].
 ///
@@ -428,11 +482,122 @@ pub struct BlockOutcome {
 
 // §12 — every abandoned configuration, counted AND named.
 //
-// The census is DEFINED IN `verdict` (it is a field of `SessionVerdict`, which
-// is the artifact a reader holds) and folded HERE. One definition, one shape in
-// the report and in the fold — a second struct with the same name and different
-// fields is how a count in the log stops matching the count in the verdict.
-pub use crate::verdict::AbandonCensus;
+// DEFINED HERE and carried whole into `SessionVerdict`. One definition, one
+// shape in the fold and in the report — a second struct with the same name and
+// different fields is how a count in the log stops matching the count in the
+// verdict.
+//
+// NO SILENT DROPS (non-negotiable 4) is this struct: every way a configuration
+// can leave the loop without a result has a counter, and each counter is
+// incremented at exactly one place, in `Session::apply`.
+
+/// Every abandoned configuration, counted and named.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AbandonCensus {
+    /// Proposals that reached the journal. The denominator for everything else.
+    pub proposals_drawn: usize,
+    /// Refused because an identical `config_hash` had already been run — the
+    /// same experiment twice is one experiment, not two trials.
+    pub duplicates_refused: usize,
+    /// Refused BEFORE running: the payoff floor is unreachable under the
+    /// proposal's own exit geometry, so its answer was fixed before a bar was
+    /// read.
+    pub payoff_floor_unreachable: usize,
+    /// Refused because the proposal left the trust region and was reverted.
+    pub trust_region_reverted: usize,
+    /// Individual searches inside a sweep that returned an error.
+    pub searches_errored: usize,
+    /// Whole sweeps that failed with an error.
+    pub sweeps_failed: usize,
+    /// Whole sweeps found open on resume: the process died between the intent
+    /// record and the outcome record.
+    pub sweeps_abandoned: usize,
+    /// Screen failures by conjunct, indexed by
+    /// [`crate::judge::ScreenConjunct::index`]: `S1..S6` plus `Unavailable`.
+    pub screen_failed_by_conjunct: [usize; 7],
+    /// Trial-return matrices deleted by the store's garbage collector.
+    pub gc_deleted_matrices: usize,
+    pub gc_bytes_reclaimed: u64,
+    /// `(reason, config_hash)` for the first [`CENSUS_EXAMPLE_LIMIT`] drops. A
+    /// count tells a reader how many died; an example tells them which question
+    /// to ask next, which is why the census carries both.
+    pub examples: Vec<(String, String)>,
+}
+
+impl AbandonCensus {
+    /// Everything that left the loop without a result. Counted, named, and
+    /// **never elided when zero.**
+    ///
+    /// A renderer that prints only the non-zero rows lets a reader mistake "this
+    /// counter does not exist" for "this counter is zero", which is the exact
+    /// difference between a drop that was measured and a drop that was never
+    /// instrumented. Every row is printed on every report.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "ABANDON CENSUS — every configuration that left without a result"
+        );
+        let _ = writeln!(
+            s,
+            "  proposals drawn                 {}",
+            self.proposals_drawn
+        );
+        let _ = writeln!(
+            s,
+            "  refused: duplicate config_hash  {}",
+            self.duplicates_refused
+        );
+        let _ = writeln!(
+            s,
+            "  refused: payoff floor unreachable {}",
+            self.payoff_floor_unreachable
+        );
+        let _ = writeln!(
+            s,
+            "  refused: trust region reverted  {}",
+            self.trust_region_reverted
+        );
+        let _ = writeln!(
+            s,
+            "  searches errored                {}",
+            self.searches_errored
+        );
+        let _ = writeln!(s, "  sweeps failed                   {}", self.sweeps_failed);
+        let _ = writeln!(
+            s,
+            "  sweeps abandoned (crash)        {}",
+            self.sweeps_abandoned
+        );
+        let _ = writeln!(s, "  screen failures by conjunct:");
+        for (i, label) in crate::judge::ScreenConjunct::ALL_LABELS.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "    {label:<16} {}",
+                self.screen_failed_by_conjunct[i]
+            );
+        }
+        let _ = writeln!(
+            s,
+            "  trial matrices GC'd             {} ({} bytes reclaimed)",
+            self.gc_deleted_matrices, self.gc_bytes_reclaimed
+        );
+        if self.examples.is_empty() {
+            let _ = writeln!(s, "  named examples: none");
+        } else {
+            let _ = writeln!(
+                s,
+                "  named examples (first {} of the drops):",
+                self.examples.len()
+            );
+            for (reason, config_hash) in &self.examples {
+                let _ = writeln!(s, "    {config_hash}  {reason}");
+            }
+        }
+        s
+    }
+}
 
 /// How many named examples the census keeps. Bounded because it is rendered in
 /// every report and a session runs for days.
@@ -449,6 +614,28 @@ fn note(census: &mut AbandonCensus, reason: &str, config_hash: &str) {
         census
             .examples
             .push((reason.to_string(), config_hash.to_string()));
+    }
+}
+
+/// Does `candidate` strictly improve on the current best?
+///
+/// **One definition, used twice**: [`SessionWriter::offer_best_ever`] asks it
+/// before deciding whether a record is worth journalling, and
+/// [`Session::apply`] asks it again when folding that record. If the two sides
+/// used different rules, a resumed session would compute a different
+/// `best_ever` from the same journal than the process that wrote it — which is
+/// precisely the divergence §11.4's assertion exists to catch, moved one level
+/// down where the assertion could not see it.
+///
+/// Strict `>`, so an equal result does not displace the incumbent: the earlier
+/// one is the one whose trial matrices the GC has been keeping, and swapping to
+/// a tie would discard evidence for no gain. A NaN candidate loses every
+/// comparison and can therefore never become the best — the right answer, since
+/// "no number" is never good news.
+pub fn advances_best(current: Option<&BestEver>, candidate: &BestEver) -> bool {
+    match current {
+        None => candidate.e_screen_pess.is_finite(),
+        Some(best) => candidate.e_screen_pess > best.e_screen_pess,
     }
 }
 
@@ -497,8 +684,21 @@ pub struct Session {
     /// The shuffle null: every control sweep's best `E_screen_pess`, in block
     /// order.
     pub null_observations: Vec<f64>,
+    /// The best screened result the session has ever seen.
+    ///
+    /// Folded from [`Record::BestEverAdvanced`] and from nothing else. It was
+    /// once assigned through a `&mut Session` and the cost was exact: a debug
+    /// build tripped the §11.4 assertion on the next append, and a release build
+    /// silently dropped the pointer on every restart — which takes R2's U2
+    /// condition with it, so the loop could no longer report the goal
+    /// UNREACHABLE, and un-keeps the previous best sweep's trial matrices at the
+    /// next GC, so the evidence went too.
     pub best_ever: Option<BestEver>,
     /// One row per sweep — the `pbo_session` input.
+    ///
+    /// Folded from [`Record::ChampionRecorded`], for the same reason: a champion
+    /// matrix that restarts empty makes `pbo_session` refuse forever, and a
+    /// refusal is a fail, so NO PROMOTION IS POSSIBLE after any restart.
     pub champions: Vec<ChampionRow>,
     pub oos_touches_spent: u32,
     pub census: AbandonCensus,
@@ -743,6 +943,42 @@ impl Session {
                 slots[*slot] = screen_result.clone();
             }
 
+            Record::BestEverAdvanced { best } => {
+                // MONOTONE, not blind assignment. The writer only appends a
+                // record that strictly improves, so on a forward replay the two
+                // are the same thing; taking the max as well means the folded
+                // pointer cannot be walked BACKWARDS by a record a reader
+                // replays out of order, and makes the fold idempotent under a
+                // duplicated line.
+                self.note_sweep(best.sweep);
+                if advances_best(self.best_ever.as_ref(), best) {
+                    self.best_ever = Some(best.clone());
+                }
+            }
+
+            Record::ChampionRecorded { row } => {
+                self.note_sweep(row.sweep);
+                // One row per sweep is what `pbo_session` is defined over. Two
+                // rows from one sweep would let a single sweep vote twice in the
+                // PBO of the loop's own selection procedure, which is a
+                // measurement that flatters itself — so this is refused rather
+                // than de-duplicated, because a de-duplication would hide the
+                // caller that wrote it twice.
+                if let Some(existing) = self.champions.iter().find(|c| c.sweep == row.sweep) {
+                    bail!(
+                        "the journal carries TWO ChampionRecorded records for {} (config {} then \
+                         {}). The session champion matrix is defined as ONE ROW PER SWEEP — the \
+                         input to pbo_session, the PBO of the loop's own selection procedure — so \
+                         a second row would let one sweep vote twice in the statistic that decides \
+                         whether the loop is fooling itself.",
+                        row.sweep,
+                        existing.config_hash,
+                        row.config_hash
+                    );
+                }
+                self.champions.push(row.clone());
+            }
+
             Record::PosteriorUpdated { sweep, credits } => {
                 self.posterior.credit(*sweep, credits);
             }
@@ -898,22 +1134,6 @@ impl Session {
             .collect()
     }
 
-    /// Update the best-ever pointer. Called by the runner after the judge has
-    /// screened a sweep; kept here because `best_ever` is session state.
-    pub fn offer_best_ever(&mut self, candidate: BestEver) {
-        let better = match &self.best_ever {
-            None => true,
-            Some(current) => candidate.e_screen_pess > current.e_screen_pess,
-        };
-        if better {
-            self.best_ever = Some(candidate);
-        }
-    }
-
-    pub fn push_champion(&mut self, row: ChampionRow) {
-        self.champions.push(row);
-    }
-
     pub fn has_stopped(&self) -> bool {
         self.stopped.is_some()
     }
@@ -1021,11 +1241,30 @@ impl SessionWriter {
         &self.session
     }
 
-    /// Mutable access for the two pieces of state the judge computes and the
-    /// session merely holds: `best_ever` and the champion matrix. Everything
-    /// else must go through [`SessionWriter::append`].
-    pub fn session_mut(&mut self) -> &mut Session {
-        &mut self.session
+    /// Offer a candidate as the session's new best-ever result.
+    ///
+    /// Returns whether it advanced. **There is no `session_mut`**: this used to
+    /// be `writer.session_mut().offer_best_ever(..)`, an assignment into a field
+    /// of the fold's own product, and it is exactly the state-outside-the-fold
+    /// that a debug build catches on the next append and a release build loses
+    /// on the next restart. The comparison happens BEFORE the append so a
+    /// non-advancing offer costs no journal line, and it is the same
+    /// [`advances_best`] the fold applies, so the two can never disagree.
+    pub fn offer_best_ever(&mut self, candidate: BestEver) -> Result<bool> {
+        if !advances_best(self.session.best_ever.as_ref(), &candidate) {
+            return Ok(false);
+        }
+        self.append(Record::BestEverAdvanced { best: candidate })?;
+        Ok(true)
+    }
+
+    /// Record one sweep's champion row into the session champion matrix.
+    ///
+    /// Journalled, for the same reason: an in-memory matrix restarts empty, and
+    /// an empty matrix makes `pbo_session` refuse — which is a FAIL, so no
+    /// promotion would ever be possible again after a restart.
+    pub fn push_champion(&mut self, row: ChampionRow) -> Result<()> {
+        self.append(Record::ChampionRecorded { row })
     }
 
     pub fn journal(&self) -> &Journal {
@@ -1489,13 +1728,65 @@ mod tests {
         }
     }
 
+    fn best(sweep: u64, slot: usize, e: f64) -> BestEver {
+        BestEver {
+            sweep: SweepId(sweep),
+            slot,
+            config_hash: format!("fnv64:{sweep:016x}-{slot}"),
+            e_screen_pess: e,
+            n_trades: 250,
+            dsr: Some(0.97),
+            pbo: Some(0.31),
+        }
+    }
+
+    /// The month grid and the return generator are the SAME ones
+    /// `judge::the_session_champion_matrix_is_built_in_memory_from_public_fields`
+    /// pins as accepted by `pbo_cscv`, so a resume test that asserts
+    /// `pbo_session` returns a number is testing the resume and not the CSCV
+    /// admission rules.
+    fn champion_months() -> Vec<i64> {
+        (24_300..24_336).collect()
+    }
+
+    fn champion_row(sweep: u64) -> ChampionRow {
+        let i = sweep as i64 - 1;
+        ChampionRow {
+            sweep: SweepId(sweep),
+            config_hash: format!("fnv64:{sweep:016x}"),
+            strategy_id: format!("g{sweep}"),
+            period_keys: champion_months(),
+            monthly_returns: (0..36).map(|m| 0.01 * ((i + m) % 7) as f64 - 0.02).collect(),
+            e_screen_pess: 0.4,
+        }
+    }
+
     #[test]
     fn the_fold_equals_the_incremental_apply_after_every_record() {
         // §11.4, the invariant the whole resume path rests on.
+        //
+        // `best_ever` and the champion matrix are IN this list on purpose. They
+        // were once the two fields the runner assigned through a `&mut Session`,
+        // which made the fold and the incremental state diverge on the first
+        // sweep that produced a champion — a debug-build panic on the next
+        // append, and in a release build a silent loss of both on every restart.
+        // Anything that moves them back out of the journal fails here.
         let records = vec![
             header_record("ar-test"),
             started(1),
             completed(1, 100),
+            Record::ChampionRecorded {
+                row: champion_row(1),
+            },
+            Record::BestEverAdvanced {
+                best: best(1, 0, 0.40),
+            },
+            // A record that does NOT advance. The fold is monotone, so this
+            // leaves the pointer where it was — and the fold and the incremental
+            // apply have to agree about that too.
+            Record::BestEverAdvanced {
+                best: best(1, 7, 0.11),
+            },
             started(2),
             Record::SweepFailed {
                 sweep: SweepId(2),
@@ -1514,6 +1805,57 @@ mod tests {
                 record.tag()
             );
         }
+
+        // And the fold produced the right values, not merely equal ones: a fold
+        // that dropped both fields would also be "equal" to an incremental apply
+        // that dropped both.
+        assert_eq!(incremental.champions.len(), 1);
+        assert_eq!(incremental.champions[0].sweep, SweepId(1));
+        let best_ever = incremental.best_ever.as_ref().expect("a best-ever pointer");
+        assert_eq!(best_ever.slot, 0, "the lower offer must not displace the best");
+        assert!((best_ever.e_screen_pess - 0.40).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_second_champion_row_for_one_sweep_is_refused_not_appended() {
+        // The session champion matrix is ONE ROW PER SWEEP. A second row would
+        // let one sweep vote twice in `pbo_session` — the statistic that decides
+        // whether the loop is fooling itself.
+        let records = vec![
+            header_record("ar-test"),
+            Record::ChampionRecorded {
+                row: champion_row(1),
+            },
+            Record::ChampionRecorded {
+                row: champion_row(1),
+            },
+        ];
+        let err = Session::fold(&records).expect_err("two rows from one sweep must not fold");
+        assert!(format!("{err:#}").contains("ONE ROW PER SWEEP"), "got: {err:#}");
+    }
+
+    #[test]
+    fn the_best_ever_pointer_only_ever_moves_up() {
+        // Replay order is not a promise the fold gets to rely on, so the fold
+        // takes the max rather than assigning. A NaN loses every comparison and
+        // can never become the best: "no number" is never good news.
+        assert!(advances_best(None, &best(1, 0, -3.0)));
+        assert!(!advances_best(None, &best(1, 0, f64::NAN)));
+        assert!(advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, 0.11)));
+        assert!(!advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, 0.10)));
+        assert!(!advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, f64::NAN)));
+
+        let records = vec![
+            header_record("ar-test"),
+            Record::BestEverAdvanced {
+                best: best(1, 0, 0.40),
+            },
+            Record::BestEverAdvanced {
+                best: best(2, 0, 0.05),
+            },
+        ];
+        let session = Session::fold(&records).unwrap();
+        assert_eq!(session.best_ever.as_ref().unwrap().sweep, SweepId(1));
     }
 
     #[test]
@@ -1563,6 +1905,142 @@ mod tests {
         let session = Session::fold(&records).unwrap();
         assert_eq!(session.n_session(), 62, "a trial that ran is a trial that ran");
         assert_eq!(session.census.sweeps_abandoned, 1);
+    }
+
+    /// **The adversary's test.** Kill the loop after sweeps that produced
+    /// champions — mid-sweep, with an intent on disk and no outcome — resume,
+    /// and require that both `best_ever` and the champion matrix came back, and
+    /// that the two capabilities they carry are still reachable.
+    ///
+    /// This is the whole of DEFECT 1. When these two lived outside the fold:
+    ///
+    /// * a DEBUG build panicked on the first append after the first champion,
+    ///   because `SessionWriter::append` re-folds and compares — so this test
+    ///   also fails as a panic, not as an assertion, if anything moves them back
+    ///   out;
+    /// * a RELEASE build lost both on every restart, and the loss is not
+    ///   cosmetic. R2's U2 condition reads `best_ever`; with `None` it falls into
+    ///   the arm that says *there is nothing to compare*, which can never be
+    ///   satisfied, so **the loop could no longer report the goal UNREACHABLE** —
+    ///   the one thing this project has never been able to say. And
+    ///   `pbo_session` over an empty champion matrix REFUSES, and a refusal is a
+    ///   fail, so **no promotion was possible** either.
+    #[test]
+    fn a_crash_loses_one_sweep_but_never_the_best_ever_or_the_champion_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+
+        // ── the process that did the work, and then died ────────────────────
+        {
+            let mut writer = SessionWriter::open(&path).unwrap();
+            writer.append(header_record("ar-test")).unwrap();
+            for sweep in 1..=12u64 {
+                writer.append(started(sweep)).unwrap();
+                writer.append(completed(sweep, 100)).unwrap();
+                writer.push_champion(champion_row(sweep)).unwrap();
+                let advanced = writer
+                    .offer_best_ever(best(sweep, 0, 0.10 + 0.01 * sweep as f64))
+                    .unwrap();
+                assert!(advanced, "sweep {sweep} strictly improved on its predecessor");
+            }
+            // A non-advancing offer costs no journal line and changes nothing.
+            assert!(!writer.offer_best_ever(best(12, 9, -5.0)).unwrap());
+
+            // Three shuffle-control observations — MIN_NULL_OBS — so the null
+            // exists and U2 has something on both sides of its comparison.
+            for (block, e) in [(0u32, 0.90), (1, 1.00), (2, 1.10)] {
+                writer
+                    .append(Record::ShuffleControlCompleted {
+                        block: BlockId(block),
+                        kind: crate::shuffle::ControlKind::CircularRotation,
+                        tau: 0.37,
+                        source_sweep: SweepId(4 * (block as u64 + 1)),
+                        trials_offered: 100,
+                        e_screen_pess: Some(e),
+                        dsr: Some(0.5),
+                    })
+                    .unwrap();
+            }
+
+            // And now the crash: sweep 13's INTENT is on disk, its outcome never
+            // arrives, and the process is gone before it can write anything else.
+            writer.append(started(13)).unwrap();
+        }
+
+        // ── the resume ──────────────────────────────────────────────────────
+        let resumed = SessionWriter::open(&path).unwrap();
+        let session = resumed.session();
+
+        // A crash loses ONE SWEEP, not the session.
+        assert_eq!(session.sweeps_run(), 12);
+        assert_eq!(
+            session.open_sweep.as_ref().map(|o| o.sweep),
+            Some(SweepId(13)),
+            "the sweep the process died inside is visibly open, for the resume path to abandon"
+        );
+        assert_eq!(session.next_sweep(), SweepId(14));
+
+        // Both pieces of state came back FROM THE JOURNAL.
+        assert_eq!(session.champions.len(), 12, "the champion matrix survived");
+        let best_ever = session
+            .best_ever
+            .as_ref()
+            .expect("the best-ever pointer survived the process that produced it");
+        assert_eq!(best_ever.sweep, SweepId(12));
+        assert!((best_ever.e_screen_pess - 0.22).abs() < 1e-9);
+
+        // CAPABILITY 1 — the loop can still say GOAL UNREACHABLE. U2 must be in
+        // the arm that HAS both numbers, and must be satisfiable: the best live
+        // result (+0.22) never beat the null's 95th percentile (+1.10).
+        let check =
+            crate::verdict::check_unreachable(session, &crate::judge::JudgeThresholds::frozen());
+        let u2 = check
+            .conditions
+            .iter()
+            .find(|c| c.id == "U2")
+            .expect("U2 is always evaluated");
+        assert!(
+            u2.detail.contains("best live E_screen_pess"),
+            "U2 fell into the no-best arm after a resume, which can never be satisfied: {}",
+            u2.detail
+        );
+        assert!(u2.satisfied, "U2 must remain SATISFIABLE after a resume: {}", u2.detail);
+
+        // CAPABILITY 2 — promotion is still possible. `pbo_session` is computed
+        // over the champion matrix; with an empty matrix it refuses, and a
+        // refusal is a fail.
+        let (pbo, refusal) = crate::judge::session_pbo_value(session);
+        assert!(
+            pbo.is_some(),
+            "pbo_session refused after a resume, so no promotion would ever be possible again: \
+             {refusal:?}"
+        );
+    }
+
+    /// A release build must not lose them either — and `debug_assert_eq!` is
+    /// compiled out there, so the incremental state IS whatever the writer put
+    /// in it. Comparing the writer's own view against a fold of its own journal
+    /// is the check that survives `--release`.
+    #[test]
+    fn the_writers_view_equals_a_fold_of_its_own_journal_in_any_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut writer = SessionWriter::open(&path).unwrap();
+        writer.append(header_record("ar-test")).unwrap();
+        writer.append(started(1)).unwrap();
+        writer.append(completed(1, 100)).unwrap();
+        writer.push_champion(champion_row(1)).unwrap();
+        writer.offer_best_ever(best(1, 0, 0.4)).unwrap();
+
+        let folded = Session::fold(writer.journal().records()).unwrap();
+        assert_eq!(
+            &folded,
+            writer.session(),
+            "the writer's session must be a pure fold of its own journal in EVERY build — this \
+             assertion is the release-build half of §11.4, where debug_assert_eq! is gone"
+        );
+        assert!(folded.best_ever.is_some());
+        assert_eq!(folded.champions.len(), 1);
     }
 
     #[test]
@@ -1762,6 +2240,36 @@ mod tests {
         assert!(SessionId::parse("ar-2026/../x").is_err());
         assert!(SessionId::parse("").is_err());
         assert!(SessionId::parse("ar-20260810T101500Z-1a2b3c4d").is_ok());
+    }
+
+    /// `SweepId`'s `Display` IS the on-disk directory name, and
+    /// `gc_trial_matrices` parses it back with `strip_prefix("sweep-")`.
+    ///
+    /// Pinned here because the failure mode is silent: a prettier rendering
+    /// (`"sweep #1"`) still writes and still reads within one process, and the
+    /// only symptom is a garbage collector that matches nothing and a store that
+    /// grows for days without one error line.
+    #[test]
+    fn the_sweep_directory_name_is_the_name_the_gc_parses_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0003").unwrap())
+                .unwrap();
+        for id in [SweepId(1), SweepId(42)] {
+            let name = store
+                .sweep_dir(id)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(name, format!("sweep-{}", id.0));
+            assert_eq!(
+                name.strip_prefix("sweep-").and_then(|n| n.parse::<u64>().ok()),
+                Some(id.0),
+                "the GC must be able to recover the SweepId from the directory name"
+            );
+        }
     }
 
     #[test]

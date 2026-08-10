@@ -105,6 +105,20 @@ pub enum Expression {
     ModeNative,
 }
 
+impl Expression {
+    /// Whether drawing this variant makes the run differ from the mode's own
+    /// default objective.
+    ///
+    /// A [`Expression::ModeNative`] variant overrides nothing: a session in
+    /// which it is the ONLY drawable variant sweeps axis A under one fixed,
+    /// implicit objective — the default — while the coverage table records that
+    /// an objective variant was drawn. That is the shape of "axis B ran" with
+    /// none of the content, and [`axis_b_live_check`] refuses it.
+    pub fn varies_the_objective(self) -> bool {
+        matches!(self, Self::Overrides)
+    }
+}
+
 /// One row of the declared objective set.
 #[derive(Debug, Clone, Copy)]
 pub struct VariantSpec {
@@ -135,6 +149,22 @@ pub struct VariantSpec {
 
 /// B1's exposure ceilings — the concrete "fewer, different trades" lever.
 pub const B1_MAX_IN_MARKET_LEVELS: &[f64] = &[0.10, 0.05, 0.02];
+
+/// The fields B1 writes, which depend on what the compiled search has.
+///
+/// Two of the three are unconditional: `min_trades_per_day` and
+/// `TargetProfile::max_in_market` both exist on today's `DiscoveryConfig` and
+/// `TargetProfile::evaluate` already enforces the second. The third — scoring
+/// net per BAR IN MARKET — needs a knob that does not exist yet, so it is
+/// declared in `exact_form_requires` and appears here only when the feature that
+/// proves the symbol exists is on. A `writes` list that named a field the build
+/// cannot write would be the same silent substitution this module exists to
+/// prevent, one level up.
+pub const B1_WRITES: &[&str] = if cfg!(feature = "search-in-market-fitness") {
+    &["min_trades_per_day", "target_profile.max_in_market", "fitness_table"]
+} else {
+    &["min_trades_per_day", "target_profile.max_in_market"]
+};
 /// B2's conditioning families, declared BEFORE the run. Choosing the bucket
 /// after seeing the result is the classic subgroup overfit; the family is fixed
 /// here, the complement's expectancy is reported alongside always, and the
@@ -177,15 +207,41 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         changes: ObjectiveDimension::EligiblePopulation,
         scenario: None,
         expression: Expression::Overrides,
-        requires: &[RequiredKnob::InMarketFitness],
-        exact_form_requires: None,
-        writes: &["min_trades_per_day", "target_profile.max_in_market", "fitness_table"],
+        // ── THE AXIS-B LIVENESS ANCHOR. ────────────────────────────────────
+        //
+        // Empty, and that is the fix for the axis being inert in the shipped
+        // build. The two levers that DEFINE this variant both exist on today's
+        // `DiscoveryConfig`: `min_trades_per_day` (removing the volume floor)
+        // and `TargetProfile::max_in_market`, which `TargetProfile::evaluate`
+        // already enforces with a named rejection (`TooMuchTimeInMarket`).
+        //
+        // It used to require `FitnessTable::NetPerBarInMarket`, a symbol
+        // `neoethos-search` does not have. Every other `Overrides` variant
+        // needs a knob that does not exist yet either, so gating this one too
+        // left the DEFAULT BUILD with `ModeNative` variants only — a variant
+        // that writes nothing, i.e. an axis that runs the mode's own default and
+        // reports that it explored the objective space. `axis_b_live_check`
+        // now refuses to start such a session; this row is what lets it start.
+        //
+        // The clause that is NOT expressible is declared, not dropped: see
+        // `exact_form_requires` immediately below, which is rendered beside the
+        // variant in every space report.
+        requires: &[],
+        exact_form_requires: if cfg!(feature = "search-in-market-fitness") {
+            None
+        } else {
+            Some(RequiredKnob::InMarketFitness)
+        },
+        writes: B1_WRITES,
         params: 3,
         max_draws_per_session: None,
         why_not_a_reparameterisation:
             "the average trade loses 4.15 pips, so the only exit is FEWER, DIFFERENT trades: the \
-             volume floor is removed, a hard exposure budget is imposed, and net is scored per BAR \
-             IN MARKET so being flat is not penalised.",
+             volume floor is removed and a hard exposure budget is imposed, both of which change \
+             WHICH trades are eligible rather than how the same population is summarised. (The \
+             third clause of the exact form — scoring net per BAR IN MARKET so that being flat is \
+             not penalised — needs a knob the compiled search does not have, and is declared in \
+             `exact_form_requires` rather than silently omitted.)",
     },
     VariantSpec {
         id: ObjectiveVariant::B2Conditional,
@@ -563,6 +619,13 @@ pub enum ObjectiveError {
     RefusalLevelOutOfRange { dim: RefusalDim, level: u8, arity: usize },
     ParamOutOfRange { variant: ObjectiveVariant, param: u8, arity: usize },
     VariantNotDrawable { variant: ObjectiveVariant, reason: VariantExclusion },
+    /// Every drawable variant has spent its `max_draws_per_session`.
+    ///
+    /// The proposer used to handle this by falling back to the full drawable
+    /// list, which re-admitted the capped control past its own ceiling with no
+    /// counter and no census line. Named here so the slot is refused, counted
+    /// and named instead.
+    AllVariantsCapped { drawable: Vec<String> },
 }
 
 impl std::fmt::Display for ObjectiveError {
@@ -577,6 +640,14 @@ impl std::fmt::Display for ObjectiveError {
                 f,
                 "objective `{}` has {arity} parameter levels; level {param} does not exist",
                 variant.label()
+            ),
+            Self::AllVariantsCapped { drawable } => write!(
+                f,
+                "every drawable objective variant [{}] has spent its max_draws_per_session, so \
+                 there is no variant left to draw. The slot is REFUSED and counted rather than \
+                 re-admitting a capped control past its own ceiling, which would run a \
+                 configuration nobody chose under a name somebody did",
+                drawable.join(", ")
             ),
             Self::VariantNotDrawable { variant, reason } => match reason {
                 VariantExclusion::MissingKnob(k) => write!(
@@ -770,18 +841,263 @@ pub fn axis_b_report(caps: &Capabilities, scenario: ScenarioKind) -> Vec<Variant
                     ObjectiveError::VariantNotDrawable { variant: v, reason: r }.to_string()
                 }),
                 exact_form_requires: spec.exact_form_requires.map(|k| {
-                    format!(
-                        "the exact functional needs `{}` ({}); what runs today is the mode's own \
-                         objective",
-                        k.symbol(),
-                        k.required_elsewhere_section()
-                    )
+                    // The sentence must name what ACTUALLY runs, and that
+                    // differs by expression. Saying "the mode's own objective"
+                    // for an `Overrides` variant would describe a run nobody
+                    // made — the approximation would be stated, but stated
+                    // wrongly, which is worse than not stating it.
+                    match spec.expression {
+                        Expression::ModeNative => format!(
+                            "the exact functional needs `{}` ({}); what runs today is the mode's \
+                             own objective",
+                            k.symbol(),
+                            k.required_elsewhere_section()
+                        ),
+                        Expression::Overrides => format!(
+                            "the exact functional needs `{}` ({}); what runs today is the \
+                             expressible half of it — the overrides [{}] — and NOT the missing \
+                             term",
+                            k.symbol(),
+                            k.required_elsewhere_section(),
+                            spec.writes.join(", ")
+                        ),
+                    }
                 }),
                 max_draws_per_session: spec.max_draws_per_session,
                 why_not_a_reparameterisation: spec.why_not_a_reparameterisation.to_string(),
             }
         })
         .collect()
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Is axis B actually running? (§7.0, and the operator's "BOTH TOGETHER".)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The two scenarios, as a table. `ScenarioKind` is owned by [`crate::goals`];
+/// this is the local enumeration the coverage arithmetic needs and it is
+/// asserted exhaustive by [`tests::the_scenario_table_is_exhaustive`].
+pub const SCENARIOS: [ScenarioKind; 2] = [ScenarioKind::Risky, ScenarioKind::PropFirm];
+
+/// Why the objective axis would not actually vary in this build.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxisBInert {
+    pub scenario: ScenarioKind,
+    /// Variants that CAN be drawn — possibly non-empty, and still inert.
+    pub drawable: Vec<&'static str>,
+    /// Why each variant that would have varied the objective is unavailable.
+    pub excluded: Vec<String>,
+}
+
+impl std::fmt::Display for AxisBInert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AXIS B IS INERT in this build: of the objective variants drawable for the {:?} \
+             scenario [{}], not one overrides anything — every drawable variant is the mode's own \
+             default objective under a name. The loop would sweep the SEARCH CONFIGURATION under \
+             one fixed objective while its coverage table recorded that it explored the objective \
+             space, and U4 would then certify a space it never searched on the axis the measured \
+             base rate says the answer must live on (expectancy was -4.15 pips per trade in EVERY \
+             exit configuration tested). Refusing to start rather than reporting a refutation \
+             nobody could act on. What is missing: {}",
+            self.scenario,
+            self.drawable.join(", "),
+            if self.excluded.is_empty() {
+                "nothing is excluded, which means the declared table itself carries no \
+                 overriding variant — that is a defect in VARIANTS, not in the build"
+                    .to_string()
+            } else {
+                self.excluded.join("; ")
+            }
+        )
+    }
+}
+
+impl std::error::Error for AxisBInert {}
+
+/// The liveness rule, on its own so it can be exercised over a table: a set of
+/// variants carries the objective axis iff at least one of them is **uncapped**
+/// and **overrides** something.
+///
+/// Uncapped, because [`ObjectiveVariant::B0ScoringTable`] is the declared
+/// control with `max_draws_per_session = 1`: one sweep out of a session cannot
+/// carry an axis. Overriding, because a [`Expression::ModeNative`] variant runs
+/// the mode's own objective and changes nothing.
+pub fn carries_the_axis(variants: &[ObjectiveVariant]) -> bool {
+    variants.iter().any(|v| {
+        v.spec().expression.varies_the_objective() && v.spec().max_draws_per_session.is_none()
+    })
+}
+
+/// The drawable axis-B set, or a refusal naming why the axis cannot vary.
+///
+/// **This is the gate that keeps the operator's second axis from being skipped.**
+/// It is not enough that *some* variant is drawable — see [`carries_the_axis`]
+/// for the rule and why it is that rule.
+pub fn axis_b_live_check(
+    caps: &Capabilities,
+    scenario: ScenarioKind,
+) -> Result<Vec<ObjectiveVariant>, AxisBInert> {
+    let drawable: Vec<ObjectiveVariant> =
+        ObjectiveVariant::ALL.into_iter().filter(|v| v.drawable(caps, scenario)).collect();
+
+    if carries_the_axis(&drawable) {
+        return Ok(drawable);
+    }
+
+    let excluded = ObjectiveVariant::ALL
+        .into_iter()
+        .filter(|v| carries_the_axis(std::slice::from_ref(v)))
+        .filter_map(|v| {
+            v.exclusion_reason(caps, scenario)
+                .map(|r| ObjectiveError::VariantNotDrawable { variant: v, reason: r }.to_string())
+        })
+        .collect();
+
+    Err(AxisBInert {
+        scenario,
+        drawable: drawable.iter().map(|v| v.label()).collect(),
+        excluded,
+    })
+}
+
+/// The axis-B half of U4, computed against the **declared** drawable set rather
+/// than against whatever happens to be in the coverage counters. Produced by
+/// [`axis_b_coverage`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxisBCoverage {
+    /// Any variant at all was credited at least once. **False is enough on its
+    /// own to fail U4.**
+    pub axis_ran: bool,
+    /// The scenario whose native objective was actually covered, when one was.
+    pub scenario: Option<ScenarioKind>,
+    /// `(variant, sweeps drawn)` for every declared-drawable variant below the
+    /// bar. Non-empty whenever `axis_ran` is false.
+    pub under_drawn: Vec<(&'static str, usize)>,
+}
+
+impl AxisBCoverage {
+    /// U4's axis-B conjunct.
+    pub fn satisfied(&self) -> bool {
+        self.axis_ran && self.scenario.is_some() && self.under_drawn.is_empty()
+    }
+
+    /// The line U4 prints, whichever way it went.
+    pub fn detail(&self, min_draws: usize) -> String {
+        if !self.axis_ran {
+            return format!(
+                "NO objective variant was ever credited. Axis B — the half the measured base rate \
+                 says the answer must live on — produced no runs, so this space was not searched \
+                 on it and cannot be refuted on it. (An empty axis-B coverage list satisfies \
+                 'every variant was drawn {min_draws} times' only vacuously; that is the trap this \
+                 conjunct exists to fail.)"
+            );
+        }
+        if self.scenario.is_none() {
+            return format!(
+                "no scenario's own objective variant reached {min_draws} sweep(s)' worth of \
+                 draws, so the objective the goal set is actually defined by was never exercised: \
+                 [{}]",
+                self.render_under()
+            );
+        }
+        if self.under_drawn.is_empty() {
+            format!(
+                "every declared-drawable objective variant reached {min_draws} sweep(s)' worth of \
+                 draws (scenario-native objective: {:?})",
+                self.scenario
+            )
+        } else {
+            format!(
+                "under-drawn objective variants (< {min_draws} sweeps): [{}]",
+                self.render_under()
+            )
+        }
+    }
+
+    fn render_under(&self) -> String {
+        self.under_drawn
+            .iter()
+            .map(|(l, n)| format!("{l} ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Evaluate [`AxisBCoverage`] for a session.
+///
+/// # The hole this closes
+///
+/// U4 says *a space is not refuted if it was not searched*. Reading the coverage
+/// counters alone cannot say that, because the counters only contain keys that
+/// were **credited**: an axis that produced no runs at all contributes no keys,
+/// "no key is under-drawn" is then vacuously true, and the loop certifies a
+/// space it never explored on the axis that matters most. `session.coverage
+/// .is_empty()` does not catch it either — axis A is credited on every proposal,
+/// so the counters are non-empty while the objective axis is untouched. The
+/// DECLARED set is the only thing that knows what should have been drawn, so it
+/// is the thing U4 is evaluated against.
+///
+/// `sweeps_of` is the session's own fold — `coverage.get("objective", label)
+/// .sweeps` — passed as a closure so this function has no session dependency and
+/// can be exercised from a table in a test.
+///
+/// The scenario is **inferred from the journal**, not passed in: exactly one of
+/// the scenario-specific variants is drawable in any session (they are
+/// `ModeNative` and always drawable in their own scenario), so the scenario
+/// whose native variants are all covered is the scenario the session ran. If
+/// none is, the session never exercised the objective its goal set is defined
+/// by, and U4 fails saying so — which is the honest answer either way and needs
+/// no extra argument that a caller could get wrong.
+pub fn axis_b_coverage(
+    caps: &Capabilities,
+    min_draws: usize,
+    sweeps_of: &dyn Fn(&str) -> usize,
+) -> AxisBCoverage {
+    let axis_ran = ObjectiveVariant::ALL.into_iter().any(|v| sweeps_of(v.label()) > 0);
+
+    let expressible = |v: ObjectiveVariant| v.spec().requires.iter().all(|k| k.available(caps));
+
+    // The scenario-agnostic half: every one of them must clear the bar.
+    let mut under_drawn: Vec<(&'static str, usize)> = ObjectiveVariant::coverage_set()
+        .filter(|v| v.spec().scenario.is_none() && expressible(*v))
+        .filter_map(|v| {
+            let n = sweeps_of(v.label());
+            (n < min_draws).then_some((v.label(), n))
+        })
+        .collect();
+
+    // The scenario-native half: exactly one scenario's group must clear it.
+    let mut scenario = None;
+    let mut best_gap: Option<Vec<(&'static str, usize)>> = None;
+    for k in SCENARIOS {
+        let gap: Vec<(&'static str, usize)> = ObjectiveVariant::coverage_set()
+            .filter(|v| v.spec().scenario == Some(k) && expressible(*v))
+            .filter_map(|v| {
+                let n = sweeps_of(v.label());
+                (n < min_draws).then_some((v.label(), n))
+            })
+            .collect();
+        let group_exists =
+            ObjectiveVariant::coverage_set().any(|v| v.spec().scenario == Some(k) && expressible(v));
+        if !group_exists {
+            continue;
+        }
+        if gap.is_empty() {
+            scenario = Some(k);
+            best_gap = Some(Vec::new());
+            break;
+        }
+        if best_gap.as_ref().is_none_or(|g| gap.len() < g.len()) {
+            best_gap = Some(gap);
+        }
+    }
+    under_drawn.extend(best_gap.unwrap_or_default());
+    under_drawn.sort_unstable();
+    under_drawn.dedup();
+
+    AxisBCoverage { axis_ran, scenario, under_drawn }
 }
 
 #[cfg(test)]
@@ -907,6 +1223,213 @@ mod tests {
         // The shipped EvaluationConfig ships 0, which discovery.rs reads as 35.
         assert_eq!(b1.label_horizon_bars(0), 35);
         assert_eq!(b1.label_horizon_bars(120), 120);
+    }
+
+    // ── DEFECT 3, first half: axis B must RUN in the shipped default build ──
+
+    #[test]
+    fn the_scenario_table_is_exhaustive() {
+        // `axis_b_coverage` infers the session's scenario by trying each entry
+        // of SCENARIOS. A scenario missing from the table would be a scenario
+        // whose native objective U4 could never see, so it would certify a
+        // space it never searched — the exact failure this wave closes.
+        // Exhaustive BY COMPILER: adding a `ScenarioKind` variant makes this
+        // match fail to build, which is the only way a hand-written table like
+        // SCENARIOS stays honest.
+        for k in SCENARIOS {
+            let _: &str = match k {
+                ScenarioKind::Risky => "risky",
+                ScenarioKind::PropFirm => "prop_firm",
+            };
+        }
+        assert_eq!(SCENARIOS.len(), 2);
+        assert_ne!(SCENARIOS[0], SCENARIOS[1]);
+        // …and every scenario-specific variant names one of them.
+        for spec in VARIANTS {
+            if let Some(k) = spec.scenario {
+                assert!(SCENARIOS.contains(&k), "{} names a scenario not in SCENARIOS", spec.label);
+            }
+        }
+    }
+
+    #[test]
+    fn axis_b_is_live_in_the_default_build() {
+        // THE REGRESSION TEST FOR DEFECT 3. `Capabilities::compiled()` with the
+        // shipped feature set (all pending knobs OFF) must still yield an
+        // objective axis that actually varies — under BOTH goal scenarios.
+        //
+        // Before this wave every `Overrides` variant required a symbol
+        // `neoethos-search` does not have, so the default build's drawable set
+        // was `{B5}` (Risky) or `{B6}` (PropFirm): one ModeNative variant that
+        // writes nothing. The loop swept axis A under the mode's own objective
+        // and its coverage table said it had explored the objective space.
+        let caps = Capabilities::compiled();
+        for scenario in SCENARIOS {
+            let drawable = axis_b_live_check(&caps, scenario)
+                .unwrap_or_else(|e| panic!("axis B is inert in the shipped build: {e}"));
+            assert!(
+                carries_the_axis(&drawable),
+                "{scenario:?}: drawable set {:?} carries no uncapped overriding variant",
+                drawable.iter().map(|v| v.label()).collect::<Vec<_>>()
+            );
+            // …and it is not merely the capped control doing the work.
+            assert!(
+                drawable.iter().any(|v| *v == ObjectiveVariant::B1Selectivity),
+                "{scenario:?}: B1 is the variant whose levers the compiled search actually has"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_is_expressible_with_symbols_the_compiled_search_has() {
+        // The claim the liveness fix rests on: B1's two levers are real fields
+        // and `ObjectiveChoice::apply` writes them under the DEFAULT feature
+        // set. If `min_trades_per_day` or `max_in_market` ever moved behind a
+        // feature, this fails rather than the axis quietly going inert again.
+        let caps = Capabilities::compiled();
+        let choice = ObjectiveChoice::new(
+            ObjectiveVariant::B1Selectivity,
+            1,
+            RefusalLevels::permissive(),
+            &caps,
+            ScenarioKind::Risky,
+        )
+        .expect("B1 must be drawable with no pending knob compiled in");
+        let mut cfg = DiscoveryConfig { min_trades_per_day: 7.5, ..Default::default() };
+        choice.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.min_trades_per_day, 0.0, "the volume floor must be REMOVED, not lowered");
+        assert_eq!(cfg.target_profile.max_in_market, B1_MAX_IN_MARKET_LEVELS[1]);
+        // And the term that is NOT expressible is declared rather than dropped.
+        assert_eq!(
+            ObjectiveVariant::B1Selectivity.spec().exact_form_requires,
+            Some(RequiredKnob::InMarketFitness)
+        );
+        assert!(!B1_WRITES.contains(&"fitness_table"), "writes must not name a field it cannot write");
+    }
+
+    #[test]
+    fn a_mode_native_only_axis_does_not_carry_the_axis() {
+        // The rule itself, over a table. ModeNative overrides nothing, and the
+        // capped control is one sweep out of a session.
+        assert!(!carries_the_axis(&[ObjectiveVariant::B5TerminalWealth]));
+        assert!(!carries_the_axis(&[ObjectiveVariant::B6MonthlyConsistency]));
+        assert!(!carries_the_axis(&[ObjectiveVariant::B0ScoringTable]));
+        assert!(!carries_the_axis(&[]));
+        assert!(carries_the_axis(&[ObjectiveVariant::B1Selectivity]));
+        assert!(carries_the_axis(&[
+            ObjectiveVariant::B5TerminalWealth,
+            ObjectiveVariant::B1Selectivity
+        ]));
+    }
+
+    #[test]
+    fn the_inert_refusal_names_the_missing_symbols() {
+        // The message an operator would actually get. Built directly, because
+        // the shipped build can no longer produce the condition — which is the
+        // point, and is why the renderer still has to be exercised.
+        let caps = Capabilities::compiled();
+        let inert = AxisBInert {
+            scenario: ScenarioKind::Risky,
+            drawable: vec![ObjectiveVariant::B5TerminalWealth.label()],
+            excluded: vec![
+                ObjectiveError::VariantNotDrawable {
+                    variant: ObjectiveVariant::B4LabelHorizon,
+                    reason: ObjectiveVariant::B4LabelHorizon
+                        .exclusion_reason(&caps, ScenarioKind::Risky)
+                        .unwrap(),
+                }
+                .to_string(),
+            ],
+        };
+        let text = inert.to_string();
+        assert!(text.contains("AXIS B IS INERT"), "{text}");
+        assert!(text.contains("label_max_hold_bars"), "{text}");
+        assert!(text.contains("B5_terminal_wealth"), "{text}");
+    }
+
+    // ── DEFECT 3, second half: U4 may not certify an unsearched axis ────────
+
+    #[test]
+    fn u4_cannot_certify_an_axis_that_produced_no_runs() {
+        // THE REGRESSION TEST FOR THE U4 HALF OF DEFECT 3.
+        //
+        // Reading the coverage counters alone, "no credited objective key is
+        // under-drawn" is TRUE when nothing was credited at all — the classic
+        // "for all x in {}" trap. Evaluated against the DECLARED drawable set it
+        // is false, and says so in words an operator can act on.
+        let caps = Capabilities::compiled();
+        let nothing_ran = axis_b_coverage(&caps, crate::space::B_MIN_DRAWS, &|_: &str| 0);
+        assert!(!nothing_ran.axis_ran);
+        assert!(!nothing_ran.satisfied(), "U4 certified an axis that produced no runs");
+        assert!(!nothing_ran.under_drawn.is_empty());
+        let detail = nothing_ran.detail(crate::space::B_MIN_DRAWS);
+        assert!(detail.contains("produced no runs"), "{detail}");
+        assert!(detail.contains("vacuously"), "{detail}");
+    }
+
+    #[test]
+    fn u4_needs_every_declared_drawable_variant_and_the_scenario_native_one() {
+        let caps = Capabilities::compiled();
+        let min = crate::space::B_MIN_DRAWS;
+
+        // Everything drawn enough: satisfied, and the scenario is inferred.
+        let all = axis_b_coverage(&caps, min, &|_: &str| min);
+        assert!(all.satisfied(), "{:?}", all);
+        assert!(all.scenario.is_some());
+
+        // The scenario-agnostic half covered but the goal set's own objective
+        // never drawn: NOT satisfied. A session that never ran the objective
+        // its goals are defined by has not searched the space.
+        let no_native = axis_b_coverage(&caps, min, &|label: &str| {
+            if label == ObjectiveVariant::B5TerminalWealth.label()
+                || label == ObjectiveVariant::B6MonthlyConsistency.label()
+            {
+                0
+            } else {
+                min
+            }
+        });
+        assert!(no_native.axis_ran);
+        assert!(!no_native.satisfied());
+        assert!(no_native.scenario.is_none());
+
+        // One variant a single sweep short: NOT satisfied, and named with its
+        // count so the report says which question to ask next.
+        let short = axis_b_coverage(&caps, min, &|label: &str| {
+            if label == ObjectiveVariant::B1Selectivity.label() { min - 1 } else { min }
+        });
+        assert!(!short.satisfied());
+        assert!(
+            short
+                .under_drawn
+                .contains(&(ObjectiveVariant::B1Selectivity.label(), min - 1)),
+            "{:?}",
+            short.under_drawn
+        );
+        assert!(short.detail(min).contains("B1_selectivity (2)"), "{}", short.detail(min));
+    }
+
+    #[test]
+    fn u4_never_demands_a_variant_the_build_cannot_draw() {
+        // The other side of the same coin: a space is not refuted if it was not
+        // searched, but a variant that is EXCLUDED and named in the space report
+        // was never searchable, so demanding it would make R2 unreachable
+        // forever — the loop could then never say "unreachable", which is the
+        // one thing this project has never been able to say.
+        let caps = Capabilities::compiled();
+        let cov = axis_b_coverage(&caps, crate::space::B_MIN_DRAWS, &|_: &str| crate::space::B_MIN_DRAWS);
+        assert!(cov.satisfied());
+        for v in ObjectiveVariant::ALL {
+            if v.exclusion_reason(&caps, ScenarioKind::Risky).is_some()
+                && v.exclusion_reason(&caps, ScenarioKind::PropFirm).is_some()
+            {
+                assert!(
+                    !cov.under_drawn.iter().any(|(l, _)| *l == v.label()),
+                    "U4 demands `{}`, which no build can draw",
+                    v.label()
+                );
+            }
+        }
     }
 
     #[test]
