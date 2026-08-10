@@ -105,10 +105,13 @@
 #     it is not, the disagreement is a decision rather than drift.
 #
 #   risk.max_portfolio_risk
-#     The risky profile's portfolio cap. NOTE the live store carries 0.0,
-#     which under the current reading means NO CAP AT ALL rather than 'no
-#     risk' — that ambiguity is being turned into a loud startup error
-#     naming both readings, never a silent correction.
+#     The RISKY ladder's concurrent-risk cap, and correct here because this
+#     file is `trading_mode: risky` with `preset: none`. Since 2026-08-10 it
+#     is also the SEED for that mode, so the file and the code now agree by
+#     construction rather than by coincidence. Under a prop firm the seed is
+#     the preset's daily stop instead — carrying 0.34 there is 8.5x FTMO's
+#     daily limit, which one correlated move spends in full. See
+#     portfolio_cap_follows_the_mode.rs.
 #
 #   risk.total_drawdown_limit
 #     CORRECTED 2026-08-10 from 0.20000000298023224 — same f32 fingerprint,

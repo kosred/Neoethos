@@ -160,9 +160,12 @@ const ROOT_REGISTERED: &[(&str, &str, &str)] = &[
     (
         "risk.max_portfolio_risk",
         "0.34",
-        "The risky profile's portfolio cap. NOTE the live store carries 0.0, which under the \
-         current reading means NO CAP AT ALL rather than 'no risk' — that ambiguity is being \
-         turned into a loud startup error naming both readings, never a silent correction.",
+        "The RISKY ladder's concurrent-risk cap, and correct here because this file is \
+         `trading_mode: risky` with `preset: none`. Since 2026-08-10 it is also the SEED for \
+         that mode, so the file and the code now agree by construction rather than by \
+         coincidence. Under a prop firm the seed is the preset's daily stop instead — carrying \
+         0.34 there is 8.5x FTMO's daily limit, which one correlated move spends in full. \
+         See portfolio_cap_follows_the_mode.rs.",
     ),
     (
         "risk.trailing_enabled",
@@ -214,13 +217,16 @@ const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
     ),
     (
         "risk.max_portfolio_risk",
-        "0.34",
-        "MONEY. Set 2026-08-10, and the only live divergence here that moves live sizing. The \
-         store carried 0.0 — and so does the DEFAULT, which is the finding: on a knob named \
-         max_ that reads as NO CAP AT ALL, and it is the shipped behaviour everywhere rather \
-         than anything the operator chose. 0.34 is the risky profile's cap and is strictly \
-         safer, putting a ceiling where there was none. Written explicitly, never inherited, \
-         so it cannot move because a default moves.",
+        "0.04",
+        "MONEY, and no longer a divergence — it is the SEED for this file's ftmo preset under \
+         prop_firm, so it equals the default and is listed only because money keys always are. \
+         History worth keeping: this store carried 0.0 until 2026-08-10, and so did the \
+         DEFAULT, which was the actual finding — on a knob named max_ that reads as NO CAP AT \
+         ALL, shipped on every install and chosen by nobody. It was then briefly set to 0.34, \
+         which is the RISKY ladder's number and 8.5x FTMO's daily stop; the operator caught it \
+         the same day. The cap is now seeded per preset AND per trading_mode, at the daily \
+         stop, because if correlated positions stop out together the day's loss IS the total \
+         open risk. See portfolio_cap_follows_the_mode.rs.",
     ),
     (
         "models.regime_router_enabled",

@@ -81,7 +81,7 @@ risk:
   risky_max_risk_per_trade: 0.3
   prop_firm_min_risk_per_trade: null
   prop_firm_max_risk_per_trade: null
-  max_portfolio_risk: 0.0
+  max_portfolio_risk: 0.04
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07000000104308128
   min_risk_reward: 2.0

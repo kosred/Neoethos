@@ -641,10 +641,20 @@ impl Default for RiskConfig {
             risky_max_risk_per_trade: Some(0.30),
             prop_firm_min_risk_per_trade: None,
             prop_firm_max_risk_per_trade: None,
-            // Portfolio-level concurrent-risk cap: 0 = disabled (per-engine
-            // sizing only). Opt-in via config/Advanced — never a silent
-            // sizing change for existing users.
-            max_portfolio_risk: 0.0,
+            // Portfolio-level concurrent-risk cap. WAS 0.0 UNTIL 2026-08-10,
+            // where 0 meant "disabled" — i.e. a knob named max_ shipped meaning
+            // NO CAP AT ALL, on every install, chosen by nobody. Nothing about
+            // that was opt-in: the operator opted into a limit by the act of
+            // running a prop-firm mode, and got none.
+            //
+            // The daily stop is the right seed because it is the same number
+            // read the other way round: if every open position stops out
+            // together — the honest worst case for correlated FX pairs — the
+            // day's loss IS the total open risk. `reconcile_preset` re-seeds
+            // this per preset AND per trading_mode; the risky ladder gets
+            // RISKY_PORTFOLIO_RISK_CAP instead, which is a tolerance for ruin
+            // rather than a rulebook.
+            max_portfolio_risk: runtime.daily_dd_stop_trading_pct,
             // Internal early stop sits 20% below the firm's published
             // daily-loss ceiling so a guard-rail trips before a real
             // breach. Operators override in YAML if their firm gives
@@ -3523,6 +3533,10 @@ mod load_seal {
         ("risk.total_drawdown_limit", true),
         ("risk.max_lot_size", true),
         ("risk.max_trades_per_day", true),
+        // Added 2026-08-10 with the mode-aware seed. Without this row the field
+        // never counts as operator-set, and the seed would OVERWRITE a number
+        // he typed — a preset silently becoming a lock, on a money cap.
+        ("risk.max_portfolio_risk", true),
         // `risk.prop_firm_rules` removed 2026-08-10 with the field itself (D6).
     ];
 
@@ -3533,10 +3547,22 @@ mod load_seal {
         total_drawdown_limit: f64,
         max_lot_size: f64,
         max_trades_per_day: usize,
+        max_portfolio_risk: f64,
     }
 
+    /// The concurrent-risk ceiling for the RISKY ladder, where the point is to
+    /// multiply a small balance and `risky_max_risk_per_trade` is already 0.30.
+    /// It is deliberately not derived from a daily-drawdown stop: risky mode has
+    /// no challenge to fail, so the binding constraint is the operator's
+    /// tolerance for ruin, not a firm's rulebook.
+    const RISKY_PORTFOLIO_RISK_CAP: f64 = 0.34;
+
     impl PresetSeeds {
-        fn for_preset(preset: PropFirmPreset) -> Self {
+        /// `risky_ladder` comes from `system.trading_mode`, NOT from the preset.
+        /// The two are different questions — the preset names whose rulebook
+        /// applies, the mode names which ladder runs — and `max_portfolio_risk`
+        /// is the one seed that needs both.
+        fn for_preset(preset: PropFirmPreset, risky_ladder: bool) -> Self {
             let constraints = PropFirmConstraints::for_preset(preset);
             let runtime = PropFirmRuntimeDefaults::for_preset(preset);
             Self {
@@ -3545,6 +3571,19 @@ mod load_seal {
                 total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
                 max_lot_size: runtime.max_lot_size,
                 max_trades_per_day: runtime.max_trades_per_day,
+                // Under a prop firm the ceiling is arithmetic, not taste. FX
+                // pairs correlate, so the honest worst case is every open
+                // position stopping out together — and then the day's loss IS
+                // the total open risk. A concurrent-risk budget above the daily
+                // stop can therefore breach the daily limit in a single move,
+                // which is the way a challenge is failed outright rather than
+                // slowly. Seeding it AT the daily stop makes the two limits say
+                // the same thing instead of contradicting each other.
+                max_portfolio_risk: if risky_ladder {
+                    RISKY_PORTFOLIO_RISK_CAP
+                } else {
+                    runtime.daily_dd_stop_trading_pct
+                },
             }
         }
     }
@@ -3773,7 +3812,12 @@ mod load_seal {
         ///   is silently corrected in either direction.
         fn reconcile_preset(&mut self, preset_explicit: bool, explicit: &[&'static str]) {
             let preset = self.risk.preset;
-            let seeds = PresetSeeds::for_preset(preset);
+            // `resolved_config` collapses "risky" and "growth" onto the same
+            // ladder; this must agree with it or the cap and the ranking would
+            // describe two different runs.
+            let risky_ladder =
+                matches!(self.system.trading_mode.as_str(), "risky" | "growth");
+            let seeds = PresetSeeds::for_preset(preset, risky_ladder);
             let name = preset.as_str();
 
             let is_explicit = |path: &str| explicit.iter().any(|p| *p == path);
@@ -3825,6 +3869,43 @@ mod load_seal {
                 true,
             ) {
                 self.risk.max_trades_per_day = v.max(0.0).round() as usize;
+            }
+
+            // `max_portfolio_risk: 0.0` is not a decision, it is the field's own
+            // empty value. Every other seeded limit here reads "at most this
+            // much"; on this one a zero was read as "no ceiling", so the
+            // loosest possible setting and the unset state were spelled the
+            // same way. That is the disguise, not a preference, and it is why
+            // it is re-seeded rather than honoured — a money cap must not be
+            // removable by leaving a field alone. An operator who genuinely
+            // wants no ceiling says 1.0, which is representable, readable, and
+            // cannot be arrived at by accident.
+            if self.risk.max_portfolio_risk <= 0.0 {
+                let seed = seeds.max_portfolio_risk;
+                let was = self.risk.max_portfolio_risk;
+                let explicit = is_explicit("risk.max_portfolio_risk");
+                say_once(format!("portfolio-cap-sentinel:{name}"), move || {
+                    tracing::warn!(
+                        target: "neoethos_core::config",
+                        key = "risk.max_portfolio_risk",
+                        preset = name,
+                        old = was,
+                        new = seed,
+                        set_in_file = explicit,
+                        "NO PORTFOLIO CAP: a knob named max_ was {was}, which this code read as \
+                         UNLIMITED concurrent risk rather than as a limit. Re-seeded from the \
+                         selected preset and trading mode. To run with no ceiling, say so with \
+                         1.0 — a zero cannot mean it."
+                    );
+                });
+                self.risk.max_portfolio_risk = seed;
+            } else if let Some(v) = fix(
+                "risk.max_portfolio_risk",
+                self.risk.max_portfolio_risk,
+                seeds.max_portfolio_risk,
+                true,
+            ) {
+                self.risk.max_portfolio_risk = v;
             }
 
             // The `risk.prop_firm_rules` re-derivation block was DELETED here

@@ -223,8 +223,10 @@ What that file says, against the code as it stands today:
 code, and the two settings that matter most on his own disk — the payoff floor and the
 portfolio risk cap — were both switched off in the file the code reads.** Collapsing the
 store was the cheapest money action available, and it is DONE (2026-08-10): the payoff
-floor now inherits 2.0 and `max_portfolio_risk` is written explicitly at 0.34, because on
-that knob 0.0 is the DEFAULT too and means NO CAP AT ALL.
+floor now inherits 2.0, and `max_portfolio_risk` is SEEDED from the preset and the trading
+mode — 0.040 for this ftmo/prop_firm store — because on that knob 0.0 was the DEFAULT too
+and means NO CAP AT ALL. A first pass wrote 0.34 there, which is the risky ladder's number
+and 8.5x FTMO's daily stop; that is fixed and locked by `portfolio_cap_follows_the_mode.rs`.
 
 ---
 
