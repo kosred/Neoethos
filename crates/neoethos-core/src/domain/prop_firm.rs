@@ -182,6 +182,63 @@ impl PropFirmConstraints {
             PropFirmPreset::None => Self::NONE_OWN_MONEY,
         }
     }
+
+    /// How far short of the firm's published overall-drawdown ceiling the
+    /// internal breaker arms, as a fraction of it.
+    ///
+    /// Audit #269. This lived as a private `TOTAL_DRAWDOWN_BUFFER` in
+    /// `neoethos-app/src/server/risk.rs:46` AND as a bare `0.7` literal in
+    /// `config.rs`, and the two writers they belonged to disagreed for months:
+    /// `RiskConfig::default()` seeded the BUFFERED value while the preset
+    /// endpoint wrote the firm's RAW ceiling. Two spellings of one number is
+    /// how that survived review. There is now one.
+    pub const TOTAL_DRAWDOWN_BUFFER: f64 = 0.7;
+
+    /// The internal total-drawdown breaker for this preset.
+    ///
+    /// Audit #214. The widening happens HERE and nowhere else, and the result
+    /// is rounded back to the decimal the published rule is written in.
+    /// `max_overall_drawdown_pct` is an `f32`, so `(0.10_f32 as f64) * 0.7` is
+    /// `0.07000000104308128` — and that is the number that ended up in the
+    /// operator's own `config.yaml`, because `Settings` persists what `Default`
+    /// computed. A limit he did not type, in a file he reads, is a number
+    /// chosen by a cast. Rounding to SIX places leaves `0.07` / `0.14` on disk.
+    ///
+    /// Nine places was the first attempt and it did NOT work: the artifact
+    /// itself lives at the ninth decimal (`0.07000000104308128` rounds to
+    /// `0.070000001`, not `0.07`), so the operator still read a number he did
+    /// not type. `f32` carries ~7 significant decimal digits, so the widening
+    /// residue on a value of this magnitude is ~1e-9 — an order finer than the
+    /// 1e-6 grid below. Every published ceiling this crate carries (0.06, 0.10,
+    /// 0.12, 0.20) lands on at most three decimals after the 0.7 buffer
+    /// (0.042, 0.07, 0.084, 0.14), so 1e-6 cannot round a real rule away.
+    pub fn buffered_total_drawdown_limit(&self) -> f64 {
+        round_to_six_places((self.max_overall_drawdown_pct as f64) * Self::TOTAL_DRAWDOWN_BUFFER)
+    }
+
+    /// The monthly net-profit floor this preset publishes, widened once.
+    ///
+    /// Same `f32` cast, same fingerprint: FTMO's 4% arrived on disk as
+    /// `0.03999999910593033`.
+    pub fn monthly_profit_target(&self) -> f64 {
+        round_to_six_places(self.min_monthly_net_profit_pct as f64)
+    }
+}
+
+/// Strip the `f32`→`f64` widening artifact without pretending to more
+/// precision than a published percentage has.
+///
+/// Deliberately NOT a general-purpose rounding helper: it exists for the two
+/// call sites above, where the input is a decimal percentage stored as `f32`.
+/// The grid is 1e-6 because a coarser one could round a published rule away and
+/// a finer one does not strip the artifact at all — see
+/// `buffered_total_drawdown_limit`.
+fn round_to_six_places(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    const SCALE: f64 = 1_000_000.0;
+    (value * SCALE).round() / SCALE
 }
 
 /// Local operating defaults for challenge-cycle planning.
@@ -525,5 +582,45 @@ mod tests {
         assert!(phase_2.min_confidence_threshold > funded.min_confidence_threshold);
         assert!(funded.max_trades_per_day >= phase_1.max_trades_per_day);
         assert_eq!(funded.daily_profit_lock_pct, 0.0);
+    }
+
+    /// Audit #214. The number the operator READS in his own config.yaml must be
+    /// the number the rule is written in — not the `f32` cast's residue.
+    #[test]
+    fn the_buffered_ceilings_carry_no_f32_widening_fingerprint() {
+        // FTMO publishes 10% overall; 70% of it is 7%, not 7.000000104308128%.
+        let ftmo = PropFirmConstraints::FTMO_STANDARD;
+        assert_eq!(ftmo.buffered_total_drawdown_limit(), 0.07);
+        assert_eq!(ftmo.monthly_profit_target(), 0.04);
+        // Own money publishes 20%; 70% of it is 14%, which is what the repo
+        // profile carries.
+        assert_eq!(
+            PropFirmConstraints::NONE_OWN_MONEY.buffered_total_drawdown_limit(),
+            0.14
+        );
+        // The buffer itself is still the buffer — rounding must not have
+        // quietly become a different policy.
+        assert_eq!(PropFirmConstraints::TOTAL_DRAWDOWN_BUFFER, 0.7);
+    }
+
+    /// Every preset, not just the two spot-checked above: a buffered ceiling is
+    /// always SHORT of the published one, never at or above it.
+    #[test]
+    fn every_presets_breaker_arms_short_of_the_published_ceiling() {
+        for preset in [
+            PropFirmPreset::Ftmo,
+            PropFirmPreset::MyForexFunds,
+            PropFirmPreset::FundedNext,
+            PropFirmPreset::The5ers,
+            PropFirmPreset::None,
+        ] {
+            let c = PropFirmConstraints::for_preset(preset);
+            let buffered = c.buffered_total_drawdown_limit();
+            assert!(
+                buffered > 0.0 && buffered < c.max_overall_drawdown_pct as f64,
+                "{preset:?}: buffered {buffered} is not short of {}",
+                c.max_overall_drawdown_pct
+            );
+        }
     }
 }

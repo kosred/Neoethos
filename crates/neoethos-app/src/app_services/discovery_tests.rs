@@ -73,6 +73,7 @@ fn success_snapshot_carries_candidate_and_portfolio_counters() {
     };
 
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![best.clone(), second],
         candidates: vec![best, Gene::default(), Gene::default()],
         quality_metrics: Vec::new(),
@@ -199,6 +200,7 @@ fn success_snapshot_emits_best_oos_sharpe_from_forward_test_artifacts() {
     ];
 
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![best.clone()],
         candidates: vec![best],
         quality_metrics: Vec::new(),
@@ -249,6 +251,7 @@ fn success_snapshot_omits_best_oos_sharpe_when_forward_test_artifacts_empty() {
         ..Gene::default()
     };
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![best.clone()],
         candidates: vec![best],
         quality_metrics: Vec::new(),

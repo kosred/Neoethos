@@ -1,5 +1,6 @@
 //! POST /orders — submit a Market order to the broker.
 //! POST /orders/pending — place a resting limit/stop order.
+//! POST /orders/amend — modify a resting limit/stop order in place (#236).
 //!
 //! Money-critical. Server-side defence in depth, applied IDENTICALLY to both
 //! order-placing routes as of 2026-08-09 (#191 closed the asymmetry):
@@ -34,8 +35,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_api::{
-    OrderSide, amend_position_sltp_blocking, cancel_order_blocking, close_position_blocking,
-    fetch_account_runtime_blocking, submit_market_order_blocking, submit_pending_order_blocking,
+    OrderSide, amend_order_blocking, amend_position_sltp_blocking, cancel_order_blocking,
+    close_position_blocking, fetch_account_runtime_blocking, submit_market_order_blocking,
+    submit_pending_order_blocking,
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
 use crate::app_services::ctrader_messages::CTraderOrderType;
@@ -136,9 +138,16 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "stopLossPips is required because risk.require_stop_loss is ON \
-                          in Settings. risky:true does not override it. Set a stop-loss, \
-                          or turn 'Require Stop-Loss on every order' off in Settings.",
+                // The refusal names WHERE the setting lives. It used to say
+                // "turn it off in Settings", and there is no such control on
+                // the Settings screen — sending an operator to look for a
+                // switch that does not exist, mid-rejection, is the same
+                // disguise as a silent fallback (Settings.tsx:436 already says
+                // the truth; this string did not).
+                "error": "stopLossPips is required because risk.require_stop_loss is ON. \
+                          risky:true does not override it. Set a stop-loss, or turn the \
+                          setting off at risk.require_stop_loss under Advanced -> raw \
+                          config.yaml — there is no switch for it on the Settings screen.",
             })),
         )
             .into_response();
@@ -260,9 +269,16 @@ pub async fn place_pending(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "stopLossPips is required because risk.require_stop_loss is ON \
-                          in Settings. risky:true does not override it. Set a stop-loss, \
-                          or turn 'Require Stop-Loss on every order' off in Settings.",
+                // The refusal names WHERE the setting lives. It used to say
+                // "turn it off in Settings", and there is no such control on
+                // the Settings screen — sending an operator to look for a
+                // switch that does not exist, mid-rejection, is the same
+                // disguise as a silent fallback (Settings.tsx:436 already says
+                // the truth; this string did not).
+                "error": "stopLossPips is required because risk.require_stop_loss is ON. \
+                          risky:true does not override it. Set a stop-loss, or turn the \
+                          setting off at risk.require_stop_loss under Advanced -> raw \
+                          config.yaml — there is no switch for it on the Settings screen.",
             })),
         )
             .into_response();
@@ -505,6 +521,134 @@ pub async fn cancel_order(
     }
     let order_id = body.order_id;
     let result = tokio::task::spawn_blocking(move || cancel_order_blocking(order_id)).await;
+    outcome_to_response(result)
+}
+
+// ─── POST /orders/amend (modify a RESTING order) ───────────────────────────
+
+/// Wire DTO for `POST /orders/amend` — audit #236.
+///
+/// Every optional field means LEAVE UNCHANGED, which is the cTrader proto's own
+/// contract. `symbol` and `orderType` are required because the conversions need
+/// them: lots→wire volume needs the symbol's lot size, pips→relative units needs
+/// its pip size, and the trigger price goes to `limitPrice` or `stopPrice`
+/// depending on the order's own type.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AmendOrderBody {
+    #[serde(rename = "orderId")]
+    pub order_id: i64,
+    /// The resting order's symbol, e.g. `EURUSD`.
+    pub symbol: String,
+    /// `limit` or `stop` — the order's OWN type. cTrader rejects a limit price
+    /// on a stop order, so this is not inferable and must be stated.
+    #[serde(rename = "orderType")]
+    pub order_type: String,
+    #[serde(rename = "volumeLots")]
+    pub volume_lots: Option<f64>,
+    /// New activation price. Deliberately not floored at zero — commodity
+    /// prices can be negative and XTIUSD / XBRUSD are watchlisted.
+    #[serde(rename = "triggerPrice")]
+    pub trigger_price: Option<f64>,
+    #[serde(rename = "stopLossPips")]
+    pub stop_loss_pips: Option<f64>,
+    #[serde(rename = "takeProfitPips")]
+    pub take_profit_pips: Option<f64>,
+    #[serde(rename = "expiryUnixMs")]
+    pub expiry_unix_ms: Option<i64>,
+}
+
+/// Modify a resting limit/stop order in place — the capability the UI never had
+/// (audit #236). Before this the only way to change a trigger price was cancel +
+/// re-place, which leaves the operator's level unguarded in between.
+///
+/// Size is NOT clamped here, for the same reason it is not clamped on the two
+/// placement routes: the manual path respects the operator, and
+/// `risk.max_lot_size` is the autopilot's cap. The broker still enforces its own
+/// min/max/step volume and its rejection is surfaced verbatim.
+pub async fn amend_order(
+    State(_state): State<AppApiState>,
+    Json(body): Json<AmendOrderBody>,
+) -> Response {
+    if body.order_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "orderId must be positive"})),
+        )
+            .into_response();
+    }
+    let symbol = body.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "symbol is required — the amend converts lots and pips with this \
+                          symbol's lot size and pip size",
+            })),
+        )
+            .into_response();
+    }
+    let order_type = match body.order_type.trim().to_ascii_lowercase().as_str() {
+        "limit" => CTraderOrderType::Limit,
+        "stop" => CTraderOrderType::Stop,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "orderType must be `limit` or `stop` (got `{other}`). Only resting \
+                         orders can be amended; a filled position's brackets are changed with \
+                         POST /positions/protection."
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Refuse the nonsense values before a socket is opened, with the same rules
+    // the placement routes apply: lots and pip DISTANCES are positive numbers.
+    for (name, value) in [
+        ("volumeLots", body.volume_lots),
+        ("stopLossPips", body.stop_loss_pips),
+        ("takeProfitPips", body.take_profit_pips),
+    ] {
+        if let Some(v) = value {
+            if !v.is_finite() || v <= 0.0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("{name} must be a finite positive number when set (got {v})"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let AmendOrderBody {
+        order_id,
+        volume_lots,
+        trigger_price,
+        stop_loss_pips,
+        take_profit_pips,
+        expiry_unix_ms,
+        ..
+    } = body;
+    let result = tokio::task::spawn_blocking(move || {
+        amend_order_blocking(
+            order_id,
+            &symbol,
+            order_type,
+            volume_lots,
+            trigger_price,
+            stop_loss_pips,
+            take_profit_pips,
+            expiry_unix_ms,
+            // The operator's own amend, so no admission decision to honour —
+            // identical to the manual placement and cancel routes.
+            None,
+        )
+    })
+    .await;
     outcome_to_response(result)
 }
 

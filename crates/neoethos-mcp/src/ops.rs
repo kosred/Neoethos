@@ -569,6 +569,9 @@ impl Backend {
         if let Some(base_tf) = p.base_tf {
             body["base_tf"] = json!(base_tf);
         }
+        if let Some(portfolio_path) = p.portfolio_path {
+            body["portfolio_path"] = json!(portfolio_path);
+        }
         self.post_json("/autonomous/replay", &body).await
     }
 
@@ -767,6 +770,12 @@ impl Backend {
         if let Some(v) = p.live_ml_gate {
             body["liveMlGate"] = json!(v);
         }
+        if let Some(v) = p.blend_gate_floor {
+            body["blendGateFloor"] = json!(v);
+        }
+        if let Some(v) = p.blend_veto_below {
+            body["blendVetoBelow"] = json!(v);
+        }
         if let Some(v) = p.risky_start_balance {
             body["riskyStartBalance"] = json!(v);
         }
@@ -801,9 +810,14 @@ impl Backend {
     }
 
     pub async fn op_knob_catalog(&self) -> Result<Value, ToolError> {
+        // ONE source: the knob catalog. `GET /settings/presets` was deleted with
+        // the safety-posture vocabulary it served (#115/#116) — while it lingered
+        // as a 501 stub this function returned an error for EVERY call, because a
+        // 501 is an `Err` in `Backend::read_response`, so the whole tool was dead.
+        // Prop-firm presets are applied through `apply_risk_preset` (POST
+        // /risk/preset) and reported by `get_risk`.
         let catalog = self.get_json("/settings/knob-catalog", &[]).await?;
-        let presets = self.get_json("/settings/presets", &[]).await?;
-        Ok(json!({ "knobCatalog": catalog, "presets": presets }))
+        Ok(json!({ "knobCatalog": catalog }))
     }
 
     pub async fn op_get_risk(&self) -> Result<Value, ToolError> {

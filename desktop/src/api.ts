@@ -551,6 +551,24 @@ export const placePendingOrder = (body: {
   comment?: string | null;
 }) => apiPost<ExecResult>("/orders/pending", body);
 export const cancelOrder = (orderId: number) => apiPost<ExecResult>("/orders/cancel", { orderId });
+/**
+ * Modify a RESTING limit/stop order in place (audit #236).
+ *
+ * Every optional field means LEAVE UNCHANGED. `symbol` and `orderType` are
+ * required: the server converts lots with the symbol's lot size and pips with
+ * its pip size, and the trigger price goes to limitPrice or stopPrice according
+ * to the order's own type.
+ */
+export const amendOrder = (body: {
+  orderId: number;
+  symbol: string;
+  orderType: "limit" | "stop";
+  volumeLots?: number | null;
+  triggerPrice?: number | null;
+  stopLossPips?: number | null;
+  takeProfitPips?: number | null;
+  expiryUnixMs?: number | null;
+}) => apiPost<ExecResult>("/orders/amend", body);
 
 // ── Advanced settings / diagnostics / data import ─────────────────────────
 // ── Chart scroll-back ─────────────────────────────────────────────────────

@@ -264,20 +264,24 @@ pub struct BacktestMetrics {
     pub max_daily_drawdown: f64,
 }
 
-/// **Index-7 slot — F-001 (2026-05-25) + repurposed by scoring_version 3 (2026-06-06).**
+/// **Index-7 slot = `monthly_target_hit_rate`** (scoring_version 3, 2026-06-06).
 ///
-/// Originally (F-001) a *deliberately reserved* slot kept at 0.0: an earlier revision
-/// used it for `average_trade_pnl`; that was dropped but the `[f64; 11]` shape was kept
-/// so the GPU kernel's per-gene output stride (11 floats/gene) stayed intact.
+/// History, so the name is never mistaken for "spare room": under F-001 (2026-05-25)
+/// this slot was *reserved* and pinned to 0.0 — an earlier revision used it for
+/// `average_trade_pnl`, which was dropped while the `[f64; 11]` shape was kept so the
+/// GPU kernel's per-gene output stride (11 floats/gene) stayed intact.
 ///
-/// **scoring_version 3:** the RAW output of [`fast_evaluate_strategy_core`] now carries
+/// It is no longer reserved. The RAW output of [`fast_evaluate_strategy_core`] carries
 /// `monthly_target_hit_rate` (fraction of months hitting the operator's >=4% bar) in
-/// slot 7 — the consistency signal [`crate::scoring::ga_fitness`] optimises toward.
-/// This is SAFE because the GA fitness reads the raw eval array directly (see
-/// `genetic::evolution_math::apply_metrics`), and the CPU eval is the only producer
-/// (the GPU lane is disabled: `PHASE1_GPU_SIZING_PORTED = false`). When the GPU kernel
-/// is re-enabled it MUST also write this rate into slot 7 (parity), alongside porting
-/// risk-based sizing.
+/// slot 7 — the consistency signal [`crate::scoring::ga_fitness`] optimises toward, and
+/// its dominant term. The GA fitness reads the raw eval array directly (see
+/// `genetic::evolution_math::apply_metrics`).
+///
+/// BOTH producers write it: the CPU eval (`fast_evaluate_strategy_core`, this file) and
+/// the GPU lane, which is ENABLED (`PHASE1_GPU_SIZING_PORTED = true`, this file) —
+/// cubecl (`cubecl_eval.rs`), prototype B (`prototype_b_population.cu` → `values[7]`)
+/// and prototype C (`prototype_c_engine/device.rs` → `metric_base + 7`). Any new
+/// producer MUST write this slot or the dominant reward silently reads 0.0.
 ///
 /// The [`BacktestMetrics`] STRUCT does not model this field, so [`BacktestMetrics::
 /// from_metric_array`] ignores slot 7 and [`BacktestMetrics::to_metric_array`] writes
@@ -285,18 +289,18 @@ pub struct BacktestMetrics {
 /// the GA fitness, so the divergence is intentional and contained. Code that hand-rolls
 /// a `[f64; 11]` to feed `ga_fitness` must set slot 7 to the hit-rate (0.0 disables the
 /// dominant consistency reward).
-pub const BACKTEST_METRICS_RESERVED_INDEX_7: usize = 7;
+pub const BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX: usize = 7;
 
 impl BacktestMetrics {
-    /// Index of the deliberately-reserved slot in the array form. See
-    /// [`BACKTEST_METRICS_RESERVED_INDEX_7`] for history.
-    pub const RESERVED_INDEX_7: usize = BACKTEST_METRICS_RESERVED_INDEX_7;
+    /// Index of `monthly_target_hit_rate` in the array form. See
+    /// [`BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX`] for history and producers.
+    pub const MONTHLY_TARGET_HIT_RATE_INDEX: usize =
+        BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX;
 
     pub fn from_metric_array(metrics: [f64; 11]) -> Self {
-        // metrics[7] is the reserved-slot (F-001 / 2026-05-25 doc fix).
-        // Old kernel revision used it for average_trade_pnl; that field
-        // was dropped but the array width was kept to preserve the GPU
-        // output stride. We do not read index 7 here.
+        // metrics[7] is monthly_target_hit_rate (see the const's doc). The STRUCT
+        // does not model it — it is a GA-fitness-only signal read straight off the
+        // raw array — so it is deliberately not read here.
         Self {
             net_profit: metrics[0],
             sharpe: metrics[1],
@@ -316,9 +320,10 @@ impl BacktestMetrics {
     }
 
     pub fn to_metric_array(self) -> [f64; 11] {
-        // Index 7 is the reserved slot (F-001 — see struct-level doc).
-        // Always 0.0 — DO NOT repurpose without updating every caller
-        // that hand-rolls a [f64; 11] expecting this slot to stay zero.
+        // Index 7 is monthly_target_hit_rate, which this STRUCT does not model,
+        // so the struct view writes 0.0 there. Feeding this array to ga_fitness
+        // therefore disables the dominant consistency reward — only the raw eval
+        // output (or a GPU metrics row) is valid fitness input.
         [
             self.net_profit,
             self.sharpe,
@@ -327,7 +332,8 @@ impl BacktestMetrics {
             self.win_rate,
             self.profit_factor,
             self.expectancy,
-            0.0, // F-001: reserved index 7 — see BACKTEST_METRICS_RESERVED_INDEX_7
+            0.0, // slot 7: monthly_target_hit_rate is not modelled by this struct
+                 // — see BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX
             self.trade_count as f64,
             self.consistency,
             self.max_daily_drawdown,
@@ -582,7 +588,58 @@ pub fn install_backtest_runtime_overrides_from_env() {
 /// evaluation happens.
 pub fn install_backtest_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
     crate::execution_profile::report_retired_env_vars();
-    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_settings(s));
+    let resolved = BacktestRuntimeOverrides::from_settings(s);
+    report_equity_denominator_disagreement(s, resolved.initial_equity);
+    let _ = BACKTEST_RUNTIME_OVERRIDES.set(resolved);
+}
+
+/// #265 — TWO starting balances, and this is the one the search ranks on.
+///
+/// `risk.initial_balance` is the operator's account. `models.backtest_runtime
+/// .initial_equity` is the denominator every percentage this search reports is
+/// computed against — net return %, max drawdown %, max daily loss %, and the
+/// slot-7 `monthly_target_hit_rate` bar of "4% of the month's starting equity".
+/// The shipped defaults are 10 000 and 100 000, so out of the box the search
+/// ranks candidates by percentages of a balance ten times the account, and
+/// nothing said so.
+///
+/// This does NOT reconcile them, deliberately. They are not obviously one
+/// concept — a funded prop-firm challenge really is a different balance from
+/// the operator's own account — and silently substituting one for the other
+/// would move every ranked percentage without anybody choosing it. What it does
+/// is make the disagreement impossible to run past unnoticed: both numbers, the
+/// ratio, and the list of metrics that depend on it, once per process, at the
+/// single point every production binary passes through before any evaluation.
+///
+/// Making them agree is a one-line config edit; the operator makes it.
+fn report_equity_denominator_disagreement(s: &neoethos_core::Settings, initial_equity: f64) {
+    let account = s.risk.initial_balance;
+    if !account.is_finite() || account <= 0.0 {
+        tracing::error!(
+            target: "neoethos_search::cost_model",
+            configured_account_balance = account,
+            search_initial_equity = initial_equity,
+            "risk.initial_balance is not a usable balance, so it cannot be compared with the \
+             search's equity denominator. Every percentage this run ranks on is computed \
+             against models.backtest_runtime.initial_equity"
+        );
+        return;
+    }
+    if (account - initial_equity).abs() <= f64::EPSILON * account.abs().max(1.0) {
+        return;
+    }
+    tracing::warn!(
+        target: "neoethos_search::cost_model",
+        account_balance = account,
+        search_initial_equity = initial_equity,
+        ratio = initial_equity / account,
+        "TWO STARTING BALANCES (#265). risk.initial_balance is your account; \
+         models.backtest_runtime.initial_equity is what THIS SEARCH divides by. Net return %, \
+         max drawdown %, max daily loss % and the slot-7 monthly-target hit rate (>=4% of the \
+         month's starting equity) are all measured against the SECOND number, so a candidate \
+         ranked here is ranked against a balance that is not the one you trade. Set them equal \
+         in config.yaml if that is not what you want — nothing here changes either value"
+    );
 }
 
 /// Returns the currently installed backtest runtime overrides, or the
@@ -863,7 +920,7 @@ pub fn fast_evaluate_strategy_core(
     let mut month_ptr = -1i64;
     // Parallel to `monthly_pnls`: equity at the START of each completed month, so we
     // can compute each month's RETURN % (pnl / month-start-equity) for the
-    // monthly_target_hit_rate metric (reserved slot 7). Compounding makes total net a
+    // monthly_target_hit_rate metric (slot 7). Compounding makes total net a
     // poor consistency signal; per-month return % is scale-invariant.
     let mut month_start_equities = vec![initial_equity; month_capacity];
     let mut current_month_start_equity = initial_equity;
@@ -1299,7 +1356,7 @@ pub fn fast_evaluate_strategy_core(
         0.0
     };
 
-    // monthly_target_hit_rate (reserved slot 7, scoring_version 3, 2026-06-06):
+    // monthly_target_hit_rate (slot 7, scoring_version 3, 2026-06-06):
     // the fraction of COMPLETE months whose return >= MONTHLY_RETURN_TARGET of that
     // month's STARTING equity. This is the CONSISTENT-monthly-return signal the GA
     // now optimises toward (ga_fitness reads metrics[7]) — it matches the prop-firm
@@ -1307,9 +1364,12 @@ pub fn fast_evaluate_strategy_core(
     // `consistency`/`sharpe` (= monthly mean/std, which a few big months inflate).
     // 0.04 = the operator's >=4%/month bar. Months with no trades count as misses
     // (a strategy that sits out a month did NOT hit the bar) — same spirit as the gate.
-    // GPU PARITY (Phase 2): when the cubecl kernel ports risk-based sizing it MUST
-    // also fill slot 7 with this rate, else GPU-evaluated genes score fitness with
-    // monthly_hit=0. The GPU lane is currently disabled (PHASE1_GPU_SIZING_PORTED).
+    // GPU PARITY: the GPU lane is ENABLED (`PHASE1_GPU_SIZING_PORTED = true`, this
+    // file) and every device producer fills slot 7 with this same rate — cubecl
+    // (`cubecl_eval.rs`), prototype B (`prototype_b_population.cu` values[7]),
+    // prototype C (`prototype_c_engine/device.rs` metric_base + 7). A producer that
+    // omits it scores GPU-evaluated genes with monthly_hit = 0, i.e. with the
+    // dominant fitness term switched off.
     const MONTHLY_RETURN_TARGET: f64 = 0.04;
     let monthly_target_hit_rate = if month_ptr >= 0 {
         // SECOND silent drop site (2026-08-10): this `.min()` is what actually
@@ -1387,7 +1447,7 @@ pub fn fast_evaluate_strategy_core(
         sanitize(win_rate),
         sanitize(pf),
         sanitize(expectancy),
-        sanitize(monthly_target_hit_rate), // slot 7: was reserved 0.0 — now the consistent-monthly-return signal (scoring_version 3)
+        sanitize(monthly_target_hit_rate), // slot 7: the consistent-monthly-return signal (scoring_version 3)
         trade_count as f64,
         sanitize(consistency),
         sanitize(max_daily_dd),

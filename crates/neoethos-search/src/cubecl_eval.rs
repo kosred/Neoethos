@@ -3418,10 +3418,13 @@ fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool
 /// path keeps the genes×samples signal matrix on the GPU — eliminating the
 /// signal readback (measured 688ms on the A6000, vs a 0.09ms kernel) and the
 /// matching re-upload — so the win is largest on DENSE timeframes (M1/M5, the
-/// most bars) and discrete cards. Resolution order:
-///   1. explicit `NEOETHOS_GPU_FUSED_EVAL` (`1`/`true`/`on` or `0`/`false`/`off`)
-///      — operator override, wins in either direction, skips the probe;
-///   2. otherwise AUTO — run the byte-parity self-check on THIS machine's GPU and
+/// most bars) and discrete cards. Resolution order (there is NO operator
+/// override: the `NEOETHOS_GPU_FUSED_EVAL` env knob was DELETED 2026-08-10 —
+/// see `resolve_fused_eval_enabled`):
+///   1. native prototype B available → OFF (B owns population eval; standing up a
+///      cubecl VRAM pool would starve it — measured on a 3090);
+///   2. integrated / shared-memory GPU → OFF (the fused path OOMs there);
+///   3. otherwise AUTO — run the byte-parity self-check on THIS machine's GPU and
 ///      enable iff the fused path is bit-for-bit identical to the proven windowed
 ///      path. Any mismatch / error / panic keeps the windowed path (fail-safe;
 ///      parity is sacred on the real-money path).
@@ -3536,7 +3539,7 @@ fn resolve_fused_eval_enabled() -> bool {
     if installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0) {
         tracing::info!(
             target: "neoethos_search::cubecl_eval",
-            "fused VRAM-resident eval left OFF — integrated/shared-memory GPU detected (its device-local heap is too small for the VRAM-resident signal matrix; the fused path OOMs there). Using the proven windowed path, which the hybrid splitter demotes to the CPU if the GPU is slower. Force with NEOETHOS_GPU_FUSED_EVAL=1 to override."
+            "fused VRAM-resident eval left OFF — integrated/shared-memory GPU detected (its device-local heap is too small for the VRAM-resident signal matrix; the fused path OOMs there). Using the proven windowed path, which the hybrid splitter demotes to the CPU if the GPU is slower. There is no override — this is auto-detected from the device probe."
         );
         return false;
     }
@@ -3559,7 +3562,7 @@ fn resolve_fused_eval_enabled() -> bool {
         Ok(Ok(false)) => {
             tracing::warn!(
                 target: "neoethos_search::cubecl_eval",
-                "fused VRAM-resident eval left OFF — startup parity check did not match the windowed path bit-for-bit on this GPU; staying on the proven windowed path (fail-safe). Force with NEOETHOS_GPU_FUSED_EVAL=1 only if you have separately verified this card."
+                "fused VRAM-resident eval left OFF — startup parity check did not match the windowed path bit-for-bit on this GPU; staying on the proven windowed path (fail-safe). There is no override: a card whose fused path is not bit-identical must be fixed, not forced."
             );
             false
         }

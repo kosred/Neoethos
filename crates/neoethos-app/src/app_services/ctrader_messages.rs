@@ -192,7 +192,11 @@ pub const CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2176;
 //   build_subscribe_live_trendbar_request  (2135) - production polls bars via
 //   build_unsubscribe_live_trendbar_request(2136)   broker_api::fetch_recent_chart_bars_blocking
 // KEPT and still unbuilt on purpose (WIRE items, not dead ends):
-//   build_amend_order_request, build_unsubscribe_spots_request.
+//   build_unsubscribe_spots_request.
+// WIRED 2026-08-10 (#236): `build_amend_order_request` left that list. It now
+// has a production caller — `broker_api::amend_order_blocking`, reached from
+// `POST /orders/amend` and the Actions screen's Modify button — carried by the
+// new `CTraderExecutionRequest::AmendOrder` variant. Do NOT move it back.
 // WIRED 2026-08-09 (#238): `build_margin_call_list_request` is no longer on
 // that list. It now has a production caller —
 // `broker_api::fetch_margin_status_blocking`, polled by

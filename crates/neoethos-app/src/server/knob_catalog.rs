@@ -207,6 +207,24 @@ fn build_catalog() -> Vec<KnobEntry> {
     let cost = &strat_overrides.cost_profile;
     let smc = &ga_overrides.smc_gate;
 
+    // The live-blend multipliers have no runtime-override cache to read from —
+    // they are plain `Settings` fields consulted at engine start
+    // (`live_trading::operator_blend_gate_floor` / `_veto_below`). Read the
+    // operator's store once; an unreadable config falls back to the compiled
+    // defaults, which is exactly what the engine would use, so the catalog
+    // cannot show a number the run would not use.
+    let models = neoethos_core::Settings::from_yaml(super::state::current_config_path())
+        .map(|s| s.models)
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                target: "neoethos_app::knob_catalog",
+                error = %err,
+                "could not read the config for the knob catalog — showing the compiled \
+                 defaults, which is what a run with an unreadable config would also use"
+            );
+            neoethos_core::config::ModelsConfig::default()
+        });
+
     vec![
         // ── Section 1 — Broker connectivity ──────────────────────────────
         KnobEntry {
@@ -386,6 +404,32 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_conservative: "true",
             preset_balanced: "false",
             preset_aggressive: "false",
+        },
+        KnobEntry {
+            id: "models.blend_gate_floor",
+            section: "Risk & PnL safety",
+            label: "Live blend floor (how small ML may shrink a gene entry)",
+            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            default: "0.34",
+            current: format!("{}", models.blend_gate_floor),
+            help_short: "Smallest fraction of its size a validated gene entry may be shrunk to by a lukewarm ensemble.",
+            help_long: "Only applies while `models.live_ml_gate` is ON. The genes ALWAYS pick the direction; ML can only shrink size. This floor is what stops a lukewarm model from gating a validated gene edge to nothing — at 0.34 a bar the ensemble is unsure about still trades at a third of its size. Raise it to give ML less authority over sizing, lower it to give ML more. **2026-08-10 (#232): this was a hardcoded literal in the live sizing path with no config recipient — the value shown here is now the one the engine reads.** An out-of-range, non-finite, or inverted pair (floor below the veto) is REFUSED back to these defaults by `BlendConfig::from_config_values` and logged with both numbers, so a bad value cannot silently change a live position size.",
+            preset_conservative: "0.50",
+            preset_balanced: "0.34",
+            preset_aggressive: "0.20",
+        },
+        KnobEntry {
+            id: "models.blend_veto_below",
+            section: "Risk & PnL safety",
+            label: "Live blend veto (skip the bar below this multiplier)",
+            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            default: "0.15",
+            current: format!("{}", models.blend_veto_below),
+            help_short: "Effective multiplier below which the live blend SKIPS the bar instead of sizing it to the floor.",
+            help_long: "Without this, a bar the ensemble almost fully rejects would still open at the minimum lot the sizing floor allows. Must be <= the blend floor, or every floored bar would be vetoed — that pair is refused back to the shipped defaults, loudly. Raise it to skip more marginal bars; lower it to take them small. Only applies while `models.live_ml_gate` is ON.",
+            preset_conservative: "0.25",
+            preset_balanced: "0.15",
+            preset_aggressive: "0.05",
         },
         KnobEntry {
             id: "risk.reject_pip_fallback",
@@ -1000,96 +1044,33 @@ pub async fn get_knob_catalog(State(_state): State<AppApiState>) -> Response {
     Json(response).into_response()
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresetSummary {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresetsResponse {
-    pub presets: Vec<PresetSummary>,
-}
-
-/// `GET /settings/presets` — **withdrawn 2026-08-09 (#115 / #116). Returns 501
-/// with an empty list and the reason.**
-///
-/// ## What this used to be, and why it is gone
-///
-/// It returned three safety-posture presets — Conservative / Balanced /
-/// Aggressive — each with a description promising a specific bundle:
-/// *"0.5% risk/trade, strict SMC gate, tight PnL circuit breaker, fewer cTrader
-/// retries … Risky Mode disabled."*
-///
-/// **Nothing in the product could apply any of them.** Verified across
-/// `crates/`, `desktop/src`, `desktop/src-tauri/src`, `mesh/` and `mcp/`: there
-/// was no `POST` counterpart, no apply function, and no client. The only preset
-/// writer in the backend is `server::risk::update_preset`, which parses a
-/// completely different vocabulary (`ftmo | myforexfunds | fundednext | the5ers
-/// | none`) and rejects every id above with `unknown_preset`. The desktop
-/// Settings screen already carries a comment saying exactly that
-/// (`desktop/src/screens/Settings.tsx:37-39`) and deliberately calls
-/// `/risk/preset` instead.
-///
-/// Two disjoint preset vocabularies, one of them inert, is how #213/#214
-/// happened: the operator reasonably believed a posture existed that would set
-/// his risk knobs for him, so nobody checked what the ONE working preset path
-/// actually wrote into the drawdown breakers.
-///
-/// ## Why 501 and not a silent deletion
-///
-/// The route is registered in `server/mod.rs:232`, which this change does not
-/// own. Returning `501 Not Implemented` with a machine-readable code keeps the
-/// route compiling while making the absence explicit to every client, instead
-/// of handing back three plausible-looking objects that do nothing.
-///
-/// ## What restoring it would require (do not restore it partially)
-///
-/// A real apply path must write EVERY knob its description promises, or the
-/// description is a new lie in place of the old one. Of the five things the
-/// text above promised, only two have a `Settings` field with a live consumer
-/// today — `risk.risk_per_trade` and `risk.require_stop_loss`. "Strict SMC
-/// gate", "PnL circuit breaker" and "fewer cTrader retries" resolve to search
-/// runtime overrides and cTrader knobs with no single Settings recipient, and
-/// "Risky Mode disabled" is `system.trading_mode` plus the §6.4 acknowledgement.
-/// Wiring three of five and shipping the same description is the defect, not the
-/// fix. The per-knob `presetConservative` / `presetBalanced` / `presetAggressive`
-/// strings on every [`KnobEntry`] survive as ADVISORY values — a UI may render
-/// them as "recommended", never as a control that sets anything.
-pub async fn get_presets(State(_state): State<AppApiState>) -> Response {
-    tracing::warn!(
-        target: "neoethos_app::server::knob_catalog",
-        "GET /settings/presets called — this endpoint is withdrawn (#115/#116): the \
-         safety-posture presets it used to advertise had no apply path anywhere in the \
-         product. Use POST /risk/preset (ftmo|myforexfunds|fundednext|the5ers|none) for \
-         prop-firm presets, or set individual knobs via POST /settings."
-    );
-    let response = PresetsResponse {
-        // Empty on purpose. A client that iterates this list now renders
-        // nothing, which is the truth, instead of three switches that do
-        // nothing, which is worse than nothing.
-        presets: Vec::new(),
-    };
-    (
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "presets": response.presets,
-            "code": "safety_presets_withdrawn",
-            "error": "Safety-posture presets (conservative/balanced/aggressive) were \
-                      advertised by this endpoint but no code in the product could apply \
-                      them. They have been withdrawn rather than left as controls that do \
-                      nothing.",
-            "useInstead": {
-                "propFirmPresets": "POST /risk/preset — ftmo | myforexfunds | fundednext | the5ers | none",
-                "individualKnobs": "POST /settings, or Settings -> Advanced -> raw YAML",
-            },
-        })),
-    )
-        .into_response()
-}
+// GET /settings/presets — DELETED 2026-08-10 (#115 / #116).
+//
+// It served three safety-posture presets (Conservative / Balanced /
+// Aggressive), each with a description promising a bundle of knobs — "0.5%
+// risk/trade, strict SMC gate, tight PnL circuit breaker, fewer cTrader
+// retries ... Risky Mode disabled". NOTHING in the product could apply any of
+// them: no POST counterpart, no apply function, no client, in `crates/`,
+// `desktop/src`, `desktop/src-tauri/src`, `mesh/` or `mcp/`.
+//
+// THE DECISION (#116): there is ONE preset vocabulary and it is the prop-firm
+// one — `POST /risk/preset` (ftmo | myforexfunds | fundednext | the5ers |
+// none), `server::risk::update_preset`. Two disjoint vocabularies, one of them
+// inert, is how #213/#214 happened: the operator believed a posture existed
+// that would set his risk knobs, so nobody checked what the ONE working preset
+// path actually wrote into the drawdown breakers.
+//
+// The 2026-08-09 pass left the route registered returning 501 with an empty
+// list. That was worse than either option: `neoethos-mcp`'s `op_knob_catalog`
+// fetched it unconditionally, and a 501 is an Err in `Backend::read_response`,
+// so the whole `knob_catalog` MCP tool failed. Route, handler, `PresetsResponse`
+// and `PresetSummary` are now gone, along with that fetch.
+//
+// The per-knob `presetConservative` / `presetBalanced` / `presetAggressive`
+// strings on [`KnobEntry`] survive as ADVISORY values a UI may render as
+// "recommended". They are never a control that sets anything. Restoring an
+// apply path means writing EVERY knob a description promises — three of five is
+// a new lie in place of the old one.
 
 #[cfg(test)]
 mod tests {

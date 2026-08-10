@@ -2,10 +2,27 @@
 //! over on-disk history.
 //!
 //! Returns the SAME `EngineStats` the CLI `trader-replay` command prints, from
-//! the SAME `neoethos_trader::replay_symbol_from_dir` helper — so the two
-//! front-ends are byte-identical (the UI↔CLI parity mandate, applied to the
-//! trader from day one). ZERO broker calls: the engine runs the mock execution
-//! adapter over replayed bars.
+//! the SAME helpers: `neoethos_trader::replay_portfolio_from_dir` when a
+//! `portfolio_path` is given (the operator's REAL discovered genes) and
+//! `replay_symbol_from_dir` otherwise (a 3-bar momentum STUB that is not any
+//! strategy discovery produced — the response's `fidelity_warnings` say so).
+//! ZERO broker calls: the engine runs the mock execution adapter over replayed
+//! bars.
+//!
+//! ## What was false here until 2026-08-10 (#229)
+//!
+//! This header claimed byte-identical parity with the CLI while the route
+//! passed `EngineConfig::default()`: `ReplayCostModel::zero()` and the
+//! synthetic 10 000 balance. So the Replay button filled at the mark — no
+//! spread, no slippage, no commission — and reported percentage drawdown
+//! against a balance that was not the operator's, while the CLI charged his
+//! real broker costs from `risk.*`. It also had no portfolio option at all, so
+//! the button could only ever run the momentum stub.
+//!
+//! Both are fixed by calling what the CLI calls:
+//! `EngineConfig::for_replay_from_settings` (the ONE `Settings` -> config
+//! adapter) and `replay_portfolio_from_dir` for a supplied portfolio. Parity is
+//! now a property of the arguments, and both front-ends pass the same ones.
 //!
 //! Symbol/base resolve through the shared `SystemConfig` resolvers — exactly as
 //! `/engines/discovery/start` does — so an omitted field defaults from
@@ -27,6 +44,16 @@ use super::state::AppApiState;
 pub struct ReplayBody {
     pub symbol: Option<String>,
     pub base_tf: Option<String>,
+    /// Path to a `*.live_portfolio.json`. Supplied → the REAL discovered genes
+    /// are replayed (`replay_portfolio_from_dir`, the same call the CLI's
+    /// `trader-replay --portfolio` makes). Omitted → the momentum STUB, which
+    /// is not a strategy this product produced; the response says so in
+    /// `fidelity_warnings`.
+    ///
+    /// Added 2026-08-10 (#229): the route had no portfolio option, so the UI's
+    /// Replay button could only ever run the stub while the module header
+    /// claimed parity with a CLI that could run either.
+    pub portfolio_path: Option<String>,
 }
 
 pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBody>>) -> Response {
@@ -66,17 +93,36 @@ pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBo
         }
     };
 
+    // The operator's REAL balance and REAL costs (audit #224 / #70 / #229).
+    //
+    // This route used to pass `EngineConfig::default()`: a synthetic 10 000
+    // starting balance and `ReplayCostModel::zero()`, so every percentage the
+    // replay reported was against a balance that was not his, on fills that
+    // charged nothing — while `data_replay`'s header claimed this route and the
+    // CLI's `trader-replay` produce identical `EngineStats`. They now call the
+    // SAME adapter, so the two front-ends cannot report different numbers for
+    // the same history.
+    let engine_cfg =
+        neoethos_trader::EngineConfig::for_replay_from_settings(settings.as_ref(), &symbol);
+
     // The replay reads + crunches a whole history synchronously — keep it off the
     // async runtime's worker threads.
     let sym = symbol.clone();
     let base = base_tf.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        neoethos_trader::replay_symbol_from_dir(
-            &data_dir,
-            &sym,
-            &base,
-            neoethos_trader::EngineConfig::default(),
-        )
+    // #229 (2026-08-10): the portfolio option this route never had. With a
+    // `portfolio_path` the operator's REAL discovered genes are replayed through
+    // the same helper `trader-replay --portfolio` calls; without one the
+    // momentum STUB runs, and every way it differs from a discovered strategy
+    // comes back in `fidelity_warnings` (`data_replay::disclose`).
+    let portfolio = body
+        .portfolio_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let result = tokio::task::spawn_blocking(move || match portfolio {
+        Some(path) => neoethos_trader::replay_portfolio_from_dir(&data_dir, &path, engine_cfg),
+        None => neoethos_trader::replay_symbol_from_dir(&data_dir, &sym, &base, engine_cfg),
     })
     .await;
 
@@ -85,7 +131,8 @@ pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBo
         Ok(Err(err)) => actionable_error(
             StatusCode::BAD_REQUEST,
             "Replay failed — make sure the data folder has this symbol + base timeframe \
-             (run Data Bootstrap or import a file first).",
+             (run Data Bootstrap or import a file first), and that any portfolio_path you \
+             passed points at a readable *.live_portfolio.json.",
             &err,
         ),
         Err(join_err) => actionable_error(

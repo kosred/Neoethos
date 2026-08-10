@@ -60,9 +60,11 @@
 //! verified by hand against the code and written into [`NO_QUALIFIED_READER`]
 //! below with the site that fooled the old rule. Six of the ten are worse than
 //! merely unread: four are ASSIGNED by production code that then never reads
-//! them back, and four more (`risk.trailing_*`) are shadowed duplicates of the
+//! them back, and four more (`risk.trailing_*`) were shadowed duplicates of the
 //! `models.exit_policy` keys that actually drive the search — an operator
-//! tuning the trail in the section named "risk" moves nothing at all.
+//! tuning the trail in the section named "risk" moved nothing at all. Those four
+//! were DELETED on 2026-08-10 (#206) once live execution read
+//! `models.exit_policy`; they are listed here as history, not as open items.
 //!
 //! # 2026-08-10 — three more ways it credited the wrong receiver
 //!
@@ -95,8 +97,9 @@
 //!   2026-08-10) read knobs through fully qualified paths in order to PRINT
 //!   them. That is precisely the STORED shape above — validated, persisted,
 //!   displayed, then ignored — so counting those reads would have cleared
-//!   `risk.trailing_*` and `risk.challenge_mode`, whose ledger entries say in
-//!   as many words that the logger exists BECAUSE they reach nothing. Reads
+//!   `risk.trailing_*` and `risk.challenge_mode`, whose ledger entries said in
+//!   as many words that the logger existed BECAUSE they reached nothing (the
+//!   `risk.trailing_*` four were deleted outright on 2026-08-10, #206). Reads
 //!   inside the functions named in [`REPORTING_ONLY`] are recorded separately
 //!   and never satisfy a knob.
 //!
@@ -208,51 +211,17 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
          nobody noticed: changing the config moves nothing and looks like it worked. OWNER: \
          operator — it scales position size per signal confidence.",
     ),
-    // ─── the four trailing shadows. 2026-08-10 UPDATE: the disagreement is now
-    // NAMED IN THE LOG of every run — `resolve_and_log_duplicate_knobs`
-    // (neoethos-search/src/discovery.rs) prints the winner, the loser and all
-    // four value pairs once per run, WARN when they differ. That is the whole
-    // change; which copy wins is unaltered.
+    // ─── the four trailing shadows: DELETED 2026-08-10 (audit #206). ────────
     //
-    // ⚠ DELETION IS BLOCKED, AND THE ORDER MATTERS. Live execution
-    // (`live_trading.rs:1226-1272`) trails UNCONDITIONALLY with no config
-    // recipient of any kind. Deleting these four before live reads
-    // `models.exit_policy` converts a visibly-wrong value into an INVISIBLE
-    // HARDCODE on the path that spends real money — strictly worse than the
-    // defect being fixed. Wire live to `models.exit_policy` first; then delete.
-    // Tracked in `docs/pending-edits-forbidden-territory.md`.
-    (
-        "RiskConfig::trailing_enabled",
-        Inert::Unwired,
-        "SHADOWED DUPLICATE. The search's exit geometry comes from `models.exit_policy` \
-         (strategy_gene.rs `let exit = overrides.exit_policy`), added 2026-08-09 to replace \
-         the hardcode. `risk.trailing_enabled` reaches nothing; the reads that fooled the old \
-         guard are `BacktestSettings::trailing_enabled` in cubecl_eval.rs. The operator's live \
-         store sets THIS copy and carries no `models.exit_policy` block at all, so his \
-         hand-tuned numbers move nothing and the ExitPolicy Rust defaults are what run — \
-         which every run now says out loud. OWNER: operator — delete this key AFTER live \
-         trailing reads models.exit_policy, never before.",
-    ),
-    (
-        "RiskConfig::trailing_atr_multiplier",
-        Inert::Unwired,
-        "SHADOWED DUPLICATE of `models.exit_policy.trailing_stop_multiplier` — see \
-         `RiskConfig::trailing_enabled`. Despite the name it was never an ATR multiple: it is \
-         a multiple of the position's own stop distance. The rename is part of the migration \
-         and must be carried across, not dropped. OWNER: operator.",
-    ),
-    (
-        "RiskConfig::trailing_be_trigger_r",
-        Inert::Unwired,
-        "SHADOWED DUPLICATE of `models.exit_policy.trailing_be_trigger_r` — see \
-         `RiskConfig::trailing_enabled`. OWNER: operator.",
-    ),
-    (
-        "RiskConfig::trailing_min_lock_pips",
-        Inert::Unwired,
-        "SHADOWED DUPLICATE of `models.exit_policy.trailing_min_lock_pips` — see \
-         `RiskConfig::trailing_enabled`. OWNER: operator.",
-    ),
+    // `RiskConfig::trailing_enabled` / `trailing_atr_multiplier` /
+    // `trailing_be_trigger_r` / `trailing_min_lock_pips` are no longer fields,
+    // so there is nothing left for this ledger to record. They were shadows of
+    // `models.exit_policy.*`, and the documented precondition for removing them
+    // — "live execution must read `models.exit_policy` FIRST, never the reverse"
+    // — was met by `live_trading.rs:747-782` (policy resolved and logged) and
+    // `:1479-1493` (geometry applied). The rename `trailing_atr_multiplier` ->
+    // `trailing_stop_multiplier` is carried in `RETIRED_KEYS`, which names each
+    // old key at WARN when a real store still carries it.
     // REMOVED 2026-08-10: `RiskConfig::monthly_profit_target_pct` now HAS a
     // qualified production reader and the knob works.
     //
@@ -333,7 +302,9 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
 /// shape from this module's header: validated, persisted, displayed, ignored.
 /// Counting a reporter would have cleared `risk.trailing_*` and
 /// `risk.challenge_mode` the same week their ledger entries were written to
-/// record that the logger exists BECAUSE those keys reach nothing.
+/// record that the logger exists BECAUSE those keys reach nothing. (The
+/// `risk.trailing_*` four were then DELETED — 2026-08-10, #206 — which is the
+/// outcome a reporter defers, never the outcome it produces.)
 ///
 /// This is an allow-list of REPORTERS, not of knobs: adding a function here
 /// removes credit, it never grants it. The direction matters — the worst this
@@ -348,9 +319,11 @@ const REPORTING_ONLY: &[(&str, &str, &str)] = &[
         "crates/neoethos-search/src/discovery.rs",
         "resolve_and_log_duplicate_knobs",
         "prints the winner and the loser of every duplicated knob once per run (landed \
-         2026-08-10). It reads `settings.risk.trailing_*` ONLY to name them as ignored — \
-         crediting that would clear the four keys whose ledger entries say they reach no \
-         evaluator, CPU or CUDA.",
+         2026-08-10). It reads `models.eval_runtime.spread_pips` / `.commission_per_trade` and \
+         the account-currency pair ONLY to name them as the losing copy — crediting that would \
+         clear knobs whose ledger entries say they reach no evaluator, CPU or CUDA. It did the \
+         same for `risk.trailing_*` until those four fields were DELETED (2026-08-10, #206), \
+         which is the resolution a reporter defers rather than produces.",
     ),
     (
         "crates/neoethos-search/src/discovery.rs",

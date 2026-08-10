@@ -86,7 +86,7 @@ it (and slow `fetch_history` downloads).
 
 | Backend surface | Why it is excluded |
 |---|---|
-| `POST /broker/credentials`, `POST /broker/account/select`, `POST /broker/reauth` | These can flip the whole system Demo→Live or change which account trades. Operator-only, via the desktop app. The control plane must be structurally incapable of switching itself to live money. |
+| `POST /broker/credentials`, `POST /broker/reauth` | These can flip the whole system Demo→Live. Operator-only, via the desktop app. The control plane must be structurally incapable of switching itself to live money. `POST /broker/account/select` — the route that changed *which account trades* — was **deleted** 2026-08-10 (audit #120): it had no client, and account selection is a Tauri command in the desktop app (`select_account`). The rule above is now structural for account switching rather than a convention. |
 | `GET/POST /settings/raw` | Verbatim `config.yaml` write can change any knob including broker-adjacent behavior, bypassing the typed DTO's field allowlist. The typed `get_settings`/`update_settings` + `knob_catalog` cover every legitimate need. |
 | `/supervisor/*` | One agent brain at a time. Codex IS the supervisor when this control plane is in use; exposing the internal LLM supervisor's tick/chat would create two autonomous actors issuing StartLive-class actions concurrently. |
 | `/auth/codex/*`, `POST /codex/chat` | OAuth/browser flows are operator-only; proxying chat through the app is pointless from inside Codex. |
@@ -271,7 +271,7 @@ required). `open_world_hint=false` on everything except `news_briefing`
 |---|---|---|---|---|
 | 48 | `get_settings` | `{}` | RO | `GET /settings` (typed DTO) |
 | 49 | `update_settings` | partial mirror of the `POST /settings` DTO: `{trading_mode?, compute_mode?, risk_per_trade?, search_population?, search_generations?, search_max_hours?, search_max_indicators?, search_portfolio_size?, search_corr_threshold?, search_max_rows?, prefilter_top_k?, convergence_patience?, stagnation_patience?, novelty_weight?, disable_smc_gate?, max_portfolio_risk?, live_ml_gate?, risky_*?, news_*?}` — typed fields only, no passthrough. The `search_*` prefix matches the backend DTO verbatim | MUT (several knobs alter live sizing → `destructive_hint=true` as the honest hint, but classed MUT: it executes no trade) | `POST /settings` |
-| 50 | `knob_catalog` | `{}` | RO | `GET /settings/knob-catalog` + `GET /settings/presets` — the machine-readable help Codex reads before touching `update_settings` |
+| 50 | `knob_catalog` | `{}` | RO | `GET /settings/knob-catalog` — the machine-readable help Codex reads before touching `update_settings`. (`GET /settings/presets` was DELETED with the safety-posture preset vocabulary, #115/#116; prop-firm presets live on `apply_risk_preset` / `get_risk`.) |
 | 51 | `get_risk` | `{}` | RO | `GET /risk` |
 | 52 | `apply_risk_preset` | `{**preset**: str}` | TRADE (rewrites live sizing config) | `POST /risk/preset` |
 | 53 | `risky_scenarios` | `{starting_usd?, target_usd?, risk_fraction?, win_rate?, reward_to_risk?}` | RO | `GET /risky/scenarios` |

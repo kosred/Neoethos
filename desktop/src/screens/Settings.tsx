@@ -38,9 +38,11 @@ export default function Settings() {
       /* settings optional */
     }
     try {
-      // Use the REAL prop-firm presets the backend's /risk/preset accepts
-      // (ftmo/myforexfunds/…), not /settings/presets (conservative/balanced/…)
-      // which setRiskPreset rejects with `unknown preset`.
+      // The ONE preset vocabulary: the prop-firm presets POST /risk/preset
+      // accepts (ftmo/myforexfunds/…), reported by GET /risk. The second,
+      // disjoint vocabulary (conservative/balanced/aggressive) that used to be
+      // served by GET /settings/presets had no apply path and was deleted
+      // (#115/#116) — this screen never used it.
       setPresets((await riskInfo()).availablePresets);
     } catch {
       /* presets optional */

@@ -527,9 +527,35 @@ export default function Advanced() {
               lands. DO NOT make these inputs before then. */}
           <div className="banner info">
             <b>Read-only.</b> These {knobs.length} knobs are documented here with their type, legal
-            range and presets, but the backend has no knob write endpoint yet
+            range and advisory preset columns, but the backend has no knob write endpoint yet
             (<code>POST /settings/knobs</code>). Change them in the raw <code>config.yaml</code>{" "}
             editor above, or use the typed form at the top of this screen for the common ones.
+          </div>
+          {/* Audit #115 / #116 (2026-08-10). The three preset columns below are
+              159 recommendation strings and NOTHING in the product applies them.
+              `GET /settings/presets` — the endpoint that served a
+              Conservative/Balanced/Aggressive *posture* — was DELETED, because
+              it had no POST counterpart, no apply function and no client
+              anywhere in `crates/`, `desktop/src`, `desktop/src-tauri/src`,
+              `mesh/` or `mcp/`. The ONE preset vocabulary that writes anything
+              is the prop-firm one (`POST /risk/preset` — ftmo | myforexfunds |
+              fundednext | the5ers | none), which this screen does not offer and
+              Settings.tsx does.
+              The strings survive as ADVISORY values, which is only honest while
+              the UI SAYS they are advisory. Three unlabelled columns headed
+              Conservative/Balanced/Aggressive read as a posture the operator can
+              select — that belief is exactly how #213/#214 happened. If a real
+              apply path ever lands it must write EVERY knob a posture promises;
+              wiring three of five and keeping the label is a new lie in place of
+              the old one. DO NOT turn these cells into controls before then. */}
+          <div className="banner warn">
+            <b>The Conservative / Balanced / Aggressive columns are advice, not a setting.</b>{" "}
+            Nothing in the product can apply a posture: there is no endpoint that writes these
+            values, and the safety-posture preset API was removed rather than left as a switch
+            that does nothing. Copy a number you want into the raw <code>config.yaml</code>{" "}
+            editor above. The one preset control that does write is the prop-firm preset
+            (FTMO / MyForexFunds / FundedNext / The5ers / none) on the Settings screen, and it
+            sets a different set of fields.
           </div>
           <div className="banner warn">
             <b>
@@ -553,9 +579,9 @@ export default function Advanced() {
                     <th>Type / range</th>
                     <th>Current<div className="muted small" style={{ fontWeight: 400 }}>live unless marked</div></th>
                     <th>Default</th>
-                    <th>Conservative</th>
-                    <th>Balanced</th>
-                    <th>Aggressive</th>
+                    <th>Conservative<div className="muted small" style={{ fontWeight: 400 }}>advice only</div></th>
+                    <th>Balanced<div className="muted small" style={{ fontWeight: 400 }}>advice only</div></th>
+                    <th>Aggressive<div className="muted small" style={{ fontWeight: 400 }}>advice only</div></th>
                     <th>Help</th>
                   </tr>
                 </thead>

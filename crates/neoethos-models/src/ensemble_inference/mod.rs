@@ -123,7 +123,7 @@ pub mod tree_adapters;
 
 pub use bootstrap::{
     DEFAULT_BOOTSTRAP_EXPERT_NAMES, build_default_registry, build_ensemble_for_symbol,
-    build_ensemble_for_symbol_with_config, load_experts_for_symbol,
+    load_experts_for_symbol,
 };
 pub use deep_classification_adapters::{
     KanAdapter, KanLoader, MlpAdapter, MlpLoader, TabNetAdapter, TabNetLoader,
@@ -976,8 +976,10 @@ const MAX_SAC_FINAL_ALPHA: f64 = 1_000.0;
 /// (51,699,690) and `sac` (final_alpha 5.69e9) — and all three are in
 /// [`DEFAULT_BOOTSTRAP_EXPERT_NAMES`], i.e. all three load and all three would
 /// vote. That is harmless *today* only because `live_ml_gate` is false and
-/// `expert_weights` is empty, which is a configuration, not a guarantee. The
-/// moment the gate is flipped, `tide`'s vote scales real position size.
+/// `models.ensemble_voting.expert_weights` ships empty — which since 2026-08-10
+/// (audit #168) is a SETTING the operator can change, not an unreachable
+/// literal. The moment the gate is flipped, `tide`'s vote scales real position
+/// size.
 ///
 /// **This does not flip any gate.** It only removes divergent artifacts from
 /// the voter set, loudly. Refusals become `degraded` entries, exactly like a

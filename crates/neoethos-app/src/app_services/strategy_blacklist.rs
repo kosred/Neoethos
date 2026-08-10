@@ -37,13 +37,24 @@
 //! **The old fingerprints are never removed.** [`is_blacklisted`] matches on
 //! gene identity, current file bytes, the pre-2026-07-18 `DefaultHasher` bytes,
 //! and the recorded path — four arms, and it logs which one caught.
+//!
+//! # Where the identity itself now lives — item #219, 2026-08-10
+//!
+//! In [`neoethos_core::strategy_identity`], not here. This module is in
+//! `neoethos-app`, the top of the dependency graph, so while the definition sat
+//! here `neoethos-search` could not see it: retirement blocked SELECTION but
+//! discovery was free to re-derive the culled rule on the very run the
+//! retirement queued. `neoethos-search` now filters the live portfolio against
+//! the same identity (`live_portfolio::from_discovery`), reading this same
+//! blacklist file. The copy that used to live here is DELETED, not wrapped —
+//! two implementations of "same strategy" would reopen the hole the day they
+//! drifted.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 /// One retired strategy. Append-only; never removed automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,134 +104,24 @@ fn legacy_fingerprint_bytes(bytes: &[u8]) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Marks a fingerprint as a GENE-identity hash rather than a file-bytes hash,
-/// so a stored entry says which kind it is and the two can never collide.
-pub const GENE_FINGERPRINT_PREFIX: &str = "gene:";
+// GENE IDENTITY MOVED 2026-08-10 (#219) to
+// `neoethos_core::strategy_identity`, and DELETED here.
+//
+// `GENE_FINGERPRINT_PREFIX`, `GENE_MEASUREMENT_FIELDS`,
+// `PORTFOLIO_NON_IDENTITY_FIELDS`, `write_canonical`, `resolve_indices`,
+// `gene_rule_identity` and `gene_fingerprint_bytes` all lived in THIS file,
+// which sits at the top of the dependency graph. So the identity that decides
+// "this is the retired strategy" was unreachable from `neoethos-search`: the
+// GA could re-derive a culled rule on the very run the retirement queued, and
+// nothing in the loop noticed. The definition now lives in `neoethos-core`,
+// which both crates depend on, and there is exactly ONE of it.
+//
+// `gene_fingerprint_bytes` keeps its name and behaviour for every caller here
+// (it is what `retire` stores and `is_blacklisted` matches on) and is a
+// one-line delegation.
 
-/// Fields on a `Gene` that record HOW THAT RUN WENT, not what the strategy is.
-///
-/// Every one of these moves between two discovery runs that find the same
-/// trading rule, which is precisely why a file-bytes fingerprint let a culled
-/// strategy back in (#218). They are excluded from the identity.
-///
-/// **This is a deny-list, deliberately.** Anything not named here JOINS the
-/// identity, so a new *rule* field added to `Gene` is covered automatically.
-/// The failure mode of a stale deny-list is an over-specific fingerprint — the
-/// pre-existing behaviour, which never blocks a strategy that was not culled.
-/// An allow-list would fail the other way: a new rule field silently ignored,
-/// two genuinely different strategies sharing one fingerprint, and a strategy
-/// blocked that nobody retired.
-///
-/// **If you add a per-run measurement to `Gene`, add it here.**
-const GENE_MEASUREMENT_FIELDS: &[&str] = &[
-    "fitness",
-    "sharpe_ratio",
-    "win_rate",
-    "max_drawdown",
-    "profit_factor",
-    "expectancy",
-    "trades_count",
-    "generation",
-    "strategy_id",
-    "slice_pass_rate",
-    "consistency",
-];
-
-/// Top-level artifact fields excluded from the identity.
-///
-/// `schema_version` is the file format, not the strategy. `effective_feature_names`
-/// is not dropped so much as CONSUMED — it is folded into each gene by resolving
-/// `indices` to names, which is the only way a positional index means anything.
-const PORTFOLIO_NON_IDENTITY_FIELDS: &[&str] = &["schema_version", "effective_feature_names"];
-
-/// Deterministic textual form of a JSON value: object keys sorted, no
-/// whitespace. Written explicitly rather than relying on `serde_json`'s map
-/// ordering, which is a Cargo-feature (`preserve_order`) away from changing and
-/// would silently invalidate every stored fingerprint if it did.
-fn write_canonical(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => {
-            // Delegate escaping to serde_json so quotes/control chars cannot
-            // forge a boundary between two different values.
-            out.push_str(&Value::String(s.clone()).to_string());
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&Value::String((*key).clone()).to_string());
-                out.push(':');
-                if let Some(v) = map.get(*key) {
-                    write_canonical(v, out);
-                }
-            }
-            out.push('}');
-        }
-    }
-}
-
-/// Replace a gene's positional `indices` with the feature NAMES they select.
-///
-/// An index only means something against the column list discovery produced, so
-/// two runs whose prefilters ordered features differently describe different
-/// strategies with identical index arrays. An index with no name (list absent,
-/// or out of range) is kept VERBATIM rather than dropped — dropping a column
-/// would make two different strategies hash the same.
-fn resolve_indices(indices: &Value, names: &[&str]) -> Value {
-    let Some(items) = indices.as_array() else {
-        return indices.clone();
-    };
-    Value::Array(
-        items
-            .iter()
-            .map(|index| {
-                match index
-                    .as_u64()
-                    .and_then(|position| names.get(position as usize))
-                {
-                    Some(name) => Value::String((*name).to_string()),
-                    None => index.clone(),
-                }
-            })
-            .collect(),
-    )
-}
-
-/// One gene reduced to the trading rule: measurements removed, indices named.
-fn gene_rule_identity(gene: &Value, names: &[&str]) -> Value {
-    let Some(fields) = gene.as_object() else {
-        return gene.clone();
-    };
-    let mut rule = Map::new();
-    for (key, value) in fields {
-        if GENE_MEASUREMENT_FIELDS.contains(&key.as_str()) {
-            continue;
-        }
-        if key == "indices" {
-            rule.insert("features".to_string(), resolve_indices(value, names));
-            continue;
-        }
-        rule.insert(key.clone(), value.clone());
-    }
-    Value::Object(rule)
-}
+/// See [`neoethos_core::strategy_identity::GENE_FINGERPRINT_PREFIX`].
+pub use neoethos_core::strategy_identity::GENE_FINGERPRINT_PREFIX;
 
 /// Fingerprint the STRATEGY a live-portfolio artifact describes, independent of
 /// which run produced the file.
@@ -230,43 +131,7 @@ fn gene_rule_identity(gene: &Value, names: &[&str]) -> Value {
 /// so an unrecognised shape degrades to the old behaviour instead of silently
 /// producing no identity at all.
 pub fn gene_fingerprint_bytes(bytes: &[u8]) -> Option<String> {
-    let parsed: Value = serde_json::from_slice(bytes).ok()?;
-    let fields = parsed.as_object()?;
-    let genes = fields.get("genes")?.as_array()?;
-
-    let names: Vec<&str> = fields
-        .get("effective_feature_names")
-        .and_then(|v| v.as_array())
-        .map(|list| list.iter().map(|v| v.as_str().unwrap_or("")).collect())
-        .unwrap_or_default();
-
-    // Everything else on the artifact — symbol, base_tf, higher_tfs,
-    // normalize_features — IS identity: it changes what the rule does. Copying
-    // by iteration rather than by an allow-list means a future field joins the
-    // identity by default.
-    let mut identity = Map::new();
-    for (key, value) in fields {
-        if key == "genes" || PORTFOLIO_NON_IDENTITY_FIELDS.contains(&key.as_str()) {
-            continue;
-        }
-        identity.insert(key.clone(), value.clone());
-    }
-    identity.insert(
-        "genes".to_string(),
-        Value::Array(
-            genes
-                .iter()
-                .map(|gene| gene_rule_identity(gene, &names))
-                .collect(),
-        ),
-    );
-
-    let mut canonical = String::new();
-    write_canonical(&Value::Object(identity), &mut canonical);
-    Some(format!(
-        "{GENE_FINGERPRINT_PREFIX}{:016x}",
-        neoethos_core::utils::hashing::fnv1a64(canonical.as_bytes())
-    ))
+    neoethos_core::strategy_identity::portfolio_gene_fingerprint(bytes)
 }
 
 /// Fingerprint a portfolio file by path; `None` if unreadable.
@@ -526,7 +391,10 @@ mod tests {
     #[test]
     fn an_out_of_range_index_is_kept_verbatim() {
         let names = ["rsi_14"];
-        let resolved = resolve_indices(&serde_json::json!([0, 7]), &names);
+        let resolved = neoethos_core::strategy_identity::resolve_indices(
+            &serde_json::json!([0, 7]),
+            &names,
+        );
         assert_eq!(resolved, serde_json::json!(["rsi_14", 7]));
     }
 

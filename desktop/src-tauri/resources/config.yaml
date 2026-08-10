@@ -73,7 +73,7 @@ system:
 risk:
   preset: ftmo
   initial_balance: 10000.0
-  monthly_profit_target_pct: 0.03999999910593033
+  monthly_profit_target_pct: 0.04
   min_risk_per_trade: 0.0
   max_risk_per_trade: 0.03
   risk_per_trade: 0.03
@@ -83,7 +83,7 @@ risk:
   prop_firm_max_risk_per_trade: null
   max_portfolio_risk: 0.04
   daily_drawdown_limit: 0.04
-  total_drawdown_limit: 0.07000000104308128
+  total_drawdown_limit: 0.07
   min_risk_reward: 2.0
   max_lot_size: 10.0
   require_stop_loss: true
@@ -98,10 +98,6 @@ risk:
   atr_period: 14
   atr_stop_multiplier: 1.5
   triple_barrier_max_bars: 35
-  trailing_enabled: true
-  trailing_atr_multiplier: 1.0
-  trailing_be_trigger_r: 1.0
-  trailing_min_lock_pips: 2.0
   slippage_pips: 0.5
   commission_per_lot: 7.0
   commission_per_lot_is_per_side: true
@@ -270,6 +266,8 @@ models:
   calibration_method: platt
   calibration_min_rows: 300
   live_ml_gate: false
+  blend_gate_floor: 0.34
+  blend_veto_below: 0.15
   model_param_overrides: {}
   regime_router_enabled: false
   regime_router_min_models: 2
@@ -404,6 +402,11 @@ models:
     sl_max_pips: 20.0
     tp_min_pips: 12.0
     tp_max_pips: 45.0
+  ensemble_voting:
+    expert_weights: {}
+    excluded_experts: []
+    anomaly_lo: 0.5
+    anomaly_hi: 0.9
   seen_signature_runtime:
     flush_every: 4096
     load_max: 3000000

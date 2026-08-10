@@ -27,6 +27,14 @@ neoethos-data = { path = "../neoethos-data" }
 # `LivePortfolioArtifact` loader — reused, never re-implemented, so live signals
 # match backtest signals.
 neoethos-search = { path = "../neoethos-search" }
+# The operator's `Settings`, for ONE `Settings -> EngineConfig` adapter
+# (`EngineConfig::for_replay_from_settings`). Added 2026-08-10 (#229): that
+# adapter lived in `neoethos-cli`, so `neoethos-app`'s `POST /autonomous/replay`
+# could not reach it and passed `EngineConfig::default()` — zero spread, zero
+# commission, zero slippage, a synthetic balance — while the module header
+# claimed the two front-ends were byte-identical. This is not a new dependency
+# edge in practice: `neoethos-search` above already depends on `neoethos-core`.
+neoethos-core = { path = "../neoethos-core" }
 # v0.5 ML-integration Stage 3: the SoftVotingEnsemble role-aware combiner that
 # gates gene size in the blend. OPTIONAL + behind the `ml-blend` feature so the
 # default (gene-only) build stays dependency-light and does not pull in the

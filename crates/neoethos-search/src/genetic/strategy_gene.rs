@@ -325,11 +325,15 @@ pub const COMMISSION_SIDES_PER_ROUND_TRIP: f64 = 2.0;
 /// field that is charged once meant **half the real commission was charged on
 /// every trade in every backtest this project has ever run**.
 ///
-/// The conversion happens at exactly TWO boundaries — here, and
-/// `DiscoveryConfig::from_settings` — both driven by the same
-/// `risk.commission_per_lot_is_per_side` flag, so they cannot disagree and the
-/// number cannot be doubled twice. Everything downstream of those two points
-/// means ROUND TRIP.
+/// The conversion happens at exactly THREE boundaries — here, and TWICE in
+/// `DiscoveryConfig::from_settings` (the baseline
+/// `evaluation_commission_per_trade`, and the stress pass's
+/// `sensitivity_commission_per_lot`, added 2026-08-10 — it was the one
+/// commission input that skipped this function, which made the "higher
+/// commission" stress test charge HALF the baseline at the shipped defaults).
+/// All three are driven by the same `risk.commission_per_lot_is_per_side` flag,
+/// so they cannot disagree and no number is doubled twice. Everything
+/// downstream of those points means ROUND TRIP.
 ///
 /// This has ZERO expected value in money. Charging the true cost creates no
 /// edge; it stops the search from selecting candidates on a subsidy.
@@ -884,19 +888,17 @@ impl Default for EvaluationConfig {
         //
         // WHICH CONFIG KEY THIS IS, unambiguously (2026-08-10): the ONLY source
         // of the four trailing values below is `models.exit_policy.*`
-        // (`ExitPolicyOverrides::from_settings`, runtime_overrides.rs). The
-        // identically-named `risk.trailing_enabled` / `_atr_multiplier` /
-        // `_be_trigger_r` / `_min_lock_pips` are a SHADOWED DUPLICATE: they are
-        // read by nothing on the search path, CPU or CUDA, and are ledgered as
-        // such in `crates/neoethos-core/tests/config_has_recipient.rs`. The
-        // disagreement between the two copies is named with both values, once
-        // per run, by `resolve_and_log_duplicate_knobs` in discovery.rs — this
-        // read site does not log, because it runs once per candidate.
-        //
-        // Note the rename across the twin: `risk.trailing_atr_multiplier` maps
-        // to `models.exit_policy.trailing_stop_multiplier`, and despite the old
-        // name it was never an ATR multiple — it is a multiple of the position's
-        // own stop distance.
+        // (`ExitPolicyOverrides::from_settings`, runtime_overrides.rs) — and as
+        // of today it is the only source ANYWHERE. The identically-named
+        // `risk.trailing_enabled` / `_atr_multiplier` / `_be_trigger_r` /
+        // `_min_lock_pips` were a shadowed duplicate that reached no evaluator,
+        // CPU or CUDA; they were DELETED from `RiskConfig` (audit #206) once
+        // live execution was given the same recipient, so there is no longer a
+        // second copy to disagree with. A store that still carries the old keys
+        // is told so by name, with the rename `risk.trailing_atr_multiplier` ->
+        // `models.exit_policy.trailing_stop_multiplier`, by `RETIRED_KEYS` in
+        // `neoethos-core/src/config.rs`. Despite that old name it was never an
+        // ATR multiple — it is a multiple of the position's own stop distance.
         let exit = overrides.exit_policy;
 
         Self {

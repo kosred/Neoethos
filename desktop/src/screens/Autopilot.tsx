@@ -237,7 +237,17 @@ export default function Autopilot() {
     setBusy(true);
     setMsg(`Replaying ${focus.symbol ?? ""} ${focus.baseTf ?? ""}…`);
     try {
-      const r = await autonomousReplay({ symbol: focus.symbol ?? undefined, base_tf: focus.baseTf ?? undefined });
+      // Pass the focused strategy's OWN artifact (audit #225). Without
+      // `portfolio_path` the backend runs the 3-bar momentum STUB behind a
+      // synthetic 0.5%-of-price bracket — on EURUSD a ~54-pip stop against the
+      // GA's 6-20 — so the button reported numbers for a strategy this product
+      // never produced. With it, `replay_portfolio_from_dir` replays the real
+      // genes at each bar's own SL/TP.
+      const r = await autonomousReplay({
+        symbol: focus.symbol ?? undefined,
+        base_tf: focus.baseTf ?? undefined,
+        portfolio_path: focus.path,
+      });
       setReplay(r);
       setMsg("✓ Replay done.");
     } catch (e) {

@@ -7,29 +7,28 @@
 //! retirement leaves a coverage gap on that (symbol, base_tf) — so queue a
 //! fresh Discovery run to refill it.
 //!
-//! # What "blacklisted" does and does not mean — corrected 2026-08-09 (#219)
+//! # What "blacklisted" means — closed 2026-08-10 (#219)
 //!
-//! This header used to say the retired strategy is *"never selectable, never
-//! re-discovered"*. **The second half was false and is the reason this item is
-//! open.** `neoethos-search` contains zero references to the blacklist: the
-//! GA is free to re-derive the retired rule on the very run this module
-//! queues, and it does not know it is doing so.
-//!
-//! What actually holds today:
+//! This header once said the retired strategy is *"never selectable, never
+//! re-discovered"* while only the first half was true. Both halves hold now:
 //!
 //! * **Selection is guarded.** `server::autonomous` and `app_services::federation`
 //!   both call [`strategy_blacklist::is_blacklisted`] before a portfolio can go
 //!   live, and `server::portfolios` hides retired ones from the listing.
-//! * **Identity is now the gene, not the file** ([`strategy_blacklist`], #218),
-//!   so a re-discovered artifact describing the SAME rule is caught at
-//!   selection even though its bytes differ. That is what closed the practical
-//!   hole this module opened.
-//! * **Still open:** a rediscovery whose portfolio contains the culled gene
-//!   *alongside different ones* hashes differently and is not blocked, and the
-//!   search still wastes the run re-deriving it. The durable fix is for
-//!   discovery to consult the blacklist before a gene reaches
-//!   `live_portfolio.json`; that lives in `neoethos-search`, which this crate
-//!   must not edit, and is still OPEN.
+//! * **Identity is the gene, not the file** ([`strategy_blacklist`], #218), so a
+//!   re-discovered artifact describing the SAME rule is caught at selection even
+//!   though its bytes differ.
+//! * **Discovery now consults it too.** The identity moved down to
+//!   `neoethos_core::strategy_identity`, which `neoethos-search` can see, and
+//!   `neoethos_search::live_portfolio` drops any RETIRED RULE from the artifact
+//!   the trader consumes — per gene, so a culled rule bundled with different
+//!   company no longer slips through on an artifact-level hash. The set is read
+//!   from this same `strategy_blacklist.json` at search startup
+//!   (`install_search_runtime_overrides_from_settings`).
+//!
+//! What is still true and is NOT a defect: the GA can still SPEND time
+//! re-deriving a retired rule inside a run — the gate is at promotion, not at
+//! mutation — and it says so loudly when it happens.
 //!
 //! [`strategy_blacklist`]: crate::app_services::strategy_blacklist
 //! [`strategy_blacklist::is_blacklisted`]: crate::app_services::strategy_blacklist::is_blacklisted

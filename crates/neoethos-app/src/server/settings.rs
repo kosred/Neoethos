@@ -113,6 +113,12 @@ pub struct SettingsDto {
     /// per-trade risk on live entries (genes keep the direction; ML only
     /// shrinks size / skips on a hard regime+anomaly collapse).
     pub live_ml_gate: bool,
+    /// Live blend floor (models.blend_gate_floor): the smallest fraction of its
+    /// size a gene entry may be shrunk to by a lukewarm ensemble.
+    pub blend_gate_floor: f64,
+    /// Live blend veto (models.blend_veto_below): effective multiplier below
+    /// which the bar is SKIPPED rather than sized to the floor.
+    pub blend_veto_below: f64,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -152,6 +158,14 @@ pub struct SettingsUpdateDto {
     pub disable_smc_gate: Option<bool>,
     /// LIVE ML gate toggle (models.live_ml_gate).
     pub live_ml_gate: Option<bool>,
+    /// Live blend floor (models.blend_gate_floor). Range [0,1]; must be >=
+    /// `blend_veto_below`. An invalid pair is REFUSED back to the shipped
+    /// defaults by `BlendConfig::from_config_values` at read time, loudly —
+    /// this write path only range-clamps.
+    pub blend_gate_floor: Option<f64>,
+    /// Live blend veto (models.blend_veto_below). Range [0,1]; see
+    /// [`Self::blend_gate_floor`].
+    pub blend_veto_below: Option<f64>,
     /// Risk fraction per trade (0..=max_risk_per_trade). Lets the operator set
     /// the sizing risk for the search/run directly (clamped on write).
     pub risk_per_trade: Option<f64>,
@@ -755,6 +769,33 @@ pub async fn update_settings(
     if let Some(v) = payload.live_ml_gate {
         settings.models.live_ml_gate = v;
     }
+    // Range only. The PAIR rule (`veto_below <= gate_floor`) is enforced where
+    // the numbers are used — `BlendConfig::from_config_values` refuses an
+    // inverted pair back to the shipped defaults and logs both — so it is not
+    // duplicated here. A non-finite value is dropped rather than written: NaN
+    // in a live sizing multiplier is not a preference.
+    if let Some(v) = payload.blend_gate_floor {
+        if v.is_finite() {
+            settings.models.blend_gate_floor = v.clamp(0.0, 1.0);
+        } else {
+            tracing::warn!(
+                target: "neoethos_app::server::settings",
+                "models.blend_gate_floor was sent as a non-finite number — ignored, the \
+                 stored value stands"
+            );
+        }
+    }
+    if let Some(v) = payload.blend_veto_below {
+        if v.is_finite() {
+            settings.models.blend_veto_below = v.clamp(0.0, 1.0);
+        } else {
+            tracing::warn!(
+                target: "neoethos_app::server::settings",
+                "models.blend_veto_below was sent as a non-finite number — ignored, the \
+                 stored value stands"
+            );
+        }
+    }
 
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(
@@ -852,5 +893,7 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         disable_smc_gate: settings.models.search_runtime.disable_smc_gate,
         max_portfolio_risk: settings.risk.max_portfolio_risk,
         live_ml_gate: settings.models.live_ml_gate,
+        blend_gate_floor: settings.models.blend_gate_floor,
+        blend_veto_below: settings.models.blend_veto_below,
     }
 }

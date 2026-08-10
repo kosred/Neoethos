@@ -270,6 +270,13 @@ pub struct ReplayBacktestParams {
     pub symbol: Option<String>,
     /// Base timeframe. Omit to resolve from config.yaml like the CLI.
     pub base_tf: Option<String>,
+    /// Path to a `*.live_portfolio.json` (from `list_portfolios`). Supplied →
+    /// the REAL discovered genes are replayed, exactly as `trader-replay
+    /// --portfolio` does. Omitted → a 3-bar momentum STUB that is not any
+    /// strategy this product produced; the result says so in
+    /// `fidelity_warnings`. Added 2026-08-10 (#229) — until then no front-end
+    /// but the CLI could reach the real genes.
+    pub portfolio_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,6 +404,12 @@ pub struct UpdateSettingsParams {
     /// LIVE ML gate: the trained ensemble scales per-trade risk on live
     /// entries (genes keep the direction).
     pub live_ml_gate: Option<bool>,
+    /// Live blend floor (0..1): the smallest fraction of its size a gene entry
+    /// may be shrunk to by a lukewarm ensemble. Must be >= `blend_veto_below`.
+    pub blend_gate_floor: Option<f64>,
+    /// Live blend veto (0..1): effective multiplier below which the bar is
+    /// SKIPPED rather than sized to the floor.
+    pub blend_veto_below: Option<f64>,
     /// Risky-Mode starting balance (account currency, > 0).
     pub risky_start_balance: Option<f64>,
     /// Risky-Mode target balance (account currency, > 0).

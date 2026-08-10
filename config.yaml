@@ -40,13 +40,6 @@
 # (unannotated keys are ordinary developer tuning; the ones with a
 #  reason are decisions that neither side may move alone)
 #
-#   models.discovery_mode
-#     INERT. discovery.rs maps only `strict|legacy`; `risky` — and the live
-#     store's `prop_firm` — fall through to system.trading_mode.
-#     Restricting the accepted values is routed (pending-A A6) and blocked on
-#     the TUI, which offers exactly the two values the engine does not
-#     honour.
-#
 #   models.l1_feature_selection_enabled
 #     2026-08-10. Default is false. This changes WHAT IS SEARCHED — L1
 #     selection prunes the feature set before the GA sees it — so it is

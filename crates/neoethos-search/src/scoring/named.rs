@@ -72,12 +72,12 @@ pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(5);
 /// Matches `genetic::evolution_math::score_from_metrics` byte-for-byte.
 /// The mapping in `metrics: &[f64; 11]` is the canonical
 /// `[BacktestMetrics::to_metric_array]` order (see `eval.rs` lines
-/// 165-200 and `BACKTEST_METRICS_RESERVED_INDEX_7`):
+/// 165-200 and `BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX`):
 ///
 /// ```text
 ///   metrics[0] = net_profit      metrics[5] = profit_factor
 ///   metrics[1] = sharpe          metrics[6] = expectancy
-///   metrics[2] = peak_equity     metrics[7] = RESERVED (always 0.0)
+///   metrics[2] = peak_equity     metrics[7] = monthly_target_hit_rate
 ///   metrics[3] = max_drawdown    metrics[8] = trade_count
 ///   metrics[4] = win_rate        metrics[9] = consistency
 ///                                metrics[10] = max_daily_drawdown

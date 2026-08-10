@@ -27,12 +27,21 @@ use crate::position::PositionManager;
 ///     ten times the operator's real account
 ///   - this one, the replay's
 ///
-/// It is NOT reconciled here: `neoethos-core/src/config.rs` is owned by another
-/// workflow this wave, and silently changing which of three numbers the replay
-/// uses would move the reported drawdown without anybody choosing it. What
-/// changed is that the number is now NAMED, and a replay that runs on it says
-/// so in its fidelity report instead of presenting it as the operator's
-/// account.
+/// **2026-08-10 (#229/#265): this is now a FALLBACK, not a default in use.**
+/// Both replay front-ends build their config through
+/// [`EngineConfig::for_replay_from_settings`], which takes
+/// `risk.initial_balance`, so a replay reaches this constant only when
+/// `Settings` could not be read at all or the configured balance is unusable —
+/// and in both cases it says so at WARN and `common_warnings` marks the run
+/// synthetic.
+///
+/// The remaining disagreement is between the OTHER two: `risk.initial_balance`
+/// (the account) and `models.backtest_runtime.initial_equity` (what the SEARCH
+/// divides every percentage by). It is not reconciled by fiat, because they are
+/// not obviously one concept and substituting one for the other would move every
+/// ranked percentage without anybody choosing it. It is reported instead, once
+/// per process, with both numbers, by
+/// `neoethos_search::eval::install_backtest_runtime_overrides_from_settings`.
 pub const DEFAULT_REPLAY_STARTING_BALANCE: f64 = 10_000.0;
 
 /// Engine-wide knobs (Phase 1).
@@ -51,6 +60,16 @@ pub struct EngineConfig {
     pub costs: crate::execution::ReplayCostModel,
     /// The GA evaluator's time stop, in bars. `None` ⇒ no time stop.
     pub max_hold_bars: Option<u64>,
+    /// The GA evaluator's / live loop's break-even + trailing stop (audit
+    /// #227). `None` ⇒ no trail, which is what this engine did unconditionally
+    /// before 2026-08-10 — stop, target and time stop were its only exits while
+    /// both of the paths it claims to mirror also move the stop after `+1R`.
+    ///
+    /// The replay helpers resolve it from `models.exit_policy` via
+    /// `EvaluationConfig`, the same single recipient discovery and live read, so
+    /// a run with the policy OFF is byte-identical to the old behaviour and a run
+    /// with it ON models what the strategy was actually scored under.
+    pub trailing: Option<crate::position::TrailingPolicy>,
 }
 
 impl Default for EngineConfig {
@@ -60,7 +79,182 @@ impl Default for EngineConfig {
             window_cap: 512,
             costs: crate::execution::ReplayCostModel::zero(),
             max_hold_bars: None,
+            trailing: None,
         }
+    }
+}
+
+impl EngineConfig {
+    /// The replay config a front-end that holds the operator's `Settings`
+    /// should use: HIS starting balance and HIS broker costs, not the
+    /// synthetic defaults (audit #224 / #265).
+    ///
+    /// This exists so the policy lives ONCE. Both front-ends —
+    /// `neoethos-cli`'s `trader-replay` family and `neoethos-app`'s
+    /// `POST /autonomous/replay` — passed `EngineConfig::default()`, which is
+    /// a 10 000 balance and `ReplayCostModel::zero()`: every replay an operator
+    /// could actually run reported percentage drawdown against a balance that
+    /// was not his, on fills that charged nothing. This entry point takes the
+    /// four numbers and enforces the RULES about them; front-ends holding a
+    /// `Settings` should call [`EngineConfig::for_replay_from_settings`] below,
+    /// which is the one adapter that reads those four fields off the config.
+    ///
+    /// * `initial_balance` — `risk.initial_balance`. A non-finite or
+    ///   non-positive value keeps [`DEFAULT_REPLAY_STARTING_BALANCE`], because
+    ///   the equity curve divides by it; the substitution is logged, never
+    ///   silent, and `data_replay::common_warnings` then reports the run as
+    ///   synthetic exactly as before.
+    /// * `commission_per_lot_per_side` — the ONE-SIDE charge. The replay's
+    ///   execution adapter charges it on entry AND on exit
+    ///   (`execution.rs:173`/`:206`), so handing it a round-trip number bills
+    ///   the operator twice. Callers convert with
+    ///   `RiskConfig::round_trip_commission_per_lot() / 2.0`.
+    /// * `pip_size` — `None` when the symbol is not in the metadata table. The
+    ///   spread cannot be converted to price units without it, so the costs
+    ///   stay ZERO and say so: a wrong cost is worse than a declared absent
+    ///   one, because it looks like it was charged.
+    pub fn for_replay(
+        initial_balance: f64,
+        spread_pips: f64,
+        slippage_pips: f64,
+        commission_per_lot_per_side: f64,
+        pip_size: Option<f64>,
+    ) -> Self {
+        let starting_balance = if initial_balance.is_finite() && initial_balance > 0.0 {
+            initial_balance
+        } else {
+            tracing::warn!(
+                target: "neoethos_trader::engine",
+                configured = initial_balance,
+                fallback = DEFAULT_REPLAY_STARTING_BALANCE,
+                "risk.initial_balance is not a usable balance — the replay's equity curve \
+                 divides by it, so the synthetic default is used and the run is reported as \
+                 synthetic"
+            );
+            DEFAULT_REPLAY_STARTING_BALANCE
+        };
+        let costs = match pip_size {
+            Some(pip) => crate::execution::ReplayCostModel::from_pips(
+                spread_pips,
+                slippage_pips,
+                commission_per_lot_per_side,
+                pip,
+            ),
+            None => {
+                tracing::warn!(
+                    target: "neoethos_trader::engine",
+                    "the symbol's pip size is unknown, so the spread cannot be converted to \
+                     price units — this replay charges NOTHING. Add the symbol to the \
+                     metadata table rather than trusting the result"
+                );
+                crate::execution::ReplayCostModel::zero()
+            }
+        };
+        Self {
+            starting_balance,
+            costs,
+            ..Self::default()
+        }
+    }
+
+    /// The ONE `Settings` → [`EngineConfig`] adapter for every replay front-end.
+    ///
+    /// **Moved here 2026-08-10 (#229).** It used to be `replay_engine_config`
+    /// in `neoethos-cli/src/main.rs`, private to the CLI. `neoethos-app`'s
+    /// `POST /autonomous/replay` therefore could not call it and passed
+    /// [`EngineConfig::default`] — `ReplayCostModel::zero()` and the synthetic
+    /// [`DEFAULT_REPLAY_STARTING_BALANCE`] — so the operator's Replay button
+    /// filled at the mark, charged nothing, and reported drawdown against a
+    /// balance that was not his, while `data_replay`'s module header claimed
+    /// the two front-ends produce byte-identical `EngineStats`. The CLI copy is
+    /// DELETED; this is the only one.
+    ///
+    /// `None` settings is not an error — it is a replay whose costs and balance
+    /// could not be resolved, which returns the synthetic default and says so
+    /// at WARN. `data_replay::common_warnings` then reports the run as
+    /// synthetic, so the disclosure survives.
+    ///
+    /// Commission is converted from the operator's round trip to the ONE-SIDE
+    /// charge [`EngineConfig::for_replay`] documents, because the replay's
+    /// execution adapter bills it on entry AND on exit.
+    pub fn for_replay_from_settings(
+        settings: Option<&neoethos_core::Settings>,
+        symbol: &str,
+    ) -> Self {
+        let Some(settings) = settings else {
+            tracing::warn!(
+                target: "neoethos_trader::replay",
+                symbol,
+                "no config resolved — this replay fills at the mark, charging nothing, on a \
+                 synthetic balance"
+            );
+            return Self::default();
+        };
+        let pip_size = neoethos_core::symbol_metadata::global_table()
+            .lookup(symbol)
+            .map(|meta| meta.pip_size);
+        let risk = &settings.risk;
+        let commission_per_side = risk.round_trip_commission_per_lot() / 2.0;
+        tracing::info!(
+            target: "neoethos_trader::replay",
+            symbol,
+            initial_balance = risk.initial_balance,
+            spread_pips = risk.backtest_spread_pips,
+            slippage_pips = risk.slippage_pips,
+            commission_per_lot_per_side = commission_per_side,
+            pip_size = ?pip_size,
+            "replay balance and costs taken from the operator's config"
+        );
+        let mut cfg = Self::for_replay(
+            risk.initial_balance,
+            risk.backtest_spread_pips,
+            risk.slippage_pips,
+            commission_per_side,
+            pip_size,
+        );
+        // ── The exit the strategy was SCORED under (audit #227) ──────────────
+        //
+        // `models.exit_policy` is the single recipient for the break-even /
+        // trailing geometry: discovery reads it through `EvaluationConfig`
+        // (`strategy_gene.rs:905-913`) and the live loop reads it directly
+        // (`live_trading.rs:762`, `:1479-1493`). The replay read it NOWHERE, so
+        // it modelled a strategy whose stop never moves against two paths on
+        // which it does — while its own module header claimed parity.
+        //
+        // Same field, third reader. `trailing_enabled: false` (the shipped
+        // default) leaves `trailing: None`, i.e. byte-identical to every replay
+        // run before 2026-08-10. A pip size the metadata table does not have
+        // also leaves it `None`, because the minimum lock is quoted in pips and
+        // inventing a pip size would put the stop at a level no broker has.
+        let exit = settings.models.exit_policy;
+        cfg.trailing = if exit.trailing_enabled {
+            let armed = pip_size.and_then(|pip| {
+                crate::position::TrailingPolicy::new(
+                    exit.trailing_be_trigger_r,
+                    exit.trailing_stop_multiplier,
+                    exit.trailing_min_lock_pips,
+                    pip,
+                )
+            });
+            if armed.is_none() {
+                tracing::warn!(
+                    target: "neoethos_trader::replay",
+                    symbol,
+                    be_trigger_r = exit.trailing_be_trigger_r,
+                    stop_multiplier = exit.trailing_stop_multiplier,
+                    min_lock_pips = exit.trailing_min_lock_pips,
+                    pip_size = ?pip_size,
+                    "models.exit_policy.trailing_enabled is ON but the geometry cannot move a \
+                     stop (unknown pip size, or a non-finite / non-positive trigger or \
+                     multiplier) — this replay runs WITHOUT the trail and says so in its \
+                     fidelity report. It does not describe what live will do"
+                );
+            }
+            armed
+        } else {
+            None
+        };
+        cfg
     }
 }
 
@@ -134,6 +328,7 @@ impl<S: SignalEngine, R: RiskGate, E: ExecutionAdapter> AutonomousEngine<S, R, E
         };
         let mut positions = PositionManager::new();
         positions.set_max_hold_bars(cfg.max_hold_bars);
+        positions.set_trailing(cfg.trailing);
         Self {
             registry,
             signal,

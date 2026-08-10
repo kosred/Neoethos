@@ -500,34 +500,46 @@ fn risk_based_lots(
     lots.clamp(min_lot, max_lot)
 }
 
-/// The operator's `models.blend_gate_floor`, if he has set one.
+/// The operator's `models.blend_gate_floor`.
 ///
-/// PENDING RECIPIENT — READ THIS BEFORE BELIEVING THE WIRING. The field does
-/// NOT exist in `neoethos-core/src/config.rs` yet: that file belongs to another
-/// shard this wave, and the exact field list (name, type, default, doc line) is
-/// written down in `docs/pending-edits-forbidden-territory.md` under
-/// "`models.blend_*` — the live blend multipliers need a config recipient".
-/// Until those fields land this
-/// returns `None`, and [`neoethos_trader::BlendConfig::from_config_values`]
-/// yields the shipped `DEFAULT_BLEND_GATE_FLOOR` (0.34) — the SAME number the
-/// old `..Default::default()` produced. So the live sizing path is
-/// behaviour-identical today; what changed is that the number now arrives
-/// through the validating constructor instead of a struct literal, and one line
-/// here is all that stands between the operator's YAML and the live multiplier.
+/// **WIRED 2026-08-10 (audit #232).** The recipient field now exists
+/// (`neoethos-core/src/config.rs`, `ModelsConfig::blend_gate_floor`, default
+/// 0.34), so this stops returning `None` and returns HIS number. The value goes
+/// through [`neoethos_trader::BlendConfig::from_config_values`], which REFUSES
+/// a non-finite value, one outside `[0,1]`, or an inverted pair back to the
+/// shipped defaults and logs both numbers — so there is no path by which a bad
+/// YAML value silently changes a live position size.
 ///
-/// When the field lands: `settings.map(|s| s.models.blend_gate_floor)`. Nothing
-/// else in this file moves.
+/// The shipped default is numerically identical to the old hardcoded
+/// `DEFAULT_BLEND_GATE_FLOOR`, so an operator who sets nothing sees no change:
+/// what moved is that the literal in the live sizing path became a knob he can
+/// actually reach.
 fn operator_blend_gate_floor(settings: Option<&neoethos_core::Settings>) -> Option<f64> {
-    let _ = settings; // recipient pending — see the doc comment above
-    None
+    // Written as a `match` with an `ident: Type` binding rather than
+    // `.map(|s| ...)` on purpose: `config_has_recipient`'s scanner resolves a
+    // field access by its RECEIVER's type, and a closure parameter resolves to
+    // nothing — so the `.map` spelling would leave this knob looking like an
+    // orphan in the very ledger that exists to find orphans.
+    match settings {
+        Some(s) => {
+            let s: &neoethos_core::Settings = s;
+            Some(s.models.blend_gate_floor)
+        }
+        None => None,
+    }
 }
 
-/// The operator's `models.blend_veto_below`, if he has set one.
-/// See [`operator_blend_gate_floor`] — same pending recipient, same file, and
-/// the same "returns `None` ⇒ shipped `DEFAULT_BLEND_VETO_BELOW` (0.15)" story.
+/// The operator's `models.blend_veto_below`.
+/// See [`operator_blend_gate_floor`] — same wiring, same validating
+/// constructor, same shipped default (`DEFAULT_BLEND_VETO_BELOW`, 0.15).
 fn operator_blend_veto_below(settings: Option<&neoethos_core::Settings>) -> Option<f64> {
-    let _ = settings; // recipient pending — see `operator_blend_gate_floor`
-    None
+    match settings {
+        Some(s) => {
+            let s: &neoethos_core::Settings = s;
+            Some(s.models.blend_veto_below)
+        }
+        None => None,
+    }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -696,39 +708,57 @@ async fn run(
         .map(|s| s.risk.max_lot_size)
         .filter(|v| *v > 0.0)
         .unwrap_or(f64::INFINITY);
-    // Portfolio-level concurrent-risk cap (0 = disabled): each entry budgets
-    // against `cap − open_positions × risk_per_trade` using the broker's LIVE
-    // position count, so many engines can't stack unbounded concurrent risk.
+    // Portfolio-level concurrent-risk cap: each entry budgets against
+    // `cap − open_positions × risk_per_trade` using the broker's LIVE position
+    // count, so many engines can't stack unbounded concurrent risk.
+    //
+    // THE 0.0 SENTINEL IS GONE (2026-08-10, audit #211). This used to read
+    // "0 = disabled", which meant that on a knob named `max_` the loosest
+    // possible setting and the never-touched field were spelled the same way —
+    // and `RiskConfig::default()` shipped 0.0, so every install ran with no
+    // portfolio ceiling and nothing said so. `Settings`' preset seal now
+    // re-seeds any non-positive value from the preset + trading mode
+    // (`config.rs:3897`), so a cap of 0 cannot arrive here through a loaded
+    // config at all. If one ever does — a hand-built `Settings`, a future
+    // caller that skips the seal — it is read LITERALLY: at most 0.0 of the
+    // account may be at risk concurrently, i.e. no entries. Loud and tight, not
+    // silently unlimited. The way to run without a ceiling is 1.0.
     let portfolio_risk_cap = sizing
         .as_ref()
         .map(|s| s.risk.max_portfolio_risk)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
+    if portfolio_risk_cap <= 0.0 {
+        tracing::error!(
+            target: "neoethos_app::live_trading",
+            max_portfolio_risk = portfolio_risk_cap,
+            "risk.max_portfolio_risk is not positive — the config seal should have \
+             re-seeded it. Reading it literally: NO concurrent risk is permitted, so \
+             every entry will be refused. Set it to 1.0 if you mean 'no ceiling'."
+        );
+    }
     // Weekend kill zones — force-close before the weekend, block Fri-late /
     // Mon-open entries.
     //
-    // CORRECTED 2026-08-04. This comment used to read:
+    // PARITY, AND IT IS REAL SINCE 2026-08-10 (audit #75/#217).
     //
-    //   "PARITY with the backtest (eval.rs): discovery runs with
-    //    kill_zones_enabled from the SAME config flag ... Live must match or
-    //    positions ride weekend gaps no validated strategy ever held through."
-    //
-    // Discovery does NOT read that flag. `discovery_backtest_settings`
-    // (neoethos-search/src/discovery.rs:1365) hardcodes
+    // History, so nobody re-opens this: from 2026-08-04 to 2026-08-10 the flag
+    // was ONE-SIDED. `discovery_backtest_settings` hardcoded
     // `kill_zones_enabled: true`, so every backtest that ever validated a
-    // strategy ran WITH kill zones, unconditionally. Only this live path
-    // consults `risk.kill_zones_enabled` (neoethos-core/src/config.rs:378,
-    // default true).
+    // strategy ran WITH kill zones unconditionally, while only this live path
+    // consulted `risk.kill_zones_enabled`. Setting it to `false` could
+    // therefore only move live AWAY from what was validated — holding through
+    // weekend gaps no backtest in the artifact history had ever held through —
+    // and never toward it. The defaults agree (both `true`), which is why it
+    // went unseen.
     //
-    // So the flag is not a shared switch, it is a one-sided one, and the
-    // failure it creates is exactly the one the old comment warned about:
-    // setting `risk.kill_zones_enabled = false` makes live hold through
-    // weekend gaps that no backtest in the artifact history ever held
-    // through. Defaults agree (both true), which is why this went unseen.
-    //
-    // Do not "restore parity" by wiring the flag into discovery without
-    // deciding which side is authoritative — that would silently re-score
-    // every strategy in the library against a different simulator.
+    // Both sides now read this same field: `DiscoveryConfig::kill_zones_enabled`
+    // is set from `settings.risk.kill_zones_enabled` in
+    // `DiscoveryConfig::from_settings` and consumed by
+    // `discovery_backtest_settings`. Turning it off re-scores against a
+    // different simulator, which is a decision the operator can now actually
+    // make: the value is part of the backtest policy hash and of the run
+    // profile, so artifacts from either side of the switch are distinguishable.
     let kill_zones_enabled = sizing
         .as_ref()
         .map(|s| s.risk.kill_zones_enabled)
@@ -928,6 +958,31 @@ async fn run(
             }
         }
     } else {
+        // #240 — MAKE THE WASTE VISIBLE, do not decide it.
+        //
+        // `models.live_ml_gate` is FALSE in the code default (`config.rs:2573`),
+        // in the shipped seed (`desktop/src-tauri/resources/config.yaml:272`)
+        // and in the operator's own store. Training still builds the full
+        // expert fleet on every run, and this engine then consults NONE of it.
+        // That is either an unshipped capability or hours of training spent for
+        // nothing, and only the operator can say which.
+        //
+        // It is deliberately NOT flipped here. Flipping it is coupled to
+        // #299/#310 (three numerically divergent artifacts — `tide` best_loss
+        // 1 308 811.5, `tide_nf` 51 699 690, `sac` final_alpha 5.69e9 — sit in
+        // `DEFAULT_BOOTSTRAP_EXPERT_NAMES` with no sanity check between "on
+        // disk" and "votes") and to #315 (`expert_weights` is empty, so every
+        // voter would weigh 1.0). Turning the gate on without those two would
+        // put those artifacts into a vote that SCALES REAL POSITION SIZE.
+        // Decide them together or not at all.
+        tracing::warn!(
+            target: "neoethos_app::live_trading",
+            %symbol, %base_tf,
+            "models.live_ml_gate is OFF — this engine trades on genes alone and reads NOTHING \
+             from the trained ensemble, which is rebuilt on every training run. Turning it on \
+             is gated on audit #299/#310 (no numerical-sanity check between a trained artifact \
+             and a voting one) and #315 (expert_weights empty ⇒ every expert weighs 1.0)"
+        );
         None
     };
     let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
@@ -1432,7 +1487,15 @@ async fn run(
                     }
                     // Close the loop: the retirement left a coverage gap on this
                     // (symbol, base_tf) — queue a fresh Discovery to refill it.
-                    // The retired strategy itself can never return (blacklisted).
+                    //
+                    // The retired strategy cannot come back (#218/#219): it
+                    // cannot be SELECTED (`is_blacklisted`, matched on the GENE
+                    // rather than the file bytes) and, since 2026-08-10, it
+                    // cannot be PROMOTED either — `neoethos_search::
+                    // live_portfolio` drops any retired RULE from the artifact
+                    // the trader consumes, reading this same blacklist file.
+                    // The GA can still spend time re-deriving it inside the run
+                    // queued on the next line; when it does, it says so.
                     crate::app_services::rediscovery::request(symbol.clone(), base_tf.clone());
                     break;
                 }
@@ -2122,28 +2185,32 @@ async fn run(
                 // Portfolio-level concurrent-risk budget (max_portfolio_risk):
                 // remaining = cap − open_positions × base_risk. Skip the
                 // entry when the budget is spent; size down when only part fits.
-                let mut effective_risk = base_risk;
-                if portfolio_risk_cap > 0.0 {
-                    let open_n = open_positions_now.unwrap_or(0) as f64;
-                    let remaining = portfolio_risk_cap - open_n * base_risk;
-                    if remaining <= f64::EPSILON {
-                        tracing::warn!(
-                            target: "neoethos_app::live_trading",
-                            %symbol, open_positions = open_n,
-                            cap = portfolio_risk_cap,
-                            "entry skipped — portfolio risk budget spent \
-                             (max_portfolio_risk reached across open positions)"
-                        );
-                        if let Ok(mut s) = status.lock() {
-                            s.last_signal =
-                                Some("blocked: portfolio risk budget spent".to_string());
-                        }
-                        // No entry happened — release the daily entry slot.
-                        ACCOUNT_DAILY_ENTRIES.release(today);
-                        continue;
+                //
+                // The `if portfolio_risk_cap > 0.0` guard that used to wrap this
+                // is DELETED (2026-08-10, audit #211): it made 0.0 mean "no
+                // ceiling" on a knob named `max_`, which is the same disguise
+                // `RiskConfig::default()` shipped. The cap is now always applied
+                // literally — a cap of 0 permits no concurrent risk and every
+                // entry is refused, which the ERROR at engine start names. "No
+                // ceiling" is spelled 1.0.
+                let open_n = open_positions_now.unwrap_or(0) as f64;
+                let remaining = portfolio_risk_cap - open_n * base_risk;
+                if remaining <= f64::EPSILON {
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, open_positions = open_n,
+                        cap = portfolio_risk_cap,
+                        "entry skipped — portfolio risk budget spent \
+                         (max_portfolio_risk reached across open positions)"
+                    );
+                    if let Ok(mut s) = status.lock() {
+                        s.last_signal = Some("blocked: portfolio risk budget spent".to_string());
                     }
-                    effective_risk = base_risk.min(remaining);
+                    // No entry happened — release the daily entry slot.
+                    ACCOUNT_DAILY_ENTRIES.release(today);
+                    continue;
                 }
+                let effective_risk = base_risk.min(remaining);
 
                 // Size by the account's risk %, using the EFFECTIVE stop
                 // distance actually placed on the order (gene SL / override /
@@ -2516,6 +2583,58 @@ mod tests {
     use super::*;
     use crate::app_services::journal_store::ClosedTrade;
     use neoethos_core::domain::risky_mode as rm;
+
+    /// The operator's `models.blend_*` numbers REACH the live blend (audit
+    /// #232).
+    ///
+    /// These two multipliers scale every entry's risk and were struct literals
+    /// in this file with no config recipient. The regression this pins is the
+    /// half-wired shape they were in before: readers that compiled, were
+    /// called, and returned `None` — so the run used the shipped default no
+    /// matter what the operator typed, and looked identical either way.
+    #[test]
+    fn the_operator_blend_multipliers_reach_the_live_blend_config() {
+        let mut settings = neoethos_core::Settings::default();
+        settings.models.blend_gate_floor = 0.61;
+        settings.models.blend_veto_below = 0.11;
+
+        assert_eq!(operator_blend_gate_floor(Some(&settings)), Some(0.61));
+        assert_eq!(operator_blend_veto_below(Some(&settings)), Some(0.11));
+
+        let cfg = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            operator_blend_gate_floor(Some(&settings)),
+            operator_blend_veto_below(Some(&settings)),
+        );
+        assert!(
+            (cfg.gate_floor - 0.61).abs() < 1e-9 && (cfg.veto_below - 0.11).abs() < 1e-9,
+            "the configured pair must be the pair the live blend uses, got {} / {}",
+            cfg.gate_floor,
+            cfg.veto_below
+        );
+
+        // No settings at all is still the shipped default, not a panic.
+        let shipped = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            operator_blend_gate_floor(None),
+            operator_blend_veto_below(None),
+        );
+        let default = neoethos_trader::BlendConfig::default();
+        assert!((shipped.gate_floor - default.gate_floor).abs() < 1e-9);
+        assert!((shipped.veto_below - default.veto_below).abs() < 1e-9);
+
+        // And an inverted pair is refused back to the shipped defaults rather
+        // than vetoing every floored bar.
+        settings.models.blend_gate_floor = 0.10;
+        settings.models.blend_veto_below = 0.90;
+        let refused = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            operator_blend_gate_floor(Some(&settings)),
+            operator_blend_veto_below(Some(&settings)),
+        );
+        assert!((refused.gate_floor - default.gate_floor).abs() < 1e-9);
+        assert!((refused.veto_below - default.veto_below).abs() < 1e-9);
+    }
 
     #[test]
     fn account_level_tiers_halt_for_24h_and_order_level_tiers_do_not() {

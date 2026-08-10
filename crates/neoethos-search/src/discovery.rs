@@ -23,7 +23,7 @@ use neoethos_core::contracts::{
 };
 use neoethos_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -238,75 +238,19 @@ impl DiscoveryRuntimeOverrides {
 /// values, once per run.
 ///
 /// Called from [`DiscoveryConfig::from_settings`]. It changes no behaviour — it
-/// removes the ability for a duplicate to be edited invisibly. The three pairs
-/// here are the ones whose deciding read lives in `neoethos-search`; the shape
-/// is deliberately copied from `session_spread_pips()` above, which the
-/// 2026-08-09 knob pass names as the honest pattern every other twin should
-/// look like.
+/// removes the ability for a duplicate to be edited invisibly. The pairs here
+/// are the ones whose deciding read lives in `neoethos-search`; the shape is
+/// deliberately copied from `session_spread_pips()` above, which the 2026-08-09
+/// knob pass names as the honest pattern every other twin should look like.
+///
+/// The TRAILING pair is gone from this function (2026-08-10, audit #206) —
+/// not silenced, RESOLVED: the `risk.trailing_*` four were deleted from
+/// `RiskConfig`, so `models.exit_policy.*` is now the only place the trail can
+/// be set and there is no second value to name. A store that still carries the
+/// old keys is told so by name, with the rename, by `RETIRED_KEYS` in
+/// `neoethos-core/src/config.rs`.
 fn resolve_and_log_duplicate_knobs(settings: &neoethos_core::Settings) {
-    // ── 1. TRAILING 💰 ───────────────────────────────────────────────────────
-    //
-    // `models.exit_policy.*` DECIDES. `risk.trailing_*` reaches nothing.
-    //
-    // The search's exit geometry arrives through
-    // `StrategyEvaluationRuntimeOverrides::exit_policy` → `EvaluationConfig::
-    // default()` (strategy_gene.rs) → every evaluator, CPU and CUDA alike. The
-    // `risk.trailing_*` four are ledgered as SHADOWED DUPLICATE in
-    // `config_has_recipient.rs`. The operator's live store at
-    // `%LOCALAPPDATA%\neoethos\config.yaml` sets the RISK copy — including
-    // hand-tuned `trailing_atr_multiplier: 0.4` and `trailing_be_trigger_r:
-    // 0.1` — and does not contain an `exit_policy` block at all, so those
-    // deliberate numbers move nothing and the ExitPolicy Rust defaults are what
-    // actually runs.
-    //
-    // NOTE for whoever deletes the risk four: live execution
-    // (`live_trading.rs`) trails UNCONDITIONALLY with no config recipient of any
-    // kind. Deleting the visible-but-dead keys before live reads
-    // `models.exit_policy` converts a visibly-wrong value into an invisible
-    // hardcode on the path that spends real money. Log first, wire live, then
-    // delete.
-    let risk_trail = &settings.risk;
-    let exit = &settings.models.exit_policy;
-    let trailing_disagrees = risk_trail.trailing_enabled != exit.trailing_enabled
-        || (risk_trail.trailing_atr_multiplier - exit.trailing_stop_multiplier).abs()
-            > f64::EPSILON
-        || (risk_trail.trailing_be_trigger_r - exit.trailing_be_trigger_r).abs() > f64::EPSILON
-        || (risk_trail.trailing_min_lock_pips - exit.trailing_min_lock_pips).abs() > f64::EPSILON;
-    if trailing_disagrees {
-        tracing::warn!(
-            target: "neoethos_search::config_resolution",
-            winner = "models.exit_policy",
-            loser = "risk.trailing_*",
-            effective_trailing_enabled = exit.trailing_enabled,
-            effective_stop_multiplier = exit.trailing_stop_multiplier,
-            effective_be_trigger_r = exit.trailing_be_trigger_r,
-            effective_min_lock_pips = exit.trailing_min_lock_pips,
-            ignored_risk_trailing_enabled = risk_trail.trailing_enabled,
-            ignored_risk_atr_multiplier = risk_trail.trailing_atr_multiplier,
-            ignored_risk_be_trigger_r = risk_trail.trailing_be_trigger_r,
-            ignored_risk_min_lock_pips = risk_trail.trailing_min_lock_pips,
-            "TRAILING IS SET TWICE AND THE TWO DISAGREE. This search uses \
-             models.exit_policy.*; the risk.trailing_* values above are ignored — they \
-             reach no evaluator, CPU or CUDA. If the risk.* numbers are the ones you \
-             tuned, copy them into models.exit_policy.* (note the rename: \
-             risk.trailing_atr_multiplier -> models.exit_policy.trailing_stop_multiplier, \
-             and despite its old name it was never an ATR multiple — it is a multiple of \
-             the position's own stop distance)."
-        );
-    } else {
-        tracing::info!(
-            target: "neoethos_search::config_resolution",
-            winner = "models.exit_policy",
-            trailing_enabled = exit.trailing_enabled,
-            trailing_stop_multiplier = exit.trailing_stop_multiplier,
-            trailing_be_trigger_r = exit.trailing_be_trigger_r,
-            trailing_min_lock_pips = exit.trailing_min_lock_pips,
-            "trailing resolved from models.exit_policy (risk.trailing_* is a shadowed \
-             duplicate and agrees with it)"
-        );
-    }
-
-    // ── 2. COST 💰 ───────────────────────────────────────────────────────────
+    // ── COST 💰 ───────────────────────────────────────────────────────────
     //
     // `risk.*` DECIDES, unconditionally. `models.eval_runtime.spread_pips` /
     // `.commission_per_trade` reach nothing in a discovery run.
@@ -347,7 +291,7 @@ fn resolve_and_log_duplicate_knobs(settings: &neoethos_core::Settings) {
         );
     }
 
-    // ── 3. SYMBOL / ACCOUNT CURRENCY 💰 ──────────────────────────────────────
+    // ── SYMBOL / ACCOUNT CURRENCY 💰 ──────────────────────────────────────
     //
     // `system.*` DECIDES whenever non-empty, and `from_settings` above reads
     // ONLY `system.*`. Two `symbol:` keys ~1300 lines apart in the same file is
@@ -561,6 +505,26 @@ pub struct DiscoveryConfig {
     /// 0.0 only when the symbol has no swap metadata (logged loudly).
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
+    /// Weekend kill zones — force-close before the weekend close and block
+    /// Friday-late / Monday-open entries (`eval.rs:1537`, `:1654`).
+    ///
+    /// WIRED 2026-08-10 (audit #75/#217). This was the literal `true` in
+    /// [`discovery_backtest_settings`], sitting between two fields that read
+    /// `config.`. Live read `risk.kill_zones_enabled`
+    /// (`live_trading.rs:732-735`) and the search read nothing, so the knob was
+    /// ONE-SIDED: setting it to `false` could only make live hold through
+    /// weekend gaps that no backtest in the artifact history had ever held
+    /// through. It could never make live match a validated backtest, because no
+    /// backtest could be run with kill zones off.
+    ///
+    /// Both sides now read the same `risk.kill_zones_enabled` (default `true`,
+    /// `config.rs:671`), so the shipped behaviour is unchanged and the two sides
+    /// can no longer disagree. Turning it OFF re-scores against a different
+    /// simulator, and that is visible rather than silent: the value is part of
+    /// the backtest policy hash (`DiscoveryBacktestPolicy::kill_zones_enabled`)
+    /// and of the run profile, so artifacts produced on either side of the
+    /// switch are distinguishable after the fact.
+    pub kill_zones_enabled: bool,
     pub population: usize,
     /// When `true`, `run_search` raises the GA population to the card's fits
     /// ceiling (bounded to 16 384, never below `population`) and logs the
@@ -638,8 +602,15 @@ pub struct DiscoveryConfig {
     pub mc_min_profitable: u32,
     /// Spread (pips) used in the sensitivity test. Previously hardcoded 2.0.
     pub sensitivity_spread_pips: f64,
-    /// Commission per lot used in the sensitivity test. Previously
-    /// hardcoded $7/lot.
+    /// Commission per lot used in the sensitivity test — a ROUND-TRIP charge,
+    /// like [`Self::evaluation_commission_per_trade`], because the stress pass
+    /// subtracts it exactly once per closed trade.
+    ///
+    /// `from_settings` puts `models.prop_search_sensitivity_commission_per_lot`
+    /// through the same `round_trip_commission_per_lot` conversion as the
+    /// baseline (gated on `risk.commission_per_lot_is_per_side`) and then
+    /// clamps it UP to the baseline: a stress scenario may cost more than the
+    /// run it stresses, never less.
     pub sensitivity_commission_per_lot: f64,
     /// Opt-in adaptive coarse-threshold ladder (config-driven replacement
     /// for the `NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS` env flag). Read by
@@ -745,6 +716,11 @@ impl Default for DiscoveryConfig {
             cost_band_pips: Some((1.6, 2.4)),
             swap_long_pips_per_day: 0.0,
             swap_short_pips_per_day: 0.0,
+            // Same value `RiskConfig::default()` ships (`config.rs:671`), so a
+            // config-less fallback searches under the same weekend policy the
+            // live loop applies. See the field's doc for why this is one knob
+            // and not two.
+            kill_zones_enabled: true,
             population: 1000,
             population_auto: false,
             generations: 10,
@@ -802,7 +778,17 @@ impl Default for DiscoveryConfig {
             mc_runs: 100,
             mc_min_profitable: 70,
             sensitivity_spread_pips: 2.0,
-            sensitivity_commission_per_lot: 7.0,
+            // ROUND TRIP, not per side (2026-08-10, same change that put
+            // `from_settings` through `round_trip_commission_per_lot`). The
+            // field is subtracted ONCE per closed trade, so the per-side 7.0
+            // that stood here was half a stress test: the "higher commission"
+            // pass charged less than the baseline it was stressing and every
+            // candidate cleared it. 14.0 is the shipped
+            // `risk.commission_per_lot: 7.0` per side taken both ways, which is
+            // exactly what `from_settings(&Settings::default())` resolves to —
+            // the two production constructors are pinned together by
+            // `discovery_config_default_vs_from_settings_divergence_does_not_grow`.
+            sensitivity_commission_per_lot: 14.0,
             // Matches `DiscoveryRuntimeConfig::default()`, which moved to `true`
             // in the same batch. The gene threshold ladder's own comment says it
             // is "calibrated for z-score-normalised features"; leaving this
@@ -1084,6 +1070,9 @@ impl DiscoveryConfig {
             cost_band_pips,
             swap_long_pips_per_day: swap_long,
             swap_short_pips_per_day: swap_short,
+            // #75/#217: the SAME field the live loop reads
+            // (`live_trading.rs:732-735`). One knob, both sides.
+            kill_zones_enabled: settings.risk.kill_zones_enabled,
             population: model_settings.prop_search_population.max(10),
             population_auto: model_settings.prop_search_population_auto,
             generations: model_settings.prop_search_generations.max(1),
@@ -1162,9 +1151,44 @@ impl DiscoveryConfig {
                 .prop_search_mc_min_profitable
                 .min(model_settings.prop_search_mc_runs.max(1)),
             sensitivity_spread_pips: model_settings.prop_search_sensitivity_spread_pips.max(0.0),
-            sensitivity_commission_per_lot: model_settings
-                .prop_search_sensitivity_commission_per_lot
-                .max(0.0),
+            // SAME PER-SIDE→ROUND-TRIP CONVERSION AS THE BASELINE (2026-08-10).
+            //
+            // This number is assigned straight into `settings.commission_per_trade`
+            // for the stress pass (`discovery.rs` sensitivity arm) and into the
+            // scenario descriptor, and BOTH charge it exactly once per closed
+            // trade — the same contract as `evaluation_commission_per_trade`. It
+            // was the one commission input that never went through
+            // `round_trip_commission_per_lot`, so at the shipped defaults
+            // (`risk.commission_per_lot: 7.0` per side → 14.0 round trip, and
+            // `prop_search_sensitivity_commission_per_lot: 7.0` charged as-is)
+            // the "higher commission" stress test charged HALF the baseline. A
+            // stress scenario that is cheaper than the run it stresses passes
+            // everything, which is worse than not running it.
+            //
+            // The `.max(baseline)` is not a repair of a bad number, it is the
+            // definition of the pass: a sensitivity test is the baseline cost or
+            // worse, never better. It is logged when it binds.
+            sensitivity_commission_per_lot: {
+                let quoted = model_settings
+                    .prop_search_sensitivity_commission_per_lot
+                    .max(0.0);
+                let round_trip = crate::genetic::strategy_gene::round_trip_commission_per_lot(
+                    quoted,
+                    commission_is_per_side,
+                );
+                if round_trip < resolved_commission {
+                    tracing::warn!(
+                        target: "neoethos_search::cost_model",
+                        sensitivity_quoted_per_lot = quoted,
+                        sensitivity_round_trip = round_trip,
+                        baseline_round_trip = resolved_commission,
+                        "models.prop_search_sensitivity_commission_per_lot is BELOW the \
+                         baseline commission — raising it to the baseline so the stress \
+                         pass cannot be cheaper than the run it stresses"
+                    );
+                }
+                round_trip.max(resolved_commission)
+            },
             adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
             mode: resolve_discovery_mode(
                 &settings.system.trading_mode,
@@ -1438,6 +1462,23 @@ impl DiscoveryConfig {
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryResult {
+    /// The cost-band verdict for every candidate that SURVIVED the quality
+    /// screen, as `(strategy_id, verdict)` — audit #71.
+    ///
+    /// The band was measured at both edges and counted run-level since
+    /// 2026-08-09, and then DROPPED at this boundary: the export loop bound it
+    /// `_cost_band` and threw it away, so a gene profitable only at the
+    /// optimistic 1.6-pip edge reached `live_portfolio.json` indistinguishable
+    /// from one profitable across the whole band. The census answered "how many"
+    /// and nothing answered "which", which is the question an operator looking
+    /// at a deployed strategy is actually asking.
+    ///
+    /// EMPTY IS NOT "ALL CLEAR". It means the quality screen did not run, or ran
+    /// with no band configured. A reader that treats an absent entry as
+    /// `SurvivesBand` re-creates the defect; the verdict for a gene with no
+    /// entry is [`CostBandVerdict::Unmeasured`], which is what
+    /// [`cost_band_for_strategy`] returns.
+    pub cost_band_by_strategy: Vec<(String, CostBandVerdict)>,
     pub portfolio: Vec<Gene>,
     pub candidates: Vec<Gene>,
     pub quality_metrics: Vec<StrategyMetrics>,
@@ -1469,6 +1510,21 @@ pub struct DiscoveryResult {
     /// even open the funnel — production callers should treat that as a
     /// bug, not a normal case.
     pub funnel_profile: Option<crate::funnel_profile::FunnelProfile>,
+}
+
+impl DiscoveryResult {
+    /// What the cost band said about this strategy — audit #71.
+    ///
+    /// A strategy with no entry is [`CostBandVerdict::Unmeasured`], never
+    /// `SurvivesBand`: "we did not measure" and "it passed" are different
+    /// answers and only one of them supports a claim.
+    pub fn cost_band_for_strategy(&self, strategy_id: &str) -> CostBandVerdict {
+        self.cost_band_by_strategy
+            .iter()
+            .find(|(id, _)| id == strategy_id)
+            .map(|(_, verdict)| *verdict)
+            .unwrap_or(CostBandVerdict::Unmeasured)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1684,6 +1740,11 @@ pub struct DiscoveryRunProfile {
     /// the cost basis: two runs at different swap are not comparable.
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
+    /// Weekend kill zones as this run resolved them (`risk.kill_zones_enabled`).
+    /// Recorded from 2026-08-10: it decides whether a Friday-evening position
+    /// was force-closed and whether Monday-open entries were blocked, so two
+    /// runs that differ on it are not the same experiment.
+    pub kill_zones_enabled: bool,
     /// Discovery regime (Strict / PropFirm / Risky) — changes filter floors,
     /// ranking, and gates. Was NOT recorded before slice 5.
     pub mode: DiscoveryMode,
@@ -2071,7 +2132,9 @@ fn discovery_backtest_settings(
         // the CPU path and the CUDA kernel; it was silently 0 here before).
         swap_long_pips_per_day: config.swap_long_pips_per_day,
         swap_short_pips_per_day: config.swap_short_pips_per_day,
-        kill_zones_enabled: true,
+        // #75/#217 (2026-08-10). This was the literal `true`, between two
+        // fields that read `config.`. It is now the one knob both sides read.
+        kill_zones_enabled: config.kill_zones_enabled,
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
         ..crate::eval::BacktestSettings::default()
@@ -4701,22 +4764,31 @@ pub fn cost_band_discriminates(band: Option<(f64, f64)>, baseline_cost_pips: f64
 /// `OptimisticEdgeOnly` is the finding this type exists to make unmissable:
 /// profitable at the cheap end of the band and not at the expensive end. It is
 /// NOT a result, and it must not be reported as one.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// `Serialize`/`Deserialize` added 2026-08-10 (#71) so the verdict can be
+/// written into `live_portfolio.json` beside the genes it judges. The wire
+/// spelling is exactly [`CostBandVerdict::label`], so a log line and an
+/// artifact can be grepped with the same string.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CostBandVerdict {
     /// No band configured, or both launches failed. The candidate carries NO
     /// cost-robustness evidence — which is different from carrying good news.
     #[default]
+    #[serde(rename = "cost_band_unmeasured")]
     Unmeasured,
     /// The band cannot discriminate: its pessimistic edge is at or below the
     /// cost the run already charged, so passing it is arithmetic, not evidence.
     /// Counted separately and never as good news. See
     /// [`cost_band_discriminates`].
+    #[serde(rename = "cost_band_not_discriminating")]
     NotDiscriminating,
     /// Profitable at BOTH edges. The only verdict that supports a claim.
+    #[serde(rename = "cost_band_survives")]
     SurvivesBand,
     /// Profitable at the optimistic edge, not at the pessimistic one.
+    #[serde(rename = "cost_band_optimistic_edge_only")]
     OptimisticEdgeOnly,
     /// Unprofitable at both edges.
+    #[serde(rename = "cost_band_fails")]
     FailsBand,
 }
 
@@ -5046,9 +5118,11 @@ where
     // Auto-enable the fused VRAM-resident eval (signals stay on the GPU, no host
     // round-trip) IFF it proves byte-identical to the windowed path on THIS
     // machine's card — resolved + logged up-front so the ~sub-second probe runs
-    // before the GA loop, not lazily mid-generation. The operator can still force
-    // it either way via NEOETHOS_GPU_FUSED_EVAL. This is the biggest win on dense
-    // timeframes (M1/M5), where the signal matrix is largest.
+    // before the GA loop, not lazily mid-generation. There is NO operator override
+    // (`NEOETHOS_GPU_FUSED_EVAL` was deleted 2026-08-10): the decision is
+    // auto-detected — OFF when native prototype B owns population eval, OFF on an
+    // integrated GPU, otherwise decided by the byte-parity probe. This is the
+    // biggest win on dense timeframes (M1/M5), where the signal matrix is largest.
     #[cfg(feature = "gpu")]
     crate::cubecl_eval::ensure_fused_eval_decided();
 
@@ -7646,6 +7720,10 @@ where
     // Same contract: all-zero when the screen is skipped, so an absent band is
     // never reported as a band that everything passed.
     let mut cost_band_census = CostBandCensus::default();
+    // Per-strategy companion to the census (audit #71): the census answers "how
+    // many", this answers "which". Same contract — EMPTY when the screen is
+    // skipped, and an absent entry reads as `Unmeasured`, never as a pass.
+    let mut cost_band_by_strategy: Vec<(String, CostBandVerdict)> = Vec::new();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -8594,16 +8672,15 @@ where
                 // of the band is still a survivor of the screen the operator
                 // configured — it is just not a result.
                 //
-                // HOW FAR THE VERDICT ACTUALLY TRAVELS, corrected 2026-08-09: it
-                // rides on the survivor through this function and is counted
+                // HOW FAR THE VERDICT TRAVELS, corrected again 2026-08-10 (#71):
+                // it rides on the survivor through this function, is counted
                 // run-level in `CostBandCensus` and on the funnel's
-                // `passed_quality` stage. It does NOT reach the exported
-                // portfolio — the export loop drops it (see the `_cost_band`
-                // bind below). So a reader of `live_portfolio.json` CANNOT see
-                // which genes were optimistic-edge-only; only the run's log and
-                // funnel say so. Carrying it into the portfolio structs is the
-                // follow-up, and until it lands this comment must not claim
-                // otherwise.
+                // `passed_quality` stage, AND is now carried per strategy out of
+                // the export loop on `DiscoveryResult::cost_band_by_strategy`
+                // and into `live_portfolio.json` as `cost_band`. Until today the
+                // export loop bound it `_cost_band` and dropped it, so a reader
+                // of the one artifact a live run consumes could not tell an
+                // optimistic-edge-only gene from one robust across the band.
                 let cost_band = if config.cost_band_pips.is_some() && !band_discriminates {
                     CostBandVerdict::NotDiscriminating
                 } else {
@@ -8923,12 +9000,17 @@ where
 
         let mut screened_genes = Vec::with_capacity(strict_passed.len());
         let mut screened_signals = Vec::with_capacity(strict_passed.len());
-        // `_cost_band` is bound rather than dropped by a bare `_` so that adding
-        // a tuple slot cannot silently sail past this site. The verdict itself
-        // is already counted in `cost_band_census` and logged; carrying it into
-        // the portfolio structs is the follow-up that belongs with the export
-        // path, not with the screen.
-        for (candidate_idx, gene, sig, _, _, _, _cost_band) in strict_passed {
+        // AUDIT #71 CLOSED HERE (2026-08-10). This loop used to bind the verdict
+        // `_cost_band` and drop it, which is where the band stopped travelling:
+        // it was measured at both edges and counted run-level, and then the only
+        // artifact a live run reads could not say WHICH genes were
+        // optimistic-edge-only. The verdict now rides out on
+        // `DiscoveryResult::cost_band_by_strategy`, keyed by `strategy_id` —
+        // the same key `logged_trades` uses, so no positional assumption is
+        // made about a portfolio that is re-ranked and correlation-pruned
+        // downstream.
+        for (candidate_idx, gene, sig, _, _, _, cost_band) in strict_passed {
+            cost_band_by_strategy.push((gene.strategy_id.clone(), cost_band));
             screened_genes.push((candidate_idx, gene));
             screened_signals.push(sig);
         }
@@ -9682,6 +9764,7 @@ where
     log_goal_report(config, &portfolio, &quality_metrics, &logged_trades);
 
     Ok(DiscoveryResult {
+        cost_band_by_strategy,
         portfolio,
         candidates: ranked_candidate_genes,
         quality_metrics,
@@ -10545,6 +10628,7 @@ pub fn build_discovery_profile(
         cost_band_pips,
         swap_long_pips_per_day,
         swap_short_pips_per_day,
+        kill_zones_enabled,
         population,
         generations,
         max_indicators,
@@ -10708,6 +10792,7 @@ pub fn build_discovery_profile(
         cost_band_pips: *cost_band_pips,
         swap_long_pips_per_day: *swap_long_pips_per_day,
         swap_short_pips_per_day: *swap_short_pips_per_day,
+        kill_zones_enabled: *kill_zones_enabled,
         mode: *mode,
         target_profile: *target_profile,
         max_pbo: *max_pbo,

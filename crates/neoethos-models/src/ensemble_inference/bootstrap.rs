@@ -172,37 +172,62 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
 
 /// Build a [`SoftVotingEnsemble`] for `<models_root>/<symbol>/<tf>/`.
 ///
-/// Returns `Ok((ensemble, outcome))` even when many experts are
-/// missing — only fails if NO Classification3 voter loaded
-/// (caller should then refuse to start auto-trade). The
-/// `outcome` is also reachable via `ensemble.load_outcome()` but
-/// the caller often wants it BEFORE deciding whether to use the
-/// ensemble at all.
+/// Succeeds even when many experts are missing — it fails only if NO
+/// Classification3 voter loaded (the caller should then refuse to start
+/// auto-trade). The load outcome is reachable via `ensemble.load_outcome()`.
+///
+/// The voting config comes from `models.ensemble_voting`
+/// (audit #168). There is no second builder that takes a
+/// [`SoftVotingEnsembleConfig`] argument: `build_ensemble_for_symbol_with_config`
+/// existed, was called by nothing, and was the reason the
+/// live ensemble ran on `SoftVotingEnsembleConfig::default()` —
+/// all ~33 experts at weight 1.0 — on every install. It is
+/// deleted; this is the only way to build the live ensemble,
+/// and it reads the operator's file.
 pub fn build_ensemble_for_symbol(
     models_root: &Path,
     symbol: &str,
     timeframe: &str,
 ) -> Result<SoftVotingEnsemble> {
-    build_ensemble_for_symbol_with_config(
-        models_root,
-        symbol,
-        timeframe,
-        SoftVotingEnsembleConfig::default(),
-    )
+    let outcome = load_experts_for_symbol(models_root, symbol, timeframe)?;
+    SoftVotingEnsemble::new(outcome, voting_config_from_settings()?)
+        .context("construct SoftVotingEnsemble from load outcome")
 }
 
-/// Same as [`build_ensemble_for_symbol`] with an explicit
-/// SoftVoting config (e.g. operator-overridden expert weights /
-/// exclusion list).
-pub fn build_ensemble_for_symbol_with_config(
-    models_root: &Path,
-    symbol: &str,
-    timeframe: &str,
-    config: SoftVotingEnsembleConfig,
-) -> Result<SoftVotingEnsemble> {
-    let outcome = load_experts_for_symbol(models_root, symbol, timeframe)?;
-    SoftVotingEnsemble::new(outcome, config)
-        .context("construct SoftVotingEnsemble from load outcome")
+/// Resolve [`SoftVotingEnsembleConfig`] from `models.ensemble_voting`.
+///
+/// Fail-loud on BOTH arms. A config that cannot be read, or one whose anomaly
+/// knees are inverted, must not be silently replaced with the built-in default:
+/// that default is a different combining rule, and this one scales live
+/// position size. The caller (`live_trading`) already treats an ensemble build
+/// error as "run gene-only, and say so loudly", which is the correct response
+/// to "I do not know what the operator configured".
+fn voting_config_from_settings() -> Result<SoftVotingEnsembleConfig> {
+    let settings: neoethos_core::Settings = neoethos_core::Settings::load()
+        .context("read models.ensemble_voting for the live soft-voting ensemble")?;
+    voting_config(&settings.models.ensemble_voting)
+}
+
+/// The translation itself, on an explicitly typed borrow so the config-recipient
+/// scanner can see which fields are read and so this is testable without
+/// touching the operator's file.
+fn voting_config(
+    voting: &neoethos_core::config::EnsembleVotingConfig,
+) -> Result<SoftVotingEnsembleConfig> {
+    voting
+        .validate()
+        .map_err(|why| anyhow::anyhow!("{why}"))
+        .context("models.ensemble_voting is not a usable configuration")?;
+    Ok(SoftVotingEnsembleConfig {
+        expert_weights: voting
+            .expert_weights
+            .iter()
+            .map(|(name, weight)| (name.clone(), *weight as f32))
+            .collect(),
+        excluded_names: voting.excluded_experts.iter().cloned().collect(),
+        anomaly_lo: voting.anomaly_lo as f32,
+        anomaly_hi: voting.anomaly_hi as f32,
+    })
 }
 
 /// Lower-level helper: build the registry, resolve the per-symbol
@@ -444,6 +469,49 @@ mod tests {
         assert_eq!(outcome.degraded_count(), 0);
         assert_eq!(outcome.missing_count(), 33);
         assert!(!outcome.has_any_loaded());
+    }
+
+    /// Audit #168. The shipped default must combine exactly as the deleted
+    /// `SoftVotingEnsembleConfig::default()` did, or wiring the config would
+    /// itself change live sizing on every install that never edits the file.
+    #[test]
+    fn the_shipped_voting_config_reproduces_the_old_hardcoded_default() {
+        let resolved = voting_config(&neoethos_core::config::EnsembleVotingConfig::default())
+            .expect("the shipped default must be a valid configuration");
+        let old = SoftVotingEnsembleConfig::default();
+        assert!(resolved.expert_weights.is_empty());
+        assert!(resolved.excluded_names.is_empty());
+        assert_eq!(resolved.anomaly_lo, old.anomaly_lo);
+        assert_eq!(resolved.anomaly_hi, old.anomaly_hi);
+    }
+
+    /// A weight the operator can type must actually reach the aggregator —
+    /// that is the whole defect this item names.
+    #[test]
+    fn an_operator_weight_reaches_the_aggregator() {
+        let mut voting = neoethos_core::config::EnsembleVotingConfig::default();
+        voting.expert_weights.insert("xgboost".into(), 3.0);
+        voting.excluded_experts.push("tide".into());
+        let resolved = voting_config(&voting).expect("valid");
+        assert_eq!(resolved.expert_weights.get("xgboost"), Some(&3.0_f32));
+        assert!(resolved.excluded_names.contains("tide"));
+    }
+
+    /// Inverted knees veto every trade. That is a refusal, not a default.
+    #[test]
+    fn an_inverted_anomaly_band_is_refused_by_name() {
+        let mut voting = neoethos_core::config::EnsembleVotingConfig::default();
+        voting.anomaly_hi = 0.1;
+        let error = voting_config(&voting).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("anomaly_hi"), "{error:#}");
+    }
+
+    #[test]
+    fn a_negative_vote_weight_is_refused_by_name() {
+        let mut voting = neoethos_core::config::EnsembleVotingConfig::default();
+        voting.expert_weights.insert("lightgbm".into(), -1.0);
+        let error = voting_config(&voting).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("lightgbm"), "{error:#}");
     }
 
     #[test]

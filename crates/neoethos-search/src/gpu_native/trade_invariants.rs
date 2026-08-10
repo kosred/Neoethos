@@ -193,6 +193,50 @@ pub fn check_pnl_reconciles(
     })
 }
 
+/// The whole net over one device readback, as one call.
+///
+/// `aggregates` is `(candidate_id, net_profit)` straight off the reducer's
+/// metric rows — `values[0]`. Every candidate that appears there is reconciled
+/// against the trades that were settled for it, and every settled trade is held
+/// to the per-trade properties above.
+///
+/// Returns rendered complaints rather than the typed violations because the two
+/// checks produce different shapes and every caller so far wants the same
+/// thing: a list to refuse the run with. An empty vector means the readback
+/// held.
+///
+/// `events` may be empty. The device does not maintain an event stream — the
+/// reduce opens positions from the signal, and `read_diagnostics` passes a null
+/// events pointer deliberately (`neoethos-gpu-cuda/src/population.rs:700`) — so
+/// on that path the two price-window properties do not fire and the arithmetic
+/// properties do. Callers that *do* have the entries (a host reference walk)
+/// get the window bound checked as well.
+pub fn audit_device_outcomes(
+    events: &[NeoPopulationEvent],
+    outcomes: &[NeoPopulationOutcome],
+    aggregates: &[(u64, f64)],
+    prices: PriceSeries<'_>,
+    pip_value: f64,
+    pip_value_per_lot: f64,
+) -> Vec<String> {
+    let mut complaints: Vec<String> = check_trade_invariants(
+        events,
+        outcomes,
+        prices,
+        pip_value,
+        pip_value_per_lot,
+    )
+    .into_iter()
+    .map(|violation| violation.to_string())
+    .collect();
+    for (candidate_id, net_profit) in aggregates {
+        if let Some(complaint) = check_pnl_reconciles(outcomes, *candidate_id, *net_profit) {
+            complaints.push(complaint);
+        }
+    }
+    complaints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +363,55 @@ mod tests {
         assert!(check_pnl_reconciles(&trades, 1, 18.0).is_none());
         let complaint = check_pnl_reconciles(&trades, 1, 25.0).expect("mismatch must be reported");
         assert!(complaint.contains("18"), "{complaint}");
+    }
+
+    /// The device path supplies no events. The arithmetic properties and the
+    /// reconciliation must still fire, or wiring the net there buys nothing.
+    #[test]
+    fn the_audit_still_bites_when_the_device_supplies_no_event_stream() {
+        let high = [100.0, 101.0];
+        let low = [100.0, 99.0];
+        let mut bad = outcome(-1.0, 0.0, 10.0, -1.0);
+        bad.exit_bar = 1;
+        let complaints = audit_device_outcomes(
+            &[],
+            &[bad],
+            &[(1, 999.0)],
+            PriceSeries { high: &high, low: &low },
+            0.01,
+            1.0,
+        );
+        assert!(
+            complaints.iter().any(|c| c.contains("mfe_non_negative")),
+            "{complaints:?}"
+        );
+        assert!(
+            complaints
+                .iter()
+                .any(|c| c.contains("r_multiple_sign_matches_pnl")),
+            "{complaints:?}"
+        );
+        assert!(
+            complaints.iter().any(|c| c.contains("reducer reported 999")),
+            "{complaints:?}"
+        );
+    }
+
+    #[test]
+    fn an_honest_readback_produces_no_complaints() {
+        let high = [100.0, 101.0, 102.0, 100.5, 100.0];
+        let low = [100.0, 99.5, 100.0, 99.0, 100.0];
+        let honest = [outcome(200.0, 100.0, 50.0, 1.0)];
+        assert!(
+            audit_device_outcomes(
+                &[event(POPULATION_DIRECTION_LONG, 100.0)],
+                &honest,
+                &[(1, 50.0)],
+                PriceSeries { high: &high, low: &low },
+                0.01,
+                1.0,
+            )
+            .is_empty()
+        );
     }
 }

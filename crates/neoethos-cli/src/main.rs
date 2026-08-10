@@ -212,6 +212,7 @@ fn main() -> Result<()> {
         "import" => cmd_import(&args[2..]),
         "config" => cmd_config(&args[2..]),
         "auto-loop" => cmd_auto_loop(&args[2..]),
+        "autoresearch" => cmd_autoresearch(&args[2..]),
         "schedule" => cmd_schedule(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         "wizard" => cmd_wizard(&args[2..]),
@@ -658,7 +659,10 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             neoethos_trader::replay_portfolio_from_dir(
                 &root,
                 &portfolio,
-                replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
+                neoethos_trader::EngineConfig::for_replay_from_settings(
+                    settings.as_ref(),
+                    &default_symbol(settings.as_ref()),
+                ),
             )?
         } else {
             let models_root =
@@ -702,7 +706,10 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
                 &root,
                 &portfolio,
                 &models_root,
-                replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
+                neoethos_trader::EngineConfig::for_replay_from_settings(
+                    settings.as_ref(),
+                    &default_symbol(settings.as_ref()),
+                ),
                 blend,
             )?
         }
@@ -721,7 +728,7 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             &root,
             &symbol,
             &base,
-            replay_engine_config(settings.as_ref(), &symbol),
+            neoethos_trader::EngineConfig::for_replay_from_settings(settings.as_ref(), &symbol),
         )?
     };
     println!("trader-replay (offline dry-run, zero broker calls):");
@@ -888,7 +895,10 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
             &root,
             &portfolio,
             &models_root,
-            replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
+            neoethos_trader::EngineConfig::for_replay_from_settings(
+                settings.as_ref(),
+                &default_symbol(settings.as_ref()),
+            ),
             neoethos_trader::BlendConfig::from_config_values(
                 mode,
                 Some(gate_floor),
@@ -2564,6 +2574,178 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// `autoresearch` — the goal-driven loop's operator entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every flag `autoresearch` accepts. Anything else is REFUSED by name.
+///
+/// The allow-list is the point, not a convenience. `RunArgs` deliberately has no
+/// field naming a goal constant, a cost field or a judge threshold — *"if there
+/// were, the loop's goals would be writable from the command line, which is the
+/// same defect wearing a different hat"*. A CLI that silently ignored
+/// `--target-balance 999999` would give an operator every reason to believe he
+/// had set one, which is worse than not offering it: the loop would run toward
+/// the config's goal while its author believed it was running toward his.
+const AUTORESEARCH_FLAGS: &[&str] = &[
+    "--symbol",
+    "--max-sweeps",
+    "--max-hours",
+    "--session",
+    "--scenario",
+    "--dry-run",
+    // Set by the schedule orchestrator on the children it spawns; it is parsed
+    // in `main` from the full argv and would otherwise look unknown here.
+    "--cpu-threads",
+    "--help",
+    "-h",
+];
+
+/// `neoethos-cli autoresearch` — start or resume the goal-driven research loop.
+///
+/// **THE ENTRY POINT THAT DID NOT EXIST.** `neoethos_autoresearch::runner::run`
+/// was invoked from nowhere in the workspace — no CLI subcommand, no UI route,
+/// no caller outside its own crate — so the loop the operator asked for ("time
+/// for the karpathy loop, so that you are not needed at all; it matters that the
+/// bot runs on the GOAL and not on a human") could not be started by a human
+/// either.
+///
+/// ## One config, no env, no second config file
+///
+/// The settings come from `Settings::load()` and from nothing else. `--config`
+/// is REFUSED rather than honoured: the loop freezes the goal set, the judge and
+/// the cost model into a `session_id` at S0 and verifies all three on every
+/// resume, so a session started against one file and resumed against another
+/// would be refused halfway through a multi-day run — or, worse, resumed under a
+/// goal the earlier sweeps were never optimised toward.
+///
+/// ## What it will not do
+///
+/// It never places an order, never contacts a broker and never writes
+/// `live_portfolio.json`. On success it writes a PROPOSAL beside the verdict and
+/// stops. The operator promotes.
+fn cmd_autoresearch(args: &[String]) -> Result<()> {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        autoresearch_help();
+        return Ok(());
+    }
+
+    // Checked BEFORE the allow-list, so the operator who reaches for the flag
+    // every other subcommand has gets the reason rather than a list.
+    if has_flag(args, "--config") {
+        anyhow::bail!(
+            "`autoresearch` reads the ONE config — the same file every other reader in this \
+             process resolves — and has no --config override. A session freezes its goal_hash, \
+             judge_hash and cost_hash at open and refuses to resume when any of them moves, so a \
+             run started against a second config file would be refused partway through or, worse, \
+             resumed under a goal its earlier sweeps were never optimised toward."
+        );
+    }
+
+    // Refuse an unknown flag rather than ignore it.
+    for arg in args {
+        if arg.starts_with("--") && !AUTORESEARCH_FLAGS.contains(&arg.as_str()) {
+            anyhow::bail!(
+                "`autoresearch` does not accept {arg}. Accepted: {}.\n\n\
+                 There is deliberately NO flag naming a goal constant, a cost field or a judge \
+                 threshold. The loop optimises TOWARD the goals in your config and can never \
+                 rewrite them, and a flag that let the command line move a goal would be that \
+                 rule broken from the outside. Change the value in your config.yaml and start a \
+                 NEW session — a session's goal_hash, judge_hash and cost_hash are frozen into \
+                 its id at open and verified on every resume.",
+                AUTORESEARCH_FLAGS.join(" ")
+            );
+        }
+    }
+    let settings = neoethos_core::Settings::load().context(
+        "loading the operator's config for the autoresearch loop. The loop's GOALS live in it \
+         (system.risky_* or risk.monthly_profit_target_pct + models.prop_firm_min_pass_rate), so \
+         there is nothing to optimise toward without it — and built-in defaults are not your \
+         settings.",
+    )?;
+
+    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(Some(&settings)));
+    let mut run_args = neoethos_autoresearch::RunArgs::new(symbol);
+    run_args.dry_run = has_flag(args, "--dry-run");
+    run_args.session = parse_flag(args, "--session");
+    run_args.scenario = parse_flag(args, "--scenario");
+    if let Some(raw) = parse_flag(args, "--max-sweeps") {
+        run_args.max_sweeps = match raw.trim().parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => anyhow::bail!(
+                "--max-sweeps expects a positive integer, got `{raw}`. Refusing to guess a budget \
+                 for a run that can last days."
+            ),
+        };
+    }
+    if let Some(raw) = parse_flag(args, "--max-hours") {
+        run_args.max_hours = match raw.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => anyhow::bail!(
+                "--max-hours expects a positive number of hours, got `{raw}`. Refusing to guess."
+            ),
+        };
+    }
+
+    println!(
+        "autoresearch: symbol {} | max_sweeps {} | max_hours {} | session {} | scenario {}{}",
+        run_args.symbol,
+        run_args.max_sweeps,
+        if run_args.max_hours.is_finite() {
+            format!("{:.2}", run_args.max_hours)
+        } else {
+            "unbounded".to_string()
+        },
+        run_args.session.as_deref().unwrap_or("<new>"),
+        run_args
+            .scenario
+            .as_deref()
+            .unwrap_or("<the goal set's primary>"),
+        if run_args.dry_run { " | DRY RUN" } else { "" }
+    );
+    println!(
+        "The loop PROPOSES. It never places an order, never contacts the broker and never writes \
+         live_portfolio.json — its outputs are a verdict and, on success, a proposal, both under \
+         the autoresearch store."
+    );
+
+    let verdict = neoethos_autoresearch::runner::run(run_args, &settings)
+        .context("running the autoresearch loop")?;
+
+    println!("{}", verdict.render());
+    match neoethos_autoresearch::SessionStore::root() {
+        Ok(root) => println!(
+            "artifacts: {}",
+            root.join(&verdict.session_id).display()
+        ),
+        Err(err) => println!("artifacts: <store root unresolved: {err:#}>"),
+    }
+    Ok(())
+}
+
+fn autoresearch_help() {
+    println!("neoethos-cli autoresearch — the goal-driven research loop");
+    println!();
+    println!("USAGE:");
+    println!("    neoethos-cli autoresearch [--symbol EURUSD] [--max-sweeps N] [--max-hours H]");
+    println!("                              [--session <id>] [--scenario <label>] [--dry-run]");
+    println!();
+    println!("    --symbol      Instrument to search. Defaults to the config's symbol.");
+    println!("    --max-sweeps  Sweep budget; one sweep is 100 searches. Default 200.");
+    println!("    --max-hours   Wall-clock budget. Unbounded when omitted.");
+    println!("    --session     Resume an existing session id. A new id when omitted.");
+    println!("    --scenario    Optimise toward this scenario label instead of the primary.");
+    println!("                  An unknown label is REFUSED — it never falls back.");
+    println!("    --dry-run     Draw and stamp one sweep's proposals; run no search.");
+    println!();
+    println!("    There is NO flag for a goal, a cost or a judge threshold. The loop optimises");
+    println!("    toward the constants in your config.yaml and can never rewrite them; a session");
+    println!("    freezes their hashes into its id and refuses to resume when any of them moves.");
+    println!();
+    println!("    The loop PROPOSES. It writes a verdict and, on success, a proposal, under the");
+    println!("    autoresearch store. It never places an order and never touches the broker.");
+}
+
 /// `neoethos-cli wizard` — TUI counterpart of the desktop first-run
 /// wizard. Spec §8 (`installer_wizard_ux_spec.md`).
 fn cmd_wizard(_args: &[String]) -> Result<()> {
@@ -2875,60 +3057,18 @@ fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Setting
 }
 
 
-/// `EngineConfig` with the operator's REAL broker costs, instead of
-/// `EngineConfig::default()` which charges nothing.
-///
-/// `ReplayCostModel` and `from_pips` were written and then never called: all
-/// four replay entry points here and the one in `neoethos-app` passed
-/// `EngineConfig::default()`, whose `costs` is `ReplayCostModel::zero()`. So
-/// every replay an operator could actually run filled at the mark — no spread,
-/// no slippage, no commission — and the only thing standing between him and a
-/// flattering number was a disclosure warning. That warning is the honest
-/// minimum; charging the costs is the fix.
-///
-/// The pip size comes from the symbol table, never a guess: EURUSD is 0.0001
-/// and USDJPY is 0.01, and using the wrong one misprices the spread by a factor
-/// of a hundred. An unknown symbol therefore keeps the ZERO model and says so
-/// by name — a wrong cost is worse than a declared absent one, because it looks
-/// like it was charged.
-fn replay_engine_config(
-    settings: Option<&neoethos_core::Settings>,
-    symbol: &str,
-) -> neoethos_trader::EngineConfig {
-    let mut cfg = neoethos_trader::EngineConfig::default();
-    let Some(settings) = settings else {
-        tracing::warn!(
-            target: "neoethos_cli::replay",
-            "no config resolved — this replay fills at the mark, charging nothing"
-        );
-        return cfg;
-    };
-    let Some(meta) = neoethos_core::symbol_metadata::global_table().lookup(symbol) else {
-        tracing::warn!(
-            target: "neoethos_cli::replay",
-            symbol,
-            "symbol is not in the metadata table, so its pip size is unknown and the              spread cannot be converted to price units. This replay charges NOTHING.              Fix the symbol or add it to the table rather than trusting the result."
-        );
-        return cfg;
-    };
-    let risk = &settings.risk;
-    cfg.costs = neoethos_trader::ReplayCostModel::from_pips(
-        risk.backtest_spread_pips,
-        risk.slippage_pips,
-        risk.commission_per_lot,
-        meta.pip_size,
-    );
-    tracing::info!(
-        target: "neoethos_cli::replay",
-        symbol,
-        spread_pips = risk.backtest_spread_pips,
-        slippage_pips = risk.slippage_pips,
-        commission_per_lot = risk.commission_per_lot,
-        pip_size = meta.pip_size,
-        "replay costs charged from the operator's config"
-    );
-    cfg
-}
+// `replay_engine_config` MOVED 2026-08-10 (#229) to
+// `neoethos_trader::EngineConfig::for_replay_from_settings`, and DELETED here.
+//
+// It was private to this binary, so `neoethos-app`'s `POST /autonomous/replay`
+// could not call it and passed `EngineConfig::default()` instead: zero spread,
+// zero slippage, zero commission, on the synthetic 10 000 balance. One
+// front-end charged the operator's real broker costs and the other charged
+// nothing, while `data_replay`'s header claimed both produce byte-identical
+// `EngineStats`. The rules it enforces (unusable balance -> synthetic default
+// and say so; unknown pip size -> charge NOTHING rather than a wrong cost;
+// commission halved from the round trip because the adapter bills entry AND
+// exit) are unchanged and documented on the moved function.
 
 fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {
     // **F-648 / F-CORE2 closure (2026-05-25)**: previously fell back to
@@ -3314,6 +3454,24 @@ fn print_help() {
         "                               (discover --root <DST> runs on the slice). Enables OOM-safe walk-forward chunking."
     );
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
+    println!(
+        "  autoresearch [--symbol EURUSD] [--max-sweeps 200] [--max-hours H] [--session <id>] [--scenario <label>] [--dry-run]"
+    );
+    println!(
+        "                               The goal-driven loop: it proposes (search config, objective) pairs, runs them as"
+    );
+    println!(
+        "                               sweeps of 100 searches, judges each against a FROZEN judge, journals every one, and"
+    );
+    println!(
+        "                               stops with one of three verdicts. It optimises TOWARD the goals in your config and"
+    );
+    println!(
+        "                               can never rewrite them — there is no flag for a goal, a cost or a judge threshold."
+    );
+    println!(
+        "                               It never places an order and never writes live_portfolio.json. The operator promotes."
+    );
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!("  setup [show|paths|ctrader]  Headless credentials helper (Task #61).");
     println!("                               Prints canonical paths + ready-to-paste templates.");

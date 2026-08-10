@@ -24,7 +24,7 @@ pub use ensemble_inference::{
     DEFAULT_BOOTSTRAP_EXPERT_NAMES, EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome,
     ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, ExpertRegistry,
     SoftVotingEnsemble, SoftVotingEnsembleConfig, build_default_registry,
-    build_ensemble_for_symbol, build_ensemble_for_symbol_with_config, load_experts_for_symbol,
+    build_ensemble_for_symbol, load_experts_for_symbol,
 };
 
 pub use deep_models::{

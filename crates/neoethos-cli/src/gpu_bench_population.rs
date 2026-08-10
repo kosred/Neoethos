@@ -30,6 +30,22 @@ use neoethos_search::gpu_native::snapshot_fixture::SnapshotPopulationFixture;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// The two prices the trade-invariant net needs to turn a price distance into
+/// the same money the kernel reported, carried as one value so a call site
+/// cannot supply one and forget the other.
+/// Read only by the Prototype B arm, which is feature-gated. The value is still
+/// BUILT unconditionally so the two arms take the same argument list and cannot
+/// drift apart.
+#[cfg_attr(
+    not(any(feature = "gpu-nvidia", feature = "gpu-b-native")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy)]
+struct DevicePricing {
+    pip_value: f64,
+    pip_value_per_lot: f64,
+}
+
 /// Tiny deterministic fixture path for `--execute-tiny --prototype b|c`.
 pub fn run_tiny(
     args: &[String],
@@ -149,6 +165,10 @@ fn execute(
             device,
             session_id,
             max_events,
+            DevicePricing {
+                pip_value: reference.settings.pip_value,
+                pip_value_per_lot: reference.settings.pip_value_per_lot,
+            },
         )?,
         PrototypeId::C => run_prototype_c(
             &measured,
@@ -182,13 +202,68 @@ fn run_prototype_b(
     device: Option<usize>,
     session_id: u64,
     max_events: usize,
+    pricing: DevicePricing,
 ) -> Result<PopulationBenchmarkOutcome> {
     use neoethos_search::gpu_native::prototype_b_engine::create_prototype_b_engine;
+    use neoethos_search::gpu_native::trade_invariants::{audit_device_outcomes, PriceSeries};
 
     let mut engine = create_prototype_b_engine(device, session_id, max_events)
         .map_err(|error| anyhow::anyhow!("Prototype B is unavailable: {error}"))?;
-    execute_population_benchmark(&mut engine, workload, eligibility, options)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+    let outcome = execute_population_benchmark(&mut engine, workload, eligibility, options)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    // The correctness net over the trades the card actually settled. Parity
+    // against the oracle only proves the two agree; these properties hold by
+    // definition, so they catch the case parity is blind to — both wrong.
+    //
+    // Outside every timed repetition: `read_diagnostics` is a device-to-host
+    // copy, and it refuses itself above a 1 GB host budget rather than taking
+    // the machine down. A refusal is reported, not swallowed: a benchmark that
+    // could not check its own trades must say so.
+    match engine.read_diagnostics() {
+        Ok(diagnostics) => {
+            let aggregates = outcome
+                .candidate_ids
+                .iter()
+                .copied()
+                .zip(outcome.metrics.iter().map(|values| values[0]))
+                .collect::<Vec<_>>();
+            let complaints = audit_device_outcomes(
+                &diagnostics.events,
+                &diagnostics.outcomes,
+                &aggregates,
+                PriceSeries {
+                    high: &workload.dataset.high,
+                    low: &workload.dataset.low,
+                },
+                pricing.pip_value,
+                pricing.pip_value_per_lot,
+            );
+            if !complaints.is_empty() {
+                let shown = complaints
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                anyhow::bail!(
+                    "Prototype B settled {} trade(s) that violate properties holding by \
+                     definition — the measurement is void, not slow. First {} of {}:\n  {shown}",
+                    diagnostics.outcomes.len(),
+                    complaints.len().min(20),
+                    complaints.len()
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: the trade-invariant net did not run — the diagnostic readback was \
+                 refused: {error}"
+            );
+        }
+    }
+
+    Ok(outcome)
 }
 
 #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-b-native")))]
@@ -199,6 +274,7 @@ fn run_prototype_b(
     _device: Option<usize>,
     _session_id: u64,
     _max_events: usize,
+    _pricing: DevicePricing,
 ) -> Result<PopulationBenchmarkOutcome> {
     anyhow::bail!(
         "Prototype B is a native-CUDA engine: rebuild the CLI with --features gpu-b-native \
@@ -501,6 +577,11 @@ mod tests {
             })
             .unwrap();
         let eligibility = workload.common_bc_intersection(PrototypeKind::BWarpCooperative);
+        // The pricing comes from the workload's own oracle, exactly as the
+        // production call site at `execute` builds it. No literal is invented
+        // here: a fixture price that drifted from the settings the kernel is
+        // handed would make this test assert against a world that cannot exist.
+        let reference = evaluate_population_oracle(&workload).unwrap();
         let error = run_prototype_b(
             &workload,
             &eligibility,
@@ -508,6 +589,10 @@ mod tests {
             None,
             1,
             4096,
+            DevicePricing {
+                pip_value: reference.settings.pip_value,
+                pip_value_per_lot: reference.settings.pip_value_per_lot,
+            },
         )
         .unwrap_err();
         assert!(error.to_string().contains("gpu-b-native"), "{error}");

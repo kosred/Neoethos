@@ -13,6 +13,10 @@ pub mod scheduler;
 pub mod schema_version;
 pub mod sectioned_log;
 pub mod storage;
+// The ONE definition of "this is the same trading rule" (#219, 2026-08-10).
+// It lived in `neoethos-app`, above `neoethos-search` in the dependency graph,
+// so the search could not consult the blacklist the live side writes.
+pub mod strategy_identity;
 pub mod symbol_metadata;
 pub mod system;
 pub mod utils;

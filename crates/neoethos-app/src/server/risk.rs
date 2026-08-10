@@ -31,19 +31,17 @@ use neoethos_core::domain::prop_firm::{
 
 use super::state::AppApiState;
 
-/// Fraction of a firm's PUBLISHED overall-drawdown ceiling this app arms its
-/// internal breaker at. **This is a MIRROR of `neoethos_core::config`'s
-/// `RiskConfig::default()` (`config.rs:561`, `* 0.7`) — not an independent
-/// policy.** The two must move together; if they diverge, a preset click and a
-/// fresh `Settings::default()` produce different breakers for the same preset,
-/// which is precisely the divergence #213/#214 recorded.
-///
-/// It lives here as a local constant only because `config.rs` exposes no
-/// preset→buffered-risk helper to call. The proper end state is one function in
-/// `neoethos-core` that both callers use; that edit is recorded in
-/// `docs/pending-edits-forbidden-territory.md` (§7) because `config.rs` was
-/// owned by another workflow when this landed.
-const TOTAL_DRAWDOWN_BUFFER: f64 = 0.7;
+// The fraction of a firm's PUBLISHED overall-drawdown ceiling this app arms its
+// internal breaker at USED TO BE SPELLED HERE, as a local
+// `const TOTAL_DRAWDOWN_BUFFER: f64 = 0.7` mirroring a bare `0.7` literal in
+// `RiskConfig::default()`. Two spellings of one number, in two crates, is
+// exactly the divergence #213/#214/#269 recorded: a preset click and a fresh
+// `Settings::default()` could produce different breakers for the same preset.
+//
+// LANDED 2026-08-10 (#269): both are DELETED. The single owner is
+// `PropFirmConstraints::buffered_total_drawdown_limit()` in
+// `neoethos-core/src/domain/prop_firm.rs`, and both writers call it. Do not
+// reintroduce a local constant for this — change the helper.
 
 // F-553/F-576 closure (2026-05-25): the per-file `const CONFIG_PATH`
 // was removed in favour of the process-wide install on
@@ -254,12 +252,12 @@ pub async fn update_preset(
     //     separately published stop-trading threshold (FTMO 0.040 against the
     //     firm's 0.05 ceiling; The5%ers 0.032 against 0.04; own money 0.08
     //     against 0.10). It is NOT `max_daily_loss_pct * 0.7`.
-    //   * total → `max_overall_drawdown_pct * TOTAL_DRAWDOWN_BUFFER`, the same
+    //   * total → `PropFirmConstraints::buffered_total_drawdown_limit()`, the same
     //     0.7 `config.rs:561` applies.
     let constraints = PropFirmConstraints::for_preset(preset);
     let runtime = PropFirmRuntimeDefaults::for_preset(preset);
     let seeded_daily = runtime.daily_dd_stop_trading_pct;
-    let seeded_total = (constraints.max_overall_drawdown_pct as f64) * TOTAL_DRAWDOWN_BUFFER;
+    let seeded_total = constraints.buffered_total_drawdown_limit();
 
     // NEVER SILENTLY RAISE A LIMIT. A preset switch may TIGHTEN a breaker; it
     // may not widen one that is already in force. Without this, moving from
@@ -345,7 +343,7 @@ pub async fn update_preset(
     // whatever was there. The ledger entry in
     // `crates/neoethos-core/tests/config_has_recipient.rs:200-207` remains
     // accurate (`Inert::WrittenNeverRead`, OWNER: operator) and needs no edit.
-    settings.risk.monthly_profit_target_pct = constraints.min_monthly_net_profit_pct as f64;
+    settings.risk.monthly_profit_target_pct = constraints.monthly_profit_target();
 
     if let Err(err) = settings.save(config_path()) {
         tracing::error!(

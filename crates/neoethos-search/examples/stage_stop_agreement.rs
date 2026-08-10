@@ -156,7 +156,12 @@ fn main() -> anyhow::Result<()> {
         spread_pips: 1.5,
         commission_per_trade: 7.0,
         risk_based_sizing: false,
-        kill_zones_enabled: true, // discovery's serial lanes run kill zones on
+        // The shipped value of `risk.kill_zones_enabled` (config.rs:671), which
+        // since 2026-08-10 is what `discovery_backtest_settings` reads instead
+        // of a literal (#75/#217). Pinned here so this example compares the two
+        // lanes under one weekend policy rather than under whatever the local
+        // config says.
+        kill_zones_enabled: true,
         ..BacktestSettings::default()
     };
     let initial_balance = 100_000.0;

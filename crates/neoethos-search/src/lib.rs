@@ -141,7 +141,7 @@ pub use deflated::{
     DecodeError, DecodedTrialMatrix, DecodedTrialRow, DeflatedSharpeReport, PboReport,
     TRIAL_STATISTICS_SCHEMA, TrialStatisticsReport, analyse_bytes, analyse_matrix, analyse_run,
     decode as decode_trial_matrix, deflated_sharpe, pbo_cscv, read_matrix as read_trial_matrix,
-    read_matrix_at as read_trial_matrix_at,
+    read_matrix_at as read_trial_matrix_at, redeflate_sharpe,
 };
 
 pub use eval::{
@@ -173,8 +173,9 @@ pub use genetic::{
     signals_for_gene, signals_for_gene_full, take_elites,
 };
 pub use live_portfolio::{
-    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
-    project_features_to_effective, save_live_portfolio_json,
+    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, current_retired_rules,
+    install_retired_rules_from_settings, load_live_portfolio_json, project_features_to_effective,
+    save_live_portfolio_json,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};
@@ -262,4 +263,12 @@ pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Setting
     // it here is what makes the field reach production instead of decorating
     // the struct.
     neoethos_data::install_feature_cube_policy(s.models.data_runtime.feature_cube_mode);
+    // ✓ config (2026-08-10, #219) — the auto-cull blacklist reaches the SEARCH.
+    // Until today `neoethos-search` held zero references to it: the live loop
+    // retired a losing strategy, queued a rediscovery, and the GA was free to
+    // re-derive the identical rule on that very run. This reads
+    // `<system.data_dir>/strategy_blacklist.json` — the same file
+    // `app_services::strategy_blacklist` writes — through the one identity
+    // definition in `neoethos_core::strategy_identity`.
+    crate::live_portfolio::install_retired_rules_from_settings(s);
 }

@@ -48,6 +48,17 @@ neoethos-search = { path = "../neoethos-search" }
 # `ml-blend` enables the genes×ensemble blend path (`trader-replay --blend`); the
 # cli already builds neoethos-models so this is only a feature flag, no new cost.
 neoethos-trader = { path = "../neoethos-trader", features = ["ml-blend"] }
+# The goal-driven research loop. `neoethos-cli autoresearch` is its ONLY operator
+# entry point: `runner::run` was invoked from nowhere in the workspace — no CLI
+# subcommand, no UI route, no caller outside its own crate — so the loop could
+# not be started by a human at all.
+#
+# This edge is one-directional and stays that way. `neoethos-autoresearch`
+# depends on NEITHER `neoethos-app` NOR `neoethos-trader` (its own manifest says
+# so, and `tests/no_broker_dependency.rs` fails if that ever stops being true),
+# so adding it here gives the CLI a way to START the loop and gives the loop no
+# way to reach a broker.
+neoethos-autoresearch = { path = "../neoethos-autoresearch" }
 anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }

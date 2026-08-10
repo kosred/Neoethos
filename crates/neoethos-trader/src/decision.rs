@@ -269,6 +269,7 @@ mod tests {
             tp: None,
             source: SignalSource::Strategy,
             opened_at_bar: 0,
+            trail_px: None,
         }
     }
 

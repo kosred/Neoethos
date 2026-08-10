@@ -490,36 +490,29 @@ pub struct RiskConfig {
     pub atr_stop_multiplier: f64,
     pub triple_barrier_max_bars: usize,
     // ---------------------------------------------------------------------
-    // WARNING UNWIRED / SHADOWED DUPLICATE - the four fields below (2026-08-10)
+    // `trailing_enabled` / `trailing_atr_multiplier` / `trailing_be_trigger_r`
+    // / `trailing_min_lock_pips` DELETED HERE 2026-08-10 (audit #206).
     //
-    // `trailing_enabled`, `trailing_be_trigger_r` and `trailing_min_lock_pips`
-    // ALSO exist on `models.exit_policy` (`ExitPolicyConfig`, below), and THE
-    // SEARCH READS THAT COPY (`strategy_gene.rs:867`). The operator's live
-    // store sets THESE - including a hand-tuned `trailing_atr_multiplier: 0.4`
-    // and `trailing_be_trigger_r: 0.1` - and they move nothing.
-    // `config_has_recipient.rs:173-198` ledgers all four as SHADOWED
-    // DUPLICATE; `trailing_atr_multiplier` was never an ATR multiple.
+    // They were shadowed duplicates of `models.exit_policy.*`: the search has
+    // always read that copy (`strategy_gene.rs`), so these four reached no
+    // evaluator, CPU or CUDA, while the operator's live store set them —
+    // including a hand-tuned `trailing_atr_multiplier: 0.4` and
+    // `trailing_be_trigger_r: 0.1` that moved nothing.
     //
-    // THEY ARE NOT DELETED YET, DELIBERATELY. Live execution trails
-    // UNCONDITIONALLY with no config recipient at all
-    // (`live_trading.rs:1226-1272`). Deleting these keys would convert a
-    // visibly-wrong value into an INVISIBLE HARDCODE on the path that spends
-    // real money. The order is: wire live to `models.exit_policy` FIRST, then
-    // delete these - never the reverse. Tracked in
-    // `docs/pending-edits-forbidden-territory.md`.
+    // The documented precondition for deleting them is now MET. Until today
+    // live execution trailed unconditionally with no config recipient, so
+    // removing the visible-but-dead keys would have turned a wrong value into an
+    // invisible hardcode on the path that spends real money — the required order
+    // was "wire live to `models.exit_policy` FIRST, then delete". Live reads it:
+    // `live_trading.rs:747-782` resolves the policy and logs which branch it
+    // took, and `:1479-1493` applies `trailing_be_trigger_r` /
+    // `trailing_stop_multiplier` / `trailing_min_lock_pips` from it.
+    //
+    // All four are in `RETIRED_KEYS`, so a store that still carries them loads
+    // with each key NAMED at WARN and the rename to `models.exit_policy` spelled
+    // out (`trailing_atr_multiplier` → `trailing_stop_multiplier`; despite the
+    // old name it was never an ATR multiple).
     // ---------------------------------------------------------------------
-    pub trailing_enabled: bool,
-    pub trailing_atr_multiplier: f64,
-    pub trailing_be_trigger_r: f64,
-    /// Pips of profit the trail must lock once it engages, measured from the
-    /// entry.
-    ///
-    /// The other two knobs are multiples of the gene's stop distance, so the
-    /// same pair locks a different amount for every gene: with `trigger -
-    /// distance = 0.1`, a 20-pip stop protects 2 pips and a 10-pip stop only 1.
-    /// An account is not risked in multiples of R, so the floor is absolute —
-    /// once the trail is active the stop never sits closer to entry than this.
-    pub trailing_min_lock_pips: f64,
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     /// Is `commission_per_lot` the charge for ONE SIDE, or for the round trip?
@@ -622,7 +615,7 @@ impl Default for RiskConfig {
             initial_balance: 10_000.0,
             // Monthly profit floor (operator directive 2026-05-14)
             // tracks the active preset's published target.
-            monthly_profit_target_pct: constraints.min_monthly_net_profit_pct as f64,
+            monthly_profit_target_pct: constraints.monthly_profit_target(),
             min_risk_per_trade: 0.0,
             max_risk_per_trade: 0.030,
             risk_per_trade: 0.030,
@@ -662,7 +655,11 @@ impl Default for RiskConfig {
             daily_drawdown_limit: runtime.daily_dd_stop_trading_pct,
             // Internal trailing total cap at 70% of the firm's
             // overall-drawdown ceiling for the same buffer reason.
-            total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
+            //
+            // #269: the buffer used to be a bare `0.7` here and a private
+            // `TOTAL_DRAWDOWN_BUFFER` in `neoethos-app/src/server/risk.rs`.
+            // One number, one spelling — the helper on the constraints.
+            total_drawdown_limit: constraints.buffered_total_drawdown_limit(),
             min_risk_reward: 2.0,
             max_lot_size: runtime.max_lot_size,
             require_stop_loss: true,
@@ -683,10 +680,6 @@ impl Default for RiskConfig {
             atr_period: 14,
             atr_stop_multiplier: 1.5,
             triple_barrier_max_bars: 35,
-            trailing_enabled: true,
-            trailing_atr_multiplier: 1.0,
-            trailing_be_trigger_r: 1.0,
-            trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
             slippage_pips: 0.5,
             commission_per_lot: 7.0,
             // Per side — that is how a broker quotes it, and how the number 7.0
@@ -1017,8 +1010,17 @@ pub struct ModelsConfig {
     /// stays profitable under degraded execution. Previously hardcoded
     /// 2.0 in discovery.rs.
     pub prop_search_sensitivity_spread_pips: f64,
-    /// Commission per lot used in the sensitivity test. Previously
-    /// hardcoded $7/lot in discovery.rs.
+    /// Commission per lot used in the sensitivity test, quoted on the SAME side
+    /// convention as `risk.commission_per_lot` — `DiscoveryConfig::from_settings`
+    /// puts it through the same `round_trip_commission_per_lot` conversion,
+    /// gated on `risk.commission_per_lot_is_per_side`, and then clamps it UP to
+    /// the resolved baseline commission: a stress pass may charge more than the
+    /// run it stresses, never less.
+    ///
+    /// Until 2026-08-10 it skipped the conversion entirely, so at the shipped
+    /// defaults (7.0 here; 7.0 per side → 14.0 round trip there) the "higher
+    /// commission" scenario charged HALF the baseline and every candidate passed
+    /// it. Previously hardcoded $7/lot in discovery.rs.
     pub prop_search_sensitivity_commission_per_lot: f64,
     pub train_batch_size: usize,
     /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]`
@@ -1075,6 +1077,30 @@ pub struct ModelsConfig {
     /// silently; the operator flips this knowingly. Fail-soft: any
     /// ensemble error on a bar falls back to gene-only sizing, loudly.
     pub live_ml_gate: bool,
+
+    /// Floor on the ML agreement term in the live blend (`models.live_ml_gate`).
+    /// A gene bar the ensemble is only lukewarm about still trades at THIS
+    /// fraction of its size, so the validated gene edge is never gated to
+    /// nothing by a lukewarm model. Range [0,1]; default 0.34. Out of range,
+    /// non-finite, or below `blend_veto_below` ⇒ REFUSED back to the default and
+    /// logged with both numbers (`BlendConfig::from_config_values`) — this
+    /// multiplier scales every entry's risk.
+    ///
+    /// Kept numerically equal to `neoethos_trader::DEFAULT_BLEND_GATE_FLOOR`.
+    /// `neoethos-core` cannot depend on `neoethos-trader`, so the literal is
+    /// duplicated deliberately rather than imported; changing one without the
+    /// other is the defect this note exists to prevent.
+    pub blend_gate_floor: f64,
+
+    /// Effective-multiplier floor below which the live blend SKIPS the bar
+    /// entirely (Flat, not confidence 0 — the sizing floor would otherwise open
+    /// min volume). In `MlConfirm` it also vetoes when the raw ML `p_side` is
+    /// below it. Range [0,1]; default 0.15. Must be <= `blend_gate_floor`, else
+    /// every floored bar would be vetoed and the pair is REFUSED back to the
+    /// defaults, loudly.
+    ///
+    /// Kept numerically equal to `neoethos_trader::DEFAULT_BLEND_VETO_BELOW`.
+    pub blend_veto_below: f64,
     #[serde(serialize_with = "serialize_sorted_nested_map")]
     pub model_param_overrides: HashMap<String, HashMap<String, String>>,
     pub regime_router_enabled: bool,
@@ -1202,6 +1228,10 @@ pub struct ModelsConfig {
     /// [`GeneStopBoundsConfig`] — the recipient the `[6, 20]` / `[12, 45]` pip
     /// literals in `evolution_math.rs` never had.
     pub gene_stop_bounds: GeneStopBoundsConfig,
+    /// How the live soft-voting ensemble combines its experts. See
+    /// [`EnsembleVotingConfig`] — the recipient
+    /// `SoftVotingEnsembleConfig::default()` never had.
+    pub ensemble_voting: EnsembleVotingConfig,
     /// Seen-signature dedup-memory knobs (config-driven replacement for
     /// the `NEOETHOS_BOT_PROP_SEEN_*` env vars). See
     /// [`SeenSignatureRuntimeConfig`].
@@ -1859,7 +1889,11 @@ impl Default for ExitPolicyConfig {
             trailing_enabled: false,
             trailing_be_trigger_r: 1.0,
             trailing_stop_multiplier: 1.0,
-            trailing_min_lock_pips: 2.0,
+            // The shared constant, not a literal: since the `risk.trailing_*`
+            // shadows were deleted (#206) this struct is the ONLY owner of the
+            // trail geometry, and the backtest, the CUDA kernel and live
+            // trading all take it from here.
+            trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
         }
     }
 }
@@ -1932,6 +1966,95 @@ impl Default for GeneStopBoundsConfig {
             tp_min_pips: 12.0,
             tp_max_pips: 45.0,
         }
+    }
+}
+
+/// How the LIVE soft-voting ensemble combines its experts.
+///
+/// WHY THIS EXISTS (2026-08-10, audit #168). `SoftVotingEnsembleConfig` carried
+/// these knobs with no way to set any of them: the only production builder was
+/// `build_ensemble_for_symbol`, which handed the aggregator
+/// `SoftVotingEnsembleConfig::default()`. So `expert_weights` was empty on every
+/// install and all ~33 loaded experts voted at exactly 1.0 — including the ones
+/// the operator would have discounted. A `_with_config` twin existed and was
+/// called by nothing; it is gone, and this is its recipient.
+///
+/// MONEY PATH, and the size direction only. The ensemble never picks a
+/// direction — the genes do (`live_trading.rs`); its output scales position
+/// size. Down-weighting an expert therefore cannot open a trade that would not
+/// have opened; it can change how much is committed to one.
+///
+/// THE DEFAULT IS EXACTLY THE OLD BEHAVIOUR: no weights, no exclusions, the same
+/// two anomaly knees. Nothing moves until the operator writes a weight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnsembleVotingConfig {
+    /// Per-expert vote weight, `canonical expert name` → `weight`. An expert
+    /// not named here votes at 1.0; the weights are normalised per row, so only
+    /// their RATIOS matter and a uniform map is the same as an empty one.
+    ///
+    /// OWNER: the operator. There is no defensible machine-chosen default —
+    /// validation accuracy is measured per training run and per symbol, and
+    /// baking one run's ranking into the shipped config would be exactly the
+    /// invented number this codebase refuses. Empty means "no opinion", which
+    /// is the honest state until he measures one.
+    pub expert_weights: std::collections::BTreeMap<String, f64>,
+    /// Canonical expert names that must NOT vote even when their artifact
+    /// loaded. Distinct from a 0.0 weight only in intent: a 0.0 weight still
+    /// counts the expert as a voter for the "N voting" log line.
+    pub excluded_experts: Vec<String>,
+    /// Raw `isolation_forest` anomaly score below which no size penalty is
+    /// applied (scale 1.0).
+    pub anomaly_lo: f64,
+    /// Raw anomaly score at or above which the anomaly scale hard-vetoes the
+    /// trade to size 0. Must be above [`Self::anomaly_lo`]; the two are
+    /// validated together by [`Self::validate`].
+    pub anomaly_hi: f64,
+}
+
+impl Default for EnsembleVotingConfig {
+    fn default() -> Self {
+        Self {
+            // Empty: all experts at 1.0. See the field doc for why no ranking
+            // is shipped.
+            expert_weights: std::collections::BTreeMap::new(),
+            excluded_experts: Vec::new(),
+            anomaly_lo: 0.5,
+            // 0.9 matches the trained ~0.95-quantile threshold.
+            anomaly_hi: 0.9,
+        }
+    }
+}
+
+impl EnsembleVotingConfig {
+    /// Reject a configuration whose knees are inverted or whose weights are not
+    /// usable numbers, by name, rather than letting it scale live position size
+    /// into nonsense.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.anomaly_lo.is_finite() || !self.anomaly_hi.is_finite() {
+            return Err(format!(
+                "models.ensemble_voting.anomaly_lo / anomaly_hi must be finite numbers \
+                 (got {} and {})",
+                self.anomaly_lo, self.anomaly_hi
+            ));
+        }
+        if self.anomaly_hi <= self.anomaly_lo {
+            return Err(format!(
+                "models.ensemble_voting.anomaly_hi ({}) must be ABOVE anomaly_lo ({}) — below \
+                 the low knee there is no penalty and at the high knee the trade is vetoed, so \
+                 an inverted pair vetoes everything",
+                self.anomaly_hi, self.anomaly_lo
+            ));
+        }
+        for (name, weight) in &self.expert_weights {
+            if !weight.is_finite() || *weight < 0.0 {
+                return Err(format!(
+                    "models.ensemble_voting.expert_weights[{name}] = {weight} — a vote weight \
+                     must be a finite number at or above zero"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2469,6 +2592,11 @@ impl Default for ModelsConfig {
             calibration_method: "platt".to_string(),
             calibration_min_rows: 300,
             live_ml_gate: false,
+            // MUST stay equal to `neoethos_trader::DEFAULT_BLEND_GATE_FLOOR` /
+            // `DEFAULT_BLEND_VETO_BELOW`. `neoethos-core` cannot depend on
+            // `neoethos-trader`, so these are the literals, not an import.
+            blend_gate_floor: 0.34,
+            blend_veto_below: 0.15,
             model_param_overrides: HashMap::new(),
             regime_router_enabled: false,
             regime_router_min_models: 2,
@@ -2539,6 +2667,7 @@ impl Default for ModelsConfig {
             stop_target_runtime: StopTargetRuntimeConfig::default(),
             exit_policy: ExitPolicyConfig::default(),
             gene_stop_bounds: GeneStopBoundsConfig::default(),
+            ensemble_voting: EnsembleVotingConfig::default(),
             seen_signature_runtime: SeenSignatureRuntimeConfig::default(),
             discovery_ledger: DiscoveryLedgerConfig::default(),
             smc_search_runtime: SmcSearchRuntimeConfig::default(),
@@ -3270,6 +3399,45 @@ mod load_seal {
                    `system.trading_mode` (risky/growth = risky ladder, anything else = \
                    prop-firm); set that. The value in this file changed nothing and is ignored",
         },
+        // ── risk.trailing_* — the four shadows of models.exit_policy (#206) ──
+        // Deleted 2026-08-10, AFTER live execution was given the real recipient.
+        // The operator's live store sets `trailing_enabled: true` plus a
+        // hand-tuned `trailing_atr_multiplier: 0.4` / `trailing_be_trigger_r:
+        // 0.1`, so every one of these is present in a real file and each has to
+        // name its replacement rather than just disappear.
+        RetiredKey {
+            path: "risk.trailing_enabled",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10: a shadowed duplicate that reached no evaluator, CPU or \
+                   CUDA. The trail is `models.exit_policy.trailing_enabled` — read by the search \
+                   (strategy_gene.rs) and, since today, by live execution \
+                   (live_trading.rs). Note the DEFAULT DIFFERS: this key shipped `true`, \
+                   models.exit_policy ships `false`, because a trail armed at +1R capped the \
+                   measured payoff at 1.08 against a configured floor of 2.0. If you want the \
+                   trail, set models.exit_policy.trailing_enabled: true deliberately",
+        },
+        RetiredKey {
+            path: "risk.trailing_atr_multiplier",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10: replaced by models.exit_policy.trailing_stop_multiplier. \
+                   RENAMED ON PURPOSE — despite the old name it was never an ATR multiple, it is \
+                   a multiple of the position's own initial stop distance. Copy your value across \
+                   under the new name",
+        },
+        RetiredKey {
+            path: "risk.trailing_be_trigger_r",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10: replaced by models.exit_policy.trailing_be_trigger_r, same \
+                   name and same meaning (profit in multiples of the initial stop before the \
+                   trail arms)",
+        },
+        RetiredKey {
+            path: "risk.trailing_min_lock_pips",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10: replaced by models.exit_policy.trailing_min_lock_pips, \
+                   same name and same meaning (absolute pip floor on the profit the armed trail \
+                   locks)",
+        },
         RetiredKey {
             path: "risk.meta_label_tp_pips",
             kind: RetiredKind::Deleted,
@@ -3566,9 +3734,9 @@ mod load_seal {
             let constraints = PropFirmConstraints::for_preset(preset);
             let runtime = PropFirmRuntimeDefaults::for_preset(preset);
             Self {
-                monthly_profit_target_pct: constraints.min_monthly_net_profit_pct as f64,
+                monthly_profit_target_pct: constraints.monthly_profit_target(),
                 daily_drawdown_limit: runtime.daily_dd_stop_trading_pct,
-                total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
+                total_drawdown_limit: constraints.buffered_total_drawdown_limit(),
                 max_lot_size: runtime.max_lot_size,
                 max_trades_per_day: runtime.max_trades_per_day,
                 // Under a prop firm the ceiling is arithmetic, not taste. FX
@@ -3957,9 +4125,23 @@ mod load_seal {
                     "NO STATISTICAL-SIGNIFICANCE FLOOR on expectancy",
                     "read as a minimum, 0 is also the literal floor 't >= 0'",
                 ),
+                // Added 2026-08-10 (audit #193). The autopilot is the ONE
+                // enforcement reader in the workspace
+                // (`live_trading.rs:694-697`) and it spells the disabled state
+                // `.filter(|v| *v > 0.0).unwrap_or(f64::INFINITY)` — so a knob
+                // named `max_` reads 0 as NO LOT CEILING, on the path that
+                // sends orders. Same shape as `risk.max_portfolio_risk`, which
+                // shipped uncapped on every install for exactly this reason.
+                (
+                    "risk.max_lot_size",
+                    "NO LOT CEILING on autopilot entries — the size is bounded only by the \
+                     broker's own max_volume",
+                    "read as a maximum, 0 lots would mean 'never trade'. Neither is a setting \
+                     anyone chooses on purpose; the shipped default is 10.0 lots",
+                ),
             ];
 
-            let values: [(&str, f64, f64); 4] = [
+            let values: [(&str, f64, f64); 5] = [
                 ("risk.max_portfolio_risk", self.risk.max_portfolio_risk, 0.0),
                 (
                     "models.prop_search_max_in_market",
@@ -3975,6 +4157,15 @@ mod load_seal {
                     "models.prop_search_min_expectancy_t_stat",
                     self.models.prop_search_min_expectancy_t_stat,
                     0.0,
+                ),
+                // The seeded value is preset-derived (`PropFirmRuntimeDefaults`),
+                // so the comparison is against THIS config's preset rather than
+                // a literal — no preset seeds 0, so a 0 here is always a
+                // deviation and is reported at ERROR rather than WARN.
+                (
+                    "risk.max_lot_size",
+                    self.risk.max_lot_size,
+                    PropFirmRuntimeDefaults::for_preset(self.risk.preset).max_lot_size,
                 ),
             ];
 

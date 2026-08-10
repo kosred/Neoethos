@@ -139,12 +139,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── Second divergence on the same struct: kill zones ───────────────────
-    // `risk.kill_zones_enabled: true` in config.yaml reaches the LIVE loop
-    // (live_trading.rs:479 reads it) but not discovery: `discovery.rs:1365`
-    // hardcodes `true` and `search_engine.rs`'s scoring settings take
-    // `..BacktestSettings::default()`, which is `false`. So the GA holds
-    // through the weekend and every downstream validation force-exits at
-    // Friday 20:00. Same gene, same bars, different exit rule.
+    // HALF FIXED 2026-08-10 (#75/#217). `risk.kill_zones_enabled` used to reach
+    // the LIVE loop and NOT discovery, which hardcoded `true`. Discovery now
+    // reads the same field, so live and the discovery lanes agree.
+    //
+    // What this example still measures is the OTHER half: `search_engine.rs`'s
+    // scoring settings take `..BacktestSettings::default()`, which is `false`.
+    // So the GA holds through the weekend while every downstream validation
+    // force-exits at Friday 20:00 — same gene, same bars, different exit rule.
+    // The two rows below are that gap, in money.
     println!();
     println!(
         "{:>26}  {:>9}  {:>14}  {:>12}  {:>12}",

@@ -37,6 +37,14 @@
 //! and charge whatever [`execution::ReplayCostModel`] the caller supplies. That
 //! model still defaults to zero — inventing a spread would be a different lie —
 //! so the zero case is the first line of the fidelity report.
+//!
+//! 2026-08-10 (audit #227): the fourth exit arrived. The crate had NO
+//! break-even move and NO trailing stop anywhere, while both paths it claims to
+//! mirror move the stop once a trade reaches `+be_trigger_r × R`. It now reads
+//! the same `models.exit_policy` they do, through the one
+//! [`engine::EngineConfig::for_replay_from_settings`] adapter, and reports the
+//! armed geometry (or its absence) in the fidelity list. With the shipped
+//! default — `trailing_enabled: false` — the numbers are unchanged.
 
 pub mod blend_signal;
 pub mod contracts;
@@ -76,7 +84,7 @@ pub use engine::{
 };
 pub use execution::{MockExecutionAdapter, ReplayCostModel};
 pub use portfolio::PortfolioRegistry;
-pub use position::{Position, PositionManager};
+pub use position::{Position, PositionManager, TrailingPolicy};
 pub use replay::replay;
 pub use risk::{MaxOpenPositionsGate, PermissiveRiskGate};
 pub use signal::MomentumStubSignal;

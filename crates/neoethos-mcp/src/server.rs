@@ -493,8 +493,10 @@ impl ControlPlane {
 
     #[tool(
         description = "Offline dry-run of the autonomous trader over on-disk history — the SAME \
-                       engine and stats as the CLI trader-replay. ZERO broker calls. Long \
-                       synchronous call: can take minutes on deep history.",
+                       engine, costs and stats as the CLI trader-replay. Pass portfolio_path to \
+                       replay the REAL discovered genes; omit it and this runs a 3-bar momentum \
+                       STUB whose result lists every stub in fidelity_warnings. ZERO broker \
+                       calls. Long synchronous call: can take minutes on deep history.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn replay_backtest(
@@ -716,8 +718,9 @@ impl ControlPlane {
 
     #[tool(
         description = "Machine-readable catalog of every runtime knob (help text, ranges, \
-                       defaults) plus the available presets — read this before touching \
-                       update_settings.",
+                       defaults, and ADVISORY per-knob preset values) — read this before \
+                       touching update_settings. Prop-firm presets are APPLIED with \
+                       apply_risk_preset and reported by get_risk.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn knob_catalog(&self) -> CallToolResult {
@@ -726,7 +729,8 @@ impl ControlPlane {
 
     #[tool(
         description = "Current risk configuration: per-trade risk, drawdown limits, lot caps, \
-                       active prop-firm preset and the available presets.",
+                       and the active prop-firm preset (ftmo | myforexfunds | fundednext | \
+                       the5ers | none).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn get_risk(&self) -> CallToolResult {

@@ -3,9 +3,10 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
-    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
-    CTraderNewOrderRequest, CTraderOpenApiJsonMessage, CTraderOpenApiTransport,
-    build_account_auth_request, build_amend_position_sltp_request, build_application_auth_request,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest,
+    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
+    CTraderOpenApiTransport, build_account_auth_request, build_amend_order_request,
+    build_amend_position_sltp_request, build_application_auth_request,
     build_cancel_order_request, build_close_position_request, build_new_order_request,
     expected_response_payload_type, is_ctrader_auth_token_error, is_matching_open_api_response,
     parse_ctrader_error_payload_parts, parse_open_api_envelope,
@@ -31,6 +32,18 @@ pub enum CTraderExecutionRequest {
     /// answers with a `ProtoOAExecutionEvent`, so it rides the same retry +
     /// idempotency path.
     AmendPositionSltp(CTraderAmendPositionSltpRequest),
+    /// Modify a RESTING (pending) order — `ProtoOAAmendOrderReq` (2109). Wired
+    /// 2026-08-10 (audit #236).
+    ///
+    /// Distinct from [`Self::AmendPositionSltp`], which modifies a FILLED
+    /// position: this one changes the order that has not filled yet — its
+    /// trigger price, its volume, its expiry, its bracket. Until today
+    /// `build_amend_order_request` existed with no variant to carry it and no
+    /// caller, so the UI could place a pending order and cancel it but not
+    /// change it: correcting a trigger price meant cancel + re-place, which is
+    /// two broker round trips and a window in which the operator has no resting
+    /// order at all.
+    AmendOrder(Box<CTraderAmendOrderRequest>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +245,7 @@ impl CTraderExecutionRequest {
             Self::CancelOrder(request) => request.account_id,
             Self::ClosePosition(request) => request.account_id,
             Self::AmendPositionSltp(request) => request.account_id,
+            Self::AmendOrder(request) => request.account_id,
         }
     }
 
@@ -243,6 +257,7 @@ impl CTraderExecutionRequest {
             Self::AmendPositionSltp(request) => {
                 build_amend_position_sltp_request(request, client_msg_id)
             }
+            Self::AmendOrder(request) => build_amend_order_request(request, client_msg_id),
         }
     }
 
@@ -290,6 +305,27 @@ impl CTraderExecutionRequest {
                 request.guaranteed_stop_loss,
                 request.trailing_stop_loss,
                 request.stop_loss_trigger_method.map(|v| v.label())
+            ),
+            // Every field the request can carry is in the fingerprint, for the
+            // same reason as `new`: two amends that differ in ANY value are
+            // different intents, and collapsing them would let the idempotency
+            // cache answer one with the other's result.
+            Self::AmendOrder(request) => format!(
+                "amend_order|acct={}|order_id={}|vol={:?}|limit={:?}|stop={:?}|exp={:?}|sl={:?}|tp={:?}|slip_pts={:?}|rsl={:?}|rtp={:?}|gsl={:?}|tsl={:?}|trigger={:?}",
+                request.account_id,
+                request.order_id,
+                request.volume,
+                request.limit_price,
+                request.stop_price,
+                request.expiration_timestamp_ms,
+                request.stop_loss,
+                request.take_profit,
+                request.slippage_in_points,
+                request.relative_stop_loss,
+                request.relative_take_profit,
+                request.guaranteed_stop_loss,
+                request.trailing_stop_loss,
+                request.stop_trigger_method.map(|v| v.label())
             ),
         }
     }
@@ -727,6 +763,7 @@ fn request_action_label(request: &CTraderExecutionRequest) -> &'static str {
         CTraderExecutionRequest::CancelOrder(_) => "cancel_order",
         CTraderExecutionRequest::ClosePosition(_) => "close_position",
         CTraderExecutionRequest::AmendPositionSltp(_) => "amend_position_sltp",
+        CTraderExecutionRequest::AmendOrder(_) => "amend_order",
     }
 }
 
@@ -1136,6 +1173,18 @@ fn validate_execution_outcome(
                     "cTrader amend-position-SLTP response position mismatch: expected {}, got {:?}",
                     inner.position_id,
                     outcome.position_id
+                );
+            }
+        }
+        CTraderExecutionRequest::AmendOrder(inner) => {
+            // Same check the cancel arm makes, and for the same reason: the
+            // broker must answer about the order we named. A reply about a
+            // different order id is not a success we can report.
+            if outcome.order_id != Some(inner.order_id) {
+                anyhow::bail!(
+                    "cTrader amend-order response order mismatch: expected {}, got {:?}",
+                    inner.order_id,
+                    outcome.order_id
                 );
             }
         }

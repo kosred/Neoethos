@@ -86,7 +86,10 @@ const PINNED: &[&str] = &[
     "risk.atr_stop_multiplier",
     "risk.min_risk_reward",
     "risk.commission_per_lot_is_per_side",
-    "risk.trailing_enabled",
+    // `risk.trailing_enabled` removed 2026-08-10 with the field itself (#206):
+    // the trail is `models.exit_policy.trailing_enabled` and there is no second
+    // copy left to pin. A store still carrying the old key is named at WARN by
+    // `RETIRED_KEYS`.
 ];
 
 /// Free-form maps whose keys are data, not schema. Flattening into them would
@@ -166,15 +169,6 @@ const ROOT_REGISTERED: &[(&str, &str, &str)] = &[
          coincidence. Under a prop firm the seed is the preset's daily stop instead — carrying \
          0.34 there is 8.5x FTMO's daily limit, which one correlated move spends in full. \
          See portfolio_cap_follows_the_mode.rs.",
-    ),
-    (
-        "risk.trailing_enabled",
-        "true",
-        "UNWIRED / SHADOWED DUPLICATE. The search reads models.exit_policy.trailing_enabled; \
-         this RiskConfig copy is what the operator's live store sets, and live execution trails \
-         unconditionally with no config recipient at all. Marked, not deleted — deleting it \
-         would turn a visibly wrong value into an invisible hardcode on the path that spends \
-         real money.",
     ),
     (
         "models.tree_device_preference",
@@ -259,19 +253,18 @@ const LIVE_REGISTERED: &[(&str, &str, &str)] = &[
          stricter, louder side of `auto`, so the safer value is already the one in the file and \
          nothing is being raised here.",
     ),
-    (
-        "risk.total_drawdown_limit",
-        "0.07",
-        "MONEY. Default is 0.07000000104308128 — the SAME NUMBER, and the difference is an f32 \
-         constant widened to f64 by the code that wrote the default, not a decision by anyone. \
-         His file carries the clean 0.07, which is FTMO's 0.10 x the 0.7 internal buffer and is \
-         correct for the `preset: ftmo` this store runs. The gap is ~1.0e-9, which is ABOVE this \
-         test's 1e-12 tolerance, so it reports as a divergence and must be recorded. Registered \
-         rather than 'fixed': rewriting a live drawdown limit to a longer spelling of the same \
-         number is a money-path edit that buys nothing, and the f32 fingerprint belongs on the \
-         record — it is the signature that identified the writer behind the two WRONG drawdown \
-         numbers in the repo profile.",
-    ),
+    // `risk.total_drawdown_limit` USED TO BE REGISTERED HERE, at "0.07" against
+    // a default of 0.07000000104308128 — the same number, differing only by an
+    // f32 constant widened to f64 inside `RiskConfig::default()`. The entry
+    // said the fingerprint should stay on the record rather than be "fixed".
+    //
+    // DELETED 2026-08-10 (#214). The fingerprint was fixed at its source
+    // instead: `PropFirmConstraints::buffered_total_drawdown_limit()` widens
+    // once and rounds, so the compiled default IS 0.07 and there is no
+    // divergence left for this table to hold. A registered decision that can
+    // never fire reads as coverage — the test's own words, two functions down
+    // in `every_registered_path_is_pinned`. The history lives in that helper's
+    // doc comment, where a reader looking at the number will find it.
 ];
 
 fn repo_root() -> PathBuf {
@@ -698,29 +691,6 @@ fn the_repo_config_exists_and_parses() {
 /// this carries the rest, so that the annotations B wrote into the 935-line
 /// file survive the collapse in the one place that is checked.
 const ROOT_NOTES: &[(&str, &str)] = &[
-    (
-        "models.discovery_mode",
-        "INERT. discovery.rs maps only `strict|legacy`; `risky` — and the live store's \
-         `prop_firm` — fall through to system.trading_mode. Restricting the accepted values is \
-         routed (pending-A A6) and blocked on the TUI, which offers exactly the two values the \
-         engine does not honour.",
-    ),
-    (
-        "risk.trailing_be_trigger_r",
-        "UNWIRED / SHADOWED DUPLICATE — the search reads models.exit_policy.*. Kept, not deleted: \
-         live execution trails unconditionally with no config recipient, so deleting the key \
-         turns a visibly wrong value into an invisible hardcode on the path that spends real \
-         money. Order: wire live_trading.rs to models.exit_policy FIRST (pending-A A8).",
-    ),
-    (
-        "risk.trailing_min_lock_pips",
-        "UNWIRED / SHADOWED DUPLICATE — see risk.trailing_be_trigger_r.",
-    ),
-    (
-        "risk.trailing_atr_multiplier",
-        "UNWIRED / SHADOWED DUPLICATE, and the NAME LIES: it was never an ATR multiple, it is a \
-         multiple of the position's own stop distance. See risk.trailing_be_trigger_r.",
-    ),
     (
         "system.trading_mode",
         "The profile this file exists to describe. NOT merged with models.discovery_mode — that \

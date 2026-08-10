@@ -153,14 +153,19 @@ at the bottom.
 - **Aggressive:** `0.05` (5%) — only halt on major drift; not
   recommended for prop-firm runs.
 
-### `NEOETHOS_PROP_FIRM_PRESET`
-- **Type:** enum `ftmo` | `myforexfunds` | `fundednext` | `the5ers` | `none`
-- **Default:** `ftmo`
-- **Effect:** which prop-firm preset seeds `RiskConfig::default()`.
-  The preset sets daily-loss / max-drawdown / profit-target /
-  min-trading-days defaults. Operator can still override individual
-  fields in `config.yaml`.
-- **All profiles:** pick the preset that matches your funded account.
+### `NEOETHOS_PROP_FIRM_PRESET` — **RETIRED in v0.4.36. INERT. Setting it changes nothing.**
+- **Set it instead:** `risk.preset` in the config file — enum `ftmo` |
+  `myforexfunds` | `fundednext` | `the5ers` | `none`. The preset re-derives the
+  six seeded money fields (daily-loss / max-drawdown / profit-target /
+  min-trading-days and their siblings) at load, and individual fields still
+  override it.
+- **Why this entry is still here:** an operator who has the variable exported
+  needs to be told it is dead, not silently left believing tighter preset limits
+  are in force. The binaries say the same thing at startup — one `ERROR` line per
+  retired name, naming the value found and the config key that decides it now
+  (`crates/neoethos-core/src/env_overrides.rs` `RETIRED_ENV_VARS` /
+  `log_active_overrides_at_startup`). Audit #143: this section previously
+  described the variable as active, which is the lie the code stopped telling.
 
 ### Risk-per-trade fraction (from prop-firm preset or `RiskConfig`)
 - **Type:** `f64`, `[0.0, 0.05]` (0–5 %)

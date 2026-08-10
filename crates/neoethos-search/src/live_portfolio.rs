@@ -50,6 +50,22 @@ pub struct LivePortfolioArtifact {
     pub normalize_features: bool,
     /// The promoted portfolio — FULL genes, including SMC flags + SL/TP.
     pub genes: Vec<Gene>,
+    /// What the round-trip COST BAND said about each promoted gene, as
+    /// `(strategy_id, verdict)` — audit #71.
+    ///
+    /// The band charges the same candidate at an optimistic and a pessimistic
+    /// all-in cost. `cost_band_optimistic_edge_only` means profitable at the
+    /// cheap end and NOT at the expensive one: a strategy whose entire result
+    /// is a bet that the operator's real spread is the good one. Until
+    /// 2026-08-10 the verdict was measured, counted run-level, and then dropped
+    /// at the export boundary, so this file — the only artifact a live run reads
+    /// — could not tell such a gene from one profitable across the whole band.
+    ///
+    /// `#[serde(default)]`: artifacts written before this field existed load
+    /// with it EMPTY, and empty means UNMEASURED, not "all survived". Read it
+    /// through [`LivePortfolioArtifact::cost_band_for`], which spells that out.
+    #[serde(default)]
+    pub cost_band: Vec<(String, crate::discovery::CostBandVerdict)>,
 }
 
 impl LivePortfolioArtifact {
@@ -60,6 +76,23 @@ impl LivePortfolioArtifact {
         normalize_features: bool,
         result: &DiscoveryResult,
     ) -> Self {
+        let genes = drop_retired_rules(
+            oos_surviving_genes(result),
+            &result.effective_feature_names,
+        );
+        // Only the genes that actually ship, in the order they ship: a verdict
+        // for a gene the OOS gate dropped is noise, and a missing verdict for a
+        // gene that IS here would be a lie of omission — so every promoted gene
+        // gets a row, `Unmeasured` included.
+        let cost_band = genes
+            .iter()
+            .map(|gene| {
+                (
+                    gene.strategy_id.clone(),
+                    result.cost_band_for_strategy(&gene.strategy_id),
+                )
+            })
+            .collect();
         Self {
             schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
             symbol: symbol.to_string(),
@@ -67,9 +100,128 @@ impl LivePortfolioArtifact {
             higher_tfs: higher_tfs.to_vec(),
             effective_feature_names: result.effective_feature_names.clone(),
             normalize_features,
-            genes: oos_surviving_genes(result),
+            genes,
+            cost_band,
         }
     }
+
+    /// The cost-band verdict recorded for `strategy_id` in THIS artifact.
+    ///
+    /// A gene with no row is [`CostBandVerdict::Unmeasured`] — which is what an
+    /// artifact written before the field existed reports for every gene. It is
+    /// deliberately not `SurvivesBand`: "we did not measure" and "it passed"
+    /// are different answers, and only one of them supports deploying.
+    pub fn cost_band_for(&self, strategy_id: &str) -> crate::discovery::CostBandVerdict {
+        self.cost_band
+            .iter()
+            .find(|(id, _)| id == strategy_id)
+            .map(|(_, verdict)| *verdict)
+            .unwrap_or(crate::discovery::CostBandVerdict::Unmeasured)
+    }
+}
+
+/// Process-wide set of RETIRED trading rules, installed once at startup from
+/// the operator's `Settings` (`install_search_runtime_overrides_from_settings`).
+///
+/// Not installed ⇒ empty ⇒ every gene is kept, which is exactly the behaviour
+/// this file had before #219 and is what unit tests see.
+static RETIRED_RULES: std::sync::OnceLock<neoethos_core::strategy_identity::RetiredRules> =
+    std::sync::OnceLock::new();
+
+/// Read `<data_dir>/strategy_blacklist.json` and install the retired rule set.
+/// Idempotent: the first install wins, like every other runtime-override
+/// boundary in this crate.
+pub fn install_retired_rules_from_settings(s: &neoethos_core::Settings) {
+    let retired =
+        neoethos_core::strategy_identity::RetiredRules::load_from_data_dir(&s.system.data_dir);
+    if retired.entries > 0 {
+        tracing::info!(
+            target: "neoethos_search::live_portfolio",
+            blacklist_entries = retired.entries,
+            retired_rules = retired.len(),
+            unreadable_entries = retired.unreadable_entries,
+            data_dir = %s.system.data_dir.display(),
+            "auto-cull blacklist loaded — discovery will refuse to promote these rules"
+        );
+    }
+    let _ = RETIRED_RULES.set(retired);
+}
+
+/// The installed retired-rule set, or an empty one when nothing was installed.
+pub fn current_retired_rules() -> &'static neoethos_core::strategy_identity::RetiredRules {
+    static EMPTY: std::sync::OnceLock<neoethos_core::strategy_identity::RetiredRules> =
+        std::sync::OnceLock::new();
+    RETIRED_RULES
+        .get()
+        .unwrap_or_else(|| {
+            EMPTY.get_or_init(neoethos_core::strategy_identity::RetiredRules::default)
+        })
+}
+
+/// AUTO-CULL GATE — item #219, 2026-08-10.
+///
+/// The retirement loop was only half closed. `strategy_blacklist::is_blacklisted`
+/// stops a retired artifact being SELECTED (`server::autonomous`,
+/// `app_services::federation`), but `neoethos-search` held zero references to
+/// the blacklist: the GA was free to re-derive the culled rule on the very run
+/// `app_services::rediscovery` queued after the cull, and a portfolio pairing
+/// that rule with two different genes hashed differently as an artifact, so
+/// selection did not catch it either.
+///
+/// This filters at the ONE artifact the autonomous trader consumes, by the SAME
+/// identity the blacklist stores (`neoethos_core::strategy_identity`), so a
+/// retired rule cannot come back bundled with new company. The gene stays in
+/// every other discovery artifact for inspection — nothing is deleted.
+///
+/// Silent when nothing is retired. Loud, per rule, when something is.
+fn drop_retired_rules(genes: Vec<Gene>, feature_names: &[String]) -> Vec<Gene> {
+    let retired = current_retired_rules();
+    if retired.is_empty() || genes.is_empty() {
+        return genes;
+    }
+    let names: Vec<&str> = feature_names.iter().map(String::as_str).collect();
+    let before = genes.len();
+    let mut kept = Vec::with_capacity(before);
+    for gene in genes {
+        let value = match serde_json::to_value(&gene) {
+            Ok(v) => v,
+            Err(err) => {
+                // Serializing a Gene basically cannot fail. If it ever does,
+                // KEEPING the member loudly beats dropping a strategy nobody
+                // retired — the same direction `oos_surviving_genes` chose.
+                tracing::warn!(
+                    target: "neoethos_search::live_portfolio",
+                    strategy_id = %gene.strategy_id,
+                    error = %err,
+                    "auto-cull gate: could not hash gene — keeping it WITHOUT a blacklist check"
+                );
+                kept.push(gene);
+                continue;
+            }
+        };
+        let fingerprint =
+            neoethos_core::strategy_identity::gene_rule_fingerprint(&value, &names);
+        if retired.contains(&fingerprint) {
+            tracing::warn!(
+                target: "neoethos_search::live_portfolio",
+                strategy_id = %gene.strategy_id,
+                rule_fingerprint = %fingerprint,
+                "AUTO-CULL GATE: this rule was RETIRED by the live loop and is dropped from                  the live portfolio. The search re-derived a strategy the operator already                  stopped for losing; it stays in the discovery artifacts for inspection"
+            );
+            continue;
+        }
+        kept.push(gene);
+    }
+    if kept.len() < before {
+        tracing::warn!(
+            target: "neoethos_search::live_portfolio",
+            dropped = before - kept.len(),
+            kept = kept.len(),
+            retired_rules = retired.len(),
+            "auto-cull gate: the search rediscovered retired rules — GA time was spent              re-deriving strategies that can never trade"
+        );
+    }
+    kept
 }
 
 /// OOS gate for LIVE trading (audit B02, 2026-07-13): only strategies that
@@ -263,11 +415,27 @@ mod tests {
             ],
             normalize_features: false,
             genes: vec![gene],
+            cost_band: vec![(
+                "test-gene".to_string(),
+                crate::discovery::CostBandVerdict::OptimisticEdgeOnly,
+            )],
         };
 
         let json = serde_json::to_string(&artifact).unwrap();
         let back: LivePortfolioArtifact = serde_json::from_str(&json).unwrap();
         assert_eq!(artifact, back, "artifact must survive a JSON round-trip");
+        // The verdict has to survive the round trip too — it is the whole point
+        // of carrying it (audit #71), and a silently dropped field would look
+        // exactly like the pre-2026-08-10 behaviour it replaces.
+        assert_eq!(
+            back.cost_band_for("test-gene"),
+            crate::discovery::CostBandVerdict::OptimisticEdgeOnly
+        );
+        // An unknown strategy reads as Unmeasured, never as a pass.
+        assert_eq!(
+            back.cost_band_for("no-such-gene"),
+            crate::discovery::CostBandVerdict::Unmeasured
+        );
     }
 
     #[test]
@@ -332,6 +500,7 @@ mod tests {
         let winner = gene("winner", 0.4);
         let loser = gene("loser", 0.6);
         let mut result = crate::discovery::DiscoveryResult {
+            cost_band_by_strategy: Vec::new(),
             portfolio: vec![winner.clone(), loser.clone()],
             candidates: Vec::new(),
             quality_metrics: Vec::new(),

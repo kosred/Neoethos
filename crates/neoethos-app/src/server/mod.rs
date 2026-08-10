@@ -231,7 +231,10 @@ pub fn router(state: AppApiState) -> Router {
             "/settings/knob-catalog",
             get(knob_catalog::get_knob_catalog),
         )
-        .route("/settings/presets", get(knob_catalog::get_presets))
+        // `/settings/presets` is GONE (#115/#116, 2026-08-10): the
+        // safety-posture vocabulary it served had no apply path anywhere in the
+        // product. The ONE preset vocabulary is the prop-firm one, written by
+        // `POST /risk/preset`. See the note in `knob_catalog.rs`.
         .route("/engines/status", get(system_status::engines))
         // Storage transparency + autopilot artifact picker.
         .route("/storage/paths", get(storage::paths))
@@ -351,13 +354,16 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/margin/expected", get(data_control::expected_margin))
         .route("/broker/profile", get(data_control::ctid_profile))
         .route("/broker/version", get(data_control::server_version))
-        // F-333: set the *active* cTrader account by promoting it to the
-        // front of broker_credentials.toml's accounts list (resolve_creds
-        // reads accounts.first()). MVP — takes effect on next start.
-        .route(
-            "/broker/account/select",
-            post(broker_control::account_select),
-        )
+        // `POST /broker/account/select` DELETED 2026-08-10 (audit #120). It was
+        // the only route that could change WHICH ACCOUNT TRADES, it had no
+        // client, and it disagreed with the path that does have one: the Tauri
+        // command `select_account` (`desktop/src-tauri/src/broker.rs:256`) also
+        // sets `enabled_for_execution` and the Demo/Live environment, neither of
+        // which this route touched — so the two answers to "which account is
+        // active" were different. `docs/codex-control-plane.md` additionally
+        // requires the HTTP control plane to be structurally incapable of
+        // switching accounts or environments; deleting the route is what makes
+        // that true rather than merely intended.
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
         // #192: import user-provided CSV/Parquet/Arrow/JSON/JSONL/TSV
@@ -372,6 +378,11 @@ pub fn router(state: AppApiState) -> Router {
             get(orders::list_pending).post(orders::place_pending),
         )
         .route("/orders/cancel", post(orders::cancel_order))
+        // #236: modify a RESTING order in place. Until 2026-08-10 the UI could
+        // place a pending order and cancel it but not change it, so correcting a
+        // trigger price meant cancel + re-place — two broker round trips and a
+        // window with no order behind the level.
+        .route("/orders/amend", post(orders::amend_order))
         .route("/positions/close", post(orders::close_position))
         .route(
             "/positions/protection",

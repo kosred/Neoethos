@@ -2,9 +2,20 @@
 //!
 //! This is the single helper that makes the offline replay REACHABLE from both
 //! front-ends: `neoethos-cli trader-replay` and the app `POST /autonomous/replay`
-//! both call [`replay_symbol_from_dir`], so they produce byte-identical
-//! [`EngineStats`] from the same data — the UI↔CLI parity mandate, applied to the
-//! trader from day one. ZERO broker calls (mock execution), real bars in.
+//! call the SAME two entry points — [`replay_symbol_from_dir`] for the momentum
+//! STUB and [`replay_portfolio_from_dir`] for the operator's real discovered
+//! genes. ZERO broker calls (mock execution), real bars in.
+//!
+//! **Parity is a property of the ARGUMENTS, not of this module — corrected
+//! 2026-08-10 (#229).** The header used to assert flatly that the two
+//! front-ends "produce byte-identical `EngineStats`". They produce identical
+//! stats when they pass the same [`EngineConfig`], and until today they did
+//! not: the CLI passed the operator's balance and broker costs while the app
+//! route passed `EngineConfig::default()` — a synthetic balance filling at the
+//! mark with zero spread, slippage and commission — and had no portfolio option
+//! at all, so the Replay button could only ever run the stub. Both now build
+//! the config through [`EngineConfig::for_replay_from_settings`], the single
+//! adapter, and both can pass a portfolio path.
 
 use std::path::Path;
 
@@ -75,11 +86,28 @@ fn common_warnings(cfg: &EngineConfig) -> Vec<String> {
          no rejections, no requotes."
             .to_string(),
     );
-    w.push(
-        "TRAILING: the replay has no trailing stop or break-even move at all. The live loop \
-         and the GA evaluator both have exit geometry this path does not model."
-            .to_string(),
-    );
+    // TRAILING (audit #227). Until 2026-08-10 this warning was unconditional
+    // and correct: the replay had no break-even move anywhere in the crate. It
+    // now models the same trail discovery and live read from
+    // `models.exit_policy`, so the warning fires only when the run genuinely
+    // ran without one — and an ARMED run still says which geometry it used,
+    // because "trailing on" is not one behaviour, it is four numbers.
+    match &cfg.trailing {
+        None => w.push(
+            "TRAILING: no break-even move and no trailing stop in this run. If \
+             models.exit_policy.trailing_enabled is ON, or the symbol has no pip size in the \
+             metadata table, this run does NOT model the exit the live loop and the GA \
+             evaluator apply."
+                .to_string(),
+        ),
+        Some(t) => w.push(format!(
+            "TRAILING: armed from models.exit_policy — break-even at +{:.2}R, stop trailed at \
+             {:.2}x the position's own stop distance, minimum lock {:.1} pips (pip {:.5}). The \
+             stop is tested BEFORE the take-profit on every later bar, so this run's payoff is \
+             capped the same way the search's is.",
+            t.be_trigger_r, t.stop_multiplier, t.min_lock_pips, t.pip_size,
+        )),
+    }
     w
 }
 

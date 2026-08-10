@@ -55,6 +55,7 @@ fn temp_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn empty_portfolio_is_an_explicit_error() {
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: vec![Gene::default()],
         quality_metrics: Vec::new(),
@@ -83,6 +84,7 @@ fn empty_portfolio_is_an_explicit_error() {
 #[test]
 fn non_empty_portfolio_is_accepted() {
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![Gene::default()],
         candidates: vec![Gene::default()],
         quality_metrics: Vec::new(),
@@ -204,6 +206,7 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
 #[test]
 fn portfolio_export_requires_validation_gates() {
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -233,6 +236,7 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
     // portfolio that cleared the window but NOT walkforward+CPCV (the exact
     // shape of the AUDUSD 20-straight-losses incident) must never export.
     let mut result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -358,6 +362,7 @@ fn auto_tune_n_windows_scales_with_history() {
 #[test]
 fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
     let mut result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -387,6 +392,7 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
 #[test]
 fn discovery_profile_exports_validation_gate_status() {
     let mut result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: vec![profitable_gene("alpha-1")],
         quality_metrics: Vec::new(),
@@ -467,6 +473,7 @@ fn sample_walkforward_validation_artifact(
 fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("canonical-backtests");
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -507,6 +514,7 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
 fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("walkforward-validations");
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -543,6 +551,7 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
 fn save_canonical_backtest_artifacts_skips_when_empty() {
     let dir = temp_dir("canonical-backtests-empty");
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -641,6 +650,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         min_history_years: 0,
     };
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1091,6 +1101,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
     .expect("forward-test artifacts should build");
 
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio,
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1133,6 +1144,7 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         span_days: 0.0,
     };
     let mut result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1184,6 +1196,7 @@ fn empty_discovery_result_with_gates(
     gates.walkforward_passed = walkforward_passed;
     gates.cpcv_passed = cpcv_passed;
     DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1368,6 +1381,7 @@ fn compute_discovery_prop_firm_artifacts_produces_one_artifact_per_strategy() {
 fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("prop-firm-validations");
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1405,6 +1419,7 @@ fn populated_discovery_result(
     prop_firm_count: usize,
 ) -> DiscoveryResult {
     DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2685,6 +2700,52 @@ fn duplicate_knobs_resolve_to_the_documented_winner() {
     );
 }
 
+/// The sensitivity ("higher commission") stress pass can never charge LESS than
+/// the run it stresses.
+///
+/// `models.prop_search_sensitivity_commission_per_lot` is assigned straight into
+/// `BacktestSettings::commission_per_trade`, which every evaluator subtracts
+/// exactly once per closed trade — the same contract as the baseline. It was the
+/// one commission input that skipped `round_trip_commission_per_lot`, so at the
+/// shipped defaults (7.0 here, 7.0 per side → 14.0 round trip on the baseline)
+/// the stress scenario cost half the baseline and every candidate passed it.
+#[test]
+fn sensitivity_commission_is_round_trip_and_never_below_the_baseline() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.commission_per_lot = 7.0;
+    settings.risk.commission_per_lot_is_per_side = true;
+
+    // The shipped state: the same quote on both knobs.
+    settings.models.prop_search_sensitivity_commission_per_lot = 7.0;
+    let cfg = DiscoveryConfig::from_settings(&settings);
+    assert!(
+        cfg.sensitivity_commission_per_lot >= cfg.evaluation_commission_per_trade,
+        "the stress pass charged {} while the baseline charged {} — a cheaper \
+         stress test passes everything",
+        cfg.sensitivity_commission_per_lot,
+        cfg.evaluation_commission_per_trade
+    );
+
+    // A genuinely harsher quote survives the conversion and is NOT clamped down.
+    settings.models.prop_search_sensitivity_commission_per_lot = 20.0;
+    let cfg = DiscoveryConfig::from_settings(&settings);
+    assert!(
+        (cfg.sensitivity_commission_per_lot - 40.0).abs() < 1e-9,
+        "a per-side quote of 20.0 is a 40.0 round trip, got {}",
+        cfg.sensitivity_commission_per_lot
+    );
+
+    // With a round-trip quote the flag must not double anything.
+    settings.risk.commission_per_lot_is_per_side = false;
+    settings.models.prop_search_sensitivity_commission_per_lot = 20.0;
+    let cfg = DiscoveryConfig::from_settings(&settings);
+    assert!(
+        (cfg.sensitivity_commission_per_lot - 20.0).abs() < 1e-9,
+        "a round-trip quote must pass through unchanged, got {}",
+        cfg.sensitivity_commission_per_lot
+    );
+}
+
 /// `models.discovery_runtime` is the ONLY operator input for the discovery
 /// runtime knobs, and an out-of-range value keeps the default.
 ///
@@ -3528,6 +3589,7 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
     //    empty result. Field EXISTENCE is what is asserted (a null value
     //    resolves fine), so the fixture's emptiness does not weaken the test.
     let empty_result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -3603,6 +3665,7 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         .max_rows_by_timeframe
         .extend([("M1".to_string(), 100), ("M5".to_string(), 200), ("H1".to_string(), 50)]);
     let result = DiscoveryResult {
+        cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -3946,4 +4009,67 @@ fn a_cost_band_below_the_charged_cost_cannot_discriminate() {
         Some((2.8, 4.4)),
         f64::NAN
     ));
+}
+
+/// Audit #75/#217 — the weekend kill zones are ONE knob, and the search reads it.
+///
+/// Until 2026-08-10 `discovery_backtest_settings` hardcoded
+/// `kill_zones_enabled: true` while only the live loop consulted
+/// `risk.kill_zones_enabled`. That made the knob one-sided: turning it off could
+/// move live AWAY from every validated backtest and never toward it. This
+/// asserts BOTH ends — the config field is sourced from `Settings`, and the
+/// settings template every discovery lane flows through carries it — so the
+/// literal cannot come back without a red test.
+#[test]
+fn the_kill_zone_switch_reaches_the_discovery_backtest() {
+    let mut settings = neoethos_core::Settings::default();
+    // The shipped value, and the value the live loop defaults to.
+    assert!(
+        settings.risk.kill_zones_enabled,
+        "the shipped default must stay ON — this test's whole point is that both \
+         sides move together, not that they are both true"
+    );
+
+    let gene = profitable_gene("kill-zone-wiring");
+
+    // Through the RESOLVER, never the raw builder: the SLICE-2 guard
+    // (`discovery_backtest_settings_has_no_callers_outside_the_resolvers`)
+    // permits exactly three occurrences of the private builder and none in
+    // this file. `PopulationTemplateResolver::template` is the gene-independent
+    // template every population lane takes, and it is the one that carries the
+    // weekend policy, so asserting on it asserts on what actually runs.
+    let template = |config: &crate::discovery::DiscoveryConfig| {
+        crate::discovery::PopulationTemplateResolver::new(config, None).template(&gene)
+    };
+
+    let on = crate::discovery::DiscoveryConfig::from_settings(&settings);
+    assert!(on.kill_zones_enabled, "from_settings must carry the field");
+    assert!(
+        template(&on).kill_zones_enabled,
+        "the ON setting must reach the settings template"
+    );
+
+    settings.risk.kill_zones_enabled = false;
+    let off = crate::discovery::DiscoveryConfig::from_settings(&settings);
+    assert!(
+        !off.kill_zones_enabled,
+        "flipping risk.kill_zones_enabled must flip the discovery config"
+    );
+    assert!(
+        !template(&off).kill_zones_enabled,
+        "the OFF setting must reach the settings template — a hardcoded `true` here is \
+         exactly the defect this test exists for"
+    );
+
+    // And the two runs must be TELLABLE APART afterwards: the value is part of
+    // the backtest policy hash, so artifacts produced under either setting
+    // cannot be confused for one another.
+    let hash_on = crate::discovery::discovery_backtest_policy_hash(&on, &gene, &template(&on))
+        .expect("policy hash (on)");
+    let hash_off = crate::discovery::discovery_backtest_policy_hash(&off, &gene, &template(&off))
+        .expect("policy hash (off)");
+    assert_ne!(
+        hash_on, hash_off,
+        "two runs under opposite weekend policies must not hash identically"
+    );
 }

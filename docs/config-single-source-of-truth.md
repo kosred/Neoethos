@@ -157,7 +157,7 @@ migration tool, with what each means **today**:
 | `models.discovery_runtime.prefilter_top_k` | `50` | base feature set collapses 217 → ~64 columns; SMC, session and footprint families die first ⚠ **the "217" is stale** — see note below |
 | `models.require_walkforward_for_export` | `false` | **the out-of-sample export gate is OFF** — a portfolio reaches live money on the window gate alone |
 | `risk.max_portfolio_risk` | `0.0` | **NO CAP AT ALL**, not "no risk" |
-| `risk.trailing_enabled` | `true` | the **orphaned** copy; the search reads `models.exit_policy`, and live execution trails unconditionally with no config gate |
+| `risk.trailing_enabled` | `true` | **the key no longer exists** (deleted 2026-08-10, audit #206). It was the orphaned copy; the trail is `models.exit_policy.trailing_enabled`, which BOTH the search and — since the same day — live execution read. His store still carries the old key, so the loader names it at WARN via `RETIRED_KEYS` and ignores it |
 
 > ⚠ **The "217 columns" in the `prefilter_top_k` row is stale (2026-08-09).**
 > The base cube is no longer 217 columns. With the vocabulary restored it offers
@@ -173,7 +173,10 @@ migration tool, with what each means **today**:
 And the trailing values specifically: his file sets
 `risk.trailing_atr_multiplier: 0.4` and `risk.trailing_be_trigger_r: 0.1` and has
 **no `models.exit_policy` block at all**. The search reads that block
-exclusively, so those hand-tuned numbers have moved nothing. The migration
+exclusively, so those hand-tuned numbers have moved nothing. Since 2026-08-10
+the four `risk.trailing_*` keys are not fields at all — they are retired keys,
+so loading his store names each one at WARN with the replacement path instead of
+accepting it in silence. The migration
 shows all four side by side and **does not copy them across** — copying
 `trailing_enabled: true` turns the trail on for every future search, and the
 measured record says the trail is applied before the take-profit check on every

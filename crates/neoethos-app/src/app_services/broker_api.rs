@@ -27,8 +27,9 @@ use crate::app_services::ctrader_execution::{
     CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
-    CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
+    CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce,
+    CTraderTradeSide,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
@@ -1303,6 +1304,132 @@ pub fn cancel_order_blocking(order_id: i64) -> Result<CTraderExecutionOutcome> {
             account_id,
             order_id,
         }),
+    };
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Modify a RESTING (pending) order — `ProtoOAAmendOrderReq` (2109).
+///
+/// **The capability the UI did not have (audit #236, wired 2026-08-10.)**
+/// `build_amend_order_request` had existed since the message layer was written,
+/// with no `CTraderExecutionRequest` variant to carry it and no caller, so the
+/// Actions screen could place a resting order and cancel it but never change
+/// it. Correcting a trigger price meant cancel + re-place: two broker round
+/// trips, a different order id, and a window in which the level the operator was
+/// waiting for has no order behind it at all.
+///
+/// **Every parameter is `Option`, and `None` means LEAVE UNCHANGED** — that is
+/// the proto's own contract for the optional fields. At least one must be
+/// `Some`, or there is nothing to amend and this refuses rather than sending a
+/// no-op the broker would answer with a success.
+///
+/// `trigger_price` is written to `limit_price` or `stop_price` according to
+/// `order_type`, which must be the order's OWN type: cTrader rejects a limit
+/// price on a stop order. Volume is lots and SL/TP are pip DISTANCES, converted
+/// by the same [`prepare_new_order`] that the placement paths use, so an amend
+/// and a placement can never disagree about what "0.01 lots" or "20 pips" mean
+/// on this symbol.
+///
+/// **Why it goes through the margin-call halt.** Amending a resting order is
+/// NOT the exposure-reducing action that closing and stop-moving are: the order
+/// can still fill, and this call can raise its volume. So it takes the same
+/// choke point as placing one. During a halt the operator can still CANCEL the
+/// order, which is the safe direction, and the refusal says so.
+#[allow(clippy::too_many_arguments)]
+pub fn amend_order_blocking(
+    order_id: i64,
+    symbol: &str,
+    order_type: CTraderOrderType,
+    volume_lots: Option<f64>,
+    trigger_price: Option<f64>,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    expiry_unix_ms: Option<i64>,
+    expected_is_live: Option<bool>,
+) -> Result<CTraderExecutionOutcome> {
+    if volume_lots.is_none()
+        && trigger_price.is_none()
+        && stop_loss_pips.is_none()
+        && take_profit_pips.is_none()
+        && expiry_unix_ms.is_none()
+    {
+        return Err(anyhow!(
+            "amend_order needs at least one of volumeLots / triggerPrice / stopLossPips / \
+             takeProfitPips / expiryUnixMs — every field was omitted, so there is nothing to \
+             change and no order was sent"
+        ));
+    }
+    if !matches!(
+        order_type,
+        CTraderOrderType::Limit | CTraderOrderType::Stop
+    ) {
+        return Err(anyhow!(
+            "amend_order applies to RESTING limit/stop orders only (got {order_type:?}). A \
+             filled position's stop and target are changed with amend_position_sltp"
+        ));
+    }
+    if let Some(price) = trigger_price {
+        // Deliberately NOT floored at zero: commodity prices can be negative
+        // (WTI settled at -$37.63 on 2020-04-20) and XTIUSD is watchlisted. What
+        // is refused is a value that is not a number.
+        if !price.is_finite() {
+            return Err(anyhow!("triggerPrice must be a finite number (got {price})"));
+        }
+    }
+    if let Some(ms) = expiry_unix_ms {
+        if ms <= 0 {
+            return Err(anyhow!(
+                "expiryUnixMs must be a positive epoch-millisecond timestamp when set (got {ms}). \
+                 To make the order Good-Till-Cancel, omit it — this call cannot clear an expiry \
+                 that is already set"
+            ));
+        }
+    }
+
+    // Volume conversion needs a lot size, and the SL/TP pip conversion needs a
+    // pip size, so the symbol is resolved even when only one of them is being
+    // amended. `1.0` is a placeholder that is only used when `volume_lots` is
+    // None, and its converted result is discarded below.
+    let prep = prepare_new_order(
+        symbol,
+        volume_lots.unwrap_or(1.0),
+        stop_loss_pips,
+        take_profit_pips,
+        expected_is_live,
+    )?;
+
+    let (limit_price, stop_price) = match order_type {
+        CTraderOrderType::Limit => (trigger_price, None),
+        _ => (None, trigger_price),
+    };
+
+    let amend = CTraderAmendOrderRequest {
+        account_id: prep.account_id,
+        order_id,
+        volume: volume_lots.map(|_| prep.volume_units),
+        limit_price,
+        stop_price,
+        expiration_timestamp_ms: expiry_unix_ms,
+        // Absolute SL/TP are the position-amend path's currency; a resting
+        // order's bracket is expressed as a distance from its own entry, the
+        // same encoding `submit_pending_order_blocking` writes.
+        stop_loss: None,
+        take_profit: None,
+        slippage_in_points: None,
+        relative_stop_loss: prep.relative_stop_loss,
+        relative_take_profit: prep.relative_take_profit,
+        guaranteed_stop_loss: None,
+        trailing_stop_loss: None,
+        stop_trigger_method: None,
+    };
+
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: prep.creds.client_id,
+        client_secret: prep.creds.client_secret,
+        access_token: prep.creds.access_token,
+        environment: prep.creds.environment,
+        account_id: prep.creds.account_id_str,
+        request: CTraderExecutionRequest::AmendOrder(Box::new(amend)),
     };
     ProductionCTraderExecutionBackend::default().execute(&runtime_request)
 }

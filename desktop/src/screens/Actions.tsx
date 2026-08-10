@@ -5,6 +5,7 @@ import {
   rejectAction,
   brokerPendingOrders,
   placePendingOrder,
+  amendOrder,
   cancelOrder,
   streamSpots,
   type PendingOrder,
@@ -95,6 +96,67 @@ export default function Actions() {
     }
   };
 
+  // ── Modify a resting order in place (audit #236) ──────────────────────────
+  // Until 2026-08-10 the only way to change a trigger price was Cancel then
+  // re-place: two broker round trips, a new order id, and a stretch in which
+  // the level the operator is waiting for has no order behind it at all.
+  // `editId` is the row being edited; blank fields mean LEAVE UNCHANGED, which
+  // is what the endpoint does with an omitted field.
+  const [editId, setEditId] = useState<number | null>(null);
+  const [eLots, setELots] = useState<number | "">("");
+  const [eTrigger, setETrigger] = useState<number | "">("");
+  const [eSl, setESl] = useState<number | "">("");
+  const [eTp, setETp] = useState<number | "">("");
+
+  const beginEdit = (o: PendingOrder) => {
+    setEditId(o.orderId);
+    // Seed with what the order carries today so the operator edits a value
+    // rather than retyping one, and an untouched field round-trips unchanged.
+    setELots(o.volumeLots ?? "");
+    setETrigger(o.triggerPrice ?? "");
+    // SL/TP come back from the broker as ABSOLUTE prices while the amend takes
+    // pip DISTANCES, so they are deliberately left blank: pre-filling a price
+    // into a pips box would send a stop thousands of pips away.
+    setESl("");
+    setETp("");
+  };
+
+  const cancelEdit = () => {
+    setEditId(null);
+    setELots("");
+    setETrigger("");
+    setESl("");
+    setETp("");
+  };
+
+  const saveEdit = async (o: PendingOrder) => {
+    const otypeOfRow = String(o.orderType ?? "").toUpperCase().includes("STOP") ? "stop" : "limit";
+    if (eLots === "" && eTrigger === "" && eSl === "" && eTp === "") {
+      setMsg("Nothing to change — set at least one of lots, trigger, SL or TP.");
+      return;
+    }
+    setBusy(true);
+    setMsg(`Modifying order #${o.orderId}…`);
+    try {
+      await amendOrder({
+        orderId: o.orderId,
+        symbol: o.symbol,
+        orderType: otypeOfRow,
+        volumeLots: eLots === "" ? null : Number(eLots),
+        triggerPrice: eTrigger === "" ? null : Number(eTrigger),
+        stopLossPips: eSl === "" ? null : Number(eSl),
+        takeProfitPips: eTp === "" ? null : Number(eTp),
+      });
+      setMsg(`✓ modified order #${o.orderId}`);
+      cancelEdit();
+      await reloadPending();
+    } catch (e) {
+      setMsg(`Modify failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const cancel = async (orderId: number) => {
     setBusy(true);
     setMsg(`Cancelling order #${orderId}…`);
@@ -136,7 +198,7 @@ export default function Actions() {
         <p>A <b>conditional (pending) order</b> rests at the broker and fills automatically the moment the market reaches your <b>trigger price</b> — you don't have to be watching. It survives closing the app.</p>
         <HelpStep n={1}><b>Limit</b> = enter at a <i>better</i> price than now (BUY below / SELL above the market). <b>Stop</b> = enter on a <i>breakout</i> (BUY above / SELL below).</HelpStep>
         <HelpStep n={2}>Set Symbol, side, lots, the <b>trigger price</b>, and optional SL/TP in pips. Leave expiry blank for Good-Till-Cancel.</HelpStep>
-        <HelpStep n={3}>Resting orders appear below — <b>Cancel</b> any that haven't filled. The broker validates the price/side combination and rejects invalid ones with a reason.</HelpStep>
+        <HelpStep n={3}>Resting orders appear below — <b>Modify</b> one to change its lots, trigger price or bracket in place (leave a box blank to keep what it has), or <b>Cancel</b> any that haven't filled. The broker validates the price/side combination and rejects invalid ones with a reason.</HelpStep>
         <p className="muted small">The <b>AI approvals</b> section stays empty unless the assistant proposes a trade-management action for your one-click confirmation. Automated entries live in <b>Autopilot</b>.</p>
       </HelpPanel>
 
@@ -221,10 +283,33 @@ export default function Actions() {
                   <td className="muted">{price(o.stopLoss)}</td>
                   <td className="muted">{price(o.takeProfit)}</td>
                   <td className="muted">{fmtTime(o.openTimestampMs)}</td>
-                  <td><button className="danger" disabled={busy} onClick={() => cancel(o.orderId)}>Cancel</button></td>
+                  <td style={{ whiteSpace: "nowrap" }}>
+                    <button disabled={busy} onClick={() => (editId === o.orderId ? cancelEdit() : beginEdit(o))}>
+                      {editId === o.orderId ? "Close" : "Modify"}
+                    </button>{" "}
+                    <button className="danger" disabled={busy} onClick={() => cancel(o.orderId)}>Cancel</button>
+                  </td>
                 </tr>
               );
             })}
+            {orders
+              .filter((o) => o.orderId === editId)
+              .map((o) => (
+                <tr key={`edit-${o.orderId}`}>
+                  <td colSpan={10}>
+                    <div className="ticket-row" style={{ flexWrap: "wrap", gap: 12 }}>
+                      <span className="muted">Modify #{o.orderId} — blank = leave unchanged</span>
+                      <label>Lots<input type="number" min="0.01" step="0.01" value={eLots} onChange={(e) => setELots(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
+                      {/* Unfloored on purpose: commodity prices can be negative. */}
+                      <label>Trigger<input type="number" step="0.00001" value={eTrigger} onChange={(e) => setETrigger(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: 110 }} /></label>
+                      <label>SL pips <Tip text="A DISTANCE in pips, not a price. The broker reports the existing stop as a price, so this box starts empty — type a distance to replace it, or leave it blank to keep the stop the order already has." /><input type="number" min="0" value={eSl} onChange={(e) => setESl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
+                      <label>TP pips<input type="number" min="0" value={eTp} onChange={(e) => setETp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} style={{ width: 80 }} /></label>
+                      <button className="primary" disabled={busy} onClick={() => saveEdit(o)}>{busy ? "…" : "Save changes"}</button>
+                      <button disabled={busy} onClick={cancelEdit}>Discard</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
           </tbody>
         </table>
       )}
