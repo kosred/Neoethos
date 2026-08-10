@@ -412,7 +412,16 @@ pub struct RiskConfig {
     /// block. Wiring the two together would change live sizing, so it is NOT
     /// done silently here — see `tests/config_has_recipient.rs::UNWIRED`.
     pub challenge_phase: String,
-    pub prop_firm_rules: bool,
+    // `prop_firm_rules: bool` DELETED 2026-08-10 (knob-second-pass D6). It was
+    // literally `preset != PropFirmPreset::None` — one write from the Risk
+    // preset dropdown, one read into the display DTO, and ZERO decisions:
+    // every discovery call passes a hardcoded `PropFirmRiskRules::default()`.
+    // Because it tracked the PRESET while the engine takes its regime from
+    // `system.trading_mode`, the card could announce "Prop-firm rules: ON"
+    // during a risky run. The display is now derived from `system.trading_mode`
+    // (`neoethos-app/src/server/risk.rs::derive_prop_firm_rules_active`), which
+    // is what the engine actually reads. The key is in `RETIRED_KEYS`, so a
+    // live store still carrying it loads with the key NAMED at WARN.
     pub kill_zones_enabled: bool,
     /// Daily entry cap, counted per ACCOUNT — see the arming flag below.
     pub max_trades_per_day: usize,
@@ -613,11 +622,6 @@ impl Default for RiskConfig {
             require_stop_loss: true,
             challenge_mode: false,
             challenge_phase: "phase_1".to_string(),
-            // Disable the prop-firm gate entirely when the operator
-            // selected `preset: none` — they're trading their own
-            // money; we still respect per-trade risk limits but skip
-            // the challenge accounting.
-            prop_firm_rules: preset != PropFirmPreset::None,
             kill_zones_enabled: true,
             // Cap is preset-driven. FTMO defaults to 15; The5%ers is
             // tighter; "own money" raises it. Operators can override
@@ -2022,10 +2026,67 @@ impl Default for SmcSearchRuntimeConfig {
     }
 }
 
+/// Where the multi-timeframe feature cube is assembled.
+///
+/// This replaces `NEOETHOS_FEATURE_CUBE_MODE` (retired 2026-08-10), whose
+/// `ram` arm returned BEFORE the free-RAM check and so could put a cube larger
+/// than the machine into memory — a failure wearing the costume of a choice.
+///
+/// The RAM and disk assemblies are required to produce BIT-IDENTICAL cubes, so
+/// this knob is a performance/robustness choice, not an arithmetic one. It is
+/// nonetheless recorded in the discovery run profile
+/// (`/execution/feature_cube_mode`) because a run that silently went to disk
+/// and a run that stayed in RAM are otherwise indistinguishable after the fact,
+/// and because a knob that CAN move the answer must never be invisible again
+/// (the `NEOETHOS_GPU_F64` failure mode).
+///
+/// # THERE IS NO `ram`, AND THAT IS THE POINT
+///
+/// The retired variable accepted `ram | disk | auto`. This field accepts
+/// `auto | disk` only, and a file that says `ram` fails to load naming the
+/// field and the two accepted values. Two reasons, and both matter:
+///
+/// 1. **Forcing RAM is the defect that was removed.** It is the only input in
+///    the whole assembly that could put more bytes in memory than the machine
+///    reports having.
+/// 2. **A clamped `ram` would be a lever that changes nothing.** If the probe
+///    still binds — and it must — then `ram` and `auto` produce the same
+///    decision for every cube on every machine. Shipping it would be the same
+///    disease under a new name: a control the operator believes is live, that
+///    decides nothing.
+///
+/// `disk` is kept, and it is not symmetric with `ram`: it can only LOWER peak
+/// memory, so there is nothing for the probe to veto. It is the escape hatch
+/// for the case where the probe over-reports — a container whose cgroup limit
+/// is below the host RAM `available_memory_bytes()` sees, which is exactly the
+/// shape of a rented box.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FeatureCubeMode {
+    /// Derive from the free-RAM probe (the shipped answer, and what every run
+    /// with the env var unset has always done).
+    #[default]
+    Auto,
+    /// Always stream to the disk-mmap store, even when the cube would fit.
+    /// Slower; always honoured; can only reduce peak memory.
+    Disk,
+}
+
+impl FeatureCubeMode {
+    /// Stable lowercase spelling, for the run profile and for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Disk => "disk",
+        }
+    }
+}
+
 /// Data-layer behavior knobs — config-driven replacement for the
 /// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`
-/// env vars. Both default OFF (opt-in). Consumed by the data crate via
-/// `neoethos_data::install_data_runtime_overrides(...)` at startup.
+/// / `NEOETHOS_FEATURE_CUBE_MODE` env vars. Consumed by the data crate via
+/// `neoethos_data::install_data_runtime_overrides(...)` and
+/// `neoethos_data::install_feature_cube_policy(...)` at startup.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DataRuntimeConfig {
@@ -2074,6 +2135,11 @@ pub struct DataRuntimeConfig {
     /// instead of NaN-ing the stale tail (was
     /// `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`). OFF by default.
     pub rebuild_stale_higher_tfs: bool,
+    /// Where the multi-TF feature cube is assembled — see [`FeatureCubeMode`].
+    /// Was `NEOETHOS_FEATURE_CUBE_MODE`, retired 2026-08-10 because its `ram`
+    /// arm returned before the free-RAM check. `ram` is not an accepted value
+    /// here; `auto | disk` are.
+    pub feature_cube_mode: FeatureCubeMode,
 }
 
 impl Default for DataRuntimeConfig {
@@ -2084,6 +2150,9 @@ impl Default for DataRuntimeConfig {
             // differ by 1e5, so a multi-indicator gene equalled its largest term.
             normalize_features: true,
             rebuild_stale_higher_tfs: false,
+            // `Auto` reproduces exactly what every run got with the env var
+            // unset, which is what the operator's live store has always had.
+            feature_cube_mode: FeatureCubeMode::Auto,
         }
     }
 }
@@ -2646,7 +2715,7 @@ mod load_seal {
     // re-reads the file). Emitting the same money-path finding 40 times is how
     // a real finding becomes wallpaper. Each DISTINCT message is emitted once
     // per process; nothing is ever downgraded or suppressed by content.
-    fn say_once(key: String, emit: impl FnOnce()) {
+    pub(super) fn say_once(key: String, emit: impl FnOnce()) {
         static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut guard = match seen.lock() {
@@ -2675,10 +2744,14 @@ mod load_seal {
         /// The operator's live store (`%LOCALAPPDATA%\neoethos\config.yaml`
         /// and its POSIX equivalents). **This is what a real run reads.**
         UserStore,
-        /// Last-resort relative `"config.yaml"`, resolved against the process
-        /// working directory — the same binary reads a different file
-        /// depending on the directory it was started from.
-        RepoRelative,
+        /// The operator's store, RELOCATED by `NEOETHOS_USER_DATA_DIR`.
+        ///
+        /// This is the *second* env input that can move WHICH FILE the process
+        /// reads (`$CONFIG_FILE` is the first). It gets its own name in the log
+        /// instead of hiding inside [`Self::UserStore`], because "the config
+        /// you edited is not the config this run read" is precisely the failure
+        /// this enum exists to make impossible.
+        UserStoreRedirected,
         /// A caller-supplied path (`Settings::from_yaml`).
         ExplicitPath,
         /// Deserialized from bytes with no path: the raw-YAML editor's schema
@@ -2692,7 +2765,7 @@ mod load_seal {
                 Self::CompiledDefaults => "compiled_defaults",
                 Self::EnvConfigFile => "env:CONFIG_FILE",
                 Self::UserStore => "user_store",
-                Self::RepoRelative => "cwd_relative",
+                Self::UserStoreRedirected => "user_store:NEOETHOS_USER_DATA_DIR",
                 Self::ExplicitPath => "explicit_path",
                 Self::InMemory => "in_memory",
             }
@@ -2968,6 +3041,15 @@ mod load_seal {
         },
         // ── risk.* ──
         RetiredKey {
+            path: "risk.prop_firm_rules",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-10: it was `risk.preset != none` written twice, read only by \
+                   the Risk card's DTO, and consulted by NO engine — every discovery call passes \
+                   a hardcoded PropFirmRiskRules::default(). Which rule set actually runs is \
+                   `system.trading_mode` (risky/growth = risky ladder, anything else = \
+                   prop-firm); set that. The value in this file changed nothing and is ignored",
+        },
+        RetiredKey {
             path: "risk.meta_label_tp_pips",
             kind: RetiredKind::Deleted,
             note: "superseded by risk.meta_label_fixed_tp (price units, not pips)",
@@ -3161,13 +3243,31 @@ mod load_seal {
                     "config key is RETIRED and is being IGNORED — {note}. Delete the line: it has \
                      no effect and never will."
                 ),
-                RetiredKind::Derived => tracing::warn!(
-                    target: "neoethos_core::config",
-                    key = path,
-                    config = %origin,
-                    "config key is DERIVED FROM HARDWARE and is being IGNORED — {note}. Delete \
-                     the line: the runtime detects it."
-                ),
+                // 2026-08-10 (pending-A A4): the derived text comes from
+                // `crate::system::RETIRED_DERIVED_KEYS` — the ONE table — not
+                // from a second copy maintained here. The two agreed by luck
+                // before; `retired_derived_tables_are_one_table` below makes it
+                // a mechanism. `note` is the fallback only if the lookup misses,
+                // and that test makes a miss impossible.
+                RetiredKind::Derived => {
+                    let detail = match crate::system::retired_derived_key(path) {
+                        Some(entry) => match entry.set_instead {
+                            Some(knob) => format!(
+                                "it is computed from {}. If you meant to constrain it, set `{knob}`",
+                                entry.derived_from
+                            ),
+                            None => format!("it is computed from {}", entry.derived_from),
+                        },
+                        None => note.to_string(),
+                    };
+                    tracing::warn!(
+                        target: "neoethos_core::config",
+                        key = path,
+                        config = %origin,
+                        "config key is DERIVED FROM HARDWARE and is being IGNORED — {detail}. \
+                         Delete the line: the runtime detects it."
+                    );
+                }
             });
         }
     }
@@ -3212,7 +3312,7 @@ mod load_seal {
         ("risk.total_drawdown_limit", true),
         ("risk.max_lot_size", true),
         ("risk.max_trades_per_day", true),
-        ("risk.prop_firm_rules", true), // `true` is the safer reading
+        // `risk.prop_firm_rules` removed 2026-08-10 with the field itself (D6).
     ];
 
     /// What the ACTIVE preset says the six fields should hold.
@@ -3222,7 +3322,6 @@ mod load_seal {
         total_drawdown_limit: f64,
         max_lot_size: f64,
         max_trades_per_day: usize,
-        prop_firm_rules: bool,
     }
 
     impl PresetSeeds {
@@ -3235,7 +3334,6 @@ mod load_seal {
                 total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
                 max_lot_size: runtime.max_lot_size,
                 max_trades_per_day: runtime.max_trades_per_day,
-                prop_firm_rules: preset != PropFirmPreset::None,
             }
         }
     }
@@ -3352,16 +3450,37 @@ mod load_seal {
             Self::from_raw(raw, ConfigProvenance::record(source, Some(path.to_path_buf())))
         }
 
-        /// THE resolution order, and the only one.
+        /// THE resolution order, and the only one. **Two branches, then the
+        /// compiled defaults.**
         ///
-        ///   1. `$CONFIG_FILE` (CI / test overrides).
-        ///   2. `user_config_path()` — the operator's live store — **if it
-        ///      exists**. On his machine it does, so this is the branch a real
-        ///      run takes, and it is not either of the two files in the repo.
-        ///   3. literal `"config.yaml"`, resolved against the process working
-        ///      directory.
+        ///   1. `$CONFIG_FILE` — the one supported way to point a run at a
+        ///      different file. Explicit, and named in the log.
+        ///   2. `user_config_path()` — the operator's store — **if it exists**.
+        ///      On his machine it does, so this is the branch a real run takes.
+        ///      Tagged [`ConfigSource::UserStoreRedirected`] when
+        ///      `NEOETHOS_USER_DATA_DIR` moved it.
+        ///   3. Neither exists → **the compiled `Default` impls, and nothing
+        ///      else.** Under the 2026-08-10 scheme the Rust `Default`s ARE the
+        ///      defaults and a config file carries OVERRIDES ONLY, so "no file"
+        ///      means "no overrides" — a legitimate state, not an error.
         ///
-        /// Each branch logs, by name, the file it opened.
+        /// # What this REFUSES that it used to do
+        ///
+        /// There was a third branch: the bare relative path `"config.yaml"`,
+        /// resolved against the process working directory. It is **deleted**.
+        /// It was the fourth config surface and it made the same binary trade
+        /// differently depending on the directory it was started from — a run
+        /// from the repo root silently picked up the repo's developer profile
+        /// (`require_walkforward_for_export: false`,
+        /// `prop_firm_min_pass_rate: 0.0`, `max_portfolio_risk: 0.34`), and the
+        /// identical binary one directory up did not.
+        ///
+        /// A developer who WANTS the repo profile now says so:
+        /// `$env:CONFIG_FILE = 'config.yaml'`. See
+        /// `docs/config-single-source-of-truth.md`.
+        ///
+        /// Each branch logs, by name, what it opened — including branch 3,
+        /// which logs that it opened nothing.
         pub fn load() -> anyhow::Result<Self> {
             if let Ok(explicit) = std::env::var("CONFIG_FILE") {
                 let path = PathBuf::from(explicit);
@@ -3369,19 +3488,33 @@ mod load_seal {
             }
             let user = user_config_path();
             if user.exists() {
-                return Self::from_path_tagged(&user, ConfigSource::UserStore);
+                let source = if crate::env_overrides::user_data_dir_override().is_some() {
+                    ConfigSource::UserStoreRedirected
+                } else {
+                    ConfigSource::UserStore
+                };
+                return Self::from_path_tagged(&user, source);
             }
-            say_once("cwd-relative-config".to_string(), || {
+            // No file anywhere. Say so at WARN, name the path that was absent,
+            // name the escape hatch, and name the fallback that is NO LONGER
+            // taken — silence here is how a run on a rented box could pick up a
+            // profile nobody chose.
+            let cwd_had_one = std::path::Path::new("config.yaml").exists();
+            say_once("compiled-defaults-config".to_string(), move || {
                 tracing::warn!(
                     target: "neoethos_core::config",
                     user_store = %user_config_path().display(),
                     cwd = ?std::env::current_dir().ok(),
-                    "the operator's config store does not exist — falling back to the RELATIVE \
-                     path \"config.yaml\". The same binary reads a different file depending on \
-                     the directory it was started from."
+                    cwd_config_yaml_present = cwd_had_one,
+                    "NO CONFIG FILE WAS READ. $CONFIG_FILE is unset and the operator's store does \
+                     not exist, so this run uses the COMPILED DEFAULTS and nothing else. Until \
+                     2026-08-10 this branch silently read the relative path \"config.yaml\" — that \
+                     fallback is DELETED, so if a ./config.yaml is present it is being IGNORED \
+                     (cwd_config_yaml_present says whether one is). To use it, set \
+                     CONFIG_FILE=config.yaml explicitly."
                 );
             });
-            Self::from_path_tagged(&PathBuf::from("config.yaml"), ConfigSource::RepoRelative)
+            Ok(Self::default())
         }
 
         fn from_raw(
@@ -3483,22 +3616,10 @@ mod load_seal {
                 self.risk.max_trades_per_day = v.max(0.0).round() as usize;
             }
 
-            if !is_explicit("risk.prop_firm_rules")
-                && self.risk.prop_firm_rules != seeds.prop_firm_rules
-            {
-                let (old, new) = (self.risk.prop_firm_rules, seeds.prop_firm_rules);
-                say_once(format!("preset-seed:{name}:risk.prop_firm_rules"), move || {
-                    tracing::warn!(
-                        target: "neoethos_core::config",
-                        key = "risk.prop_firm_rules",
-                        preset = name,
-                        old = old,
-                        new = new,
-                        "PRESET RE-DERIVED from the SELECTED preset"
-                    );
-                });
-                self.risk.prop_firm_rules = seeds.prop_firm_rules;
-            }
+            // The `risk.prop_firm_rules` re-derivation block was DELETED here
+            // 2026-08-10 together with the field (D6). It re-derived a bool
+            // that no engine read; the regime the engine actually runs comes
+            // from `system.trading_mode`.
 
             if !preset_explicit {
                 say_once("preset-implicit".to_string(), move || {
@@ -3643,6 +3764,69 @@ mod load_seal {
              scripts/migrate_live_config.ps1 takes the backup and shows the diff first."
         )
     }
+
+    #[cfg(test)]
+    mod seal_tests {
+        use super::*;
+
+        /// pending-A A4. Two tables listed the same three hardware-derived
+        /// keys and agreed **by luck**: `load_seal::RETIRED_KEYS` (this file)
+        /// and `crate::system::RETIRED_DERIVED_KEYS`. The message is now taken
+        /// from `system`, and this test is what stops the two lists from
+        /// separating — a key derived in one and settable in the other is a
+        /// hardware value an operator can freeze into a file and carry to
+        /// another machine, which is the defect being closed.
+        #[test]
+        fn retired_derived_tables_are_one_table() {
+            let here: Vec<&str> = RETIRED_KEYS
+                .iter()
+                .filter(|k| k.kind == RetiredKind::Derived)
+                .map(|k| k.path)
+                .collect();
+
+            for path in &here {
+                assert!(
+                    crate::system::retired_derived_key(path).is_some(),
+                    "`{path}` is marked Derived in config.rs but is absent from \
+                     crate::system::RETIRED_DERIVED_KEYS, so the loader would fall back to a \
+                     second, hand-maintained sentence. Add it to the system table."
+                );
+            }
+
+            for entry in crate::system::RETIRED_DERIVED_KEYS {
+                assert!(
+                    here.contains(&entry.key),
+                    "`{}` is in crate::system::RETIRED_DERIVED_KEYS but NOT in \
+                     load_seal::RETIRED_KEYS as Derived — so a config file that still carries it \
+                     is REFUSED as an unknown key (or worse, still accepted as an input) instead \
+                     of being named and ignored.",
+                    entry.key
+                );
+            }
+        }
+
+        /// The cwd-relative surface is deleted, and the enum is the record of
+        /// it. If a variant for it reappears, the fourth config surface has
+        /// come back with it.
+        #[test]
+        fn there_is_no_cwd_relative_config_source() {
+            for source in [
+                ConfigSource::CompiledDefaults,
+                ConfigSource::EnvConfigFile,
+                ConfigSource::UserStore,
+                ConfigSource::UserStoreRedirected,
+                ConfigSource::ExplicitPath,
+                ConfigSource::InMemory,
+            ] {
+                assert_ne!(
+                    source.as_str(),
+                    "cwd_relative",
+                    "the working-directory config branch is deleted; a run must never again \
+                     depend on the directory it was started from"
+                );
+            }
+        }
+    }
 }
 
 /// Canonical user-data path for the operator's editable `config.yaml`.
@@ -3669,14 +3853,48 @@ mod load_seal {
 /// (Settings → App tab, F-312 raw YAML editor, `/settings` POST) write
 /// back to the same path. Tests that need a synthetic path can still
 /// supply one via the `CONFIG_FILE` env var — `Settings::load` checks
-/// that first and LOGS which of the three branches it took.
+/// that first and LOGS which branch it took. Since 2026-08-10 there are only
+/// two file branches (`$CONFIG_FILE`, this store) and then the compiled
+/// defaults; the bare relative `"config.yaml"` branch is deleted.
 pub fn user_config_path() -> PathBuf {
     // Explicit override (NEOETHOS_USER_DATA_DIR) wins on every platform, so the
     // desktop shell / power users can point ALL config + data readers at one
     // chosen root (e.g. a project dir) — keeping every resolver consistent.
+    //
+    // 2026-08-10 (pending-A A9): this is the SECOND env input that can move
+    // WHICH FILE the whole process reads, and it was silent. It is retained —
+    // `desktop/src-tauri/src/lib.rs:545` uses it as the dev data-root escape and
+    // deleting it here would split the config path from the data path — but a
+    // redirect now NAMES ITSELF, with both the platform-standard path it
+    // replaced and the path it chose instead. A failure must never wear the
+    // costume of a choice, and neither must a redirect.
     if let Some(dir) = crate::env_overrides::user_data_dir_override() {
-        return PathBuf::from(dir).join("config.yaml");
+        let redirected = PathBuf::from(&dir).join("config.yaml");
+        let shown = redirected.display().to_string();
+        let standard = platform_user_config_path().display().to_string();
+        load_seal::say_once(format!("user-data-dir-override:{shown}"), || {
+            tracing::warn!(
+                target: "neoethos_core::config",
+                env_var = crate::env_overrides::ENV_USER_DATA_DIR,
+                value = %dir,
+                config = %shown,
+                platform_default = %standard,
+                "NEOETHOS_USER_DATA_DIR IS REDIRECTING THE CONFIG FILE. This process will read \
+                 the config shown, NOT the platform-standard store. Unset the variable to go back \
+                 to the standard path."
+            );
+        });
+        return redirected;
     }
+    platform_user_config_path()
+}
+
+/// The platform-standard store path, with no env redirect applied.
+///
+/// Split out so [`user_config_path`] can name BOTH paths when
+/// `NEOETHOS_USER_DATA_DIR` moves the answer — "your config is elsewhere" is
+/// only actionable if the message says where it would otherwise have been.
+fn platform_user_config_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
@@ -3706,7 +3924,21 @@ pub fn user_config_path() -> PathBuf {
                 .join("config.yaml");
         }
     }
-    PathBuf::from("config.yaml")
+    // No LOCALAPPDATA (Windows), no HOME / XDG_DATA_HOME (POSIX). Unreachable
+    // on any supported OS, and it must NOT resolve to the bare relative
+    // `"config.yaml"`: `Settings::load` treats this path's existence as "the
+    // operator has a store", so returning the repo file here would smuggle back
+    // the cwd-relative surface that branch 3 of `load()` just deleted.
+    load_seal::say_once("no-home-dir".to_string(), || {
+        tracing::warn!(
+            target: "neoethos_core::config",
+            "no LOCALAPPDATA / HOME / XDG_DATA_HOME — the config store falls back to \
+             ./neoethos/config.yaml relative to the working directory. This is NOT the repo's \
+             ./config.yaml: adopting that file by accident is the cwd-dependent-behaviour defect \
+             closed on 2026-08-10. Set NEOETHOS_USER_DATA_DIR to choose the root explicitly."
+        );
+    });
+    PathBuf::from("neoethos").join("config.yaml")
 }
 
 impl Settings {
@@ -3788,6 +4020,51 @@ impl Settings {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The successor to `NEOETHOS_FEATURE_CUBE_MODE` must not accept `ram`.
+    ///
+    /// The retired variable accepted it, and its `ram` arm returned BEFORE the
+    /// free-RAM check — the one input that could cause an OOM was the one input
+    /// that skipped the OOM guard. A migration that copies the old value across
+    /// must fail LOUDLY at load, naming the field and the two legal values,
+    /// rather than parse into something that quietly means `auto`.
+    #[test]
+    fn feature_cube_mode_refuses_ram_and_defaults_to_auto() {
+        assert_eq!(
+            FeatureCubeMode::default(),
+            FeatureCubeMode::Auto,
+            "the default must reproduce the env-unset behaviour every run has had"
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<FeatureCubeMode>("disk").unwrap(),
+            FeatureCubeMode::Disk
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<FeatureCubeMode>("auto").unwrap(),
+            FeatureCubeMode::Auto
+        );
+
+        let refused = serde_yaml_ng::from_str::<FeatureCubeMode>("ram");
+        let err = refused
+            .expect_err("`ram` must be refused — forcing RAM is the defect that was removed")
+            .to_string();
+        assert!(
+            err.contains("ram") && err.contains("auto") && err.contains("disk"),
+            "the refusal must name the offending value AND the accepted ones, or the \
+             operator has to go read the source to fix his file: {err}"
+        );
+    }
+
+    /// The whole point of the field is that a run can say which assembly built
+    /// its cube. A spelling that drifts from the serde representation would
+    /// make the run profile disagree with the config file it came from.
+    #[test]
+    fn feature_cube_mode_as_str_matches_its_serde_spelling() {
+        for mode in [FeatureCubeMode::Auto, FeatureCubeMode::Disk] {
+            let yaml = serde_yaml_ng::to_string(&mode).unwrap();
+            assert_eq!(yaml.trim(), mode.as_str());
+        }
+    }
 
     #[test]
     fn config_maps_serialize_in_sorted_deterministic_order() {

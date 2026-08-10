@@ -41,6 +41,15 @@ pub struct TreeRuntimeOverrides {
     pub early_stop_patience: Option<usize>,
     pub early_stop_min_delta: Option<f64>,
     pub lightgbm_gpu: bool,
+    /// The operator's CPU thread budget for the native tree pools, from
+    /// `models.backtest_runtime.rayon_threads` — the SAME field
+    /// `neoethos-search` resolves `RAYON_NUM_THREADS` to.
+    ///
+    /// Closes the asymmetry recorded as D-F4: one variable, two crates, two
+    /// answers. `neoethos-search` retired `RAYON_NUM_THREADS` to this field;
+    /// `neoethos-models` kept reading the raw variable on every tree train.
+    /// Both now read one field.
+    pub rayon_threads: Option<usize>,
 }
 
 impl Default for TreeRuntimeOverrides {
@@ -52,6 +61,7 @@ impl Default for TreeRuntimeOverrides {
             early_stop_patience: None,
             early_stop_min_delta: None,
             lightgbm_gpu: false,
+            rayon_threads: None,
         }
     }
 }
@@ -73,16 +83,29 @@ impl TreeRuntimeOverrides {
             early_stop_patience: c.early_stop_patience,
             early_stop_min_delta: c.early_stop_min_delta,
             lightgbm_gpu: c.lightgbm_gpu,
+            rayon_threads: s.models.backtest_runtime.rayon_threads.filter(|n| *n > 0),
         }
     }
 }
 
 static TREE_RUNTIME: OnceLock<TreeRuntimeOverrides> = OnceLock::new();
 
+/// Install ONLY this registry. `pub(crate)` so the single crate-wide
+/// installer in `runtime::install` is the one entry point callers see.
+pub(crate) fn set_tree_runtime(s: &neoethos_core::Settings) {
+    let _ = TREE_RUNTIME.set(TreeRuntimeOverrides::from_settings(s));
+}
+
 /// Install the tree-model runtime config from `Settings` (call once at
 /// startup, before any model training). The first install wins.
+///
+/// Kept under its historical name because the app, the desktop shell and the
+/// CLI already call it. It now installs EVERY `neoethos-models` registry via
+/// [`crate::runtime::install::install_model_runtime_from_settings`] and emits
+/// the retired-env-var report, so no caller has to learn a new name to get the
+/// config-only behaviour. New callers should prefer the aggregate directly.
 pub fn install_tree_runtime_from_settings(s: &neoethos_core::Settings) {
-    let _ = TREE_RUNTIME.set(TreeRuntimeOverrides::from_settings(s));
+    crate::runtime::install::install_model_runtime_from_settings(s);
 }
 
 /// Current tree-model runtime config (defaults if never installed — e.g. in
@@ -116,24 +139,27 @@ pub fn cpu_threads_hint() -> usize {
     {
         return n;
     }
-    // ⚠ AUDIT #279 — DO NOT DELETE THIS READ.
+    // ⚠ AUDIT #279 — RESOLVED 2026-08-10. The read stays; the ENV read does not.
     //
-    // A refuter pass concluded `RAYON_NUM_THREADS` is dead because the only
-    // site it found was an orphaned `from_env` constructor in
-    // `neoethos-search/src/.../eval.rs:535`. That conclusion is wrong as
-    // stated: the variable is LIVE right here, on a production path — this
-    // function is called from `parallel_trainer.rs:19`, `catboost.rs:414` and
-    // `catboost.rs:702`, i.e. on every tree train. The situation is an
-    // asymmetry (dead on the search side, live on the models side), not a
-    // silence. Removing the var on the strength of the eval.rs finding takes
-    // away the only thread control the tree trainers have when
-    // `hardware.cpu_budget` is unset. Read the code here before acting on that
-    // item anywhere else in the tree.
-    if let Ok(val) = env::var("RAYON_NUM_THREADS")
-        && let Ok(parsed) = val.trim().parse::<usize>()
-        && parsed > 0
-    {
-        return parsed;
+    // The history matters, because the naive fix here is wrong in both
+    // directions. A refuter pass once concluded `RAYON_NUM_THREADS` was dead
+    // on the strength of an orphaned `from_env` in
+    // `neoethos-search/src/.../eval.rs`. It was not: this function runs on
+    // every tree train (`parallel_trainer.rs:19`, `catboost.rs:414`,
+    // `catboost.rs:702`), so deleting the knob outright would have taken away
+    // the tree trainers' only thread control whenever
+    // `system.hardware.cpu_budget` is unset.
+    //
+    // The real defect was the ASYMMETRY: `neoethos-search` retired the
+    // variable to `models.backtest_runtime.rayon_threads` while this crate
+    // kept reading the raw environment — one variable, two crates, two
+    // answers, and only one of them recorded in the artifact. Both crates now
+    // read the one field. The thread control survives; the second channel does
+    // not. An exported `RAYON_NUM_THREADS` is NOT reported as retired: it is a
+    // standard rayon variable that still sizes rayon's own global pool, and
+    // claiming we ignore it would be a different lie.
+    if let Some(n) = current_tree_runtime().rayon_threads {
+        return n;
     }
     num_cpus::get().saturating_sub(1).max(1)
 }
@@ -368,22 +394,48 @@ pub fn gpu_count() -> usize {
         None
     }
 
-    if let Some(count) = env_gpu_count(&[
+    // ⚠ THESE SIX ARE NOT OUR CONFIGURATION AND ARE DELIBERATELY KEPT.
+    //
+    // `CUDA_VISIBLE_DEVICES` and its vendor siblings are read by the NVIDIA /
+    // ROCm drivers themselves: when one is set, the masked cards do not exist
+    // as far as any CUDA context in this process is concerned. Reading them is
+    // OBSERVING THE HARDWARE as the driver presents it, not reading a setting
+    // out of the environment. Ignoring them would make this function report
+    // cards the runtime cannot open — a config file cannot overrule a driver
+    // mask. They are therefore not in `RETIRED_ENV_VARS` and must not be.
+    let masked = env_gpu_count(&[
         "GPU_VISIBLE_DEVICES",
         "CUDA_VISIBLE_DEVICES",
         "NVIDIA_VISIBLE_DEVICES",
         "HIP_VISIBLE_DEVICES",
         "ROCR_VISIBLE_DEVICES",
         "ROCM_VISIBLE_DEVICES",
-    ]) {
-        return count;
-    }
+    ]);
+    // Explicit config count (`models.tree_runtime.gpu_count`, was the
+    // `FOREX_GPU_COUNT` env var).
+    let configured = current_tree_runtime().gpu_count;
 
-    // Explicit config override (was the `FOREX_GPU_COUNT` env var). Sits after
-    // the standard `*_VISIBLE_DEVICES` probe — the same precedence
-    // `FOREX_GPU_COUNT` had — and before the nvidia-smi / rocm subprocess probes.
-    if let Some(count) = current_tree_runtime().gpu_count {
-        return count;
+    match (masked, configured) {
+        // Both answered and they disagree: the SAFER (smaller) number binds
+        // and the disagreement is logged with both values. Taking the larger
+        // would either open a card the driver has masked away or oversubscribe
+        // one the operator asked to leave alone.
+        (Some(mask_count), Some(config_count)) if mask_count != config_count => {
+            let effective = mask_count.min(config_count);
+            tracing::warn!(
+                target: "neoethos_models::tree_config",
+                driver_visible_devices = mask_count,
+                configured_gpu_count = config_count,
+                effective = effective,
+                "GPU count disagreement: a *_VISIBLE_DEVICES driver mask reports \
+                 {mask_count} card(s) while models.tree_runtime.gpu_count says \
+                 {config_count}; the safer (smaller) value {effective} binds"
+            );
+            return effective;
+        }
+        (Some(count), _) => return count,
+        (None, Some(count)) => return count,
+        (None, None) => {}
     }
 
     if let Some(count) = nvidia_smi_gpu_count() {

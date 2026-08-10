@@ -6,6 +6,11 @@ pub mod bootstrap_writer;
 // Call-sites elsewhere consult `env_overrides::*` typed getters instead
 // of reading `std::env::var` directly.
 pub mod env_overrides;
+// 2026-08-10 config consolidation: the tombstone list. Every env var this
+// crate USED to read is named here, and a name still exported at startup
+// produces an ERROR saying it was ignored and which config key replaced it.
+// Non-negotiable #4: a deleted lever must announce itself, not fall silent.
+pub mod retired_env;
 pub mod broker_config;
 pub mod broker_persistence;
 pub mod ctrader_account;

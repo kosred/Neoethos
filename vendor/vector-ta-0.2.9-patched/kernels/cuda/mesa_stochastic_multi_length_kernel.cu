@@ -268,3 +268,139 @@ extern "C" __global__ void mesa_stochastic_multi_length_batch_f64(
         row_out_trigger_4[i] = trigger_4;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `mesa_stochastic_multi_length_with_kernel`
+// (src/indicators/mesa_stochastic_multi_length.rs:663) ->
+// `MesaStochasticMultiLengthStream::update` (:588), whose two stages are
+// `SharedFilterState::update` (:522) and `MesaLineState::update` (:430).
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `mesa_stochastic_multi_length_batch_f64` (:127) is double-clean but declares
+// twenty parameters -- five `const int*` per-row parameter arrays, two
+// host-allocated ring scratch buffers and EIGHT output matrices. The f64 lane
+// launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// and reads back ONE matrix, so the lane gets its own entry point here. The one
+// ring it needs is a fixed-size PER-THREAD array of `length_1` = 48 doubles,
+// 384 bytes, bounded at compile time.
+//
+// WHICH COLUMN: `mesa_1`. `compute_mesa_stochastic_multi_length_batch`
+// (cpu_batch.rs:10604-10629) accepts eight output ids -- `mesa_1..4` and
+// `trigger_1..4` -- and has NO `value` alias, so a parity run must name the
+// column. `mesa_1` is the longest line (`length_1` = 48, the CPU default at
+// cpu_batch.rs:10577) and the one the other three are read against; the four
+// triggers are each an SMA OF a mesa line, so nothing is lost by not computing
+// them here. Precedent for naming rather than inventing a `value`:
+// `ict_propulsion_block_neo_batch_f64`, which emits `bullish_high`.
+//
+// SHAPE: one thread per combo, bars ascending. Six carried scalars in the
+// shared two-pole high-pass / super-smoother cascade (`prev_src_1/2`,
+// `prev_hp_1/2`, `prev_filt_1/2`, :488-493) plus the mesa line's own
+// `prev_1`/`prev_2` and its 48-slot ring. Two IIRs in series -- there is no
+// bar-parallel form.
+//
+// PERIOD-INVARIANT: the CPU batch reads `source`, `length_1..4` and
+// `trigger_length` and NEVER `period` (cpu_batch.rs:10576-10582), so every
+// swept period gives the same CPU column and this kernel writes identical rows.
+// `length_1` is pinned at the CPU default 48.
+//
+// ROUNDING: every step is the CPU's `mul_add` nesting reproduced as `fma`,
+// operand for operand:
+//   hp   = fma(hp_coef, src - 2*nz(p1) + nz(p2),
+//              fma(hp_fb1, nz(hp1), hp_fb2 * nz(hp2)))        -- CPU :524-529
+//   filt = fma(c1, hp, fma(c2, nz(f1), c3 * nz(f2)))          -- CPU :532-537
+//   out  = fma(c1, stoc, fma(c2, nz(prev_1), c3 * nz(prev_2)))-- CPU :464
+// Writing these as separate multiplies and adds would be three roundings where
+// the CPU has two, on a value that feeds its own recurrence.
+//
+// PI IS 3.14, NOT M_PI. `const PI: f64 = 3.14` (:30) is the CPU's own
+// constant -- Ehlers' original script writes 3.14 and the crate reproduces it.
+// Substituting `M_PI` here would compute a DIFFERENT indicator, so the file's
+// `constexpr double PI = 3.14` (:5) is correct and is reused.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic, no epsilon. `cos`, `sin`, `exp` are the double overloads. The NaN
+// is a DOUBLE quiet-NaN bit pattern.
+//
+// FIRST VALID IS NOT READ: the CPU never resets -- a non-finite bar makes `hp`
+// and `filt` NaN for that bar and `nz()` (:6 here, :410 there) folds the NaN
+// history to 0.0 on the next one, so the series is defined from bar 0 with no
+// warmup index. The lane row declares `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+#define NEO_MESA_LENGTH_1 48
+
+__device__ inline double neo_mesa_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__ void mesa_stochastic_multi_length_neo_batch_f64(
+    const double* __restrict__ source,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_mesa_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    double mesa_ring[NEO_MESA_LENGTH_1];
+    MesaLineState mesa_1_state;
+    mesa_1_state.init(mesa_ring, NEO_MESA_LENGTH_1);
+
+    // `SharedFilterState::new`, :498-506. Identical expressions, same order.
+    const double alpha1 =
+        ((cos(0.707 * 2.0 * PI / 48.0) + sin(0.707 * 2.0 * PI / 48.0) - 1.0) /
+         cos(0.707 * 2.0 * PI / 48.0));
+    const double one_minus_alpha = 1.0 - alpha1;
+    const double hp_coef = (1.0 - alpha1 * 0.5) * (1.0 - alpha1 * 0.5);
+    const double a1 = exp(-1.414 * PI / 10.0);
+    const double b1 = 2.0 * a1 * cos(1.414 * PI / 10.0);
+    const double c2 = b1;
+    const double c3 = -(a1 * a1);
+    const double c1 = 1.0 - c2 - c3;
+    const double hp_feedback_1 = 2.0 * one_minus_alpha;
+    const double hp_feedback_2 = -(one_minus_alpha * one_minus_alpha);
+
+    double prev_src_1 = nan_value;
+    double prev_src_2 = nan_value;
+    double prev_hp_1 = nan_value;
+    double prev_hp_2 = nan_value;
+    double prev_filt_1 = nan_value;
+    double prev_filt_2 = nan_value;
+
+    for (int i = 0; i < n; ++i) {
+        const double value = source[i];
+        const double hp = isfinite(value)
+            ? fma(
+                  hp_coef,
+                  value - 2.0 * nz(prev_src_1) + nz(prev_src_2),
+                  fma(hp_feedback_1, nz(prev_hp_1), hp_feedback_2 * nz(prev_hp_2)))
+            : nan_value;
+        const double filt = isfinite(hp)
+            ? fma(c1, hp, fma(c2, nz(prev_filt_1), c3 * nz(prev_filt_2)))
+            : nan_value;
+
+        prev_src_2 = prev_src_1;
+        prev_src_1 = value;
+        prev_hp_2 = prev_hp_1;
+        prev_hp_1 = hp;
+        prev_filt_2 = prev_filt_1;
+        prev_filt_1 = filt;
+
+        row[i] = mesa_1_state.update(filt, c1, c2, c3);
+    }
+}

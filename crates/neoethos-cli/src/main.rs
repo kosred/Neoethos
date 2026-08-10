@@ -96,9 +96,31 @@ fn main() -> Result<()> {
             neoethos_core::Settings::default()
         }
     };
-    let process_cpu_assignment = std::env::var("NEOETHOS_BOT_CPU_BUDGET")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok());
+    // CPU budget for THIS process — an internal parent→child handoff, not an
+    // operator knob.
+    //
+    // It used to travel as the environment variable `NEOETHOS_BOT_CPU_BUDGET`,
+    // set by `spawn_discover_combo` on each `discover` child the schedule
+    // orchestrator starts. That was the config-chaos pattern in miniature: it
+    // appeared in no config file and in no knob catalog, yet a stale export
+    // left in a shell silently re-partitioned the cores of every later run,
+    // and the old `.ok().and_then(parse.ok())` chain swallowed a typo without
+    // a word — `NEOETHOS_BOT_CPU_BUDGET=eight` meant "no assignment".
+    //
+    // It is now `--cpu-threads`: visible in the process list, scoped to the
+    // one invocation it was written for, and FATAL when malformed.
+    let process_cpu_assignment = match parse_flag(&raw_args, "--cpu-threads") {
+        None => None,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => anyhow::bail!(
+                "--cpu-threads expects a positive integer, got `{raw}`. This flag is set by \
+                 the schedule orchestrator on the children it spawns; there is no reason to \
+                 pass it by hand. Refusing to run rather than guess a core budget."
+            ),
+        },
+    };
+    warn_retired_env_vars();
     startup_settings.apply_process_cpu_assignment(process_cpu_assignment);
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
@@ -1727,7 +1749,14 @@ fn spawn_discover_combo(
         .arg("--portfolio-size")
         .arg(resolved.search.portfolio_size.to_string())
         .arg("--out")
-        .arg(format!("cache/schedule/{symbol}_{timeframe}.json"));
+        .arg(format!("cache/schedule/{symbol}_{timeframe}.json"))
+        // The child's CPU budget travels as an ARGUMENT, not as
+        // `NEOETHOS_BOT_CPU_BUDGET`. An env var here was indistinguishable
+        // from an operator knob and outlived the invocation it was meant for;
+        // an argument is scoped to this child and visible in the process list.
+        // Read back in `main()` via `parse_flag(&raw_args, "--cpu-threads")`.
+        .arg("--cpu-threads")
+        .arg(a.cpu_threads.to_string());
     // NOTE: intra-combo GPU sharding (the plural *_DEVICES env) is DISABLED at
     // the dispatch layer — the cubecl wgpu multi-device path panics
     // at runtime ("Memory page 0 doesn't exist" in cubecl-runtime client.rs) and
@@ -1741,7 +1770,11 @@ fn spawn_discover_combo(
     for (key, value) in gpu_assignment_env(a, hardware) {
         cmd.env(key, value);
     }
-    cmd.env("NEOETHOS_BOT_CPU_BUDGET", a.cpu_threads.to_string());
+    // `NEOETHOS_BOT_DATA_ROOT` still travels as an env var because its reader
+    // is `neoethos-models/src/training_orchestrator.rs:329`, in a crate this
+    // change does not own. The `--root` argument above already carries the same
+    // value to the search; the env copy exists only for the in-process trainer.
+    // Collapsing it is a neoethos-models edit, routed, not done here.
     cmd.env("NEOETHOS_BOT_DATA_ROOT", root);
     cmd.spawn()
         .with_context(|| format!("spawning discover for {symbol}/{timeframe}"))
@@ -2560,6 +2593,42 @@ fn default_batch_timeframes_csv(settings: Option<&neoethos_core::Settings>) -> S
          --timeframes explicitly or ensure config.yaml is reachable."
     );
     String::new()
+}
+
+/// Environment variables this binary used to obey and no longer does, each
+/// paired with what replaced it.
+///
+/// NOTHING branches on this list — it is a report, not a decision. It exists
+/// because the failure mode this whole consolidation is closing is the SILENT
+/// one: an operator who exported a name that used to work, and a binary that
+/// ignored it without saying so. A deleted lever that is still being pulled
+/// must announce that it is deleted.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
+    "NEOETHOS_BOT_CPU_BUDGET",
+    "--cpu-threads (set by the schedule orchestrator on the children it spawns)",
+)];
+
+/// Name every retired variable that is still set in this process's
+/// environment, state its replacement, and say plainly that the value was
+/// ignored. Called once from `main()`.
+fn warn_retired_env_vars() {
+    for (name, replacement) in RETIRED_ENV_VARS {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        let value = value.to_string_lossy().to_string();
+        eprintln!(
+            "IGNORED ENV VAR: {name}={value} — this variable was deleted. Nothing read it, \
+             and NOTHING in this run was changed by it. Its replacement is: {replacement}."
+        );
+        tracing::warn!(
+            target: "neoethos_cli",
+            env_var = %name,
+            value = %value,
+            replacement = %replacement,
+            "a deleted environment variable is still set; its value was ignored"
+        );
+    }
 }
 
 fn parse_flag(args: &[String], name: &str) -> Option<String> {

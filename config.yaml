@@ -9,11 +9,16 @@
 #   3. desktop/src-tauri/resources/config.yaml       (233 keys, a strict subset)
 #   4. %LOCALAPPDATA%\neoethos\config.yaml           — THE OPERATOR'S LIVE STORE
 #
-# `Settings::load()` reads $CONFIG_FILE, else the live store IF IT EXISTS, else
-# the literal relative path "config.yaml". The live store exists. **Every run
-# on this machine reads surface 4 and nothing else.** Surfaces 2 and 3 were
-# documentation that lied: 150 keys present here were absent from the seed, and
-# five shared keys disagreed — all five on the money path.
+# `Settings::load()` reads $CONFIG_FILE, else the live store IF IT EXISTS,
+# else THE COMPILED DEFAULTS. Until 2026-08-10 there was a third file branch —
+# the bare relative path "config.yaml", i.e. THIS FILE, resolved against the
+# working directory. It is DELETED: the same binary read a different config
+# depending on the directory it was started from, so simply being in the repo
+# root silently turned the out-of-sample export gate off. **A run reads surface
+# 4, or a file you named with $CONFIG_FILE, or nothing at all — and it logs
+# which.** Surfaces 2 and 3 were documentation that lied: 150 keys present here
+# were absent from the seed, and five shared keys disagreed — all five on the
+# money path.
 #
 # THE SCHEME NOW IN FORCE (docs/config-single-source-of-truth.md):
 #

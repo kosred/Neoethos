@@ -245,3 +245,169 @@ void bandpass_many_series_one_param_time_major_from_hp_f32(
         }
     }
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: `bandpass_fill_bp` (src/indicators/bandpass.rs:303-370),
+// which is the ONLY path `bandpass_output_into_slice` (:652) takes for the
+// `Bp` field, and `Bp` is what `output_id == "value"` resolves to
+// (dispatch/cpu_batch.rs:14152). The bp series is built from
+// `highpass_scalar` (moving_averages/highpass.rs:438) and then
+// `bandpass_scalar` (bandpass.rs:718).
+//
+// PERIOD-SWEPT: `compute_bandpass_batch` reads a parameter literally named
+// `period` (default 20) and `bandwidth` (default 0.3, cpu_batch.rs:14179).
+//
+// SHAPE: one thread per combo walking bars ASCENDING. Both stages are 2-pole
+// IIRs whose accumulation order is load-bearing, and the bandpass stage reads
+// hp[i] and hp[i-2] -- so hp is produced INSIDE the same ascending loop and
+// carried in three registers rather than materialised. No per-thread array,
+// therefore no `max_period` and NEVER-OOM by construction.
+//
+// EPSILON: the f32 lane guards `fabsf(co) < 1e-7f` at :24. That constant is
+// sized for f32 and is WRONG here; this kernel uses the CPU's own guard,
+// `cos_val.abs() < 1e-15` (highpass.rs:334, :400), which is the f64 rule.
+// ===========================================================================
+
+static __forceinline__ __device__ double bandpass_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void bandpass_neo_batch_f64(const double* __restrict__ prices,
+                            int n,
+                            const int* __restrict__ periods,
+                            int n_combos,
+                            int first_valid,
+                            double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = bandpass_neo_qnan();
+
+    const int period = periods[combo];
+    // cpu_batch.rs:14180 -- the batch's only other parameter, and the lane
+    // sweeps `period` alone, so this is the CPU's default at every row.
+    const double bandwidth = 0.3;
+
+    // bandpass.rs:255 -- `position(|x| x.is_finite())`, which is the
+    // `F64FirstValidRule::CloseFinite` this row declares.
+    int first = first_valid;
+    if (first < 0) first = 0;
+
+    bool refused = false;
+
+    // bandpass_prepare, :253-273.
+    if (first >= n) refused = true;
+    if (period <= 0 || period > n) refused = true;
+    if (!refused && (n - first) < period) refused = true;
+
+    // bandpass.rs:277-286. `f64::round` is half-away-from-zero and so is the
+    // CUDA double `round`, so the two agree bit for bit.
+    long long hp_period_ll = 0;
+    long long trig_period_ll = 0;
+    if (!refused) {
+        hp_period_ll = (long long)round(4.0 * (double)period / bandwidth);
+        trig_period_ll = (long long)round(((double)period / bandwidth) / 1.5);
+        if (hp_period_ll < 2) refused = true;
+        if (trig_period_ll < 2) refused = true;
+    }
+
+    // highpass.rs:313-316 -- a SEPARATE scan, `!is_nan`, which names an
+    // earlier bar than the `is_finite` scan above whenever the frame carries
+    // an infinity. Derived here rather than taken from `first`.
+    int first_hp = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(prices[i])) { first_hp = i; break; }
+    }
+    if (first_hp < 0) refused = true;
+
+    int hp_period = 0;
+    double hp_theta = 0.0;
+    if (!refused) {
+        hp_period = (int)hp_period_ll;
+        // highpass_with_kernel, :318-330: every refusal it makes.
+        if (n <= 2 || hp_period <= 0 || hp_period > n) refused = true;
+        else if ((n - first_hp) < hp_period) refused = true;
+        else {
+            hp_theta = 2.0 * M_PI * 1.0 / (double)hp_period;
+            const double cos_val = cos(hp_theta);
+            if (fabs(cos_val) < 1e-15) refused = true;
+        }
+    }
+
+    if (refused) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    // bandpass.rs:317-318 -- warm_bp, and :331 bp_start = warm_bp - 2. The
+    // highpass length check above guarantees first_hp + 2 <= n, so warm_bp is
+    // exactly first_hp + 2 and bp_start is exactly first_hp.
+    int warm_bp = first_hp + 2;
+    if (warm_bp < 2) warm_bp = 2;
+    if (warm_bp > n) warm_bp = n;
+    int bp_start = warm_bp >= 2 ? (warm_bp - 2) : 0;
+
+    // highpass_scalar, :447-450.
+    const double hp_sin = sin(hp_theta);
+    const double hp_cos = cos(hp_theta);
+    const double alpha_hp = 1.0 + ((hp_sin - 1.0) / hp_cos);
+    const double hp_c = 1.0 - 0.5 * alpha_hp;
+    const double hp_oma = 1.0 - alpha_hp;
+
+    // bandpass.rs:319-321 and bandpass_scalar :733-735.
+    const double beta = cos(2.0 * M_PI / (double)period);
+    const double gamma = cos(2.0 * M_PI * bandwidth / (double)period);
+    const double alpha_bp = 1.0 / gamma - sqrt((1.0 / (gamma * gamma)) - 1.0);
+    const double bp_a = 0.5 * (1.0 - alpha_bp);
+    const double bp_c = beta * (1.0 + alpha_bp);
+    const double bp_d = -alpha_bp;
+
+    const int nan_end = warm_bp < n ? warm_bp : n;
+    for (int i = 0; i < nan_end; ++i) row[i] = nn;
+
+    // One ascending pass. `hp_cur/hp_m1/hp_m2` carry the highpass series;
+    // `y_m1/y_m2` carry the bandpass recursion. bp_start == first_hp, so the
+    // two stages advance in lockstep and the relative index j = i - bp_start
+    // is the index `bandpass_scalar` sees.
+    double hp_cur = 0.0, hp_m1 = 0.0, hp_m2 = 0.0;
+    double x_m1 = 0.0;
+    double y_m1 = 0.0, y_m2 = 0.0;
+
+    for (int i = first_hp; i < n; ++i) {
+        const double x = prices[i];
+        if (i == first_hp) {
+            hp_cur = x;               // highpass.rs:461 -- *dst = *src
+        } else {
+            hp_cur = fma(hp_oma, hp_m1, hp_c * (x - x_m1));
+        }
+        x_m1 = x;
+
+        const int j = i - bp_start;
+        double y;
+        if (j == 0) {
+            y = hp_cur;               // bandpass.rs:724 -- out[0] = hp[0]
+        } else if (j == 1) {
+            y = hp_cur;               // :728 -- out[1] = hp[1]
+        } else {
+            // :743 -- d.mul_add(y_im2, c.mul_add(y_im1, a * delta)). Two fmas
+            // and one multiply, in that nesting. The f32 lane's unrolled form
+            // is arithmetically the same recurrence; the unroll is not a
+            // different accumulation.
+            const double delta = hp_cur - hp_m2;
+            y = fma(bp_d, y_m2, fma(bp_c, y_m1, bp_a * delta));
+        }
+
+        if (i >= warm_bp) row[i] = y;
+
+        hp_m2 = hp_m1;
+        hp_m1 = hp_cur;
+        y_m2 = y_m1;
+        y_m1 = y;
+    }
+}

@@ -335,7 +335,20 @@ export type RiskInfo = {
   preset: string;
   presetDisplayName: string;
   availablePresets: PresetSummary[];
-  propFirmRulesEnabled: boolean;
+  // `propFirmRulesEnabled` was HERE and is deleted. It mirrored
+  // `risk.prop_firm_rules`, a config field with exactly one write
+  // (`server/risk.rs:166`, from the preset dropdown), one read
+  // (`:244`, into this DTO) and ZERO decisions anywhere in the engine —
+  // every discovery call passes a hardcoded `PropFirmRiskRules::default()`.
+  // Risk.tsx and RiskyMode.tsx rendered it as "currently active rules", so the
+  // app could announce "Prop-firm" while `system.trading_mode` was `risky`.
+  // Both screens now derive that display from `system.trading_mode`.
+  //
+  // ⚠ The Rust half is NOT deleted by this change: `RiskDto`
+  // (`crates/neoethos-app/src/server/risk.rs:44`) and the config field
+  // (`RiskConfig::prop_firm_rules`) still exist and the endpoint still emits
+  // the key — it is now simply ignored. Deleting them is a neoethos-app +
+  // neoethos-core edit, routed as E-5/D6.
   riskyModeCooldownRemainingSecs: number | null;
 };
 export const riskInfo = () => apiGet<RiskInfo>("/risk");

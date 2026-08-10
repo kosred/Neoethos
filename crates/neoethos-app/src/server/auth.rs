@@ -48,10 +48,45 @@ pub fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Operator-supplied token via `NEOETHOS_API_TOKEN` (any non-empty value),
+/// The environment variable carrying the operator's API bearer token.
+///
+/// # This is a SECRET, not a setting — and that is why it survived
+///
+/// The 2026-08-10 config consolidation deleted every environment variable in
+/// this crate that could change what the bot DOES, and routed each to a named
+/// field in the one config file. This one is deliberately **not** routed
+/// there, and the reasoning belongs next to the read rather than in a doc
+/// nobody opens:
+///
+/// * `config.yaml` is displayed verbatim by the Settings → Advanced raw-YAML
+///   editor, is copied to `config.yaml.bak.<unix-ms>` on every save, and is
+///   readable by any process running as the operator. A bearer token that
+///   grants **order placement and broker-credential rewrite** does not belong
+///   in a file with those properties.
+/// * `server/diagnostics.rs` builds an operator-shareable support bundle from
+///   the same surfaces. A token in the config would ride along in it.
+/// * The workspace already keeps credentials out of the config: broker
+///   secrets live in `broker_credentials.toml` under the platform data dir,
+///   not in `config.yaml`. This follows that existing rule, it does not
+///   invent a new exception.
+///
+/// So the invariant the consolidation enforces is intact: **no configuration
+/// is read from the environment.** A credential is not configuration. The
+/// value is never logged, never echoed in an error, and never written to the
+/// config file.
+///
+/// The control plane (`crates/neoethos-mcp`, binary `neoethos-control-plane`)
+/// receives the same value through its `--token` argument; see
+/// `docs/codex-control-plane.md`.
+const ENV_API_TOKEN: &str = "NEOETHOS_API_TOKEN";
+
+/// Operator-supplied token via [`ENV_API_TOKEN`] (any non-empty value),
 /// trimmed. `None` when unset or blank.
+///
+/// This is the ONLY place in the crate that reads it, so "where does the
+/// token come from" has exactly one answer.
 pub fn configured_token() -> Option<String> {
-    std::env::var("NEOETHOS_API_TOKEN")
+    std::env::var(ENV_API_TOKEN)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

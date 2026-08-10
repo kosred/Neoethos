@@ -658,12 +658,39 @@ pub fn compute_sample_weights(y: &Series) -> Result<Vec<f32>> {
 /// to identify features that have shifted significantly.
 ///
 /// Derived from legacy detect_feature_drift (lines 346-477)
+///
+/// # `threshold` — 2026-08-10: the parameter is now the parameter
+///
+/// This function took a `_threshold` argument, **discarded it**, and read
+/// `NEOETHOS_BOT_DRIFT_THRESHOLD` (default `0.20`) instead. A caller passing
+/// `risk.feature_drift_threshold` would have been overruled by an environment
+/// variable that appears in no config file and no artifact. The argument is now
+/// honoured and the env var is deleted (reported at startup if still set).
+///
+/// Pass `settings.risk.feature_drift_threshold`. It is scaled by realised
+/// volatility below, exactly as the env value was.
+///
+/// ⚠ **NO CALLER as of 2026-08-10.** A workspace grep over `crates/`,
+/// `desktop/` and `mcp/` finds this function's definition and nothing else, so
+/// no run's behaviour changes today — including the fact that the shipped
+/// `risk.feature_drift_threshold` (0.30) is looser than the literal 0.20 the
+/// env default supplied. Whoever wires the first caller owns that comparison
+/// and must state it, because a looser base threshold means drift is flagged
+/// LESS often.
 pub fn detect_feature_drift(
     train_df: &DataFrame,
     val_df: &DataFrame,
-    _threshold: f64,
+    threshold: f64,
     method: &str,
 ) -> Result<FeatureDriftReport> {
+    if !threshold.is_finite() || threshold <= 0.0 {
+        anyhow::bail!(
+            "detect_feature_drift needs a positive base threshold; received {threshold}. \
+             Pass risk.feature_drift_threshold — a non-positive value would report every \
+             feature as drifted, or none, depending on the comparison, and neither is a \
+             usable answer."
+        );
+    }
     if train_df.height() == 0 || val_df.height() == 0 {
         return Ok(FeatureDriftReport {
             drifted_features: vec![],
@@ -710,10 +737,7 @@ pub fn detect_feature_drift(
     }
 
     // HPC FIX: Regime-Aware Drift Thresholding (lines 405-417)
-    let base_threshold = std::env::var("NEOETHOS_BOT_DRIFT_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.20);
+    let base_threshold = threshold;
 
     let mut vol_scale = 1.0;
     if let Ok(vol_col) = val_df.column("realized_volatility")

@@ -331,9 +331,26 @@ fn training_hardware_profile_id() -> String {
     HardwareProbe::new().detect().stable_id()
 }
 
+/// The source revision stamped into the artifact.
+///
+/// ⚠ These two reads are deliberately KEPT and are NOT operator configuration.
+/// They record WHICH CODE produced an artifact; they select nothing, gate
+/// nothing and enter no decision, and there is no config field that could hold
+/// them honestly — a commit hash written into `config.yaml` by hand is a lie
+/// waiting to happen. This is the same carve-out as the toolchain locators in
+/// `build.rs`: provenance and machine facts, not settings.
+///
+/// - `GITHUB_SHA` is set by GitHub Actions. We do not own the name and cannot
+///   rename it.
+/// - `NEOETHOS_SOURCE_COMMIT` is the explicit spelling for box provisioning and
+///   local builds.
+///
+/// The third spelling, `GIT_COMMIT_HASH`, is deleted (2026-08-10): nothing in
+/// this repository ever set it, and a third name for one fact is how a stale
+/// value ends up stamped on an artifact built from different code. It is
+/// reported at startup if still set.
 fn training_source_commit() -> String {
     std::env::var("NEOETHOS_SOURCE_COMMIT")
-        .or_else(|_| std::env::var("GIT_COMMIT_HASH"))
         .or_else(|_| std::env::var("GITHUB_SHA"))
         .map(|value| value.trim().to_string())
         .ok()

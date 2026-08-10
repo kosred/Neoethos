@@ -225,15 +225,14 @@ fn softmax_predict_kernel(
 }
 
 pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
-    let normalized = resolved_policy(model_name);
-    let model_env = format!(
-        "NEOETHOS_BOT_{}_CUDA_KERNEL",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    // Two-tier gate: subsystem-wide env can disable the kernel for all
-    // statistical models, AND a per-model env can override that.
-    crate::common::cuda_kernel_enabled(&normalized, "NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL")
-        && !crate::common::is_kernel_disabled_env(&model_env)
+    // ONE gate: the configured device policy (`models.statistical_device`).
+    //
+    // Until 2026-08-10 this was a two-tier ENV gate on top of the policy —
+    // a subsystem-wide `NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL` plus a
+    // per-model `NEOETHOS_BOT_<MODEL>_CUDA_KERNEL`. Neither had a config
+    // field, so the operator could hold a config that said `gpu` and a
+    // shell that said CPU, and the artifact recorded only the config.
+    crate::common::cuda_kernel_enabled(&resolved_policy(model_name))
 }
 
 /// The normalised device policy, with `auto` resolved against the hardware.
@@ -247,7 +246,9 @@ pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
 /// naming a device explicitly.
 ///
 /// This is reachable only when the operator sets `models.statistical_device`
-/// to `auto` (or an env var to the same); the shipped default is `cpu`.
+/// to `auto`; the shipped default is `cpu`. There is no env spelling — the
+/// `NEOETHOS_BOT_<MODEL>_DEVICE` / `NEOETHOS_BOT_META_DEVICE` pair that used
+/// to outrank the field was deleted 2026-08-10.
 fn resolved_policy(model_name: &str) -> String {
     let normalized = normalize_statistical_device_policy(&super::common::statistical_device_policy(
         model_name,
@@ -280,23 +281,14 @@ fn resolved_policy(model_name: &str) -> String {
 }
 
 fn cuda_device_id(model_name: &str) -> usize {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_CUDA_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    let normalized = resolved_policy(model_name);
-    crate::common::cuda_device_id_from_policy(
-        &normalized,
-        &model_key,
-        Some("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE"),
-    )
+    // The ordinal comes from the policy (`gpu:1`), which comes from
+    // `models.statistical_device`. The two env names that used to outrank
+    // it are deleted — see `common::cuda_device_id_from_policy`.
+    crate::common::cuda_device_id_from_policy(&resolved_policy(model_name))
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
-    crate::common::cuda_kernel_units(
-        client.properties().hardware.max_units_per_cube,
-        "NEOETHOS_BOT_STATISTICAL_KERNEL_UNITS",
-    )
+    crate::common::cuda_kernel_units(client.properties().hardware.max_units_per_cube)
 }
 
 fn flatten_features(features: &Array2<f32>, cols: usize) -> Result<Vec<f32>> {

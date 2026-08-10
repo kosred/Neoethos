@@ -566,3 +566,268 @@ extern "C" __global__ void macz_many_series_one_param_time_major_f32(
         }
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (macz)
+ *
+ * CPU reference: `macz_scalar_classic` (src/indicators/macz.rs:806), reached
+ *   because `macz_prepare` (:650) maps `Kernel::Auto` to `Kernel::Scalar`
+ *   OUTRIGHT (:726-729) and `macz_compute_into_tail_only` (:764) then IGNORES
+ *   the kernel argument entirely (`let _ = kernel;`). There is exactly one CPU
+ *   path, so there is exactly one oracle.
+ *
+ * Column: output_id "value" -> `out.values` (cpu_batch.rs:15415-15417).
+ *
+ * PERIOD-INVARIANT: `compute_macz_batch` reads `fast_length` (12),
+ *   `slow_length` (25), `signal_length` (9), `lengthz` (20), `length_stdev`
+ *   (25), `a` (1.0), `b` (1.0), `use_lag` (false) and `gamma` (0.02)
+ *   (cpu_batch.rs:15385-15393) and NEVER `period`.
+ *
+ * Input: (close, volume) -- `ensure_same_len_2("macz", close.len(),
+ *   volume.len())` (cpu_batch.rs:15347) -> F64InputKind::CloseVolume, and the
+ *   volume branch of the CPU IS taken (`has_volume` true), which changes the
+ *   vwap term from a plain mean to a volume weighting.
+ *
+ * FIRST-VALID IGNORED, and this is not laziness: `macz_prepare` :678-681 scans
+ *   CLOSE ALONE (`data.iter().position(|x| !x.is_nan())`). Volume is never
+ *   scanned -- a NaN volume is handled INSIDE the loop by `n_vwap_nan`
+ *   (:894-899), which makes the vwap NaN for that window instead of moving the
+ *   series start. Declaring `AllInputsNonNan` over CloseVolume would adopt
+ *   volume's first non-NaN too and SHIFT every window on any frame whose
+ *   volume starts later than its close. So the kernel derives its own index
+ *   and the caller's value is genuinely unused.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. Eight accumulators are carried
+ *   subtract-then-add (sum_fast, sum_slow, sum_lz, sum2_lz, sum_lsd, sum2_lsd,
+ *   sum_pv, sum_v) plus a `signal_length`-deep ring, and the output at bar i
+ *   is a difference against a mean of the previous `sig` outputs.
+ *
+ * Roundings, counted against the CPU lines:
+ *   :896   sum_pv = x.mul_add(v, sum_pv)                      -- ONE fma
+ *   :888   sum_lz = sum_lz + x, sum2_lz = sum2_lz + x * x     -- plain, NO fma
+ *   :983   (-2.0 * vwap_i).mul_add(e, e2) + vwap_i * vwap_i   -- ONE fma
+ *   :1011  zvwap.mul_add(a, (macd / sd_src) * b)              -- ONE fma
+ *   :1000  (e2 - e * e).max(0.0).sqrt()                       -- plain
+ *   Every mul_add above becomes an fma; every plain add/multiply stays plain.
+ *   The count matches line for line -- writing fma(x, x, sum2_lz) for :889
+ *   would REMOVE a rounding the reference performs.
+ *
+ * NaN semantics: `var.max(0.0)` (:984) and `(e2 - e*e).max(0.0)` (:1000) are
+ *   `f64::max`, which returns the NON-NaN operand -- so a NaN variance becomes
+ *   0.0 on the CPU. `fmax` is used here for exactly that reason; the `>= 0.0`
+ *   if-chain that reads naturally in C would let the NaN through and poison
+ *   `sd`, `zvwap` and then every bar of the signal ring.
+ *
+ * Epsilons: there is not one tolerance constant on this path. The only
+ *   comparisons are exact (`sd > 0.0`, `sum_v > 0.0`, `sd_src > 0.0`), so
+ *   there is no f32-sized epsilon to re-derive -- the f32-era constants
+ *   elsewhere in this file belong to the f32 entry points and are untouched.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:15385-15393. */
+#define NEO_MACZ_FAST     12
+#define NEO_MACZ_SLOW     25
+#define NEO_MACZ_SIG      9
+#define NEO_MACZ_LZ       20
+#define NEO_MACZ_LSD      25
+#define NEO_MACZ_A        1.0
+#define NEO_MACZ_B        1.0
+#define NEO_MACZ_USE_LAG  0
+#define NEO_MACZ_GAMMA    0.02
+
+extern "C" __global__
+void macz_neo_batch_f64(const double* __restrict__ close,
+                        const double* __restrict__ volume,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods;     /* period-invariant -- see header */
+    (void)first_valid; /* CLOSE-ONLY scan, derived below -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int    fast  = NEO_MACZ_FAST;
+    const int    slow  = NEO_MACZ_SLOW;
+    const int    sig   = NEO_MACZ_SIG;
+    const int    lz    = NEO_MACZ_LZ;
+    const int    lsd   = NEO_MACZ_LSD;
+    const double a     = NEO_MACZ_A;
+    const double b     = NEO_MACZ_B;
+
+    /* `macz_prepare` :678-681 -- first non-NaN of CLOSE alone. */
+    int first = -1;
+    for (int i = 0; i < n; ++i) { if (!isnan(close[i])) { first = i; break; } }
+    if (first < 0) return;                       /* AllValuesNaN */
+
+    int need = fast;
+    if (slow > need) need = slow;
+    if (lz   > need) need = lz;
+    if (lsd  > need) need = lsd;
+    if (n - first < need) return;                /* :700 NotEnoughValidData */
+
+    const int fast_start = first + fast - 1;
+    const int slow_start = first + slow - 1;
+    const int lz_start   = first + lz - 1;
+    const int lsd_start  = first + lsd - 1;
+    const int warm_m     = first + need - 1;               /* :831 */
+    const int warm_hist  = first + need + sig - 2;         /* macz_warm_len :646 */
+
+    double sum_fast = 0.0, sum_slow = 0.0;
+    int    n_fast_nan = 0, n_slow_nan = 0;
+    double sum_lz = 0.0, sum2_lz = 0.0, sum_lsd = 0.0, sum2_lsd = 0.0;
+    int    n_lz_nan = 0, n_lsd_nan = 0;
+    double sum_pv = 0.0, sum_v = 0.0;
+    int    n_vwap_nan = 0;
+
+#if NEO_MACZ_USE_LAG
+    double l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+    const double gamma = NEO_MACZ_GAMMA;
+#endif
+
+    /* `sig_ring` (:855-862): a `signal_length`-deep ring seeded with NaN. Its
+     * depth is a CPU DEFAULT, not a swept parameter, so it is sized here at
+     * exactly that default and no caller-supplied number reaches it. */
+    double sig_ring[NEO_MACZ_SIG];
+    for (int k = 0; k < sig; ++k) sig_ring[k] = NEO_F64_NAN;
+    double sig_sum   = 0.0;
+    int    sig_count = 0, sig_nan = 0, sig_head = 0;
+
+    const double inv_fast = 1.0 / (double)fast;
+    const double inv_slow = 1.0 / (double)slow;
+    const double inv_lz   = 1.0 / (double)lz;
+    const double inv_lsd  = 1.0 / (double)lsd;
+    const double inv_sig  = 1.0 / (double)sig;
+
+    for (int i = first; i < n; ++i) {
+        const double x        = close[i];
+        const bool   x_is_nan = isnan(x);
+
+        if (x_is_nan) {
+            n_fast_nan += 1; n_slow_nan += 1; n_lz_nan += 1; n_lsd_nan += 1;
+        } else {
+            sum_fast = sum_fast + x;
+            sum_slow = sum_slow + x;
+            sum_lz   = sum_lz   + x;
+            sum2_lz  = sum2_lz  + x * x;
+            sum_lsd  = sum_lsd  + x;
+            sum2_lsd = sum2_lsd + x * x;
+        }
+
+        {   /* has_volume is TRUE on this lane -- see header. */
+            const double v = volume[i];
+            if (x_is_nan || isnan(v)) {
+                n_vwap_nan += 1;
+            } else {
+                sum_pv = fma(x, v, sum_pv);   /* :896 x.mul_add(v, sum_pv) */
+                sum_v  = sum_v + v;
+            }
+        }
+
+        if (i >= first + fast) {
+            const double xo = close[i - fast];
+            if (isnan(xo)) n_fast_nan -= 1; else sum_fast -= xo;
+        }
+        if (i >= first + slow) {
+            const double xo = close[i - slow];
+            if (isnan(xo)) n_slow_nan -= 1; else sum_slow -= xo;
+        }
+        if (i >= first + lz) {
+            const double xo = close[i - lz];
+            if (isnan(xo)) { n_lz_nan -= 1; }
+            else { sum_lz -= xo; sum2_lz -= xo * xo; }
+            const double vo = volume[i - lz];
+            if (isnan(xo) || isnan(vo)) n_vwap_nan -= 1;
+            else { sum_pv -= xo * vo; sum_v -= vo; }
+        }
+        if (i >= first + lsd) {
+            const double xo = close[i - lsd];
+            if (isnan(xo)) { n_lsd_nan -= 1; }
+            else { sum_lsd -= xo; sum2_lsd -= xo * xo; }
+        }
+
+        const bool have_fast = (i >= fast_start) && (n_fast_nan == 0);
+        const bool have_slow = (i >= slow_start) && (n_slow_nan == 0);
+
+        const double fast_ma = have_fast ? (sum_fast * inv_fast) : NEO_F64_NAN;
+        const double slow_ma = have_slow ? (sum_slow * inv_slow) : NEO_F64_NAN;
+        const double macd    = (isnan(fast_ma) || isnan(slow_ma))
+                                 ? NEO_F64_NAN : (fast_ma - slow_ma);
+
+        double vwap_i = NEO_F64_NAN;
+        if (i >= lz_start) {
+            if (n_vwap_nan == 0 && sum_v > 0.0) vwap_i = sum_pv / sum_v;
+        }
+
+        double zvwap = NEO_F64_NAN;
+        if (i >= lz_start && n_lz_nan == 0 && !isnan(vwap_i) && isfinite(x)) {
+            const double e   = sum_lz  * inv_lz;
+            const double e2  = sum2_lz * inv_lz;
+            /* :983 -- ONE fma, then a plain add of vwap_i * vwap_i. */
+            const double var = fma(-2.0 * vwap_i, e, e2) + vwap_i * vwap_i;
+            /* var.max(0.0) is f64::max: a NaN var becomes 0.0. */
+            const double sd  = sqrt(fmax(var, 0.0));
+            zvwap = (sd > 0.0) ? ((x - vwap_i) / sd) : 0.0;
+        }
+
+        double sd_src = NEO_F64_NAN;
+        if (i >= lsd_start && n_lsd_nan == 0) {
+            const double e  = sum_lsd  * inv_lsd;
+            const double e2 = sum2_lsd * inv_lsd;
+            sd_src = sqrt(fmax(e2 - e * e, 0.0));
+        }
+
+        double macz_raw = NEO_F64_NAN;
+        if (i >= warm_m && isfinite(sd_src) && sd_src > 0.0
+            && isfinite(zvwap) && isfinite(macd)) {
+            macz_raw = fma(zvwap, a, (macd / sd_src) * b);   /* :1011 */
+        }
+
+        double macz_val;
+#if NEO_MACZ_USE_LAG
+        if (isfinite(macz_raw)) {
+            const double one_minus_g = 1.0 - gamma;
+            const double new_l0 = fma(macz_raw, one_minus_g, gamma * l0);
+            const double new_l1 = fma(-gamma, new_l0, l0 + gamma * l1);
+            const double new_l2 = fma(-gamma, new_l1, l1 + gamma * l2);
+            const double new_l3 = fma(-gamma, new_l2, l2 + gamma * l3);
+            l0 = new_l0; l1 = new_l1; l2 = new_l2; l3 = new_l3;
+            macz_val = (l0 + 2.0 * l1 + 2.0 * l2 + l3) / 6.0;
+        } else {
+            macz_val = NEO_F64_NAN;
+        }
+#else
+        macz_val = macz_raw;   /* use_lag default is FALSE (cpu_batch.rs:15392) */
+#endif
+
+        if (i >= warm_m) {
+            if (sig_count == sig) {
+                const double leaving = sig_ring[sig_head];
+                if (isnan(leaving)) { if (sig_nan > 0) sig_nan -= 1; }
+                else                { sig_sum -= leaving; }
+            } else {
+                sig_count += 1;
+            }
+            sig_ring[sig_head] = macz_val;
+            if (isnan(macz_val)) sig_nan += 1; else sig_sum += macz_val;
+            sig_head += 1;
+            if (sig_head == sig) sig_head = 0;
+
+            if (i >= warm_hist) {
+                const double signal = (sig_count == sig && sig_nan == 0)
+                                        ? (sig_sum * inv_sig) : NEO_F64_NAN;
+                o[i] = (isnan(macz_val) || isnan(signal))
+                         ? NEO_F64_NAN : (macz_val - signal);
+            }
+        }
+    }
+}

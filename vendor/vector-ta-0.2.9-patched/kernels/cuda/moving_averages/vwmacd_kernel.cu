@@ -833,3 +833,128 @@ extern "C" __global__ void vwmacd_many_series_one_param_time_major_f64(
         out_hist_tm[idx] = (!isnan(m) && !isnan(s)) ? (m - s) : f64_nan();
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (vwmacd)
+ *
+ * CPU reference: `vwmacd_scalar_classic` (src/indicators/vwmacd.rs:711),
+ *   reached from `vwmacd_prepare` (:1637) whose `chosen` is FORCED to
+ *   `Kernel::Scalar` whenever the three ma types are the CPU defaults
+ *   sma/sma/ema (:1711-1714). So the scalar path is not one option among
+ *   several here -- it is THE path the dispatcher takes, and therefore the
+ *   only oracle.
+ *
+ * Column: output_id "value" -> `VwmacdOutputField::Macd`
+ *   (cpu_batch.rs:5711-5713).
+ *
+ * PERIOD-INVARIANT: `compute_vwmacd_batch` reads `fast`/`fast_period` (12),
+ *   `slow`/`slow_period` (26) and `signal`/`signal_period` (9)
+ *   (cpu_batch.rs:5736-5741) and NEVER a parameter named `period`, so five
+ *   swept periods produce five identical CPU columns and this kernel emits
+ *   five identical rows.
+ *
+ * Input: (close, volume) -- `extract_close_volume_input("vwmacd", .., "close")`
+ *   (cpu_batch.rs:5709) -> F64InputKind::CloseVolume.
+ *
+ * FIRST-VALID: `first_valid_pair` (:317-321) is the first index at which
+ *   close AND volume are BOTH non-NaN -- exactly
+ *   F64FirstValidRule::AllInputsNonNan over the two series this kind names.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. The four volume-weighted
+ *   accumulators (f_cv, f_v, s_cv, s_v) are carried subtract-then-add across
+ *   bars; a prefix-sum reformulation would re-associate every one of them and
+ *   the macd feeds a threshold comparison.
+ *
+ * Roundings, counted against the CPU line:
+ *   `let cv_i = close[i] * v_i;`               (:742)  -- ONE multiply, no fma.
+ *   `f_cv += cv_i; f_v += v_i; s_cv += cv_i; s_v += v_i;` (:744-747)
+ *   `dst_macd[i] = fast_vwma - slow_vwma;`     (:769)  -- two divides, one sub.
+ *   The CPU does NOT use mul_add anywhere on this column, so neither does this
+ *   kernel: an fma here would drop a rounding the reference performs.
+ *
+ * NaN semantics: the CPU guards only `f_v != 0.0 && s_v != 0.0` (:766) and
+ *   lets a NaN close or volume propagate through the sums. Reproduced as
+ *   written -- there is no max/min on this column, so rule 4 does not bite.
+ *
+ * Retires nothing: the five MIXED `float*`/`double*` stages in this file stay
+ *   for the 180 wrappers that still call them. Our lane never touches them --
+ *   `F64Kernel::Vwmacd` resolves to THIS symbol by table, never by suffix.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:5736-5741. */
+#define NEO_VWMACD_FAST   12
+#define NEO_VWMACD_SLOW   26
+#define NEO_VWMACD_SIGNAL 9
+
+extern "C" __global__
+void vwmacd_neo_batch_f64(const double* __restrict__ close,
+                          const double* __restrict__ volume,
+                          int n,
+                          const int* __restrict__ periods,
+                          int n_combos,
+                          int first_valid,
+                          double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods; /* period-invariant -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int fast   = NEO_VWMACD_FAST;
+    const int slow   = NEO_VWMACD_SLOW;
+    const int signal = NEO_VWMACD_SIGNAL;
+
+    /* `vwmacd_prepare` :1688 refuses any of the three above `len`. */
+    if (fast > n || slow > n || signal > n) return;
+
+    const int first = first_valid;
+    if (first < 0 || first >= n) return;
+    /* :1699 -- NotEnoughValidData. */
+    if (n - first < slow) return;
+
+    const int macd_warm = first + (fast > slow ? fast : slow) - 1;
+
+    double f_cv = 0.0, f_v = 0.0, s_cv = 0.0, s_v = 0.0;
+
+    for (int i = first; i < n; ++i) {
+        const double v_i  = volume[i];
+        const double cv_i = close[i] * v_i;
+
+        f_cv += cv_i;
+        f_v  += v_i;
+        s_cv += cv_i;
+        s_v  += v_i;
+
+        const int n_since_first = i - first + 1;
+        if (n_since_first > fast) {
+            const int    j    = i - fast;
+            const double v_o  = volume[j];
+            const double cv_o = close[j] * v_o;
+            f_cv -= cv_o;
+            f_v  -= v_o;
+        }
+        if (n_since_first > slow) {
+            const int    j    = i - slow;
+            const double v_o  = volume[j];
+            const double cv_o = close[j] * v_o;
+            s_cv -= cv_o;
+            s_v  -= v_o;
+        }
+
+        if (i >= macd_warm) {
+            if (f_v != 0.0 && s_v != 0.0) {
+                const double fast_vwma = f_cv / f_v;
+                const double slow_vwma = s_cv / s_v;
+                o[i] = fast_vwma - slow_vwma;
+            } else {
+                o[i] = NEO_F64_NAN;
+            }
+        }
+    }
+}

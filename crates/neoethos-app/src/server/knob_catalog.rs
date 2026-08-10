@@ -58,37 +58,37 @@ pub struct KnobEntry {
     /// Human-readable display name for the Settings card.
     pub label: &'static str,
 
-    /// Historical env-var name for this knob. `None` when it never had one.
-    ///
-    /// ⚠ THIS IS NOT A PROMISE THAT SETTING IT DOES ANYTHING. The previous
-    /// wording — "still honoured for backward compat" — was untrue for a large
-    /// share of these entries and it was being shown to the operator in the
-    /// Settings UI.
-    ///
-    /// Concretely: the ~35 `NEOETHOS_BOT_PROP_*` / `_SEARCH_SEED` /
-    /// `_NOVELTY_WEIGHT` entries are read only by the `*_from_env` constructors
-    /// in `neoethos-search/src/genetic/runtime_overrides.rs`, whose sole entry
-    /// point `install_search_runtime_overrides_from_env` had ZERO production
-    /// callers and was deleted on 2026-08-03. Production installs the config
-    /// path (`install_search_runtime_overrides_from_settings`, called from
-    /// app/src/lib.rs:29 and cli/src/main.rs:33), which reads
-    /// `models.search_runtime`. So for those knobs the CONFIG is authoritative
-    /// and the env var is inert. `config.rs` even records that
-    /// `NEOETHOS_PROP_FIRM_PRESET` "was retired in v0.4.36" while this catalog
-    /// still lists it.
-    ///
-    /// NOT YET AUDITED PER ENTRY. Two attempts to classify all 49 by grep gave
-    /// contradictory answers — the readers use helper functions rather than a
-    /// literal `env::var("NAME")`, so a naive pattern misses them, and that
-    /// exact mistake has produced two wrong findings on this branch already.
-    /// Until each entry is traced from catalog → reader → production caller,
-    /// treat this field as PROVENANCE, not behaviour.
-    ///
-    /// The direction is one config for everything and no env vars, so the end
-    /// state for this field is removal — after the migration, not before, and
-    /// with the UI updated in the same change since it keys on `id`.
-    pub env_var: Option<&'static str>,
-
+    // ── `env_var` — DELETED 2026-08-10 (W2-7 / D-F1) ────────────────────
+    //
+    // The field carried a "historical env-var name" for 51 of these entries,
+    // under its own doc comment admitting it had NOT been audited per entry
+    // and was "PROVENANCE, not behaviour". That distinction does not survive
+    // the wire: this catalog is served verbatim to the LLM control plane
+    // (`crates/neoethos-mcp/src/ops.rs:803` → `server.rs:718`, described to
+    // the model as the authoritative list of every runtime knob) and rendered
+    // in Settings → Advanced. Both audiences read a variable name next to a
+    // knob as a way to set the knob.
+    //
+    // Every one of those names is now inert. The search-side readers
+    // (`install_search_runtime_overrides_from_env` and the `*_from_env`
+    // constructors behind the ~35 `NEOETHOS_BOT_PROP_*` entries) were deleted
+    // on 2026-08-03; the app-side ones moved to `AppRuntimeConfig` and were
+    // deleted here on 2026-08-10. Telling an agent to export
+    // `NEOETHOS_BOT_PROP_TOURNAMENT_SIZE` and then reporting the change as
+    // applied is the exact failure this wave exists to end.
+    //
+    // The field is REMOVED rather than set to `None` everywhere: 51 `None`s
+    // are a slot waiting for someone to fill it back in. Nothing in
+    // `desktop/src/**` reads `envVar` (only a prose comment in
+    // `Advanced.tsx:441` mentions it), so dropping the JSON key breaks no UI.
+    //
+    // Deliberately NOT replaced with a `config_key` field. Populating one
+    // correctly for 51 entries is an audit — `id` here is a display path
+    // (`"backtest.max_month_buckets"`), not a config path
+    // (`models.backtest_runtime.month_capacity`) — and a `config_key` guessed
+    // from the id would be the same lie in a new field. The retired NAMES are
+    // not lost: `app_services::retired_env` holds them with their replacement
+    // keys and prints them when one is still exported.
     /// What kind of widget the UI should render. **2026-05-26**: this
     /// field is `#[serde(flatten)]` so the `KnobKind` variant's tag
     /// (`kind`) and constraint fields (`min`, `max`, `enumChoices`)
@@ -181,7 +181,16 @@ pub struct KnobCatalogResponse {
     pub knobs: Vec<KnobEntry>,
 }
 
-const SCHEMA_VERSION: u32 = 1;
+/// Wire schema of `GET /settings/knob-catalog`.
+///
+/// **2 (2026-08-10)** — the `envVar` key was REMOVED from every entry (W2-7).
+/// A consumer pinned to v1 that expects the key must treat its absence as
+/// "this knob has no environment variable", which is now true of all of them.
+/// Bumped rather than dropped silently because the LLM control plane reads
+/// this payload as authoritative.
+///
+/// 1 — original shape, with `envVar`.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Build the catalog. Each entry reads its `current` value from the
 /// installed runtime overrides; the static parts come from the
@@ -204,7 +213,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.read_timeout_secs",
             section: "Broker connectivity (cTrader)",
             label: "Read timeout (seconds)",
-            env_var: Some("NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS"),
             kind: KnobKind::Int { min: Some(0), max: Some(3600) },
             default: "30",
             current: "30".to_string(), // Read inline in execute_via_session; no typed cache yet.
@@ -218,7 +226,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.max_attempts",
             section: "Broker connectivity (cTrader)",
             label: "Max execution attempts",
-            env_var: Some("NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS"),
             kind: KnobKind::Int { min: Some(1), max: Some(5) },
             default: "3",
             current: "3".to_string(),
@@ -232,7 +239,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.backoff_base_ms",
             section: "Broker connectivity (cTrader)",
             label: "Retry backoff base (ms)",
-            env_var: Some("NEOETHOS_BOT_CTRADER_BACKOFF_BASE_MS"),
             kind: KnobKind::Int { min: Some(10), max: Some(2000) },
             default: "200",
             current: "200".to_string(),
@@ -246,7 +252,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.allow_partial_fill",
             section: "Broker connectivity (cTrader)",
             label: "Accept partial fills",
-            env_var: Some("NEOETHOS_BOT_CTRADER_ALLOW_PARTIAL_FILL"),
             kind: KnobKind::Bool,
             default: "false",
             current: "false".to_string(),
@@ -260,7 +265,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.chart_merge_side",
             section: "Broker connectivity (cTrader)",
             label: "Chart merge side",
-            env_var: Some("NEOETHOS_BOT_CHART_MERGE_SIDE"),
             kind: KnobKind::Enum { variants: &["mid", "bid", "ask"] },
             default: "mid",
             current: "mid".to_string(),
@@ -276,7 +280,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.account_currency",
             section: "Risk & PnL safety",
             label: "Account currency (ISO-4217)",
-            env_var: Some("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY"),
             kind: KnobKind::Text,
             default: "(unset → hard-fail at risk gate)",
             current: cost
@@ -295,7 +298,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "paths.symbol_metadata_override",
             section: "Logging / persistence",
             label: "Symbol-metadata path override",
-            env_var: Some("NEOETHOS_BOT_SYMBOL_METADATA"),
             kind: KnobKind::Path,
             default: "data/symbol_metadata.json",
             current: "data/symbol_metadata.json".to_string(),
@@ -310,14 +312,23 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "paths.user_data_dir_override",
             section: "Logging / persistence",
             label: "User data dir override",
-            env_var: Some("NEOETHOS_USER_DATA_DIR"),
             kind: KnobKind::Path,
             default: "(platform default — %LOCALAPPDATA% on Windows)",
             current: "(platform default)".to_string(),
             help_short:
                 "Where logs and persistent state live. Override to redirect to a portable drive or RAM disk.",
+            // ⚠ One of exactly three catalog entries whose environment
+            // variable is STILL LIVE after the 2026-08-10 consolidation, and
+            // the only one that can change WHICH CONFIG FILE the process
+            // reads. `neoethos_core::config::user_config_path()` consults
+            // `crate::env_overrides::user_data_dir_override()` (config.rs:3872)
+            // and already logs "NEOETHOS_USER_DATA_DIR IS REDIRECTING THE
+            // CONFIG FILE" (config.rs:3883) when it fires. It lives in
+            // `neoethos-core`, which this wave could not edit; recorded as A9
+            // in the handoff. Said out loud in the help text rather than left
+            // for an operator to discover.
             help_long:
-                "By default `dirs::data_local_dir()` resolves to `%LOCALAPPDATA%/NeoEthos` on Windows. Override only if you have a specific reason (portable installation, faster disk, segregated backup target).",
+                "By default `dirs::data_local_dir()` resolves to `%LOCALAPPDATA%/NeoEthos` on Windows. Override only if you have a specific reason (portable installation, faster disk, segregated backup target). ⚠ This one is still driven by the `NEOETHOS_USER_DATA_DIR` environment variable, not by this file — and it decides which config file the process reads, so setting it changes the answer to every other question on this screen. The startup log names it explicitly when it is in force.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -326,7 +337,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.prop_firm_preset",
             section: "Risk & PnL safety",
             label: "Prop-firm preset",
-            env_var: Some("NEOETHOS_PROP_FIRM_PRESET"),
             kind: KnobKind::Enum {
                 variants: &["ftmo", "myforexfunds", "fundednext", "the5ers", "none"],
             },
@@ -342,7 +352,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pnl_audit_drift_fraction",
             section: "Risk & PnL safety",
             label: "PnL audit drift threshold",
-            env_var: Some("NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION"),
             kind: KnobKind::Float { min: Some(1e-5), max: Some(0.05) },
             default: "0.001",
             current: "0.001".to_string(),
@@ -356,7 +365,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pnl_circuit_breaker_fraction",
             section: "Risk & PnL safety",
             label: "PnL circuit breaker",
-            env_var: Some("NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION"),
             kind: KnobKind::Float { min: Some(1e-4), max: Some(0.20) },
             default: "0.01",
             current: "0.01".to_string(),
@@ -370,7 +378,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.require_stop_loss",
             section: "Risk & PnL safety",
             label: "Require Stop-Loss on every order",
-            env_var: None,
             kind: KnobKind::Bool,
             default: "true",
             current: "true".to_string(),
@@ -384,7 +391,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.reject_pip_fallback",
             section: "Risk & PnL safety",
             label: "Reject cross-pair pip-value fallback",
-            env_var: Some("NEOETHOS_BOT_REJECT_PIP_FALLBACK"),
             kind: KnobKind::Bool,
             default: "false",
             current: format!("{}", cost.reject_pip_fallback),
@@ -400,7 +406,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.seed",
             section: "Discovery / GA search",
             label: "RNG seed (deterministic)",
-            env_var: Some("NEOETHOS_BOT_SEARCH_SEED"),
             kind: KnobKind::Int { min: Some(0), max: None },
             default: "(unset — non-deterministic)",
             current: ga_overrides.seed.map(|s| s.to_string()).unwrap_or_else(|| "(unset)".to_string()),
@@ -414,7 +419,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.novelty_weight",
             section: "Discovery / GA search",
             label: "Novelty bonus weight",
-            env_var: Some("NEOETHOS_BOT_NOVELTY_WEIGHT"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
             default: "0.0",
             current: format!("{}", ga_overrides.novelty_weight),
@@ -428,7 +432,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.stagnation_patience",
             section: "Discovery / GA search",
             label: "Stagnation patience (generations)",
-            env_var: Some("NEOETHOS_BOT_PROP_STAGNATION_GENS"),
             kind: KnobKind::Int { min: Some(1), max: Some(50) },
             default: "2",
             current: format!("{}", ga_overrides.stagnation_patience),
@@ -442,7 +445,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.convergence_patience",
             section: "Discovery / GA search",
             label: "Convergence patience (generations)",
-            env_var: Some("NEOETHOS_BOT_PROP_CONVERGENCE_GENS"),
             kind: KnobKind::Int { min: Some(0), max: Some(5000) },
             default: "250",
             current: format!("{}", ga_overrides.convergence_patience),
@@ -456,7 +458,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.min_improvement",
             section: "Discovery / GA search",
             label: "Min improvement epsilon",
-            env_var: Some("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
             default: "0.000000000001",
             current: format!("{}", ga_overrides.min_improvement),
@@ -470,7 +471,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.convergence_min_elapsed_fraction",
             section: "Discovery / GA search",
             label: "Convergence min-elapsed fraction",
-            env_var: Some("NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
             default: "0.5",
             current: format!("{}", ga_overrides.convergence_min_elapsed_fraction),
@@ -484,7 +484,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.tournament_size",
             section: "Discovery / GA search",
             label: "Tournament size override",
-            env_var: Some("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE"),
             kind: KnobKind::Int { min: Some(2), max: Some(64) },
             default: "(derived: max(pop/12, 3))",
             current: ga_overrides
@@ -501,7 +500,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_start",
             section: "Discovery / GA search",
             label: "SMC gate start threshold",
-            env_var: Some("NEOETHOS_BOT_PROP_SMC_GATE_START"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
             default: "0.75",
             current: format!("{}", smc.start),
@@ -515,7 +513,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_end",
             section: "Discovery / GA search",
             label: "SMC gate end threshold",
-            env_var: Some("NEOETHOS_BOT_PROP_SMC_GATE_END"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
             default: "0.35",
             current: format!("{}", smc.end),
@@ -529,7 +526,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.disable_smc_gate",
             section: "Discovery / GA search",
             label: "Disable SMC gate (diagnostic)",
-            env_var: Some("NEOETHOS_BOT_DISABLE_SMC_GATE"),
             kind: KnobKind::Bool,
             default: "false",
             current: format!("{}", smc.disable_gate),
@@ -545,7 +541,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "quality.min_trades_per_month",
             section: "Quality / acceptance filtering",
             label: "Min trades per month",
-            env_var: Some("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH"),
             kind: KnobKind::Int { min: Some(1), max: Some(200) },
             default: "4",
             current: format!("{}", quality_overrides.min_trades_per_month),
@@ -559,7 +554,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "quality.trading_days_per_month",
             section: "Quality / acceptance filtering",
             label: "Trading days per month",
-            env_var: Some("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH"),
             kind: KnobKind::Float { min: Some(1.0), max: Some(31.0) },
             default: "21.0",
             current: format!("{}", quality_overrides.trading_days_per_month),
@@ -575,7 +569,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.stream_max_attempts",
             section: "Broker connectivity (cTrader)",
             label: "Streaming max attempts",
-            env_var: Some("NEOETHOS_BOT_CTRADER_STREAM_MAX_ATTEMPTS"),
             kind: KnobKind::Int { min: Some(1), max: Some(5) },
             default: "3",
             current: "3".to_string(),
@@ -589,7 +582,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.stream_backoff_base_ms",
             section: "Broker connectivity (cTrader)",
             label: "Streaming backoff base (ms)",
-            env_var: Some("NEOETHOS_BOT_CTRADER_STREAM_BACKOFF_BASE_MS"),
             kind: KnobKind::Int { min: Some(10), max: Some(2000) },
             default: "200",
             current: "200".to_string(),
@@ -605,7 +597,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.quote_to_account_rate",
             section: "Risk & PnL safety",
             label: "Quote→account FX rate override",
-            env_var: Some("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"),
             kind: KnobKind::Float { min: Some(0.000_001), max: None },
             default: "(unset — broker-derived)",
             current: cost
@@ -622,7 +613,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pip_value",
             section: "Cost model / pip-value",
             label: "Per-pip account-currency value (override)",
-            env_var: Some("NEOETHOS_BOT_PROP_PIP_VALUE"),
             kind: KnobKind::Float { min: Some(0.000_001), max: None },
             default: "(broker symbol metadata)",
             current: cost
@@ -639,7 +629,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pip_value_per_lot",
             section: "Cost model / pip-value",
             label: "Per-lot pip value (override)",
-            env_var: Some("NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT"),
             kind: KnobKind::Float { min: Some(0.000_001), max: None },
             default: "(broker symbol metadata)",
             current: cost
@@ -656,7 +645,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "cost.spread_pips",
             section: "Cost model / pip-value",
             label: "Spread override (pips)",
-            env_var: Some("NEOETHOS_BOT_PROP_SPREAD_PIPS"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(100.0) },
             default: "(broker-quoted)",
             current: cost
@@ -673,7 +661,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "cost.commission_per_trade",
             section: "Cost model / pip-value",
             label: "Commission per trade (override)",
-            env_var: Some("NEOETHOS_BOT_PROP_COMMISSION"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(50.0) },
             default: "(broker-quoted)",
             current: cost
@@ -692,7 +679,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_cap",
             section: "Discovery / GA search",
             label: "Archive capacity override",
-            env_var: Some("NEOETHOS_BOT_PROP_ARCHIVE_CAP"),
             kind: KnobKind::Int { min: Some(0), max: Some(200_000) },
             default: "(derived: min(pop × gens, 50000))",
             current: ga_overrides
@@ -709,7 +695,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_curve",
             section: "Discovery / GA search",
             label: "SMC gate curve exponent",
-            env_var: Some("NEOETHOS_BOT_PROP_SMC_GATE_CURVE"),
             kind: KnobKind::Float { min: Some(0.1), max: Some(5.0) },
             default: "1.0",
             current: format!("{}", smc.curve),
@@ -723,7 +708,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_stagnation_step",
             section: "Discovery / GA search",
             label: "SMC gate stagnation-relax step",
-            env_var: Some("NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(0.5) },
             default: "0.03",
             current: format!("{}", smc.stagnation_step),
@@ -737,7 +721,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_mode",
             section: "Discovery / GA search",
             label: "Archive scoring mode",
-            env_var: Some("NEOETHOS_BOT_PROP_ARCHIVE_MODE"),
             kind: KnobKind::Enum { variants: &["net", "pf", "sharpe"] },
             default: "net",
             current: ga_overrides.archive_scoring.mode.clone(),
@@ -751,7 +734,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_net",
             section: "Discovery / GA search",
             label: "Archive min net P&L",
-            env_var: Some("NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET"),
             kind: KnobKind::Float { min: None, max: None },
             default: "0.0",
             current: format!("{}", ga_overrides.archive_scoring.min_net),
@@ -765,7 +747,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_pf",
             section: "Discovery / GA search",
             label: "Archive min profit factor",
-            env_var: Some("NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(10.0) },
             default: "1.0",
             current: format!("{}", ga_overrides.archive_scoring.min_pf),
@@ -779,7 +760,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_sharpe",
             section: "Discovery / GA search",
             label: "Archive min Sharpe ratio",
-            env_var: Some("NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE"),
             kind: KnobKind::Float { min: None, max: None },
             default: "0.0",
             current: format!("{}", ga_overrides.archive_scoring.min_sharpe),
@@ -793,7 +773,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.parent_selection",
             section: "Discovery / GA search",
             label: "Parent selection policy",
-            env_var: Some("NEOETHOS_BOT_PROP_PARENT_SELECTION"),
             kind: KnobKind::Enum {
                 variants: &["rank_weighted", "tournament", "truncation"],
             },
@@ -809,7 +788,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.survivor_selection",
             section: "Discovery / GA search",
             label: "Survivor selection policy",
-            env_var: Some("NEOETHOS_BOT_PROP_SURVIVOR_SELECTION"),
             kind: KnobKind::Enum {
                 variants: &["rank_weighted", "tournament", "truncation"],
             },
@@ -825,7 +803,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.random_immigrants",
             section: "Discovery / GA search",
             label: "Random immigrants ratio",
-            env_var: Some("NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(0.95) },
             default: "0.25",
             current: format!("{}", ga_overrides.selection.immigrant_ratio),
@@ -839,7 +816,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.survivor_fraction",
             section: "Discovery / GA search",
             label: "Survivor fraction (elite carry-over)",
-            env_var: Some("NEOETHOS_BOT_PROP_SURVIVOR_FRACTION"),
             kind: KnobKind::Float { min: Some(0.0), max: Some(0.95) },
             default: "0.10",
             current: format!("{}", ga_overrides.selection.survivor_fraction),
@@ -853,7 +829,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.selection_temperature",
             section: "Discovery / GA search",
             label: "Selection temperature",
-            env_var: Some("NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE"),
             kind: KnobKind::Float { min: Some(0.001), max: Some(10.0) },
             default: "0.75",
             current: format!("{}", ga_overrides.selection.temperature),
@@ -869,7 +844,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "backtest.initial_equity",
             section: "Backtest runtime",
             label: "Initial equity",
-            env_var: Some("NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY"),
             kind: KnobKind::Float { min: Some(100.0), max: Some(10_000_000.0) },
             default: "100000.0",
             current: format!("{}", neoethos_search::current_backtest_runtime_overrides().initial_equity),
@@ -882,13 +856,30 @@ fn build_catalog() -> Vec<KnobEntry> {
         KnobEntry {
             id: "backtest.max_month_buckets",
             section: "Backtest runtime",
-            label: "Max month buckets",
-            env_var: Some("NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS"),
-            kind: KnobKind::Int { min: Some(12), max: Some(1200) },
+            label: "Max month buckets (TRUNCATES the record scored — not just RAM)",
+            // ── W2-6 / E-4 (2026-08-10): the advertised minimum is GONE. ────
+            // This said `min: Some(12)` while the help text called the knob a
+            // RAM cap. Those two statements cannot both be acted on: 12 is not
+            // a memory choice, it is "score every gene on its first twelve
+            // months". `month_capacity` sizes `monthly_pnls`, which feeds
+            // metric slot 7, which `named.rs:161` weights at 0.45 — the
+            // DOMINANT term of the prop-firm objective. An operator who took
+            // the UI's own endorsed minimum would have every gene in a ten-year
+            // record ranked on its first year, and would get back a perfectly
+            // plausible number with nothing wrong-looking about it.
+            //
+            // The floor is now 240, the shipped default and a full 20-year
+            // sweep. Nothing legitimate wants less: this is not a knob for
+            // shortening the evaluation window (that is `stage1_window` and the
+            // funnel percentages), it is a ceiling on how many months of
+            // history the buckets can hold. Raising the floor can only make the
+            // scored record LONGER, never shorter — the safer direction, per
+            // non-negotiable #2.
+            kind: KnobKind::Int { min: Some(240), max: Some(1200) },
             default: "240",
             current: format!("{}", neoethos_search::current_backtest_runtime_overrides().month_capacity),
-            help_short: "Cap on per-month statistics buckets (240 = 20 years).",
-            help_long: "Caps RAM on very-long history runs. Default 240 covers a 20-year sweep; raise to 600 for 50-year MT5 historical imports.",
+            help_short: "How many months of per-month statistics are kept. Truncating this TRUNCATES THE RECORD every gene is scored on.",
+            help_long: "Not merely a RAM cap, despite what this text used to say. `month_capacity` sizes the `monthly_pnls` series, which becomes metric slot 7, which carries a weight of 0.45 in the prop-firm objective (`named.rs:161`) — the largest single term. Set it below the length of your history and every gene is ranked on the first N months of that history, and the resulting score looks entirely normal. 240 = 20 years and is the default and the minimum; raise to 600 for 50-year MT5 historical imports. There is no reason to lower it.",
             preset_conservative: "240",
             preset_balanced: "240",
             preset_aggressive: "600",
@@ -897,7 +888,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "backtest.rayon_threads",
             section: "Backtest runtime",
             label: "Rayon worker threads",
-            env_var: Some("NEOETHOS_BOT_RUST_THREADS"),
             kind: KnobKind::Int { min: Some(1), max: Some(256) },
             default: "(num CPU cores)",
             current: neoethos_search::current_backtest_runtime_overrides()
@@ -915,11 +905,12 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "stop_target.tail_max_bars",
             section: "Backtest runtime",
             label: "Adaptive-stop tail cap (bars)",
-            // Never had an env var. It had no recipient at all: the value was
-            // hardcoded at `stop_target.rs:78` and the config key was deleted
-            // in 48abfc90 for being dead. Listing it with an invented env var
-            // would repeat the sin this catalog's own doc comment warns about.
-            env_var: None,
+            // History, kept because it explains the 0 default: this knob had
+            // no recipient at all — the value was hardcoded at
+            // `stop_target.rs:78` and the config key was deleted in 48abfc90
+            // for being dead. (It never carried an env var either; the
+            // `env_var` field that used to say so was removed from every entry
+            // on 2026-08-10 — see the tombstone on `KnobEntry`.)
             kind: KnobKind::Int { min: Some(0), max: Some(100_000_000) },
             default: "0",
             current: format!(
@@ -936,7 +927,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "stop_target.tail_step",
             section: "Backtest runtime",
             label: "Adaptive-stop tail sampling stride",
-            env_var: None,
             kind: KnobKind::Int { min: Some(1), max: Some(1_000) },
             default: "1",
             current: format!(
@@ -955,12 +945,16 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "log.rust_log",
             section: "Logging / persistence",
             label: "RUST_LOG filter",
-            env_var: Some("RUST_LOG"),
             kind: KnobKind::Text,
             default: "(production default from Settings)",
             current: "(see startup banner)".to_string(),
             help_short: "tracing-subscriber filter (e.g. `info,sqlx=warn`).",
-            help_long: "Lower to `error,neoethos=info` for quieter logs; raise to `debug` for diagnostics. The production default ships in `Settings.system.log_filter`.",
+            // Still live, and legitimately so: `RUST_LOG` is parsed by
+            // `tracing_subscriber::EnvFilter` itself, an ecosystem convention
+            // that predates and outranks our config file. It changes what is
+            // PRINTED, never what is decided. `neoethos-core/src/env_overrides.rs`
+            // classifies it the same way.
+            help_long: "Lower to `error,neoethos=info` for quieter logs; raise to `debug` for diagnostics. The production default ships in `Settings.system.log_filter`. The `RUST_LOG` environment variable still overrides it — that one is parsed by the tracing subscriber itself, it is an ecosystem convention rather than a NeoEthos setting, and it changes only what is printed.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -969,12 +963,13 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "log.log_dir",
             section: "Logging / persistence",
             label: "Log directory override",
-            env_var: Some("LOG_DIR"),
             kind: KnobKind::Path,
             default: "(platform default — %APPDATA%/neoethos/logs on Windows)",
             current: "(platform default)".to_string(),
             help_short: "Override the on-disk log directory.",
-            help_long: "By default logs go under the platform user-data-dir. Override to redirect to a fast SSD, a network share, or a tmpfs for ephemeral runs.",
+            // Still live in `neoethos-core/src/logging.rs` via `ENV_LOG_DIR`.
+            // Destination of log FILES only — no decision depends on it.
+            help_long: "By default logs go under the platform user-data-dir. Override to redirect to a fast SSD, a network share, or a tmpfs for ephemeral runs. Still driven by the `LOG_DIR` environment variable, read in `neoethos-core`; it moves where log files are written and nothing else.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -983,7 +978,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "server.bind_addr",
             section: "Server / network",
             label: "HTTP server bind address",
-            env_var: Some("NEOETHOS_SERVER_BIND"),
             kind: KnobKind::Text,
             default: "127.0.0.1:7423",
             current: "127.0.0.1:7423".to_string(),
@@ -1127,7 +1121,59 @@ mod tests {
         };
         let json =
             serde_json::to_string(&response).expect("catalog must serialize without error");
-        assert!(json.contains("\"schemaVersion\":1"));
+        assert!(json.contains("\"schemaVersion\":2"));
         assert!(json.contains("\"id\":\"ctrader.max_attempts\""));
+    }
+
+    /// W2-7: the catalog must not advertise an environment variable for ANY
+    /// knob. It is served to the LLM control plane as the authoritative knob
+    /// list, and every retired name is inert — an agent told to export one
+    /// would report a change it did not make.
+    ///
+    /// This is the pinning test that makes re-adding the field a deliberate
+    /// act rather than an accident.
+    #[test]
+    fn catalog_advertises_no_environment_variables() {
+        let catalog = build_catalog();
+        let json = serde_json::to_string(&KnobCatalogResponse {
+            schema_version: SCHEMA_VERSION,
+            generated_at_unix_ms: 0,
+            knobs: catalog,
+        })
+        .expect("catalog must serialize without error");
+        assert!(
+            !json.contains("envVar"),
+            "the knob catalog must not carry an `envVar` key — no environment \
+             variable is honoured, and the control plane reads this as \
+             authoritative"
+        );
+        assert!(
+            !json.contains("NEOETHOS_BOT_"),
+            "a retired NEOETHOS_BOT_* name leaked into the catalog payload"
+        );
+    }
+
+    /// W2-6 💰: `month_capacity` truncates the record every gene is SCORED on
+    /// (metric slot 7, weight 0.45 of the prop-firm objective). The UI once
+    /// endorsed a minimum of 12, i.e. "rank a ten-year record on its first
+    /// year and return a plausible number". The advertised floor must never
+    /// again be below the shipped default.
+    #[test]
+    fn month_bucket_minimum_cannot_truncate_the_scored_record() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|k| k.id == "backtest.max_month_buckets")
+            .expect("backtest.max_month_buckets must exist in the catalog");
+        match entry.kind {
+            KnobKind::Int { min, .. } => assert_eq!(
+                min,
+                Some(240),
+                "the advertised minimum must be the shipped 240 (20 years); \
+                 anything lower is a UI-endorsed way to score genes on a \
+                 truncated history"
+            ),
+            other => panic!("expected an Int knob, got {other:?}"),
+        }
     }
 }

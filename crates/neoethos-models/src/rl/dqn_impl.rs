@@ -308,7 +308,7 @@ fn resolve_rl_training_precision_with_capability(
 ) -> (String, Option<String>) {
     let requested = requested
         .map(normalize_training_precision_policy)
-        .unwrap_or_else(|| requested_training_precision_policy("dqn"));
+        .unwrap_or_else(|| requested_training_precision_policy());
     let effective_backend = backend.trim().to_ascii_lowercase();
     let effective_backend = if effective_backend.is_empty() {
         "rlkit_cpu".to_string()
@@ -1460,7 +1460,7 @@ impl TradingReinforcementLearner {
 
         let (device, effective_policy, effective_backend) =
             resolve_rl_training_device(&self.train_args.device_policy)?;
-        let requested_precision = requested_training_precision_policy("dqn");
+        let requested_precision = requested_training_precision_policy();
         let (effective_precision, _precision_degraded_reason) =
             resolve_rl_training_precision_with_capability(
                 Some(&requested_precision),
@@ -2261,7 +2261,7 @@ impl TradingReinforcementLearner {
         let (effective_backend, effective_device_policy, used_network_snapshot, used_fallback_q) =
             self.live_runtime_identity();
         let mut reasons = Vec::new();
-        let requested_precision = requested_training_precision_policy("dqn");
+        let requested_precision = requested_training_precision_policy();
         let (effective_precision, precision_degraded_reason) =
             resolve_rl_training_precision_with_capability(
                 Some(&requested_precision),

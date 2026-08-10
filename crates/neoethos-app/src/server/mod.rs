@@ -92,28 +92,30 @@ use self::state::AppApiState;
 /// never send Origin preflights, so they are unaffected. Everything else —
 /// i.e. every real website — is denied.
 ///
-/// Escape hatch for deliberate LAN setups (e.g. phone browser monitoring):
-/// `NEOETHOS_CORS_ALLOW_ANY=1` restores the old behavior, with a loud
-/// warning, matching the non-loopback bind warning in `serve()`.
+/// ## The escape hatch is GONE (2026-08-10, config consolidation)
+///
+/// `NEOETHOS_CORS_ALLOW_ANY=1` used to restore `allow_origin(Any)` with a
+/// warning. It is deleted, and it did NOT become a config key.
+///
+/// Reasoning, stated here because "we removed an operator's option" deserves
+/// a reason on the line that removed it:
+///
+/// * It was an environment variable that silently and totally disabled a
+///   security control on a **trade-capable, unauthenticated** API. That is the
+///   exact shape non-negotiable #2 forbids — a lever that raises a limit, off
+///   the config surface, invisible in the run artifact.
+/// * Its stated purpose (reach the API from a phone on the LAN) is already
+///   served, and served safely, by binding a non-loopback address: that path
+///   goes through [`configure_api_auth`], which **refuses to bind at all**
+///   without an operator-supplied API token. The env var bypassed that gate
+///   entirely — allow-any CORS on a loopback bind needs no token.
+/// * So the two mechanisms were not equivalent. One demands a credential, the
+///   other demanded nothing.
+///
+/// If the variable is still exported, `app_services::retired_env` prints an
+/// ERROR at startup naming it and saying the value was ignored. Nothing here
+/// reads it.
 fn cors_layer() -> CorsLayer {
-    let allow_any = std::env::var("NEOETHOS_CORS_ALLOW_ANY")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        })
-        .unwrap_or(false);
-    if allow_any {
-        tracing::warn!(
-            target: "neoethos_app::server",
-            "SECURITY: NEOETHOS_CORS_ALLOW_ANY is set — ANY website open in a \
-             browser that can reach this API may call the unauthenticated \
-             trading endpoints. Only use this behind your own auth/firewall."
-        );
-        return CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
-    }
     let allowed = AllowOrigin::predicate(|origin, _| {
         origin.to_str().map(origin_is_allowed).unwrap_or(false)
     });

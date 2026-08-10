@@ -8,6 +8,7 @@ pub mod artifacts;
 pub mod capabilities;
 pub mod dispatch;
 pub mod hpo;
+pub mod install;
 pub mod prediction;
 pub mod profile;
 pub mod training_artifact;

@@ -20,7 +20,46 @@ use crate::tui::theme;
 /// search budget, prop-firm strictness) — the full long tail stays in
 /// config.yaml.
 pub fn make_config_form() -> FormState {
-    let s = neoethos_core::Settings::load().unwrap_or_default();
+    // A load failure used to become `Settings::default()` in silence, which
+    // paints the Rust defaults on the screen as if they were the operator's
+    // file. `save_config_form` re-loads and REFUSES to write when the load
+    // fails, so a bad load can never overwrite config.yaml with defaults — but
+    // it could still be READ as the truth. Say so, by name, at error level.
+    let s = match neoethos_core::Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            let path = neoethos_core::config::user_config_path();
+            tracing::error!(
+                target: "neoethos_cli::tui",
+                config = %path.display(),
+                error = %format!("{e:#}"),
+                "config could not be loaded — this form is showing BUILT-IN DEFAULTS, not \
+                 your settings. Saving is refused until the file loads."
+            );
+            neoethos_core::Settings::default()
+        }
+    };
+    // The engine maps only `strict` and `legacy` (`discovery.rs:5755-5760`);
+    // everything else falls through to `system.trading_mode`. Rather than show
+    // a dead value as if it were selected, blank the field and put the on-disk
+    // value in the hint, where it reads as the report it is.
+    let discovery_mode_live = matches!(s.models.discovery_mode.trim(), "strict" | "legacy");
+    let discovery_mode_value = if discovery_mode_live {
+        s.models.discovery_mode.clone()
+    } else {
+        String::new()
+    };
+    let discovery_mode_hint = if discovery_mode_live {
+        "strict | legacy | (blank). Blank = the risky/prop-firm axis, which is \
+         system.trading_mode — NOT settable here."
+            .to_string()
+    } else {
+        format!(
+            "strict | legacy | (blank). On disk: `{}` — the engine maps that to NOTHING and \
+             falls through to system.trading_mode = `{}`, which is NOT settable here.",
+            s.models.discovery_mode, s.system.trading_mode
+        )
+    };
     FormState::new(vec![
         Field::new(
             "Symbol",
@@ -37,10 +76,26 @@ pub fn make_config_form() -> FormState {
             s.system.base_timeframe.clone(),
             "e.g. M1, M5, M30, H1",
         ),
+        // This is `system.enable_gpu_preference` — the TRAINING device gate.
+        // It is NOT the discovery-search device: `models.prop_search_device`
+        // REPLACES the global for the search whenever it is non-empty
+        // (`backend.rs:126-130`), so `cpu` here plus a non-empty
+        // `prop_search_device` still runs the search on the card. The refuters
+        // established these are two axes and must not be merged, so the hint
+        // names the other one and reports its current value.
         Field::new(
-            "Compute mode",
+            "Compute (training)",
             s.system.enable_gpu_preference.clone(),
-            "auto | cpu | gpu  (auto picks the best device, never OOMs)",
+            match s.models.prop_search_device.trim() {
+                "" => "auto | cpu | gpu — TRAINING device. The discovery search uses \
+                       models.prop_search_device, currently empty, so it follows this value."
+                    .to_string(),
+                dev => format!(
+                    "auto | cpu | gpu — TRAINING device ONLY. The discovery SEARCH runs on \
+                     models.prop_search_device = `{dev}`, which overrides this value and is \
+                     not settable here."
+                ),
+            },
         ),
         Field::new(
             "Data dir",
@@ -49,8 +104,8 @@ pub fn make_config_form() -> FormState {
         ),
         Field::new(
             "Discovery mode",
-            s.models.discovery_mode.clone(),
-            "prop_firm | strict | risky",
+            discovery_mode_value,
+            discovery_mode_hint,
         ),
         Field::new(
             "Population",
@@ -138,7 +193,7 @@ pub fn save_config_form(form: &FormState) -> String {
     );
 
     // Compute mode + discovery mode are enumerated — validate before applying.
-    if let Some(v) = form.value_for("Compute mode") {
+    if let Some(v) = form.value_for("Compute (training)") {
         let v = v.trim().to_lowercase();
         if matches!(v.as_str(), "auto" | "cpu" | "gpu") {
             if v != s.system.enable_gpu_preference {
@@ -149,15 +204,28 @@ pub fn save_config_form(form: &FormState) -> String {
             rejected.push("compute-mode (use auto|cpu|gpu)");
         }
     }
+    // `strict` and `legacy` are the ONLY two values the engine maps
+    // (`discovery.rs:5755-5760`). This form used to offer `prop_firm | strict |
+    // risky` — two values that map to nothing — and to REJECT `legacy`, one of
+    // the two that work. Blank now means "leave it alone / fall through to
+    // system.trading_mode", which is the honest default, and is also what an
+    // untouched field carrying a retired on-disk value renders as.
     if let Some(v) = form.value_for("Discovery mode") {
         let v = v.trim().to_lowercase();
-        if matches!(v.as_str(), "prop_firm" | "strict" | "risky") {
+        if v.is_empty() {
+            // Blank = no opinion. Never writes, so a retired on-disk value is
+            // preserved verbatim rather than silently rewritten by a form the
+            // operator did not touch.
+        } else if matches!(v.as_str(), "strict" | "legacy") {
             if v != s.models.discovery_mode {
                 s.models.discovery_mode = v;
                 changed += 1;
             }
         } else {
-            rejected.push("discovery-mode (use prop_firm|strict|risky)");
+            rejected.push(
+                "discovery-mode (use strict|legacy, or blank — `prop_firm`/`risky` map to \
+                 nothing here; that axis is system.trading_mode)",
+            );
         }
     }
 

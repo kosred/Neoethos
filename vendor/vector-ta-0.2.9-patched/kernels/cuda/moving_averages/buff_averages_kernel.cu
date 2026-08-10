@@ -573,3 +573,124 @@ extern "C" __global__ void buff_averages_many_series_one_param_exp2_f32(
         t += step;
     }
 }
+
+
+// ===========================================================================
+// NEOETHOS f64 LANE  --  closer 4, round 3
+//
+// CPU reference: `buff_averages_scalar`
+// (src/indicators/moving_averages/buff_averages.rs:599-691), reached through
+// `buff_averages_with_kernel` (:342) -> `buff_averages_compute_into` (:524).
+//
+// OUTPUT: the FAST buff. `ma_batch.rs:627-637` defaults `output` to "fast",
+// so that is the column a caller asking for `value` gets.
+//
+// PERIOD-SWEPT, and the swept int is the SLOW period: `ma_batch.rs:593`
+// assigns `sweep.slow_period = period_range` while `fast_period` stays at its
+// default 5 (`BuffAveragesBatchRange::default`, :1429). Mapping the swept int
+// onto `fast_period` instead would compute a different indicator.
+//
+// SHAPE: one thread per combo walking bars ASCENDING. The numerator and
+// denominator are carried across bars with subtract-then-add (:616-651), so
+// the accumulation order is load-bearing and a bar-parallel rebuild would
+// round differently. The window is read straight out of global memory --
+// no per-thread ring, hence no `max_period` and NEVER-OOM by construction.
+//
+// FIRST-VALID: declared `Ignored` and derived here. `buff_averages_prepare`
+// (:470) scans PRICE ALONE with `!is_nan`; volume is never scanned, so the
+// `AllInputsNonNan` rule over a (close, volume) pair would name a later bar
+// on any frame whose volume has a hole, and first-valid sets both the NaN
+// prefix and the seed window.
+// ===========================================================================
+
+static __forceinline__ __device__ double buff_averages_neo_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__
+void buff_averages_neo_batch_f64(const double* __restrict__ price,
+                                 const double* __restrict__ volume,
+                                 int n,
+                                 const int* __restrict__ periods,
+                                 int n_combos,
+                                 int first_valid,
+                                 double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+    if (n <= 0) return;
+    (void)first_valid;  // derived below -- see the header.
+
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    const double nn = buff_averages_neo_qnan();
+
+    const int slow_period = periods[combo];
+    const int fast_period = 5;  // buff_averages.rs:1429 / :220
+
+    // buff_averages_prepare, :470-473 -- price alone, `!is_nan`.
+    int first = -1;
+    for (int i = 0; i < n; ++i) {
+        if (!isnan(price[i])) { first = i; break; }
+    }
+
+    bool refused = false;
+    if (first < 0) refused = true;                                   // AllValuesNaN
+    if (fast_period <= 0 || fast_period > n) refused = true;          // :476
+    if (slow_period <= 0 || slow_period > n) refused = true;          // :483
+    if (!refused && (n - first) < slow_period) refused = true;        // :491
+
+    long long warm_ll = 0;
+    if (!refused) {
+        warm_ll = (long long)first + (long long)slow_period - 1;
+        // :613 -- `if warm >= len { return; }` leaves an all-NaN column.
+        if (warm_ll >= (long long)n) refused = true;
+        // The CPU forms `warm + 1 - fast_period` as a usize (:634). When the
+        // slow window is shorter than the fast one that expression underflows
+        // rather than producing a window, so the row is refused by name here
+        // instead of reading out of bounds.
+        else if (warm_ll + 1 < (long long)fast_period) refused = true;
+    }
+
+    if (refused) {
+        for (int i = 0; i < n; ++i) row[i] = nn;
+        return;
+    }
+
+    const int warm = (int)warm_ll;
+    for (int i = 0; i < warm; ++i) row[i] = nn;
+
+    // :633-640 -- the fast seed window, ascending, skipping any bar whose
+    // price OR volume is NaN.
+    double num = 0.0;
+    double den = 0.0;
+    const int fast_start = warm + 1 - fast_period;
+    for (int i = fast_start; i <= warm; ++i) {
+        const double p = price[i];
+        const double v = volume[i];
+        if (!isnan(p) && !isnan(v)) {
+            num += p * v;
+            den += v;
+        }
+    }
+    row[warm] = (den != 0.0) ? (num / den) : 0.0;
+
+    // :615-651 -- subtract the leaving bar, then add the arriving one, in
+    // that order. Reversing them changes the rounding of `num`.
+    for (int i = warm + 1; i < n; ++i) {
+        const double new_p = price[i];
+        const double new_v = volume[i];
+        const int old_i = i - fast_period;
+        const double old_p = price[old_i];
+        const double old_v = volume[old_i];
+
+        if (!isnan(old_p) && !isnan(old_v)) {
+            num -= old_p * old_v;
+            den -= old_v;
+        }
+        if (!isnan(new_p) && !isnan(new_v)) {
+            num += new_p * new_v;
+            den += new_v;
+        }
+
+        row[i] = (den != 0.0) ? (num / den) : 0.0;
+    }
+}

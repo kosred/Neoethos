@@ -253,7 +253,9 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     // ── feature cube (neoethos-data) ──
     (
         "NEOETHOS_FEATURE_CUBE_MODE",
-        "the free-RAM probe (never-OOM invariant)",
+        "models.data_runtime.feature_cube_mode (auto|disk), recorded in the run profile at \
+         /execution/feature_cube_mode. There is no `ram` value: forcing RAM was the arm that \
+         returned before the free-RAM check",
     ),
 ];
 
@@ -567,6 +569,16 @@ pub struct ExecutionEnvironmentProfile {
     /// `NEOETHOS_ADAPTIVE_STOPS=0` is the escape hatch) and its reward:risk.
     pub adaptive_stops_enabled: bool,
     pub adaptive_stops_rr: f64,
+    /// Where the multi-timeframe feature cube was assembled —
+    /// `models.data_runtime.feature_cube_mode`, as installed in this process
+    /// (`"auto"` = derive from the free-RAM probe, `"disk"` = always stream).
+    ///
+    /// Recorded because the RAM and disk assemblies are only bit-identical
+    /// BY TEST, not by construction: if they ever diverge, this is the field
+    /// that says which one produced the cube a given run searched over. It
+    /// replaces `NEOETHOS_FEATURE_CUBE_MODE`, which could move the same
+    /// decision from a shell with no trace in any artifact.
+    pub feature_cube_mode: String,
     /// Threads the global rayon pool is actually running with. Thread count
     /// changes scheduling; recorded so a cross-machine reproduction can pin it.
     pub effective_rayon_threads: usize,
@@ -596,6 +608,9 @@ impl ExecutionEnvironmentProfile {
             smc_search: crate::genetic::smc_indicators::SmcSearchConfig::current(),
             adaptive_stops_enabled: crate::stop_target::adaptive_stops_enabled(),
             adaptive_stops_rr: crate::stop_target::adaptive_stops_rr(),
+            feature_cube_mode: neoethos_data::current_feature_cube_policy()
+                .as_str()
+                .to_string(),
             effective_rayon_threads: rayon::current_num_threads(),
             available_parallelism: std::thread::available_parallelism().ok().map(|n| n.get()),
             gpu: GpuLaneProfile {

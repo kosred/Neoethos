@@ -37,51 +37,42 @@ pub fn cuda_flatten_features(
     Ok(features.iter().copied().collect())
 }
 
-/// Returns `true` if the given env var holds one of the standard
-/// "disabled" tokens. Used to gate per-model CUDA kernels via
-/// `NEOETHOS_BOT_<NAME>_CUDA_KERNEL=0`. Centralized so we do not have
-/// three exact-copy `matches!` blocks across the GPU files.
-pub fn is_kernel_disabled_env(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    )
-}
-
-/// Returns `true` if a device policy requests GPU AND the kernel is
-/// not disabled by env var. Both inputs are normalized (trimmed,
-/// lowercased) before the prefix/equality test.
-pub fn cuda_kernel_enabled(policy: &str, kernel_env_name: &str) -> bool {
+/// Returns `true` if a device policy requests GPU. The input is
+/// normalized (trimmed, lowercased) before the prefix/equality test.
+///
+/// ## 2026-08-10 — the env kill-switch is gone
+///
+/// This used to take a `kernel_env_name` and AND the answer with
+/// `NEOETHOS_BOT_<MODEL>_CUDA_KERNEL` not being set to a "disabled"
+/// token. Five such names existed (`_NEAT_`, `_NEURO_EVO_`,
+/// `_STATISTICAL_`, plus a per-model spelling of each) and none had a
+/// config field, a knob-catalog row or a line in `config.yaml`. That
+/// made them exactly the `NEOETHOS_GPU_F64` failure mode: a variable
+/// that silently moves the run onto a different execution path and
+/// leaves no trace in the artifact.
+///
+/// The device decision is now made once, by the configured device
+/// policy (`models.statistical_device` for the statistical models, the
+/// caller-supplied policy string for the evolutionary ones), and that
+/// string is what the artifact records. Anyone who wants the CPU path
+/// sets the policy to `cpu`.
+pub fn cuda_kernel_enabled(policy: &str) -> bool {
     let normalized = policy.trim().to_ascii_lowercase();
-    let requested_gpu = normalized == "gpu" || normalized.starts_with("gpu:");
-    requested_gpu && !is_kernel_disabled_env(kernel_env_name)
+    normalized == "gpu" || normalized.starts_with("gpu:")
 }
 
-/// Resolve which CUDA ordinal to bind to:
-///   1. honour the explicit `<DEVICE_ENV>` env var if set + parseable;
-///   2. honour the fallback env var (subsystem-wide) if set + parseable;
-///   3. parse `gpu:N` out of the requested policy;
-///   4. default to ordinal 0.
-pub fn cuda_device_id_from_policy(
-    policy: &str,
-    device_env_name: &str,
-    fallback_env_name: Option<&str>,
-) -> usize {
-    let read = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-    };
-    if let Some(id) = read(device_env_name) {
-        return id;
-    }
-    if let Some(fallback) = fallback_env_name
-        && let Some(id) = read(fallback)
-    {
-        return id;
-    }
+/// Resolve which CUDA ordinal to bind to: parse `gpu:N` out of the
+/// requested policy, else ordinal 0.
+///
+/// ## 2026-08-10 — the two env overrides are gone
+///
+/// This used to consult `NEOETHOS_BOT_<MODEL>_CUDA_DEVICE` and a
+/// subsystem-wide fallback name BEFORE the policy string. That is two
+/// more ways to say the one thing the policy already says — and the
+/// two env names outranked the configured value, so a stale export
+/// pinned every kernel to a card the config never named. The policy
+/// carries the ordinal (`gpu:1`); there is no second channel.
+pub fn cuda_device_id_from_policy(policy: &str) -> usize {
     policy
         .trim()
         .to_ascii_lowercase()
@@ -90,19 +81,20 @@ pub fn cuda_device_id_from_policy(
         .unwrap_or(0)
 }
 
-/// Resolve the kernel's units-per-cube count, clamped to
-/// `[1, max_units]`. `max_units` is supplied by the caller (typically
-/// from `client.properties().hardware.max_units_per_cube`) so this
-/// helper stays free of any specific compute-runtime types.
-pub fn cuda_kernel_units(max_units: u32, units_env_name: &str) -> u32 {
-    let max_units = max_units.max(1);
-    std::env::var(units_env_name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(max_units)
-        .min(max_units)
-        .max(1)
+/// The kernel's units-per-cube count: the hardware maximum, floored at 1.
+/// `max_units` is supplied by the caller (typically from
+/// `client.properties().hardware.max_units_per_cube`) so this helper
+/// stays free of any specific compute-runtime types.
+///
+/// ## 2026-08-10 — `NEOETHOS_BOT_*_KERNEL_UNITS` deleted
+///
+/// Three env names could shrink the launch geometry below what the card
+/// reports. Occupancy is a property of the hardware, not an operator
+/// preference (never-OOM invariant: peak memory is a function of the
+/// available hardware, never of a user parameter), so the value is now
+/// read from the device and nowhere else.
+pub fn cuda_kernel_units(max_units: u32) -> u32 {
+    max_units.max(1)
 }
 
 /// Collapse vendor-specific device labels into the canonical
@@ -173,75 +165,65 @@ mod tests {
 
     #[test]
     fn kernel_enabled_requires_gpu_policy() {
-        unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_CUDA_KERNEL");
-        }
-        assert!(cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
-        assert!(cuda_kernel_enabled("gpu:1", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
-        assert!(!cuda_kernel_enabled("cpu", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
-        assert!(!cuda_kernel_enabled("auto", "NEOETHOS_BOT_TEST_CUDA_KERNEL"));
+        assert!(cuda_kernel_enabled("gpu"));
+        assert!(cuda_kernel_enabled("gpu:1"));
+        assert!(!cuda_kernel_enabled("cpu"));
+        assert!(!cuda_kernel_enabled("auto"));
     }
 
+    /// The kernel decision must depend on NOTHING but the policy string.
+    /// Setting the three retired kill-switches must not move it — that is
+    /// the whole point of deleting them, and a test that only checked the
+    /// happy path would not have noticed a leftover reader.
     #[test]
-    fn kernel_enabled_respects_disable_env() {
+    fn kernel_enabled_ignores_the_retired_env_kill_switches() {
         unsafe {
-            std::env::set_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL", "false");
+            std::env::set_var("NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL", "0");
+            std::env::set_var("NEOETHOS_BOT_NEAT_CUDA_KERNEL", "off");
+            std::env::set_var("NEOETHOS_BOT_NEURO_EVO_CUDA_KERNEL", "disabled");
         }
-        assert!(!cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_DISABLE_KERNEL"));
+        assert!(cuda_kernel_enabled("gpu"));
+        assert!(cuda_kernel_enabled("gpu:2"));
         unsafe {
-            std::env::set_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL", "1");
-        }
-        assert!(cuda_kernel_enabled("gpu", "NEOETHOS_BOT_TEST_DISABLE_KERNEL"));
-        unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_DISABLE_KERNEL");
+            std::env::remove_var("NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL");
+            std::env::remove_var("NEOETHOS_BOT_NEAT_CUDA_KERNEL");
+            std::env::remove_var("NEOETHOS_BOT_NEURO_EVO_CUDA_KERNEL");
         }
     }
 
     #[test]
     fn cuda_device_id_parses_policy_suffix() {
-        unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_DEVICE");
-        }
-        assert_eq!(
-            cuda_device_id_from_policy("gpu:3", "NEOETHOS_BOT_TEST_DEVICE", None),
-            3
-        );
-        assert_eq!(
-            cuda_device_id_from_policy("gpu", "NEOETHOS_BOT_TEST_DEVICE", None),
-            0
-        );
+        assert_eq!(cuda_device_id_from_policy("gpu:3"), 3);
+        assert_eq!(cuda_device_id_from_policy("gpu"), 0);
+        assert_eq!(cuda_device_id_from_policy("cpu"), 0);
     }
 
+    /// The retired `NEOETHOS_BOT_*_CUDA_DEVICE` names used to OUTRANK the
+    /// policy. A stale export must no longer be able to move the kernel to
+    /// a card the configured policy did not name.
     #[test]
-    fn cuda_device_id_prefers_env_var() {
+    fn cuda_device_id_ignores_the_retired_device_env() {
         unsafe {
-            std::env::set_var("NEOETHOS_BOT_TEST_DEVICE_EXPLICIT", "5");
+            std::env::set_var("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE", "5");
+            std::env::set_var("NEOETHOS_BOT_NEAT_CUDA_DEVICE", "7");
         }
-        assert_eq!(
-            cuda_device_id_from_policy("gpu:1", "NEOETHOS_BOT_TEST_DEVICE_EXPLICIT", None),
-            5
-        );
+        assert_eq!(cuda_device_id_from_policy("gpu:1"), 1);
         unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_DEVICE_EXPLICIT");
+            std::env::remove_var("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_NEAT_CUDA_DEVICE");
         }
     }
 
     #[test]
-    fn cuda_kernel_units_clamps_to_max() {
+    fn cuda_kernel_units_is_the_hardware_maximum() {
+        assert_eq!(cuda_kernel_units(64), 64);
+        assert_eq!(cuda_kernel_units(0), 1);
         unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_UNITS");
+            std::env::set_var("NEOETHOS_BOT_STATISTICAL_KERNEL_UNITS", "32");
         }
-        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 64);
+        assert_eq!(cuda_kernel_units(64), 64);
         unsafe {
-            std::env::set_var("NEOETHOS_BOT_TEST_UNITS", "32");
-        }
-        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 32);
-        unsafe {
-            std::env::set_var("NEOETHOS_BOT_TEST_UNITS", "9999");
-        }
-        assert_eq!(cuda_kernel_units(64, "NEOETHOS_BOT_TEST_UNITS"), 64);
-        unsafe {
-            std::env::remove_var("NEOETHOS_BOT_TEST_UNITS");
+            std::env::remove_var("NEOETHOS_BOT_STATISTICAL_KERNEL_UNITS");
         }
     }
 

@@ -65,7 +65,13 @@ pub const CTRADER_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:43001/callback";
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const CREDENTIALS_FILENAME: &str = "broker_credentials.toml";
-const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";
+// 2026-08-10: the production read of this variable is GONE from this file — it
+// now goes through `env_overrides::broker_credentials_path_override()`, the one
+// registry that owns the name. The only remaining reference is the test harness
+// below, which must still set the variable to exercise the override, so the
+// constant lives in `mod tests` and is aliased from the registry rather than
+// re-spelled as a literal. Two literals for one variable is how a rename
+// silently stops an operator's override applying.
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrokerAccountTarget {
@@ -161,10 +167,13 @@ impl HasSchemaVersion for BrokerSettingsState {
 /// Returns the first candidate that EXISTS. If none exists, returns
 /// the highest-priority candidate so callers can create it there.
 pub fn credentials_file_path() -> Result<PathBuf> {
-    if let Ok(custom) = env::var(ENV_OVERRIDE_VAR) {
-        if !custom.trim().is_empty() {
-            return Ok(PathBuf::from(custom));
-        }
+    // Routed through the registry getter (2026-08-10) so this file no longer
+    // reads the environment itself. BEHAVIOUR: the getter TRIMS the value; the
+    // inline read did not, so a path pasted with a trailing newline used to
+    // become a path that cannot exist, and the credentials file was silently
+    // created somewhere else.
+    if let Some(custom) = crate::env_overrides::broker_credentials_path_override() {
+        return Ok(PathBuf::from(custom));
     }
 
     let candidates = candidate_paths()?;
@@ -268,6 +277,9 @@ pub fn save_to_disk(path: &Path, settings: &BrokerSettingsState) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Aliased, never re-spelled: see the note beside `CREDENTIALS_FILENAME`.
+    const ENV_OVERRIDE_VAR: &str = crate::env_overrides::ENV_BROKER_CREDENTIALS_PATH;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

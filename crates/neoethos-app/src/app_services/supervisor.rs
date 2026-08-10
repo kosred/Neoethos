@@ -443,13 +443,48 @@ fn parse_actions(reply: &str) -> Vec<SupervisorAction> {
     serde_json::from_str::<Vec<SupervisorAction>>(&reply[start..=end]).unwrap_or_default()
 }
 
-/// Local MCP sidecar base URL (overridable via `NEOETHOS_MCP_URL`).
+/// Local MCP sidecar base URL.
+///
+/// 2026-08-10 config consolidation: this was a SECOND, independent
+/// `NEOETHOS_MCP_URL` read. Two readers of one variable meant the Supervisor
+/// and the `/mcp/status` card could dial different processes and neither
+/// would say so. There is now one resolver, in the module that owns
+/// `mcp_servers.json`, and it takes the port from that file — the same file
+/// the sidecar itself reads. See `crate::server::mcp::sidecar_url`.
 pub(crate) fn mcp_sidecar_url() -> String {
-    std::env::var("NEOETHOS_MCP_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:7431".to_string())
+    crate::server::mcp::sidecar_url()
         .trim_end_matches('/')
         .to_string()
 }
+
+/// The message an operator sees when the MCP sidecar does not answer.
+///
+/// **W10b (2026-08-10).** Until today this said "is neoethos-mcp running?"
+/// while `crates/neoethos-mcp` ALSO produced a binary called `neoethos-mcp` —
+/// a different program with a different job. An operator following the
+/// message could check the wrong process, find it running, and conclude the
+/// message was lying. The crate has since been renamed (`[[bin]] name =
+/// "neoethos-control-plane"`, `crates/neoethos-mcp/Cargo.toml:35`), so the
+/// repo can no longer build two binaries with that name — but an installed
+/// directory may still hold a stale executable from an earlier build, and the
+/// two names are still one letter of context apart.
+///
+/// So the message names BOTH, and says which one is wanted:
+///
+/// * **`neoethos-mcp`** — the OUTBOUND sidecar, built from the separate
+///   `mcp/` workspace, spawned next to the app, answers HTTP on the port in
+///   `mcp_servers.json`. **This is the one that is not answering.**
+/// * **`neoethos-control-plane`** — the INBOUND control plane, built from
+///   `crates/neoethos-mcp`, which lets an external LLM drive this backend. It
+///   is a different process and starting it will not fix this.
+const MCP_SIDECAR_UNREACHABLE: &str =
+    "MCP sidecar not reachable. The process that must be running is \
+     `neoethos-mcp` (the OUTBOUND sidecar built from the `mcp/` workspace, \
+     spawned next to the app, listening on the port in `mcp_servers.json`). \
+     It is NOT `neoethos-control-plane` (the INBOUND control plane built from \
+     `crates/neoethos-mcp`) — those are two different programs and starting \
+     the wrong one will not fix this. Check Settings → MCP for the configured \
+     port, and that `neoethos-mcp` sits in the app's own directory.";
 
 /// Audit S02: conservative read-only allowlist for MCP tools the LLM may run
 /// without operator approval. Matched on the tool name's leading verb; ANYTHING
@@ -590,7 +625,7 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
                 .timeout(std::time::Duration::from_secs(15))
                 .send()
                 .await
-                .context("MCP sidecar not reachable — is neoethos-mcp running?")?
+                .context(MCP_SIDECAR_UNREACHABLE)?
                 .error_for_status()?;
             let v: serde_json::Value = resp.json().await?;
             Ok(format!("MCP tools: {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))
@@ -622,7 +657,7 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
                 .json(&serde_json::json!({ "server": server, "tool": tool, "args": args }))
                 .send()
                 .await
-                .context("MCP sidecar not reachable — is neoethos-mcp running?")?
+                .context(MCP_SIDECAR_UNREACHABLE)?
                 .error_for_status()?;
             let v: serde_json::Value = resp.json().await?;
             Ok(format!("mcp_call {server}/{tool} → {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))

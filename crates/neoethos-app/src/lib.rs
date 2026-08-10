@@ -36,4 +36,10 @@ pub fn install_runtime_overrides_from_settings(settings: &neoethos_core::Setting
         settings.models.data_runtime.rebuild_stale_higher_tfs,
     );
     app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
+    // 2026-08-10 config consolidation, non-negotiable #4: a retired env var
+    // that is still exported must SAY SO. This is the last thing the installer
+    // does, so the notice sits directly beneath the values that actually took
+    // effect. It reads nothing and applies nothing — it only names what was
+    // ignored. Both front-ends reach it because both call this function.
+    app_services::retired_env::report_retired_env_vars();
 }

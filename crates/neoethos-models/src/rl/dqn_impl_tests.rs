@@ -435,21 +435,52 @@ fn runtime_backend_details_explain_requested_gpu_fallback_to_cpu() {
     assert!(degraded_reason.contains("rl_backend_degraded_to_fallback_q"));
 }
 
+/// A bf16 request must still be reported as unavailable — but the request now
+/// arrives as a value, not as `NEOETHOS_BOT_DQN_TRAIN_PRECISION`.
+///
+/// The old shape of this test exported that variable and asserted the reason
+/// came back. It passed because the env var was a real input to the resolver,
+/// so it pinned the defect the config consolidation removed: precision could be
+/// set from a shell with no config field and no artifact record. The precision
+/// now comes from `system.hardware.training_precision` only, so the request is
+/// injected here the way production injects it — as an argument.
 #[test]
-fn runtime_backend_details_explain_requested_precision_when_unavailable() {
+fn requested_precision_unavailable_is_reported() {
+    let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (effective, degraded_reason) =
+        resolve_rl_training_precision_with_capability(Some("bf16"), "rlkit_cpu", "cpu", Some(true));
+    assert_eq!(effective, "fp32");
+    let degraded_reason =
+        degraded_reason.expect("precision request should appear in degraded reason");
+    assert!(degraded_reason.contains("requested_rl_precision_unavailable(bf16)"));
+}
+
+/// With nothing configured, no precision is requested and the runtime report
+/// must not invent one. This is the half a retired env var could break
+/// silently: a leftover export used to make every DQN artifact claim a bf16
+/// request that no configuration contained.
+#[test]
+fn no_configured_precision_means_no_precision_complaint() {
     let _env = PRECISION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION", "bf16");
+        std::env::set_var("NEOETHOS_BOT_TRAIN_PRECISION", "bf16");
+        std::env::set_var("FOREX_TRAIN_PRECISION", "bf16");
     }
     let learner = TradingReinforcementLearner::new();
     let (_backend, degraded_reason) = learner.runtime_backend_details();
     unsafe {
         std::env::remove_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION");
+        std::env::remove_var("NEOETHOS_BOT_TRAIN_PRECISION");
+        std::env::remove_var("FOREX_TRAIN_PRECISION");
     }
 
-    let degraded_reason =
-        degraded_reason.expect("precision request should appear in degraded reason");
-    assert!(degraded_reason.contains("requested_rl_precision_unavailable(bf16)"));
+    assert!(
+        !degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("requested_rl_precision_unavailable")),
+        "retired precision env vars must not reach the runtime report: {degraded_reason:?}"
+    );
 }
 
 #[test]

@@ -47,6 +47,37 @@ pub fn current_data_runtime_overrides() -> DataRuntimeOverrides {
     DATA_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
 }
 
+// ─── Feature-cube assembly policy (2026-08-10, env→config wave 2) ──────────
+// The config recipient for the retired `NEOETHOS_FEATURE_CUBE_MODE`.
+//
+// It lives in its OWN slot rather than being added to `DataRuntimeOverrides`
+// because that struct's installer, `install_data_runtime_overrides`, is called
+// from `neoethos-app` and `neoethos-cli` — crates this change does not open.
+// Widening its arity would break their build with no one able to repair it in
+// the same change. This slot is installed from
+// `neoethos_search::install_search_runtime_overrides_from_settings`, which
+// every production binary already calls with the resolved `Settings`, so the
+// field reaches production without a second edit anywhere.
+
+static FEATURE_CUBE_POLICY: std::sync::OnceLock<neoethos_core::config::FeatureCubeMode> =
+    std::sync::OnceLock::new();
+
+/// Install the operator's `models.data_runtime.feature_cube_mode`.
+/// Idempotent — the first install wins.
+pub fn install_feature_cube_policy(mode: neoethos_core::config::FeatureCubeMode) {
+    let _ = FEATURE_CUBE_POLICY.set(mode);
+}
+
+/// The installed feature-cube policy, or `Auto` when nothing installed one.
+/// `Auto` is exactly what every run got while the env var was unset, so an
+/// un-installed process behaves as it always did.
+pub fn current_feature_cube_policy() -> neoethos_core::config::FeatureCubeMode {
+    FEATURE_CUBE_POLICY
+        .get()
+        .copied()
+        .unwrap_or(neoethos_core::config::FeatureCubeMode::Auto)
+}
+
 #[cfg(test)]
 mod data_runtime_overrides_tests {
     use super::*;
@@ -1381,9 +1412,12 @@ where
 /// 2026-08-10: `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` used to force
 /// the choice, and the `ram` arm returned BEFORE the free-RAM check two lines
 /// below — a failure wearing the costume of a choice, and the never-OOM
-/// invariant inverted. It is gone. The decision is derived from the probe, and
-/// the derivation is now logged so "why did this run go to disk?" has an
-/// answer in the log instead of in someone's shell history.
+/// invariant inverted. The variable is gone; the knob survives as
+/// `models.data_runtime.feature_cube_mode`, recorded in the discovery run
+/// profile at `/execution/feature_cube_mode`, with the ordering corrected: the
+/// probe now binds `ram` instead of being skipped by it. The derivation is
+/// logged, so "why did this run go to disk?" has an answer in the log instead
+/// of in someone's shell history.
 ///
 /// The `auto` requirement is derived from the assembly's ACTUAL peak, which is
 /// why it changed on 2026-07-20. The old assembly built every per-TF block and
@@ -1421,27 +1455,47 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
         }
     }
     report_retired_env_vars();
+    let configured = current_feature_cube_policy();
+    let cube_gb = format!("{:.1}", cube_bytes as f64 / 1e9);
+
+    // `disk` is always honoured: it can only LOWER peak memory, so there is
+    // no conflict for the probe to resolve.
+    if configured == neoethos_core::config::FeatureCubeMode::Disk {
+        tracing::info!(
+            target: "neoethos_data::feature_cube",
+            cube_gb = %cube_gb,
+            configured = "disk",
+            in_ram = false,
+            "feature-cube assembly forced to the disk-mmap store by \
+             models.data_runtime.feature_cube_mode"
+        );
+        return false;
+    }
+
     let available = neoethos_core::available_memory_bytes();
     if available == 0 {
         tracing::warn!(
             target: "neoethos_data::feature_cube",
-            cube_gb = format!("{:.1}", cube_bytes as f64 / 1e9),
+            cube_gb = %cube_gb,
+            configured = %configured.as_str(),
             "available-memory probe returned 0 — taking the disk-mmap path. This is the \
              safe answer, not a measured one."
         );
         return false;
     }
     let needed = (cube_bytes as f64) * 1.5 + 2.0e9;
-    let in_ram = needed < available as f64;
+    let fits = needed < available as f64;
+
     tracing::info!(
         target: "neoethos_data::feature_cube",
-        cube_gb = format!("{:.1}", cube_bytes as f64 / 1e9),
+        cube_gb = %cube_gb,
         needed_gb = format!("{:.1}", needed / 1e9),
         available_gb = format!("{:.1}", available as f64 / 1e9),
-        in_ram,
+        configured = %configured.as_str(),
+        in_ram = fits,
         "feature-cube assembly path derived from the free-RAM probe"
     );
-    in_ram
+    fits
 }
 
 /// Environment variables this crate used to honour and no longer does.
@@ -1449,7 +1503,8 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
 const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     (
         "NEOETHOS_FEATURE_CUBE_MODE",
-        "the free-RAM probe in should_build_cube_in_ram (never-OOM invariant)",
+        "models.data_runtime.feature_cube_mode, clamped by the free-RAM probe in \
+         should_build_cube_in_ram (never-OOM invariant)",
     ),
     (
         "NEOETHOS_REQUIRE_GPU",
@@ -2124,6 +2179,22 @@ mod cube_assembly_tests {
              free-RAM check"
         );
         unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+    }
+
+    /// The config successor must default to the derived answer, so a process
+    /// that never installs one behaves exactly as it always has.
+    ///
+    /// Deliberately does NOT install a policy: the slot is a process-wide
+    /// `OnceLock`, and a test that filled it would decide the answer for every
+    /// other test in the binary depending on which ran first. The `disk` arm is
+    /// pinned by inspection of the branch above, and `ram` is pinned by the
+    /// type itself — see `FeatureCubeMode`, which has no such variant.
+    #[test]
+    fn feature_cube_policy_defaults_to_derive() {
+        assert_eq!(
+            super::current_feature_cube_policy(),
+            neoethos_core::config::FeatureCubeMode::Auto
+        );
     }
 }
 

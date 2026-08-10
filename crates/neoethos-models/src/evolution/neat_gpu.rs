@@ -221,18 +221,15 @@ fn neat_population_metrics_kernel(
 }
 
 pub(crate) fn neat_cuda_kernel_enabled(policy: &str) -> bool {
-    crate::common::cuda_kernel_enabled(policy, "NEOETHOS_BOT_NEAT_CUDA_KERNEL")
+    crate::common::cuda_kernel_enabled(policy)
 }
 
 fn cuda_device_id(policy: &str) -> usize {
-    crate::common::cuda_device_id_from_policy(policy, "NEOETHOS_BOT_NEAT_CUDA_DEVICE", None)
+    crate::common::cuda_device_id_from_policy(policy)
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
-    crate::common::cuda_kernel_units(
-        client.properties().hardware.max_units_per_cube,
-        "NEOETHOS_BOT_NEAT_KERNEL_UNITS",
-    )
+    crate::common::cuda_kernel_units(client.properties().hardware.max_units_per_cube)
 }
 
 fn activation_code(activation: Activation) -> i32 {

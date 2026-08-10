@@ -71,6 +71,17 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// `desktop_seed_is_the_serialised_defaults` REWRITES the seed while
+/// `the_seed_on_disk_declares_itself_generated` reads it, on parallel threads
+/// of the same binary. Without this a reader can observe a half-written file
+/// and fail for a reason unrelated to what it guards. Poisoning is ignored: a
+/// panicking assert must not turn the rest of the suite into lock errors.
+static SEED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_seed() -> std::sync::MutexGuard<'static, ()> {
+    SEED_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn seed_path() -> PathBuf {
     repo_root()
         .join("desktop")
@@ -165,6 +176,7 @@ fn describe_change(old: &str, new: &str) -> String {
 
 #[test]
 fn desktop_seed_is_the_serialised_defaults() {
+    let _guard = lock_seed();
     let path = seed_path();
     let want = expected_seed();
     let have = std::fs::read_to_string(&path).unwrap_or_default();
@@ -218,6 +230,34 @@ fn the_generated_body_carries_the_marker_the_migration_tool_requires() {
             .lines()
             .any(|l| l.trim_end() == GENERATED_MARKER),
         "the marker must be a line of its own"
+    );
+}
+
+/// The marker must be on the FILE, not just in the string this test can
+/// compute. `desktop_seed_is_the_serialised_defaults` proves it by byte
+/// equality, but only after it has already rewritten the file — so on the run
+/// where a hand-written seed is still on disk, this is the check that names the
+/// actual problem ("this file was written by a person") instead of drowning it
+/// in a whole-file diff.
+#[test]
+fn the_seed_on_disk_declares_itself_generated() {
+    let _guard = lock_seed();
+    let path = seed_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        // An absent seed is a valid end state of the collapse — the compiled
+        // defaults are the defaults, so a fresh install needs no file at all.
+        // `desktop_seed_is_the_serialised_defaults` creates it either way.
+        return;
+    };
+    assert!(
+        text.lines().any(|l| l.trim_end() == GENERATED_MARKER),
+        "{} does not carry `{GENERATED_MARKER}`, so it was written by hand. It is a GENERATED \
+         projection of Settings::default(): the defaults live in \
+         crates/neoethos-core/src/config.rs and nowhere else. Change the `Default` impl and \
+         re-run `cargo test -p neoethos-core --test generated_seed_is_current`. \
+         scripts/migrate_live_config.ps1 also refuses to read defaults from a file without this \
+         marker, so a hand-edited seed cannot leak values into the operator's live store.",
+        path.display()
     );
 }
 

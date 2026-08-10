@@ -633,3 +633,149 @@ extern "C" __global__ void mab_many_series_one_param_time_major_f64(
         out_lower_tm[new_idx] = slow_tm[new_idx] - devdn * dev;
     }
 }
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (mab)
+ *
+ * CPU reference: `mab_scalar` (src/indicators/mab.rs:698), reached because
+ *   `mab_prepare2` (:252) maps `Kernel::Auto` to `Kernel::Scalar` OUTRIGHT
+ *   (:282-285). There is no auto-detected AVX path for this indicator, so the
+ *   scalar association is the whole oracle and the 1-ULP seed question that
+ *   dogged `wilders`/`vwap` does not arise here.
+ *
+ * Column: output_id "value" -> `out.upperband` (cpu_batch.rs:15316-15321).
+ *
+ * PERIOD-INVARIANT: `compute_mab_batch` reads `fast_period` (10),
+ *   `slow_period` (50), `devup` (1.0), `devdn` (1.0), `fast_ma_type` ("sma")
+ *   and `slow_ma_type` ("sma") (cpu_batch.rs:15294-15299) and NEVER `period`.
+ *
+ * Input: ONE price series -- `extract_slice_input("mab", req.data, "close")`
+ *   (cpu_batch.rs:15291) -> F64InputKind::CloseSlice.
+ *
+ * FIRST-VALID: `mab_prepare2` :269-272 is `position(|x| !x.is_nan())` over the
+ *   single series -- F64FirstValidRule::AllInputsNonNan.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. Three accumulators are carried
+ *   subtract-then-add (the two SMA sums and `sum_sq`), and `sum_sq` at bar i
+ *   is a function of its own value at bar i-1, so there is no bar-parallel
+ *   form that preserves the rounding.
+ *
+ * Roundings, counted against the CPU lines:
+ *   `sum += *dp.add(first + k);`                (sma.rs:334)  plain add
+ *   `sum += *dp.add(i) - *dp.add(i - period);`  (sma.rs:341)  ONE sub then add
+ *   `*op.add(i) = sum * inv;`                   (sma.rs:342)  multiply by 1/p
+ *   `sum_sq += diff * diff;`                    (mab.rs:718)  NO fma
+ *   `sum_sq += new * new - old * old;`          (mab.rs:734)  NO fma, sub first
+ *   `let dev = (sum_sq / fast_period as f64).sqrt();` (:735)
+ *   `upper[i] = slow_ma[i] + devup * dev;`      (:738)
+ *   Not one of these is a `mul_add` on the CPU, so not one of them is an
+ *   `fma` here. Writing `fma(devup, dev, slow_ma)` would drop a rounding the
+ *   reference performs.
+ *
+ * NaN semantics: `mab_scalar` contains no max/min at all -- rule 4 does not
+ *   bite on this column, and a NaN in the window propagates exactly as the
+ *   CPU lets it.
+ *
+ * The two MIXED stages in this file (`mab_build_prefix_single_f32` writing a
+ *   `double*`, `mab_batch_from_prefix_sma_f32` taking one) are left standing
+ *   for the f32 wrappers that call them. This lane never crosses that
+ *   boundary: no `float*` appears in this entry point, and the resolution
+ *   table -- not a name suffix -- is what routes `F64Kernel::Mab` here.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:15294-15297. */
+#define NEO_MAB_FAST_PERIOD 10
+#define NEO_MAB_SLOW_PERIOD 50
+#define NEO_MAB_DEVUP       1.0
+#define NEO_MAB_DEVDN       1.0
+
+extern "C" __global__
+void mab_neo_batch_f64(const double* __restrict__ prices,
+                       int n,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods; /* period-invariant -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int    fast  = NEO_MAB_FAST_PERIOD;
+    const int    slow  = NEO_MAB_SLOW_PERIOD;
+    const double devup = NEO_MAB_DEVUP;
+
+    /* :262 -- InvalidPeriod. */
+    if (fast > n || slow > n) return;
+
+    const int first = first_valid;
+    if (first < 0 || first >= n) return;
+
+    const int need       = (fast > slow ? fast : slow);
+    const int need_total = need + fast - 1;          /* :275 */
+    if (n - first < need_total) return;              /* :276 NotEnoughValidData */
+
+    const int warmup       = first + need_total - 1; /* :286 */
+    const int first_output = warmup + 1;             /* mab.rs:401 passes warmup+1 */
+    if (first_output >= n) return;
+
+    /* --- fast/slow SMA, exactly `sma_scalar` (sma.rs:317) ----------------- */
+    const double inv_fast = 1.0 / (double)fast;
+    const double inv_slow = 1.0 / (double)slow;
+
+    double sum_fast = 0.0;
+    for (int k = 0; k < fast; ++k) sum_fast += prices[first + k];
+    double sum_slow = 0.0;
+    for (int k = 0; k < slow; ++k) sum_slow += prices[first + k];
+
+    /* `diff[i] = fast_ma[i] - slow_ma[i]` is needed again `fast` bars later,
+     * so the row keeps a ring that deep. `fast_period` is a CPU DEFAULT here,
+     * not a swept parameter (this indicator is period-invariant), so the ring
+     * is sized at exactly that default and no caller-supplied number can reach
+     * it. */
+    double diff_ring[NEO_MAB_FAST_PERIOD];
+    for (int k = 0; k < fast; ++k) diff_ring[k] = 0.0;
+
+    /* `start_idx` (mab.rs:709) = first_output - fast + 1. */
+    const int start_idx = (first_output >= fast) ? (first_output - fast + 1) : 0;
+
+    double sum_sq = 0.0;
+    int    ring_pos = 0;
+
+    for (int i = first; i < n; ++i) {
+        /* Advance the two SMA sums to bar i in CPU order. */
+        if (i >= first + fast) sum_fast += prices[i] - prices[i - fast];
+        if (i >= first + slow) sum_slow += prices[i] - prices[i - slow];
+
+        const int have_fast = (i >= first + fast - 1);
+        const int have_slow = (i >= first + slow - 1);
+        if (!have_fast || !have_slow) continue;
+
+        const double fast_ma = sum_fast * inv_fast;
+        const double slow_ma = sum_slow * inv_slow;
+        const double diff    = fast_ma - slow_ma;
+
+        /* Seed window [start_idx, start_idx + fast) -- mab.rs:716-719. */
+        if (i >= start_idx && i < start_idx + fast) {
+            sum_sq += diff * diff;
+        } else if (i > first_output) {
+            /* mab.rs:731-734: subtract the diff `fast` bars back, add this one. */
+            const double old = diff_ring[(i - fast) % fast];
+            sum_sq += diff * diff - old * old;
+        }
+
+        diff_ring[i % fast] = diff;
+
+        if (i >= first_output) {
+            const double dev = sqrt(sum_sq / (double)fast);
+            o[i] = slow_ma + devup * dev;
+        }
+    }
+}

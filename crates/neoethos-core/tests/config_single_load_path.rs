@@ -58,6 +58,65 @@ fn config_rs() -> String {
         .expect("read config.rs")
 }
 
+/// `config.rs` with every `#[cfg(test)]` module removed.
+///
+/// Assertions of the form "this string must not appear in `config.rs`" are
+/// claims about the code that RUNS, and `config.rs` carries its own unit tests
+/// whose entire job is to name the thing being forbidden. `config.rs` asserts
+/// that no `ConfigSource` variant renders as `"cwd_relative"`; the literal in
+/// that assertion made the textual scan below report the deleted branch as
+/// restored. One guard was detecting the other.
+///
+/// This narrows the scan rather than weakening it: the two assertions are
+/// unchanged, and a `"cwd_relative"` anywhere in production code — including a
+/// comment there — still fails. Do NOT use this for scans that should also
+/// cover test code.
+fn production_config_rs() -> String {
+    let src = config_rs();
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src.as_str();
+
+    while let Some(marker) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..marker]);
+        let after = &rest[marker..];
+        // Skip to the `{` that opens the gated item, then consume to its match.
+        let Some(open) = after.find('{') else {
+            // No block follows (e.g. a gated `use`): drop the rest of the line.
+            let line_end = after.find('\n').map_or(after.len(), |i| i + 1);
+            rest = &after[line_end..];
+            continue;
+        };
+        let bytes = after.as_bytes();
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => rest = &after[e..],
+            // Unbalanced braces: keep the remainder rather than silently
+            // dropping code from the scan.
+            None => {
+                out.push_str(after);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 // ── direction 1: every field is reachable from a file ───────────────────────
 
 #[test]
@@ -295,6 +354,93 @@ fn every_config_struct_denies_unknown_fields() {
         denies >= struct_count,
         "every config struct must set deny_unknown_fields ({denies} attributes for {struct_count} \
          structs). Without it a misspelled key inside a section parses, saves, and reports success."
+    );
+}
+
+// ── the fourth surface is gone ──────────────────────────────────────────────
+
+/// `Settings::load()` had three branches; the third was the bare relative
+/// `"config.yaml"`, resolved against the process working directory. That is
+/// the fourth config surface, and it made the SAME BINARY trade differently
+/// depending on the directory it was started from: a run from the repo root
+/// silently picked up the developer profile's
+/// `require_walkforward_for_export: false` and `prop_firm_min_pass_rate: 0.0`,
+/// and the identical binary one directory up did not.
+///
+/// The branch is deleted. When no file resolves, the compiled `Default` impls
+/// are used and the run says so — under the 2026-08-10 scheme the `Default`s
+/// ARE the defaults, so "no file" means "no overrides", which is a legitimate
+/// state rather than an error.
+#[test]
+fn the_working_directory_can_no_longer_choose_the_config() {
+    // Production code only: `config.rs`'s own unit test
+    // `there_is_no_cwd_relative_config_source` names the forbidden tag in order
+    // to forbid it, and scanning it made this guard report the branch restored.
+    // Using the production source also makes the two positive assertions below
+    // STRONGER — the announcement and the `$CONFIG_FILE` read must be in the
+    // code that runs, not merely somewhere in the file.
+    let src = production_config_rs();
+
+    assert!(
+        !src.contains("ConfigSource::RepoRelative"),
+        "the cwd-relative branch is back in Settings::load(). One binary, one answer: which \
+         config a run reads must not depend on the directory it was launched from."
+    );
+    assert!(
+        !src.contains("\"cwd_relative\""),
+        "the `cwd_relative` provenance tag is back, which means the branch that produces it is too"
+    );
+
+    // The escape hatch that replaced it must still be the documented one, and
+    // it must still be the ONLY env read in the file.
+    assert!(
+        src.contains("std::env::var(\"CONFIG_FILE\")"),
+        "$CONFIG_FILE is the one supported way to point a run at a different file; without it \
+         there is no way to run a local experiment and the pressure to restore the cwd fallback \
+         comes straight back"
+    );
+    assert!(
+        src.contains("NO CONFIG FILE WAS READ"),
+        "the compiled-defaults branch must announce itself. A run that reads no file at all is \
+         exactly the case that must never be inferred from silence"
+    );
+}
+
+/// `user_config_path()`'s own last resort must not smuggle the deleted branch
+/// back in: `load()` treats that path's existence as 'the operator has a
+/// store', so returning the bare `"config.yaml"` there would re-adopt the repo
+/// profile by accident on any machine with no home directory.
+#[test]
+fn the_store_fallback_is_not_the_repo_file() {
+    let src = config_rs();
+    let tail = src
+        .split("fn platform_user_config_path()")
+        .nth(1)
+        .expect("platform_user_config_path must exist — it is what user_config_path falls back to");
+    let body = tail.split("\nimpl Settings {").next().unwrap_or(tail);
+    assert!(
+        !body.contains("PathBuf::from(\"config.yaml\")"),
+        "the no-home-directory fallback resolves to the bare relative \"config.yaml\", which is \
+         the repo's developer profile. It must resolve somewhere that cannot be the repo file."
+    );
+}
+
+/// `NEOETHOS_USER_DATA_DIR` is the second env input that can move WHICH FILE
+/// the process reads. It is retained (the desktop shell uses it as the dev
+/// data-root escape) but it may not be silent — pending-A A9.
+#[test]
+fn a_redirected_store_is_named_in_the_provenance() {
+    assert_eq!(
+        ConfigSource::UserStoreRedirected.as_str(),
+        "user_store:NEOETHOS_USER_DATA_DIR",
+        "a redirected store must be distinguishable from the platform-standard one in the log; \
+         'the config you edited is not the config this run read' is the whole failure mode"
+    );
+    let src = config_rs();
+    assert!(
+        src.contains("NEOETHOS_USER_DATA_DIR IS REDIRECTING THE CONFIG FILE"),
+        "a redirect must name itself, with the path it chose and the platform-standard path it \
+         replaced"
     );
 }
 

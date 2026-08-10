@@ -456,19 +456,14 @@ impl NeuroEvoExpert {
         &self.feature_columns
     }
 
-    fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
-
+    /// Compile-time evaluation budget for the CR-FM-NES loop.
+    ///
+    /// `FOREX_NEURO_EVO_MAX_EVALS` used to override this. It bounded the
+    /// generation count (see [`Self::effective_generation_count_with_budget`])
+    /// from outside the config, so an export shortened the search and nothing
+    /// in the artifact said so. Deleted 2026-08-10; reported at startup if set.
     fn max_evaluations_budget() -> usize {
-        Self::env_usize(
-            "FOREX_NEURO_EVO_MAX_EVALS",
-            DEFAULT_MAX_NEURO_EVO_EVALUATIONS,
-        )
+        DEFAULT_MAX_NEURO_EVO_EVALUATIONS
     }
 
     fn effective_generation_count_with_budget(&self, max_evaluations_budget: usize) -> usize {

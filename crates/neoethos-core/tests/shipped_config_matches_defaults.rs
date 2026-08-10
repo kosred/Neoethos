@@ -28,6 +28,14 @@
 //!    dated decision that neither side can move without editing this file.
 //! 3. **The live store is read when present.** Its divergences are named here
 //!    in the same table as the repo's.
+//! 4. **The repo profile is collapsed to OVERRIDES ONLY**
+//!    (`the_repo_profile_carries_only_its_overrides`). A key whose value
+//!    already equals the compiled default is deleted from the file — which
+//!    cannot change any effective value, because the loader supplies the
+//!    identical number from `Default`. What is left is exactly the set of
+//!    disagreements, so a value can only appear in a file when it means
+//!    something. This is the other half of the collapse: the desktop seed is
+//!    generated, this one is reduced.
 //!
 //! The desktop seed is no longer compared: it is GENERATED from
 //! `Settings::default()` (see `generated_seed_is_current.rs`), so it cannot
@@ -272,6 +280,17 @@ fn root_config() -> PathBuf {
     repo_root().join("config.yaml")
 }
 
+/// `the_repo_profile_carries_only_its_overrides` REWRITES the repo config, and
+/// three other tests in this same binary read it — on parallel threads. Without
+/// a lock a reader can observe a half-written file and fail for a reason that
+/// has nothing to do with what it guards. Poisoning is ignored deliberately: a
+/// panicking assert must not convert the rest of the suite into lock errors.
+static ROOT_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_root_config() -> std::sync::MutexGuard<'static, ()> {
+    ROOT_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The operator's live store — **the only file a run reads**. Absent on CI and
 /// on a fresh machine, which is why every check that uses it is conditional
 /// rather than skipped-by-design.
@@ -370,6 +389,7 @@ fn assert_no_unknown_keys(path: &Path, remedy: &str) {
 
 #[test]
 fn repo_config_contains_no_key_that_is_not_a_settings_field() {
+    let _guard = lock_root_config();
     assert_no_unknown_keys(
         &root_config(),
         "Remedy: delete the key from config.yaml, or restore the field it names.",
@@ -436,6 +456,7 @@ fn assert_pinned(path: &Path, table: &[(&str, &str, &str)], which: &str) {
 
 #[test]
 fn repo_config_divergences_from_the_defaults_are_registered_decisions() {
+    let _guard = lock_root_config();
     assert_pinned(&root_config(), ROOT_REGISTERED, "ROOT_REGISTERED");
 }
 
@@ -501,8 +522,279 @@ fn prefilter_top_k_default_is_the_shipped_240_not_the_old_50() {
 
 #[test]
 fn the_repo_config_exists_and_parses() {
+    let _guard = lock_root_config();
     let p = root_config();
     assert!(p.exists(), "repo config missing: {}", p.display());
     let leaves = leaves_of_file(&p);
     assert!(!leaves.is_empty(), "{} parsed to nothing", p.display());
+}
+
+// ---------------------------------------------------------------------------
+// 5. THE COLLAPSE. The repo profile carries OVERRIDES ONLY.
+// ---------------------------------------------------------------------------
+//
+// Wave 1 gave the project one LOAD PATH. This is the one FILE.
+//
+// The repo `config.yaml` restated 383 values, of which the overwhelming
+// majority were simply the code default written out a second time. Every one of
+// those was a place a `Default` change could be contradicted by a file nobody
+// re-read — which is exactly how `prefilter_top_k` shipped at 50 in one file
+// and 240 in another for eight months. The seed file was solved by generating
+// it (`generated_seed_is_current.rs`). This is the other half: the repo profile
+// is reduced to the keys that actually DISAGREE with the code, so a value can
+// only appear in a file when it means something.
+//
+// # Why this test may DELETE lines from config.yaml but may never CHANGE one
+//
+// A key is dropped only when its value is byte-for-byte the compiled default
+// (numerically, to 1e-12). Dropping it therefore cannot change any effective
+// value — the loader supplies the identical number from `Default`. A key whose
+// value DIFFERS is kept verbatim, whatever it is, registered or not. This test
+// never rewrites a value, never reconciles a disagreement, and never touches
+// the operator's live store.
+
+/// Reasons attached to keys the repo profile keeps but which are not on the
+/// [`PINNED`] list. [`ROOT_REGISTERED`] carries the reason for the pinned ones;
+/// this carries the rest, so that the annotations B wrote into the 935-line
+/// file survive the collapse in the one place that is checked.
+const ROOT_NOTES: &[(&str, &str)] = &[
+    (
+        "models.discovery_mode",
+        "INERT. discovery.rs maps only `strict|legacy`; `risky` — and the live store's \
+         `prop_firm` — fall through to system.trading_mode. Restricting the accepted values is \
+         routed (pending-A A6) and blocked on the TUI, which offers exactly the two values the \
+         engine does not honour.",
+    ),
+    (
+        "risk.trailing_be_trigger_r",
+        "UNWIRED / SHADOWED DUPLICATE — the search reads models.exit_policy.*. Kept, not deleted: \
+         live execution trails unconditionally with no config recipient, so deleting the key \
+         turns a visibly wrong value into an invisible hardcode on the path that spends real \
+         money. Order: wire live_trading.rs to models.exit_policy FIRST (pending-A A8).",
+    ),
+    (
+        "risk.trailing_min_lock_pips",
+        "UNWIRED / SHADOWED DUPLICATE — see risk.trailing_be_trigger_r.",
+    ),
+    (
+        "risk.trailing_atr_multiplier",
+        "UNWIRED / SHADOWED DUPLICATE, and the NAME LIES: it was never an ATR multiple, it is a \
+         multiple of the position's own stop distance. See risk.trailing_be_trigger_r.",
+    ),
+    (
+        "system.trading_mode",
+        "The profile this file exists to describe. NOT merged with models.discovery_mode — that \
+         merge was overturned by the refuters and is never to be executed.",
+    ),
+];
+
+const PROFILE_HEADER: &str = "\
+# ============================================================================
+# DEVELOPER EXPERIMENT PROFILE — OVERRIDES ONLY. NOT the config a run reads.
+# ============================================================================
+#
+# Generated by crates/neoethos-core/tests/shipped_config_matches_defaults.rs
+# (`the_repo_profile_carries_only_its_overrides`). Every key BELOW differs from
+# `neoethos_core::config::Settings::default()`. Every key NOT below is the code
+# default, deliberately absent so that it cannot contradict one.
+#
+# THE SCHEME (docs/config-single-source-of-truth.md):
+#
+#   * The Rust `Default` impls are the SINGLE SOURCE OF DEFAULT VALUES.
+#   * desktop/src-tauri/resources/config.yaml is GENERATED from those defaults
+#     and fails the build if it drifts.
+#   * The operator's store (%LOCALAPPDATA%\\neoethos\\config.yaml) is the ONLY
+#     file a run reads, and carries HIS overrides only. Migrate it with
+#     scripts/migrate_live_config.ps1 — never by hand, never unattended.
+#   * THIS FILE is read by NOTHING unless you point $CONFIG_FILE at it.
+#
+# HOW TO RUN A LOCAL EXPERIMENT WITH A DIFFERENT SETTING:
+#
+#     Copy-Item config.yaml my-experiment.yaml     # edit the copy
+#     $env:CONFIG_FILE = 'my-experiment.yaml'
+#     cargo run -p neoethos-cli -- discover
+#
+# $CONFIG_FILE is the FIRST branch of the resolution order and the ONLY
+# supported way to point a run at a different file. The bare relative
+# \"config.yaml\" fallback is DELETED: until 2026-08-10 the same binary read a
+# different config depending on the directory it was started from, so simply
+# being in the repo root silently turned the OOS export gate off. A run now
+# logs, by name, which file it opened — or that it opened none.
+#
+# TO ADD AN OVERRIDE: add the key here. If it is on the PINNED list in the
+# generating test you must also register the value AND the reason in
+# ROOT_REGISTERED, or the test fails naming your key. To REMOVE an override,
+# delete the line; the code default takes over.
+# ============================================================================
+";
+
+/// Insert `value` at a dotted path into a YAML mapping, creating intermediate
+/// mappings. Insertion order is the caller's, so a sorted key list yields a
+/// deterministic, section-grouped file.
+fn insert_dotted(root: &mut serde_yaml_ng::Mapping, dotted: &str, value: serde_yaml_ng::Value) {
+    let mut parts: Vec<&str> = dotted.split('.').collect();
+    let leaf = parts.pop().expect("a dotted path has at least one segment");
+    let mut node: &mut serde_yaml_ng::Mapping = root;
+    for part in parts {
+        let key = serde_yaml_ng::Value::String(part.to_string());
+        if !node.contains_key(&key) {
+            node.insert(
+                key.clone(),
+                serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()),
+            );
+        }
+        node = node
+            .get_mut(&key)
+            .and_then(|v| v.as_mapping_mut())
+            .expect("intermediate config nodes are mappings");
+    }
+    node.insert(serde_yaml_ng::Value::String(leaf.to_string()), value);
+}
+
+fn reason_for(path: &str) -> Option<&'static str> {
+    ROOT_REGISTERED
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map(|(_, _, why)| *why)
+        .or_else(|| {
+            ROOT_NOTES
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, why)| *why)
+        })
+}
+
+/// Wrap `text` into `# ` comment lines under a `#   <path>` heading.
+fn comment_block(path: &str, text: &str) -> String {
+    let mut out = format!("#   {path}\n");
+    let mut line = String::from("#     ");
+    for word in text.split_whitespace() {
+        if line.len() + word.len() + 1 > 78 {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            line = String::from("#     ");
+        }
+        line.push_str(word);
+        line.push(' ');
+    }
+    out.push_str(line.trim_end());
+    out.push('\n');
+    out
+}
+
+#[test]
+fn the_repo_profile_carries_only_its_overrides() {
+    let _guard = lock_root_config();
+    let path = root_config();
+    let defaults = default_leaves();
+    let file = leaves_of_file(&path);
+
+    // A key that is not a field at all is NOT something this test may act on:
+    // it cannot be compared to a default, so it can be neither dropped as
+    // redundant nor kept as an override. Refuse, and leave the file alone.
+    let unknown: Vec<&String> = file
+        .keys()
+        .filter(|k| {
+            !defaults.contains_key(*k)
+                && !OPAQUE_MAPS.contains(&k.as_str())
+                && !OPAQUE_MAPS.iter().any(|m| k.starts_with(&format!("{m}.")))
+        })
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "{} carries {} key(s) that are not fields of Settings, so the profile cannot be \
+         collapsed without guessing what they meant. NOTHING HAS BEEN WRITTEN. Delete them (or \
+         restore their fields) and re-run:\n{}",
+        path.display(),
+        unknown.len(),
+        unknown.iter().map(|k| format!("  - {k}")).collect::<Vec<_>>().join("\n"),
+    );
+
+    let mut kept: Vec<(&String, &serde_yaml_ng::Value)> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (key, value) in &file {
+        match defaults.get(key) {
+            // Identical to the compiled default: the line says nothing the code
+            // does not already say, and removing it cannot change a value.
+            Some(d) if same(value, d) => {
+                dropped.push(format!("  DROP  {key}: {value:?}  (== the code default)"))
+            }
+            _ => kept.push((key, value)),
+        }
+    }
+
+    let mut body = serde_yaml_ng::Mapping::new();
+    for &(key, value) in &kept {
+        insert_dotted(&mut body, key.as_str(), value.clone());
+    }
+    let rendered = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(body))
+        .expect("the retained overrides must serialise");
+    let rendered = rendered.strip_prefix("---\n").unwrap_or(&rendered);
+
+    let mut reasons = String::from(
+        "#\n# WHY EACH KEY BELOW DIVERGES FROM THE CODE DEFAULT\n\
+         # (unannotated keys are ordinary developer tuning; the ones with a\n\
+         #  reason are decisions that neither side may move alone)\n#\n",
+    );
+    for &(key, _) in &kept {
+        if let Some(why) = reason_for(key.as_str()) {
+            reasons.push_str(&comment_block(key, why));
+            reasons.push_str("#\n");
+        }
+    }
+    reasons.push_str(
+        "# ============================================================================\n",
+    );
+
+    let want = format!("{PROFILE_HEADER}{reasons}{rendered}");
+    let have = std::fs::read_to_string(&path).unwrap_or_default();
+    if have == want {
+        return;
+    }
+
+    std::fs::write(&path, &want).unwrap_or_else(|e| {
+        panic!(
+            "the repo profile at {} is not overrides-only AND could not be rewritten: {e}",
+            path.display()
+        )
+    });
+
+    panic!(
+        "\n\
+         {} was not overrides-only, so it HAS BEEN COLLAPSED and REWRITTEN.\n\
+         \n\
+         {} key(s) kept (they differ from the code default), {} key(s) dropped.\n\
+         Every dropped key held EXACTLY the compiled default, so no effective value moved —\n\
+         the loader supplies the identical number from `Settings::default()`. Review `git diff`\n\
+         and commit.\n\
+         \n\
+         {}\n\
+         \n\
+         This test fails on rewrite by design, the same way generated_seed_is_current.rs does:\n\
+         a config file shrinking is something a human reads once. Re-run to confirm green.\n",
+        path.display(),
+        kept.len(),
+        dropped.len(),
+        if dropped.is_empty() {
+            "  (no key dropped — only the header, ordering or a value's rendering changed)".to_string()
+        } else {
+            dropped.join("\n")
+        },
+    );
+}
+
+/// A note whose key is not a field guards nothing and reads as coverage.
+#[test]
+fn every_annotated_path_is_a_real_field() {
+    let defaults = default_leaves();
+    let dead: Vec<&str> = ROOT_NOTES
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| !defaults.contains_key(*p))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "these ROOT_NOTES paths are not fields of Settings — the field was renamed or deleted \
+         and the note was left behind: {dead:?}"
+    );
 }

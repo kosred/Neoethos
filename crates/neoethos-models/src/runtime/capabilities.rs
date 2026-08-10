@@ -125,15 +125,83 @@ pub fn normalize_runtime_device_policy(policy: &str) -> String {
     crate::common::normalize_vendor_device_policy(policy, &[])
 }
 
+/// Process-wide per-model device policy, installed once from the operator's
+/// `Settings` by [`crate::runtime::install::install_model_runtime_from_settings`].
+///
+/// Replaces the `NEOETHOS_BOT_<MODEL>_DEVICE` / `NEOETHOS_BOT_META_DEVICE` env
+/// pair. Both names are retired; both are reported at startup if still set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelDeviceOverrides {
+    /// `system.device` — the global device string every model param map is
+    /// seeded with.
+    pub default_device: String,
+    /// `models.model_param_overrides[<model>]["device"]` — the per-model
+    /// override the orchestrator already honours when it builds param maps.
+    pub per_model: std::collections::HashMap<String, String>,
+}
+
+impl ModelDeviceOverrides {
+    pub fn from_settings(s: &neoethos_core::Settings) -> Self {
+        let per_model = s
+            .models
+            .model_param_overrides
+            .iter()
+            .filter_map(|(model, params)| {
+                params
+                    .get("device")
+                    .map(|device| (model.clone(), device.clone()))
+            })
+            .collect();
+        Self {
+            default_device: s.system.device.clone(),
+            per_model,
+        }
+    }
+
+    fn policy_for(&self, model_name: &str) -> String {
+        let key = model_name.trim();
+        if let Some(device) = self.per_model.get(key) {
+            return device.clone();
+        }
+        if self.default_device.trim().is_empty() {
+            return "auto".to_string();
+        }
+        self.default_device.clone()
+    }
+}
+
+static MODEL_DEVICE: std::sync::OnceLock<ModelDeviceOverrides> = std::sync::OnceLock::new();
+
+/// Install ONLY this registry. `pub(crate)`; the crate-wide entry point is
+/// [`crate::runtime::install::install_model_runtime_from_settings`].
+pub(crate) fn set_model_device_registry(s: &neoethos_core::Settings) {
+    let _ = MODEL_DEVICE.set(ModelDeviceOverrides::from_settings(s));
+}
+
+/// The installed registry. When nothing has been installed — unit tests, and
+/// any embedder that never calls an installer — the default is an empty map
+/// with an empty `default_device`, which [`ModelDeviceOverrides::policy_for`]
+/// resolves to `"auto"`. That is exactly what the deleted env chain produced
+/// when no variable was set, so a run that never installs behaves as before
+/// rather than inventing a device.
+pub fn current_model_device_overrides() -> &'static ModelDeviceOverrides {
+    MODEL_DEVICE.get_or_init(ModelDeviceOverrides::default)
+}
+
+/// The device policy the operator requested for `model_name`, normalized to
+/// `auto|cpu|gpu|gpu:N`.
+///
+/// ## 2026-08-10 — routed to config
+///
+/// This read `NEOETHOS_BOT_<MODEL>_DEVICE` then `NEOETHOS_BOT_META_DEVICE`,
+/// falling back to the literal `"auto"`. Neither name had a config field, so
+/// the ONLY way to make the runtime report say "you asked for a GPU" was a
+/// shell export — while `system.device` and
+/// `models.model_param_overrides[<model>]["device"]`, the two settings that
+/// actually route models to devices, were invisible to it. The report and the
+/// routing now read the same two fields.
 pub fn requested_runtime_device_policy(model_name: &str) -> String {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    let requested = std::env::var(&model_key)
-        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
-        .unwrap_or_else(|_| "auto".to_string());
-    normalize_runtime_device_policy(&requested)
+    normalize_runtime_device_policy(&current_model_device_overrides().policy_for(model_name))
 }
 
 pub fn append_runtime_degraded_reason(
@@ -268,16 +336,60 @@ pub fn normalize_training_precision_policy(policy: &str) -> String {
     }
 }
 
-pub fn requested_training_precision_policy(model_name: &str) -> String {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_TRAIN_PRECISION",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    let requested = std::env::var(&model_key)
-        .or_else(|_| std::env::var("NEOETHOS_BOT_TRAIN_PRECISION"))
-        .or_else(|_| std::env::var("FOREX_TRAIN_PRECISION"))
-        .unwrap_or_else(|_| "auto".to_string());
-    normalize_training_precision_policy(&requested)
+/// The training precision the operator asked for, normalized to
+/// `auto|fp32|bf16|fp8|bf4`.
+///
+/// ## 2026-08-10 — routed to `system.hardware.training_precision`
+///
+/// Three env spellings used to answer this — `NEOETHOS_BOT_<MODEL>_TRAIN_PRECISION`,
+/// `NEOETHOS_BOT_TRAIN_PRECISION` and the legacy `FOREX_TRAIN_PRECISION` — for
+/// one thing that already has a config field. `neoethos-core` had ALREADY
+/// deleted its own readers of the last two (`HardwareRuntimeOverrides::from_env`,
+/// removed 2026-08-03) precisely because the field exists; this crate kept
+/// reading them, so precision had one answer in the hardware plan and a
+/// different one here. `current_hardware_runtime_overrides()` is installed by
+/// core's own startup path, so no new installation is required.
+///
+/// `None` (the shipped default) yields `"auto"` — the same value the env chain
+/// produced when no variable was set, so a default config changes no precision.
+///
+/// The old `model_name` parameter is DELETED, not underscored. It selected the
+/// `NEOETHOS_BOT_<MODEL>_TRAIN_PRECISION` spelling; with that spelling retired
+/// there is exactly one answer for every model, and a parameter that callers
+/// still fill in (`"burn"`, `"dqn"`) while it steers nothing is a knob that
+/// looks live and is not. Per-model precision has no config field today; if one
+/// is added it belongs on `ModelsConfig` and this function takes the model back
+/// as an argument then, not before.
+pub fn requested_training_precision_policy() -> String {
+    let Some(configured) = neoethos_core::system::current_hardware_runtime_overrides()
+        .training_precision
+    else {
+        return "auto".to_string();
+    };
+
+    // `system.hardware.training_precision` can say `fp16`; no training lane in
+    // this crate has an fp16 path (burn selects between fp32 and bf16, the DQN
+    // lane the same). Passing `fp16` down would hit each backend's catch-all
+    // arm and quietly execute fp32. Say so instead, and return the precision
+    // that will actually run — rule: a failure must never wear the costume of
+    // a choice.
+    if matches!(configured, neoethos_core::system::TrainingPrecision::Fp16) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                target: "neoethos_models::config",
+                configured = "fp16",
+                effective = "fp32",
+                field = "system.hardware.training_precision",
+                "system.hardware.training_precision = fp16 has no training lane \
+                 in neoethos-models; these models will train in fp32. Set bf16 \
+                 for reduced precision on a card that supports it."
+            );
+        });
+        return "fp32".to_string();
+    }
+
+    normalize_training_precision_policy(configured.as_str())
 }
 
 pub fn model_capability(name: &str) -> Option<ModelCapability> {
@@ -608,17 +720,48 @@ mod tests {
     }
 
     #[test]
-    fn gpu_policy_cpu_fallback_reason_detects_model_override() {
+    fn model_device_overrides_prefer_the_per_model_config_entry() {
+        let mut settings = neoethos_core::Settings::default();
+        settings.system.device = "cpu".to_string();
+        settings.models.model_param_overrides.insert(
+            "neat".to_string(),
+            std::collections::HashMap::from([("device".to_string(), "cuda:3".to_string())]),
+        );
+        let overrides = super::ModelDeviceOverrides::from_settings(&settings);
+        assert_eq!(
+            super::normalize_runtime_device_policy(&overrides.policy_for("neat")),
+            "gpu:3"
+        );
+        assert_eq!(
+            super::normalize_runtime_device_policy(&overrides.policy_for("dqn")),
+            "cpu"
+        );
+    }
+
+    /// An empty registry — the state in unit tests and in any embedder that
+    /// never installs — must resolve to `auto`, which is what the deleted env
+    /// chain produced when no variable was set. And a retired export must not
+    /// move it.
+    #[test]
+    fn model_device_policy_defaults_to_auto_and_ignores_retired_env() {
+        let overrides = super::ModelDeviceOverrides::default();
+        assert_eq!(
+            super::normalize_runtime_device_policy(&overrides.policy_for("neat")),
+            "auto"
+        );
+
         unsafe {
             std::env::set_var("NEOETHOS_BOT_NEAT_DEVICE", "cuda:3");
+            std::env::set_var("NEOETHOS_BOT_META_DEVICE", "cuda:7");
         }
         let reason = gpu_policy_cpu_fallback_reason("neat");
         unsafe {
             std::env::remove_var("NEOETHOS_BOT_NEAT_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_META_DEVICE");
         }
         assert_eq!(
-            reason.as_deref(),
-            Some("requested device policy `gpu:3`; runtime currently executes on CPU")
+            reason, None,
+            "a retired env var must not be able to claim a GPU was requested"
         );
     }
 
@@ -672,17 +815,23 @@ mod tests {
         assert_eq!(normalize_training_precision_policy("unknown"), "auto");
     }
 
+    /// The three retired precision spellings must not move the answer. With
+    /// nothing installed, `system.hardware.training_precision` is `None`, so
+    /// the answer is `auto` — the same value the env chain gave when no
+    /// variable was set.
     #[test]
-    fn requested_training_precision_policy_prefers_model_scoped_env() {
+    fn requested_training_precision_policy_ignores_retired_env() {
         unsafe {
             std::env::set_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION", "bf16");
-            std::env::set_var("NEOETHOS_BOT_TRAIN_PRECISION", "fp32");
+            std::env::set_var("NEOETHOS_BOT_TRAIN_PRECISION", "bf16");
+            std::env::set_var("FOREX_TRAIN_PRECISION", "bf16");
         }
-        let requested = requested_training_precision_policy("dqn");
+        let requested = requested_training_precision_policy();
         unsafe {
             std::env::remove_var("NEOETHOS_BOT_DQN_TRAIN_PRECISION");
             std::env::remove_var("NEOETHOS_BOT_TRAIN_PRECISION");
+            std::env::remove_var("FOREX_TRAIN_PRECISION");
         }
-        assert_eq!(requested, "bf16");
+        assert_eq!(requested, "auto");
     }
 }

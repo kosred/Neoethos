@@ -531,17 +531,59 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
             .cloned()
             .unwrap_or_else(|| "EURUSD".to_string());
         info!("Headless: auto-starting discovery for {}", symbol);
-        let request = DiscoveryRequest {
-            data_root: runtime.data_dir.clone(),
-            symbol,
-            base_tf: "M1".to_string(),
-            higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
-            config: neoethos_search::DiscoveryConfig::default(),
-            prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
+        // ── 2026-08-10, config consolidation ─────────────────────────────
+        // This built `DiscoveryConfig::default()`. Every discovery knob the
+        // operator had set — population, generations, gates, cost model,
+        // `min_history_years` — was IGNORED on the headless auto-discovery
+        // path, while the UI path (`server/engines_control.rs:205`) and the
+        // validation sweep (`app_services/validation.rs:283`) both used
+        // `from_settings`. Same binary, same config file, three different
+        // answers depending on how the run was started.
+        //
+        // FAIL LOUD, do not substitute. If the config cannot be read we do
+        // NOT quietly fall back to the compiled defaults and run anyway —
+        // that is the failure wearing the costume of a choice. The run is
+        // refused and the reason is named.
+        let discovery_config = match Settings::from_yaml(&runtime.config_path) {
+            Ok(settings) => {
+                let cfg = neoethos_search::DiscoveryConfig::from_settings(&settings);
+                info!(
+                    config_path = %runtime.config_path,
+                    population = cfg.population,
+                    generations = cfg.generations,
+                    min_history_years = cfg.runtime_overrides.min_history_years,
+                    "Headless: discovery config resolved FROM THE CONFIG FILE \
+                     (previously the compiled defaults, which ignored every \
+                     operator knob on this path)"
+                );
+                Some(cfg)
+            }
+            Err(err) => {
+                error!(
+                    config_path = %runtime.config_path,
+                    error = %err,
+                    "Headless: REFUSING to auto-start discovery — the config file \
+                     could not be read, and running on the compiled defaults would \
+                     search a different space than the operator configured without \
+                     saying so. Fix the config and restart. (Auto-training, if \
+                     requested, is unaffected and still runs.)"
+                );
+                None
+            }
         };
-        match start_discovery_job(request, tx.clone()) {
-            Ok(_handle) => info!("Headless: discovery job started"),
-            Err(err) => error!("Headless: failed to start discovery: {}", err),
+        if let Some(discovery_config) = discovery_config {
+            let request = DiscoveryRequest {
+                data_root: runtime.data_dir.clone(),
+                symbol,
+                base_tf: "M1".to_string(),
+                higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
+                config: discovery_config,
+                prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
+            };
+            match start_discovery_job(request, tx.clone()) {
+                Ok(_handle) => info!("Headless: discovery job started"),
+                Err(err) => error!("Headless: failed to start discovery: {}", err),
+            }
         }
     }
 

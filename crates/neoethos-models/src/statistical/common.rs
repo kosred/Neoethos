@@ -34,11 +34,9 @@ pub fn normalize_statistical_device_policy(policy: &str) -> String {
 /// is in the CUDA aggregate, the policy needs a real home in config.
 static STATISTICAL_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Install the statistical device policy from `Settings`. Call once at
-/// startup, before any model training; the first install wins. Called from
-/// `neoethos_app::install_runtime_overrides_from_settings` (app + desktop)
-/// and from the CLI's `main`.
-pub fn install_statistical_runtime_from_settings(settings: &neoethos_core::Settings) {
+/// Install ONLY this registry. `pub(crate)` so the single crate-wide
+/// installer in `runtime::install` is the one entry point callers see.
+pub(crate) fn set_statistical_device(settings: &neoethos_core::Settings) {
     let configured = settings.models.statistical_device.trim();
     let _ = STATISTICAL_DEVICE.set(if configured.is_empty() {
         "cpu".to_string()
@@ -47,32 +45,67 @@ pub fn install_statistical_runtime_from_settings(settings: &neoethos_core::Setti
     });
 }
 
+/// Install the statistical device policy from `Settings`. Call once at
+/// startup, before any model training; the first install wins. Called from
+/// `neoethos_app::install_runtime_overrides_from_settings` (app + desktop)
+/// and from the CLI's `main`.
+///
+/// Kept under its historical name because those callers already use it; it now
+/// installs EVERY `neoethos-models` registry via
+/// [`crate::runtime::install::install_model_runtime_from_settings`] and emits
+/// the retired-env-var report.
+pub fn install_statistical_runtime_from_settings(settings: &neoethos_core::Settings) {
+    crate::runtime::install::install_model_runtime_from_settings(settings);
+}
+
 /// The configured policy (defaults to `"cpu"` when never installed — e.g. in
 /// unit tests — which is the behaviour every build has had to date).
 pub fn configured_statistical_device() -> &'static str {
     STATISTICAL_DEVICE.get_or_init(|| "cpu".to_string())
 }
 
-/// Resolve the device policy for one model: the per-model env var, then the
-/// subsystem env var, then config. The env vars keep priority they have
-/// always had; config replaces the literal `"auto"` that used to sit at the
-/// bottom of this chain.
+/// The device policy for one statistical model: `models.statistical_device`,
+/// and nothing else.
+///
+/// ## 2026-08-10 — the two env overrides are deleted
+///
+/// This used to read `NEOETHOS_BOT_<MODEL>_DEVICE`, then
+/// `NEOETHOS_BOT_META_DEVICE`, and only then the config field — i.e. the field
+/// the operator could see was the LOWEST-priority input, and the two that
+/// outranked it appeared in no config file, no knob catalogue and no run
+/// artifact. A shell export could put ElasticNet on the CUDA softmax kernel,
+/// whose fitted weights differ from the CPU path, and the artifact would record
+/// `cpu`.
+///
+/// `model_name` is retained in the signature: the callers pass it, the log
+/// lines want it, and a future per-model field belongs on `ModelsConfig` rather
+/// than in a second resolution chain here.
 pub fn statistical_device_policy(model_name: &str) -> String {
-    let model_key = format!(
-        "NEOETHOS_BOT_{}_DEVICE",
-        model_name.trim().to_ascii_uppercase().replace('-', "_")
-    );
-    std::env::var(&model_key)
-        .or_else(|_| std::env::var("NEOETHOS_BOT_META_DEVICE"))
-        .unwrap_or_else(|_| configured_statistical_device().to_string())
+    let _ = model_name;
+    configured_statistical_device().to_string()
 }
 
 pub fn runtime_backend_with_gpu_fallback(
     model_name: &str,
     cpu_backend: &str,
 ) -> (Option<String>, Option<String>) {
-    let requested = statistical_device_policy(model_name);
-    let normalized = normalize_statistical_device_policy(&requested);
+    runtime_backend_with_gpu_fallback_for_policy(
+        &statistical_device_policy(model_name),
+        cpu_backend,
+    )
+}
+
+/// The policy-in, report-out half of [`runtime_backend_with_gpu_fallback`].
+///
+/// Split out 2026-08-10 so the "you asked for GPU and got CPU" report can be
+/// tested against an explicit policy string. It used to be tested by exporting
+/// `NEOETHOS_BOT_META_DEVICE`, which only worked because the env var was a real
+/// input — the test was pinning the defect.
+pub fn runtime_backend_with_gpu_fallback_for_policy(
+    requested: &str,
+    cpu_backend: &str,
+) -> (Option<String>, Option<String>) {
+    let normalized = normalize_statistical_device_policy(requested);
     let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
         Some(format!(
             "requested device policy `{normalized}`; statistical backend currently executes on CPU"
@@ -285,7 +318,8 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 mod tests {
     use super::{
         configured_statistical_device, install_statistical_runtime_from_settings,
-        normalize_statistical_device_policy, runtime_backend_with_gpu_fallback,
+        normalize_statistical_device_policy, runtime_backend_with_gpu_fallback_for_policy,
+        statistical_device_policy,
     };
 
     /// The default keeps the statistical models on the CPU.
@@ -313,19 +347,32 @@ mod tests {
 
     #[test]
     fn runtime_backend_marks_gpu_request_as_cpu_fallback() {
-        unsafe {
-            std::env::set_var("NEOETHOS_BOT_META_DEVICE", "gpu:0");
-        }
         let (backend, degraded_reason) =
-            runtime_backend_with_gpu_fallback("elasticnet", "cpu_backend");
+            runtime_backend_with_gpu_fallback_for_policy("cuda:0", "cpu_backend");
         assert_eq!(backend.as_deref(), Some("cpu_backend"));
         assert!(
             degraded_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("currently executes on CPU"))
         );
+
+        let (_, no_reason) = runtime_backend_with_gpu_fallback_for_policy("cpu", "cpu_backend");
+        assert!(no_reason.is_none());
+    }
+
+    /// The retired per-model / subsystem device env vars must not move the
+    /// statistical policy any more.
+    #[test]
+    fn statistical_device_policy_ignores_retired_env_overrides() {
+        unsafe {
+            std::env::set_var("NEOETHOS_BOT_META_DEVICE", "gpu:0");
+            std::env::set_var("NEOETHOS_BOT_ELASTICNET_DEVICE", "gpu:3");
+        }
+        let policy = statistical_device_policy("elasticnet");
         unsafe {
             std::env::remove_var("NEOETHOS_BOT_META_DEVICE");
+            std::env::remove_var("NEOETHOS_BOT_ELASTICNET_DEVICE");
         }
+        assert_eq!(policy, configured_statistical_device());
     }
 }

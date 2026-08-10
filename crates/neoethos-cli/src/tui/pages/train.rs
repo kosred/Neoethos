@@ -117,7 +117,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         if y + 1 < inner.y + inner.height {
             Paragraph::new(Line::from(vec![
                 Span::raw("                  "),
-                Span::styled(field.hint, theme::caption_style()),
+                Span::styled(field.hint.as_str(), theme::caption_style()),
             ]))
             .render(
                 Rect {

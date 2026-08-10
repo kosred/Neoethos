@@ -1,4 +1,4 @@
-import { riskyScenarios, settings, strategyList, riskInfo } from "../api";
+import { riskyScenarios, settings, strategyList } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel } from "../components/Help";
 
@@ -26,7 +26,6 @@ function ProjBlock({ label, proj }: { label: string; proj: any }) {
 
 export default function RiskyMode() {
   const { data: cfg } = usePoll(settings, 0);
-  const { data: risk } = usePoll(riskInfo, 0);
   const { data: list } = usePoll(strategyList, 0);
 
   const start = cfg?.riskyStartBalance ?? 100;
@@ -39,7 +38,11 @@ export default function RiskyMode() {
 
   const mult = target / start;
   const riskyStrats = (list?.strategies ?? []).filter((s) => s.mode === "risky");
-  const propActive = risk?.propFirmRulesEnabled;
+  // Which rule set governs comes from `system.trading_mode`, the field the
+  // engine reads. This used to come from `risk.prop_firm_rules` — one write,
+  // one display read, zero decisions — so this banner could say "Prop-firm"
+  // while trading_mode was risky and the account was being sized accordingly.
+  const propActive = cfg?.tradingMode === "prop_firm";
 
   return (
     <div className="screen">
@@ -97,7 +100,16 @@ export default function RiskyMode() {
       <h2>Mode exclusivity</h2>
       <div className="banner info">
         Risky and Prop-firm are two separate configs — only ONE runs at a time. The other is dormant until you pause
-        or the account is blown. Currently active rules: <b>{propActive ? "Prop-firm" : "Risky"}</b>.
+        or the account is blown. Currently active rules:{" "}
+        <b>{cfg ? (propActive ? "Prop-firm" : "Risky") : "—"}</b>{" "}
+        <span className="muted small">(from system.trading_mode — change it in Settings → Discovery mode)</span>.
+        {propActive && (
+          <>
+            {" "}
+            <b>Trading mode is Prop-firm, so nothing on this screen is in force</b> — the sizing
+            ladder and projections below describe what Risky mode WOULD do.
+          </>
+        )}
       </div>
     </div>
   );

@@ -238,4 +238,13 @@ pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Setting
     install_seen_signature_memory_runtime_overrides_from_settings(s); // ✓ S2f config
     install_stop_target_runtime_overrides_from_settings(s); // ✓ S2g config (2026-08-04)
     crate::genetic::install_gene_stop_bounds_overrides_from_settings(s); // ✓ S2h config (2026-08-09)
+    // ✓ config (2026-08-10) — the recipient for the retired
+    // NEOETHOS_FEATURE_CUBE_MODE. It is installed HERE rather than through
+    // `neoethos_data::install_data_runtime_overrides`, whose two callers are in
+    // `neoethos-app` and `neoethos-cli`: widening that function's arity would
+    // break their build inside a change that cannot repair them. This function
+    // is already called by both binaries with the resolved Settings, so routing
+    // it here is what makes the field reach production instead of decorating
+    // the struct.
+    neoethos_data::install_feature_cube_policy(s.models.data_runtime.feature_cube_mode);
 }

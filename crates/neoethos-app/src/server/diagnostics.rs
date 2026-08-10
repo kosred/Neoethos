@@ -270,14 +270,30 @@ fn collect_system_info() -> String {
     buf
 }
 
-/// Hostname helper. Doesn't pull a new dep — uses the env var on
-/// Windows / unix.
+/// Hostname helper. Doesn't pull a new dep — uses the OS-provided variable
+/// (`COMPUTERNAME` on Windows, `HOSTNAME` on unix).
+///
+/// # Why this env read survived the 2026-08-10 config consolidation
+///
+/// The consolidation's rule is that **configuration** comes from one file and
+/// never from the environment. These two names are not configuration and
+/// never were: they are set by the operating system's own login/session
+/// machinery, describe the machine rather than the bot, are read only to
+/// print a line in an operator-facing support bundle, and steer no decision
+/// the bot makes. Putting a hostname in `config.yaml` would let a snapshot
+/// claim to come from a machine it did not come from — strictly worse.
+///
+/// Same category as the toolchain locators (`CUDA_PATH`, `VULKAN_SDK`) in
+/// `build.rs`: environment as an interface to the platform, not as a second
+/// config surface.
 fn hostname() -> anyhow::Result<String> {
-    if let Ok(h) = std::env::var("COMPUTERNAME") {
-        return Ok(h);
-    }
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        return Ok(h);
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(h) = std::env::var(var) {
+            let h = h.trim();
+            if !h.is_empty() {
+                return Ok(h.to_string());
+            }
+        }
     }
     Ok("unknown".to_string())
 }

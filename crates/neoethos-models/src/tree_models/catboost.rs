@@ -528,17 +528,29 @@ impl CatBoostExpert {
     }
 
     #[cfg(feature = "catboost")]
+    /// Locate the official CatBoost CLI binary.
+    ///
+    /// ⚠ `NEOETHOS_BOT_CATBOOST_EXECUTABLE` is deliberately KEPT, and is not a
+    /// configuration knob: it is a **toolchain locator** for an external
+    /// third-party binary, the same class as the compiler/CUDA locators in
+    /// `build.rs`. It selects no behaviour, changes no number and enters no
+    /// decision — it answers "where is the executable", a question about the
+    /// machine, and the alternative (PATH lookup) is already the fallback
+    /// below. It is NOT in `RETIRED_ENV_VARS` for that reason.
+    ///
+    /// The second spelling, `CATBOOST_EXECUTABLE`, is deleted (2026-08-10):
+    /// two names for one locator is the duplicate-knob defect in miniature —
+    /// with two set to different paths, which binary trained the model
+    /// depended on the order of this array. It is reported at startup if set.
     fn resolve_executable(&self) -> Result<PathBuf> {
-        for key in ["NEOETHOS_BOT_CATBOOST_EXECUTABLE", "CATBOOST_EXECUTABLE"] {
-            if let Ok(value) = std::env::var(key) {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    let candidate = PathBuf::from(trimmed);
-                    if candidate.exists() {
-                        return Ok(candidate);
-                    }
-                    bail!("configured CatBoost executable {trimmed} does not exist");
+        if let Ok(value) = std::env::var("NEOETHOS_BOT_CATBOOST_EXECUTABLE") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                let candidate = PathBuf::from(trimmed);
+                if candidate.exists() {
+                    return Ok(candidate);
                 }
+                bail!("configured CatBoost executable {trimmed} does not exist");
             }
         }
 
@@ -554,7 +566,7 @@ impl CatBoostExpert {
         }
 
         bail!(
-            "CatBoost training requires an official CatBoost CLI binary; set NEOETHOS_BOT_CATBOOST_EXECUTABLE or CATBOOST_EXECUTABLE, or place `catboost` on PATH"
+            "CatBoost training requires an official CatBoost CLI binary; set NEOETHOS_BOT_CATBOOST_EXECUTABLE, or place `catboost` on PATH"
         )
     }
 

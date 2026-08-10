@@ -278,9 +278,25 @@ pub async fn update_settings_raw_yaml(
             .into_response();
     }
 
-    // (2) Typed schema check. This catches fat-finger field renames
-    // before they reach the GA engine. Use the same deserializer that
-    // `Settings::from_yaml` uses internally.
+    // (2) Typed schema check — **and, since 2026-08-10, the FULL loader.**
+    //
+    // W2-4 / A1. This step used to be shape-only, and `trailing_enabeld:`
+    // sailed through it: serde ignored the unknown key, the file was written
+    // verbatim, and the endpoint reported success for an edit that would never
+    // take effect. That endpoint is the only route to 364 of the 390 knobs, so
+    // "saved" meaning "silently discarded" was the single largest lie in the
+    // settings surface.
+    //
+    // `Deserialize for Settings` is now hand-written and IS the loader
+    // (`config.rs`, `mod load_seal`). There is no derived impl left to route
+    // around, so this one call runs — on this payload, before anything is
+    // written — the retired-key prune, the **unknown-key refusal**, the preset
+    // re-derivation and the money-path reports. A misspelled key now returns
+    // 400 naming the key.
+    //
+    // No app-side edit was needed to close W2-4: sealing the deserializer in
+    // `neoethos-core` closed it here as a consequence. That is the point of
+    // sealing it rather than fixing call sites one at a time.
     let candidate: neoethos_core::Settings =
         match serde_yaml_ng::from_str::<neoethos_core::Settings>(&payload.yaml) {
             Ok(s) => s,
@@ -300,24 +316,30 @@ pub async fn update_settings_raw_yaml(
             }
         };
 
-    // (2b) **VALUE check — #293, added 2026-08-09.** Steps 1 and 2 validate
-    // SHAPE only. `Settings::from_yaml` additionally runs
-    // `validate_safety_bounds` (`config.rs:2615`); this endpoint went straight
-    // from `serde_yaml_ng::from_str` to the disk write, so a hand-edited
-    // `risk_per_trade: 50` (meaning 50%, typed as 5000%) was accepted, written,
-    // and became the sizing input on the next run.
+    // (2b) **VALUE check — #293, added 2026-08-09.**
     //
-    // `validate_safety_bounds` is private to `neoethos-core` AND only logs — it
-    // cannot reject, by design, because config consumers require a non-fatal
-    // load. A save endpoint is the one place where refusing IS possible, so the
-    // same conditions it screams about are enforced here as a hard 400. The
-    // thresholds are copied deliberately and named in the message; if
+    // ⚠ CORRECTED 2026-08-10 (A1): the sentence that used to open this block —
+    // "Steps 1 and 2 validate SHAPE only; `Settings::from_yaml` additionally
+    // runs `validate_safety_bounds`" — is no longer true of step 2, because
+    // step 2 is now the loader itself. It is still true of the CONSEQUENCE,
+    // and that is why this block stays: `validate_safety_bounds` **logs and
+    // does not reject**, by design, because config consumers require a
+    // non-fatal load. A save endpoint is the one place where refusing is
+    // possible, so the same conditions it screams about are enforced here as a
+    // hard 400. Historically, going straight from `serde_yaml_ng::from_str` to
+    // the disk write meant a hand-edited `risk_per_trade: 50` (meaning 50%,
+    // typed as 5000%) was accepted, written, and became the sizing input on
+    // the next run.
+    //
+    // The thresholds are copied deliberately and named in the message; if
     // `config.rs` moves one, this list must move with it.
     //
     // **This REFUSES saves that were previously accepted.** The five conditions
-    // are listed in the response so a refusal is never mysterious. The config on
-    // disk today (daily 0.10, total 0.20, risk_per_trade 0.03) passes all five —
-    // this does not lock the operator out of his own editor.
+    // are listed in the response so a refusal is never mysterious. The config
+    // this machine runs (daily 0.08, total 0.14, risk_per_trade 0.03 — see
+    // `docs/pending-edits-forbidden-territory.md` §7 for where 0.08/0.14 come
+    // from) passes all five; this does not lock the operator out of his own
+    // editor.
     {
         let r = &candidate.risk;
         let mut violations: Vec<String> = Vec::new();

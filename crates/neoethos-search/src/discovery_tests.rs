@@ -3316,20 +3316,14 @@ enum KnobClass {
     /// The string is the justification, kept next to the exemption (read by
     /// humans reviewing the exemption, not by the assertions).
     DiagnosticOnly(#[allow(dead_code)] &'static str),
-    /// The knob is RETIRED: nothing reads it to decide anything. It appears in
-    /// this crate's sources ONLY inside the retired-name announcement tables,
-    /// which read it solely to log at ERROR that a value found in the shell was
-    /// IGNORED. It therefore has no resolved value to record in the run profile
-    /// — recording one would imply it still reached the run.
-    ///
-    /// This is NOT a free pass: the assertion below requires every name
-    /// classified here to be present in `RETIRED_ENV_VARS` or
-    /// `RETIRED_SEARCH_ENV_VARS`, so a knob that is still live cannot be parked
-    /// in this variant without also being declared retired in the shipped table
-    /// that shouts about it.
-    ///
-    /// The string names what decides the behaviour instead.
-    Retired(#[allow(dead_code)] &'static str),
+    // DELETED 2026-08-10: a third variant, `Retired(&str)`. Its doc claimed
+    // "the assertion below requires every name classified here to be present in
+    // RETIRED_ENV_VARS or RETIRED_SEARCH_ENV_VARS" — and no such assertion was
+    // ever written, nor was the variant ever constructed. It was an exemption
+    // route with an imaginary guard, i.e. the exact shape this census exists to
+    // catch, sitting inside the census. A retired knob whose config successor
+    // is recorded takes a `Profile` row (see NEOETHOS_FEATURE_CUBE_MODE); one
+    // that truly decides nothing takes `DiagnosticOnly` with its justification.
 }
 
 fn collect_env_knob_names_in_crate_sources() -> std::collections::BTreeSet<String> {
@@ -3475,6 +3469,12 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         // ── Adaptive stops ──
         ("NEOETHOS_ADAPTIVE_STOPS", Profile("/execution/adaptive_stops_enabled")),
         ("NEOETHOS_ADAPTIVE_STOP_RR", Profile("/execution/adaptive_stops_rr")),
+        // ── Feature cube (neoethos-data) ──
+        // The RESOLVED value of `models.data_runtime.feature_cube_mode`, which
+        // replaced the env var. Recorded, not exempted: the RAM and disk
+        // assemblies are bit-identical BY TEST, not by construction, so the
+        // artifact must say which one built the cube a run searched over.
+        ("NEOETHOS_FEATURE_CUBE_MODE", Profile("/execution/feature_cube_mode")),
         // ── GPU lane ──
         ("NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL", Profile("/execution/gpu/cuda_backtest_kernel_enabled")),
         ("NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS", Profile("/execution/gpu/cuda_backtest_kernel_units")),

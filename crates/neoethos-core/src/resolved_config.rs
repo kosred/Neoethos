@@ -45,8 +45,17 @@ pub enum ResolvedSource {
     Config,
     /// Resolved from a sentinel (e.g. `0` → "use all" / "population×generations").
     SentinelExpanded,
-    /// An environment variable overrode or augmented the config value.
-    EnvOverride,
+    /// The discovery MODE picked this value, not the operator and not the
+    /// built-in default.
+    ///
+    /// REPLACED `EnvOverride` on 2026-08-10. Every row that carried that label
+    /// was lying in one of two ways: two of them named env vars the engine had
+    /// stopped reading (now config rows), and the remaining two —
+    /// `min_fitness_score` and `max_drawdown` — were selected by
+    /// `mode == "prop_firm"` with no environment involved at any point. This
+    /// report exists to answer "which value won and where did it come from";
+    /// it must not be the thing that gets that wrong.
+    ModeDerived,
     /// Built-in default (operator did not set anything).
     Default,
 }
@@ -56,7 +65,7 @@ impl ResolvedSource {
         match self {
             Self::Config => "config",
             Self::SentinelExpanded => "sentinel→resolved",
-            Self::EnvOverride => "env",
+            Self::ModeDerived => "mode",
             Self::Default => "default",
         }
     }
@@ -97,10 +106,18 @@ pub struct ResolvedSearchConfig {
     pub walkforward_splits: usize,
     pub embargo_minutes: usize,
     pub mode: String,
-    /// `NEOETHOS_BOT_NORMALIZE_FEATURES` resolved to bool.
-    pub normalize_features_env: bool,
-    /// `NEOETHOS_BOT_DISABLE_SMC_GATE` resolved to bool.
-    pub disable_smc_gate_env: bool,
+    /// `models.data_runtime.normalize_features`.
+    ///
+    /// RENAMED 2026-08-10 from `normalize_features_env`. It read
+    /// `NEOETHOS_BOT_NORMALIZE_FEATURES`, a variable the engine stopped
+    /// honouring months ago — so the ONE diagnostic built to answer "which
+    /// value won" answered it with a number nothing used, under the label
+    /// `source=env`. Both fields are core-internal; no crate outside
+    /// `resolved_config.rs` names them.
+    pub normalize_features: bool,
+    /// `models.search_runtime.disable_smc_gate`. Renamed for the same reason —
+    /// see [`ResolvedSearchConfig::normalize_features`].
+    pub disable_smc_gate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,8 +178,8 @@ impl ResolvedConfig {
         } else {
             min_trades_per_day_raw.max(0.0)
         };
-        let normalize_features_env = env_truthy("NEOETHOS_BOT_NORMALIZE_FEATURES");
-        let disable_smc_gate_env = env_truthy("NEOETHOS_BOT_DISABLE_SMC_GATE");
+        let normalize_features = s.models.data_runtime.normalize_features;
+        let disable_smc_gate = s.models.search_runtime.disable_smc_gate;
 
         // Filters section --------------------------------------------------
         // **F-148 documentation (2026-05-25)** — these literals
@@ -335,19 +352,19 @@ impl ResolvedConfig {
             &mut display_fields,
             "search",
             "normalize_features",
-            std::env::var("NEOETHOS_BOT_NORMALIZE_FEATURES").unwrap_or_default(),
-            normalize_features_env.to_string(),
-            ResolvedSource::EnvOverride,
-            Some("NEOETHOS_BOT_NORMALIZE_FEATURES=1; default off"),
+            normalize_features.to_string(),
+            normalize_features.to_string(),
+            ResolvedSource::Config,
+            Some("models.data_runtime.normalize_features; default true"),
         );
         push_field(
             &mut display_fields,
             "search",
             "disable_smc_gate",
-            std::env::var("NEOETHOS_BOT_DISABLE_SMC_GATE").unwrap_or_default(),
-            disable_smc_gate_env.to_string(),
-            ResolvedSource::EnvOverride,
-            Some("NEOETHOS_BOT_DISABLE_SMC_GATE=1; diagnostic"),
+            disable_smc_gate.to_string(),
+            disable_smc_gate.to_string(),
+            ResolvedSource::Config,
+            Some("models.search_runtime.disable_smc_gate; default false"),
         );
         push_field(
             &mut display_fields,
@@ -356,7 +373,7 @@ impl ResolvedConfig {
             "0".to_string(),
             min_fitness_score.to_string(),
             if mode == "prop_firm" {
-                ResolvedSource::EnvOverride
+                ResolvedSource::ModeDerived
             } else {
                 ResolvedSource::Default
             },
@@ -378,7 +395,7 @@ impl ResolvedConfig {
             "0".to_string(),
             max_drawdown.to_string(),
             if mode == "prop_firm" {
-                ResolvedSource::EnvOverride
+                ResolvedSource::ModeDerived
             } else {
                 ResolvedSource::Default
             },
@@ -439,8 +456,8 @@ impl ResolvedConfig {
                 walkforward_splits: s.models.walkforward_splits.max(2),
                 embargo_minutes: s.models.embargo_minutes,
                 mode: mode.to_string(),
-                normalize_features_env,
-                disable_smc_gate_env,
+                normalize_features,
+                disable_smc_gate,
             },
             filters: ResolvedFiltersConfig {
                 min_fitness_score,
@@ -491,12 +508,13 @@ fn push_field(
     });
 }
 
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
-}
+// DELETED 2026-08-10: `fn env_truthy(name: &str) -> bool`. Its only two
+// callers read `NEOETHOS_BOT_NORMALIZE_FEATURES` and
+// `NEOETHOS_BOT_DISABLE_SMC_GATE` — names the engine has not consulted for
+// months — and reported them to the operator as `source=env`. This file is
+// the ONE diagnostic that answers "which value won"; a diagnostic that
+// invents a source is worse than no diagnostic. Both rows now read the
+// config fields the engine reads.
 
 /// Resolve the mode this report DESCRIBES. Must agree, for every `Settings`,
 /// with the mode the engine RUNS — `neoethos_search::discovery::

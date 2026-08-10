@@ -143,26 +143,24 @@ impl GeneticStrategyExpert {
         &self.feature_columns
     }
 
-    fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
-
+    /// Compile-time evaluation budget for the label-fitting loop.
+    ///
+    /// `FOREX_GENETIC_MAX_LABEL_EVALS` used to override this. It had no config
+    /// field, no catalogue row and no artifact record, yet it caps how many
+    /// generations actually run (see
+    /// [`Self::effective_generation_count_with_budget`]) — i.e. an export could
+    /// cut the search short and the run would report the CONFIGURED generation
+    /// count regardless. That is a knob that changes what the search selects
+    /// while leaving no trace. Deleted 2026-08-10; reported at startup if set.
     fn max_label_evaluations() -> usize {
-        Self::env_usize(
-            "FOREX_GENETIC_MAX_LABEL_EVALS",
-            DEFAULT_MAX_LABEL_EVALUATIONS,
-        )
+        DEFAULT_MAX_LABEL_EVALUATIONS
     }
 
+    /// Compile-time cap on the candidate pool. Same reasoning as
+    /// [`Self::max_label_evaluations`]; `FOREX_GENETIC_MAX_DISCOVERY_CANDIDATES`
+    /// is deleted.
     fn max_discovery_candidates() -> usize {
-        Self::env_usize(
-            "FOREX_GENETIC_MAX_DISCOVERY_CANDIDATES",
-            DEFAULT_MAX_DISCOVERY_CANDIDATES,
-        )
+        DEFAULT_MAX_DISCOVERY_CANDIDATES
     }
 
     fn effective_generation_count_with_budget(

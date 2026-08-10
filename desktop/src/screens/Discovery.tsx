@@ -340,14 +340,37 @@ export default function Discovery() {
         <h2 style={{ marginTop: 12 }}>Before you start — what THIS search will use</h2>
         <div className="ticket-row" style={{ alignItems: "flex-end" }}>
           <label>
-            Mode <Tip text="Applies to THIS search (saved to config). Risky = aggressive account-multiplication, drawdown-agnostic, ranks by fastest compounding. Prop-firm = robust FTMO-style rules (low drawdown / daily-loss limits)." />
+            Mode <Tip text="Applies to THIS search (saved to config as system.trading_mode). Risky = aggressive account-multiplication, drawdown-agnostic, ranks by fastest compounding. Prop-firm = robust FTMO-style rules (low drawdown / daily-loss limits)." />
             <select value={cfg?.tradingMode ?? "risky"} onChange={(e) => applyMode(e.target.value as "risky" | "prop_firm")}>
               <option value="risky">🚀 Risky</option>
               <option value="prop_firm">🛡 Prop-firm</option>
             </select>
+            {/* models.discovery_mode can override this switch and reach a mode
+                (`strict`) it cannot express. The backend resolves and ships the
+                effective value; showing only the switch would let this
+                pre-flight promise one regime and run another. */}
+            {cfg?.tradingModeDivergent && (
+              <span className="sell small">
+                ⚠ overridden — this search will run as <b>{String(cfg.effectiveDiscoveryMode)}</b>{" "}
+                (models.discovery_mode = {String(cfg.discoveryMode)})
+              </span>
+            )}
           </label>
+          {/* 💰 The old tooltip promised "this search + live sizing". It sets
+              neither. `grep '\.risk_per_trade\b' crates/neoethos-search` →
+              zero hits: the search samples from the risk BANDS
+              (discovery.rs:813-821). And risky-mode live sizing substitutes
+              its own ladder (live_trading.rs:1664-1680). It binds live sizing
+              in prop-firm mode, and nothing else. */}
           <label>
-            Risk %/trade <Tip text="Fraction of the account risked per trade (position sizing). Clamped to the account's max risk. Set what you want for this search + live sizing." />
+            Risk %/trade{" "}
+            <Tip
+              text={
+                cfg?.tradingMode === "risky"
+                  ? "Does NOT apply to this search, and does NOT apply to live sizing while the mode is Risky. The search samples the configured risk bands, not this field; risky live sizing uses the engine's 30–50% ladder capped by Max portfolio risk. Saved to config.yaml, where it will bind if you switch to Prop-firm."
+                  : "Live position sizing in Prop-firm mode: fraction of the account risked per trade, clamped to the account's max risk. It does NOT change what THIS search explores — the search samples the configured risk bands, not this field."
+              }
+            />
             <input
               type="number"
               step="0.1"

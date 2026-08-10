@@ -289,11 +289,27 @@ export default function Settings() {
         </div>
         {cfg && (
           <p className="muted small" style={{ marginTop: 10 }}>
-            Active: <b>{cfg.tradingMode ?? "?"}</b>
+            Active: <b>{cfg.effectiveDiscoveryMode ?? cfg.tradingMode ?? "?"}</b>
             {cfg.tradingMode === "risky" && cfg.riskyStartBalance != null && (
               <> · goal €{Math.round(cfg.riskyStartBalance).toLocaleString()} → €{Math.round(cfg.riskyTargetBalance).toLocaleString()} in {cfg.riskyHorizonDays} days</>
             )}
           </p>
+        )}
+        {/* The backend already computes and ships both values plus a
+            divergence flag (settings.rs:795-808) because models.discovery_mode
+            can override system.trading_mode — which the switch above does not
+            write. Rendering only the switch's own value is how a search runs
+            under rules the operator did not pick and the screen agrees with
+            him anyway. */}
+        {cfg?.tradingModeDivergent && (
+          <div className="banner warn" style={{ marginTop: 8 }}>
+            <b>These two disagree, and the search obeys the second one.</b> The mode switch above
+            wrote <code>system.trading_mode = {String(cfg.tradingMode)}</code>, but{" "}
+            <code>models.discovery_mode = {String(cfg.discoveryMode)}</code> overrides it, so the
+            search runs as <b>{String(cfg.effectiveDiscoveryMode)}</b>. Every candidate already
+            ranked was ranked under that. Clear <code>models.discovery_mode</code> in{" "}
+            <b>Advanced → raw config.yaml</b> to make this switch decide again.
+          </div>
         )}
       </div>
 
@@ -337,15 +353,35 @@ export default function Settings() {
         </div>
       </div>
 
-      <h2>Compute</h2>
-      <p className="muted small">Which hardware discovery/training use. <b>auto</b> picks the best device and fits any card; <b>cpu</b> forces the CPU lane (safest); <b>gpu</b> forces GPU.</p>
+      {/* This control writes system.enable_gpu_preference, which gates
+          TRAINING. The discovery SEARCH device is models.prop_search_device,
+          and backend.rs:126-130 lets it REPLACE the global whenever it is
+          non-empty — both shipped config files set it. So the old copy
+          ("forces the CPU lane") and the old "Active:" line were both false on
+          any box with that key set: press CPU and the search still ran on the
+          card while this screen reported cpu.
+          The refuters established these are two axes and must not be merged
+          (cpu training + gpu search is the A6000 configuration on record), so
+          the fix is to stop this control from claiming the other axis. */}
+      <h2>Compute <span className="muted small">(training device)</span></h2>
+      <p className="muted small">
+        Which hardware <b>training</b> uses. <b>auto</b> picks the best device and fits any card;
+        <b> cpu</b> keeps training on the CPU; <b>gpu</b> prefers the card.
+      </p>
       <div className="ticket">
         <div className="seg" style={{ maxWidth: 360 }}>
           {(["auto", "cpu", "gpu"] as const).map((m) => (
             <button key={m} className={cfg?.computeMode === m ? "on" : ""} onClick={() => setCompute(m)}>{m.toUpperCase()}</button>
           ))}
         </div>
-        {cfg && <p className="muted small" style={{ marginTop: 8 }}>Active: <b>{cfg.computeMode ?? "?"}</b></p>}
+        {cfg && <p className="muted small" style={{ marginTop: 8 }}>Saved: <b>{cfg.computeMode ?? "?"}</b> <span className="muted">(training)</span></p>}
+        <p className="muted small">
+          ⚠ This does <b>not</b> set the discovery-search device. The search reads{" "}
+          <code>models.prop_search_device</code>, which overrides this value whenever it is set —
+          choosing CPU here can still give you a GPU search. The device a run actually used is
+          printed in that run's device-summary log line; the key itself is editable in{" "}
+          <b>Advanced → raw config.yaml</b>.
+        </p>
       </div>
 
       <h2>Risk &amp; sizing</h2>
@@ -359,15 +395,47 @@ export default function Settings() {
             </select>
           </label>
         )}
+        {/* 💰 In risky mode this card was a lie by an order of magnitude: live
+            sizing ignores risk.risk_per_trade entirely (live_trading.rs:
+            1664-1680 substitutes the 0.30→0.50 ladder, then :1749-1770 caps
+            the first entry at max_portfolio_risk). The card said 3%. So the
+            label now names the mode it is true in, and in risky mode says what
+            actually sizes the trade. */}
+        {risk && cfg?.tradingMode === "risky" && (
+          <div className="banner warn" style={{ marginTop: 12 }}>
+            <b>Trading mode is RISKY — the “risk / trade” number below is not what the bot risks.</b>{" "}
+            Risky live sizing ignores <code>risk.risk_per_trade</code> and uses the engine's own
+            ladder (30–50% of equity), capped by <b>Max portfolio risk</b>. The honest band is on
+            the <b>Risky Mode</b> screen. Switch to Prop-firm above for this number to bind.
+          </div>
+        )}
         {risk && (
           <div className="cards" style={{ marginTop: 12, gridTemplateColumns: "repeat(4,1fr)" }}>
-            <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{((risk.riskPerTrade ?? 0) * 100).toFixed(2)}%</div></div>
+            <div className="card">
+              <div className="card-label">RISK / TRADE{cfg?.tradingMode === "risky" ? " (NOT IN FORCE)" : ""}</div>
+              <div className="card-value" style={cfg?.tradingMode === "risky" ? { opacity: 0.45 } : undefined}>
+                {((risk.riskPerTrade ?? 0) * 100).toFixed(2)}%
+              </div>
+            </div>
             <div className="card"><div className="card-label">DAILY DD CAP</div><div className="card-value">{((risk.dailyDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
             <div className="card"><div className="card-label">TOTAL DD CAP</div><div className="card-value">{((risk.totalDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
             <div className="card"><div className="card-label">MAX LOT</div><div className="card-value">{risk.maxLotSize ?? "—"}</div></div>
           </div>
         )}
-        <p className="muted small" style={{ marginTop: 8 }}>Manual orders (Positions) are not gated by these — they apply to automated trading.</p>
+        {/* This used to read "Manual orders (Positions) are not gated by these".
+            False since 2026-08-09: orders.rs:116-137 refuses a manual order
+            with 400 when require_stop_loss is on. A promise that manual is
+            unconstrained, on a screen the operator checks before placing one
+            by hand, is a promise that produces a rejected order at the worst
+            possible moment. */}
+        <p className="muted small" style={{ marginTop: 8 }}>
+          The drawdown caps, max lot and risk-per-trade above apply to <b>automated</b> trading.{" "}
+          <b>One of them does bind manual orders:</b> with <b>Require stop-loss</b>{" "}
+          {risk ? <b className={risk.requireStopLoss ? "sell" : ""}>{risk.requireStopLoss ? "ON" : "off"}</b> : "on"}
+          , a manual order sent from <b>Positions</b> without a stop is <b>refused</b>. It is set
+          by <code>risk.require_stop_loss</code> in <b>Advanced → raw config.yaml</b> — there is
+          no switch for it on this screen or any other.
+        </p>
       </div>
 
       <h2>Autopilot loop</h2>

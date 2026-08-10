@@ -22,17 +22,26 @@ pub struct Field {
     /// Default value used when `value` is empty or invalid.
     pub default_value: String,
     /// Hint shown beneath the value in muted text.
-    pub hint: &'static str,
+    ///
+    /// Owned, not `&'static str`: a hint that has to REPORT something — which
+    /// of two knobs is in force, what the on-disk value maps to — cannot be a
+    /// literal. Making it owned is what lets the Config page name the twin
+    /// that beats the field the operator is looking at.
+    pub hint: String,
 }
 
 impl Field {
-    pub fn new(label: &'static str, default_value: impl Into<String>, hint: &'static str) -> Self {
+    pub fn new(
+        label: &'static str,
+        default_value: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         let default_value: String = default_value.into();
         Self {
             label,
             value: default_value.clone(),
             default_value,
-            hint,
+            hint: hint.into(),
         }
     }
 

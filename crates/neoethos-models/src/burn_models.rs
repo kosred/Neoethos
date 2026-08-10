@@ -2023,7 +2023,7 @@ fn requested_burn_training_precision(requested_precision: Option<&str>) -> Strin
     requested_precision
         .map(normalize_training_precision_policy)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| requested_training_precision_policy("burn"))
+        .unwrap_or_else(|| requested_training_precision_policy())
 }
 
 fn resolve_burn_training_precision_for_backend<B: Backend>(
@@ -2031,16 +2031,6 @@ fn resolve_burn_training_precision_for_backend<B: Backend>(
     device: &B::Device,
     requested_precision: Option<&str>,
 ) -> (BurnExecutionPrecision, Option<String>) {
-    fn env_flag(name: &str, default: bool) -> bool {
-        match std::env::var(name) {
-            Ok(value) => matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            ),
-            Err(_) => default,
-        }
-    }
-
     let requested = requested_burn_training_precision(requested_precision);
 
     let gpu_requested = selection.effective_policy == "default"
@@ -2057,8 +2047,14 @@ fn resolve_burn_training_precision_for_backend<B: Backend>(
     } else {
         B::supports_dtype(device, DType::BF16)
     };
-    let model_supports_bf16 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF16", true);
-    let bf16_supported = supports_bf16 && model_supports_bf16;
+    // `FOREX_BURN_MODEL_SUPPORTS_BF16` (default true) used to AND into this.
+    // It was a capability assertion dressed as a knob: whether a model can run
+    // in bf16 is answered by `B::supports_dtype` and the card's own bf16
+    // support, both probed directly above. An env var that could only turn a
+    // supported dtype OFF, with no config field and no artifact record, is a
+    // second answer to a question the hardware already answers. Deleted
+    // 2026-08-10; reported at startup if still exported.
+    let bf16_supported = supports_bf16;
 
     match requested.as_str() {
         "bf16" if bf16_supported => (BurnExecutionPrecision::Bf16, None),

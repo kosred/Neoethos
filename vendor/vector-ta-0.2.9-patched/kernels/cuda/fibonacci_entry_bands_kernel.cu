@@ -402,3 +402,123 @@ extern "C" __global__ void fibonacci_entry_bands_batch_f64(
         has_prev_tp_short_band = isfinite(tp_short_band);
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `fibonacci_entry_bands_with_kernel`
+// (src/indicators/fibonacci_entry_bands.rs:1080) -> `FibonacciEntryBandsStream
+// ::update` (:603) / `update_valid` (:620).
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `fibonacci_entry_bands_batch_f64` (:138) is double-clean but declares 31
+// parameters and 23 `double*` -- it is the MULTI-OUTPUT shape its own wrapper
+// launches. The f64 lane launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// and reads ONE `rows x n` matrix back. So the lane gets its own entry point
+// beside the existing one, in this file, sharing this file's device helpers.
+//
+// WHICH COLUMN
+//
+// `compute_fibonacci_entry_bands_batch` (cpu_batch.rs:8850-8946) accepts
+// eighteen output ids and has NO `value` alias at all. It DOES alias
+// "middle"/"basis" onto `out.basis` (:8888), which is the series every other
+// column is derived from -- the four upper and four lower bands are
+// `basis +/- volatility * MULT`, and `trend`, the entry flags and the bounce
+// flags are all comparisons AGAINST basis. So this kernel emits `basis`, and a
+// parity run must ask the CPU for "basis" (or "middle") by name. Precedent:
+// `ict_propulsion_block_neo_batch_f64` in this same lane emits `bullish_high`
+// for the same reason.
+//
+// SHAPE: one thread per combo, bars ascending. `basis` is a CASCADE OF TWO
+// EMAs (ema1 over the source, ema2 over ema1, :625-631) and the CPU RESETS the
+// whole stream at any bar that is not `valid_bar` (:608-611), so the value at
+// bar i depends on where the last invalid bar was. A bar-parallel form cannot
+// know that, which is why this is registered sequential.
+//
+// PERIOD-INVARIANT. The CPU batch reads `source`, `length`, `atr_length`,
+// `use_atr` and `tp_aggressiveness` and NEVER `period` (cpu_batch.rs:8862-
+// 8867), so five swept periods give five identical CPU columns and this kernel
+// writes five identical rows. Both parameters this column depends on are
+// pinned below at the CPU defaults: `source` = hlc3 (:29) and `length` = 21
+// (:30), so `ema_alpha = 2/(21+1)` exactly as `resolve_params` computes it
+// (:912).
+//
+// ROUNDING: the CPU writes `prev + alpha * (source - prev)` (:626) -- a
+// subtract, a multiply and an add, THREE roundings, and NOT a `mul_add`. This
+// kernel writes the same three operations in the same order. Using `fma` here
+// would be the mirror image of the `natr` defect: one rounding where the CPU
+// has three.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic. The NaN is a DOUBLE quiet-NaN bit pattern, not `__int_as_float`.
+// No epsilon is introduced -- `FLOAT_TOL` (1e-12, :23) is already f64-sized and
+// this column does not read it.
+//
+// FIRST VALID IS NOT READ: the CPU restarts the stream at every invalid bar
+// (:608), so a single global warmup index would be wrong after the first hole.
+// The lane row declares `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+#define NEO_FEB_SOURCE SOURCE_HLC3
+#define NEO_FEB_LENGTH 21
+
+__device__ inline double neo_feb_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__ void fibonacci_entry_bands_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_feb_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    // `resolve_params`, fibonacci_entry_bands.rs:912.
+    const double alpha = 2.0 / (static_cast<double>(NEO_FEB_LENGTH) + 1.0);
+
+    bool has_ema1 = false;
+    bool has_ema2 = false;
+    double ema1 = 0.0;
+    double ema2 = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        // `update`, :607-611: an invalid bar resets the stream and emits NaN.
+        if (!valid_bar(NEO_FEB_SOURCE, o, h, l, c)) {
+            has_ema1 = false;
+            has_ema2 = false;
+            row[i] = nan_value;
+            continue;
+        }
+
+        const double src = source_value(NEO_FEB_SOURCE, o, h, l, c);
+        // `update_valid`, :625-631.
+        ema1 = has_ema1 ? (ema1 + alpha * (src - ema1)) : src;
+        has_ema1 = true;
+        ema2 = has_ema2 ? (ema2 + alpha * (ema1 - ema2)) : ema1;
+        has_ema2 = true;
+
+        row[i] = ema2;
+    }
+}

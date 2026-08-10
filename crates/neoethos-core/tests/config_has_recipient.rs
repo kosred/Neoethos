@@ -64,6 +64,42 @@
 //! `models.exit_policy` keys that actually drive the search — an operator
 //! tuning the trail in the section named "risk" moves nothing at all.
 //!
+//! # 2026-08-10 — three more ways it credited the wrong receiver
+//!
+//! * **`Some(p)` / `Ok(p)` was an unresolved receiver.** `live_trading.rs`
+//!   reads the live trail geometry as `p.trailing_be_trigger_r` (`:717`) and
+//!   `policy.trailing_min_lock_pips` (`:1440`), where both names are bound by a
+//!   pattern over `let exit_policy: Option<ExitPolicyConfig>`. The binder only
+//!   understood `ident: Type` annotations, so the receiver resolved to nothing:
+//!   `ExitPolicyConfig` — the struct that actually receives the live money-path
+//!   geometry — looked unread, and the reads were reported under the bare field
+//!   name they share with `RiskConfig`. A pattern over a value whose type is
+//!   known, directly or as `Option<T>` / `Result<T, _>`, now binds to `T`.
+//! * **`self` was bound file-wide.** One `impl SomeConfig` anywhere in a file
+//!   made `self.<field>` resolve to that config struct EVERYWHERE in the file,
+//!   including inside `impl RiskManager` — a different struct with identical
+//!   field names, which is the exact defect the 2026-08-09 rewrite set out to
+//!   kill. `self` is now valid only inside the `impl` block that bound it.
+//! * **An ambiguous receiver counted as a resolved one.** When a receiver could
+//!   be two config types and both declare the field, the old rule credited
+//!   both. Two answers is not an answer: it now credits neither, and the access
+//!   is reported as receiver-unresolved. A false orphan costs an argument; a
+//!   false clearance ships a knob that moves nothing on the path that spends
+//!   real money.
+//!
+//! And one way it credited a real, fully qualified read that is not a
+//! recipient:
+//!
+//! * **A config REPORTER is not a consumer.** `resolve_and_log_duplicate_knobs`
+//!   and `log_gate_states` (`neoethos-search/src/discovery.rs`, both landed
+//!   2026-08-10) read knobs through fully qualified paths in order to PRINT
+//!   them. That is precisely the STORED shape above — validated, persisted,
+//!   displayed, then ignored — so counting those reads would have cleared
+//!   `risk.trailing_*` and `risk.challenge_mode`, whose ledger entries say in
+//!   as many words that the logger exists BECAUSE they reach nothing. Reads
+//!   inside the functions named in [`REPORTING_ONLY`] are recorded separately
+//!   and never satisfy a knob.
+//!
 //! # What this test enforces now
 //!
 //! 1. Every field reachable from `Settings` is read through a **qualified**
@@ -103,8 +139,11 @@ use std::path::{Path, PathBuf};
 /// Why a knob is allowed to have no qualified production reader.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Inert {
-    /// A real consumer mechanism exists; connecting it would change trading
-    /// behaviour, so wiring is a deliberate, measured act — not tidying.
+    /// A real consumer mechanism exists and this field does not reach it.
+    /// Either connecting it would change trading behaviour — so wiring is a
+    /// deliberate, measured act, not tidying — or the mechanism's honest source
+    /// is elsewhere (a hardware probe) and the field is awaiting deletion in a
+    /// shard that owns the file the deletion has to land in.
     Unwired,
     /// The only qualified reader lives in `tests/`, `benches/` or `examples/`.
     /// The code that reads it is real; no production run touches it.
@@ -223,11 +262,21 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
          `PropFirmConstraints`, never from Settings. So the operator's number is replaced and \
          then not consulted. OWNER: operator — it is a live trading stop condition.",
     ),
-    // ─── the three hardware-derived fields. SCHEDULED FOR DELETION in the
-    // 2026-08-10 config wave (knob pass D4): the writer that made them
-    // `WrittenNeverRead` — `AutoTuner::apply`, which had zero callers — is being
-    // deleted along with them, and the honest source for all three is the
-    // hardware probe (`HardwareExecutionPlan`), not a config file.
+    // ─── the three hardware-derived fields. RECLASSIFIED 2026-08-10 from
+    // `WrittenNeverRead` to `Unwired`, because the claim stopped being true:
+    // the writer that made them written — `AutoTuner::apply`, which had zero
+    // callers — went out with the `NEOETHOS_BOT_*` layer (`system.rs:1354`
+    // records the removal). Nothing assigns them any more, so `WrittenNeverRead`
+    // would now be a false statement about the code, and this ledger is checked
+    // in both directions precisely so a stale claim cannot sit here.
+    //
+    // They are still SCHEDULED FOR DELETION and are not deleted yet.
+    // `pending-A.md` §A3: all three are `#[serde(skip)]` and listed in
+    // `load_seal::RETIRED_KEYS` as `Derived`, so a value for them in a file is
+    // NAMED AT WARN and ignored and `Settings::save` no longer writes them —
+    // but the struct fields survive until the shard that owns `system.rs`
+    // lands the removal. The honest source for all three is the hardware probe
+    // (`HardwareExecutionPlan`), not a config file.
     //
     // ⚠ WHEN THE FIELD GOES, DELETE ITS ENTRY HERE IN THE SAME CHANGE. This
     // ledger is checked BOTH ways: an entry naming a field that no longer exists
@@ -236,30 +285,75 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
     // fix is to remove the entry, not to re-add the field.
     (
         "SystemConfig::n_jobs",
-        Inert::WrittenNeverRead,
-        "the dead `AutoTuner::apply` assigned `self.settings.system.n_jobs = hints.n_jobs` and \
-         every consumer read `AutoTuneHints::n_jobs` instead. One of the two false passes that \
-         motivated the 2026-08-09 rewrite. The value in the shipped config (11) is the \
-         fingerprint of `available_parallelism() - 1` on a 12-core box, pickled into YAML by \
-         `Settings::save` and then shipped to every other machine. OWNER: operator — DELETE; \
-         rayon width is a property of the box, not of a config file.",
+        Inert::Unwired,
+        "the mechanism is the hardware probe, not this field. Its former writer — \
+         `AutoTuner::apply`, `self.settings.system.n_jobs = hints.n_jobs` — was DELETED with \
+         the NEOETHOS_BOT_* layer, so this is no longer WrittenNeverRead; it is simply unread. \
+         Every consumer reads `AutoTuneHints::n_jobs`/`available_parallelism()`. One of the two \
+         false passes that motivated the 2026-08-09 rewrite. The value in the shipped config \
+         (11) is the fingerprint of `available_parallelism() - 1` on a 12-core box, pickled into \
+         YAML by `Settings::save` and then shipped to every other machine; it is now \
+         `#[serde(skip)]` + a `Derived` entry in `load_seal::RETIRED_KEYS`, so a file that still \
+         carries `n_jobs:` is named at WARN and ignored rather than obeyed. OWNER: operator — \
+         DELETE the field; rayon width is a property of the box, not of a config file.",
     ),
     (
         "SystemConfig::num_gpus",
-        Inert::WrittenNeverRead,
-        "same dead writer; every reader is `HardwareProfile::num_gpus` (scheduler.rs, \
-         cli/main.rs) which is probed from the machine, not from config. The shipped `0` is a \
-         detector result frozen on a box with no card and then carried to a 3090. OWNER: \
-         operator — DELETE, the probe is the honest source.",
+        Inert::Unwired,
+        "same removed writer, same reason it is Unwired rather than WrittenNeverRead. Every \
+         reader is `HardwareProfile::num_gpus` (scheduler.rs, cli/main.rs), probed from the \
+         machine. The shipped `0` is a detector result frozen on a box with no card and then \
+         carried to a 3090; it is now `#[serde(skip)]` + `Derived`, so the frozen value is named \
+         at WARN and ignored. OWNER: operator — DELETE the field, the probe is the honest \
+         source.",
     ),
     (
         "ModelsConfig::inference_batch_size",
-        Inert::WrittenNeverRead,
-        "same dead writer; the consumers use `AutoTuneHints::inference_batch_size`. The second \
-         of the two false passes that motivated the rewrite. Ships 32 in both repo files — a \
-         value the hardware plan would never produce. OWNER: operator — DELETE; wiring it would \
-         let a config value override a hardware-derived batch size, which has NEVER-OOM \
-         implications.",
+        Inert::Unwired,
+        "same removed writer; the consumers use `AutoTuneHints::inference_batch_size` / \
+         `HardwareExecutionPlan::inference_batch_size`. The second of the two false passes that \
+         motivated the rewrite. Ships 32 in both repo files — a value the hardware plan would \
+         never produce (it emits 128/1024/2048/4096/8192) — now `#[serde(skip)]` + `Derived`. \
+         OWNER: operator — DELETE the field; wiring it would let a config value override a \
+         hardware-derived batch size, which has NEVER-OOM implications.",
+    ),
+];
+
+// ──────────────────── reads that are reports, not recipients ────────────────────
+
+/// Functions that exist to PRINT the resolved configuration.
+///
+/// Their reads are fully qualified and completely real — and they satisfy
+/// nothing. A knob whose only qualified reader is a reporter is the STORED
+/// shape from this module's header: validated, persisted, displayed, ignored.
+/// Counting a reporter would have cleared `risk.trailing_*` and
+/// `risk.challenge_mode` the same week their ledger entries were written to
+/// record that the logger exists BECAUSE those keys reach nothing.
+///
+/// This is an allow-list of REPORTERS, not of knobs: adding a function here
+/// removes credit, it never grants it. The direction matters — the worst this
+/// list can do is report a knob as an orphan that in fact has a live consumer,
+/// which is an argument; the thing it prevents is a money-path knob being
+/// declared working because something logged it.
+///
+/// Entries are `(path suffix, fn name, why)` and are checked for staleness by
+/// [`the_reporting_only_list_is_exact`].
+const REPORTING_ONLY: &[(&str, &str, &str)] = &[
+    (
+        "crates/neoethos-search/src/discovery.rs",
+        "resolve_and_log_duplicate_knobs",
+        "prints the winner and the loser of every duplicated knob once per run (landed \
+         2026-08-10). It reads `settings.risk.trailing_*` ONLY to name them as ignored — \
+         crediting that would clear the four keys whose ledger entries say they reach no \
+         evaluator, CPU or CUDA.",
+    ),
+    (
+        "crates/neoethos-search/src/discovery.rs",
+        "log_gate_states",
+        "prints every gate flag with its configured and default value at run start. Its \
+         `settings.risk.challenge_mode` read is accompanied, in the same call, by the text \
+         `UNWIRED: … this arms nothing today` — the reporter says out loud that it is not a \
+         recipient.",
     ),
 ];
 
@@ -604,15 +698,176 @@ fn ident_ending_before(b: &[u8], pos: usize) -> Option<(String, usize)> {
 /// typed local does.
 type Bindings = BTreeMap<String, BTreeSet<String>>;
 
-/// Bind identifiers to config struct types, from five shapes:
+/// Everything one file says about what its identifiers are.
+///
+/// `self` is deliberately NOT in `bindings`. It used to be, and that was a
+/// second edition of the defect this whole file exists to catch: a single
+/// `impl SomeConfig` anywhere in a file bound `self` for the file's entire
+/// length, so `self.challenge_mode` inside `impl RiskManager` — a different
+/// struct that happens to declare a field of that name — resolved to the config
+/// struct. `self` now carries the byte range of the `impl` block that bound it.
+struct FileFacts {
+    /// Receiver spelling -> config type(s). File-wide; `self` is not here.
+    bindings: Bindings,
+    /// `(start, end, type)` of each `impl <ConfigStruct>` block.
+    self_scopes: Vec<(usize, usize, String)>,
+}
+
+impl FileFacts {
+    /// The config type(s) a receiver spelling could be at byte `pos`.
+    fn types_at(&self, name: &str, pos: usize) -> BTreeSet<String> {
+        if name == "self" {
+            return self
+                .self_scopes
+                .iter()
+                .filter(|(start, end, _)| pos >= *start && pos < *end)
+                .map(|(_, _, ty)| ty.clone())
+                .collect();
+        }
+        self.bindings.get(name).cloned().unwrap_or_default()
+    }
+}
+
+/// Index of the `}` matching the `{` at `open`.
+fn match_brace_forward(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the `{` that opens the innermost block containing `pos`.
+fn enclosing_open_brace(b: &[u8], pos: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = pos.min(b.len());
+    while i > 0 {
+        i -= 1;
+        match b[i] {
+            b'}' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The expression a `Some(x)` / `Ok(x)` **pattern** is matched against, or
+/// `None` when this is not a pattern position at all (`Some(v)` as a
+/// constructor binds nothing and must credit nothing).
+///
+/// Two shapes cover every real site in this workspace:
+///   `match <expr> { … Some(x) [if guard] => … }`
+///   `[if|while] let …Some(x)… = <expr>`  — including inside a tuple pattern,
+///   which is how `live_trading.rs:1427` binds the live trailing policy.
+fn scrutinee_text<'a>(code: &'a str, pat_start: usize, pat_end: usize) -> Option<&'a str> {
+    let b = code.as_bytes();
+    let mut k = pat_end;
+    while k < b.len() && (b[k] as char).is_whitespace() {
+        k += 1;
+    }
+    // A match arm: the scrutinee is the `match` header of the enclosing block.
+    if code[k..].starts_with("=>") || code[k..].starts_with("if ") {
+        let open = enclosing_open_brace(b, pat_start)?;
+        let start = code[..open].rfind([';', '{', '}']).map(|p| p + 1).unwrap_or(0);
+        let header = code[start..open].trim();
+        let at = header.rfind("match ")?;
+        return Some(header[at + "match ".len()..].trim());
+    }
+    // A `let` pattern: the scrutinee follows the `=` that ends the pattern.
+    let before = code[..pat_start].trim_end_matches(['(', ',', '&', ' ', '\t', '\r', '\n']);
+    if !before.ends_with("let") {
+        return None;
+    }
+    let mut j = pat_end;
+    while j < b.len() {
+        match b[j] {
+            b';' | b'{' => return None,
+            b'=' if b.get(j + 1) != Some(&b'=') && b.get(j + 1) != Some(&b'>') => break,
+            _ => j += 1,
+        }
+    }
+    if j >= b.len() {
+        return None;
+    }
+    let rhs = &code[j + 1..];
+    let mut end = rhs.len();
+    for stop in [rhs.find(';'), rhs.find('{'), rhs.find(" else")] {
+        if let Some(s) = stop {
+            end = end.min(s);
+        }
+    }
+    // Never slice mid-character; `get` returns None rather than panicking.
+    let rhs = rhs.get(..end).map(str::trim)?;
+
+    // `let (Some(a), Some(b)) = (x, y)` — the pattern's position in the tuple
+    // decides which element it binds. Getting this wrong would credit a struct
+    // to a name that never held it, so when the position cannot be matched the
+    // answer is nothing.
+    let let_at = code[..pat_start].rfind("let ")?;
+    let pattern_prefix = &code[let_at + 4..pat_start];
+    if !pattern_prefix.trim_start().starts_with('(') {
+        return Some(rhs);
+    }
+    let idx = pattern_prefix.matches(',').count();
+    tuple_element(rhs, idx)
+}
+
+/// Element `idx` of a parenthesised tuple expression, split at depth 1.
+fn tuple_element(expr: &str, idx: usize) -> Option<&str> {
+    let inner = expr.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut n = 0usize;
+    for (at, c) in inner.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                if n == idx {
+                    return Some(inner[start..at].trim());
+                }
+                n += 1;
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    (n == idx).then(|| inner[start..].trim())
+}
+
+/// Bind identifiers to config struct types, from six shapes:
 ///   `fn f(cfg: &DiscoveryRuntimeConfig)` / `let cfg: RiskConfig`
 ///   `struct S { cfg: PropFirmGateConfig }` (so `self.cfg.field` resolves)
-///   `impl RiskConfig { … self.field }`
+///   `impl RiskConfig { … self.field }` (scoped to the block)
 ///   `fn app_runtime() -> AppRuntimeConfig` (so `app_runtime().field` resolves)
 ///   `let cfg = &settings.models.discovery_runtime;`
-fn collect_bindings(code: &str, model: &ConfigModel) -> Bindings {
+///   `match exit_policy { Some(p) => … }` where `exit_policy` is known
+fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
     let b = code.as_bytes();
     let mut out: Bindings = BTreeMap::new();
+    let mut self_scopes: Vec<(usize, usize, String)> = Vec::new();
+    // `name -> T` for `name: Option<T>` / `name: Result<T, _>` annotations.
+    // Without this, every value that arrives wrapped — which is every value
+    // that can fail to resolve, i.e. every value on a fail-closed path — has an
+    // unresolvable receiver the moment it is unwrapped.
+    let mut option_inner: Bindings = BTreeMap::new();
     let bind = |name: &str, ty: &str, out: &mut Bindings| {
         out.entry(name.to_string()).or_default().insert(ty.to_string());
     };
@@ -670,11 +925,23 @@ fn collect_bindings(code: &str, model: &ConfigModel) -> Bindings {
             if generic_or_end && model.structs.contains_key(&ty) {
                 bind(&bindee, &ty, &mut out);
             }
+            // `Option<T>` / `Result<T, _>`: remember the `T` so a later
+            // `Some(x)` / `Ok(x)` over this name resolves instead of vanishing.
+            if generic_or_end
+                && (ty == "Option" || ty == "Result")
+                && k < b.len()
+                && b[k] == b'<'
+            {
+                let inner = base_type(&code[k + 1..]);
+                if model.structs.contains_key(&inner) {
+                    bind(&bindee, &inner, &mut option_inner);
+                }
+            }
         }
         i += 1;
     }
 
-    // (2) `impl [<..>] [Trait for] Type {`  -> bind `self`
+    // (2) `impl [<..>] [Trait for] Type {`  -> bind `self` INSIDE THAT BLOCK
     let mut from = 0usize;
     while let Some(rel) = code[from..].find("impl") {
         let at = from + rel;
@@ -689,7 +956,9 @@ fn collect_bindings(code: &str, model: &ConfigModel) -> Bindings {
         let target = header.rsplit(" for ").next().unwrap_or(header);
         let ty = base_type(target.trim());
         if model.structs.contains_key(&ty) {
-            bind("self", &ty, &mut out);
+            let open = at + brace;
+            let end = match_brace_forward(b, open).unwrap_or(code.len());
+            self_scopes.push((open, end, ty));
         }
     }
 
@@ -751,7 +1020,56 @@ fn collect_bindings(code: &str, model: &ConfigModel) -> Bindings {
         }
     }
 
-    out
+    // (4) `Some(x)` / `Ok(x)` over a value whose type is known binds `x` to it.
+    //
+    // The live money path is the reason this exists. `live_trading.rs` resolves
+    // the trail geometry fail-closed into `let exit_policy:
+    // Option<ExitPolicyConfig>` and then reads it as `p.trailing_be_trigger_r`
+    // (match arm) and `policy.trailing_min_lock_pips` (tuple `let`). Neither
+    // receiver was an `ident: Type` annotation, so both resolved to nothing —
+    // the one struct that DOES receive the live geometry looked unread.
+    for kw in ["Some(", "Ok("] {
+        let mut from = 0usize;
+        while let Some(rel) = code[from..].find(kw) {
+            let at = from + rel;
+            from = at + kw.len();
+            if at > 0 && is_ident_byte(b[at - 1]) {
+                continue;
+            }
+            let Some((bindee, after)) = ident_at(b, at + kw.len()) else { continue };
+            // Only a bare binding: `Some(p)`. `Some(Foo(x))`, `Some(compute())`
+            // and `Some(Enum::Variant)` bind nothing here.
+            if b.get(after) != Some(&b')') {
+                continue;
+            }
+            if !bindee.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+                continue; // a unit variant, not a binding
+            }
+            let Some(scrutinee) = scrutinee_text(code, at, after + 1) else { continue };
+            let mut candidates: BTreeSet<String> = BTreeSet::new();
+            for tok in scrutinee.split(|c: char| !is_ident_byte(c as u8)) {
+                if tok.is_empty() {
+                    continue;
+                }
+                // The wrapper's `T` first, then a name already resolved to a
+                // config struct, then a config field that installs one.
+                if let Some(t) = option_inner.get(tok) {
+                    candidates.extend(t.iter().cloned());
+                } else if let Some(t) = out.get(tok) {
+                    candidates.extend(t.iter().cloned());
+                } else if let Some(t) = model.installs.get(tok) {
+                    candidates.extend(t.iter().cloned());
+                }
+            }
+            // Two candidate types is not a resolution. Bind nothing.
+            if candidates.len() == 1 {
+                let ty = candidates.into_iter().next().expect("len == 1");
+                bind(&bindee, &ty, &mut out);
+            }
+        }
+    }
+
+    FileFacts { bindings: out, self_scopes }
 }
 
 /// The config type an initialiser expression evaluates to, when that is
@@ -777,6 +1095,10 @@ fn binding_type_of_expr(rhs: &str, model: &ConfigModel, known: &Bindings) -> Opt
         }
     }
 
+    // Adapters that hand back the SAME config value (possibly still wrapped).
+    // `filter` is here for `let trailing = exit_policy.filter(|p| …);` — the
+    // live trailing gate. `Option::filter` cannot change `T`, so the binding is
+    // exact; the only way to lose it is to not look.
     const CHEAP: &[&str] = &[
         "clone",
         "to_owned",
@@ -787,6 +1109,8 @@ fn binding_type_of_expr(rhs: &str, model: &ConfigModel, known: &Bindings) -> Opt
         "as_ref",
         "copied",
         "to_vec",
+        "filter",
+        "take",
     ];
 
     let b = trimmed.as_bytes();
@@ -909,61 +1233,92 @@ struct Read {
     field: String,
 }
 
-/// Attribute a `<receiver>.<field>` occurrence to the struct(s) that declare it.
+/// Attribute a `<receiver>.<field>` occurrence at byte `pos` to the struct that
+/// declares it.
 ///
 /// Returns empty when the receiver cannot be resolved — an unqualified match is
-/// **not** evidence. That single change is the whole point of the rewrite.
+/// **not** evidence. That single change was the whole point of the 2026-08-09
+/// rewrite, and 2026-08-10 closes the hole in it: a receiver that resolves to
+/// TWO config types, both of which declare the field, is not resolved either.
+/// Two answers is not an answer, so it credits neither and the access is
+/// reported as receiver-unresolved. A false orphan costs an argument; a false
+/// clearance ships a knob that moves nothing on the path that spends real money.
 fn attribute(
     field: &str,
     chain: &[String],
-    bindings: &Bindings,
+    facts: &FileFacts,
     model: &ConfigModel,
+    pos: usize,
 ) -> Vec<Read> {
-    let mut out = Vec::new();
-    let Some(r1) = chain.first() else { return out };
+    let Some(r1) = chain.first() else { return Vec::new() };
 
     // (a) receiver bound to a config type that declares the field.
-    if let Some(types) = bindings.get(r1) {
-        for ty in types {
-            if model.declares(ty, field) {
-                out.push(Read { owner: ty.clone(), field: field.to_string() });
-            }
+    let mut owners: BTreeSet<String> = BTreeSet::new();
+    for ty in facts.types_at(r1, pos) {
+        if model.declares(&ty, field) {
+            owners.insert(ty);
         }
     }
 
     // (b) receiver is itself the field that installs the declaring struct:
     //     `<anything>.discovery_runtime.prefilter_top_k`
-    if let Some(installed) = model.installs.get(r1) {
-        for ty in installed {
-            if !model.declares(ty, field) {
-                continue;
+    let mut via_install: BTreeSet<String> = BTreeSet::new();
+    for ty in model.installs.get(r1).into_iter().flatten() {
+        if !model.declares(ty, field) {
+            continue;
+        }
+        // Check the next link up when we can resolve it: `models` must be a
+        // field of whatever holds it. An unresolvable outer receiver is
+        // accepted — the two-segment chain is already strong evidence, and the
+        // dominant real shape is a closure parameter (`.map(|s| s.models.…)`)
+        // whose type no textual pass can see.
+        let consistent = match chain.get(1) {
+            None => true,
+            Some(r2) => {
+                let mut candidates: BTreeSet<String> = facts.types_at(r2, pos);
+                candidates.extend(model.installs.get(r2).into_iter().flatten().cloned());
+                candidates.is_empty() || candidates.iter().any(|t| model.declares(t, r1))
             }
-            // Check the next link up when we can resolve it: `models` must be a
-            // field of whatever holds it. An unresolvable outer receiver is
-            // accepted — the two-segment chain is already strong evidence.
-            let consistent = match chain.get(1) {
-                None => true,
+        };
+        if consistent {
+            via_install.insert(ty.clone());
+        }
+    }
+    owners.extend(via_install.iter().cloned());
+
+    if owners.len() != 1 {
+        return Vec::new();
+    }
+    let owner = owners.into_iter().next().expect("len == 1");
+    let mut out = vec![Read { owner: owner.clone(), field: field.to_string() }];
+
+    // Reading `prefilter_top_k` off `discovery_runtime` is also a read of
+    // `discovery_runtime` itself — but only for the parent that installs THIS
+    // type there. Crediting every struct with a same-named field would be the
+    // original defect, one level up.
+    if via_install.contains(&owner) {
+        let parents: Vec<String> = model
+            .structs
+            .iter()
+            .filter(|(_, fields)| fields.iter().any(|(f, t)| f == r1 && *t == owner))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let chosen: Vec<String> = if parents.len() <= 1 {
+            parents
+        } else {
+            // Several containers install the same type under the same name:
+            // credit only the one the chain actually went through.
+            match chain.get(1) {
                 Some(r2) => {
-                    let mut candidates: BTreeSet<&String> = BTreeSet::new();
-                    if let Some(t) = model.installs.get(r2) {
-                        candidates.extend(t);
-                    }
-                    if let Some(t) = bindings.get(r2) {
-                        candidates.extend(t);
-                    }
-                    candidates.is_empty() || candidates.iter().any(|t| model.declares(t, r1))
+                    let mut candidates: BTreeSet<String> = facts.types_at(r2, pos);
+                    candidates.extend(model.installs.get(r2).into_iter().flatten().cloned());
+                    parents.into_iter().filter(|p| candidates.contains(p)).collect()
                 }
-            };
-            if consistent {
-                out.push(Read { owner: ty.clone(), field: field.to_string() });
-                // Reading `prefilter_top_k` off `discovery_runtime` is also a
-                // read of `discovery_runtime` itself.
-                for (parent, fields) in &model.declares {
-                    if fields.contains(r1) {
-                        out.push(Read { owner: parent.clone(), field: r1.clone() });
-                    }
-                }
+                None => Vec::new(),
             }
+        };
+        for parent in chosen {
+            out.push(Read { owner: parent, field: r1.clone() });
         }
     }
     out
@@ -1009,6 +1364,10 @@ struct ReadIndex {
     production: BTreeSet<(String, String)>,
     /// Same, but only in tests / benches / examples.
     scaffolding: BTreeSet<(String, String)>,
+    /// Same, but only inside a function listed in [`REPORTING_ONLY`] — code
+    /// whose entire job is to print the configuration. A fully qualified read
+    /// that ends in a log line is a report, not a recipient.
+    reporting: BTreeSet<(String, String)>,
     /// `field -> file:line` for accesses that LOOK like a read but whose
     /// receiver could not be resolved. Pure diagnostics: this is what the old
     /// scanner was counting as proof.
@@ -1076,6 +1435,36 @@ fn credit_config_rs_accessors(src: &str, model: &ConfigModel, index: &mut ReadIn
     }
 }
 
+/// Byte ranges, in `code`, of the [`REPORTING_ONLY`] functions declared in the
+/// file at workspace-relative path `rel`.
+fn reporting_ranges(rel: &str, code: &str) -> Vec<(usize, usize)> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for (path, func, _) in REPORTING_ONLY {
+        if !rel.ends_with(*path) {
+            continue;
+        }
+        let needle = format!("fn {func}");
+        let mut from = 0usize;
+        while let Some(rel_at) = code[from..].find(&needle) {
+            let at = from + rel_at;
+            from = at + needle.len();
+            if at > 0 && is_ident_byte(b[at - 1]) {
+                continue;
+            }
+            // The body starts at the first `{` after the signature.
+            let Some(open) = code[at..].find('{').map(|o| at + o) else { continue };
+            let end = match_brace_forward(b, open).unwrap_or(code.len());
+            out.push((at, end));
+        }
+    }
+    out
+}
+
+fn in_range(ranges: &[(usize, usize)], pos: usize) -> bool {
+    ranges.iter().any(|(start, end)| pos >= *start && pos <= *end)
+}
+
 fn scan_workspace(model: &ConfigModel) -> ReadIndex {
     let root = workspace_root();
     let skip = std::fs::canonicalize(config_rs()).ok();
@@ -1096,7 +1485,7 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
             continue;
         };
         let code = strip_noncode(&raw);
-        let bindings = collect_bindings(&code, model);
+        let facts = collect_facts(&code, model);
         let b = code.as_bytes();
         let scaffolding = is_scaffolding(&file);
         let rel = file
@@ -1104,6 +1493,7 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");
+        let reporters = reporting_ranges(&rel, &code);
 
         // (d) `let SomeConfig { a, b, .. } = …` destructures.
         for ty in model.structs.keys() {
@@ -1122,7 +1512,9 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
                 for tok in body.split(|c: char| !is_ident_byte(c as u8)) {
                     if model.declares(ty, tok) {
                         let key = (ty.clone(), tok.to_string());
-                        if scaffolding {
+                        if in_range(&reporters, open) {
+                            index.reporting.insert(key);
+                        } else if scaffolding {
                             index.scaffolding.insert(key);
                         } else {
                             index.production.insert(key);
@@ -1154,10 +1546,15 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
                 k += 1;
             }
             if k < b.len() && b[k] == b'(' {
-                if scaffolding {
-                    index.called_in_scaffolding.insert(field.clone());
-                } else {
-                    index.called_in_production.insert(field.clone());
+                // A call made by a reporter is recorded NOWHERE on purpose: an
+                // accessor whose only invocation is inside a config printer
+                // vouches for nothing.
+                if !in_range(&reporters, i) {
+                    if scaffolding {
+                        index.called_in_scaffolding.insert(field.clone());
+                    } else {
+                        index.called_in_production.insert(field.clone());
+                    }
                 }
                 i = end;
                 continue;
@@ -1167,7 +1564,7 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
                 continue;
             }
             let chain = receiver_chain(b, i);
-            let hits = attribute(&field, &chain, &bindings, model);
+            let hits = attribute(&field, &chain, &facts, model, i);
             // An assignment TARGET is not a recipient. `settings.system.n_jobs
             // = hints.n_jobs` is the auto-tuner writing the knob; if nothing
             // ever reads it back, the operator's value is overwritten and then
@@ -1188,7 +1585,9 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
             } else {
                 for r in hits {
                     let key = (r.owner, r.field);
-                    if scaffolding {
+                    if in_range(&reporters, i) {
+                        index.reporting.insert(key);
+                    } else if scaffolding {
                         index.scaffolding.insert(key);
                     } else {
                         index.production.insert(key);
@@ -1273,6 +1672,13 @@ fn every_settings_field_reaches_a_qualified_consumer() {
             near.push_str(
                 "\n  NOTE: qualified code ASSIGNS this field and nothing reads it back — the \
                  operator's value is overwritten, then ignored",
+            );
+        }
+        if index.reporting.contains(&key) {
+            near.push_str(
+                "\n  NOTE: the only qualified read is inside a config REPORTER (see \
+                 REPORTING_ONLY in this file) — it prints the value and changes nothing. \
+                 Logging a knob is not honouring it",
             );
         }
         if index.scaffolding.contains(&key) {
@@ -1373,6 +1779,38 @@ fn the_no_qualified_reader_ledger_is_exact() {
     assert!(
         problems.is_empty(),
         "the no-qualified-reader ledger is out of date:\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn the_reporting_only_list_is_exact() {
+    // A list that removes credit must not rot: if a reporter is renamed or
+    // deleted, its entry silently starts covering nothing and knobs it used to
+    // mask get cleared without anyone deciding that. Fail instead.
+    let root = workspace_root();
+    let mut problems: Vec<String> = Vec::new();
+    for (path, func, why) in REPORTING_ONLY {
+        let file = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Ok(raw) = std::fs::read_to_string(&file) else {
+            problems.push(format!("`{path}` is listed in REPORTING_ONLY but cannot be read"));
+            continue;
+        };
+        let code = strip_noncode(&raw);
+        let ranges = reporting_ranges(path, &code);
+        if ranges.is_empty() {
+            problems.push(format!(
+                "`{path}` no longer declares `fn {func}` — the REPORTING_ONLY entry now hides \
+                 nothing. Delete it, or point it at the function that replaced it"
+            ));
+        }
+        if why.trim().len() < 40 {
+            problems.push(format!("`{path}::{func}` must say why it is a reporter, not a reader"));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the reporting-only list is out of date:\n{}",
         problems.join("\n")
     );
 }
@@ -1583,11 +2021,17 @@ mod scanner {
     use super::*;
 
     fn tiny_model() -> ConfigModel {
+        // `ExitPolicyConfig` and `RiskConfig` share `trailing_min_lock_pips` on
+        // purpose: that collision is the live money-path case — the search and
+        // live execution read the exit policy, the operator's file sets the risk
+        // copy, and the guard must never confuse the two in either direction.
         parse_config_model(
             "pub struct Settings {\n    pub models: ModelsConfig,\n    pub risk: RiskConfig,\n}\n\
              pub struct ModelsConfig {\n    pub discovery_runtime: DiscoveryRuntimeConfig,\n    \
-             pub inference_batch_size: usize,\n}\n\
+             pub exit_policy: ExitPolicyConfig,\n    pub inference_batch_size: usize,\n}\n\
              pub struct DiscoveryRuntimeConfig {\n    pub prefilter_top_k: usize,\n}\n\
+             pub struct ExitPolicyConfig {\n    pub trailing_min_lock_pips: f64,\n    \
+             pub trailing_enabled: bool,\n}\n\
              pub struct RiskConfig {\n    pub trailing_min_lock_pips: f64,\n}\n",
         )
     }
@@ -1595,7 +2039,7 @@ mod scanner {
     fn reads(code: &str) -> BTreeSet<(String, String)> {
         let model = tiny_model();
         let stripped = strip_noncode(code);
-        let bindings = collect_bindings(&stripped, &model);
+        let facts = collect_facts(&stripped, &model);
         let b = stripped.as_bytes();
         let mut out = BTreeSet::new();
         let mut i = 0usize;
@@ -1609,7 +2053,7 @@ mod scanner {
                 continue;
             };
             let chain = receiver_chain(b, i);
-            for r in attribute(&field, &chain, &bindings, &model) {
+            for r in attribute(&field, &chain, &facts, &model, i) {
                 out.insert((r.owner, r.field));
             }
             i = end;
@@ -1759,6 +2203,132 @@ mod scanner {
                 "prefilter_top_k".to_string()
             )),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_some_pattern_binds_the_wrapped_config_type() {
+        // The live money path, reduced: `live_trading.rs:709` resolves the trail
+        // fail-closed into an `Option<ExitPolicyConfig>` and reads it in a match
+        // arm. Before this rule the receiver `p` resolved to nothing, so the
+        // struct that actually receives the live geometry looked unread.
+        let out = reads(
+            "fn f(s: &Settings) { let exit_policy: Option<ExitPolicyConfig> = None; \
+             match exit_policy { Some(p) if p.trailing_enabled => { \
+             let _ = p.trailing_min_lock_pips; } None => {} } }",
+        );
+        assert!(
+            out.contains(&(
+                "ExitPolicyConfig".to_string(),
+                "trailing_min_lock_pips".to_string()
+            )),
+            "`Some(p)` over an Option<ExitPolicyConfig> must resolve: {out:?}"
+        );
+        // …and it must NOT credit the identically-named `RiskConfig` field.
+        assert!(
+            !out.contains(&("RiskConfig".to_string(), "trailing_min_lock_pips".to_string())),
+            "the risk copy is a different struct: {out:?}"
+        );
+
+        // The tuple-`let` shape, which is how the live trailing block binds it.
+        let out = reads(
+            "fn f() { let exit_policy: Option<ExitPolicyConfig> = None; \
+             let trailing = exit_policy.filter(|p| p.trailing_enabled); \
+             if let (Some(policy), Some(x)) = (trailing, other) { \
+             let _ = policy.trailing_min_lock_pips; } }",
+        );
+        assert!(
+            out.contains(&(
+                "ExitPolicyConfig".to_string(),
+                "trailing_min_lock_pips".to_string()
+            )),
+            "`if let (Some(policy), …) = (trailing, …)` must resolve: {out:?}"
+        );
+
+        // `Ok(x)` over a Result<T, _> is the same rule.
+        let out = reads(
+            "fn f() { let loaded: Result<ExitPolicyConfig, Error> = go(); \
+             match loaded { Ok(p) => { let _ = p.trailing_min_lock_pips; } Err(_) => {} } }",
+        );
+        assert!(
+            out.contains(&(
+                "ExitPolicyConfig".to_string(),
+                "trailing_min_lock_pips".to_string()
+            )),
+            "`Ok(p)` over a Result<ExitPolicyConfig, _> must resolve: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_receiver_credits_nothing() {
+        // No annotation anywhere: `p` is an unknown. The rule is to credit
+        // NOTHING — not to fall back on the bare field name, which is how a
+        // knob that reaches no consumer gets declared working.
+        let out = reads(
+            "fn f() { match whatever() { Some(p) => { let _ = p.trailing_min_lock_pips; } \
+             None => {} } }",
+        );
+        assert!(out.is_empty(), "an unresolved receiver must credit nothing: {out:?}");
+
+        // A constructor is not a pattern: `Some(cfg)` here binds nothing.
+        let out = reads(
+            "fn f() { let cfg = mystery(); let wrapped = Some(cfg); \
+             let _ = cfg.trailing_min_lock_pips; }",
+        );
+        assert!(out.is_empty(), "a constructor call must bind nothing: {out:?}");
+    }
+
+    #[test]
+    fn an_ambiguous_receiver_credits_nothing() {
+        // `p` could be either struct and both declare the field. Two answers is
+        // not an answer.
+        let out = reads(
+            "fn f(a: &ExitPolicyConfig, b: &RiskConfig) { let p: ExitPolicyConfig = *a; \
+             let p: RiskConfig = *b; let _ = p.trailing_min_lock_pips; }",
+        );
+        assert!(out.is_empty(), "an ambiguous receiver must credit nothing: {out:?}");
+    }
+
+    #[test]
+    fn self_is_scoped_to_the_impl_block_that_bound_it() {
+        // The 2026-08-09 defect, one level down: a file with `impl RiskConfig`
+        // used to make `self.<field>` resolve to RiskConfig everywhere in the
+        // file, including inside `impl` blocks of unrelated types that happen to
+        // declare a field of the same name.
+        let src = "impl RiskConfig { fn a(&self) -> f64 { self.trailing_min_lock_pips } }\n\
+                   impl RiskManager { fn b(&self) -> f64 { self.trailing_min_lock_pips } }\n";
+        let model = tiny_model();
+        let stripped = strip_noncode(src);
+        let facts = collect_facts(&stripped, &model);
+
+        let inside = stripped.find("self.trailing_min_lock_pips").expect("first read");
+        let outside = stripped.rfind("self.trailing_min_lock_pips").expect("second read");
+        assert!(
+            facts.types_at("self", inside).contains("RiskConfig"),
+            "`self` must resolve inside `impl RiskConfig`"
+        );
+        assert!(
+            facts.types_at("self", outside).is_empty(),
+            "`self` in `impl RiskManager` is a different struct and must resolve to nothing"
+        );
+    }
+
+    #[test]
+    fn a_reporter_is_not_a_recipient() {
+        // A fully qualified read whose only purpose is to print the value.
+        let src = "fn log_gate_states(settings: &Settings) { \
+                   tracing::info!(v = settings.risk.trailing_min_lock_pips); }\n\
+                   fn act(settings: &Settings) { \
+                   let _ = settings.models.discovery_runtime.prefilter_top_k; }\n";
+        let code = strip_noncode(src);
+        let ranges = reporting_ranges("crates/neoethos-search/src/discovery.rs", &code);
+        assert_eq!(ranges.len(), 1, "exactly the reporter must be ranged: {ranges:?}");
+        let reporter_read = code.find("settings.risk").expect("reporter read");
+        let real_read = code.find("settings.models").expect("real read");
+        assert!(in_range(&ranges, reporter_read), "the reporter's read must be inside its range");
+        assert!(
+            !in_range(&ranges, real_read),
+            "a read outside the reporter must keep its credit"
         );
     }
 

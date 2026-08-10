@@ -40,9 +40,82 @@ const TEMPLATE: &str = r#"{
 }
 "#;
 
-/// Local MCP sidecar base URL (overridable via `NEOETHOS_MCP_URL`).
-fn sidecar_url() -> String {
-    std::env::var("NEOETHOS_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:7431".to_string())
+/// The port the sidecar listens on when `mcp_servers.json` does not say.
+/// Matches [`TEMPLATE`] and `mcp/mcp_servers.example.json` — those three must
+/// move together.
+const DEFAULT_SIDECAR_PORT: u16 = 7431;
+
+/// Local MCP sidecar base URL — **derived from the sidecar's own config file,
+/// not from the environment.**
+///
+/// # What changed and why (2026-08-10, config consolidation)
+///
+/// This used to read `NEOETHOS_MCP_URL`. Two call sites read it independently
+/// (here and `app_services::supervisor`), so a typo in one shell export could
+/// point the Supervisor at one process and the `/mcp/status` card at another,
+/// and the UI would report a healthy sidecar the Supervisor could not reach.
+///
+/// There is no new config key, because there does not need to be one: the
+/// sidecar's port is ALREADY stated, exactly once, in `mcp_servers.json` —
+/// the file this module writes at `PUT /mcp/config` and the file the sidecar
+/// itself reads at startup. Reading the port from there means the two
+/// processes cannot disagree about it: there is one number, in one file, that
+/// both of them obey.
+///
+/// The sidecar is always local (it is spawned next to the app), so the host
+/// is fixed at `127.0.0.1`. Making it configurable would re-open the same
+/// two-places-one-fact hole for no operator benefit.
+///
+/// If `NEOETHOS_MCP_URL` is still exported, `app_services::retired_env` says
+/// so by name at startup. Nothing here reads it.
+pub(crate) fn sidecar_url() -> String {
+    format!("http://127.0.0.1:{}", sidecar_port())
+}
+
+/// The `port` field of `mcp_servers.json`, or [`DEFAULT_SIDECAR_PORT`].
+///
+/// A missing FILE is the ordinary "no MCP configured yet" state and is not
+/// worth a warning. A file that EXISTS but whose `port` is absent, not a
+/// number, or out of range is a disagreement between what the operator wrote
+/// and what this process will dial — non-negotiable #3 says that substitution
+/// gets named, with both values.
+fn sidecar_port() -> u16 {
+    let Ok(raw) = std::fs::read_to_string(CONFIG_FILE) else {
+        return DEFAULT_SIDECAR_PORT;
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::server::mcp",
+                path = CONFIG_FILE,
+                error = %err,
+                fallback_port = DEFAULT_SIDECAR_PORT,
+                "mcp_servers.json exists but is not valid JSON — dialling the \
+                 sidecar on the default port instead. The sidecar reads the same \
+                 file, so it may not be listening there."
+            );
+            return DEFAULT_SIDECAR_PORT;
+        }
+    };
+    match parsed.get("port") {
+        None => DEFAULT_SIDECAR_PORT,
+        Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0) {
+            Some(port) => port,
+            None => {
+                tracing::warn!(
+                    target: "neoethos_app::server::mcp",
+                    path = CONFIG_FILE,
+                    configured_port = %v,
+                    fallback_port = DEFAULT_SIDECAR_PORT,
+                    "mcp_servers.json `port` is not a valid TCP port — dialling \
+                     the default instead. Fix the file (Settings → MCP) so this \
+                     process and the sidecar agree on one number."
+                );
+                DEFAULT_SIDECAR_PORT
+            }
+        },
+    }
 }
 
 // ─── GET /mcp/config ───────────────────────────────────────────────────────
@@ -141,9 +214,18 @@ pub async fn status() -> Json<serde_json::Value> {
         return Json(serde_json::json!({
             "reachable": false,
             "url": base,
-            "note": "MCP sidecar not running. It starts with the app when \
-                     neoethos-mcp.exe is installed next to it; changes to \
-                     mcp_servers.json apply on the next app start.",
+            // W10b (2026-08-10): name BOTH binaries. `neoethos-mcp` is the
+            // outbound sidecar from the `mcp/` workspace; `neoethos-control-plane`
+            // is the inbound control plane from `crates/neoethos-mcp`. Until
+            // today both crates produced an executable called `neoethos-mcp`,
+            // so an operator could verify the wrong process and believe this
+            // message was wrong.
+            "note": "MCP sidecar not running. The process wanted is `neoethos-mcp` \
+                     (the OUTBOUND sidecar from the `mcp/` workspace), installed \
+                     next to the app — NOT `neoethos-control-plane` (the INBOUND \
+                     control plane from `crates/neoethos-mcp`), which is a \
+                     different program. Changes to mcp_servers.json, including \
+                     its `port`, apply on the next app start.",
         }));
     };
     let tools: serde_json::Value = match client.get(format!("{base}/tools")).send().await {

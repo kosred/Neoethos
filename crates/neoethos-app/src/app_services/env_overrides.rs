@@ -28,11 +28,19 @@
 //! Call sites elsewhere in the crate import these getters / constants
 //! rather than calling `std::env::var(...)` directly.
 //!
-//! ## Migration plan
+//! ## Migration COMPLETE — 2026-08-10
 //!
-//! Phase A (this commit) — registry created with the highest-impact knobs.
-//! Phase B — remaining call sites swap their inline reads for the
-//!   typed getters. Each migration is mechanical + behaviour-preserving.
+//! The file name is now historical. Every BEHAVIOURAL knob here reads
+//! `neoethos_core::config::AppRuntimeConfig`, installed once at startup from
+//! the single `Settings` — there is no environment involved. What remains on
+//! the environment is exactly one thing, in exactly one function
+//! (`fixture_path_override`): the three test/CI path redirections and the
+//! one-shot broker-payload capture directory, each of which now announces
+//! itself at WARN the first time it is used.
+//!
+//! Retired names are NOT read here and NOT silently ignored either — they are
+//! listed in `app_services::retired_env`, which prints an ERROR naming the
+//! variable and its replacement config key when one is still exported.
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -45,11 +53,16 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 // (SERVER_BIND, the six CTRADER_* retry/stream knobs, CHART_MERGE_SIDE and
 // the two PNL_* thresholds) were deleted together with their 5 DEFAULT_*
 // twins. The runtime values are read through the AppRuntimeConfig OnceLock
-// (config-consolidation S3-app), knob_catalog.rs carries the env names as
-// its own string literals and imports nothing from here, and the only
-// remaining references were this file's own test assertions — the claimed
-// "drift-guard" did not exist. The PATH-override constants below stay live
-// (their env-reading getters are the production/test call sites).
+// (config-consolidation S3-app), and the only remaining references were this
+// file's own test assertions — the claimed "drift-guard" did not exist.
+//
+// 2026-08-10 update: `knob_catalog.rs` used to repeat those names as its own
+// string literals in an `env_var` field. That field is deleted (W2-7); the
+// names now live in `app_services::retired_env` beside the config key that
+// replaced each one, and are printed only when one is still exported.
+//
+// The four PATH-override constants below stay live: their getters are the
+// test/CI call sites, and each announces itself at WARN when used.
 
 /// Override path for the live trading journal. Test/CI use; production
 /// reads from the platform user-data-dir.
@@ -182,29 +195,95 @@ pub fn pnl_circuit_breaker_fraction() -> f64 {
     app_runtime().pnl_circuit_breaker_fraction.clamp(1e-4, 0.20)
 }
 
+// ---------------------------------------------------------------------------
+// Test/CI fixture path overrides — the ONE env read left in this module
+// ---------------------------------------------------------------------------
+//
+// 2026-08-10, config consolidation. The four getters below used to make four
+// separate `env::var` calls, each silently returning a path. That is the
+// pattern non-negotiable #3 names: a substitution wearing the costume of a
+// choice. If one of these were set in a production shell — say a leftover
+// `NEOETHOS_BOT_LIVE_JOURNAL_PATH` from a debugging session — the live
+// trading journal would be written somewhere the operator was not looking,
+// and NOTHING would say so. The journal is the record every P&L number is
+// reconstructed from.
+//
+// They are not promoted to config keys, because they are not operator
+// configuration: they exist so a test can point a store at a temp directory
+// without racing the real one, and `NEOETHOS_CAPTURE_FIXTURES_DIR` exists so
+// the operator can run the app ONCE to capture real broker payloads. A
+// config key would invite permanent use of a facility that is meant to be
+// momentary.
+//
+// So they stay on the environment, and instead they SHOUT. One call site,
+// one WARN per variable per process, naming the variable and the path it
+// substituted. A relocated journal is now impossible to miss in the log.
+
+/// Read a fixture path override and announce the substitution once.
+///
+/// `purpose` completes the sentence "…is redirecting <purpose> to". Returns
+/// the trimmed value, or `None` when unset or blank (blank is treated as
+/// unset — an exported-but-empty variable is an accident, not an instruction
+/// to use the empty path).
+fn fixture_path_override(var: &'static str, purpose: &'static str) -> Option<String> {
+    // The single `env::var` in this module. Everything above reads
+    // `AppRuntimeConfig`, which comes from the one config file.
+    let value = env::var(var).ok()?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    say_once(var, || {
+        tracing::warn!(
+            target: "neoethos_app::env_overrides",
+            env_var = var,
+            path = %value,
+            "TEST/CI FIXTURE OVERRIDE ACTIVE: `{var}` is set, so {purpose} is \
+             being read from and written to `{value}` instead of the platform \
+             user-data-dir. This is a test facility. If you did not mean to set \
+             it, unset it and restart — production state written under this path \
+             will not be found by a normal launch."
+        );
+    });
+    Some(value)
+}
+
+/// Emit `f` the first time this process sees `key`. Keeps the warning honest
+/// (it names a real substitution) without turning a per-call getter into
+/// log wallpaper — several of these are consulted on every store access.
+fn say_once(key: &'static str, f: impl FnOnce()) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    // A poisoned mutex must never silence a substitution notice.
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(key) {
+        drop(guard);
+        f();
+    }
+}
+
 /// Live-journal path override. `None` when unset → callers fall back to
 /// the platform user-data-dir default.
 pub fn live_journal_path_override() -> Option<String> {
-    env::var(ENV_LIVE_JOURNAL_PATH)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    fixture_path_override(ENV_LIVE_JOURNAL_PATH, "the LIVE TRADING JOURNAL")
 }
 
 /// Pending-actions path override. `None` when unset.
 pub fn pending_actions_path_override() -> Option<String> {
-    env::var(ENV_PENDING_ACTIONS_PATH)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    fixture_path_override(ENV_PENDING_ACTIONS_PATH, "the pending-actions store")
 }
 
 /// Risky-Mode persistence path override. `None` when unset.
 pub fn risky_mode_state_path_override() -> Option<String> {
-    env::var(ENV_RISKY_MODE_STATE_PATH)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    fixture_path_override(
+        ENV_RISKY_MODE_STATE_PATH,
+        "the Risky Mode kill-switch state",
+    )
 }
 
 /// Real-data fixture capture directory. `None` = capture disabled
@@ -213,10 +292,10 @@ pub fn risky_mode_state_path_override() -> Option<String> {
 /// `<dir>/<message_type>_<unix_ms>.bin` so the
 /// `ctrader_test_fixtures` loader can replay them in future tests.
 pub fn capture_fixtures_dir() -> Option<String> {
-    env::var(ENV_CAPTURE_FIXTURES_DIR)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    fixture_path_override(
+        ENV_CAPTURE_FIXTURES_DIR,
+        "cTrader payload capture (every parsed broker response written to disk)",
+    )
 }
 
 /// Write a captured proto-payload to the configured fixture

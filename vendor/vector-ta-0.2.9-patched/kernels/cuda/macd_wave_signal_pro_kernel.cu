@@ -53,7 +53,11 @@ struct SeededEma {
             return false;
         }
 
-        value = input * alpha + beta * value;
+        // CPU: `value.mul_add(self.alpha, self.beta * self.value)`
+        // (macd_wave_signal_pro.rs:405) -- ONE multiply then ONE FUSED
+        // multiply-add, TWO roundings. `input * alpha + beta * value` is
+        // mul/mul/add, THREE roundings under this file's `-fmad=false`.
+        value = fma(input, alpha, beta * value);
         *out = value;
         return true;
     }
@@ -257,5 +261,152 @@ extern "C" __global__ void macd_wave_signal_pro_batch_f64(
         row_line[i] = line_value;
         row_buy[i] = buy_value;
         row_sell[i] = sell_value;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `macd_wave_signal_pro_with_kernel`
+// (src/indicators/macd_wave_signal_pro.rs:769) ->
+// `macd_wave_signal_pro_row_clean_from_slices` (:706) / `_row_from_slices`
+// (:658), whose per-bar step is `CoreState::update`.
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `macd_wave_signal_pro_batch_f64` (:153) is double-clean but declares twelve
+// parameters and TEN `double*` -- six output matrices -- and takes no
+// `const int* periods` array at all. That is the multi-output shape its own
+// wrapper launches. The f64 lane launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// so the lane gets its own entry point here, beside the existing one.
+//
+// WHICH COLUMN: `diff`. `compute_macd_wave_signal_pro_batch`
+// (cpu_batch.rs:13600) maps output_id "value" AND "diff" onto `out.diff`, so
+// this is the lane's `value` column, named rather than guessed.
+//
+// SHAPE: one thread per combo, bars ascending. `diff = ema_fast - ema_slow`
+// over close, both SEEDED EMAs, and the CPU resets both at any bar that is not
+// four-way finite (`macd_wave_signal_pro_row_from_slices`, :686). Only the two
+// EMAs are carried -- the DEA EMA, the fifteen short SMAs and the 40-bar SMA
+// feed `dea`, `macd_histogram`, `line_convergence` and the two signals, none of
+// which this column reads, so they are not computed here. `prev_diff`/
+// `prev_dea` likewise only feed the buy/sell flags.
+//
+// THE CLEAN AND DIRTY CPU PATHS AGREE HERE. `_row_clean_from_slices` starts the
+// state at `first` and never resets; `_row_from_slices` starts at 0 and resets
+// on every invalid bar, which for a leading run of invalid bars leaves the
+// state exactly as freshly constructed at `first`. Same series.
+//
+// PERIOD-INVARIANT: the CPU batch closure is `|_params|` (cpu_batch.rs:13591)
+// -- it constructs `Default::default()` and reads NO parameter at all, so every
+// swept period gives the same CPU column and this kernel writes identical rows.
+//
+// ROUNDING -- THE ONE THING THAT HAD TO CHANGE. `SeededEma::update` (:405)
+// writes `value.mul_add(self.alpha, self.beta * self.value)`: ONE multiply for
+// `beta * value` and then ONE FUSED multiply-add, so TWO roundings. The
+// existing entry point in this file writes `input * alpha + beta * value`,
+// which under this lane's `-fmad=false` is mul, mul, add -- THREE roundings,
+// and a different number in the last place on most bars. This entry point uses
+// `fma(input, alpha, beta * value)` so the count matches the CPU exactly.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic, no epsilon. The NaN is a DOUBLE quiet-NaN bit pattern.
+//
+// FIRST VALID IS NOT READ: the CPU restarts the cascade at every invalid bar,
+// so one global warmup index would be wrong after the first hole. The lane row
+// declares `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+__device__ inline double neo_mwsp_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+/// `SeededEma` with the CPU's rounding: seed by SMA of the first `period`
+/// values, then `fma(value, alpha, beta * prev)` -- macd_wave_signal_pro.rs:405.
+struct NeoMwspEma {
+    int period;
+    double alpha;
+    double beta;
+    int count;
+    double sum;
+    double value;
+
+    __device__ void init(int period_value) {
+        period = period_value;
+        alpha = 2.0 / (static_cast<double>(period_value) + 1.0);
+        beta = 1.0 - alpha;
+        reset();
+    }
+
+    __device__ void reset() {
+        count = 0;
+        sum = 0.0;
+        value = neo_mwsp_qnan();
+    }
+
+    __device__ bool update(double input, double* out) {
+        if (count < period) {
+            count += 1;
+            sum += input;
+            if (count == period) {
+                value = sum / static_cast<double>(period);
+                *out = value;
+                return true;
+            }
+            *out = neo_mwsp_qnan();
+            return false;
+        }
+        value = fma(input, alpha, beta * value);
+        *out = value;
+        return true;
+    }
+};
+
+extern "C" __global__ void macd_wave_signal_pro_neo_batch_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_mwsp_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+
+    NeoMwspEma ema_fast;
+    NeoMwspEma ema_slow;
+    ema_fast.init(DIFF_FAST_PERIOD);
+    ema_slow.init(DIFF_SLOW_PERIOD);
+
+    for (int i = 0; i < n; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!valid_ohlc(o, h, l, c)) {
+            ema_fast.reset();
+            ema_slow.reset();
+            row[i] = nan_value;
+            continue;
+        }
+
+        double fast = nan_value;
+        double slow = nan_value;
+        const bool has_fast = ema_fast.update(c, &fast);
+        const bool has_slow = ema_slow.update(c, &slow);
+        row[i] = (has_fast && has_slow) ? (fast - slow) : nan_value;
     }
 }

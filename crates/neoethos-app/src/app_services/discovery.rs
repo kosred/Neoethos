@@ -715,17 +715,29 @@ pub fn start_discovery_job(
 
         // ── Auto-fetch missing history (operator-chosen over a hard
         // fail) ───────────────────────────────────────────────────────
-        // Discovery's `ensure_sufficient_history` floor (set via
-        // NEOETHOS_BOT_MIN_HISTORY_YEARS) aborts when the local cache is too
-        // short. If the base timeframe is below the floor, pull the
-        // required window straight from cTrader and reload before
-        // building features — so Discovery runs on real broker history
+        // Discovery's `ensure_sufficient_history` floor aborts the run when
+        // the local cache is too short. If the base timeframe is below the
+        // floor, pull the required window straight from cTrader and reload
+        // before building features — so Discovery runs on real broker history
         // instead of failing.
+        //
+        // ── W2-18 / E-10 (2026-08-10) ────────────────────────────────────
+        // This read `NEOETHOS_BOT_MIN_HISTORY_YEARS` from the environment. The
+        // SEARCH takes the same floor from
+        // `models.discovery_runtime.min_history_years`
+        // (`DiscoveryRuntimeOverrides::from_settings`, wired into every
+        // `DiscoveryConfig::from_settings`), so there were two ways to set one
+        // number and nothing checked that they agreed. With the env var unset
+        // — the normal case — this block computed a floor of 0 and never
+        // fetched, while the search then aborted the run on the very shortage
+        // the auto-fetch exists to repair.
+        //
+        // It now reads the SAME resolved value the search will enforce,
+        // straight off the request's own `DiscoveryConfig`. There is no second
+        // number to disagree with: if the search would abort on the floor,
+        // this block fetches for exactly that floor.
         let mut dataset = dataset;
-        let min_years = std::env::var("NEOETHOS_BOT_MIN_HISTORY_YEARS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+        let min_years = request.config.runtime_overrides.min_history_years;
         if min_years > 0 {
             let have = dataset
                 .frames

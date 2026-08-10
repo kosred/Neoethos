@@ -194,6 +194,42 @@ type Group = { title: string; fields: Field[] };
 // enumChoices: [...] }`, `{ kind: "Bool" }`, … (`knob_catalog.rs:139-175`).
 // Audit #113: every one of these fields was already on the wire and the table
 // showed none of them, so a knob's legal range was invisible to the operator.
+// ── The "Current" column must not print a compile-time constant as a live
+// value ───────────────────────────────────────────────────────────────────
+//
+// 16 of the 52 catalog rows build their `current` from a string LITERAL in
+// `knob_catalog.rs`, not from the runtime. `ctrader.max_attempts` renders "3"
+// forever; set `app_runtime.ctrader_max_attempts: 5` and this screen still
+// says 3, while the live value sits one function call away in
+// `env_overrides::ctrader_max_attempts()`. A number under a heading that says
+// "Current" is a claim about what the bot is doing right now, and for these
+// rows the claim is false.
+//
+// The client cannot tell a literal from a genuine match on its own — the wire
+// carries no "is this live?" flag — so the 16 are named here and rendered as
+// what they are: the shipped value, unverified against the running process.
+//
+// ⚠ DELETE THIS LIST the moment `knob_catalog.rs` emits a `currentIsLive`
+// boolean per row. It is a mirror of another file's defect and will rot.
+const CURRENT_IS_A_SHIPPED_LITERAL = new Set<string>([
+  "ctrader.read_timeout_secs",
+  "ctrader.max_attempts",
+  "ctrader.backoff_base_ms",
+  "ctrader.allow_partial_fill",
+  "ctrader.chart_merge_side",
+  "ctrader.stream_max_attempts",
+  "ctrader.stream_backoff_base_ms",
+  "paths.symbol_metadata_override",
+  "paths.user_data_dir_override",
+  "risk.prop_firm_preset",
+  "risk.pnl_audit_drift_fraction",
+  "risk.pnl_circuit_breaker_fraction",
+  "risk.require_stop_loss",
+  "log.rust_log",
+  "log.log_dir",
+  "server.bind_addr",
+]);
+
 function knobTypeLabel(k: any): string {
   const kind = String(k?.kind ?? "Text");
   if (kind === "Enum") return `enum: ${(k.enumChoices ?? []).join(" | ")}`;
@@ -212,9 +248,26 @@ const GROUPS: Group[] = [
     title: "Mode & risk",
     fields: [
       { key: "tradingMode", label: "Trading mode", kind: "enum", options: [{ v: "risky", l: "🚀 Risky (multiply)" }, { v: "prop_firm", l: "🛡 Prop-firm (robust)" }], help: "Risky = aggressive account-multiplication, drawdown-agnostic. Prop-firm = FTMO-style strict rules. Drives discovery ranking + risk orientation." },
-      { key: "riskPerTrade", label: "Risk per trade (%)", kind: "num", pct: true, step: 0.1, help: "Percent of the account risked per trade (position sizing). Clamped to the account's max risk on save." },
-      { key: "maxPortfolioRisk", label: "Max portfolio risk (%)", kind: "num", pct: true, step: 0.5, help: "Cap on TOTAL concurrent risk across ALL running autopilot engines (e.g. 5% = entries pause once open positions already risk ~5% of the balance). 0 = off. Protects a small account when many strategies run at once." },
-      { key: "computeMode", label: "Compute", kind: "enum", options: [{ v: "auto", l: "Auto" }, { v: "cpu", l: "CPU" }, { v: "gpu", l: "GPU" }], help: "Which hardware discovery/training prefers. Auto detects; GPU can OOM on a shared-RAM iGPU." },
+      // 💰 The old help said "Percent of the account risked per trade". In
+      // risky mode that is not what happens: live sizing does not read
+      // risk.risk_per_trade at all (live_trading.rs:1664-1680 substitutes the
+      // risky ladder), and the discovery search reads the risk BANDS, not this
+      // field (grep '.risk_per_trade' across neoethos-search → zero hits). It
+      // binds in prop-firm mode. Saying which mode honours it is the whole
+      // difference between a setting and a decoration.
+      { key: "riskPerTrade", label: "Risk per trade (%)", kind: "num", pct: true, step: 0.1, help: "PROP-FIRM MODE ONLY. Percent of the account risked per trade, clamped to the account's max risk on save. In RISKY mode live sizing IGNORES this field and uses the engine's own ladder (30–50%, capped by Max portfolio risk) — see the Risky Mode screen for the band actually in force. The discovery search never reads it in either mode; it samples from the risk bands." },
+      // 💰 The old help said "entries pause once open positions risk ~5%".
+      // It does not pause: live_trading.rs:1749-1770 computes
+      // effective_risk = base_risk.min(remaining), so with nothing open the
+      // FIRST entry is resized down to this cap. And 0 is not "off" in the
+      // protective sense — it removes the cap entirely.
+      { key: "maxPortfolioRisk", label: "Max portfolio risk (%)", kind: "num", pct: true, step: 0.5, help: "Ceiling on TOTAL concurrent risk across ALL running autopilot engines. It does NOT pause entries — it SIZES THEM DOWN: each entry is cut to whatever headroom is left, so with nothing open the first entry is capped at this number. 0 means NO CAP AT ALL, not 'no additional risk'. In risky mode this is the number that decides the first entry's size." },
+      // Two axes, deliberately: enable_gpu_preference gates TRAINING;
+      // models.prop_search_device REPLACES the global for the SEARCH whenever
+      // it is non-empty (backend.rs:126-130). The refuters established these
+      // cannot be merged — cpu training + gpu search is a real configuration.
+      // So this control must not claim to choose "the" device.
+      { key: "computeMode", label: "Compute (training)", kind: "enum", options: [{ v: "auto", l: "Auto" }, { v: "cpu", l: "CPU" }, { v: "gpu", l: "GPU" }], help: "TRAINING device preference (system.enable_gpu_preference). This does NOT decide the discovery search device: models.prop_search_device overrides it for the search whenever it is set, and both shipped config files set it — so choosing CPU here can still give you a GPU search. The device each run actually used is printed in the run's device-summary log line. prop_search_device is not editable from this screen; change it in the raw config.yaml below." },
     ],
   },
   {
@@ -330,7 +383,16 @@ export default function Advanced() {
     setMsg("Saving config.yaml…");
     try {
       await saveSettingsRaw(yaml);
-      setMsg("✓ config.yaml saved (verbatim).");
+      // "(verbatim)" used to be the whole claim, and the schema check behind
+      // it accepted any misspelled key — `trailing_enabeld:` saved and
+      // reported success. `Settings` now denies unknown fields, so the check
+      // this message implies is finally the check that runs; say what it
+      // actually covers rather than leaving the operator to assume.
+      setMsg(
+        "✓ config.yaml saved verbatim — YAML parsed, schema-checked (unknown keys and " +
+          "wrong types are rejected), previous file backed up. A key the engine ignores " +
+          "would have been refused, not saved.",
+      );
     } catch (e) {
       setMsg(`Save failed: ${e}`);
     } finally {
@@ -431,7 +493,16 @@ export default function Advanced() {
       </h2>
       {showYaml && (
         <>
-          <p className="muted small">{path} — power-user fallback for the ~200 long-tail knobs not in the form above.</p>
+          {/* The old text said "~200 long-tail knobs". The measured surface is
+              390, of which this form reaches ~24 and the catalog documents 52.
+              Understating the gap is how an operator concludes the form is
+              nearly complete and stops looking in the YAML for the knob that
+              actually decided his run. */}
+          <p className="muted small">
+            {path} — the ONLY write path for the ~340 knobs neither the form above nor the
+            catalog below covers (390 knobs exist; the form reaches ~24, the catalog documents{" "}
+            {knobs.length}).
+          </p>
           <textarea className="yaml-editor" value={yaml} onChange={(e) => setYaml(e.target.value)} spellCheck={false} />
           <div className="btn-row"><button className="primary" disabled={busy} onClick={saveYaml}>Save config.yaml</button></div>
 
@@ -460,6 +531,18 @@ export default function Advanced() {
             (<code>POST /settings/knobs</code>). Change them in the raw <code>config.yaml</code>{" "}
             editor above, or use the typed form at the top of this screen for the common ones.
           </div>
+          <div className="banner warn">
+            <b>
+              {knobs.filter((k) => CURRENT_IS_A_SHIPPED_LITERAL.has(k.id)).length} of{" "}
+              {knobs.length} rows do not read their “Current” value from the running process.
+            </b>{" "}
+            The backend builds those cells from a fixed string, so they show the shipped value
+            forever — change the knob and the cell does not move. They are marked{" "}
+            <span className="sell small">⚠ shipped value — not read live</span> in the table
+            below. Every other row is a live reading. This is a backend gap
+            (<code>knob_catalog.rs</code>), not a display choice, and marking it is the honest
+            stand-in until those rows read the runtime.
+          </div>
           {sections.map((sec) => (
             <details key={sec} className="knob-section">
               <summary>{sec}</summary>
@@ -468,7 +551,7 @@ export default function Advanced() {
                   <tr>
                     <th>Knob</th>
                     <th>Type / range</th>
-                    <th>Current</th>
+                    <th>Current<div className="muted small" style={{ fontWeight: 400 }}>live unless marked</div></th>
                     <th>Default</th>
                     <th>Conservative</th>
                     <th>Balanced</th>
@@ -484,7 +567,20 @@ export default function Advanced() {
                         <div className="muted small"><code>{k.id}</code></div>
                       </td>
                       <td className="muted small">{knobTypeLabel(k)}</td>
-                      <td><b>{k.current}</b></td>
+                      {CURRENT_IS_A_SHIPPED_LITERAL.has(k.id) ? (
+                        <td
+                          title={
+                            "The backend serves this cell as a fixed string, not a reading from the " +
+                            "running process. If you changed this knob, THIS NUMBER WILL NOT MOVE — " +
+                            "check config.yaml, not here."
+                          }
+                        >
+                          <span className="muted">{k.current}</span>
+                          <div className="sell small">⚠ shipped value — not read live</div>
+                        </td>
+                      ) : (
+                        <td><b>{k.current}</b></td>
+                      )}
                       <td className="muted">{k.default}</td>
                       <td className="muted small">{k.presetConservative || "—"}</td>
                       <td className="muted small">{k.presetBalanced || "—"}</td>

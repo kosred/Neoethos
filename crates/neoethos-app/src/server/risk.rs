@@ -72,8 +72,19 @@ pub struct RiskDto {
     /// includes the firm's hard ceilings so the UI can show them
     /// inline without a follow-up request.
     pub available_presets: Vec<PresetSummaryDto>,
-    /// Whether the prop-firm gate is currently armed. Mirrors
-    /// `RiskConfig.prop_firm_rules` — false when preset is `none`.
+    /// Whether the prop-firm rule set is the one actually in force.
+    ///
+    /// **W2-2 / E-5 (2026-08-10) — this changed source.** It used to mirror
+    /// `RiskConfig.prop_firm_rules`, a bool with **no reader anywhere in the
+    /// engine**: every discovery call passes a hardcoded
+    /// `PropFirmRiskRules::default()`, so the field decided nothing. Because
+    /// that bool tracked `risk.preset` rather than the regime, this card could
+    /// announce "Prop-firm rules: ON" while `system.trading_mode` was `risky`
+    /// and the engine was running the risky ladder.
+    ///
+    /// It is now derived from `system.trading_mode`, the switch the engine
+    /// itself reads ([`derive_prop_firm_rules_active`]). The value shown is
+    /// the regime that runs.
     pub prop_firm_rules_enabled: bool,
     /// **F-231/F-501/F-630 (2026-05-25)** — Risky Mode kill-switch
     /// cooldown status. `None` = no kill on record OR cooldown
@@ -183,9 +194,36 @@ pub async fn update_preset(
     };
 
     settings.risk.preset = preset;
-    // Flip the gate flag in sync with the preset choice. "None"
-    // disables the prop-firm gate; every other preset enables it.
-    settings.risk.prop_firm_rules = preset != PropFirmPreset::None;
+    // ── W2-2 / E-5 / A2 (2026-08-10): the write of `risk.prop_firm_rules` is
+    // GONE from this endpoint. ────────────────────────────────────────────
+    // It used to read:
+    //
+    //     settings.risk.prop_firm_rules = preset != PropFirmPreset::None;
+    //
+    // Three things were wrong with it, and they compounded:
+    //   1. The field has NO reader in the engine. Every discovery call passes
+    //      a hardcoded `PropFirmRiskRules::default()`. So this line wrote a
+    //      decision nothing consulted.
+    //   2. Its only consumer was the display DTO, which therefore announced
+    //      "prop-firm rules armed" off the PRESET while the engine took its
+    //      regime from `system.trading_mode`. The card could say prop-firm
+    //      during a risky run. The DTO now derives from `trading_mode`
+    //      (`derive_prop_firm_rules_active`), so this write has no consumer
+    //      left at all.
+    //   3. `Settings`' loader ALREADY re-derives the field from the preset
+    //      when the operator has not set it explicitly (`config.rs:3539-3553`,
+    //      which logs the change by name). Writing it here on top of that
+    //      OVERWROTE an operator who HAD set it explicitly — silently, from a
+    //      preset dropdown whose label says nothing about it.
+    //
+    // Removing the write is what lets `risk.prop_firm_rules` be deleted from
+    // `config.rs` (shard A's D6, blocked on this line). Nothing in this crate
+    // reads or writes it any more.
+    //
+    // (`app_services/discovery.rs:47` also has a `prop_firm_rules` field. It
+    // is a `neoethos_search::PropFirmRiskRules` struct — a different type for
+    // a different job — and is unaffected by the deletion of the config bool.)
+    //
     // Apply the preset's numeric drawdown / profit limits IMMEDIATELY so the UI
     // + risk gate reflect the switch (previously only the name was persisted, so
     // the daily/total-DD caps never moved — FundedNext looked identical to None).
@@ -377,7 +415,56 @@ fn dto_from_settings(settings: &Settings) -> RiskDto {
         preset: preset.as_str().to_string(),
         preset_display_name: preset.display_name().to_string(),
         available_presets,
-        prop_firm_rules_enabled: r.prop_firm_rules,
+        prop_firm_rules_enabled: derive_prop_firm_rules_active(settings),
         risky_mode_cooldown_remaining_secs,
     }
+}
+
+/// Is the prop-firm rule set the regime this bot is actually running?
+///
+/// **Mirrors the engine's own arms** —
+/// `neoethos_core::resolved_config::resolve_discovery_mode` and
+/// `neoethos_search::discovery::resolve_discovery_mode` both read
+/// `system.trading_mode` and treat `risky` / `growth` as the risky ladder and
+/// everything else as prop-firm. If those arms ever move, this must move with
+/// them; `system.trading_mode` is the operator's master switch (config.rs:131)
+/// and there is no second opinion to consult.
+///
+/// Deliberately NOT `risk.preset != none`. The preset chooses WHICH firm's
+/// published numbers seed the breakers; `trading_mode` chooses WHICH RULE SET
+/// runs. An operator can legitimately keep FTMO's numbers loaded while running
+/// the risky ladder, and the card must say "risky" in that case, not "FTMO".
+///
+/// When the two disagree the disagreement is LOGGED rather than resolved
+/// silently — see [`warn_on_preset_regime_disagreement`].
+fn derive_prop_firm_rules_active(settings: &Settings) -> bool {
+    let mode = settings.system.trading_mode.trim().to_ascii_lowercase();
+    let prop_firm_active = !matches!(mode.as_str(), "risky" | "growth");
+    warn_on_preset_regime_disagreement(settings, prop_firm_active);
+    prop_firm_active
+}
+
+/// Say out loud when the loaded preset and the running regime do not match.
+///
+/// Neither combination is illegal, and neither is corrected here — correcting
+/// one silently is exactly what non-negotiable #1 forbids. But an operator who
+/// selected FTMO in the Risk screen and is running `trading_mode: risky` is
+/// looking at a card that (correctly, now) says the prop-firm rules are OFF,
+/// and deserves to be told why in the log rather than left to guess.
+fn warn_on_preset_regime_disagreement(settings: &Settings, prop_firm_active: bool) {
+    let preset_is_firm = settings.risk.preset != PropFirmPreset::None;
+    if preset_is_firm == prop_firm_active {
+        return;
+    }
+    tracing::warn!(
+        target: "neoethos_app::server::risk",
+        trading_mode = %settings.system.trading_mode,
+        preset = %settings.risk.preset.as_str(),
+        prop_firm_rules_active = prop_firm_active,
+        "`risk.preset` and `system.trading_mode` disagree about which rule set \
+         is in force. `system.trading_mode` WINS — it is what the engine reads. \
+         The preset still seeds the drawdown breakers, so the numbers on this \
+         card come from the preset while the RULES come from the trading mode. \
+         Set both, or accept that this is what you asked for."
+    );
 }

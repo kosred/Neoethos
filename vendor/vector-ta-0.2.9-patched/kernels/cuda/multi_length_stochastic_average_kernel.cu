@@ -304,3 +304,207 @@ extern "C" __global__ void multi_length_stochastic_average_batch_f64(
         row_out[i] = post_value;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NEOETHOS f64 LANE  --  closer 1, round 3
+//
+// CPU REFERENCE: `multi_length_stochastic_average_with_kernel`
+// (src/indicators/multi_length_stochastic_average.rs:876) ->
+// `multi_length_stochastic_average_row_from_slice` (:743), which at the pinned
+// defaults takes the `multi_length_stochastic_average_default_sma_finite`
+// branch (:770).
+//
+// WHY A SECOND ENTRY POINT IN THIS FILE
+//
+// `multi_length_stochastic_average_batch_f64` (:174) is double-clean but
+// declares eleven parameters -- five `const int*` per-row parameter arrays and
+// a host-allocated `double* scratch_buf`. The f64 lane launches ONE shape:
+//   (series..., int n, const int* periods, int n_combos, int first_valid,
+//    double* out)
+// and has no scratch pointer to give, so the lane gets its own entry point
+// here. Every ring it needs is a fixed-size PER-THREAD array, sized by the
+// pinned defaults below: 10 + 10 + 14 = 34 doubles, 272 bytes. Bounded at
+// compile time, not allocated.
+//
+// WHICH COLUMN: the single `value` series. `compute_multi_length_stochastic_
+// average_batch` calls `expect_value_output` (cpu_batch.rs:8669), so `value` is
+// the only output id this indicator has.
+//
+// SHAPE: one thread per combo, bars ascending. Three carried states -- the
+// presmooth SMA, the 14-slot stochastic ring and the postsmooth SMA -- and the
+// CPU RESETS the postsmooth accumulator mid-bar when the stochastic denominator
+// collapses (:838-843), so a bar-parallel form cannot know the postsmooth
+// window's contents.
+//
+// PERIOD-INVARIANT: the CPU batch reads `source`, `length`, `presmooth`,
+// `premethod`, `postsmooth` and `postmethod` and NEVER `period`
+// (cpu_batch.rs:8689-8707), so every swept period gives the same CPU column and
+// this kernel writes identical rows. The pinned values are the CPU defaults:
+// length 14 (:31), presmooth 10 (:33), postsmooth 10 (:34), both methods `sma`
+// (:35), source `close` (:32).
+//
+// ROUNDING: both SMAs are the CPU's RUNNING sums in the CPU's order --
+// subtract the departing sample first, then store, then add the arriving one
+// (:787-794, :851-856) -- so the accumulator carries the same rounding history.
+// The stochastic sum accumulates `(current - min) / (max - min)` bar by bar
+// from the newest sample backwards (:830-850), which is the order reproduced
+// here. No `fma`: the CPU writes no `mul_add` anywhere in this indicator.
+//
+// EPSILON: `FLOAT_TOL` is 1e-12 (:37, and :10 in this file) and is ALREADY
+// f64-sized -- it is the CPU's own constant, not an f32 epsilon carried over.
+// Left exactly as the CPU writes it.
+//
+// f64 END TO END: no f32 literal, no f32-suffixed math function, no fast-math
+// intrinsic. `fabs` is the double overload. The NaN is a DOUBLE quiet-NaN bit
+// pattern.
+//
+// FIRST VALID IS NOT READ: the CPU stream restarts every accumulator at any
+// non-finite bar (:761-765 via `stream.update`), so one global warmup index
+// would be wrong after the first hole. The lane row declares
+// `F64FirstValidRule::Ignored`.
+// ---------------------------------------------------------------------------
+
+#define NEO_MLSA_LENGTH 14
+#define NEO_MLSA_PRESMOOTH 10
+#define NEO_MLSA_POSTSMOOTH 10
+
+__device__ inline double neo_mlsa_qnan() {
+    return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+extern "C" __global__ void multi_length_stochastic_average_neo_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out
+) {
+    const int combo = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) {
+        return;
+    }
+    (void)periods;
+    (void)first_valid;
+
+    const double nan_value = neo_mlsa_qnan();
+    double* row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        row[i] = nan_value;
+    }
+
+    double pre_ring[NEO_MLSA_PRESMOOTH];
+    double stoch_ring[NEO_MLSA_LENGTH];
+    double post_ring[NEO_MLSA_POSTSMOOTH];
+
+    int pre_head = 0;
+    int pre_count = 0;
+    double pre_sum = 0.0;
+    int stoch_head = 0;
+    int stoch_count = 0;
+    int post_head = 0;
+    int post_count = 0;
+    double post_sum = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const double value = data[i];
+        if (!isfinite(value)) {
+            // `MultiLengthStochasticAverageStream::update` resets every
+            // accumulator on a non-finite bar.
+            pre_head = 0;
+            pre_count = 0;
+            pre_sum = 0.0;
+            stoch_head = 0;
+            stoch_count = 0;
+            post_head = 0;
+            post_count = 0;
+            post_sum = 0.0;
+            continue;
+        }
+
+        // Presmooth SMA -- :786-800.
+        if (pre_count == NEO_MLSA_PRESMOOTH) {
+            pre_sum -= pre_ring[pre_head];
+        } else {
+            pre_count += 1;
+        }
+        pre_ring[pre_head] = value;
+        pre_sum += value;
+        pre_head += 1;
+        if (pre_head == NEO_MLSA_PRESMOOTH) {
+            pre_head = 0;
+        }
+        if (pre_count < NEO_MLSA_PRESMOOTH) {
+            continue;
+        }
+        const double pre = pre_sum / static_cast<double>(NEO_MLSA_PRESMOOTH);
+
+        // Stochastic ring -- :803-813.
+        stoch_ring[stoch_head] = pre;
+        stoch_head += 1;
+        if (stoch_head == NEO_MLSA_LENGTH) {
+            stoch_head = 0;
+        }
+        if (stoch_count < NEO_MLSA_LENGTH) {
+            stoch_count += 1;
+            if (stoch_count < NEO_MLSA_LENGTH) {
+                continue;
+            }
+        }
+
+        // Multi-length stochastic average -- :815-853.
+        const int newest = (stoch_head == 0) ? (NEO_MLSA_LENGTH - 1) : (stoch_head - 1);
+        const double current = stoch_ring[newest];
+        double min_value = current;
+        double max_value = current;
+        int idx = newest;
+        double sum = 0.0;
+        bool valid_norm = true;
+
+        for (int window = 1; window <= NEO_MLSA_LENGTH; ++window) {
+            const double sample = stoch_ring[idx];
+            if (sample < min_value) {
+                min_value = sample;
+            }
+            if (sample > max_value) {
+                max_value = sample;
+            }
+            if (window >= MIN_STOCH_LENGTH) {
+                const double denom = max_value - min_value;
+                if (fabs(denom) <= FLOAT_TOL) {
+                    post_head = 0;
+                    post_count = 0;
+                    post_sum = 0.0;
+                    valid_norm = false;
+                    break;
+                }
+                sum += (current - min_value) / denom;
+            }
+            idx = (idx == 0) ? (NEO_MLSA_LENGTH - 1) : (idx - 1);
+        }
+        if (!valid_norm) {
+            continue;
+        }
+
+        // CPU: `sum / (LENGTH - (MIN_STOCH_LENGTH - 1)) as f64 * 100.0` (:857)
+        // -- divide FIRST, then scale. Two roundings, in that order.
+        const double norm =
+            sum / static_cast<double>(NEO_MLSA_LENGTH - (MIN_STOCH_LENGTH - 1)) * 100.0;
+
+        // Postsmooth SMA -- :858-871.
+        if (post_count == NEO_MLSA_POSTSMOOTH) {
+            post_sum -= post_ring[post_head];
+        } else {
+            post_count += 1;
+        }
+        post_ring[post_head] = norm;
+        post_sum += norm;
+        post_head += 1;
+        if (post_head == NEO_MLSA_POSTSMOOTH) {
+            post_head = 0;
+        }
+        if (post_count == NEO_MLSA_POSTSMOOTH) {
+            row[i] = post_sum / static_cast<double>(NEO_MLSA_POSTSMOOTH);
+        }
+    }
+}

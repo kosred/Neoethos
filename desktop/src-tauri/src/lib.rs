@@ -250,14 +250,17 @@ mod mcp_sidecar {
         // priority order, so it is found regardless of how the installer laid
         // it out (audit follow-up: a locally-built 0.5.3 packaged before the
         // sidecar finished building shipped without it beside the exe).
+        //
+        // `NEOETHOS_MCP_PATH` used to be consulted first. It is DELETED: an
+        // environment variable that redirects which BINARY this shell launches
+        // is not operator configuration, it is an invisible substitution — it
+        // lived in no config file and in no knob catalog, so a stale export
+        // could point the app at a different sidecar with nothing on screen to
+        // say so. The search order below is deterministic and is what every
+        // real install uses; `warn_retired_env_vars` names the variable if it
+        // is still set.
         let mut checked: Vec<std::path::PathBuf> = Vec::new();
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(p) = std::env::var("NEOETHOS_MCP_PATH")
-            .ok()
-            .map(std::path::PathBuf::from)
-        {
-            candidates.push(p);
-        }
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 candidates.push(dir.join(bin_name)); // beside the exe
@@ -274,8 +277,8 @@ mod mcp_sidecar {
         let Some(exe) = exe else {
             eprintln!(
                 "MCP sidecar binary '{bin_name}' not found — MCP tools unavailable this session. \
-                 Set NEOETHOS_MCP_PATH to its full path, or reinstall from a build that bundles \
-                 it. Checked: {}",
+                 Put it beside the app executable (or in its resources/ dir), or reinstall from \
+                 a build that bundles it. Checked: {}",
                 checked
                     .iter()
                     .map(|p| p.display().to_string())
@@ -364,8 +367,12 @@ mod mesh_sidecar {
     }
 
     /// Locate the sidecar binary — the SAME search order as `mcp_sidecar` so it
-    /// is found however the installer laid it out (env override, beside the exe,
-    /// or a `resources/` subdir).
+    /// is found however the installer laid it out (beside the exe, or a
+    /// `resources/` subdir).
+    ///
+    /// `NEOETHOS_MESH_PATH` is DELETED, for the same reason as
+    /// `NEOETHOS_MCP_PATH`: redirecting which binary joins a P2P swarm is not
+    /// something an environment variable should be able to do silently.
     fn locate() -> Option<std::path::PathBuf> {
         let bin_name = if cfg!(windows) {
             "neoethos-mesh.exe"
@@ -373,12 +380,6 @@ mod mesh_sidecar {
             "neoethos-mesh"
         };
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(p) = std::env::var("NEOETHOS_MESH_PATH")
-            .ok()
-            .map(std::path::PathBuf::from)
-        {
-            candidates.push(p);
-        }
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 candidates.push(dir.join(bin_name));
@@ -399,8 +400,8 @@ mod mesh_sidecar {
         let Some(exe) = locate() else {
             eprintln!(
                 "mesh sidecar 'neoethos-mesh' not found — mesh unavailable this session. \
-                 Set NEOETHOS_MESH_PATH to its full path, or reinstall from a build that \
-                 bundles it beside the app."
+                 Put it beside the app executable (or in its resources/ dir), or reinstall \
+                 from a build that bundles it."
             );
             return;
         };
@@ -542,11 +543,17 @@ fn resolve_data_root() -> PathBuf {
 fn prepare_data_root(app: &tauri::App) {
     use tauri::Manager;
 
-    let overridden = std::env::var("NEOETHOS_USER_DATA_DIR")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .is_some();
+    // ONE reader for this override, and it is not here. `user_config_path()`
+    // (which this function calls below) already resolves it through
+    // `env_overrides::user_data_dir_override()`; this shell used to read the
+    // same variable a SECOND time with its own trim/empty rules. Two readers
+    // of one name is how the two-Settings-in-one-process defect was born, so
+    // this asks the same function core asks. Same semantics, one source.
+    //
+    // The variable itself is not this change's to retire: `config.rs::
+    // user_config_path()` still consults it, and it is the last env var that
+    // can change the answer to "which config file?" (routed as A9).
+    let overridden = neoethos_core::env_overrides::user_data_dir_override().is_some();
 
     // Dev/portable: launched from a dir that already has config.yaml → keep it.
     if !overridden && std::path::Path::new("config.yaml").exists() {
@@ -793,10 +800,47 @@ async fn data_coverage(
     .map_err(|e| e.to_string())?
 }
 
+/// Environment variables this shell used to obey and no longer does, paired
+/// with what replaced them.
+///
+/// NOTHING branches on this list — it is a report, not a decision. It exists
+/// because an operator who exported a name that used to work deserves to be
+/// told the name is dead, rather than watch the app behave as if he had set
+/// nothing.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "NEOETHOS_MCP_PATH",
+        "put neoethos-mcp[.exe] beside the app executable, or in its resources/ directory",
+    ),
+    (
+        "NEOETHOS_MESH_PATH",
+        "put neoethos-mesh[.exe] beside the app executable, or in its resources/ directory",
+    ),
+];
+
+/// Name every retired variable still set in this process's environment, state
+/// its replacement, and say plainly that the value was ignored.
+fn warn_retired_env_vars() {
+    for (name, replacement) in RETIRED_ENV_VARS {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        eprintln!(
+            "IGNORED ENV VAR: {name}={} — this variable was deleted. Nothing read it, and \
+             NOTHING in this session was changed by it. Instead: {replacement}.",
+            value.to_string_lossy()
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // Before anything resolves a path: name every deleted env var that
+            // is still set. A stale export must not be able to mean nothing in
+            // silence.
+            warn_retired_env_vars();
             // STANDARD per-user data root (no hardcoded paths) + first-run seed.
             prepare_data_root(app);
             if cfg!(debug_assertions) {

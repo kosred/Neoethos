@@ -97,6 +97,18 @@ pub struct TrainingOrchestrator {
     /// point `models_dir` at a SEPARATE root (e.g. `models_oos_locked/`) so the
     /// production `models/` artifacts are never overwritten with leak-locked ones.
     pub oos_lock_from_ms: Option<i64>,
+    /// Explicit override for the historical-bars root, for callers that resolve
+    /// it themselves (the CLI's `--data-root`).
+    ///
+    /// **2026-08-10 — this replaces `NEOETHOS_BOT_DATA_ROOT`.** The orchestrator
+    /// used to read that variable directly and only fall back to
+    /// `system.data_dir`. `neoethos-cli` set it with `std::env::set_var` before
+    /// calling into this crate, so the argument travelled between two parts of
+    /// the SAME process through the environment — which also meant any leftover
+    /// export in the operator's shell silently redirected training to a
+    /// different bar store than the config named. `None` means
+    /// `system.data_dir`, which is the configured answer.
+    pub data_root_override: Option<PathBuf>,
 }
 
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
@@ -250,6 +262,25 @@ impl TrainingOrchestrator {
             settings,
             models_dir,
             oos_lock_from_ms: None,
+            data_root_override: None,
+        }
+    }
+
+    /// Builder: point training at an explicit historical-bars root instead of
+    /// `system.data_dir`. This is the replacement for the CLI setting
+    /// `NEOETHOS_BOT_DATA_ROOT` in its own process. See
+    /// [`Self::data_root_override`].
+    pub fn with_data_root(mut self, data_root: impl Into<PathBuf>) -> Self {
+        self.data_root_override = Some(data_root.into());
+        self
+    }
+
+    /// The historical-bars root this run will read: the explicit override if
+    /// one was given, else `system.data_dir`. There is no third source.
+    pub fn data_root(&self) -> String {
+        match self.data_root_override.as_ref() {
+            Some(root) => root.to_string_lossy().to_string(),
+            None => self.settings.system.data_dir.to_string_lossy().to_string(),
         }
     }
 
@@ -326,8 +357,7 @@ impl TrainingOrchestrator {
         let planned_models: Vec<String> =
             configs.iter().map(|config| config.name.clone()).collect();
 
-        let data_root = std::env::var("NEOETHOS_BOT_DATA_ROOT")
-            .unwrap_or_else(|_| self.settings.system.data_dir.to_string_lossy().to_string());
+        let data_root = self.data_root();
         let dataset = load_symbol_dataset(&data_root, symbol)?;
 
         let opts = FeatureBuildOptions {
@@ -956,6 +986,12 @@ impl TrainingOrchestrator {
     }
 
     fn transformer_hidden_dim(&self) -> usize {
+        log_knob_twin_disagreement(
+            "models.transformer_d_model",
+            self.settings.models.transformer_d_model,
+            "models.transformer_hidden_dim",
+            self.settings.models.transformer_hidden_dim,
+        );
         self.settings
             .models
             .transformer_d_model
@@ -964,6 +1000,12 @@ impl TrainingOrchestrator {
     }
 
     fn transformer_heads(&self) -> usize {
+        log_knob_twin_disagreement(
+            "models.transformer_n_heads",
+            self.settings.models.transformer_n_heads,
+            "models.transformer_heads",
+            self.settings.models.transformer_heads,
+        );
         self.settings
             .models
             .transformer_n_heads
@@ -972,6 +1014,12 @@ impl TrainingOrchestrator {
     }
 
     fn transformer_layers(&self) -> usize {
+        log_knob_twin_disagreement(
+            "models.transformer_n_layers",
+            self.settings.models.transformer_n_layers,
+            "models.transformer_layers",
+            self.settings.models.transformer_layers,
+        );
         self.settings
             .models
             .transformer_n_layers
@@ -980,14 +1028,48 @@ impl TrainingOrchestrator {
     }
 
     fn effective_training_row_budget(&self) -> Option<usize> {
-        [
-            self.settings.models.global_max_rows,
-            self.settings.models.global_max_rows_per_symbol,
-            self.settings.system.max_training_rows_per_tf,
-        ]
-        .into_iter()
-        .filter(|value| *value > 0)
-        .min()
+        // Three row caps collapsed by `.min()`. `.min()` is the safe direction
+        // — the tightest cap binds — but an operator who RAISED one of them has
+        // not raised the budget, and nothing said which one held the line.
+        let caps = [
+            (
+                "models.global_max_rows",
+                self.settings.models.global_max_rows,
+            ),
+            (
+                "models.global_max_rows_per_symbol",
+                self.settings.models.global_max_rows_per_symbol,
+            ),
+            (
+                "system.max_training_rows_per_tf",
+                self.settings.system.max_training_rows_per_tf,
+            ),
+        ];
+        let active: Vec<(&str, usize)> = caps
+            .into_iter()
+            .filter(|(_, value)| *value > 0)
+            .collect();
+        let winner: Option<(&str, usize)> =
+            active.iter().copied().min_by_key(|(_, value)| *value);
+        if let Some((winning_field, winning_value)) = winner
+            && active.iter().any(|(_, value)| *value != winning_value)
+        {
+            let all = active
+                .iter()
+                .map(|(field, value)| format!("{field}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "neoethos_models::config",
+                binding_field = winning_field,
+                binding_value = winning_value,
+                candidates = %all,
+                "training row budget: {all} — the tightest cap binds \
+                 ({winning_field}={winning_value}). Raising any of the others \
+                 alone will not raise the budget."
+            );
+        }
+        winner.map(|(_, value)| value)
     }
 
     fn apply_training_row_budget(
@@ -2393,6 +2475,16 @@ impl TrainingOrchestrator {
             );
             0.0
         };
+        // 💰 MONEY PATH. Two fields, one number, silently `.max()`ed: lowering
+        // either one alone does NOT lower the stop distance, and the label set
+        // this produces is what every model learns to trade.
+        log_money_knob_twin_disagreement(
+            "models.label_stop_atr_multiplier",
+            self.settings.models.label_stop_atr_multiplier,
+            "risk.atr_stop_multiplier",
+            self.settings.risk.atr_stop_multiplier,
+            "label stop distance (ATR multiples)",
+        );
         let atr_stop_multiplier = self
             .settings
             .models
@@ -2557,14 +2649,27 @@ pub(crate) fn resolve_label_geometry(
     let fixed_stop = settings.risk.meta_label_fixed_sl.max(min_distance);
     let (fixed_target, rr_floor) = match mode {
         LabelGeometryMode::Symmetric => (fixed_stop, 1.0),
-        LabelGeometryMode::Asymmetric => (
-            settings.risk.meta_label_fixed_tp.max(min_distance),
-            settings
-                .models
-                .label_take_profit_rr
-                .max(settings.risk.min_risk_reward)
-                .max(1.0),
-        ),
+        LabelGeometryMode::Asymmetric => {
+            // 💰 MONEY PATH, and mode-gated: this `.max()` only runs in
+            // `asymmetric` geometry, so an operator who lowered one of the two
+            // fields sees the change take effect or not depending on
+            // `models.label_geometry`.
+            log_money_knob_twin_disagreement(
+                "models.label_take_profit_rr",
+                settings.models.label_take_profit_rr,
+                "risk.min_risk_reward",
+                settings.risk.min_risk_reward,
+                "asymmetric label reward:risk floor",
+            );
+            (
+                settings.risk.meta_label_fixed_tp.max(min_distance),
+                settings
+                    .models
+                    .label_take_profit_rr
+                    .max(settings.risk.min_risk_reward)
+                    .max(1.0),
+            )
+        }
     };
     Ok(ResolvedLabelGeometry {
         mode,
@@ -3015,6 +3120,91 @@ fn timeframe_to_minutes(base_tf: &str) -> usize {
     1
 }
 
+/// The hard train→val leak floor, in bars of the base timeframe. Not
+/// configurable in either direction: `models.embargo_minutes` widens the gap,
+/// nothing narrows it below this.
+const MIN_EMBARGO_BARS: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Duplicate-knob disagreement reporting (W2-12)
+// ---------------------------------------------------------------------------
+//
+// Six settings in this file are pairs of fields collapsed by `.max()` or
+// `.min()`. The collapse itself is NOT changed here — changing which number
+// binds is a behaviour change that needs its own measurement, and for the two
+// money-path pairs it needs the operator's decision about which name survives.
+//
+// What changes is that the disagreement can no longer be silent. A silent
+// `.max()` means RAISING EITHER field raises the effective value: an operator
+// who lowered one has not lowered the setting, and no log line told him. The
+// transformer trio agree at 256 today by luck, so today these lines are quiet.
+//
+// Once one name in each pair is deleted, delete the matching call.
+
+/// Log at WARN when two integer fields that get `.max()`ed together disagree,
+/// naming both and the winner.
+fn log_knob_twin_disagreement(
+    field_a: &str,
+    value_a: usize,
+    field_b: &str,
+    value_b: usize,
+) {
+    if value_a == value_b {
+        return;
+    }
+    let (winner, winning_value) = if value_a >= value_b {
+        (field_a, value_a)
+    } else {
+        (field_b, value_b)
+    };
+    tracing::warn!(
+        target: "neoethos_models::config",
+        field_a,
+        value_a,
+        field_b,
+        value_b,
+        binding_field = winner,
+        binding_value = winning_value,
+        "duplicate knob: {field_a}={value_a} and {field_b}={value_b} are merged \
+         with .max(); {winner}={winning_value} binds. Lowering only one of them \
+         does not lower the effective value."
+    );
+}
+
+/// As [`log_knob_twin_disagreement`], for float pairs on the money path. Louder
+/// wording because these two decide the stop distance and the reward:risk floor
+/// that every label — and therefore every trained model — is built from.
+fn log_money_knob_twin_disagreement(
+    field_a: &str,
+    value_a: f64,
+    field_b: &str,
+    value_b: f64,
+    what: &str,
+) {
+    if (value_a - value_b).abs() < f64::EPSILON {
+        return;
+    }
+    let (winner, winning_value) = if value_a >= value_b {
+        (field_a, value_a)
+    } else {
+        (field_b, value_b)
+    };
+    tracing::warn!(
+        target: "neoethos_models::config",
+        field_a,
+        value_a,
+        field_b,
+        value_b,
+        binding_field = winner,
+        binding_value = winning_value,
+        decides = what,
+        "MONEY-PATH duplicate knob: {field_a}={value_a} and {field_b}={value_b} \
+         both claim to set the {what}; they are merged with .max(), so \
+         {winner}={winning_value} binds. Lowering only one of them changes \
+         nothing."
+    );
+}
+
 fn embargo_rows_for_timeframe(base_tf: &str, embargo_minutes: usize) -> usize {
     let tf_minutes = timeframe_to_minutes(base_tf).max(1);
     let raw = if embargo_minutes == 0 {
@@ -3026,12 +3216,14 @@ fn embargo_rows_for_timeframe(base_tf: &str, embargo_minutes: usize) -> usize {
     // can't allow train→val with no time gap on intraday models. 20 bars on
     // the base timeframe is the floor (~20 minutes on M1, ~5h on M15) — long
     // enough to bracket the typical label horizon for sub-hour forecasters.
-    // Override via NEOETHOS_BOT_PROP_MIN_EMBARGO_BARS.
-    let min_floor: usize = std::env::var("NEOETHOS_BOT_PROP_MIN_EMBARGO_BARS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(20);
-    raw.max(min_floor)
+    //
+    // 2026-08-10: `NEOETHOS_BOT_PROP_MIN_EMBARGO_BARS` could LOWER this floor,
+    // including to zero, from a shell — a leak guard that an untracked export
+    // could switch off. A safety floor is not an operator preference; the way
+    // to widen the gap is `models.embargo_minutes`, which is config, is in the
+    // artifact, and can only make the embargo longer than this floor, never
+    // shorter. Deleted; reported at startup if still set.
+    raw.max(MIN_EMBARGO_BARS)
 }
 
 fn halton(mut index: usize, base: usize) -> f64 {
