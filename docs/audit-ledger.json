@@ -1,0 +1,2266 @@
+{
+ "total": 323,
+ "items": [
+  {
+   "id": 1,
+   "claim": "parity.rs is 323 lines with zero non-test references",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 2,
+   "claim": "`pub mod parity;` is the module's only external mention",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 3,
+   "claim": "genetic/regime_labels.rs 522 lines, all 8 symbols reachable only from a re-export",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 4,
+   "claim": "the regime_labels re-export block is the whole consumer list",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 5,
+   "claim": "gpu_native/ranking.rs 263 lines; cmp_best_first / CANONICAL / RankKey have zero production refs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 6,
+   "claim": "regime/classifier.rs 199 lines; infer_regime_canonical is never called",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 7,
+   "claim": "regime/mod.rs is kept alive by a compile-pin test with no subject",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 8,
+   "claim": "`pub mod regime;` plus a stale Phase-B comment describing a migration that never came",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 9,
+   "claim": "archive_score / window_score / quality_score have no production caller",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 10,
+   "claim": "5 ingredient fns are used only by the three dead named scores",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 11,
+   "claim": "fn-pointer assertions plus 3 names in the `pub use` keep dead symbols compiling",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 12,
+   "claim": "the scoring module header still advertises a unification that did not occur",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 13,
+   "claim": "export_state.rs 115 lines; from_funnel referenced only by its own tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 14,
+   "claim": "DiversityKey / clamp_bin / smc_mask / diversity_key dead since 2026-05-26",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 15,
+   "claim": "KEEP — `pub type EvalMetrics = [f64;11]` must survive the diversity trim",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 16,
+   "claim": "StrategyRanker plus 3 methods, zero refs in production and test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 17,
+   "claim": "KEEP — StrategyQualityAnalyzer / score_strategy is live",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 18,
+   "claim": "gpu_native/instrumentation.rs 65 lines; gpu_stage_range! has zero expansions",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 19,
+   "claim": "Cargo feature `nvtx = []` is enabled by nothing; the NVTX extern block never compiles",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 20,
+   "claim": "RESERVED_INDEX_7 names a layout that changed under it (slot 7 = monthly_target_hit_rate)",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 21,
+   "claim": "portfolio.rs PortfolioOptimizer 487 lines, zero production refs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 22,
+   "claim": "strategy_db.rs 238 lines, all refs inside its own test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 23,
+   "claim": "`strategy-db` feature is named by no other manifest, so it compiles in no shipped build",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 24,
+   "claim": "duckdb optional dep with features=[\"bundled\"] — a C++ build for a dead feature",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 25,
+   "claim": "prototype_a_engine.rs 477 lines; its only invocation is a test",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 26,
+   "claim": "drag: `mod prototype_a_engine;` plus the re-export",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 27,
+   "claim": "~600-line Prototype-A resident block in cubecl_eval exists only for that engine",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 28,
+   "claim": "KEEP — prototype_a.rs upload structs are the production B wire format",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 29,
+   "claim": "A-specific parts safe to remove: status / capabilities / telemetry (used by gpu_bench)",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 30,
+   "claim": "prototype_c_engine/device.rs 1,767 lines, bench-only",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 31,
+   "claim": "prototype_c_engine/device_tests.rs 357 lines",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 32,
+   "claim": "prototype_c_engine.rs 238 lines",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 33,
+   "claim": "prototype_c_gpu.rs 257 lines, one caller and it is its own test",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 34,
+   "claim": "prototype_bc.rs 472 lines; route_strategy has zero production callers because production never had a choice",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 35,
+   "claim": "CubeCL fused lane is unreachable whenever prototype B is available",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 36,
+   "claim": "the f32 lane is 54% wrong at 200k bars — stated in the file",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 37,
+   "claim": "6 CI lines block the D8 delete",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 38,
+   "claim": "Cargo feature drag for gpu-vulkan / gpu-rocm / gpu-apple",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 39,
+   "claim": "compiled_gpu_vulkan plus the example documenting `--features gpu-vulkan` stop building if D8 lands",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 40,
+   "claim": "precondition — extract population_settings_for_dataset and SnapshotSettingsDto before touching their files",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 41,
+   "claim": "bench cluster plus Prototype C labelled DEAD",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 42,
+   "claim": "WindowEvaluation::trades fast path is inert — the only production construction hardcodes trades: None",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 43,
+   "claim": "the cost is measured in-repo: 191,800 calls, 45% of a run",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 44,
+   "claim": "trades_from_outcomes — the missing readback half — has zero non-test callers",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 45,
+   "claim": "walkforward_risk_diagnostics_from_trades called UNREACHABLE",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 46,
+   "claim": "accelerator_hint: 12 config tokens parsed into a field no device selector reads",
+   "money_path": false,
+   "effort": "hours",
+   "status": "SUPERSEDED"
+  },
+  {
+   "id": 47,
+   "claim": "its guard test asserts a round-trip and nothing about behaviour",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 48,
+   "claim": "gpu_pipeline_preflight returns Ok(()) before examining a stage",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 49,
+   "claim": "#35's escalation to GPU_PREFERRED (AllowCpu) is what pins the short-circuit on",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 50,
+   "claim": "stage1_baseline manifest is stale; at least 3 of 16 entries no longer match master",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 51,
+   "claim": "with_capability — the API that would make the preflight mean something — has zero production callers",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 52,
+   "claim": "gpu_fallback::is_availability has zero production callers",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 53,
+   "claim": "the strict-GPU lane (193 lines plus rebatch ladder) never executes on the shipped config",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 54,
+   "claim": "checkpoint.rs 508 lines, zero production callers",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 55,
+   "claim": "write_portfolio_artifact_atomic has no caller at all, not even a test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 56,
+   "claim": "the CLI's real resume is hand-rolled and unrelated",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 57,
+   "claim": "check_trade_invariants — the correctness net on device trades — is never called",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 58,
+   "claim": "prototype_b_mirror.rs 288 lines zero refs — HOLD: confirm no rented-box `cargo test gpu_` selects its warp_first_hit tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 59,
+   "claim": "native_session has prod_refs=0 AND test_refs=0",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 60,
+   "claim": "prototype_b_engine_status declared twice across a cfg boundary, neither with a caller",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 61,
+   "claim": "BacktestEngine trait: one consumer and it is the benchmark",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 62,
+   "claim": "signal_trace_gpu.rs plus trade_trace_gpu.rs = 1,656 cfg(test)-only lines",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 63,
+   "claim": "parity_hierarchy.rs 753 lines, no external consumer, pinned by trade_trace_gpu.rs",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 64,
+   "claim": "KEEP — gpu_discovery_probe example is a live smoke test of the config boundary",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 65,
+   "claim": "payoff-floor identity gate landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 66,
+   "claim": "ten named rejection counters landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 67,
+   "claim": "ResolvedConfigStamp + config_hash landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 68,
+   "claim": "per-trial return series persistence landed",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 69,
+   "claim": "session spread wired to production",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 70,
+   "claim": "commission charged per side",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 71,
+   "claim": "cost band landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "PARTIAL"
+  },
+  {
+   "id": 72,
+   "claim": "f64 two-pass prefilter statistic landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 73,
+   "claim": "triple-barrier label refit inside CPCV folds landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 74,
+   "claim": "trailing now default OFF with ATR-scaled clamps",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "PARTIAL"
+  },
+  {
+   "id": 75,
+   "claim": "discovery hardcodes kill_zones_enabled: true, so the live knob can only make live LESS safe",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 76,
+   "claim": "cross_pair_features.rs (552 lines) is the only feature family never wired into compute_hpc_feature_frame.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 77,
+   "claim": "cross_pair_features is absent from the crate's re-export list so it does not resolve externally.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 78,
+   "claim": "DEFAULT_CROSS_PAIR_WINDOWS drags along with the dead module.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 79,
+   "claim": "resolve_path_to_vortex has 11 grep hits, all inside its own file.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 80,
+   "claim": "loader.rs's header falsely asserts resolve_path_to_vortex is 'actually called'; the live path is convert_to_vortex.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 81,
+   "claim": "cache_dir_for / cache_path_for / cache_filename_for orphan together with loader.rs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 82,
+   "claim": "detect_divergence / vortex_indicator / fisher_transform each return exactly one grep hit.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 83,
+   "claim": "indicators.rs survives dead-code lints only via the pub re-export.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 84,
+   "claim": "normalize_feature_matrix_copy has zero references including tests.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 85,
+   "claim": "normalize_feature_matrix is referenced only by its own tests.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 86,
+   "claim": "[KEEP] norm_fit_rows + normalize_feature_series_in_place are the live normaliser.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 87,
+   "claim": "max_indicator_warmup is a dead pre-flight guard while catch_unwind silently drops columns. Refuter said WIRE, not delete.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 88,
+   "claim": "Two comments assert the dead guard is live.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 89,
+   "claim": "gpu_sma_sweep_columns dead / neoethos-data/gpu-cuda enabled by no crate.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 90,
+   "claim": "IndicatorComputePolicy::{Auto,Cpu,RequireGpu} present.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 91,
+   "claim": "GPU_SWEEP_SPECS covers 10 of 18; the other 8 reported by name as CpuIndicatorNotPortable.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 92,
+   "claim": "New neoethos-data/build.rs bakes NEOETHOS_VECTOR_TA_PTX_ARCH so an arch mismatch fails named.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 93,
+   "claim": "test_fixtures.rs 253 lines ungated; a 100-bar JSON include_str!'d into every shipped binary.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 94,
+   "claim": "The always-compiled justification names three non-test callers, none of which exist.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 95,
+   "claim": "ctrader_sample_ohlcv_first has zero callers anywhere.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 96,
+   "claim": "[CORRECTED] a bare #[cfg(test)] gate would break the neoethos-search and neoethos-app suites — use #[cfg(any(test, feature=\"test-fixtures\"))].",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 97,
+   "claim": "[TODAY] indicator dispatch fixed: 66 -> 825 columns measured on real bars.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 98,
+   "claim": "[TODAY] typed drop ledger present.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 99,
+   "claim": "[TODAY] vocabulary floor test present.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 100,
+   "claim": "[TODAY] prefilter_top_k reconciled to 240 in all four places.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 101,
+   "claim": "vector-ta f64 kernel conversion in vendor/.",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "IN_FLIGHT"
+  },
+  {
+   "id": 102,
+   "claim": "ctrader_history.rs (1,164 lines) has zero callers for every public item.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 103,
+   "claim": "Only other reference to ctrader_history is a doc-link in ctrader_messages.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 104,
+   "claim": "4 uniquely-imported payload-type consts + their ctrader_account parsers likely orphan with ctrader_history.",
+   "money_path": false,
+   "effort": "decision-required — WIRE it (the 2026-05-15 full-API directive) or delete it; the audit's own D2 batch chose neither.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 105,
+   "claim": "ctrader_openapi.rs (67 lines); zero `protobuf::` references anywhere in neoethos-app/src.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 106,
+   "claim": "4 protoc generate/compile calls + proto/ dir (~100 KB) compiled on every clean build.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 107,
+   "claim": "`protobuf = \"4.31.1-release\"` + `protoc-bin-vendored = \"3.2.0\"` carried for nothing.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 108,
+   "claim": "Check the `cc` build-dep is still needed by emit_embedded_credentials before removing.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 109,
+   "claim": "`launched_by_flutter` field on HealthResponse serves a front-end deleted 2026-06-22.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 110,
+   "claim": "`install_launched_by_flutter` + its OnceLock in server/state.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 111,
+   "claim": "CLI arg `--launched-by-flutter` + its 4 branches in main.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 112,
+   "claim": "`ENV_LAUNCHED_BY_FLUTTER` + its readers, cross-crate into neoethos-core.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 113,
+   "claim": "KnobEntry's kind/min/max/enumChoices/helpLong/envVar have 0 grep hits in any client.",
+   "money_path": false,
+   "effort": "hours — either delete the four unread fields, or have Advanced.tsx render editable typed controls from `kind`/`min`/`max`/`enumChoices` (that is the real prize: 53 knobs become editable for free).",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 114,
+   "claim": "Advanced.tsx hand-maintains a parallel schema duplicating the backend catalog.",
+   "money_path": false,
+   "effort": "days — the fix is to generate the form from the catalog (which requires #113 first), not to re-sync two lists by hand.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 115,
+   "claim": "53 knobs × 3 preset columns = 159 recommendation strings with no apply path.",
+   "money_path": true,
+   "effort": "decision-required — either add a POST /settings/presets apply path (hours once decided) or delete 159 strings that describe a product the app does not have.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 116,
+   "claim": "The UI deliberately abstains from /settings/presets; only writer is /risk/preset with a disjoint set.",
+   "money_path": true,
+   "effort": "decision-required — pick ONE preset vocabulary. Two is the defect.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 117,
+   "claim": "/mesh/migration/enable, /mesh/elites, /mesh/migrants have no client anywhere.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 118,
+   "claim": "What IS missing: nothing POSTs /mesh/migration/enable when the mesh toggle flips.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 119,
+   "claim": "GET+POST /broker/credentials have no client; no credential form exists in desktop/src.",
+   "money_path": true,
+   "effort": "hours — add the form (the DTO and both handlers already exist and mask the secret correctly), or delete the two orphan routes.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 120,
+   "claim": "POST /broker/account/select has no client — the only way to set the active cTrader account.",
+   "money_path": true,
+   "effort": "trivial — delete the orphan route, or point it at the same code the Tauri command uses.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 121,
+   "claim": "Dashboard copy sends the operator to a Settings form that has never existed.",
+   "money_path": false,
+   "effort": "trivial — one string: point him at the Authenticate button, not at a credentials form.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 122,
+   "claim": "Two crates declare [[bin]] name = \"neoethos-mcp\"; only mcp/ is bundled.",
+   "money_path": false,
+   "effort": "trivial — rename one bin (e.g. `neoethos-mcp-client`) and update the loader's bin_name.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 123,
+   "claim": "Loader probes dir.join(bin_name) before resources/, so the wrong binary is found and the not-found branch cannot fire.",
+   "money_path": false,
+   "effort": "trivial — probe resources/ first, or fix #122 and the ambiguity disappears.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 124,
+   "claim": "GET /journal/analytics has no UI client — only the LLM can see pips/R/MFE-MAE.",
+   "money_path": false,
+   "effort": "hours — one api.ts export plus a table in the Account/Journal screen; the backend already computes everything.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 125,
+   "claim": "Desktop installs a CWD-relative config path, defeating the absolute-path safety net (UNCERTAIN — never observed misfiring).",
+   "money_path": true,
+   "effort": "hours — resolve `neoethos_core::config::user_config_path()` once at lib.rs:52 and pass that absolute path to both install_config_path and from_yaml, and make the from_yaml failure loud instead of `unwrap_or_else(default)`.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 126,
+   "claim": "NOT-DEAD note — all SettingsUpdateDto fields trace to real consumers; do not re-hunt.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 127,
+   "claim": "NOT-DEAD note — all 24 desktop screens mounted, all 90 api.ts exports imported; do not re-hunt.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 128,
+   "claim": "domain/drift_monitor.rs — 345 lines, zero refs, not re-exported (delete candidate D3).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 129,
+   "claim": "domain/news_filter.rs — 338 lines, zero refs.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 130,
+   "claim": "domain/consistency.rs — 267 lines, zero refs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 131,
+   "claim": "domain/order_execution.rs — 216 lines, zero refs.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 132,
+   "claim": "domain/meta_controller.rs — 206 lines, zero refs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 133,
+   "claim": "domain/events.rs — 167 lines; its one apparent consumer (storage.rs:413 RiskLedger) is itself dead.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 134,
+   "claim": "PortfolioManager cited as 'the live one' justifying deletion of the search-side PortfolioOptimizer — refuter established it has zero refs outside its own file; BOTH are dead.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 135,
+   "claim": "The PortfolioManager-vs-PortfolioOptimizer comparison table (domain/portfolio.rs:13) is the trap and must be deleted with both types.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 136,
+   "claim": "RiskLedger never constructed ⇒ its RiskEvent consumer is dead too.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 137,
+   "claim": "RiskManager 847 lines — all three ::new calls are inside its own test module.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 138,
+   "claim": "3 news knobs orphaned with NewsFilter (config.rs:1923/1931/1934).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 139,
+   "claim": "The live news gate is a wholly separate implementation (news_calendar::entry_blackout_for, live_trading.rs:1077).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 140,
+   "claim": "Deleting order_execution.rs may flip config_has_recipient red for risk.min_risk_reward, which has a genuine reader (training_orchestrator.rs:2492).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 141,
+   "claim": "If checkpoint.rs goes, 4 core contract names become test-only (contracts/envelope.rs:56-59, primitives.rs:10, envelope.rs:156, lib.rs:37-38).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 142,
+   "claim": "4 of 8 typed env getters have zero callers (env_overrides.rs:114/:124/:133/:141).",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 143,
+   "claim": "NEOETHOS_PROP_FIRM_PRESET reported as an active override at startup though retired in v0.4.36.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 144,
+   "claim": "Phase B of the single-resolution plan landed for 4 of 8; symbol_metadata.rs:725 still bypasses with raw env::var.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 145,
+   "claim": "resolved_config reports two knobs as source=env from vars the engine no longer reads — misreports in both directions.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 146,
+   "claim": "evaluation_helpers.rs is 82 dead lines; each fn's only repo-wide hit is its own definition",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 147,
+   "claim": "simple_backtest is a second, wrong simulator (no spread, commission or sizing)",
+   "money_path": true,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 148,
+   "claim": "DeviceBenchmark dead under both cfg arms (hardware.rs:166-227)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 149,
+   "claim": "DevicePreference / select_device / select_device_from_assignment dead (hardware.rs:234/243/282)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 150,
+   "claim": "get_available_gpus / tune_torch_backend / enable_flash_attention dead (hardware.rs:328/344/372)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 151,
+   "claim": "configure_rayon_threads / get_parallel_jobs / distribute_gpu_assignment / get_gpu_for_model dead (hardware.rs:391/407/426/435)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 152,
+   "claim": "Their test block + tests/integration_test.rs:50-58 are the only consumers",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 153,
+   "claim": "[KEEP] HardwareInfo + gpu_supports_bf16 — one live consumer",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 154,
+   "claim": "runtime/onnx.rs 186 lines behind a feature enabled by nobody",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 155,
+   "claim": "ort dep + re-export + module gate + guard test",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 156,
+   "claim": "write_onnx_status_sidecar / __export_onnx plumbing writes a JSON saying it did nothing",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 157,
+   "claim": "models.export_onnx shipped `true` for a dead feature (config.rs:718/1739, config.yaml:359)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 158,
+   "claim": "Cargo.toml:210 comment falsely lists ort(cuda) in the gpu-cuda aggregate",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 159,
+   "claim": "get_model_info / list_models_by_category / is_valid_model tests-only (registry.rs:264/308/334)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 160,
+   "claim": "register_model / ModelInfo / ModelCategory tests-only (registry.rs:416/122/92)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 161,
+   "claim": "get_recommended_device / _with_plan / get_recommended_precision_with_plan zero callers including tests",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 162,
+   "claim": "[KEEP] get_model_capability is live on every train",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 163,
+   "claim": "HOLD supports_gpu_for_model / prefers_gpu_for_model — correct table, WIRE candidate for #35",
+   "money_path": false,
+   "effort": "hours — the table is correct and reads real cfg! features; it needs one caller that emits per-model supports/prefers into the training summary, which is task #35's device self-report",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 164,
+   "claim": "Flat-average EnsemblePredictor::predict impl dead; both prod consumers use predict_with_roles",
+   "money_path": true,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 165,
+   "claim": "maybe_abstain + abstain_below_confidence doubly unreachable (soft_voting.rs:344-355)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 166,
+   "claim": "with_default_config / experts_unused_for_voting / voting_expert_count tests-only; the documented 'Loaded X/32 experts' banner does not exist",
+   "money_path": false,
+   "effort": "trivial — add the two values to the existing tracing::info! at live_trading.rs:677-681, which already holds the ensemble handle",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 167,
+   "claim": "[KEEP] load_outcome is used",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 168,
+   "claim": "SoftVotingEnsembleConfig's 5 knobs unsettable; expert_weights always empty => all 33 experts weighted 1.0",
+   "money_path": true,
+   "effort": "hours — the plumbing is a Settings block plus one call swap from build_ensemble_for_symbol to build_ensemble_for_symbol_with_config; choosing the weights (validation-accuracy-derived vs operator-set) is the decision",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 169,
+   "claim": "tch feature + tch optional dep + 13 cfg sites, enabled by nothing",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 170,
+   "claim": "neat_gpu.rs + crfmnes_gpu.rs (822 lines) marked DEAD",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 171,
+   "claim": "reinforcement-learning-cuda 'enabled by nothing'",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 172,
+   "claim": "[KEEP] burn-cuda-backend exclusion is measured and documented; but the burn-cuda dep is still carried",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 173,
+   "claim": "exit_agent trained every run, loaded by nothing (~2,530 lines)",
+   "money_path": false,
+   "effort": "decision-required — either ship the exit-side decision loop that consumes ExitDecision3 (which is also the fix for #174), or stop requesting it at training_orchestrator.rs:547. Every run currently pays full training cost and disk for an artifact no code path reads.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 174,
+   "claim": "Its ExitDecision3 output is filtered out of voting (soft_voting.rs:234)",
+   "money_path": true,
+   "effort": "decision-required — this is the same decision as #173; wiring ExitDecision3 means designing an exit-side gate chain, not just removing a `continue`",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 175,
+   "claim": "genetic model runs a second, in-sample, unread GA inside train",
+   "money_path": false,
+   "effort": "decision-required — the escape hatch exists (models.discovery_runtime.genetic_expert_holdout) but flipping it changes which genes this expert produces AND starts erroring on datasets whose in-sample half is under 64 rows, per genetic.rs:546-550. That is an operator call, not a code fix.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 176,
+   "claim": "The loader whitelists both orphans by name, hiding the problem",
+   "money_path": false,
+   "effort": "trivial to delete — but it should only go once #173 and #175 are decided, otherwise the run starts warning about a state the operator deliberately chose",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 177,
+   "claim": "rllib_num_workers / ray_tune_max_concurrency only ever asserted non-zero at load",
+   "money_path": false,
+   "effort": "trivial to delete both knobs; decision-required if the operator wants to keep them as forward-compatible labels",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 178,
+   "claim": "use_rllib_agent / auto_enable_rllib inert; no Ray runtime exists",
+   "money_path": false,
+   "effort": "trivial — delete both knobs and fold the dqn request at :549 onto use_rl_agent alone; the honesty machinery at :1890-1910 and :2761-2769 goes with them",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 179,
+   "claim": "[KEEP] rl_parallel_envs / rl_eval_episodes DO change behaviour (defaults for update_interval/update_freq)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 180,
+   "claim": "models.tree_runtime.device inert — the default is never taken under the orchestrator",
+   "money_path": false,
+   "effort": "hours — but the real work is deciding precedence: should the hardware plan or the operator's tree_runtime.device win? Pick one and make the loser's field either read-only provenance or an explicit override that the plan respects.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 181,
+   "claim": "audit named the wrong survivor — models.tree_device_preference has TWO live readers",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 182,
+   "claim": "models.statistical_device: cpu means 539 lines of CUDA compile on every NVIDIA build and never run",
+   "money_path": false,
+   "effort": "decision-required — this is a product question (do the statistical models belong on the card at all?), not a dead-code fact. Either flip the default and measure, or drop statistical-gpu from the gpu-cuda aggregate and stop paying the compile.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 183,
+   "claim": "preferred_burn_device_policy feeds 12 ('device',…) entries that the hardware plan overwrites",
+   "money_path": false,
+   "effort": "hours — same precedence decision as #180; fixing them together is cheaper than separately",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 184,
+   "claim": "neuro_evo has no WorkloadKind => returns early and keeps the stale system.device string",
+   "money_path": false,
+   "effort": "trivial — add an Evolutionary arm (or widen the existing guard) so neuro_evo/neat map to a WorkloadKind; the risk is only in choosing WHICH kind, since it changes the device they train on",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 185,
+   "claim": "models.ddp_world_size called 'recorded only'",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 186,
+   "claim": "enable_ddp / enable_fsdp / symbol_hash_buckets genuinely recorded-only — the code states its own verdict",
+   "money_path": false,
+   "effort": "trivial to delete; decision-required to keep — they are honest provenance today, which is defensible, but three knobs the operator can toggle with no effect is the exact pattern this audit exists to remove",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 187,
+   "claim": "the six models.prop_search_* selection knobs called provenance strings",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 188,
+   "claim": "prop_search_async / prop_search_async_wait inert; both shipped ON against a `false` Default",
+   "money_path": false,
+   "effort": "trivial — either delete both knobs and the note, or set both YAMLs to false so the shipped value matches the Default. Do not implement async dispatch to justify the knob.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 189,
+   "claim": "[KEEP] models.hpo_backend is a legitimate provenance label read back",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 190,
+   "claim": "POST /orders enforces no configured risk; `use neoethos_core::Settings` does not appear in the file. Operator ruled W1 out of scope except require_stop_loss.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 191,
+   "claim": "place_pending has the same gap and does not even require a bracket.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 192,
+   "claim": "No downstream clamp: broker_api has zero hits for max_lot_size / risk_per_trade / require_stop_loss.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 193,
+   "claim": "risk.max_lot_size has exactly one reader in the workspace — the autopilot.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 194,
+   "claim": "risk.require_stop_loss displayed and never enforced.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 195,
+   "claim": "Manual orders do not consume an ACCOUNT_DAILY_ENTRIES slot.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 196,
+   "claim": "Demo gate scopes on symbol only, no active_account_id(). LEDGER CORRECTION: the ledger's own W2 instruction was wrong — applied literally the gate becomes unsatisfiable; replaced by an environment stamp on the journal row.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 197,
+   "claim": "The max_drawdown_pct criterion compares the whole account equity curve to one strategy's backtest DD.",
+   "money_path": true,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 198,
+   "claim": "The gate is evaluated once at start and never again.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 199,
+   "claim": "Meanwhile the environment is re-read from disk on every order (broker_api.rs:218, :270, :966).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 200,
+   "claim": "RiskyModeManager::check_trade_allowed had zero production callers.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 201,
+   "claim": "Its only construction was a read-only projection endpoint.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 202,
+   "claim": "record_kill_switch_trip is #[allow(dead_code)] — the attribute is the proof.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 203,
+   "claim": "A 5-second re-arm loop and a UI cooldown banner run off a clock no code path can start.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 204,
+   "claim": "Live sizes at 30–50% of the live balance with no kill switch, no accumulator, no presend ceiling.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 205,
+   "claim": "risky_mode.rs header binds to a TradingSession that does not exist in the workspace.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 206,
+   "claim": "Four risk.trailing_* fields have zero readers.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 207,
+   "claim": "Discovery hardcodes trailing instead (strategy_gene.rs:840-853).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 208,
+   "claim": "Live hardcodes trailing and reads the CONSTANT, not the field.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "PARTIAL"
+  },
+  {
+   "id": 209,
+   "claim": "risk.risk_per_trade bypassed in risky mode by two hardcoded consts.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 210,
+   "claim": "risk.risky_max_risk_per_trade is read only by the search.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 211,
+   "claim": "risk.max_portfolio_risk: 0.34 called inert / a max-1-position switch.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 212,
+   "claim": "risk.monthly_profit_target_pct written by the preset switch, read only by the dead manager.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 213,
+   "claim": "POST /risk/preset writes raw firm ceilings while RiskConfig::default buffers them ×0.7.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "OPEN"
+  },
+  {
+   "id": 214,
+   "claim": "The f32→f64 fingerprints in the shipped root file prove the raw write already happened — live total-DD sits at 20%, not 14%.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 215,
+   "claim": "live_journal writes nothing unless NEOETHOS_BOT_LIVE_JOURNAL_PATH is set.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 216,
+   "claim": "record_live_outcome_best_effort runs on every broker execution and silently returns Ok(false).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 217,
+   "claim": "The kill_zones_enabled knob is one-sided: it can only make live less safe than every validated backtest.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 218,
+   "claim": "strategy_blacklist fingerprints the artifact FILE, not the strategy.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 219,
+   "claim": "Discovery never consults the blacklist (zero hits in neoethos-search).",
+   "money_path": true,
+   "effort": "hours",
+   "status": "OPEN"
+  },
+  {
+   "id": 220,
+   "claim": "impl ExecutionAdapter for has exactly one hit and it is the mock.",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 221,
+   "claim": "Both RiskGate impls are non-production (permissive + test-only cap).",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 222,
+   "claim": "The Phase-5 table forward-references two types no production code constructs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 223,
+   "claim": "EngineStats.intents_blocked is structurally always zero and the CLI prints it.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 224,
+   "claim": "EngineConfig::default() hardcodes starting_balance: 10_000 at all 5 production sites.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 225,
+   "claim": "Replay bracket is a 0.5%-of-price stop, not the gene's SL/TP.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 226,
+   "claim": "Replay fills at the mark: zero spread, zero commission, zero slippage.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 227,
+   "claim": "Replay has no break-even and no trailing anywhere in the crate.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 228,
+   "claim": "Replay closes+reopens on every non-flat bar — the exact profile live_trading documents as never validated.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 229,
+   "claim": "POST /autonomous/replay runs a 3-bar momentum stub while its doc claims parity.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 230,
+   "claim": "ReplayBody is {symbol, base_tf} only — the UI cannot reach the portfolio replay.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 231,
+   "claim": "replay_blend_from_dir is not compiled into the app at all (no ml-blend feature) yet its doc asserts both front-ends.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 232,
+   "claim": "BlendConfig.gate_floor 0.34 / veto_below 0.15 are literals in the live sizing path.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 233,
+   "claim": "TradeIntent::Amend/Cancel never constructed; the live loop amends stops directly, bypassing the type built for it.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 234,
+   "claim": "Direction::opposite, PositionManager::open_positions/has_open, AutonomousEngine::registry/positions, MockFill, combine_gene_signals_with_confidence — zero call sites.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 235,
+   "claim": "8 of 11 unused cTrader builders are safe to delete.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 236,
+   "claim": "KEEP-and-WIRE build_amend_order_request — the UI can cancel a pending order but not modify one.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 237,
+   "claim": "KEEP-and-WIRE build_unsubscribe_spots_request — the streamer subscribes and never unsubscribes.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 238,
+   "claim": "KEEP-and-WIRE build_margin_call_list_request — a broker margin call is a live risk signal nothing reads.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 239,
+   "claim": "The broker can push closed bars; the live loop polls every TF every bar instead.",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 240,
+   "claim": "models.live_ml_gate false in code default, root YAML and seed ⇒ 33 experts trained and dropped every run.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 241,
+   "claim": "Even ON, ML may only shrink size or veto — genes keep direction.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 242,
+   "claim": "KEEP — confirm the REAL gates still intact: daily entry cap, total-DD, daily-loss, spread, news, ML, auto-cull→blacklist→rediscovery.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 243,
+   "claim": "376 pub fields across 19 structs => 371 operator-settable knobs",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 244,
+   "claim": "root 389 keys / seed 219 / 170 missing / 0 unique to the seed",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 245,
+   "claim": "seed ships account_currency: USD while the account is GBP",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "OPEN"
+  },
+  {
+   "id": 246,
+   "claim": "seed ships discovery_mode: prop_firm, root risky",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 247,
+   "claim": "seed ships prefilter_top_k: 50, root 240",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 248,
+   "claim": "seed ships prop_firm_rules: true, root false",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 249,
+   "claim": "daily_drawdown_limit 0.10000000149011612 vs 0.04",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 250,
+   "claim": "total_drawdown_limit 0.20000000298023224 vs 0.07",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 251,
+   "claim": "models.discovery_runtime is missing from the seed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 252,
+   "claim": "from_yaml has no deny_unknown_fields and no completeness check => keys silently take Default",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 253,
+   "claim": "AutoTuner has zero callers — 9 assignments that never execute",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 254,
+   "claim": "AutoTuner is the only code that writes those fields",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 255,
+   "claim": "system.enable_gpu / models.train_batch_size / models.hpo_trials are collateral deletions",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 256,
+   "claim": "only models.inference_batch_size and system.n_jobs are truly readerless",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 257,
+   "claim": "apply_thread_env_defaults is the ONLY workspace code setting OMP/MKL/OPENBLAS thread counts — re-home before deleting",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 258,
+   "claim": "prop_search_device beats enable_gpu_preference whenever non-empty => the UI's only compute control never decides the search",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 259,
+   "claim": "cpu_forced is unreachable from the UI (400 on anything but auto|cpu|gpu) while the screen renders 'Active: cpu'",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 260,
+   "claim": "the silent-CPU-run half is CLOSED at HEAD — resolve_with_probe escalates everything but cpu_forced",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 261,
+   "claim": "12 knobs for 6 GA-selection decisions: prop_search_* vs search_runtime.*",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 262,
+   "claim": "shipped disagreement: immigrant 0.18 (set) vs 0.25 (used)",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 263,
+   "claim": "shipped disagreement: tournament 10 (set) vs null -> derived size",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 264,
+   "claim": "the two defaults diverged independently too",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 265,
+   "claim": "three starting balances for one concept: 10 000 / 100 000 / 10 000",
+   "money_path": true,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 266,
+   "claim": "models.backtest_runtime.initial_equity is HALF_WIRED",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 267,
+   "claim": "POST /settings {tradingMode} flips system.trading_mode only, leaving models.discovery_mode behind",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 268,
+   "claim": "system.trading_mode is absent from the seed and relies on a Rust Default to agree",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 269,
+   "claim": "drawdown ceilings: buffered Default vs raw preset writer",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 270,
+   "claim": "apply_mode_overrides is multiplicative and not idempotent",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 271,
+   "claim": "call-site list wrong: orchestration.rs:127 has no such call; 5 production sites, not 6",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 272,
+   "claim": "exposure inverted: the block sits in the PropFirm arm => the fresh install is exposed, the dev tree is immune",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 273,
+   "claim": "knob_catalog advertises 49 env vars; 45 are inert",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 274,
+   "claim": "10 catalog env names have zero readers anywhere",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 275,
+   "claim": "35 catalog env names are read only inside orphaned from_env constructors",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 276,
+   "claim": "only 4 are genuinely live: RUST_LOG, LOG_DIR, NEOETHOS_USER_DATA_DIR, NEOETHOS_BOT_SYMBOL_METADATA",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 277,
+   "claim": "five install_*_from_env wrappers have zero call sites",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 278,
+   "claim": "SmcSearchConfig::from_env() is live under a misleading name — rename to current(), do not delete",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 279,
+   "claim": "collateral the audit missed: RAYON_NUM_THREADS is read only inside the orphaned from_env",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 280,
+   "claim": "NEOETHOS_BOT_CPU_BUDGET is honoured by the CLI only; the app and desktop never call apply_process_cpu_assignment",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 281,
+   "claim": "env-count discrepancy across sections: 178/138 vs 187/167 vs the stale in-repo 215/183",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 282,
+   "claim": "config_has_recipient's matcher is receiver-blind",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 283,
+   "claim": "146 of 372 knob names (39%) also exist as a pub <name>: field elsewhere",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 284,
+   "claim": "false pass: models.inference_batch_size + system.n_jobs on AutoTuneHints",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 285,
+   "claim": "false pass: risk.require_stop_loss on RiskDto",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 286,
+   "claim": "false passes: risk.trailing_min_lock_pips and risk.high_quality_confidence on BacktestSettings",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 287,
+   "claim": "false pass: risk.min_risk_reward on OrderExecutorConfig in a module nothing constructs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 288,
+   "claim": "both ledgers capped at 3 and asserted to only shrink — pressure to find any token",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 289,
+   "claim": "export gates were disarmed deliberately with a dated 2026-06-06 mandate; the real defect is that ModelsConfig::default() still encodes the pre-mandate posture",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 290,
+   "claim": "proposed cheapest test: pin gate-class fields to the same value in Default, root and seed",
+   "money_path": false,
+   "effort": "hours",
+   "status": "PARTIAL"
+  },
+  {
+   "id": 291,
+   "claim": "proposal: generate the seed from Settings::default() at build time",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 292,
+   "claim": "only 30 of 371 knobs are writable via POST /settings; 24 have a UI control",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 293,
+   "claim": "POST /settings/raw validates schema, not values",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 294,
+   "claim": "six Settings fields with literally no reader (standing ledger, unshrunk)",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 295,
+   "claim": "73 root values contradict the Rust Default; 43 seed values do",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 296,
+   "claim": "regime_router_enabled, multi_resolution_enabled, export_onnx contradict Default in both files",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 297,
+   "claim": "7,730,879 trainable neural params for the whole fleet on one (symbol, TF) = 0.39% of 2B",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 298,
+   "claim": "largest artifact is xgboost_rf at 113.45 MB; store 287.46 MB / 43 instances",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 299,
+   "claim": "three shipped artifacts numerically broken (tide 1308811.5, tide_nf 51699690.0, sac final_alpha 5.69e9) and all three are in DEFAULT_BOOTSTRAP_EXPERT_NAMES",
+   "money_path": true,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 300,
+   "claim": "14 symbols have data; system.watchlist lists 92; 78 have none",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 301,
+   "claim": "9,054 rows x 20 of ~3,700 features x 100-bar label => ~91 independent label events",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 302,
+   "claim": "capacity curve already measured flat-to-negative: OOS accuracy 0.6218 in every trial of every architecture",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 303,
+   "claim": "6 of 10 models hit best validation loss within 5 epochs",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 304,
+   "claim": "no time axis: 13 of 14 forward are Tensor<B,2>; transformer token_size = 20/8 = 3",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 305,
+   "claim": "models.transformer_seq_len is mapped to token_count then clamped to input_dim — it is not a sequence length",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 306,
+   "claim": "no GPU training backend for neural models; every config.json reads ndarray_cpu on the gpu-nvidia build",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 307,
+   "claim": "no distributed training — the code states it",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 308,
+   "claim": "no inference-time regime router; regime_*_models are read only to decide what to train",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 309,
+   "claim": "DQN CUDA path compiled since today; has never produced an artifact",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 310,
+   "claim": "zero RL output has ever reached a trade",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 311,
+   "claim": "live/online learning has never executed: 13 records vs a 40-record floor; and it is forbidden from influencing trades",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 312,
+   "claim": "there is no code path anywhere that updates a model weight from a live outcome",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 313,
+   "claim": "Decision — Option A: real 256-bar x 71-feature window, +1.3% params for ~900x input",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 314,
+   "claim": "Decision — Option B: wire the regime router at inference, 0 params",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 315,
+   "claim": "Decision — Option C: set expert_weights from validation accuracy, 0 params",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 316,
+   "claim": "Decision — Option D: widen L1 selection 20 -> 256",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 317,
+   "claim": "Decision — Option E: 2B on the current 20-number single-bar input = x259 params, x1 information",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 318,
+   "claim": "no capacity-sweep script exists in scripts/ — the gap is itself a finding",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 319,
+   "claim": "UNCERTAIN: whether the desktop CWD-relative config path has ever misfired",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 320,
+   "claim": "UNCERTAIN: whether rented-box parity scripts select prototype_b_mirror's warp_first_hit tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 321,
+   "claim": "UNCERTAIN: whether the DQN CUDA path reproduces the CPU numbers — needs one card run",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 322,
+   "claim": "UNCERTAIN: whether require_walkforward_for_export:false + prop_firm_min_pass_rate:0.0 is still the right posture",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 323,
+   "claim": "UNCERTAIN: whether the 78 dataless watchlist symbols break any consumer",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  }
+ ]
+}
