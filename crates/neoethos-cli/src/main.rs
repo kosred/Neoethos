@@ -1112,6 +1112,22 @@ fn cmd_search(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// What a streaming sweep leaves behind, beyond the per-batch portfolios: the
+/// run-level canonical feature list, the survivors remapped onto it, and the
+/// census of every batch the sweep abandoned.
+///
+/// Carried as a struct so the artifact-writing block below reads the same
+/// whether the sweep ran one batch or forty.
+struct StreamingArtifactBundle {
+    canonical: neoethos_search::orchestration::CanonicalFeatureIndex,
+    survivors: Vec<neoethos_search::orchestration::CanonicalSurvivor>,
+    ledger: neoethos_search::orchestration::StreamingRunLedger,
+    next_cursor: usize,
+    space_len: usize,
+    batch_columns: usize,
+    streamed: bool,
+}
+
 fn cmd_discover(args: &[String]) -> Result<()> {
     let result = (|| -> Result<(String, String, usize, usize)> {
         let settings = resolve_cli_settings(args)?;
@@ -1215,8 +1231,6 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             &base,
             neoethos_data::MANDATORY_TFS,
         )?;
-        let features =
-            neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
         let base_ohlcv = dataset
             .frames
             .get(&base)
@@ -1242,16 +1256,112 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             ..defaults.clone()
         }
         .apply_mode_overrides();
+        // ── THE STREAMING WORKING-SET SWEEP (opt-in) ────────────────────────
+        //
+        // `--stream-sweep` advances the working set through the
+        // (indicator, period) space in batches instead of building ONE cube and
+        // searching it. `--stream-max-batches N` spends at most N batches
+        // (default: until the space is exhausted).
+        //
+        // The batch WIDTH is deliberately not a flag: it comes from free RAM
+        // and the widest frame via `hpc_ta::streaming_batch_columns`, so peak
+        // memory is a function of the hardware and never of what the operator
+        // typed (the never-OOM invariant).
+        //
+        // WITHOUT the flag this is byte-for-byte the previous code: one
+        // `prepare_multitimeframe_features`, one holdout cycle, the same
+        // artifacts. That is the parity case, and it is the default.
+        let stream_sweep = has_flag(args, "--stream-sweep");
+        let stream_max_batches: usize = parse_flag(args, "--stream-max-batches")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         // Audit B02/B03 (2026-07-13): the CLI used to run discovery on the
         // FULL series — no held-out tail, so every "validation" window had
         // already been seen during selection. The holdout wrapper withholds
         // the last 20% and attaches honest forward-test/prop-firm evidence.
-        let result = neoethos_search::run_discovery_cycle_with_holdout(
-            &features,
-            base_ohlcv,
-            &config,
-            neoethos_search::PropFirmRiskRules::default(),
-        )?;
+        let (result, streaming) = if !stream_sweep {
+            let features =
+                neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
+            let result = neoethos_search::run_discovery_cycle_with_holdout(
+                &features,
+                base_ohlcv,
+                &config,
+                neoethos_search::PropFirmRiskRules::default(),
+            )?;
+            (result, None)
+        } else {
+            let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
+                &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                base_ohlcv.close.len(),
+                // The ONLY sanctioned build entry point: it installs the batch
+                // as the working set and restores the previous one afterwards,
+                // even on panic. `None` is documented as byte-identical to
+                // `prepare_multitimeframe_features`.
+                |batch| {
+                    neoethos_data::prepare_multitimeframe_features_batch(
+                        &dataset,
+                        &base,
+                        &higher_refs,
+                        batch,
+                    )
+                },
+                |features| {
+                    neoethos_search::run_discovery_cycle_with_holdout(
+                        features,
+                        base_ohlcv,
+                        &config,
+                        neoethos_search::PropFirmRiskRules::default(),
+                    )
+                },
+            )?;
+            if outcome.batches.is_empty() {
+                // Loud, and it NAMES every abandoned cursor. An empty sweep
+                // that says only "no portfolio" is the silent drop with extra
+                // steps.
+                let rejected: Vec<(usize, &'static str)> = outcome
+                    .ledger
+                    .rejected_rows()
+                    .iter()
+                    .map(|row| (row.cursor, row.outcome.as_str()))
+                    .collect();
+                anyhow::bail!(
+                    "streaming sweep produced no portfolio: {} batches attempted, {} abandoned \
+                     (counts: {:?}; abandoned cursors: {:?}). The sweep covered pairs \
+                     [0, {}) of {} at {} columns per batch. Nothing was lost silently — every \
+                     cursor above has a reason in the run log \
+                     (target=neoethos_search::batch_ledger).",
+                    outcome.ledger.batches_seen(),
+                    outcome.ledger.batches_rejected(),
+                    outcome.ledger.counts_by_outcome(),
+                    rejected,
+                    outcome.next_cursor,
+                    outcome.space_len,
+                    outcome.batch_columns
+                );
+            }
+            // Provenance for the run-level artifact is collected BEFORE the
+            // primary batch is moved out for the per-run artifacts below.
+            let survivors = outcome.survivors();
+            let bundle = StreamingArtifactBundle {
+                canonical: outcome.canonical.clone(),
+                survivors,
+                ledger: outcome.ledger.clone(),
+                next_cursor: outcome.next_cursor,
+                space_len: outcome.space_len,
+                batch_columns: outcome.batch_columns,
+                streamed: outcome.streamed,
+            };
+            // The FIRST surviving batch takes today's artifact paths, so a
+            // single-batch sweep writes exactly the file set a non-streaming
+            // run writes. Later batches are written beside it, keyed by cursor.
+            let primary = outcome.batches.remove(0);
+            let extra: Vec<(usize, neoethos_search::DiscoveryResult)> = outcome
+                .batches
+                .into_iter()
+                .map(|batch| (batch.cursor, batch.result))
+                .collect();
+            (primary.result, Some((bundle, extra)))
+        };
         if let Some(parent) = std::path::Path::new(&out).parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1327,6 +1437,73 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         if !result.walkforward_validation_artifacts.is_empty() {
             let validation_dir = format!("{out}.walkforward_validations");
             neoethos_search::save_walkforward_validation_artifacts(&validation_dir, &result)?;
+        }
+        // ── The streaming run artifact ──────────────────────────────────────
+        //
+        // Written ONLY on a streaming run, and never instead of the per-batch
+        // artifacts: each surviving batch keeps its own portfolio JSON, whose
+        // genes address that batch's own `effective_feature_names` and are
+        // therefore still internally consistent. THIS file is the run-level
+        // view — Option C's canonical name list, the survivors remapped onto
+        // it with the cursor that produced each one, and the batch census.
+        if let Some((bundle, extra)) = streaming {
+            for (cursor, batch_result) in &extra {
+                let batch_out = format!("{out}.batch{cursor}.json");
+                // Non-fatal, deliberately: `save_portfolio_json` runs the
+                // export-readiness gate, and a later batch failing it must not
+                // discard the batches already written. Nothing is lost — the
+                // genes themselves are in the run-level artifact below, with
+                // this cursor on them — but the failure is named, not swallowed.
+                if let Err(err) = neoethos_search::save_portfolio_json(&batch_out, batch_result) {
+                    tracing::warn!(
+                        target: "neoethos_cli::discover",
+                        error = %err,
+                        cursor = *cursor,
+                        path = %batch_out,
+                        "per-batch portfolio export failed (non-fatal — this batch's survivors \
+                         are still in the streaming run artifact)"
+                    );
+                }
+            }
+            let genes: Vec<neoethos_search::Gene> = bundle
+                .survivors
+                .iter()
+                .map(|survivor| survivor.gene.clone())
+                .collect();
+            // INVARIANT 4 again, at the artifact boundary this time: nothing
+            // leaves the process addressing a name that does not exist.
+            bundle
+                .canonical
+                .assert_indices_in_range(&genes, "cli streaming run portfolio")?;
+            let artifact = neoethos_search::orchestration::StreamingRunPortfolio {
+                schema_version:
+                    neoethos_search::orchestration::STREAMING_RUN_PORTFOLIO_SCHEMA_VERSION,
+                symbol: symbol.clone(),
+                base_timeframe: base.clone(),
+                higher_timeframes: config.higher_timeframes.clone(),
+                canonical_feature_names: bundle.canonical.names().to_vec(),
+                survivors: bundle.survivors,
+                next_cursor: bundle.next_cursor,
+                space_len: bundle.space_len,
+                batch_columns: bundle.batch_columns,
+                ledger: bundle.ledger,
+            };
+            let streaming_path = format!("{out}.streaming.json");
+            std::fs::write(&streaming_path, serde_json::to_string_pretty(&artifact)?)?;
+            println!(
+                "Streaming sweep streamed={} batches={} kept={} abandoned={} survivors={} \
+                 canonical_features={} cursor={}/{} batch_columns={} out={}",
+                bundle.streamed,
+                artifact.ledger.batches_seen(),
+                artifact.ledger.batches_kept(),
+                artifact.ledger.batches_rejected(),
+                artifact.survivors.len(),
+                artifact.canonical_feature_names.len(),
+                artifact.next_cursor,
+                artifact.space_len,
+                artifact.batch_columns,
+                streaming_path
+            );
         }
         println!(
             "Discovery {} portfolio={} candidates={} out={}",
@@ -2965,6 +3142,9 @@ fn print_help() {
     );
     println!(
         "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
+    );
+    println!(
+        "  discover ... --stream-sweep [--stream-max-batches N]  Sweep the (indicator, period) space in BATCHES instead of building one cube: a batch is sized from FREE RAM (never a flag), a discovery cycle runs per batch, and a batch whose candidates cannot clear the CONFIGURED expectancy floor is abandoned before the quality screen. Survivors from different batches are remapped onto one run-level feature list; every abandoned batch is named by cursor in <out>.streaming.json."
     );
     println!(
         "  discovery-promote-weekly [--symbol EURUSD --tf M1] [--cache-dir cache/search] [--portfolio <live_portfolio.json>]  Weekly-refresh: merge this run's discovery ledger into the live portfolio (additive by gene-signature hash) and print 'added N new, carried M, total K'."

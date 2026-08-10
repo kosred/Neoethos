@@ -516,11 +516,20 @@ async fn preflight_discovery_data_root(
 /// `start_training_job` against the same pair. That's the
 /// "natural sequence" the operator expects:
 ///
-///     Discovery (GA-evolves a portfolio)
-///        ↓ writes model_targets.json
-///     Training (34-model ensemble fits per model_targets.json)
-///        ↓ writes models/*.{pkl,joblib,pt}
-///     (Auto-Trader — lands in a follow-up)
+/// ```text
+/// Discovery (GA-evolves a portfolio)
+///    ↓ writes model_targets.json
+/// Training (34-model ensemble fits per model_targets.json)
+///    ↓ writes models/*.{pkl,joblib,pt}
+/// (Auto-Trader — lands in a follow-up)
+/// ```
+///
+/// The fence is `text` and is LOAD-BEARING, not cosmetic. Indented four
+/// spaces, rustdoc took this diagram for a Rust code block and compiled it:
+/// `↓` is "unknown start of token" and the `/*` inside `models/*.{...}` opens
+/// a block comment that never closes (E0758). `cargo test -p neoethos-app
+/// --doc` failed on it until 2026-08-10 — a `--lib` run never builds
+/// doctests, which is why it survived.
 ///
 /// Auto-chain is suppressed if the user already started Training
 /// manually before Discovery finishes (Training is single-job:

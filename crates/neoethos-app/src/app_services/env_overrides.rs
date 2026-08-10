@@ -304,10 +304,19 @@ pub fn capture_fixtures_dir() -> Option<String> {
 ///
 /// **Usage** — call from any cTrader message-parser site after
 /// successfully decoding a `ProtoOA*` response:
-/// ```rust
-/// use crate::app_services::env_overrides::capture_fixture;
+/// ```no_run
+/// use neoethos_app::app_services::env_overrides::capture_fixture;
+///
+/// let raw_bytes: &[u8] = b"\x08\x01";
 /// capture_fixture("ProtoOADealListRes", raw_bytes);
 /// ```
+///
+/// This example COMPILES, and it did not before 2026-08-10: it said
+/// `use crate::app_services::…` (a doctest is a separate crate, so `crate::`
+/// is the doctest itself — E0433) and called an undeclared `raw_bytes`
+/// (E0425). It is `no_run` rather than plain: type-checking the call is the
+/// whole value, while executing it would go looking for the configured
+/// capture directory from inside a doctest.
 ///
 /// Errors are logged at `warn` level but never propagated — capture
 /// is best-effort diagnostic, not a correctness contract. A failed

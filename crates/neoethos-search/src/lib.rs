@@ -5,6 +5,15 @@ mod artifact_io;
 // gates in `crates/neoethos-search/src/discovery.rs` + dual-mode separation
 // (PropFirm vs Risky). 161 LOC removed.
 pub mod checkpoint;
+// **The consumer for `trial_returns`** (2026-08-10). The reader for the
+// per-trial return matrix, plus the two statistics that judge the SEARCH rather
+// than the winner: the Deflated Sharpe Ratio and PBO by CSCV. Before this
+// module the matrix was written and never read, which meant no result this
+// project produced was falsifiable — including a good one. Both statistics
+// REFUSE with a named reason when the matrix is too short or too small to
+// support them, and both are attached to every trial-returns manifest by
+// `TrialReturnsWriter::finish`, from where the discovery ledger embeds them.
+pub mod deflated;
 // SL/TP-faithful CUDA eval/backtest kernel via cubecl 0.9. The CPU
 // fallback ships as the default no-gpu build — `evaluate_population_core`
 // in `eval.rs` routes through this kernel when the `gpu` feature is on
@@ -125,8 +134,14 @@ pub use run_identity::{
     max_achievable_payoff, payoff_inputs_for_config, stamp_resolved_config,
 };
 pub use trial_returns::{
-    TrialReturnMatrix, TrialReturnRow, TrialReturnsManifest, month_keys_spanning, period_returns,
-    write_trial_returns,
+    TrialReturnMatrix, TrialReturnRow, TrialReturnsManifest, TrialReturnsWriter,
+    month_keys_spanning, period_returns, write_trial_returns,
+};
+pub use deflated::{
+    DecodeError, DecodedTrialMatrix, DecodedTrialRow, DeflatedSharpeReport, PboReport,
+    TRIAL_STATISTICS_SCHEMA, TrialStatisticsReport, analyse_bytes, analyse_matrix, analyse_run,
+    decode as decode_trial_matrix, deflated_sharpe, pbo_cscv, read_matrix as read_trial_matrix,
+    read_matrix_at as read_trial_matrix_at,
 };
 
 pub use eval::{

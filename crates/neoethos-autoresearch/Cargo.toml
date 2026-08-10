@@ -1,0 +1,80 @@
+[package]
+name = "neoethos-autoresearch"
+version = "0.5.6"
+edition.workspace = true
+license.workspace = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCIES ARE A SAFETY BOUNDARY HERE, NOT A CONVENIENCE.
+#
+# `docs/autoresearch-loop.md` §2 and non-negotiable 5: the loop must be
+# STRUCTURALLY incapable of reaching a broker or of writing `live_portfolio.json`.
+# That is enforced here, at the dependency edge, and not by reviewing call sites:
+#
+#   * NOT `neoethos-app`     — the HTTP server, the order routes, the cTrader client.
+#   * NOT `neoethos-trader`  — execution, position sizing, the live journal.
+#   * NOT `neoethos-models`  — nothing in the loop trains or loads a model.
+#
+# A future edit that adds either of the first two makes this comment false, so
+# `tests/no_broker_dependency.rs` reads this manifest and fails if it does.
+# ─────────────────────────────────────────────────────────────────────────────
+[dependencies]
+neoethos-core = { path = "../neoethos-core" }
+neoethos-search = { path = "../neoethos-search" }
+neoethos-data = { path = "../neoethos-data" }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+# Companion of rand 0.9, already resolved in Cargo.lock by neoethos-search.
+# The session RNG must be a NAMED, reproducible stream: a proposal has to be
+# replayable from (session_seed, sweep_index) alone (design §3), which
+# `rand::rng()` cannot promise across platforms or rand releases.
+rand_chacha = "0.9.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPABILITY FEATURES — each one turns on a probe, not a behaviour.
+#
+# The design needs knobs `neoethos-search` does not have yet (docs/autoresearch-
+# loop.md §14.6–14.8). Every one of them is behind a feature whose ONLY effect,
+# when enabled, is to compile a function that reads the field. So a feature
+# cannot be turned on before the field exists: the crate stops compiling and the
+# error names the missing symbol.
+#
+# With a feature OFF, the axis-A level or axis-B variant that needs it is
+# EXCLUDED from the drawable space and named in the space report — never drawn
+# and silently reduced to the default, which would make the loop appear to run a
+# variant it is not running. `space::Capabilities::compiled()` is the only
+# reader; nothing else may branch on these.
+#
+# ALL DEFAULT OFF. Turning one on without applying its §14 edit is a compile
+# error, by design.
+# ─────────────────────────────────────────────────────────────────────────────
+[features]
+default = []
+# §14.6 — StreamingPlan::start_cursor
+search-streaming-start-cursor = []
+# §14.3 — ResolvedConfigStamp::ga_seed (without it, replicates are identified by
+# the pair (config_hash, replicate_seed) and the session header says so)
+search-stamp-ga-seed = []
+# §14.7 — the objective knobs
+search-label-horizon = []
+search-fitness-table = []
+search-cost-edge-scoring = []
+search-conditioning-set = []
+search-in-market-fitness = []
+search-t-stat-objective = []
+search-portfolio-objective = []
+
+[dev-dependencies]
+# Pinned to the 3.27 already in Cargo.lock so this adds a dependency EDGE and
+# not a second copy in the graph.
+tempfile = "3.27"
+
+[lints.rust]
+# The loop runs unattended for days. An ignored Result is exactly how a
+# journal append or an fsync goes missing without anyone noticing.
+unused_must_use = "deny"

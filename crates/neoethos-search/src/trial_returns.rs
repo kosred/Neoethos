@@ -63,17 +63,31 @@
 //! ## What this buys
 //!
 //! Nothing in money. It buys falsifiability: with this file, DSR and PBO become
-//! computable, and a future claim about a discovered strategy can be checked
-//! against the search that produced it.
+//! computable, and a claim about a discovered strategy can be checked against
+//! the search that produced it.
 //!
-//! ## What it does NOT yet buy — stated so nobody reads more into the file
+//! ## The consumer exists — 2026-08-10
 //!
-//! Nothing in this workspace READS this matrix yet. No Deflated Sharpe Ratio and
-//! no CSCV/PBO is computed from it (the `pbo` in `discovery.rs` is a per-
-//! candidate CPCV number, a different object entirely). So "DSR and PBO are
-//! computable" is a statement about the FORMAT, not about the pipeline: the
-//! precondition landed, the falsifiability it buys is not purchased until a
-//! consumer exists.
+//! This section previously read *"Nothing in this workspace READS this matrix
+//! yet … the precondition landed, the falsifiability it buys is not purchased
+//! until a consumer exists."* [`crate::deflated`] is that consumer.
+//!
+//! [`TrialReturnsWriter::finish`] decodes the bytes it has just re-read for the
+//! hash and computes both statistics from them:
+//!
+//! * the **Deflated Sharpe Ratio** of the best trial, against `trials_offered`
+//!   — the honest denominator, which is the count the SCREEN offered, not the
+//!   survivors and not the rows a disk-budget stride retained; and
+//! * **PBO by CSCV** over the calendar-month grid.
+//!
+//! Both land in [`TrialReturnsManifest::statistics`], which the discovery ledger
+//! already embeds wholesale (`discovery_ledger.rs`), and both are logged at run
+//! end beside the `config_hash`. Either may be a REFUSAL: a matrix too short or
+//! too small to support a statistic produces a named reason rather than a
+//! confident number, and the refusal travels exactly like a value would.
+//!
+//! Note that the `pbo` field in `discovery.rs` is a per-candidate CPCV number, a
+//! different object entirely — this one is a property of the SEARCH.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -186,6 +200,18 @@ pub struct TrialReturnsManifest {
     pub dtype: String,
     pub returns_unit: String,
     pub initial_balance: f64,
+
+    /// **What the matrix actually says about the search that produced it.**
+    ///
+    /// The Deflated Sharpe Ratio and the CSCV/PBO, computed by
+    /// [`crate::deflated`] from the very bytes this manifest hashes, at the
+    /// moment they are written. Both may be REFUSALS — a refusal is a result and
+    /// is recorded as one, so "the matrix was too short to support the
+    /// statistic" can never be mistaken for "the statistic was never run".
+    ///
+    /// `None` only for a manifest written by a build older than 2026-08-10.
+    #[serde(default)]
+    pub statistics: Option<crate::deflated::TrialStatisticsReport>,
 }
 
 /// `<cache_dir>/{SYMBOL}_{TF}.trial_returns.json` — the manifest.
@@ -543,6 +569,19 @@ impl TrialReturnsWriter {
         let bytes = std::fs::read(&self.path)
             .with_context(|| format!("re-read trial-returns payload {}", self.path.display()))?;
 
+        // READ WHAT WE JUST WROTE. Until 2026-08-10 this module's own doc said
+        // "nothing in this workspace READS this matrix yet", and a matrix nobody
+        // reads makes no result falsifiable. The bytes are already in hand for
+        // the hash, so the two statistics that judge the SEARCH — the Deflated
+        // Sharpe Ratio and the CSCV/PBO — cost one decode and are computed here,
+        // where the trial count is still honest (`self.offered`, not the count
+        // of survivors, and not the count of rows a disk-budget stride retained).
+        //
+        // Never fatal: `analyse_bytes` turns a decode failure into a refusal on
+        // both statistics rather than an error, because a run that produced its
+        // artifacts must not be failed by its own self-assessment.
+        let statistics = crate::deflated::analyse_bytes(&bytes, self.offered);
+
         let dropped = self.offered.saturating_sub(self.written);
         let retention_rule = if self.stride <= 1 {
             "all".to_string()
@@ -595,10 +634,32 @@ impl TrialReturnsWriter {
             dtype: "f64_le".to_string(),
             returns_unit: "fraction_of_initial_balance".to_string(),
             initial_balance: self.initial_balance,
+            statistics: Some(statistics.clone()),
         };
         let man = manifest_path(&self.cache_dir, &self.symbol, &self.timeframe);
         write_json_atomic(&man, &manifest)
             .with_context(|| format!("write trial-returns manifest {}", man.display()))?;
+
+        // PRINTED AT RUN END, NEXT TO THE CONFIG HASH. The caller
+        // (`discovery.rs`, the `writer.finish(...)` arm) logs the manifest with
+        // `config_hash`; this is the same moment, and both values plus every
+        // assumption behind them go to the operator's console rather than only
+        // into a JSON file nobody opens. `deflated_sharpe`/`pbo` are emitted as
+        // structured fields too, so a log scrape can find them without parsing
+        // the rendered block.
+        tracing::info!(
+            target: "neoethos_search::trial_returns",
+            symbol = %manifest.symbol,
+            timeframe = %manifest.timeframe,
+            config_hash = ?manifest.config_hash,
+            trials_offered = manifest.trials_offered,
+            trials_written = manifest.trials_written,
+            deflated_sharpe = ?statistics.dsr_value(),
+            pbo = ?statistics.pbo_value(),
+            "trial-return matrix read back — the search judged by its own record\n{}",
+            statistics.render()
+        );
+
         Ok(manifest)
     }
 }
@@ -964,6 +1025,116 @@ mod tests {
         let expected = encode(&matrix, &refs);
         let actual = std::fs::read(binary_path(&cache, "EURUSD", "M5")).unwrap();
         assert_eq!(actual, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The reader is CALLED, not merely written.**
+    ///
+    /// A statistic nobody invokes is the same defect one layer out from a matrix
+    /// nobody reads. `finish` must attach the statistics block to every manifest
+    /// it writes — and on a 3-month, 7-trial matrix both statistics must REFUSE
+    /// with a named reason rather than emit a confident number.
+    #[test]
+    fn finish_reads_the_matrix_back_and_attaches_both_statistics() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_stats_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let keys = month_keys_spanning(JAN_2024, MAR_2024);
+        let rows: Vec<TrialReturnRow> = (0..7)
+            .map(|i| TrialReturnRow {
+                candidate_index: i,
+                strategy_id: format!("gene_{i}"),
+                returns: vec![0.01 * i as f64, 0.0, -0.02],
+                trades_outside_grid: 0,
+            })
+            .collect();
+
+        let mut w = TrialReturnsWriter::open(
+            &cache,
+            "eurusd",
+            "m5",
+            keys,
+            10_000.0,
+            rows.len(),
+            Some("fnv64:cafebabe".to_string()),
+        )
+        .unwrap();
+        w.append(&rows).unwrap();
+        let m = w.finish(1_717_000_000_000).unwrap();
+
+        let stats = m.statistics.as_ref().expect("finish must attach statistics");
+        assert_eq!(stats.matrix_rows, 7);
+        assert_eq!(stats.matrix_periods, 3);
+        assert_eq!(stats.trials_offered, 7);
+        // Three months and seven trials cannot support either statistic.
+        assert!(stats.deflated_sharpe.is_none());
+        assert!(stats.pbo.is_none());
+        let dsr_refusal = stats.deflated_sharpe_refusal.as_ref().unwrap();
+        assert!(
+            dsr_refusal.starts_with("REFUSED:"),
+            "a refusal is a result and says so: {dsr_refusal}"
+        );
+        assert!(stats.pbo_refusal.as_ref().unwrap().starts_with("REFUSED:"));
+
+        // And it survives the manifest's own JSON round trip, which is how it
+        // reaches the discovery ledger.
+        let reloaded = load_manifest(&cache, "EURUSD", "M5").expect("manifest");
+        assert_eq!(reloaded.statistics, m.statistics);
+        assert_eq!(reloaded, m);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A matrix long and wide enough produces VALUES, through the same call
+    /// site — so the refusal test above cannot be passing because the reader is
+    /// simply never able to compute anything.
+    #[test]
+    fn a_long_enough_matrix_produces_values_through_the_same_call_site() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_stats_full_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        // 48 months × 40 trials.
+        let keys: Vec<i64> = (0..48).map(|i| 24_000 + i).collect();
+        let rows: Vec<TrialReturnRow> = (0..40)
+            .map(|i| TrialReturnRow {
+                candidate_index: i,
+                strategy_id: format!("gene_{i}"),
+                returns: (0..48)
+                    .map(|j| {
+                        let wobble = (((i * 31 + j * 17) % 23) as f64 - 11.0) * 0.002;
+                        0.001 * i as f64 + wobble
+                    })
+                    .collect(),
+                trades_outside_grid: 0,
+            })
+            .collect();
+
+        let mut w =
+            TrialReturnsWriter::open(&cache, "eurusd", "m5", keys, 10_000.0, rows.len(), None)
+                .unwrap();
+        w.append(&rows).unwrap();
+        let m = w.finish(1_717_000_000_000).unwrap();
+
+        let stats = m.statistics.as_ref().unwrap();
+        let dsr = stats.deflated_sharpe.as_ref().expect("DSR computable at 48×40");
+        assert!((0.0..=1.0).contains(&dsr.deflated_sharpe_ratio));
+        assert_eq!(dsr.trials_n, 40, "the honest N is the row count, not the winners");
+        let pbo = stats.pbo.as_ref().expect("PBO computable at 48×40");
+        assert!((0.0..=1.0).contains(&pbo.pbo));
+        assert!(stats.dsr_value().is_some() && stats.pbo_value().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

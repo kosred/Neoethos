@@ -253,15 +253,20 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
         "SHADOWED DUPLICATE of `models.exit_policy.trailing_min_lock_pips` — see \
          `RiskConfig::trailing_enabled`. OWNER: operator.",
     ),
-    (
-        "RiskConfig::monthly_profit_target_pct",
-        Inert::WrittenNeverRead,
-        "`server/risk.rs:174` OVERWRITES it from the chosen prop-firm preset on every \
-         `POST /risk/preset`, and the only readers are `domain::risk::PropFirmRules::\
-         monthly_profit_target_pct` / `RiskManager::monthly_profit_target_pct`, both built from \
-         `PropFirmConstraints`, never from Settings. So the operator's number is replaced and \
-         then not consulted. OWNER: operator — it is a live trading stop condition.",
-    ),
+    // REMOVED 2026-08-10: `RiskConfig::monthly_profit_target_pct` now HAS a
+    // qualified production reader and the knob works.
+    //
+    // It sat here as WrittenNeverRead because `server/risk.rs` overwrote it from
+    // the chosen prop-firm preset while the only consumers built their own value
+    // from `PropFirmConstraints` — the operator's number was replaced and then
+    // never consulted. The reader that was missing is the goal-driven loop:
+    // `crates/neoethos-autoresearch/src/goals.rs` reads it as the prop-firm
+    // monthly target the loop optimises TOWARD, and refuses to start when it is
+    // 0.0 rather than silently judging against a 0% target.
+    //
+    // This is the shape this ledger exists to catch in the USEFUL direction: the
+    // knob was never garbage, it was a capability with no consumer, and deleting
+    // it at any point in the last months would have deleted the goal.
     // ─── the three hardware-derived fields. RECLASSIFIED 2026-08-10 from
     // `WrittenNeverRead` to `Unwired`, because the claim stopped being true:
     // the writer that made them written — `AutoTuner::apply`, which had zero

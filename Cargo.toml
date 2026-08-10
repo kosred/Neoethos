@@ -11,6 +11,13 @@ members = [
   "crates/neoethos-trader",
   "crates/neoethos-gpu-contracts",
   "crates/neoethos-gpu-cuda",
+  # The autoresearch loop (docs/autoresearch-loop.md). Proposes (search
+  # configuration, objective) pairs, runs them as sweeps, judges them against a
+  # FROZEN judge, records every one, and stops with a verdict. It reads the
+  # operator's goal constants and can never write them; it depends on neither
+  # neoethos-app nor neoethos-trader, so it is structurally incapable of
+  # reaching a broker.
+  "crates/neoethos-autoresearch",
   # Codex control plane: MCP *server* over the localhost HTTP API (stdio
   # transport, demo-guarded trading tools). NOT the same thing as the
   # excluded top-level `mcp/` dir, which is the outbound MCP *client*
@@ -35,6 +42,14 @@ default-members = [
   "crates/neoethos-gpu-contracts",
   "crates/neoethos-mcp",
 ]
+# `crates/neoethos-autoresearch` is in `members` but DELIBERATELY not here yet.
+# Three workflows are writing that crate's modules concurrently (loop / proposer
+# / judge, docs/autoresearch-loop.md §2); until all three have landed, a plain
+# `cargo build` would fail on half-written sibling modules that have nothing to
+# do with what the operator is building. `cargo build -p neoethos-autoresearch`
+# and `--workspace` still compile it. ADD THIS LINE once the three modules are
+# in — an engine crate that no default build compiles is a crate whose breakage
+# is invisible.
 # The P2P mesh sidecar (Federation Phase 1+) is DELIBERATELY isolated: its own
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
 # tree can never conflict with this workspace's pinned GPU/ML stack. Excluded
