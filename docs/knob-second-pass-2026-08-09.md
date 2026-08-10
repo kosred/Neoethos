@@ -330,7 +330,7 @@ The five differing keys: `discovery_mode` risky/prop_firm · `daily_drawdown_lim
 
 | Key | Default | root | seed | **live** | Consequence |
 |---|---|---|---|---|---|
-| `prefilter_top_k` | 240 | 240 | 240 | **50** | The exact value `shipped_config_matches_defaults.rs:4-11` was written to prevent: *"the base feature set collapses from 217 columns to roughly 64, and the SMC, session and footprint families die first"* |
+| `prefilter_top_k` | 240 | 240 | 240 | **50** | The exact value `shipped_config_matches_defaults.rs:4-11` was written to prevent: *"the base feature set collapses from 217 columns to roughly 64, and the SMC, session and footprint families die first"* ⚠ **the "217" is stale — the cube is now 1,946 columns per timeframe; see [`higher-timeframe-lane-2026-08-09.md`](higher-timeframe-lane-2026-08-09.md) §7.2** |
 | `cpcv_max_rows` | 200000 | 200000 | 200000 | **0** | CPCV unbounded — the 1.05 M-row state the seed comment (`:365`) measured |
 | `multi_resolution_enabled` | **true** | false | false | **true** | The seed comment (`:12`) calls this *"the pre-GA wall that stopped combos completing on laptop AND VPS"* — and the **Rust Default is also true**, so a key-less install re-creates it |
 | `prop_search_min_payoff_ratio` 💰 | 2.0 | 2.0 | 2.0 | **0.0** | Task #36 is not in force where runs happen |

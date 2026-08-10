@@ -658,7 +658,7 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             neoethos_trader::replay_portfolio_from_dir(
                 &root,
                 &portfolio,
-                neoethos_trader::EngineConfig::default(),
+                replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
             )?
         } else {
             let models_root =
@@ -681,7 +681,7 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
                 &root,
                 &portfolio,
                 &models_root,
-                neoethos_trader::EngineConfig::default(),
+                replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
                 blend,
             )?
         }
@@ -700,7 +700,7 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             &root,
             &symbol,
             &base,
-            neoethos_trader::EngineConfig::default(),
+            replay_engine_config(settings.as_ref(), &symbol),
         )?
     };
     println!("trader-replay (offline dry-run, zero broker calls):");
@@ -845,7 +845,7 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
             &root,
             &portfolio,
             &models_root,
-            neoethos_trader::EngineConfig::default(),
+            replay_engine_config(settings.as_ref(), &default_symbol(settings.as_ref())),
             neoethos_trader::BlendConfig {
                 mode,
                 gate_floor,
@@ -2507,6 +2507,62 @@ fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Setting
     // `load()` still ends at the relative path, so a workspace checkout with no
     // user config behaves exactly as before.
     neoethos_core::Settings::load().map(Some)
+}
+
+
+/// `EngineConfig` with the operator's REAL broker costs, instead of
+/// `EngineConfig::default()` which charges nothing.
+///
+/// `ReplayCostModel` and `from_pips` were written and then never called: all
+/// four replay entry points here and the one in `neoethos-app` passed
+/// `EngineConfig::default()`, whose `costs` is `ReplayCostModel::zero()`. So
+/// every replay an operator could actually run filled at the mark — no spread,
+/// no slippage, no commission — and the only thing standing between him and a
+/// flattering number was a disclosure warning. That warning is the honest
+/// minimum; charging the costs is the fix.
+///
+/// The pip size comes from the symbol table, never a guess: EURUSD is 0.0001
+/// and USDJPY is 0.01, and using the wrong one misprices the spread by a factor
+/// of a hundred. An unknown symbol therefore keeps the ZERO model and says so
+/// by name — a wrong cost is worse than a declared absent one, because it looks
+/// like it was charged.
+fn replay_engine_config(
+    settings: Option<&neoethos_core::Settings>,
+    symbol: &str,
+) -> neoethos_trader::EngineConfig {
+    let mut cfg = neoethos_trader::EngineConfig::default();
+    let Some(settings) = settings else {
+        tracing::warn!(
+            target: "neoethos_cli::replay",
+            "no config resolved — this replay fills at the mark, charging nothing"
+        );
+        return cfg;
+    };
+    let Some(meta) = neoethos_core::symbol_metadata::global_table().lookup(symbol) else {
+        tracing::warn!(
+            target: "neoethos_cli::replay",
+            symbol,
+            "symbol is not in the metadata table, so its pip size is unknown and the              spread cannot be converted to price units. This replay charges NOTHING.              Fix the symbol or add it to the table rather than trusting the result."
+        );
+        return cfg;
+    };
+    let risk = &settings.risk;
+    cfg.costs = neoethos_trader::ReplayCostModel::from_pips(
+        risk.backtest_spread_pips,
+        risk.slippage_pips,
+        risk.commission_per_lot,
+        meta.pip_size,
+    );
+    tracing::info!(
+        target: "neoethos_cli::replay",
+        symbol,
+        spread_pips = risk.backtest_spread_pips,
+        slippage_pips = risk.slippage_pips,
+        commission_per_lot = risk.commission_per_lot,
+        pip_size = meta.pip_size,
+        "replay costs charged from the operator's config"
+    );
+    cfg
 }
 
 fn default_symbol(settings: Option<&neoethos_core::Settings>) -> String {

@@ -1376,6 +1376,26 @@ pub struct DiscoveryRuntimeConfig {
     /// unlike `regime_` — they have no force-keep. That divergence is now
     /// pinned by `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`,
     /// which parses the shipped YAML and fails if the two ever disagree again.
+    ///
+    /// **2026-08-10 — THIS IS NOW A FLOOR, NOT THE VALUE.** The effective pool
+    /// is derived from GA CAPACITY in
+    /// `neoethos_search::discovery::resolve_prefilter_top_k`:
+    /// `clamp(population * E[indices per gene] / 46, this value, cube width)`.
+    ///
+    /// Why the constant could not stay a constant: it was chosen against a
+    /// 217-column-per-timeframe cube, and the cube's width is now bounded by
+    /// `VocabularyBudget`, i.e. by FREE RAM and the frame length. A constant
+    /// against a variable cube means the FRACTION of the vocabulary the GA can
+    /// see is decided by the hardware — 13.8% at the old vocabulary, ~4.9% at
+    /// what a 20 GB box affords on the real M5 frame, 0.7% at the 4,096-column
+    /// ceiling. The derived value is calibrated on the historical operating
+    /// point (265 columns kept at population 4,096) and, correctly, does NOT
+    /// grow when the box or the timeframe list grows — because the alphabet the
+    /// GA can actually cover does not grow either.
+    ///
+    /// At the shipped populations the derived value is below this floor, so the
+    /// effective pool is still exactly the 240 it has always been. `0` still
+    /// disables the prefilter entirely.
     pub prefilter_top_k: usize,
     /// Fraction of rows treated as in-sample when ranking features; must be
     /// in `(0, 1]`. (was `NEOETHOS_BOT_PREFILTER_INSAMPLE`)

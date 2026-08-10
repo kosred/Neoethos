@@ -72,8 +72,14 @@ impl Stage1Window {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
-    /// Maximum number of features to keep after the in-sample correlation
+    /// FLOOR on the number of features kept after the in-sample correlation
     /// prefilter. `0` disables the prefilter entirely.
+    ///
+    /// Since 2026-08-10 the effective pool is derived from GA capacity by
+    /// [`resolve_prefilter_top_k`] and this value is its lower bound. See that
+    /// function for why a constant against a hardware-sized cube was the same
+    /// defect class as sizing memory from a user parameter, and for the numbers
+    /// that refuse the three obvious alternatives.
     pub prefilter_top_k: usize,
     /// Fraction of rows treated as in-sample when ranking features. Must be
     /// strictly positive and at most `1.0`.
@@ -2595,6 +2601,554 @@ impl TargetProfile {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// THE EARLY-REJECT PREDICATE, AND THE BATCH LEDGER THAT MAKES IT HONEST
+//
+// WHAT IT IS FOR, WITH THE NUMBER THAT JUSTIFIES IT.
+//
+// On the run at `docs/measurements/3090-47260276/card-run-valid.log`
+// (2026-08-09, EURUSD M5, 843,456 rows) the quality screen cost 88,971 ms —
+// **50.4% of the run's wall time** — and took 174 candidates in and **0** out.
+// All 174 died on `rejected_base_quality`: 0 on regime, 0 on Monte-Carlo, 0 on
+// spread sensitivity. The base-quality criteria ARE the expectancy / payoff /
+// win-rate floors on `TargetProfile`, and every one of those floors can be
+// evaluated against fields the GA population already carries, for free, before
+// the screen starts. The best gene the whole run produced had profit factor
+// 0.92 and net EUR -50,682 over 136 months: profit factor below 1 means
+// expectancy is negative BY CONSTRUCTION.
+//
+// So half a run's wall time was spent proving something the population's own
+// numbers already said.
+//
+// THE BIAS IS EXPLICIT AND IT IS TOWARD PASSING.
+//
+// A FALSE REJECT is invisible and permanent — the batch is gone, no artifact
+// records what it would have found, and nothing in the run says a survivor was
+// discarded. A FALSE ACCEPT costs time and nothing else. So this predicate is
+// built to be WRONG IN ONE DIRECTION ONLY. It rejects only when all three of
+// these hold at once, and passes the batch through on any doubt whatsoever:
+//
+//   1. enough of the population carries measured metrics at all
+//      ([`EARLY_REJECT_MIN_MEASURED`]) — a thin sample is uncertainty, not
+//      evidence. This is the leg that answers the run1-baseline observation
+//      that the GA archive was 0/200 for four generations and 289/527 by
+//      generation 527: a predicate that fires on "the archive looks empty" is a
+//      false-reject generator;
+//   2. NOT ONE candidate has a gross edge (`profit_factor >= 1.0`). This is the
+//      certainty leg and it is arithmetic, not judgement: `profit_factor < 1`
+//      means gross losses exceeded gross wins, so `net_profit < 0`, so
+//      `expectancy = net_profit / trades < 0`, so
+//      `TargetProfile::evaluate` refuses it unconditionally at its first line;
+//   3. the best candidate's cost-charged expectancy is below the operator's
+//      CONFIGURED floor by a stated margin.
+//
+// THE THRESHOLD IS READ, NEVER INVENTED. "Below target" means below
+// `TargetProfile::min_net_expectancy_per_trade`, which is
+// `models.prop_search_min_net_expectancy_per_trade` — the same field the
+// quality screen's own primary gate reads, in the same units (account currency
+// per trade; `Gene::expectancy` is `net_profit / trade_count` from
+// `eval.rs`, booked after spread, commission and swap). The margin below is NOT
+// a second threshold on the objective: it only ever makes the predicate more
+// permissive than the configured floor, so it can never reject something the
+// operator's own target would have admitted.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Fewest candidates that must carry measured metrics before the predicate is
+/// allowed to reject anything.
+///
+/// Not a tuning knob for the objective — a sample-size floor for the DECISION.
+/// Below it the predicate reports `Uncertain` and passes.
+pub const EARLY_REJECT_MIN_MEASURED: usize = 32;
+
+/// How far below the configured floor the best candidate must sit before the
+/// batch is abandoned, as a fraction of the population's own expectancy SCALE
+/// (mean absolute expectancy over the measured candidates).
+///
+/// Scale-relative rather than absolute because expectancy is in account
+/// currency and a run on a 100 EUR balance and a run on a 100,000 EUR balance
+/// have different natural magnitudes; a fixed cushion would be meaningless on
+/// one of them. The margin exists because the GA scores on its own evaluation
+/// window while the quality screen re-simulates, so the two numbers are not the
+/// same measurement — the cushion is the price of that difference, paid in the
+/// safe direction.
+pub const EARLY_REJECT_MARGIN_FRACTION: f64 = 0.25;
+
+/// Why a batch was abandoned, or why it was not.
+///
+/// Every variant is COUNTED and NAMED. A batch abandoned with no record is the
+/// silent drop this codebase has spent the day closing, one level up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchRejectReason {
+    /// Not one candidate in the batch made money gross, and the best
+    /// cost-charged expectancy is below the configured floor by the stated
+    /// margin. The only reason that rejects.
+    NoCandidateClearsExpectancyFloor,
+}
+
+impl BatchRejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidateClearsExpectancyFloor => "no_candidate_clears_expectancy_floor",
+        }
+    }
+}
+
+/// Why a batch was KEPT. Named too, because "we did not reject it" and "we
+/// could not tell" are different facts and only one of them is evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAcceptReason {
+    /// A candidate cleared the floor (or has a gross edge). Real evidence.
+    CandidateClearsFloor,
+    /// Too few candidates carried measured metrics to decide. Passed on
+    /// uncertainty — the deliberate bias.
+    UncertainTooFewMeasured,
+    /// The best candidate is below the floor but not by the margin. Passed on
+    /// uncertainty.
+    UncertainWithinMargin,
+    /// No candidate carried metrics at all (an empty or unevaluated
+    /// population). Passed on uncertainty.
+    UncertainNoMetrics,
+}
+
+impl BatchAcceptReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateClearsFloor => "candidate_clears_floor",
+            Self::UncertainTooFewMeasured => "uncertain_too_few_measured",
+            Self::UncertainWithinMargin => "uncertain_within_margin",
+            Self::UncertainNoMetrics => "uncertain_no_metrics",
+        }
+    }
+}
+
+/// The predicate's answer, with every number that produced it. Nothing here is
+/// derived later or re-read from elsewhere — a verdict that cannot be
+/// reconstructed from its own fields is not auditable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchVerdict {
+    pub rejected: Option<BatchRejectReason>,
+    pub accepted: Option<BatchAcceptReason>,
+    /// Candidates in the population the predicate saw.
+    pub population: usize,
+    /// Candidates that carried usable measured metrics.
+    pub measured: usize,
+    /// Best cost-charged expectancy per trade, account currency.
+    pub best_expectancy: f64,
+    /// Best profit factor across the measured candidates.
+    pub best_profit_factor: f64,
+    /// Payoff ratio implied by the best-expectancy candidate's `(pf, win_rate)`
+    /// as `pf * (1 - p) / p` — the same expression the Risky ranking already
+    /// computes. Reported, never used to reject: the payoff floor is SECONDARY
+    /// and, per `TargetProfile`'s own doc, can only ever narrow what the
+    /// expectancy gate already admitted.
+    pub best_payoff_ratio: f64,
+    /// Trades behind `best_expectancy`.
+    pub best_trades: usize,
+    /// The configured floor this was judged against.
+    pub floor: f64,
+    /// The cushion granted below the floor.
+    pub margin: f64,
+}
+
+impl BatchVerdict {
+    pub fn is_reject(&self) -> bool {
+        self.rejected.is_some()
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match (self.rejected, self.accepted) {
+            (Some(r), _) => r.as_str(),
+            (None, Some(a)) => a.as_str(),
+            // Unreachable by construction — `evaluate_batch_early_reject`
+            // always sets exactly one. Named rather than `unreachable!()`
+            // because a panic on a reporting path is never the right trade.
+            (None, None) => "unclassified",
+        }
+    }
+}
+
+/// THE PREDICATE. Cheap: `O(population)` field reads over metrics the GA's own
+/// population evaluation already produced, so it cannot call the stages it
+/// exists to skip. Honest: every input it used is on the returned verdict.
+///
+/// Reads `profile.min_net_expectancy_per_trade` — the operator's configured
+/// objective — and never a threshold of its own. Note the strict `>` in
+/// `TargetProfile::evaluate`: a floor of `0.0` means "must be strictly greater
+/// than zero", so this predicate compares the same way.
+pub fn evaluate_batch_early_reject(genes: &[Gene], profile: &TargetProfile) -> BatchVerdict {
+    let floor = profile.min_net_expectancy_per_trade;
+    let mut measured = 0usize;
+    let mut best_expectancy = f64::NEG_INFINITY;
+    let mut best_profit_factor = f64::NEG_INFINITY;
+    let mut best_payoff_ratio = 0.0f64;
+    let mut best_trades = 0usize;
+    let mut abs_sum = 0.0f64;
+    for gene in genes {
+        // A gene that never traded has `expectancy = 0.0` by construction in
+        // `eval.rs`, which is not a measurement of anything. Counting it would
+        // let a batch of non-traders look like a batch of break-even
+        // strategies — and at a floor of 0.0 that is the difference between
+        // "uncertain" and "rejected".
+        if gene.trades_count == 0 || !gene.expectancy.is_finite() {
+            continue;
+        }
+        measured += 1;
+        abs_sum += gene.expectancy.abs();
+        if gene.profit_factor.is_finite() && gene.profit_factor > best_profit_factor {
+            best_profit_factor = gene.profit_factor;
+        }
+        if gene.expectancy > best_expectancy {
+            best_expectancy = gene.expectancy;
+            best_trades = gene.trades_count;
+            let p = gene.win_rate.clamp(0.0, 1.0);
+            let pf = gene.profit_factor.max(0.0);
+            best_payoff_ratio = if p > 0.0 && p < 1.0 {
+                pf * (1.0 - p) / p
+            } else {
+                0.0
+            };
+        }
+    }
+
+    let scale = if measured > 0 {
+        abs_sum / measured as f64
+    } else {
+        0.0
+    };
+    let margin = EARLY_REJECT_MARGIN_FRACTION * scale;
+
+    let mut verdict = BatchVerdict {
+        rejected: None,
+        accepted: None,
+        population: genes.len(),
+        measured,
+        best_expectancy: if measured > 0 { best_expectancy } else { 0.0 },
+        best_profit_factor: if measured > 0 { best_profit_factor } else { 0.0 },
+        best_payoff_ratio,
+        best_trades,
+        floor,
+        margin,
+    };
+
+    // ── Leg 1: is there anything to decide on? ──────────────────────────────
+    if measured == 0 {
+        verdict.accepted = Some(BatchAcceptReason::UncertainNoMetrics);
+        return verdict;
+    }
+    if measured < EARLY_REJECT_MIN_MEASURED {
+        verdict.accepted = Some(BatchAcceptReason::UncertainTooFewMeasured);
+        return verdict;
+    }
+    // ── Leg 2: the certainty leg. Any gross edge anywhere ⇒ pass. ───────────
+    // `profit_factor >= 1.0` on even one candidate means at least one
+    // candidate did not lose money gross, which is exactly the case the
+    // predicate must never touch.
+    if best_profit_factor >= 1.0 {
+        verdict.accepted = Some(BatchAcceptReason::CandidateClearsFloor);
+        return verdict;
+    }
+    // ── Leg 3: below the CONFIGURED floor, by the margin. ───────────────────
+    if best_expectancy >= floor - margin {
+        verdict.accepted = Some(BatchAcceptReason::UncertainWithinMargin);
+        return verdict;
+    }
+    verdict.rejected = Some(BatchRejectReason::NoCandidateClearsExpectancyFloor);
+    verdict
+}
+
+/// Per-batch accounting, shaped after `neoethos_data::core::indicator_ledger`
+/// — reason, count, named examples, one census line — because that is the shape
+/// this codebase already trusts. It is a NEW ledger rather than that one:
+/// `IndicatorLedger` never crosses the crate boundary (see the census comment
+/// in `run_discovery_cycle_with_progress`, which says in its own words that
+/// from the search crate "only presence is observable").
+#[derive(Debug, Clone, Default)]
+pub struct BatchRejectionLedger {
+    pub batches_seen: usize,
+    pub batches_rejected: usize,
+    pub rejected_no_candidate_clears_floor: usize,
+    pub accepted_candidate_clears_floor: usize,
+    pub accepted_uncertain_no_metrics: usize,
+    pub accepted_uncertain_too_few_measured: usize,
+    pub accepted_uncertain_within_margin: usize,
+    /// `(cursor, reason, best_expectancy, best_payoff_ratio, best_trades)` for
+    /// the first rejections, so the census names batches rather than counting
+    /// them anonymously.
+    pub rejected_examples: Vec<(usize, &'static str, f64, f64, usize)>,
+}
+
+impl BatchRejectionLedger {
+    const MAX_EXAMPLES: usize = 24;
+
+    pub fn record(&mut self, cursor: usize, verdict: &BatchVerdict) {
+        self.batches_seen += 1;
+        match (verdict.rejected, verdict.accepted) {
+            (Some(BatchRejectReason::NoCandidateClearsExpectancyFloor), _) => {
+                self.batches_rejected += 1;
+                self.rejected_no_candidate_clears_floor += 1;
+                if self.rejected_examples.len() < Self::MAX_EXAMPLES {
+                    self.rejected_examples.push((
+                        cursor,
+                        verdict.reason(),
+                        verdict.best_expectancy,
+                        verdict.best_payoff_ratio,
+                        verdict.best_trades,
+                    ));
+                }
+            }
+            (None, Some(BatchAcceptReason::CandidateClearsFloor)) => {
+                self.accepted_candidate_clears_floor += 1
+            }
+            (None, Some(BatchAcceptReason::UncertainNoMetrics)) => {
+                self.accepted_uncertain_no_metrics += 1
+            }
+            (None, Some(BatchAcceptReason::UncertainTooFewMeasured)) => {
+                self.accepted_uncertain_too_few_measured += 1
+            }
+            (None, Some(BatchAcceptReason::UncertainWithinMargin)) => {
+                self.accepted_uncertain_within_margin += 1
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The run-end tally. Printed whenever any batch was seen, including when
+    /// none were rejected — "we streamed 40 batches and rejected none" is a
+    /// result, and a census that only appears on rejection cannot say it.
+    pub fn log_summary(&self, stage: &str) {
+        if self.batches_seen == 0 {
+            return;
+        }
+        tracing::info!(
+            target: "neoethos_search::batch_ledger",
+            stage,
+            batches_seen = self.batches_seen,
+            batches_rejected = self.batches_rejected,
+            rejected_no_candidate_clears_floor = self.rejected_no_candidate_clears_floor,
+            accepted_candidate_clears_floor = self.accepted_candidate_clears_floor,
+            accepted_uncertain_no_metrics = self.accepted_uncertain_no_metrics,
+            accepted_uncertain_too_few_measured = self.accepted_uncertain_too_few_measured,
+            accepted_uncertain_within_margin = self.accepted_uncertain_within_margin,
+            rejected_examples = ?self.rejected_examples,
+            "streaming batch census — every abandoned batch, by cursor and reason. The three \
+             `uncertain_*` buckets are batches the predicate PASSED because it could not tell; \
+             they are the cost of never being able to discard a survivor."
+        );
+    }
+}
+
+/// The process-wide batch ledger.
+///
+/// A run is a sequence of batches and the tally belongs to the RUN, not to one
+/// cycle — but the cycle is where the predicate fires. So the cycle records
+/// here and the loop (or anything else that wants it) reads one census.
+static BATCH_LEDGER: std::sync::Mutex<Option<BatchRejectionLedger>> =
+    std::sync::Mutex::new(None);
+
+fn with_batch_ledger<T>(f: impl FnOnce(&mut BatchRejectionLedger) -> T) -> T {
+    let mut guard = BATCH_LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(guard.get_or_insert_with(BatchRejectionLedger::default))
+}
+
+/// Record one batch verdict in the process ledger.
+pub fn record_batch_verdict(cursor: usize, verdict: &BatchVerdict) {
+    with_batch_ledger(|ledger| ledger.record(cursor, verdict));
+}
+
+/// Snapshot of the process ledger.
+pub fn batch_rejection_ledger() -> BatchRejectionLedger {
+    with_batch_ledger(|ledger| ledger.clone())
+}
+
+/// Print the run-end batch census.
+pub fn log_batch_rejection_summary(stage: &str) {
+    with_batch_ledger(|ledger| ledger.log_summary(stage));
+}
+
+/// Reset the process ledger. For tests and for a caller that runs several
+/// independent streaming searches in one process.
+pub fn reset_batch_rejection_ledger() {
+    with_batch_ledger(|ledger| *ledger = BatchRejectionLedger::default());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE SWAP LOOP
+//
+// WHERE IT LIVES, AND WHY NOT IN `run_discovery_cycle_with_progress`.
+//
+// `run_discovery_cycle_with_progress` takes `features: &FeatureFrame` and never
+// rebuilds it: the working set is chosen ENTIRELY outside this function, in the
+// orchestrator that calls `prepare_multitimeframe_features` and then the cycle.
+// So the loop goes AROUND that pair, which is why it is expressed here as a
+// driver over two closures rather than as surgery inside the cycle — and why
+// the parity test is trivial to write: with one batch covering the whole space
+// and the predicate never firing, the loop performs exactly one build and one
+// cycle, which is today's path.
+//
+// A DECISION THAT HAD TO BE MADE BEFORE THE LOOP COULD BE WRITTEN, and which
+// the design doc never raises: **survivors from different batches cannot share
+// a portfolio.** Gene indices address `DiscoveryResult::effective_feature_names`
+// — the cube THAT batch built — portfolio selection correlates candidates
+// against each other, and export projects by name. A portfolio assembled from
+// batch 3 and batch 11 would reference columns no single cube ever held.
+//
+// DECIDED: **cross-batch portfolios are forbidden.** Each batch produces its
+// own `DiscoveryResult`, with its own `effective_feature_names`, and the loop
+// returns them as a list. It never merges them. The alternative — rebuilding a
+// union cube over the surviving batches' columns — is cheap (survivors are few)
+// and is a legitimate follow-up, but it changes what a portfolio MEANS and so
+// is not something to do silently inside a loop.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The cursor of the streaming working set in force, or `0` when none is
+/// installed (the non-streaming path — one implicit batch at cursor 0).
+///
+/// Read rather than passed so the cycle's signature does not have to change for
+/// callers that do not stream; the working set is installed by
+/// `neoethos_data::with_extended_sweep_working_set` around the feature build
+/// and is a pure function of `(cursor, batch_columns)`.
+pub fn streaming_sweep_cursor() -> usize {
+    neoethos_data::core::hpc_ta::current_extended_sweep_working_set()
+        .map(|batch| batch.cursor)
+        .unwrap_or(0)
+}
+
+/// A streaming search: a cursor through the (indicator, period) space, a
+/// hardware-derived batch width, and the census of what it abandoned.
+pub struct StreamingSearch {
+    cursor: usize,
+    batch_columns: usize,
+    space_len: usize,
+    budget_rows: usize,
+    batches_started: usize,
+}
+
+impl StreamingSearch {
+    /// Size the working set from the machine, against the run's WIDEST frame.
+    ///
+    /// `budget_rows` is the base timeframe's bar count — the same number
+    /// `compute_hpc_feature_frame_sized` is given, for the same reason: the
+    /// batch must not be a function of which timeframe is being built, or the
+    /// per-TF cube widths diverge and the cube cannot be assembled.
+    pub fn new(budget_rows: usize) -> Self {
+        let batch_columns = neoethos_data::core::hpc_ta::streaming_batch_columns(budget_rows);
+        let space_len = neoethos_data::core::hpc_ta::extended_sweep_space_len();
+        tracing::info!(
+            target: "neoethos_search::streaming",
+            budget_rows,
+            batch_columns,
+            resident_columns =
+                neoethos_data::core::hpc_ta::planned_resident_columns(budget_rows),
+            space_len,
+            "streaming working set sized from FREE RAM and the widest frame — never from a \
+             config constant. batch_columns of 0 means this machine cannot afford any \
+             streaming extension at all."
+        );
+        Self {
+            cursor: 0,
+            batch_columns,
+            space_len,
+            budget_rows,
+            batches_started: 0,
+        }
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn batch_columns(&self) -> usize {
+        self.batch_columns
+    }
+
+    pub fn space_len(&self) -> usize {
+        self.space_len
+    }
+
+    pub fn budget_rows(&self) -> usize {
+        self.budget_rows
+    }
+
+    pub fn batches_started(&self) -> usize {
+        self.batches_started
+    }
+
+    /// The next working set, or `None` when the space is exhausted or the
+    /// machine affords no extension.
+    ///
+    /// NEVER WRAPS. Running off the end returns `None` so the caller decides
+    /// what a second pass means; a silent wrap would re-explore parameter
+    /// regions the run already rejected and report them as new.
+    pub fn next_batch(&mut self) -> Option<std::sync::Arc<neoethos_data::core::hpc_ta::SweepBatch>> {
+        if self.batch_columns == 0 || self.cursor >= self.space_len {
+            return None;
+        }
+        let batch =
+            neoethos_data::core::hpc_ta::extended_sweep_batch(self.cursor, self.batch_columns);
+        if batch.is_empty() {
+            return None;
+        }
+        self.cursor = batch.next_cursor;
+        self.batches_started += 1;
+        Some(std::sync::Arc::new(batch))
+    }
+
+    /// Drive the loop: build a cube per batch, run one discovery cycle on it,
+    /// keep the results that produced a portfolio.
+    ///
+    /// The predicate is NOT applied here — it fires inside
+    /// `run_discovery_cycle_with_progress`, before the quality screen, which is
+    /// the only place early enough to skip the 50.4%. This loop reads the
+    /// process ledger to know whether the batch it just ran was abandoned.
+    ///
+    /// `max_batches` of `0` means "until the space is exhausted".
+    pub fn run<B, C>(
+        &mut self,
+        max_batches: usize,
+        mut build_features: B,
+        mut run_cycle: C,
+    ) -> Result<Vec<DiscoveryResult>>
+    where
+        B: FnMut(&std::sync::Arc<neoethos_data::core::hpc_ta::SweepBatch>) -> Result<FeatureFrame>,
+        C: FnMut(&FeatureFrame) -> Result<DiscoveryResult>,
+    {
+        let mut survivors: Vec<DiscoveryResult> = Vec::new();
+        let mut ran = 0usize;
+        while max_batches == 0 || ran < max_batches {
+            let Some(batch) = self.next_batch() else {
+                break;
+            };
+            let cursor = batch.cursor;
+            let before = batch_rejection_ledger().batches_rejected;
+            let features = build_features(&batch)?;
+            let result = run_cycle(&features)?;
+            let after = batch_rejection_ledger().batches_rejected;
+            let abandoned = after > before;
+            tracing::info!(
+                target: "neoethos_search::streaming",
+                cursor,
+                next_cursor = batch.next_cursor,
+                space_len = batch.space_len,
+                batch_pairs = batch.pairs.len(),
+                batch_columns = batch.planned_columns,
+                abandoned,
+                portfolio = result.portfolio.len(),
+                "streaming batch complete"
+            );
+            if !abandoned && !result.portfolio.is_empty() {
+                // Kept WHOLE, never merged with another batch's portfolio —
+                // gene indices address this result's own
+                // `effective_feature_names`. See the module note above.
+                survivors.push(result);
+            }
+            ran += 1;
+        }
+        log_batch_rejection_summary("streaming_search");
+        Ok(survivors)
+    }
+}
 
 fn survived_the_backtest(metrics: &StrategyMetrics) -> bool {
     // `max_drawdown_pct` is a fraction despite the name — `(peak - equity) / peak`
@@ -4842,17 +5396,12 @@ where
     // "pool ≤ total indicators + SMC" rule the UI can only hint at.
     let configured_top_k = config.runtime_overrides.prefilter_top_k;
     let available_features = features.names.len();
-    let prefilter_top_k = if configured_top_k > 0 && configured_top_k > available_features {
-        tracing::info!(
-            target: "neoethos_search::discovery",
-            configured = configured_top_k,
-            available = available_features,
-            "indicator pool capped to the available indicator+SMC feature count"
-        );
-        available_features
-    } else {
-        configured_top_k
-    };
+    let prefilter_top_k = resolve_prefilter_top_k(
+        configured_top_k,
+        available_features,
+        config.population,
+        config.max_indicators,
+    );
     let prefilter_insample_frac = config.runtime_overrides.resolved_prefilter_insample_frac();
 
     let prefilter_min_per_tf = config.runtime_overrides.prefilter_min_per_timeframe;
@@ -5797,9 +6346,13 @@ fn prefilter_features(
         .into_par_iter()
         .map(|col_idx| {
             let name = &features.names[col_idx];
-            if name.starts_with("regime_") {
-                // Force-keep, unchanged: regime columns are the GA's context
-                // channel and are not selected on correlation.
+            if is_prefilter_state_column(name) {
+                // Force-keep. `regime_` was always here; `smc_`, `session_` and
+                // `fp_` joined it 2026-08-10 — see PREFILTER_STATE_FAMILIES for
+                // the argument and for why repairing the correlation function
+                // made it urgent. These are the GA's context and event
+                // channels; they are not selected on a univariate correlation
+                // with a directional label, because they do not have one.
                 return ColumnScore {
                     idx: col_idx,
                     score: f64::INFINITY,
@@ -5913,11 +6466,37 @@ fn prefilter_features(
     } else {
         0.0
     };
+    // Named `regime_forced` for artifact compatibility; it now counts every
+    // force-kept STATE column (regime_ + smc_ + session_ + fp_ on the base
+    // timeframe). The per-family split is in the log line below so a reader can
+    // see which families the number is made of.
     census.regime_forced = features
         .names
         .iter()
-        .filter(|n| n.starts_with("regime_"))
+        .filter(|n| is_prefilter_state_column(n))
         .count();
+    {
+        let mut per_family: Vec<(&str, usize)> = Vec::new();
+        for family in PREFILTER_STATE_FAMILIES {
+            per_family.push((
+                family,
+                features
+                    .names
+                    .iter()
+                    .filter(|n| n.starts_with(family))
+                    .count(),
+            ));
+        }
+        tracing::info!(
+            target: "neoethos_search::prefilter",
+            state_forced_total = census.regime_forced,
+            per_family = ?per_family,
+            "state-family columns force-kept ADDITIVELY (they do not consume the operator's \
+             top_k budget). BEHAVIOUR CHANGE 2026-08-10: smc_/session_/fp_ joined regime_ here, \
+             so correlation ranking may no longer evict them and every SMC gate binds to a real \
+             smc_ column rather than to whatever substring survived."
+        );
+    }
 
     correlations.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -5943,31 +6522,41 @@ fn prefilter_features(
     // templates resolve, and because removing two things at once makes neither
     // measurable. If the per-TF coverage log shows the quota is no longer
     // binding, that is the evidence to drop it.
-    if spec.min_per_tf > 0 {
+    {
         let mut kept: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
-        let mut per_group: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for &idx in &keep_indices {
-            if let Some(group) = timeframe_group(&features.names[idx]) {
-                *per_group.entry(group).or_insert(0) += 1;
+        if spec.min_per_tf > 0 {
+            let mut per_group: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for &idx in &keep_indices {
+                if let Some(group) = timeframe_group(&features.names[idx]) {
+                    *per_group.entry(group).or_insert(0) += 1;
+                }
             }
-        }
-        for &(idx, _) in &correlations {
-            let Some(group) = timeframe_group(&features.names[idx]) else {
-                continue;
-            };
-            let count = per_group.entry(group).or_insert(0);
-            if *count >= spec.min_per_tf {
-                continue;
-            }
-            if kept.insert(idx) {
-                *count += 1;
+            for &(idx, _) in &correlations {
+                let Some(group) = timeframe_group(&features.names[idx]) else {
+                    continue;
+                };
+                let count = per_group.entry(group).or_insert(0);
+                if *count >= spec.min_per_tf {
+                    continue;
+                }
+                if kept.insert(idx) {
+                    *count += 1;
+                }
             }
         }
         // Force-keep the EXACT features the multi-TF seed templates reference,
         // resolved by the templates' own role logic against the full
         // pre-prefilter names — single source of truth, no duplicated family
         // list.
+        //
+        // MOVED OUT OF THE `min_per_tf > 0` BLOCK (2026-08-10). It used to sit
+        // inside it, so setting `prefilter_min_per_timeframe: 0` — a knob about
+        // per-timeframe quotas — ALSO disabled the warm-start force-keep, and
+        // the GA's seed templates then referenced columns the prefilter had
+        // dropped. Two unrelated decisions on one flag, with nothing saying so.
+        // BEHAVIOUR CHANGE: at `min_per_tf = 0` the template columns are now
+        // kept; at any positive value nothing changes.
         for idx in crate::genetic::seed_templates::template_feature_indices(&features.names) {
             kept.insert(idx);
         }
@@ -5997,6 +6586,136 @@ fn prefilter_features(
         },
         census,
     )
+}
+
+/// Genes that must be expected to touch a given column before that column
+/// earns a place in the GA's alphabet.
+///
+/// CALIBRATED, NOT CHOSEN. At the historical operating point — 265 columns kept
+/// (`docs/measurements/3090-47260276/card-run-valid.log`, 651 in / 265 out),
+/// population 4,096, `max_indicators` 5 so `E[indices per gene] = 3` — the
+/// expected number of genes touching any given column is
+/// `4096 * 3 / 265 = 46.4`. That is the coverage the search has actually been
+/// operating at, and it is the quantity to hold fixed.
+pub const PREFILTER_COVERAGE_GENES_PER_COLUMN: f64 = 46.0;
+
+/// How many features the prefilter keeps.
+///
+/// ## The defect this closes
+///
+/// `prefilter_top_k` was a CONSTANT 240 applied to the whole assembled
+/// multi-timeframe cube. It was set when the cube was 217 columns per timeframe.
+/// The cube is no longer that: per-TF width is now bounded by
+/// `VocabularyBudget`, i.e. by FREE RAM and the frame length. So the FRACTION of
+/// the vocabulary the GA can see became a function of the hardware —
+/// 240/1,736 = 13.8% at the old vocabulary, 240/4,920 ≈ 4.9% at what this box
+/// affords on the real M5 frame, 240/32,768 = 0.7% on a box that reaches the
+/// 4,096-column ceiling. That is the same defect class as sizing memory from a
+/// user parameter, one level up.
+///
+/// ## Why the obvious answers are all wrong, with the numbers
+///
+/// * **A fraction of the cube width.** 40% of the cube at the hard ceiling is
+///   5,056 columns, which at population 4,096 is `4096*3/5056 = 2.4` expected
+///   genes per column. The search gets WORSE on the bigger box.
+/// * **Derive it from free RAM.** `top_k` is not a memory quantity. 1,000 kept
+///   columns cost 4.2 GB at the M5 store's 1,054,320 rows, so a 512 GB box
+///   would keep the entire cube — affordable, and therefore fatal. This is the
+///   one place where the never-OOM idiom is the wrong answer.
+/// * **Drop the cap and let the early-reject predicate do the work.** At the
+///   full 12,639-column cube the expected genes per column is 0.97: the median
+///   column is never sampled by the initial population at all. The predicate
+///   would then abandon batches whose useful column the GA never looked at —
+///   a FALSE REJECT, which the predicate is explicitly forbidden to be capable
+///   of. `top_k` bounds the GA's index space; the predicate bounds wasted
+///   downstream stages. They are orthogonal and neither replaces the other.
+///
+/// ## What it is instead
+///
+/// Derived from GA CAPACITY — the alphabet the population can actually cover —
+/// and floored by the operator's configured value:
+///
+/// ```text
+/// E[indices per gene] = (1 + max_indicators) / 2      # new_random_gene samples 1..=max
+/// derived  = population * E / PREFILTER_COVERAGE_GENES_PER_COLUMN
+/// top_k    = clamp(derived, configured, cube_width)
+/// ```
+///
+/// At the shipped GPU population (4,096) that is `4096*3/46 = 267`. At the
+/// shipped CPU population it is far below 240 and the operator's configured
+/// value wins. So the number does NOT grow when the box grows or when the
+/// timeframe list grows — because the alphabet the GA can cover does not grow
+/// either.
+///
+/// `configured == 0` still means "no prefilter", unchanged.
+///
+/// Conservative in the safe direction with `population_auto`: that flag lets
+/// `run_search` raise the population toward the card's ceiling, and this reads
+/// the CONFIGURED population, so the derived `top_k` is a lower bound —
+/// i.e. more coverage per column than the calibration point, never less.
+pub fn resolve_prefilter_top_k(
+    configured: usize,
+    cube_width: usize,
+    population: usize,
+    max_indicators: usize,
+) -> usize {
+    if configured == 0 {
+        return 0;
+    }
+    let expected_indices = (1.0 + max_indicators.max(1) as f64) / 2.0;
+    let derived = (population as f64 * expected_indices / PREFILTER_COVERAGE_GENES_PER_COLUMN)
+        .round()
+        .max(0.0) as usize;
+    let effective = derived.max(configured).min(cube_width.max(1));
+    tracing::info!(
+        target: "neoethos_search::prefilter",
+        configured,
+        derived,
+        effective,
+        cube_width,
+        population,
+        max_indicators,
+        expected_indices_per_gene = expected_indices,
+        coverage_genes_per_column = PREFILTER_COVERAGE_GENES_PER_COLUMN,
+        expected_genes_per_kept_column = if effective > 0 {
+            population as f64 * expected_indices / effective as f64
+        } else {
+            0.0
+        },
+        "indicator pool sized from GA CAPACITY (population x expected indices per gene / \
+         coverage), floored by the configured value and capped by the cube width — never a \
+         fraction of the cube and never derived from free RAM. See resolve_prefilter_top_k."
+    );
+    effective
+}
+
+/// Feature families whose ranking criterion the prefilter cannot evaluate.
+///
+/// The prefilter ranks on univariate correlation with a first-passage label,
+/// and the code has always conceded that criterion is wrong for state-like
+/// columns — `regime_` was exempted with `f64::INFINITY` for exactly that
+/// reason. THE EXEMPTION WAS GRANTED TO ONE FAMILY AND THE ARGUMENT COVERS
+/// FOUR. An order block, a session marker and a footprint imbalance are states
+/// and events, not directional predictors; they matter in combination, which is
+/// what the GA evaluates and what a univariate rank cannot see.
+///
+/// This became urgent rather than tidy when `pearson_correlation` was repaired.
+/// Under the broken function every column scored exactly 0.0, ties broke by
+/// column index, and `smc_` columns occupy indices 0-45 — so they always swept
+/// the top-K. The repair removed the tie-break that was silently guaranteeing
+/// their survival. Nothing else changed; the exposure is new.
+///
+/// BASE TIMEFRAME ONLY, by construction: higher-TF columns carry a `H1_`/`H4_`
+/// prefix (see `timeframe_group`), so `starts_with` matches the base block and
+/// not its ten resamplings. Same as `regime_` has always behaved.
+const PREFILTER_STATE_FAMILIES: [&str; 4] = ["regime_", "smc_", "session_", "fp_"];
+
+/// Whether this column is force-kept by the prefilter regardless of its
+/// correlation rank.
+fn is_prefilter_state_column(name: &str) -> bool {
+    PREFILTER_STATE_FAMILIES
+        .iter()
+        .any(|family| name.starts_with(family))
 }
 
 /// Identify the higher-timeframe prefix group of a multi-TF feature name.
@@ -6664,6 +7383,55 @@ where
         truncated_to: max_candidates,
     });
 
+    // ── THE EARLY-REJECT PREDICATE ─────────────────────────────────────────
+    //
+    // Here, and not one line later. This is the last point at which nothing
+    // expensive has happened yet: signal generation for every candidate, the
+    // quality screen (50.4% of the cited run's wall time), the prop-firm window
+    // gate, the walk-forward and CPCV all lie AFTER it. The predicate itself is
+    // `O(population)` field reads over metrics the GA already produced.
+    //
+    // BIASED TOWARD PASSING, deliberately and irreversibly: see
+    // `evaluate_batch_early_reject`. A false reject is invisible and permanent;
+    // a false accept only costs time.
+    let batch_verdict = evaluate_batch_early_reject(&ranked_candidate_genes, &config.target_profile);
+    record_batch_verdict(streaming_sweep_cursor(), &batch_verdict);
+    if batch_verdict.is_reject() {
+        tracing::warn!(
+            target: "neoethos_search::batch_ledger",
+            cursor = streaming_sweep_cursor(),
+            reason = batch_verdict.reason(),
+            population = batch_verdict.population,
+            measured = batch_verdict.measured,
+            best_expectancy = batch_verdict.best_expectancy,
+            best_profit_factor = batch_verdict.best_profit_factor,
+            best_payoff_ratio = batch_verdict.best_payoff_ratio,
+            best_trades = batch_verdict.best_trades,
+            expectancy_floor = batch_verdict.floor,
+            margin = batch_verdict.margin,
+            "BATCH ABANDONED before the quality screen — not one candidate made money gross \
+             and the best cost-charged expectancy is below the configured floor by the stated \
+             margin. The quality screen, the prop-firm gate, the walk-forward and OOS \
+             validation are SKIPPED for this batch. The floor is \
+             models.prop_search_min_net_expectancy_per_trade; the margin only ever makes this \
+             decision more permissive than that floor."
+        );
+    } else {
+        tracing::info!(
+            target: "neoethos_search::batch_ledger",
+            cursor = streaming_sweep_cursor(),
+            reason = batch_verdict.reason(),
+            population = batch_verdict.population,
+            measured = batch_verdict.measured,
+            best_expectancy = batch_verdict.best_expectancy,
+            best_profit_factor = batch_verdict.best_profit_factor,
+            best_payoff_ratio = batch_verdict.best_payoff_ratio,
+            expectancy_floor = batch_verdict.floor,
+            margin = batch_verdict.margin,
+            "batch kept — the early-reject predicate did not fire"
+        );
+    }
+
     let min_trades = min_trades_required(
         &features.timestamps,
         config.min_trades_per_day,
@@ -6687,7 +7455,17 @@ where
     let mut reject_profit_factor = 0usize;
     let mut reject_fitness = 0usize;
     let mut reject_other = 0usize;
-    let prefiltered: Vec<(usize, Gene)> = ranked_candidates
+    // AN ABANDONED BATCH STOPS HERE. Emptying the ladder's input is how the
+    // rejection is enforced: signal generation, the quality screen, the
+    // prop-firm window gate, correlation pruning, the walk-forward and OOS
+    // validation all iterate over this list, so an empty one costs each of them
+    // nothing and the cycle returns an honest empty portfolio. `ranked_candidate_genes`
+    // is NOT emptied — the batch's own evidence stays in the artifact, which is
+    // what lets a reader check the predicate's decision after the fact.
+    let prefiltered: Vec<(usize, Gene)> = if batch_verdict.is_reject() {
+        Vec::new()
+    } else {
+    ranked_candidates
         .iter()
         .filter(|(_, g)| {
             let ok = g.passes_filter(&config.filtering);
@@ -6713,9 +7491,25 @@ where
             ok
         })
         .map(|(idx, g)| (*idx, g.clone()))
-        .collect();
+        .collect()
+    };
     let post_passes_filter = prefiltered.len();
     funnel.record_stage("passed_base_filter", ranked_total, post_passes_filter);
+    // The batch rejection is recorded on THIS stage rather than on a stage of
+    // its own: `FunnelProfile::record_stage` silently no-ops on a name that is
+    // not in the declared stage list (`funnel_profile.rs`), so inventing
+    // `early_reject_batch` here would have written the rejection to nowhere —
+    // a silent drop in the very accounting that exists to prevent one. The
+    // authoritative census is the batch ledger
+    // (`log_batch_rejection_summary`); this line is so the PERSISTED funnel
+    // also says why every candidate vanished at this step.
+    if batch_verdict.is_reject() {
+        funnel.add_reject_reason(
+            "passed_base_filter",
+            format!("early_reject_batch.{}", batch_verdict.reason()),
+            ranked_total,
+        );
+    }
     if reject_dd > 0 {
         funnel.add_reject_reason("passed_base_filter", "max_dd_exceeded", reject_dd);
     }
@@ -8875,6 +9669,13 @@ where
     // output — the exact indistinguishability that hid the starved card.
     crate::eval_telemetry::device_summary();
 
+    // The batch census, cumulative across every cycle this process has run.
+    // Printed at the END OF EVERY CYCLE rather than only by the streaming loop,
+    // so a rejection can never be lost by a caller that drives the cycle
+    // directly. On a non-streaming run it prints one line for one batch, which
+    // is the honest description of what a non-streaming run is.
+    log_batch_rejection_summary("discovery_cycle");
+
     // Honest goal projection (Risky only): "reach the target, when, at what
     // risk?" from the selected portfolio's REAL per-trade R-multiples. Logged
     // here, before the result is moved, while config and the trades coexist.
@@ -10159,6 +10960,255 @@ mod monte_carlo_reference_tests {
         // "same distribution" a checkable claim rather than a hope.
         let host_ratio = f64::from(host.long_threshold) / f64::from(gene.long_threshold);
         assert!(host_ratio >= 0.85 && host_ratio <= 1.15);
+    }
+}
+
+#[cfg(test)]
+mod streaming_and_predicate_tests {
+    use super::*;
+
+    fn gene_with(expectancy: f64, profit_factor: f64, win_rate: f64, trades: usize) -> Gene {
+        Gene {
+            expectancy,
+            profit_factor,
+            win_rate,
+            trades_count: trades,
+            ..Gene::default()
+        }
+    }
+
+    /// The floor the predicate reads is the one the quality screen reads. At
+    /// the shipped `0.0`, both mean "strictly greater than zero".
+    fn shipped_profile() -> TargetProfile {
+        TargetProfile {
+            min_net_expectancy_per_trade: 0.0,
+            min_expectancy_t_stat: 0.0,
+            min_win_rate: 0.0,
+            min_payoff_ratio: 2.0,
+            max_in_market: 0.0,
+        }
+    }
+
+    // ── PARITY, FIRST ──────────────────────────────────────────────────────
+
+    /// THE PARITY CASE for the loop: one batch whose working set is the whole
+    /// vocabulary, with the predicate never firing, must perform EXACTLY one
+    /// feature build and one discovery cycle — which is today's path.
+    ///
+    /// The column-level half of this parity claim is
+    /// `neoethos_data::core::hpc_ta::streaming_advance_tests::
+    /// whole_space_batch_is_byte_identical_to_the_non_streaming_plan`, which
+    /// asserts on the (id, period) LIST rather than on a width, because the
+    /// extension emits `<id>_<period>` into the same namespace as the base pass
+    /// and a duplicate NAME is a hard error there.
+    #[test]
+    fn whole_space_single_batch_runs_exactly_one_cycle() {
+        let space_len = neoethos_data::core::hpc_ta::extended_sweep_space_len();
+        let mut search = StreamingSearch {
+            cursor: 0,
+            batch_columns: usize::MAX,
+            space_len,
+            budget_rows: 1_000,
+            batches_started: 0,
+        };
+        let first = search.next_batch().expect("a whole-space batch");
+        assert!(first.covers_whole_space());
+        assert!(first.exhausted);
+        assert!(
+            search.next_batch().is_none(),
+            "the cursor must not wrap — a second batch would re-explore the same space"
+        );
+        assert_eq!(search.batches_started(), 1);
+    }
+
+    /// A batch width of zero means "this machine affords no streaming
+    /// extension". It must produce NO batches rather than an endless stream of
+    /// empty ones.
+    #[test]
+    fn a_machine_that_affords_nothing_streams_nothing() {
+        let mut search = StreamingSearch {
+            cursor: 0,
+            batch_columns: 0,
+            space_len: neoethos_data::core::hpc_ta::extended_sweep_space_len(),
+            budget_rows: 1_000,
+            batches_started: 0,
+        };
+        assert!(search.next_batch().is_none());
+    }
+
+    // ── THE PREDICATE: it must be incapable of rejecting a survivor ────────
+
+    /// The measured case. On `card-run-valid.log` the best of 174 candidates
+    /// had profit factor 0.92 and net EUR -50,682 — expectancy negative by
+    /// construction. The predicate rejects, and the run's own numbers prove it
+    /// could not have discarded a survivor: `portfolio_size = 0`.
+    #[test]
+    fn the_measured_174_of_174_batch_is_rejected() {
+        let genes: Vec<Gene> = (0..200)
+            .map(|i| gene_with(-40.0 - i as f64, 0.92, 0.49, 300))
+            .collect();
+        let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
+        assert!(verdict.is_reject());
+        assert_eq!(
+            verdict.reason(),
+            BatchRejectReason::NoCandidateClearsExpectancyFloor.as_str()
+        );
+        assert_eq!(verdict.measured, 200);
+    }
+
+    /// ONE candidate with a gross edge is enough to save the whole batch, even
+    /// when every other candidate is catastrophic. This is the certainty leg:
+    /// `profit_factor >= 1.0` means the candidate did not lose money gross, and
+    /// the predicate is not allowed to have an opinion about it.
+    #[test]
+    fn one_candidate_with_a_gross_edge_saves_the_batch() {
+        let mut genes: Vec<Gene> = (0..200).map(|_| gene_with(-80.0, 0.5, 0.30, 400)).collect();
+        genes.push(gene_with(0.01, 1.0, 0.51, 400));
+        let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
+        assert!(!verdict.is_reject());
+        assert_eq!(verdict.reason(), BatchAcceptReason::CandidateClearsFloor.as_str());
+    }
+
+    /// A thin sample is uncertainty, not evidence. This is the leg that answers
+    /// the observed GA archive going 0/200 at generation 4 and 289/527 at
+    /// generation 527: a predicate that fires on "the archive looks empty" is a
+    /// false-reject generator.
+    #[test]
+    fn a_thin_population_passes_rather_than_rejecting() {
+        let genes: Vec<Gene> = (0..EARLY_REJECT_MIN_MEASURED - 1)
+            .map(|_| gene_with(-500.0, 0.2, 0.10, 90))
+            .collect();
+        let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
+        assert!(!verdict.is_reject());
+        assert_eq!(
+            verdict.reason(),
+            BatchAcceptReason::UncertainTooFewMeasured.as_str()
+        );
+    }
+
+    /// Genes that never traded carry `expectancy = 0.0` by construction. They
+    /// are not measurements and must not be counted — at a floor of 0.0 that is
+    /// exactly the difference between "uncertain" and "rejected".
+    #[test]
+    fn genes_that_never_traded_are_not_evidence() {
+        let genes: Vec<Gene> = (0..500).map(|_| gene_with(0.0, 0.0, 0.0, 0)).collect();
+        let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
+        assert!(!verdict.is_reject());
+        assert_eq!(verdict.reason(), BatchAcceptReason::UncertainNoMetrics.as_str());
+        assert_eq!(verdict.measured, 0);
+    }
+
+    /// An empty population is uncertainty, never rejection.
+    #[test]
+    fn an_empty_population_passes() {
+        let verdict = evaluate_batch_early_reject(&[], &shipped_profile());
+        assert!(!verdict.is_reject());
+    }
+
+    /// The margin only ever makes the predicate MORE permissive than the
+    /// configured floor. A batch sitting just under the floor is passed.
+    #[test]
+    fn the_margin_can_only_widen_what_is_accepted() {
+        // Scale = mean |expectancy| = 100, margin = 25. best = -10 > 0 - 25.
+        let mut genes: Vec<Gene> = (0..100).map(|_| gene_with(-100.0, 0.8, 0.4, 300)).collect();
+        genes[0] = gene_with(-10.0, 0.9, 0.45, 300);
+        let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
+        assert!(!verdict.is_reject());
+        assert_eq!(
+            verdict.reason(),
+            BatchAcceptReason::UncertainWithinMargin.as_str()
+        );
+    }
+
+    /// The predicate reads the OPERATOR'S floor. Raising it in config must move
+    /// the decision, and lowering it must too — the threshold is never a
+    /// literal in this file.
+    #[test]
+    fn the_floor_comes_from_config_not_from_the_predicate() {
+        let genes: Vec<Gene> = (0..100).map(|_| gene_with(-100.0, 0.8, 0.4, 300)).collect();
+        let mut lenient = shipped_profile();
+        lenient.min_net_expectancy_per_trade = -1_000.0;
+        assert!(!evaluate_batch_early_reject(&genes, &lenient).is_reject());
+        let strict = shipped_profile();
+        assert!(evaluate_batch_early_reject(&genes, &strict).is_reject());
+    }
+
+    /// Every batch the ledger sees is counted, and a rejection is NAMED with
+    /// its cursor.
+    #[test]
+    fn the_ledger_names_what_it_abandoned() {
+        let mut ledger = BatchRejectionLedger::default();
+        let genes: Vec<Gene> = (0..100).map(|_| gene_with(-100.0, 0.8, 0.4, 300)).collect();
+        let reject = evaluate_batch_early_reject(&genes, &shipped_profile());
+        ledger.record(864, &reject);
+        let keep = evaluate_batch_early_reject(&[], &shipped_profile());
+        ledger.record(1728, &keep);
+        assert_eq!(ledger.batches_seen, 2);
+        assert_eq!(ledger.batches_rejected, 1);
+        assert_eq!(ledger.rejected_examples.len(), 1);
+        assert_eq!(ledger.rejected_examples[0].0, 864);
+        assert_eq!(ledger.accepted_uncertain_no_metrics, 1);
+    }
+
+    // ── prefilter_top_k ────────────────────────────────────────────────────
+
+    /// At the shipped configuration the derived value does not bind, so the
+    /// effective pool is exactly the 240 it has always been. The change is
+    /// therefore inert until the population is large enough for the alphabet to
+    /// support more.
+    #[test]
+    fn the_shipped_population_still_gets_the_configured_240() {
+        assert_eq!(resolve_prefilter_top_k(240, 1_795, 1_000, 5), 240);
+        assert_eq!(resolve_prefilter_top_k(240, 1_795, 100, 5), 240);
+    }
+
+    /// At the GPU population the derivation binds and reproduces the
+    /// historical operating point (265 kept) to within rounding.
+    #[test]
+    fn the_gpu_population_derives_the_historical_coverage() {
+        let k = resolve_prefilter_top_k(240, 12_639, 4_096, 5);
+        assert_eq!(k, 267);
+        let coverage = 4_096.0 * 3.0 / k as f64;
+        assert!(
+            (44.0..48.0).contains(&coverage),
+            "expected ~46 genes per column, got {coverage}"
+        );
+    }
+
+    /// The number must NOT grow with the cube. A bigger box and a longer
+    /// timeframe list do not enlarge the alphabet the GA can cover.
+    #[test]
+    fn a_wider_cube_does_not_widen_the_pool() {
+        let narrow = resolve_prefilter_top_k(240, 651, 4_096, 5);
+        let wide = resolve_prefilter_top_k(240, 46_343, 4_096, 5);
+        assert_eq!(narrow, wide);
+    }
+
+    /// The cube width is still a ceiling — a pool wider than the cube is
+    /// meaningless.
+    #[test]
+    fn the_cube_width_remains_a_hard_ceiling() {
+        assert_eq!(resolve_prefilter_top_k(240, 90, 4_096, 5), 90);
+    }
+
+    /// `0` still disables the prefilter entirely. Unchanged semantics.
+    #[test]
+    fn zero_still_means_no_prefilter() {
+        assert_eq!(resolve_prefilter_top_k(0, 1_795, 4_096, 5), 0);
+    }
+
+    /// The four state families are force-kept; a classic indicator column is
+    /// not, and a higher-timeframe copy of a state column is not (it carries a
+    /// TF prefix, so it is ranked like any other multi-TF column and protected
+    /// by the per-TF quota instead).
+    #[test]
+    fn only_base_timeframe_state_columns_are_force_kept() {
+        assert!(is_prefilter_state_column("regime_vol_state"));
+        assert!(is_prefilter_state_column("smc_ob"));
+        assert!(is_prefilter_state_column("session_london_open"));
+        assert!(is_prefilter_state_column("fp_delta"));
+        assert!(!is_prefilter_state_column("rsi_14"));
+        assert!(!is_prefilter_state_column("H1_smc_ob"));
     }
 }
 

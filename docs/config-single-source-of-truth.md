@@ -153,10 +153,21 @@ migration tool, with what each means **today**:
 | key | his value | what that means right now |
 |---|---|---|
 | `models.prop_search_min_payoff_ratio` | `0.0` | **the realized-payoff floor is OFF** — any win/loss shape is admitted |
-| `models.discovery_runtime.prefilter_top_k` | `50` | base feature set collapses 217 → ~64 columns; SMC, session and footprint families die first |
+| `models.discovery_runtime.prefilter_top_k` | `50` | base feature set collapses 217 → ~64 columns; SMC, session and footprint families die first ⚠ **the "217" is stale** — see note below |
 | `models.require_walkforward_for_export` | `false` | **the out-of-sample export gate is OFF** — a portfolio reaches live money on the window gate alone |
 | `risk.max_portfolio_risk` | `0.0` | **NO CAP AT ALL**, not "no risk" |
 | `risk.trailing_enabled` | `true` | the **orphaned** copy; the search reads `models.exit_policy`, and live execution trails unconditionally with no config gate |
+
+> ⚠ **The "217 columns" in the `prefilter_top_k` row is stale (2026-08-09).**
+> The base cube is no longer 217 columns. With the vocabulary restored it offers
+> **1,946 columns per timeframe** on this machine — 5,838 across an M5+H1+H4 run
+> — and up to the memory budget's 4,096 on a larger box. The *direction* of the
+> warning stands (a small `top_k` kills whole feature families first), but the
+> arithmetic behind it does not: a **constant** `top_k` against a
+> hardware-dependent cube width discards a hardware-dependent fraction. Measured
+> in [`higher-timeframe-lane-2026-08-09.md`](higher-timeframe-lane-2026-08-09.md).
+> Unrelated to — but easily confused with — the **void** `217/217, 40/217,
+> 8/217` higher-timeframe keep rates retracted in that same document.
 
 And the trailing values specifically: his file sets
 `risk.trailing_atr_multiplier: 0.4` and `risk.trailing_be_trigger_r: 0.1` and has

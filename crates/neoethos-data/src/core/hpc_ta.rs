@@ -475,7 +475,7 @@ pub fn compute_classic_ta_columns_sized(
     if !ext_groups.is_empty() {
         let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_groups
             .par_iter()
-            .map(|(id, periods)| sweep_one_id_ledgered(&candles, id, periods, n, Kernel::Auto))
+            .map(|(id, periods)| sweep_one_id_ledgered(&candles, *id, periods, n, Kernel::Auto))
             .collect();
         for (mut c, l) in ext {
             cols.append(&mut c);
@@ -849,6 +849,37 @@ pub fn planned_sweep_columns() -> usize {
         .iter()
         .map(|id| planned_output_count(id) * ALT_PERIODS.len())
         .sum()
+}
+
+/// Columns the RESIDENT part of a pass will stage on this machine: the admitted
+/// base vocabulary plus the historical period sweep, i.e. everything that is
+/// present in every batch and is not the streaming extension.
+///
+/// This is the same arithmetic `compute_classic_ta_columns_sized` performs, in
+/// ONE place, so a streaming loop that sizes its batch from
+/// `max_columns - resident` cannot drift from what the pass actually spends.
+/// Registry lookups only; nothing is allocated.
+pub fn planned_resident_columns(budget_rows: usize) -> usize {
+    let budget = VocabularyBudget::for_run(budget_rows);
+    let sweep_reserved = planned_sweep_columns();
+    let base_budget = budget.reserve(sweep_reserved);
+    let all_ids: Vec<&'static str> = ALL_INDICATORS.to_vec();
+    let (admitted, _deferred, _planned) = admit_indicators(&all_ids, &base_budget);
+    let base_plan: usize = admitted.iter().map(|id| planned_output_count(id)).sum();
+    base_plan + sweep_reserved
+}
+
+/// How wide one streaming batch may be on this machine: what
+/// [`VocabularyBudget`] affords at `budget_rows`, minus the resident plan.
+///
+/// A function of the hardware and the widest frame, never of a user parameter —
+/// the never-OOM invariant. Zero means the machine cannot afford ANY streaming
+/// extension, which the caller must treat as "do not stream", not as "stream a
+/// batch of nothing".
+pub fn streaming_batch_columns(budget_rows: usize) -> usize {
+    VocabularyBudget::for_run(budget_rows)
+        .max_columns
+        .saturating_sub(planned_resident_columns(budget_rows))
 }
 
 /// Is this id's window drivable by the sweep, i.e. would sweeping it produce

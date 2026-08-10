@@ -152,9 +152,27 @@ fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
    Therefore **every H1/H4/D1 column scored exactly 0.0**, the stable
    `sort_by` at `discovery.rs:3946` broke the resulting mass tie by original
    column index, and base columns — emitted first in the cube — swept the whole
-   top-K. That reproduces the measured `base 217/217, H1 40/217, H4 8/217` with
-   no free parameters. The prefilter was not ranking the higher timeframes
-   badly; it was not ranking them at all.
+   top-K. The prefilter was not ranking the higher timeframes badly; it was not
+   ranking them at all.
+
+   > ⚠ **The keep-rate figures this paragraph used to quote — `base 217/217,
+   > H1 40/217, H4 8/217` — are VOID and have been removed.** They were
+   > produced by the very function described above, so they measured column
+   > index, not correlation. Re-measured on real EURUSD M5/H1/H4 bars
+   > 2026-08-09: the legacy function scored **100% of H1 and 100% of H4
+   > columns exactly 0.0** (and 99.3% of base columns against the
+   > triple-barrier label), and the median global rank per timeframe landed on
+   > the cube's index midpoints — 973 / 2,919 / 4,865. The mechanism above is
+   > confirmed; only the numbers are retracted.
+   >
+   > What replaces them: **H1 carries rankable signal and was being discarded**
+   > (0 columns earned on rank before, 79 after; 106 clear a Bonferroni bar on
+   > their own effective sample size). **H4 does not clear that bar on a single
+   > column**, for a measured arithmetic reason that is not the old one. See
+   > [`higher-timeframe-lane-2026-08-09.md`](higher-timeframe-lane-2026-08-09.md),
+   > and re-run
+   > `crates/neoethos-search/tests/higher_timeframe_lane_measured.rs` before
+   > citing any higher-timeframe keep rate.
 
 ### The replacement
 
