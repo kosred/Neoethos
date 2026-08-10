@@ -407,17 +407,75 @@ pub fn compute_classic_ta_columns_sized(
     //     Using `cols.len()` here would make the admitted extension a function
     //     of the frame, which is the same defect one level up: two timeframes
     //     would extend by different amounts and the cube widths would diverge.
+    //
+    //     STREAMING OVERRIDE (2026-08-10). When a working set is installed by
+    //     `install_extended_sweep_working_set`, the extension is EXACTLY that
+    //     batch's (indicator, period) pairs and the budget-capped prefix is not
+    //     consulted. With no working set installed — the default, and every
+    //     existing caller — this block is byte-identical to what it was: same
+    //     plan function, same `ALT_PERIODS` slice per id, same emission order,
+    //     same deferral ledger. That identity is the parity property, and it is
+    //     structural rather than tested-by-luck: both lanes run through the SAME
+    //     `sweep_one_id_ledgered`.
+    //
+    //     THE STOPGAP STAYS, AND HERE IS WHY IT MUST. The measurement that
+    //     motivated it — "~9 s to ~12 min at 6,000 bars with 4,096 columns
+    //     allowed" — DID NOT REPRODUCE at HEAD: the production pass at 6,000
+    //     bars with `max_columns` 4,096 takes 1.36 s and emits 1,795 columns,
+    //     and the cap binds at every bar count measured (1,795 produced against
+    //     4,096 / 4,096 / 3,244 allowed at 6k / 20k / 200k). But the cost that
+    //     the cap bounds is per-column-COMPUTED, not per-column-HELD — 342 ids
+    //     take 1.10 s at 6k bars and 10.47 s at 60k — so STREAMING DOES NOT
+    //     REMOVE IT. Ten batches of a tenth of the space cost what one pass over
+    //     the whole space costs, plus ten prefilters instead of one. Removing
+    //     the cap here would therefore hand back an unbounded-in-time extension
+    //     with nothing having been fixed. What WOULD remove it is a cheaper
+    //     dispatch, and the target is named: at 6,000 bars the slowest TEN of
+    //     342 ids are 79.3% of the base pass and the slowest ten of the sweep
+    //     are 86.2% of it (`goertzel_cycle_composite_wave` 2.17 s,
+    //     `smooth_theil_sen` 1.12 s, `volume_adjusted_ma` 0.79 s, each for five
+    //     periods).
     let spent = cols.len();
     let planned_so_far = base_admitted_plan + sweep_reserved;
-    let extended_budget = budget
-        .max_columns
-        .saturating_sub(planned_so_far)
-        .min(planned_so_far);
-    let (ext_plan, ext_deferred) = extended_sweep_plan(extended_budget);
-    if !ext_plan.is_empty() {
-        let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_plan
+    let unspent = budget.max_columns.saturating_sub(planned_so_far);
+    let working_set = current_extended_sweep_working_set();
+    let (ext_groups, ext_deferred, ext_mode, extended_budget) = match working_set.as_deref() {
+        Some(batch) => {
+            if batch.planned_columns > unspent {
+                tracing::warn!(
+                    target: "neoethos_data::hpc_ta",
+                    cursor = batch.cursor,
+                    batch_columns = batch.planned_columns,
+                    unspent_columns = unspent,
+                    max_columns = budget.max_columns,
+                    "the installed streaming working set is WIDER than this machine still \
+                     affords after the base vocabulary and the historical sweep. Building it \
+                     anyway — the caller sized the batch and refusing here would silently \
+                     change which parameter region the run explored — but expect memory \
+                     pressure. Size the batch from VocabularyBudget minus the resident plan."
+                );
+            }
+            (
+                batch.grouped_by_id(),
+                Vec::new(),
+                "streaming_batch",
+                batch.planned_columns,
+            )
+        }
+        None => {
+            let extended_budget = unspent.min(planned_so_far);
+            let (plan, deferred) = extended_sweep_plan(extended_budget);
+            let groups: Vec<(&'static str, Vec<usize>)> = plan
+                .into_iter()
+                .map(|id| (id, ALT_PERIODS.to_vec()))
+                .collect();
+            (groups, deferred, "budget_prefix", extended_budget)
+        }
+    };
+    if !ext_groups.is_empty() {
+        let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_groups
             .par_iter()
-            .map(|&id| sweep_one_id_ledgered(&candles, id, &ALT_PERIODS, n, Kernel::Auto))
+            .map(|(id, periods)| sweep_one_id_ledgered(&candles, id, periods, n, Kernel::Auto))
             .collect();
         for (mut c, l) in ext {
             cols.append(&mut c);
@@ -443,7 +501,11 @@ pub fn compute_classic_ta_columns_sized(
         max_columns = budget.max_columns,
         base_columns = spent - sweep_actual,
         sweep_columns = sweep_actual,
-        extended_ids = ext_plan.len(),
+        extended_mode = ext_mode,
+        extended_cursor = working_set.as_deref().map(|b| b.cursor).unwrap_or(0),
+        extended_space_len = working_set.as_deref().map(|b| b.space_len).unwrap_or(0),
+        extended_ids = ext_groups.len(),
+        extended_pairs = ext_groups.iter().map(|(_, p)| p.len()).sum::<usize>(),
         extended_deferred = ext_deferred.len(),
         extended_columns = cols.len() - spent,
         total_columns = cols.len(),
@@ -838,7 +900,7 @@ fn is_extended_sweepable(id: &str) -> bool {
 /// itself and never depends on the frame is what lets a later change swap the
 /// working set between generations without the column layout becoming a
 /// function of scheduling.
-fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'static str>) {
+pub fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'static str>) {
     let mut admitted: Vec<&'static str> = Vec::new();
     let mut deferred: Vec<&'static str> = Vec::new();
     let mut used = 0usize;
@@ -855,6 +917,251 @@ fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'stati
         }
     }
     (admitted, deferred)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE ADVANCE — a streaming working set over the (indicator, period) space.
+//
+// WHAT THIS IS FOR, STATED HONESTLY, BECAUSE THE DESIGN DOC IS WRONG ABOUT IT.
+//
+// `docs/streaming-parameter-search.md` §1 justifies streaming by the cost of
+// MATERIALISING the cube. Measured at HEAD, that justification does not hold:
+// the production feature pass at 6,000 real EURUSD M5 bars with the budget
+// allowing 4,096 columns takes **1.36 s** and emits 1,795 columns, and at
+// 200,000 bars **26.76 s**. Time is linear in BARS and linear in COLUMNS
+// COMPUTED; it is NOT a function of columns HELD. So per unit of (indicator,
+// period) space explored, streaming costs exactly what materialising costs —
+// and a streamed run re-pays the prefilter (5.6% of a run) once per batch.
+//
+// Streaming buys exactly two things, and neither is the feature build:
+//
+//   1. the MEMORY bound, which `VocabularyBudget` already gives; and
+//   2. — the only real prize — never paying the DOWNSTREAM stages for a batch
+//      that is knowably doomed. On the run the doc cites
+//      (`docs/measurements/3090-47260276/card-run-valid.log`) the quality
+//      screen was 88,971 ms = **50.4% of wall time** and took 174 candidates
+//      in and 0 out. That is what the early-reject predicate in
+//      `neoethos_search::discovery` exists to skip.
+//
+// Build the loop to save feature-build time and it will measure as a
+// REGRESSION. Build it to skip the quality screen and it is worth 4-6x more
+// (indicator, period) regions examined per hour on the same hardware.
+//
+// WHY `extended_sweep_plan` COULD NOT BE THE ADVANCE, despite its own doc
+// comment claiming it was the prototype of one: it is a PREFIX selector that
+// always restarts at index 0, it takes no offset, and it enumerates IDS (all
+// five `ALT_PERIODS` atomically) rather than (indicator, period) pairs, so a
+// batch boundary could only ever fall between ids. The three functions below
+// are the advance it described but was not.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One point in the sweep space: an indicator and the window it is evaluated at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SweepPair {
+    pub id: &'static str,
+    pub period: usize,
+}
+
+/// A working set: the slice of the (indicator, period) space one batch covers.
+///
+/// TWO ORDERS, AND THEY ARE DELIBERATELY DIFFERENT.
+///
+/// * **Selection** walks period-OUTER / id-inner, so a batch mixes timescales
+///   rather than being 32 flavours of one window. That is the order
+///   `docs/streaming-parameter-search.md` §3.2 specifies and it is the one the
+///   cursor indexes into.
+/// * **Emission** is id-outer (`ALL_INDICATORS` order) / period-inner —
+///   *whatever the batch selected*. This is not a detail: emission order feeds
+///   `effective_feature_names` and every discovery artifact, and the parity
+///   requirement is that a batch covering the WHOLE space emits a column list
+///   byte-identical to today's non-streaming pass. Sorting the selected pairs
+///   back into emission order is what makes that true by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepBatch {
+    /// Cursor this batch began at, in SELECTION order. One integer — this is
+    /// the whole resumable state of a streaming run.
+    pub cursor: usize,
+    /// Cursor the next batch begins at. Always `> cursor` unless the space is
+    /// exhausted or the budget admits nothing.
+    pub next_cursor: usize,
+    /// The batch's pairs, in EMISSION order.
+    pub pairs: Vec<SweepPair>,
+    /// Columns this batch plans to stage, from registry lookups only.
+    pub planned_columns: usize,
+    /// Total pairs in the space, so a log line can say "batch 7 of 1,620".
+    pub space_len: usize,
+    /// True when this batch reached the end of the space. The loop decides what
+    /// that means (stop, or wrap to cursor 0 for a second pass); wrapping is
+    /// never done here, because a silent wrap is a repeat and the whole point
+    /// of the cursor is that a pair appears in exactly one batch per sweep.
+    pub exhausted: bool,
+}
+
+impl SweepBatch {
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// True when this batch is the entire space starting from zero — the
+    /// degenerate case the parity test pins.
+    pub fn covers_whole_space(&self) -> bool {
+        self.cursor == 0 && self.pairs.len() == self.space_len && self.space_len > 0
+    }
+
+    /// The batch regrouped for dispatch: `(id, periods)` in emission order,
+    /// periods ascending within each id. This is the shape
+    /// `sweep_one_id_ledgered` already takes, so the streaming lane and the
+    /// prefix lane run through the SAME sweep code with the same naming, the
+    /// same `#212` pre-flight guard and the same ledger.
+    pub fn grouped_by_id(&self) -> Vec<(&'static str, Vec<usize>)> {
+        let mut out: Vec<(&'static str, Vec<usize>)> = Vec::new();
+        for pair in &self.pairs {
+            match out.last_mut() {
+                Some((id, periods)) if *id == pair.id => periods.push(pair.period),
+                _ => out.push((pair.id, vec![pair.period])),
+            }
+        }
+        out
+    }
+}
+
+/// Position of an id in `ALL_INDICATORS`, for the emission sort. Linear scan
+/// over a 342-entry static — called once per batch, not per column.
+fn all_indicators_rank(id: &str) -> usize {
+    ALL_INDICATORS
+        .iter()
+        .position(|&candidate| candidate == id)
+        .unwrap_or(usize::MAX)
+}
+
+/// Every (indicator, period) pair the extended sweep can reach, in SELECTION
+/// order (period-outer, id-inner).
+///
+/// Four properties, all of which the streaming loop needs and none of which are
+/// free:
+///
+/// * **no repeats** — a pair appears exactly once, so batch *k* and batch *j*
+///   are disjoint;
+/// * **deterministic** — a pure function of `ALL_INDICATORS`, `ALT_PERIODS` and
+///   the vector-ta registry, so batch *k* is the same set on every machine and
+///   every run and a result is reproducible from `(seed, cursor)` alone;
+/// * **frame-independent** — nothing here reads the frame, so every timeframe
+///   in a run gets the SAME batch and the per-TF cube widths stay equal (which
+///   is what `lib.rs::try_assemble_cube_in_ram`'s width invariant requires);
+/// * **exclusion-stable** — `MULTI_PERIOD_IDS` are excluded exactly as
+///   `extended_sweep_plan` excludes them, so a streamed column can never
+///   collide by NAME with a historical sweep column (a collision is a hard
+///   error in `compute_classic_ta_columns_sized`, by design).
+pub fn extended_sweep_space() -> Vec<SweepPair> {
+    let mut space = Vec::new();
+    for &period in ALT_PERIODS.iter() {
+        for &id in ALL_INDICATORS {
+            if MULTI_PERIOD_IDS.contains(&id) || !is_extended_sweepable(id) {
+                continue;
+            }
+            space.push(SweepPair { id, period });
+        }
+    }
+    space
+}
+
+/// Size of the space `extended_sweep_space` enumerates.
+pub fn extended_sweep_space_len() -> usize {
+    extended_sweep_space().len()
+}
+
+/// Batch *k*: the pairs from `cursor` onward that fit `budget_columns`.
+///
+/// `budget_columns` comes from [`VocabularyBudget`] — free RAM divided by the
+/// widest frame's per-column price, minus what the resident families and the
+/// base vocabulary already claimed. It is never a constant and never a user
+/// parameter, which is the never-OOM invariant applied rather than circumvented.
+///
+/// ONE PAIR IS ALWAYS TAKEN when the budget is non-zero and the cursor is
+/// inside the space. Without that, an id whose planned output count alone
+/// exceeds the budget would produce an empty non-advancing batch forever — a
+/// loop that makes no progress and says nothing, which is the silent-stall
+/// shape of the silent-drop defect. Taking it anyway over-spends by at most one
+/// indicator's outputs and is reported by the budget log.
+pub fn extended_sweep_batch(cursor: usize, budget_columns: usize) -> SweepBatch {
+    let space = extended_sweep_space();
+    let space_len = space.len();
+    if cursor >= space_len || budget_columns == 0 {
+        return SweepBatch {
+            cursor,
+            next_cursor: cursor,
+            pairs: Vec::new(),
+            planned_columns: 0,
+            space_len,
+            exhausted: cursor >= space_len,
+        };
+    }
+    let mut selected: Vec<SweepPair> = Vec::new();
+    let mut used = 0usize;
+    let mut idx = cursor;
+    while idx < space_len {
+        let pair = space[idx];
+        let want = planned_output_count(pair.id);
+        if !selected.is_empty() && used + want > budget_columns {
+            break;
+        }
+        used += want;
+        selected.push(pair);
+        idx += 1;
+    }
+    // Emission order: id-outer in `ALL_INDICATORS` order, period ascending
+    // within each id. `sort_by_key` is stable, but the key is total so
+    // stability is not load-bearing — the order is a function of the SET alone,
+    // never of which cursor produced it.
+    selected.sort_by_key(|pair| (all_indicators_rank(pair.id), pair.period));
+    SweepBatch {
+        cursor,
+        next_cursor: idx,
+        pairs: selected,
+        planned_columns: used,
+        space_len,
+        exhausted: idx >= space_len,
+    }
+}
+
+/// The working set installed for this process, or `None` for the historical
+/// budget-prefix behaviour.
+///
+/// A process-level seam, exactly like [`set_indicator_compute_policy`] above and
+/// for the same reason: the cube build reaches `compute_classic_ta_columns_sized`
+/// through six frames of `rayon::join` in `lib.rs`, and threading a batch
+/// parameter through all of them would touch call sites in crates this change
+/// does not own. It is not ambient state in the dangerous sense — the batch is a
+/// pure function of `(cursor, budget_columns)`, it is logged by cursor and width
+/// on every pass, and `with_extended_sweep_working_set` in `lib.rs` scopes the
+/// install so it cannot leak past the build it was made for.
+static EXTENDED_SWEEP_WORKING_SET: std::sync::RwLock<Option<std::sync::Arc<SweepBatch>>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear) the working set. Returns the PREVIOUS value so a scoped
+/// helper can restore it — including when the build between install and restore
+/// unwinds.
+///
+/// Lock poisoning is recovered rather than propagated: a poisoned lock here
+/// means some other thread panicked while holding it, and refusing to read the
+/// working set would silently change which columns the run builds. The value is
+/// a plain `Option<Arc<_>>` with no invariant a panic could have broken.
+pub fn install_extended_sweep_working_set(
+    batch: Option<std::sync::Arc<SweepBatch>>,
+) -> Option<std::sync::Arc<SweepBatch>> {
+    let mut guard = EXTENDED_SWEEP_WORKING_SET
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *guard, batch)
+}
+
+/// The working set in force, or `None` when the pass should take the historical
+/// budget-capped prefix.
+pub fn current_extended_sweep_working_set() -> Option<std::sync::Arc<SweepBatch>> {
+    EXTENDED_SWEEP_WORKING_SET
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// CPU sweep for ONE indicator across `periods`. This is the parity reference
@@ -1613,6 +1920,165 @@ fn normalize_indicator_len(v: Vec<f64>, n: usize) -> anyhow::Result<(Vec<f64>, u
     }
 }
 
+
+#[cfg(test)]
+mod streaming_advance_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// PARITY, AND IT COMES FIRST.
+    ///
+    /// The degenerate case: one batch whose working set is the WHOLE space,
+    /// starting at cursor 0. Its emitted `(id, periods)` grouping must be
+    /// exactly what the non-streaming pass builds — the budget-prefix plan with
+    /// every id at all five `ALT_PERIODS`, in `ALL_INDICATORS` order.
+    ///
+    /// Asserted on the (id, period) LIST, not on a count: the extension emits
+    /// `<id>_<period>` names into the same namespace as the base pass and a
+    /// duplicate NAME is a hard error in `compute_classic_ta_columns_sized`, so
+    /// a width-only assertion would pass while the column set changed.
+    #[test]
+    fn whole_space_batch_is_byte_identical_to_the_non_streaming_plan() {
+        let space_len = extended_sweep_space_len();
+        assert!(space_len > 0, "the sweep space must not be empty");
+        let batch = extended_sweep_batch(0, usize::MAX);
+        assert!(batch.covers_whole_space());
+        assert!(batch.exhausted);
+        assert_eq!(batch.next_cursor, space_len);
+
+        // What the non-streaming lane would dispatch, at an unbounded budget.
+        let (plan, deferred) = extended_sweep_plan(usize::MAX);
+        assert!(deferred.is_empty(), "an unbounded budget defers nothing");
+        let expected: Vec<(&'static str, Vec<usize>)> = plan
+            .into_iter()
+            .map(|id| (id, ALT_PERIODS.to_vec()))
+            .collect();
+
+        assert_eq!(
+            batch.grouped_by_id(),
+            expected,
+            "the whole-space batch must dispatch exactly the ids, periods and ORDER the \
+             non-streaming pass dispatches — column order feeds effective_feature_names"
+        );
+    }
+
+    /// The advance never repeats and never loses a pair: the disjoint union of
+    /// every batch is exactly the space, in selection order.
+    #[test]
+    fn successive_batches_partition_the_space_exactly_once() {
+        let space = extended_sweep_space();
+        let mut cursor = 0usize;
+        let mut seen: Vec<SweepPair> = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            let batch = extended_sweep_batch(cursor, 40);
+            if batch.is_empty() {
+                break;
+            }
+            assert!(
+                batch.next_cursor > cursor,
+                "a non-empty batch must advance the cursor, or the loop stalls silently"
+            );
+            seen.extend(batch.pairs.iter().copied());
+            cursor = batch.next_cursor;
+            guard += 1;
+            assert!(guard < 100_000, "advance failed to terminate");
+            if batch.exhausted {
+                break;
+            }
+        }
+        assert_eq!(cursor, space.len());
+        assert_eq!(seen.len(), space.len(), "every pair must appear exactly once");
+        let unique: HashSet<SweepPair> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), space.len(), "no pair may appear twice");
+        let space_set: HashSet<SweepPair> = space.iter().copied().collect();
+        assert_eq!(unique, space_set, "the union of the batches IS the space");
+    }
+
+    /// Batch *k* is the same set on every call — the property that makes a
+    /// result reproducible from `(seed, cursor)` alone.
+    #[test]
+    fn a_batch_is_a_pure_function_of_cursor_and_budget() {
+        for cursor in [0usize, 1, 37, 200] {
+            let a = extended_sweep_batch(cursor, 64);
+            let b = extended_sweep_batch(cursor, 64);
+            assert_eq!(a, b, "batch at cursor {cursor} is not deterministic");
+        }
+    }
+
+    /// Selection is period-outer so a batch MIXES timescales; emission is
+    /// id-outer so the column layout never becomes a function of scheduling.
+    #[test]
+    fn selection_mixes_timescales_and_emission_is_id_ordered() {
+        let space = extended_sweep_space();
+        // Selection: the first `ALT_PERIODS[0]`-period run precedes any
+        // `ALT_PERIODS[1]` pair.
+        let first_period = space[0].period;
+        assert_eq!(first_period, ALT_PERIODS[0]);
+        // Emission within one batch: non-decreasing ALL_INDICATORS rank, and
+        // ascending period within an id.
+        let batch = extended_sweep_batch(0, 512);
+        let mut last = (0usize, 0usize);
+        for pair in &batch.pairs {
+            let key = (all_indicators_rank(pair.id), pair.period);
+            assert!(key > last || last == (0, 0), "emission order is not sorted");
+            last = key;
+        }
+    }
+
+    /// A budget smaller than one id's outputs must still advance — a batch that
+    /// makes no progress is a stall with no log line, which is the silent-drop
+    /// defect one level up.
+    #[test]
+    fn a_budget_too_small_for_one_indicator_still_advances() {
+        let batch = extended_sweep_batch(0, 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.next_cursor, 1);
+    }
+
+    /// A zero budget admits nothing and does NOT advance, and an exhausted
+    /// cursor reports itself rather than wrapping. Wrapping is the loop's
+    /// decision, never a silent one here.
+    #[test]
+    fn zero_budget_and_exhausted_cursor_are_reported_not_papered_over() {
+        let empty = extended_sweep_batch(0, 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.next_cursor, 0);
+        assert!(!empty.exhausted);
+
+        let len = extended_sweep_space_len();
+        let past_end = extended_sweep_batch(len, usize::MAX);
+        assert!(past_end.is_empty());
+        assert!(past_end.exhausted);
+        assert_eq!(past_end.next_cursor, len);
+    }
+
+    /// The space can never collide by NAME with the historical sweep, because a
+    /// duplicate column name is a hard error in the pass that emits both.
+    #[test]
+    fn the_space_excludes_the_historical_sweep_ids() {
+        for pair in extended_sweep_space() {
+            assert!(
+                !MULTI_PERIOD_IDS.contains(&pair.id),
+                "{} is swept by the historical sweep; streaming it too emits duplicate \
+                 column NAMES, which is a hard error",
+                pair.id
+            );
+        }
+    }
+
+    /// Install/restore is exact, so a scoped build cannot leak its working set
+    /// into the next one.
+    #[test]
+    fn installing_a_working_set_returns_the_previous_one() {
+        let batch = std::sync::Arc::new(extended_sweep_batch(0, 8));
+        let previous = install_extended_sweep_working_set(Some(batch.clone()));
+        assert_eq!(current_extended_sweep_working_set().as_deref(), Some(&*batch));
+        let restored = install_extended_sweep_working_set(previous);
+        assert_eq!(restored.as_deref(), Some(&*batch));
+        assert!(current_extended_sweep_working_set().is_none());
+    }
+}
 
 #[cfg(test)]
 mod tests {

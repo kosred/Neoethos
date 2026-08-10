@@ -808,6 +808,14 @@ impl CudaVosc {
 
         let use_ds = rows >= 131_072 || cols >= 1024;
 
+        // COUNTED, not disguised — the `use_ds == false` branch below computes
+        // on the HOST and uploads. See rvi_wrapper.rs for the reasoning. Recorded
+        // unconditionally at the decision point rather than inside the branch, so
+        // the counter cannot drift away from the condition it describes.
+        if !use_ds {
+            crate::cuda::host_fallback::record("vosc");
+        }
+
         let elems = Self::checked_mul(rows, cols)?;
         let mut d_out_tm: DeviceBuffer<f32> =
             unsafe { DeviceBuffer::uninitialized_async(elems, &self.stream)? };

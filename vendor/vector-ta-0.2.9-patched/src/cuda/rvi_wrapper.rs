@@ -325,6 +325,21 @@ impl CudaRvi {
             let mut d_out =
                 unsafe { DeviceBuffer::<f32>::uninitialized_async(rows_len, &self.stream)? };
             let data_f64: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+            // COUNTED, not disguised. A card is present and this branch
+            // computes on the HOST, then uploads the result and returns it
+            // as a DeviceArray — a caller holding that pointer cannot tell
+            // the device never ran. That is the exact shape the f64 lane
+            // exists to make impossible, and it survived the conversion in
+            // four wrappers because nothing was counting.
+            //
+            // The rule is not "never compute on the host". It is: card
+            // present and a kernel exists -> the card runs it; card present
+            // and no kernel -> the host may compute it, but the call is
+            // RECORDED by indicator id so it appears as work still owed.
+            // host_fallback::total() is meant to reach zero by achievement,
+            // and it was returning zero by construction because record()
+            // had no call sites in the entire crate.
+            crate::cuda::host_fallback::record("rvi");
             let cpu = rvi_scalar_mod::rvi_batch_with_kernel(&data_f64, sweep, Kernel::ScalarBatch)
                 .map_err(|e| CudaRviError::InvalidInput(format!("CPU fallback failed: {:?}", e)))?;
 

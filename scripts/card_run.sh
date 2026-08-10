@@ -151,6 +151,14 @@ step=7; say "did everything actually run on the card"
   echo "=== any CPU fallback recorded ==="
   grep -in 'cpu_fallback\|falling back\|silent cpu\|note_cpu_fallback' "$LOGS/06-run.log" | head -20
   echo
+  echo "=== vector-ta host-fallback debt (four wrappers compute on the host) ==="
+  # rvi, mass, net_myrsi and vosc each return a DeviceArray built from a HOST
+  # computation. They are now counted by vector_ta::cuda::host_fallback::record,
+  # but NOTHING READS THE COUNTER YET — the reader belongs in the device summary
+  # and that crate was being written when this landed. Until it exists, these
+  # greps are the only surface. Absence of a line here is NOT evidence of zero.
+  grep -in 'host_fallback\|host fallback\|computed on the host' "$LOGS/06-run.log" | head -10
+  echo
   echo "=== which engine evaluated the population ==="
   grep -in 'population_eval_engines\|PopulationEvalEngine\|prototype_b\|cubecl' "$LOGS/06-run.log" | head -20
   echo

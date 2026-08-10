@@ -1176,6 +1176,66 @@ pub fn prepare_multitimeframe_features(
     prepare_multitimeframe_features_with_options(ds, base_tf, &opts)
 }
 
+/// Run `build` with a streaming working set installed, restoring whatever was
+/// in force afterwards — including when `build` unwinds.
+///
+/// This is the ONLY sanctioned way to build a batch cube. The install is a
+/// process-level seam in `hpc_ta` (see
+/// `hpc_ta::install_extended_sweep_working_set` for why it is a seam rather
+/// than a parameter), and scoping it here is what stops one batch's working set
+/// from leaking into the next build. Passing `None` runs `build` under exactly
+/// today's budget-capped-prefix behaviour — that is the degenerate case the
+/// parity test pins, and it is the same code path, not a parallel one.
+///
+/// THE SAME BATCH IS USED FOR EVERY TIMEFRAME IN THE BUILD, which is required,
+/// not incidental: the batch is frame-independent by construction, so every
+/// per-timeframe block gets the same extension width and
+/// `try_assemble_cube_in_ram`'s width invariant still holds.
+pub fn with_extended_sweep_working_set<T>(
+    batch: Option<std::sync::Arc<crate::core::hpc_ta::SweepBatch>>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let previous = crate::core::hpc_ta::install_extended_sweep_working_set(batch);
+    // `catch_unwind` rather than a Drop guard because the restore must happen
+    // even when the feature build panics — a leaked working set would silently
+    // change which columns the NEXT build produces, and that is exactly the
+    // class of defect this whole change is closing.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+    crate::core::hpc_ta::install_extended_sweep_working_set(previous);
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// [`prepare_multitimeframe_features`] for one streaming batch.
+///
+/// `batch = None` is byte-identical to `prepare_multitimeframe_features`.
+pub fn prepare_multitimeframe_features_batch(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    higher_tfs: &[&str],
+    batch: Option<std::sync::Arc<crate::core::hpc_ta::SweepBatch>>,
+) -> Result<FeatureFrame> {
+    with_extended_sweep_working_set(batch, || {
+        prepare_multitimeframe_features(ds, base_tf, higher_tfs)
+    })
+}
+
+/// [`compute_hpc_feature_frame_sized`] for one streaming batch.
+///
+/// `batch = None` is byte-identical to `compute_hpc_feature_frame_sized`.
+pub fn compute_hpc_feature_frame_batch(
+    ohlcv: &Ohlcv,
+    profile: FeatureProfile,
+    budget_rows: usize,
+    batch: Option<std::sync::Arc<crate::core::hpc_ta::SweepBatch>>,
+) -> Result<FeatureFrame> {
+    with_extended_sweep_working_set(batch, || {
+        compute_hpc_feature_frame_sized(ohlcv, profile, budget_rows)
+    })
+}
+
 /// Temp path for a discovery feature-store, unique per (symbol, base_tf,
 /// process). The store auto-deletes when its `FeatureFrame` drops, so this
 /// path collides only if a prior run crashed mid-build (truncate-on-create

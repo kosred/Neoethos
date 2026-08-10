@@ -584,6 +584,19 @@ impl CudaNetMyrsi {
         rows: usize,
         params: &NetMyrsiParams,
     ) -> Result<DeviceArrayF32, CudaNetMyrsiError> {
+        // COUNTED, not disguised. See rvi_wrapper.rs for the full reasoning:
+        // this function name ends in `_dev` and returns a DeviceArray, but the
+        // arithmetic below runs on the HOST and is then uploaded. A caller
+        // holding that pointer cannot tell the device never ran.
+        //
+        // The rule is not "never compute on the host". It is: card present and a
+        // kernel exists -> the card runs it; card present and no kernel -> the
+        // host may compute it, but the call is RECORDED by indicator id so it
+        // shows up as work still owed. host_fallback::total() is meant to reach
+        // zero by achievement; it was returning zero by construction because
+        // record() had no call sites anywhere in the crate.
+        crate::cuda::host_fallback::record("net_myrsi");
+
         let (_first_valids, _period) =
             Self::prepare_many_series_inputs(data_tm_f32, cols, rows, params)?;
 

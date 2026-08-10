@@ -599,3 +599,38 @@ correctness; it costs us the ability to see where device time goes. Suggested:
 enable it for the diagnostic build on the 4090 only — `--features gpu-nvidia,nvtx`
 — rather than adding it to an aggregate, since it is instrumentation, not
 behaviour.
+
+---
+
+## HOST-FALLBACK DEBT — the counter is written, nothing reads it
+
+**Filed 2026-08-10.** Half of this landed; the other half needs a crate that was
+being written at the time.
+
+`vector_ta::cuda::host_fallback::record()` had **zero call sites in the entire
+crate** while four wrappers computed on the host and returned the result as a
+`DeviceArrayF32` — `rvi_batch_dev` (size-guarded at `rows*len <= 2_000_000`, the
+common case), and `mass_`, `net_myrsi_` and `vosc_many_series_one_param_time_major_dev`
+(the first two unconditional, the third in the `use_ds == false` branch). A caller
+holding that pointer cannot tell the device never ran. `total()` therefore
+returned zero **by construction rather than by achievement**, which reads as a
+clean bill of health — an instrument that structurally cannot report debt is
+worse than no instrument.
+
+**Done:** all four now call `record()` with their indicator id, each with the
+rule written at the site — card present and a kernel exists, the card runs it;
+card present and no kernel, the host may compute it but the call is COUNTED.
+
+**Still needed, in `crates/neoethos-search/src/eval_telemetry.rs` beside the
+existing device summary:** read `vector_ta::cuda::host_fallback::total()` and
+`per_indicator()` at run end and print them next to the GPU percentage, so a
+non-zero debt appears in the same place an operator already looks for "did this
+run stay on the card". Gate it on the `cuda` feature — the module is
+`#![cfg(feature = "cuda")]`.
+
+**Note for whoever verifies this:** the four edits are inside `cfg(feature =
+"cuda")` code. `cargo check -p vector-ta` does not compile them, and the crate
+cannot be checked with `--features cuda` from the workspace ("cannot specify
+features for packages outside of workspace") nor from inside it ("believes it's
+in a workspace when it's not"). They were brace- and paren-balance checked only.
+**The card is their first compiler.**
