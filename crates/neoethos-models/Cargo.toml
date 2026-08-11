@@ -127,7 +127,16 @@ burn-cuda = { version = "0.21", optional = true }
 
 num_cpus = "1.17.0"
 rand = "0.9.2"
-rand08 = { package = "rand", version = "0.8", optional = true }
+# `small_rng` is NOT in rand 0.8's default features, and
+# `evolution/crfmnes_impl.rs` names `rand08::rngs::SmallRng` directly. Until
+# 2026-08-11 that type resolved only because some OTHER crate in the workspace
+# graph happened to switch the feature on and cargo unified it — so
+# `cargo check -p neoethos-models --no-default-features --features
+# neuro-evolution` failed with E0425 while the full build passed. A crate must
+# declare the features its own source needs.
+rand08 = { package = "rand", version = "0.8", optional = true, features = [
+    "small_rng",
+] }
 # Ziggurat-method `StandardNormal` sampler — correct tails by construction,
 # replaces the hand-rolled Box-Muller that produced 30+ sigma outliers.
 # MUST stay on 0.5.x: rand_distr 0.6.0 requires `rand 0.10::Rng` trait,
@@ -175,7 +184,17 @@ tree-models = ["tree-models-core", "catboost"]
 
 # Pure Rust ML features
 neuro-evolution = ["dep:crfmnes", "dep:rand08"]
-neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl"]
+# `cubecl/cuda` is not optional here: `evolution/neat_gpu.rs` and
+# `evolution/crfmnes_gpu.rs` both open with `use cubecl::cuda::{CudaDevice,
+# CudaRuntime}`, so the runtime IS the feature. Until 2026-08-11 this line
+# stopped at `dep:cubecl` — the crate but not the backend — and the feature
+# could not compile on its own (E0432, `could not find cuda in cubecl`). It
+# only ever built because the `gpu-cuda` aggregate also turns on
+# `statistical-gpu`, which spells `cubecl/cuda` out correctly, and cargo
+# unified the two. The card therefore compiled these kernels while the feature
+# that names them was broken. Same defect class as the aggregate comment
+# below: naming the dependency instead of the capability.
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "cubecl/cuda"]
 reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
 reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
 adaptive-models = ["dep:irithyll"]
