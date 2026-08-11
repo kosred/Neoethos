@@ -500,10 +500,16 @@ fn launch_population_metrics_kernel(
         features.nrows() as u32,
         input_dim as u32,
         batch.max_nodes as u32,
-    )
-    .context("launch NEAT cuda population metrics kernel")?;
+    );
 
-    let bytes = client.read_one(metrics_handle);
+    // In cubecl 0.10 the generated `kernel::launch::<R>` returns `()`: the
+    // launch is fire-and-forget and a kernel fault surfaces at readback, so
+    // `.context(..)?` on it did not compile. `read_one` is where the `Result`
+    // lives now — `read_one_unchecked` is its panicking twin — which is why
+    // the context moved down here rather than being dropped.
+    let bytes = client
+        .read_one(metrics_handle)
+        .context("read back NEAT cuda population metrics")?;
     let flat = f32::from_bytes(&bytes);
     if flat.len() != metrics_len {
         bail!(

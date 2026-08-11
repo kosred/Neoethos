@@ -175,10 +175,13 @@ fn launch_loss_kernel(
         input_dim as u32,
         hidden_dim as u32,
         param_dim as u32,
-    )
-    .context("launch neuro-evo cuda loss kernel")?;
+    );
 
-    let bytes = client.read_one(losses_handle);
+    // See `neat_gpu.rs`: `kernel::launch::<R>` is `()` in cubecl 0.10, and the
+    // `Result` moved to the readback.
+    let bytes = client
+        .read_one(losses_handle)
+        .context("read back neuro-evo cuda candidate losses")?;
     Ok(f32::from_bytes(&bytes).to_vec())
 }
 
