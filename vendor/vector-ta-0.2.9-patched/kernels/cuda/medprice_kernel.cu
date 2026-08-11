@@ -213,8 +213,8 @@ static __device__ __forceinline__ double medprice_scalar_f64(double h, double l)
     const double s = h + l;
     return __isnanf(s) ? CUDART_NAN : 0.5 * s;
 }
-extern "C" __global__ __launch_bounds___f64(256, 2)
-void medprice_kernel_f32(const double* __restrict__ high,
+extern "C" __global__ __launch_bounds__(256, 2)
+void medprice_kernel_f64(const double* __restrict__ high,
                          const double* __restrict__ low,
                          int len,
                          int first_valid,
@@ -271,8 +271,8 @@ void medprice_kernel_f32(const double* __restrict__ high,
         }
     }
 }
-extern "C" __global__ __launch_bounds___f64(256, 2)
-void medprice_batch_f32(const double* __restrict__ high,
+extern "C" __global__ __launch_bounds__(256, 2)
+void medprice_batch_f64(const double* __restrict__ high,
                         const double* __restrict__ low,
                         int len,
                         int rows,
@@ -341,8 +341,8 @@ void medprice_batch_f32(const double* __restrict__ high,
         }
     }
 }
-extern "C" __global__ __launch_bounds___f64(256, 2)
-void medprice_many_series_one_param_f32(const double* __restrict__ high_tm,
+extern "C" __global__ __launch_bounds__(256, 2)
+void medprice_many_series_one_param_f64(const double* __restrict__ high_tm,
                                         const double* __restrict__ low_tm,
                                         int cols,
                                         int rows,

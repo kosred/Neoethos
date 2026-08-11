@@ -267,8 +267,8 @@ static __device__ __forceinline__ double fast_nan_f64() {
     return __longlong_as_double(0x7fffffffffffffffULL);
 }
 static __device__ __forceinline__ double fast_nan_f64() { return nan(""); }
-extern "C" __global__ __launch_bounds___f64(256, 2)
-void keltner_batch_f32(
+extern "C" __global__ __launch_bounds__(256, 2)
+void keltner_batch_rows_f64(
     const double* __restrict__ ma_rows,
     const double* __restrict__ atr_rows,
     const int*   __restrict__ row_period_idx,
@@ -367,8 +367,8 @@ void keltner_batch_f32(
         outL[t] = fma(neg_mult, a, mid);
     }
 }
-extern "C" __global__ __launch_bounds___f64(256, 2)
-void keltner_many_series_one_param_f32(
+extern "C" __global__ __launch_bounds__(256, 2)
+void keltner_many_series_one_param_f64(
     const double* __restrict__ ma_tm,
     const double* __restrict__ atr_tm,
     const int*   __restrict__ first_valids,
