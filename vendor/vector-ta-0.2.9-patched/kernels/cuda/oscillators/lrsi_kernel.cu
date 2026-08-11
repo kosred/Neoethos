@@ -234,7 +234,7 @@ void lrsi_many_series_one_param_f32(const float* __restrict__ prices_tm,
 //     than carried over; see the per-file note where one exists.
 // ===========================================================================
 
-#include <double.h>
+#include <float.h>
 static __device__ __forceinline__ double warp_broadcast_ldg_f64(const double* addr) {
     unsigned mask = __activemask();
     int leader   = __ffs(mask) - 1;

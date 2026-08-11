@@ -233,7 +233,7 @@ void roc_many_series_one_param_f32(const float* __restrict__ prices_tm,
 //     than carried over; see the per-file note where one exists.
 // ===========================================================================
 
-#include <double.h>
+#include <float.h>
 __device__ __forceinline__ double qnanf_f64() { return nan(""); }
 extern "C" __global__
 void roc_batch_f64(const double* __restrict__ prices,
