@@ -458,45 +458,45 @@ fn launch_population_metrics_kernel(
         client,
         CubeCount::Static(cubes, 1, 1),
         CubeDim::new_1d(units),
-        unsafe { ArrayArg::from_raw_parts::<f32>(&features_handle, features_flat.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&labels_handle, labels.len(), 1) },
-        unsafe { ArrayArg::from_raw_parts::<i32>(&node_counts_handle, batch.node_counts.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(labels_handle.clone(), labels.len()) },
+        unsafe { ArrayArg::from_raw_parts(node_counts_handle.clone(), batch.node_counts.len()) },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&node_offsets_handle, batch.node_offsets.len(), 1)
+            ArrayArg::from_raw_parts(node_offsets_handle.clone(), batch.node_offsets.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&edge_offsets_handle, batch.edge_offsets.len(), 1)
+            ArrayArg::from_raw_parts(edge_offsets_handle.clone(), batch.edge_offsets.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&edge_sources_handle, batch.edge_sources.len(), 1)
+            ArrayArg::from_raw_parts(edge_sources_handle.clone(), batch.edge_sources.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<f32>(&edge_weights_handle, batch.edge_weights.len(), 1)
+            ArrayArg::from_raw_parts(edge_weights_handle.clone(), batch.edge_weights.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&activation_handle, batch.activation_codes.len(), 1)
+            ArrayArg::from_raw_parts(activation_handle.clone(), batch.activation_codes.len())
         },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&biases_handle, batch.biases.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts(biases_handle.clone(), batch.biases.len()) },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&input_indices_handle, batch.input_indices.len(), 1)
-        },
-        unsafe {
-            ArrayArg::from_raw_parts::<i32>(&output_indices_handle, batch.output_indices.len(), 1)
+            ArrayArg::from_raw_parts(input_indices_handle.clone(), batch.input_indices.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&bias_indices_handle, batch.bias_indices.len(), 1)
+            ArrayArg::from_raw_parts(output_indices_handle.clone(), batch.output_indices.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&eval_offsets_handle, batch.eval_offsets.len(), 1)
+            ArrayArg::from_raw_parts(bias_indices_handle.clone(), batch.bias_indices.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<i32>(&eval_indices_handle, batch.eval_indices.len(), 1)
+            ArrayArg::from_raw_parts(eval_offsets_handle.clone(), batch.eval_offsets.len())
         },
         unsafe {
-            ArrayArg::from_raw_parts::<f32>(&complexity_handle, batch.complexity_penalties.len(), 1)
+            ArrayArg::from_raw_parts(eval_indices_handle.clone(), batch.eval_indices.len())
         },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&scratch_handle, scratch_len, 1) },
-        unsafe { ArrayArg::from_raw_parts::<f32>(&metrics_handle, metrics_len, 1) },
+        unsafe {
+            ArrayArg::from_raw_parts(complexity_handle.clone(), batch.complexity_penalties.len())
+        },
+        unsafe { ArrayArg::from_raw_parts(scratch_handle.clone(), scratch_len) },
+        unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
         ScalarArg::new(features.nrows() as u32),
         ScalarArg::new(input_dim as u32),
         ScalarArg::new(batch.max_nodes as u32),
