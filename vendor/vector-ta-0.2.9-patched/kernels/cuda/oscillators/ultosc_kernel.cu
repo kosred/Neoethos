@@ -258,9 +258,9 @@ extern "C" {
 #endif
 
 
-__device__ __constant__ double UO_W1 = 100.0 * (4.0 / 7.0);
-__device__ __constant__ double UO_W2 = 100.0 * (2.0 / 7.0);
-__device__ __constant__ double UO_W3 = 100.0 * (1.0 / 7.0);
+__device__ __constant__ double UO_W1_F64 = 100.0 * (4.0 / 7.0);
+__device__ __constant__ double UO_W2_F64 = 100.0 * (2.0 / 7.0);
+__device__ __constant__ double UO_W3_F64 = 100.0 * (1.0 / 7.0);
 
 
 __device__ __forceinline__ double2 ldg_float2_f64(const double2* __restrict__ base, int idx)
@@ -447,7 +447,7 @@ __global__ void ultosc_batch_f64(
         const double t2 = (s2b != 0.0) ? (s2a * recip_nr1_f64(s2b)) : 0.0;
         const double t3 = (s3b != 0.0) ? (s3a * recip_nr1_f64(s3b)) : 0.0;
 
-        row_out[i] = fma(UO_W1, t1, fma(UO_W2, t2, UO_W3 * t3));
+        row_out[i] = fma(UO_W1_F64, t1, fma(UO_W2_F64, t2, UO_W3_F64 * t3));
     }
 }
 
@@ -502,7 +502,7 @@ __global__ void ultosc_many_series_one_param_f64(
         const double t2 = (s2b != 0.0) ? (s2a * recip_nr1_f64(s2b)) : 0.0;
         const double t3 = (s3b != 0.0) ? (s3a * recip_nr1_f64(s3b)) : 0.0;
 
-        out_row[s] = fma(UO_W1, t1, fma(UO_W2, t2, UO_W3 * t3));
+        out_row[s] = fma(UO_W1_F64, t1, fma(UO_W2_F64, t2, UO_W3_F64 * t3));
     }
 }
 

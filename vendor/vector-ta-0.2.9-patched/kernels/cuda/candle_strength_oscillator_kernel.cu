@@ -1,4 +1,5 @@
 #include <cmath>
+#include <float.h>   // DBL_EPSILON — the f64 conversion used it without declaring it
 #include <cstddef>
 
 namespace {

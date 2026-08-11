@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <float.h>   // DBL_EPSILON — the f64 conversion used it without declaring it
 #include <math.h>
 #include <math_constants.h>
 

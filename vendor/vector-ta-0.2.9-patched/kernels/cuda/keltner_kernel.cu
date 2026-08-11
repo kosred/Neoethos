@@ -266,7 +266,6 @@ void keltner_many_series_one_param_f32(
 static __device__ __forceinline__ double fast_nan_f64() {
     return __longlong_as_double(0x7fffffffffffffffULL);
 }
-static __device__ __forceinline__ double fast_nan_f64() { return nan(""); }
 extern "C" __global__ __launch_bounds__(256, 2)
 void keltner_batch_rows_f64(
     const double* __restrict__ ma_rows,
