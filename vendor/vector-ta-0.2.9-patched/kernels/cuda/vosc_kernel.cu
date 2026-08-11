@@ -393,7 +393,7 @@ extern "C" __global__ void vosc_batch_prefix_f64(
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, inv_S);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  inv_L);
             double lavg = ds_to_float_f64(lavg_ds);
-            double num  = ds_to_float_f64(ds_sub(savg_ds, lavg_ds));
+            double num  = ds_to_float_f64(ds_sub_f64(savg_ds, lavg_ds));
             // S5 CORRECTION -- ROUNDING COUNT. `vosc.rs:437` is
             // `100.0 * (savg - lavg) / lavg`, which Rust parses left to
             // right as `(100.0 * diff) / lavg`: ONE multiply and ONE
@@ -500,7 +500,7 @@ extern "C" __global__ void vosc_batch_prefix_f64_ds(
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, invS);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  invL);
             double lavg = ds_to_float_f64(lavg_ds);
-            double num  = ds_to_float_f64(ds_sub(savg_ds, lavg_ds));
+            double num  = ds_to_float_f64(ds_sub_f64(savg_ds, lavg_ds));
             // S5 CORRECTION -- ROUNDING COUNT. `vosc.rs:437` is
             // `100.0 * (savg - lavg) / lavg`, which Rust parses left to
             // right as `(100.0 * diff) / lavg`: ONE multiply and ONE
@@ -555,7 +555,7 @@ extern "C" __global__ void vosc_many_series_one_param_f64_ds_tm_coalesced(
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, invS);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  invL);
             double lavg = ds_to_float_f64(lavg_ds);
-            double num  = ds_to_float_f64(ds_sub(savg_ds, lavg_ds));
+            double num  = ds_to_float_f64(ds_sub_f64(savg_ds, lavg_ds));
             // S5 CORRECTION -- ROUNDING COUNT. `vosc.rs:437` is
             // `100.0 * (savg - lavg) / lavg`, which Rust parses left to
             // right as `(100.0 * diff) / lavg`: ONE multiply and ONE
