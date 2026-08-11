@@ -171,10 +171,10 @@ fn launch_loss_kernel(
         unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
         unsafe { ArrayArg::from_raw_parts(labels_handle.clone(), labels.len()) },
         unsafe { ArrayArg::from_raw_parts(losses_handle.clone(), candidate_count) },
-        ScalarArg::new(features.nrows() as u32),
-        ScalarArg::new(input_dim as u32),
-        ScalarArg::new(hidden_dim as u32),
-        ScalarArg::new(param_dim as u32),
+        features.nrows() as u32,
+        input_dim as u32,
+        hidden_dim as u32,
+        param_dim as u32,
     )
     .context("launch neuro-evo cuda loss kernel")?;
 

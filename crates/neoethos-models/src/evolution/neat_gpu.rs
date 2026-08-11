@@ -497,9 +497,9 @@ fn launch_population_metrics_kernel(
         },
         unsafe { ArrayArg::from_raw_parts(scratch_handle.clone(), scratch_len) },
         unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
-        ScalarArg::new(features.nrows() as u32),
-        ScalarArg::new(input_dim as u32),
-        ScalarArg::new(batch.max_nodes as u32),
+        features.nrows() as u32,
+        input_dim as u32,
+        batch.max_nodes as u32,
     )
     .context("launch NEAT cuda population metrics kernel")?;
 
