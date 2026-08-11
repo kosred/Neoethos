@@ -2467,58 +2467,19 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
                 )
             }
         }));
-        #[cfg(not(feature = "gpu-b-adapter"))]
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            try_evaluate_population_cuda(
-                close,
-                high,
-                low,
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                month_idx,
-                day_idx,
-                timestamps,
-                sl_pips,
-                tp_pips,
-                stop_vol_mult,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                settings,
-                device_override,
-            )
-        }));
-        #[cfg(not(feature = "gpu-b-adapter"))]
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::cubecl_eval::try_evaluate_population_cuda(
-                close,
-                high,
-                low,
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                month_idx,
-                day_idx,
-                timestamps,
-                sl_pips,
-                tp_pips,
-                stop_vol_mult,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                settings,
-                device_override,
-            )
-        }));
+        // 2026-08-11: two further `let gpu = catch_unwind(...)` blocks stood
+        // here, both `cfg(not(gpu-b-adapter))`, both calling the very same
+        // `cubecl_eval::try_evaluate_population_cuda` as the arm above — the
+        // second of them byte-identical to it. `catch_unwind` RUNS its closure,
+        // so on `gpu-vulkan`, `gpu-rocm` and plain `gpu` the entire population
+        // was evaluated THREE times per call and the first two results were
+        // shadowed away unread. `gpu_started` is taken before all three, so the
+        // `record_device("validation_eval", Gpu, ...)` figure those lanes
+        // reported was ~3x the real GPU time — and validation is ~94% of a run,
+        // so this was the dominant cost, tripled and mismeasured at once.
+        // `gpu-cuda` was never affected: the adapter arm cfg'd all of it out.
+        // The compiler said so plainly — `unused variable: gpu`, twice — but
+        // only a per-feature check ever compiled this lane to hear it.
         // Classify the outcome, then let the shared policy decide. The default
         // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
         // to the historical behaviour. With it set, an availability fault fails
