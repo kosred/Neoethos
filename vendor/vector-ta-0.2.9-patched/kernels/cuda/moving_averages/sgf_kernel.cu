@@ -166,7 +166,7 @@ void sgf_multi_series_one_param_f32(const float* __restrict__ prices_tm,
 //     than carried over; see the per-file note where one exists.
 // ===========================================================================
 
-__constant__ double c_sgf_weights[SGF_MAX_PERIOD];
+__constant__ double c_sgf_weights_f64[SGF_MAX_PERIOD];
 extern "C" __global__
 void sgf_batch_f64(const double* __restrict__ prices,
                    const double* __restrict__ weights_flat,
@@ -273,7 +273,7 @@ void sgf_multi_series_one_param_f64(const double* __restrict__ prices_tm,
     double acc = 0.0;
     for (int k = 0; k < period; ++k) {
 #if SGF_USE_CONST_WEIGHTS
-        acc = fma(tile[base + k * int(blockDim.y)], c_sgf_weights[k], acc);
+        acc = fma(tile[base + k * int(blockDim.y)], c_sgf_weights_f64[k], acc);
 #else
         acc = fma(tile[base + k * int(blockDim.y)], w_sh[k], acc);
 #endif

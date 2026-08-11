@@ -292,7 +292,7 @@ void srwma_batch_f64(const double* __restrict__ prices,
         __syncthreads();
     }
 }
-__constant__ double srwma_const_w[4096];
+__constant__ double srwma_const_w_f64[4096];
 extern "C" __global__
 void srwma_many_series_one_param_f64(const double* __restrict__ prices_tm,
                                      const int*   __restrict__ first_valids,
@@ -328,7 +328,7 @@ void srwma_many_series_one_param_f64(const double* __restrict__ prices_tm,
 
 
     for (int k = threadIdx.x; k < wlen; k += blockDim.x) {
-        w_rev[k] = srwma_const_w[wlen - 1 - k];
+        w_rev[k] = srwma_const_w_f64[wlen - 1 - k];
     }
 #else
     for (int k = threadIdx.x; k < wlen; k += blockDim.x) {
