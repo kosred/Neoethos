@@ -318,6 +318,14 @@ __device__ __forceinline__ ds_f64 ds_add_f64(ds_f64 a, ds_f64 b) {
     double lo = t - (hi - s);
     return ds_make_f64(hi, lo);
 }
+// ds_neg_f64 / ds_sub_f64 were MISSING from the f64 set: the conversion created
+// ds_make/ds_from_double/ds_add/ds_mul_f/ds_to_float at f64 width and skipped
+// these two, so the f64 kernels below fell through to the f32 `ds_sub` and nvcc
+// refused the ds_f64 -> ds conversion. Same double-single algebra as the f32
+// pair, at double width.
+__device__ __forceinline__ ds_f64 ds_neg_f64(ds_f64 a) { return ds_make_f64(-a.hi, -a.lo); }
+__device__ __forceinline__ ds_f64 ds_sub_f64(ds_f64 a, ds_f64 b) { return ds_add_f64(a, ds_neg_f64(b)); }
+
 __device__ __forceinline__ ds_f64 ds_mul_f_f64(ds_f64 a, double k) {
 
     double p  = a.hi * k;
@@ -380,8 +388,8 @@ extern "C" __global__ void vosc_batch_prefix_f64(
             ds_f64 PL = ds_from_double_f64(prefix_sum[sL]);
 
 
-            ds_f64 short_sum = ds_sub(PT, PS);
-            ds_f64 long_sum  = ds_sub(PT, PL);
+            ds_f64 short_sum = ds_sub_f64(PT, PS);
+            ds_f64 long_sum  = ds_sub_f64(PT, PL);
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, inv_S);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  inv_L);
             double lavg = ds_to_float_f64(lavg_ds);
@@ -487,8 +495,8 @@ extern "C" __global__ void vosc_batch_prefix_f64_ds(
             ds_f64 PT = ds_make_f64(pt.x, pt.y);
             ds_f64 PS = ds_make_f64(pS.x, pS.y);
             ds_f64 PL = ds_make_f64(pL.x, pL.y);
-            ds_f64 short_sum = ds_sub(PT, PS);
-            ds_f64 long_sum  = ds_sub(PT, PL);
+            ds_f64 short_sum = ds_sub_f64(PT, PS);
+            ds_f64 long_sum  = ds_sub_f64(PT, PL);
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, invS);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  invL);
             double lavg = ds_to_float_f64(lavg_ds);
@@ -542,8 +550,8 @@ extern "C" __global__ void vosc_many_series_one_param_f64_ds_tm_coalesced(
             ds_f64 PT = ds_make_f64(pt.x, pt.y);
             ds_f64 PS = ds_make_f64(ps.x, ps.y);
             ds_f64 PL = ds_make_f64(pl.x, pl.y);
-            ds_f64 short_sum = ds_sub(PT, PS);
-            ds_f64 long_sum  = ds_sub(PT, PL);
+            ds_f64 short_sum = ds_sub_f64(PT, PS);
+            ds_f64 long_sum  = ds_sub_f64(PT, PL);
             ds_f64 savg_ds = ds_mul_f_f64(short_sum, invS);
             ds_f64 lavg_ds = ds_mul_f_f64(long_sum,  invL);
             double lavg = ds_to_float_f64(lavg_ds);
