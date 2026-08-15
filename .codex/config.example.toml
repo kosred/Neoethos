@@ -1,0 +1,10 @@
+# Copy only if project-scoped MCP configuration is required.
+# Keep credentials outside this file and forward them by variable name.
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env_vars = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+
+[mcp_servers.hyperstack]
+url = "http://127.0.0.1:8080/mcp"

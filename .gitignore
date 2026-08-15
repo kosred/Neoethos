@@ -5,6 +5,7 @@
 /reports/
 /logs/
 /.claude/
+/.codex/config.toml
 /.pytest_cache/
 /.ruff_cache/
 /catboost_info/
