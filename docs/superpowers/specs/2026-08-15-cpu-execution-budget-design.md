@@ -24,6 +24,8 @@ effective_worker_limit              = min(
 
 Every requested limit is optional and must be positive. Each one may narrow the automatic ceiling, but none may restore the two reserved logical threads or exceed the capacity visible to the process.
 
+Every correction follows a replace-and-delete invariant. A new implementation is first connected through every real caller, configuration/API/UI boundary, artifact reader/writer, test, script, and active document and is then proven by focused and integration evidence with complete diagnostic review. Once that replacement is correct and operational, the superseded implementation, selector, fallback, alias, dependency, test fixture, and stale guidance are deleted in the same compile-green migration; old and new production paths do not remain side by side “just in case.” A compatibility path may survive only when an external persisted artifact or protocol requires a separately named, versioned, fail-closed migration boundary with an explicit retirement condition. It never remains as a silent runtime fallback or unreachable/dead code.
+
 Examples:
 
 | Effective logical threads | Automatic workers | Explicit request | Effective workers |
