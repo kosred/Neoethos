@@ -1089,6 +1089,9 @@ fn walkforward_risk_diagnostics_from_trades(
 pub fn embargoed_walkforward_backtest(
     input: WalkforwardBacktestInput<'_>,
 ) -> Result<WalkforwardSummary> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     let _scope = crate::eval_telemetry::CallerScope::enter("walkforward");
     let WalkforwardBacktestInput {
         close,

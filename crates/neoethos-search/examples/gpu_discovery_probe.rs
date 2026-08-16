@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     // comparison against a CLI run would not have.
     neoethos_search::install_search_runtime_overrides_from_settings(&settings);
 
-    let mut config = neoethos_search::DiscoveryConfig::from_settings(&settings);
+    let mut config = neoethos_search::DiscoveryConfig::try_from_settings(&settings)?;
     if let Some(min_trades) = flag(&args, "--min-trades-per-day").and_then(|v| v.parse::<f64>().ok())
     {
         config.min_trades_per_day = min_trades;

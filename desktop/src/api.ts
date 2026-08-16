@@ -83,7 +83,7 @@ export type StreamPosition = {
   side: string; // BUY / SELL
   volume: number;
   openTimestampMs: number | null;
-  pnlPips: number;
+  pnlPips: number | null;
   pnlUsd: number; // live P/L in the ACCOUNT currency (field name is legacy)
   entryPrice: number | null; // all server-provided — client does NO conversion
   stopLoss: number | null;

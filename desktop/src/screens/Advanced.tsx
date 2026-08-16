@@ -222,8 +222,6 @@ const CURRENT_IS_A_SHIPPED_LITERAL = new Set<string>([
   "paths.symbol_metadata_override",
   "paths.user_data_dir_override",
   "risk.prop_firm_preset",
-  "risk.pnl_audit_drift_fraction",
-  "risk.pnl_circuit_breaker_fraction",
   "risk.require_stop_loss",
   "log.rust_log",
   "log.log_dir",

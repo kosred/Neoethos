@@ -190,41 +190,75 @@ pub fn gpu_only_mode_for(_model_name: &str) -> bool {
     current_tree_runtime().gpu_only
 }
 
-/// Number of models the parallel trainer is running CONCURRENTLY. `1` when
-/// training a single model (or when the parallel trainer isn't active), so
-/// a lone model still gets the full CPU budget.
-static TRAINING_CONCURRENCY: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1);
-
-/// Tell the per-model thread hint how many models train at once, so each
-/// one takes `budget / concurrency` threads instead of the full budget.
-/// The parallel trainer sets this via [`TrainingConcurrencyGuard`].
-pub(crate) fn set_training_concurrency(n: usize) {
-    TRAINING_CONCURRENCY.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+/// Process-wide number of model-training slots currently reserved by parallel
+/// trainers. Zero means no parallel trainer is active, which is interpreted as
+/// one lone model for the per-model thread split.
+struct TrainingConcurrencyCounter {
+    active: std::sync::atomic::AtomicUsize,
 }
 
-fn training_concurrency() -> usize {
-    TRAINING_CONCURRENCY
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .max(1)
+impl TrainingConcurrencyCounter {
+    const fn new() -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn current(&self) -> usize {
+        self.active
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(1)
+    }
+
+    fn reserve(&self, concurrent_models: usize) -> TrainingConcurrencyReservation<'_> {
+        let reserved = concurrent_models.max(1);
+        self.active
+            .fetch_add(reserved, std::sync::atomic::Ordering::AcqRel);
+        TrainingConcurrencyReservation {
+            counter: self,
+            reserved,
+        }
+    }
 }
 
-/// RAII guard: sets the training concurrency for its lifetime and restores
-/// it to 1 on drop (even on panic), so the throttle never leaks into a
-/// later single-model training run.
-pub struct TrainingConcurrencyGuard;
+struct TrainingConcurrencyReservation<'a> {
+    counter: &'a TrainingConcurrencyCounter,
+    reserved: usize,
+}
+
+impl Drop for TrainingConcurrencyReservation<'_> {
+    fn drop(&mut self) {
+        let previous = self
+            .counter
+            .active
+            .fetch_sub(self.reserved, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(
+            previous >= self.reserved,
+            "training concurrency reservation underflow"
+        );
+    }
+}
+
+static TRAINING_CONCURRENCY: TrainingConcurrencyCounter = TrainingConcurrencyCounter::new();
+
+/// RAII guard: adds this trainer's concurrency to the process-wide reservation
+/// and removes exactly that reservation on drop, including during unwinding.
+/// Overlapping trainers therefore cannot overwrite or prematurely reset one
+/// another's aggregate native-worker throttle.
+pub struct TrainingConcurrencyGuard {
+    _reservation: TrainingConcurrencyReservation<'static>,
+}
 
 impl TrainingConcurrencyGuard {
     pub fn new(concurrent_models: usize) -> Self {
-        set_training_concurrency(concurrent_models);
-        Self
+        Self {
+            _reservation: TRAINING_CONCURRENCY.reserve(concurrent_models),
+        }
     }
 }
 
-impl Drop for TrainingConcurrencyGuard {
-    fn drop(&mut self) {
-        set_training_concurrency(1);
-    }
+fn threads_per_model(target_total: usize, concurrent_models: usize) -> usize {
+    (target_total / concurrent_models.max(1)).max(1)
 }
 
 pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
@@ -242,8 +276,7 @@ pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
     // The resolved core hardware budget is the authoritative aggregate cap.
     // Divide it across concurrently-training models so outer Rayon workers
     // multiplied by inner native pools cannot recreate cores-squared thrash.
-    let target_total = cpu_threads_hint();
-    (target_total / training_concurrency()).max(1)
+    threads_per_model(cpu_threads_hint(), TRAINING_CONCURRENCY.current())
 }
 
 pub fn gpu_count() -> usize {
@@ -517,32 +550,41 @@ pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: us
 #[cfg(test)]
 mod tests {
     use super::parse_device_preference;
-    use super::{TrainingConcurrencyGuard, cpu_threads_hint, cpu_threads_hint_for};
+    use super::{TrainingConcurrencyCounter, threads_per_model};
 
     #[test]
     fn per_model_threads_never_exceed_resolved_cpu_budget() {
-        let target_total = cpu_threads_hint();
-        assert_eq!(
-            cpu_threads_hint_for("xgboost"),
-            target_total,
-            "a lone model gets the resolved CPU budget"
-        );
+        let target_total = 59;
+        assert_eq!(threads_per_model(target_total, 1), target_total);
+        let per_model = threads_per_model(target_total, 3);
+        assert_eq!(per_model, 19);
+        assert!(per_model * 3 <= target_total);
+        assert_eq!(threads_per_model(2, 8), 1);
+    }
+
+    #[test]
+    fn overlapping_training_reservations_accumulate_and_release_independently() {
+        let counter = TrainingConcurrencyCounter::new();
+        assert_eq!(counter.current(), 1, "no trainer means one lone model");
         {
-            let k = 3;
-            let _g = TrainingConcurrencyGuard::new(k);
-            let per_model = cpu_threads_hint_for("xgboost");
-            assert_eq!(per_model, (target_total / k).max(1));
-            assert!(
-                per_model * k <= target_total,
-                "aggregate {} must not exceed the resolved budget ({target_total})",
-                per_model * k
-            );
-            assert!(per_model >= 1, "at least one thread per model");
+            let first = counter.reserve(3);
+            assert_eq!(counter.current(), 3);
+            {
+                let second = counter.reserve(2);
+                assert_eq!(counter.current(), 5);
+                drop(first);
+                assert_eq!(
+                    counter.current(),
+                    2,
+                    "dropping one trainer keeps the other's reservation"
+                );
+                drop(second);
+            }
         }
         assert_eq!(
-            cpu_threads_hint_for("xgboost"),
-            target_total,
-            "budget restored after the guard drops"
+            counter.current(),
+            1,
+            "all reservations released restores the lone-model interpretation"
         );
     }
 

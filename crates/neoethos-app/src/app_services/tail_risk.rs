@@ -109,6 +109,10 @@ pub fn run_tail_risk(
     iterations: usize,
     risk_override: Option<f64>,
 ) -> Result<TailRiskReport> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::RiskyMode)
+        .map_err(anyhow::Error::new)?;
+
     let trades_file = trades_path_for(portfolio_path);
     let raw = std::fs::read_to_string(&trades_file).with_context(|| {
         format!(

@@ -14,7 +14,7 @@
 //! route passed `EngineConfig::default()` — a synthetic balance filling at the
 //! mark with zero spread, slippage and commission — and had no portfolio option
 //! at all, so the Replay button could only ever run the stub. Both now build
-//! the config through [`EngineConfig::for_replay_from_settings`], the single
+//! the config through [`EngineConfig::try_for_replay_from_settings`], the single
 //! adapter, and both can pass a portfolio path.
 
 use std::path::Path;
@@ -25,6 +25,13 @@ use crate::engine::{AutonomousEngine, DEFAULT_REPLAY_STARTING_BALANCE, EngineCon
 use crate::execution::MockExecutionAdapter;
 use crate::portfolio::PortfolioRegistry;
 use crate::risk::PermissiveRiskGate;
+
+fn require_broker_real_historical_replay(
+) -> anyhow::Result<neoethos_core::BrokerFinancialTruthPermitV1> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalReplay)
+        .map_err(anyhow::Error::new)
+}
 use crate::signal::MomentumStubSignal;
 
 /// Enumerate every way THIS replay is not the operator's strategy, attach the
@@ -161,6 +168,7 @@ pub fn replay_symbol_from_dir(
     base_tf: &str,
     cfg: EngineConfig,
 ) -> anyhow::Result<EngineStats> {
+    let _broker_truth = require_broker_real_historical_replay()?;
     let bars = load_bars_from_dir(&data_dir, symbol, base_tf)?;
     if bars.is_empty() {
         anyhow::bail!(
@@ -219,6 +227,7 @@ pub fn replay_portfolio_from_dir(
     portfolio_path: impl AsRef<Path>,
     cfg: EngineConfig,
 ) -> anyhow::Result<EngineStats> {
+    let broker_truth = require_broker_real_historical_replay()?;
     let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)?;
     if artifact.genes.is_empty() {
         anyhow::bail!(
@@ -273,7 +282,9 @@ pub fn replay_portfolio_from_dir(
     // bar's own bracket (audit #226). Until 2026-08-09 this path called
     // `combine_gene_signals`, threw the genes' stops away, and replayed them
     // behind a 0.5 %-of-price synthetic stop.
-    let pip_size = neoethos_search::default_pip_size(&symbol);
+    let pip_size = broker_truth
+        .exact_pip_size_v1(&symbol)
+        .map_err(anyhow::Error::new)?;
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,
@@ -354,6 +365,7 @@ pub fn replay_blend_from_dir(
     cfg: EngineConfig,
     blend: crate::blend_signal::BlendConfig,
 ) -> anyhow::Result<EngineStats> {
+    let broker_truth = require_broker_real_historical_replay()?;
     use crate::blend_signal::{BlendMode, BlendedSignalEngine, MlDecision};
 
     let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)?;
@@ -398,7 +410,9 @@ pub fn replay_blend_from_dir(
 
     // Same bracket correction as the gene-only path (audit #226): the ML gate
     // may shrink or veto SIZE, it never touches the stop.
-    let pip_size = neoethos_search::default_pip_size(&symbol);
+    let pip_size = broker_truth
+        .exact_pip_size_v1(&symbol)
+        .map_err(anyhow::Error::new)?;
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,

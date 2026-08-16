@@ -880,7 +880,7 @@ impl From<OrderSide> for CTraderTradeSide {
 /// which uses sync WSS. Callers must `spawn_blocking`.
 /// Everything a new-order (market OR pending) submission needs after the
 /// shared, money-critical prep: resolved account/symbol ids, the lots→wire
-/// volume (bounds-checked against the broker's min/max) and the tick-snapped
+/// volume (bounds-checked against the broker's min/max/step) and tick-aligned
 /// relative SL/TP. Extracted so the market and pending paths compute volume +
 /// SL/TP precision through ONE code path — a bug fixed here is fixed for both.
 struct PreparedNewOrder {
@@ -892,9 +892,74 @@ struct PreparedNewOrder {
     relative_take_profit: Option<i64>,
 }
 
+fn wire_volume_from_broker_lot_size(volume_lots: f64, lot_size_cents: i64) -> Result<i64> {
+    if !volume_lots.is_finite() || volume_lots <= 0.0 {
+        return Err(anyhow!(
+            "volume_lots must be finite and positive (got {volume_lots})"
+        ));
+    }
+    if lot_size_cents <= 0 {
+        return Err(anyhow!(
+            "broker lotSize must be positive (got {lot_size_cents})"
+        ));
+    }
+    let raw = volume_lots * lot_size_cents as f64;
+    let rounded = raw.round();
+    let tolerance = raw.abs().max(1.0) * f64::EPSILON * 8.0;
+    if !rounded.is_finite()
+        || rounded <= 0.0
+        || rounded >= i64::MAX as f64
+        || (raw - rounded).abs() > tolerance
+    {
+        return Err(anyhow!(
+            "volume {volume_lots} lots is not exactly representable by broker lotSize={lot_size_cents} or exceeds the supported range"
+        ));
+    }
+    Ok(rounded as i64)
+}
+
+fn relative_distance_from_broker_symbol(
+    pips: f64,
+    digits: i32,
+    pip_position: i32,
+) -> Result<i64> {
+    if !pips.is_finite() || pips <= 0.0 {
+        return Err(anyhow!("pip distance must be finite and positive (got {pips})"));
+    }
+    if !(0..=5).contains(&digits) {
+        return Err(anyhow!(
+            "broker symbol digits={digits} cannot be represented by cTrader relative-distance units"
+        ));
+    }
+    if !(0..=digits).contains(&pip_position) {
+        return Err(anyhow!(
+            "broker symbol pipPosition={pip_position} is inconsistent with digits={digits}"
+        ));
+    }
+
+    // ProtoOASymbol.pipPosition defines one pip as 10^-pipPosition price
+    // units. cTrader relativeStopLoss/relativeTakeProfit use 1/100000 price
+    // units, while `digits` defines the symbol's minimum price tick.
+    let raw_relative_units = pips * 10.0_f64.powi(5 - pip_position);
+    let tick_units = 10_i64.pow((5 - digits) as u32);
+    let tick_count = (raw_relative_units / tick_units as f64).round();
+    let snapped = tick_count * tick_units as f64;
+    let tolerance = raw_relative_units.abs().max(1.0) * f64::EPSILON * 8.0;
+    if !snapped.is_finite()
+        || snapped <= 0.0
+        || snapped >= i64::MAX as f64
+        || (snapped - raw_relative_units).abs() > tolerance
+    {
+        return Err(anyhow!(
+            "pip distance {pips} is not exactly aligned to broker digits={digits}, pipPosition={pip_position}"
+        ));
+    }
+    Ok(snapped as i64)
+}
+
 /// Validate inputs, resolve the symbol, convert lots→wire volume (bounds-checked)
-/// and derive the tick-snapped relative SL/TP. See the inline comments for the
-/// hard-won precision/volume history (lot_size cents, XAU tick snapping, …).
+/// and derive tick-aligned relative SL/TP exclusively from the resolved
+/// `ProtoOASymbol` contract.
 fn prepare_new_order(
     symbol: &str,
     volume_lots: f64,
@@ -979,16 +1044,9 @@ fn prepare_new_order(
     // the spurious `× 100` makes 0.01 × 10_000_000 = 100_000 wire,
     // which is exactly 0.01 lot (1,000 EUR exposure × 100 cents).
     //
-    // **2026-05-27 — A.4 fix (Cycle-3 Phase A)**: route the
-    // conversion through `SymbolMetadata::lots_to_wire_volume` so
-    // (a) overflow + non-finite inputs are caught by the helper's
-    // explicit guards rather than the silent `as i64` saturation,
-    // and (b) we no longer silently fall back to 10_000_000 cents
-    // when the broker forgot `lotSize`. That fallback was correct
-    // for FX majors but **1000× wrong for XAU** (gold has
-    // `lotSize=100`) and similarly wrong for indices/CFDs. A
-    // missing-catalog entry is now a hard failure — operator sees
-    // the bug instead of placing a wildly mis-sized order.
+    // The conversion below consumes that exact broker field with checked
+    // arithmetic. Missing/invalid lotSize, min/max, or stepVolume fails before
+    // order submission; there is no built-in FX/XAU/CFD default.
     let resolved: CTraderResolvedSymbol = resolve_symbol(&CTraderSymbolLookupRequest {
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
@@ -1005,23 +1063,7 @@ fn prepare_new_order(
              the cTrader symbol catalog endpoint."
         )
     })?;
-    let meta = neoethos_core::symbol_metadata::resolve(symbol).ok_or_else(|| {
-        anyhow!(
-            "no SymbolMetadata for {symbol} — wire-volume conversion needs \
-             pip_size/contract_size to bounds-check the result. Populate \
-             data/symbol_metadata.json (or its env override) from the \
-             ProtoOASymbol records before trading."
-        )
-    })?;
-    let volume_units = meta.lots_to_wire_volume(volume_lots, Some(lot_size)).ok_or_else(
-        || {
-            anyhow!(
-                "could not derive cTrader wire volume for {symbol}: \
-                 lots={volume_lots}, lot_size_cents={lot_size}. \
-                 Inputs must be finite, positive, and within i64 range."
-            )
-        },
-    )?;
+    let volume_units = wire_volume_from_broker_lot_size(volume_lots, lot_size)?;
     if let Some(min) = resolved.symbol.min_volume {
         if volume_units < min {
             return Err(anyhow!(
@@ -1038,30 +1080,45 @@ fn prepare_new_order(
             ));
         }
     }
+    if let Some(step) = resolved.symbol.step_volume {
+        if step <= 0 {
+            return Err(anyhow!(
+                "broker returned invalid stepVolume {step} for {symbol}"
+            ));
+        }
+        if volume_units % step != 0 {
+            return Err(anyhow!(
+                "volume {volume_units} is not aligned to broker stepVolume {step} for {symbol}"
+            ));
+        }
+    }
 
     // cTrader `relativeStopLoss` / `relativeTakeProfit` is the price *distance*
     // expressed in 1/100000 of a price unit, and the broker REJECTS any value
     // that isn't aligned to the symbol's price precision (10^-digits) with
     // "Relative stop loss has invalid precision".
     //
-    // The previous digits-only heuristic fell back to `1.0` units/pip for
-    // digits < 4, so XAUUSD (digits=2) sent `26` raw units for a 26-pip stop —
-    // not a multiple of gold's 0.01 price tick (= 1000 relative units) → the
-    // broker rejected it. (It was also 10× too far for 5-digit FX.)
-    //
-    // Correct + symbol-agnostic: derive the distance from the symbol's real
-    // `pip_size` (1 price unit = 100_000 relative units), then SNAP to the
-    // price tick so the wire value is always a valid multiple. Works for
-    // 5/3-digit FX and 2-digit gold/indices alike.
-    let digits = resolved.symbol.digits.max(0) as u32;
-    let tick_units: i64 = 10i64.pow(5u32.saturating_sub(digits.min(5)));
-    let to_relative_units = |pips: f64| -> i64 {
-        let raw = pips * meta.pip_size * 100_000.0;
-        let snapped = ((raw / tick_units as f64).round() as i64) * tick_units;
-        snapped.max(tick_units) // never zero — at least one price tick
-    };
-    let relative_stop_loss = stop_loss_pips.map(to_relative_units);
-    let relative_take_profit = take_profit_pips.map(to_relative_units);
+    // `pipPosition` defines the pip itself and `digits` defines the tick. An
+    // operator distance that cannot be represented exactly on that broker
+    // grid is rejected rather than rounded to a different risk distance.
+    let relative_stop_loss = stop_loss_pips
+        .map(|pips| {
+            relative_distance_from_broker_symbol(
+                pips,
+                resolved.symbol.digits,
+                resolved.symbol.pip_position,
+            )
+        })
+        .transpose()?;
+    let relative_take_profit = take_profit_pips
+        .map(|pips| {
+            relative_distance_from_broker_symbol(
+                pips,
+                resolved.symbol.digits,
+                resolved.symbol.pip_position,
+            )
+        })
+        .transpose()?;
 
     Ok(PreparedNewOrder {
         creds,
@@ -1920,4 +1977,39 @@ fn bars_to_normalized(bars: &[HistoricalBar]) -> Vec<NormalizedBar> {
             volume: b.volume.unwrap_or(0) as f64,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod exact_broker_order_unit_tests {
+    use super::{relative_distance_from_broker_symbol, wire_volume_from_broker_lot_size};
+
+    #[test]
+    fn wire_volume_uses_the_exact_broker_lot_size() {
+        assert_eq!(
+            wire_volume_from_broker_lot_size(0.01, 10_000_000).expect("EURUSD lotSize"),
+            100_000
+        );
+        assert_eq!(
+            wire_volume_from_broker_lot_size(0.25, 10_000).expect("broker CFD lotSize"),
+            2_500
+        );
+        assert!(wire_volume_from_broker_lot_size(0.01, 0).is_err());
+        assert!(wire_volume_from_broker_lot_size(0.000_000_05, 10_000_000).is_err());
+        assert!(wire_volume_from_broker_lot_size(f64::MAX, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn relative_distance_uses_broker_pip_position_and_digits() {
+        assert_eq!(
+            relative_distance_from_broker_symbol(20.0, 5, 4).expect("five-digit FX"),
+            200
+        );
+        assert_eq!(
+            relative_distance_from_broker_symbol(26.0, 2, 1).expect("two-digit metal"),
+            260_000
+        );
+        assert!(relative_distance_from_broker_symbol(0.005, 2, 1).is_err());
+        assert!(relative_distance_from_broker_symbol(20.0, 6, 4).is_err());
+        assert!(relative_distance_from_broker_symbol(20.0, 2, 3).is_err());
+    }
 }

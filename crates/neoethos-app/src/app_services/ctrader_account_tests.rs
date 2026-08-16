@@ -135,6 +135,26 @@ fn reconcile_response_scales_position_money_digits_four_fields() {
 }
 
 #[test]
+fn reconcile_response_rejects_monetary_fields_without_broker_scale() {
+    let response = serde_json::json!({
+        "payloadType": 2125,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "position": [{
+                "positionId": 9001,
+                "tradeData": {"symbolId": 14, "volume": 2500, "tradeSide": 1},
+                "swap": -1234
+            }],
+            "order": []
+        }
+    });
+
+    let error = parse_reconcile_response(&response.to_string())
+        .expect_err("a broker monetary integer without moneyDigits must not be guessed");
+    assert!(error.to_string().contains("position.money_digits"));
+}
+
+#[test]
 fn deal_list_response_parses_recent_deals() {
     let response = serde_json::json!({
         "clientMsgId": "deals-1",
@@ -222,6 +242,36 @@ fn deal_list_response_scales_close_detail_money_digits_four_fields() {
     assert_eq!(deals[0].swap, Some(-0.0015));
     assert_eq!(deals[0].pnl_conversion_fee, Some(-0.001));
     assert_eq!(deals[0].net_profit, Some(0.1185));
+}
+
+#[test]
+fn deal_list_rejects_close_financials_without_broker_scale() {
+    let response = serde_json::json!({
+        "payloadType": 2134,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "deal": [{
+                "dealId": 3001,
+                "orderId": 8001,
+                "positionId": 9001,
+                "volume": 1500,
+                "filledVolume": 1500,
+                "symbolId": 14,
+                "executionTimestamp": 1710000201000i64,
+                "tradeSide": 1,
+                "dealStatus": 2,
+                "closePositionDetail": {
+                    "grossProfit": 1250,
+                    "swap": -15,
+                    "commission": -40
+                }
+            }]
+        }
+    });
+
+    let error = parse_deal_list_response(&response.to_string())
+        .expect_err("close financials without moneyDigits must not be scaled locally");
+    assert!(error.to_string().contains("deal.close.money_digits"));
 }
 
 /// §5.1.3 ship gate — balance scaling with moneyDigits=4 (high-precision
@@ -389,9 +439,11 @@ fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() 
     let transport = StubTransport::with_responses(vec![
         Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
         Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-        Ok(r#"{"clientMsgId":"trader-1","payloadType":2122,"payload":{"ctidTraderAccountId":712345,"trader":{"balance":100000,"moneyDigits":2,"leverageInCents":5000,"brokerName":"Demo Broker"}}}"#.to_string()),
+        Ok(r#"{"clientMsgId":"trader-1","payloadType":2122,"payload":{"ctidTraderAccountId":712345,"trader":{"balance":100000,"moneyDigits":2,"leverageInCents":5000,"brokerName":"Demo Broker","depositAssetId":8}}}"#.to_string()),
         Ok(r#"{"clientMsgId":"reconcile-1","payloadType":2125,"payload":{"ctidTraderAccountId":712345,"position":[{"positionId":9001,"tradeData":{"symbolId":14,"volume":2500,"tradeSide":1,"openTimestamp":1710000000000},"positionStatus":1,"price":1.10123}],"order":[]}}"#.to_string()),
         Ok(r#"{"clientMsgId":"deals-1","payloadType":2134,"payload":{"ctidTraderAccountId":712345,"deal":[{"dealId":3001,"orderId":8001,"positionId":9001,"volume":1500,"filledVolume":1500,"symbolId":14,"createTimestamp":1710000200000,"executionTimestamp":1710000201000,"executionPrice":1.099,"tradeSide":1,"dealStatus":2,"commission":-40,"moneyDigits":2,"closePositionDetail":{"entryPrice":1.098,"grossProfit":1250,"swap":0,"commission":-40,"balance":1001250,"moneyDigits":2}}],"hasMore":false}}"#.to_string()),
+        Ok(r#"{"clientMsgId":"unrealized-pnl-1","payloadType":2188,"payload":{"ctidTraderAccountId":712345,"moneyDigits":2,"positionUnrealizedPnL":[{"positionId":9001,"grossUnrealizedPnL":1234,"netUnrealizedPnL":1134}]}}"#.to_string()),
+        Ok(r#"{"clientMsgId":"asset-list-1","payloadType":2113,"payload":{"ctidTraderAccountId":712345,"asset":[{"assetId":8,"name":"USD","displayName":"US Dollar","digits":2}]}}"#.to_string()),
     ]);
 
     let runtime = load_account_runtime_with_transport(
@@ -410,7 +462,91 @@ fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() 
     assert_eq!(runtime.trader.account_id, 712345);
     assert_eq!(runtime.reconcile.positions.len(), 1);
     assert_eq!(runtime.recent_deals.len(), 1);
-    assert_eq!(transport.sent_len(), 5);
+    assert_eq!(runtime.unrealized_pnl, 11.34);
+    assert_eq!(runtime.deposit_asset_name, "USD");
+    assert_eq!(
+        runtime
+            .unrealized_pnl_by_position
+            .get(&9001)
+            .map(|row| row.net_unrealized_pnl),
+        Some(11.34)
+    );
+    assert_eq!(transport.sent_len(), 7);
+}
+
+#[test]
+fn deposit_asset_name_must_be_present_nonempty_and_unique_in_the_broker_registry() {
+    let trader = parse_trader_response(
+        r#"{"payloadType":2122,"payload":{"ctidTraderAccountId":712345,"trader":{"balance":100000,"moneyDigits":2,"depositAssetId":8}}}"#,
+    )
+    .expect("valid trader response");
+    let usd = crate::app_services::ctrader_data::CTraderAssetInfo {
+        asset_id: 8,
+        name: "USD".to_string(),
+        display_name: Some("US Dollar".to_string()),
+        digits: Some(2),
+    };
+
+    assert_eq!(
+        resolve_deposit_asset_name(&trader, std::slice::from_ref(&usd))
+            .expect("one exact broker asset"),
+        "USD"
+    );
+    assert!(resolve_deposit_asset_name(&trader, &[]).is_err());
+
+    let mut blank = usd.clone();
+    blank.name = "  ".to_string();
+    assert!(resolve_deposit_asset_name(&trader, &[blank]).is_err());
+    assert!(resolve_deposit_asset_name(&trader, &[usd.clone(), usd]).is_err());
+}
+
+#[test]
+fn unrealized_pnl_rows_must_match_open_broker_positions_exactly_once() {
+    let reconcile = CTraderReconcileSnapshot {
+        account_id: 712345,
+        positions: vec![CTraderPositionSnapshot {
+            position_id: 9001,
+            symbol_id: 14,
+            trade_side: "BUY".to_string(),
+            volume: 1_000.0,
+            open_timestamp_ms: None,
+            price: Some(1.1),
+            stop_loss: None,
+            take_profit: None,
+            swap: None,
+            commission: None,
+            mirroring_commission: None,
+            used_margin: None,
+            label: None,
+            comment: None,
+            client_order_id: None,
+        }],
+        pending_orders: Vec::new(),
+    };
+    let missing = crate::app_services::ctrader_messages::CTraderUnrealizedPnLSnapshot {
+        account_id: 712345,
+        money_digits: 2,
+        positions: Vec::new(),
+    };
+    assert!(reconcile_broker_unrealized_pnl(&reconcile, &missing).is_err());
+
+    let duplicated = crate::app_services::ctrader_messages::CTraderUnrealizedPnLSnapshot {
+        account_id: 712345,
+        money_digits: 2,
+        positions: vec![
+            crate::app_services::ctrader_messages::CTraderPositionUnrealizedPnL {
+                position_id: 9001,
+                gross_unrealized_pnl: 12.34,
+                net_unrealized_pnl: 11.34,
+            },
+            crate::app_services::ctrader_messages::CTraderPositionUnrealizedPnL {
+                position_id: 9001,
+                gross_unrealized_pnl: 12.34,
+                net_unrealized_pnl: 11.34,
+            },
+        ],
+    };
+    assert!(reconcile_broker_unrealized_pnl(&reconcile, &duplicated).is_err());
 }
 
 #[test]

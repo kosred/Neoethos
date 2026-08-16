@@ -128,6 +128,10 @@ fn run_attempt(
 /// BLOCKING. Bootstrap the portfolio's R-multiples through FTMO-style
 /// barriers across a sweep of risk-per-trade sizes.
 pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<ChallengeReport> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::PropFirmMode)
+        .map_err(anyhow::Error::new)?;
+
     let trades_file = trades_path_for(portfolio_path);
     let raw = std::fs::read_to_string(&trades_file).with_context(|| {
         format!(

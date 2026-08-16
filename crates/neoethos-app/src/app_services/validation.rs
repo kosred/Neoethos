@@ -4,7 +4,7 @@
 //! dataset. Triggered by `--validation-mode` on the CLI; not reachable
 //! from the HTTP server or the existing `--auto-discovery` path.
 //!
-//! Design: sequential per-TF runs that share `DiscoveryConfig::from_settings`
+//! Design: sequential per-TF runs that share `DiscoveryConfig::try_from_settings`
 //! so the operator's `config.yaml` drives population / generations /
 //! candidate-count — the in-code defaults are deliberately small for
 //! unit tests and would not give a meaningful pass/fail signal here.
@@ -102,8 +102,7 @@ impl TfOutcome {
 /// `top_sharpe_is` (in-sample, stage-1) and `top_sharpe_oos`
 /// (forward-test on the strictly held-out tail). A big IS-OOS gap is
 /// itself diagnostic — see #211.
-const CSV_HEADER: &str =
-    "tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe_is,top_sharpe_oos,top_max_dd_pct,error_message\n";
+const CSV_HEADER: &str = "tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe_is,top_sharpe_oos,top_max_dd_pct,error_message\n";
 
 /// Run a multi-TF Discovery sweep on the first locally-discoverable
 /// symbol (falls back to AUDUSD if none). Returns the exit code the
@@ -280,7 +279,22 @@ async fn run_one_tf(
     let started = Instant::now();
     // Honor the operator's config.yaml — defaults in code are smaller
     // than what we need for a meaningful validation signal.
-    let mut config = DiscoveryConfig::from_settings(settings);
+    let mut config = match DiscoveryConfig::try_from_settings(settings) {
+        Ok(config) => config,
+        Err(error) => {
+            return TfOutcome {
+                tf: base_tf.to_string(),
+                status: "BrokerTruthUnavailable".to_string(),
+                duration_secs: started.elapsed().as_secs_f64(),
+                candidate_count: 0,
+                portfolio_count: 0,
+                top_sharpe_is: None,
+                top_sharpe_oos: None,
+                top_max_dd_pct: None,
+                error_message: format!("{error:#}"),
+            };
+        }
+    };
     // #214 + F-304: bind the *actual* sweep symbol into the discovery
     // config so the cost-model lookup sees a real cTrader symbol
     // instead of the empty-string fallback. The settings
@@ -671,9 +685,7 @@ mod tests {
         let row = outcome.to_csv_row();
         // tf,status,duration_secs(12.345),candidate(42),portfolio(7),
         // sharpe_is(1.826100),sharpe_oos(0.912300),dd(0.092100),""
-        assert!(row.starts_with(
-            "H4,Succeeded,12.345,42,7,1.826100,0.912300,0.092100,\"\""
-        ));
+        assert!(row.starts_with("H4,Succeeded,12.345,42,7,1.826100,0.912300,0.092100,\"\""));
     }
 
     // #211: header carries both IS and OOS sharpe columns. Downstream

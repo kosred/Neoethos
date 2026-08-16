@@ -87,7 +87,7 @@ impl DecisionConfig {
     /// Backtest-parity policy for the REAL-gene replay paths (audit #228):
     /// exits are stop, target, or the engine's `max_hold_bars` time stop —
     /// the same three the GA evaluator uses. `pip_size` must be the symbol's
-    /// canonical pip (`neoethos_search::default_pip_size`) or the gene bracket
+    /// exact broker `ProtoOASymbol` pip size or the gene bracket
     /// cannot be converted to price.
     pub fn gene_parity(pip_size: f64) -> Self {
         Self {

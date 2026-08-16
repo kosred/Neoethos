@@ -55,6 +55,7 @@ pub struct LiveParityReport {
 fn signals_for_frames(
     artifact: &neoethos_search::LivePortfolioArtifact,
     frames: std::collections::HashMap<String, neoethos_data::Ohlcv>,
+    pip_size: f64,
 ) -> Result<Vec<(i64, String, f64, f64)>> {
     let base_ohlcv = frames
         .get(&artifact.base_tf)
@@ -75,9 +76,7 @@ fn signals_for_frames(
         &artifact.genes,
         &aligned,
         &base_ohlcv,
-        // Same canonical pip the discovery backtest used, so adaptive-stop
-        // brackets replay identically here.
-        neoethos_search::default_pip_size(&artifact.symbol),
+        pip_size,
     );
     let ts = base_ohlcv.timestamp.clone().unwrap_or_default();
     // Feature rows align to the TAIL of the ohlcv (warmup rows dropped) — pair
@@ -128,11 +127,18 @@ pub fn run_live_parity_check(
     window_bars: usize,
     reference_bars: usize,
 ) -> Result<LiveParityReport> {
+    let broker_truth = neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::LiveTrading)
+        .map_err(anyhow::Error::new)?;
+
     let artifact = neoethos_search::load_live_portfolio_json(portfolio_path)
         .with_context(|| format!("load live portfolio {portfolio_path}"))?;
     if artifact.genes.is_empty() {
         anyhow::bail!("portfolio '{portfolio_path}' has no genes");
     }
+    let pip_size = broker_truth
+        .exact_pip_size_v1(&artifact.symbol)
+        .map_err(anyhow::Error::new)?;
     let window = window_bars.clamp(200, 5000);
     let reference = reference_bars.clamp(window + 500, 10_000);
 
@@ -145,8 +151,8 @@ pub fn run_live_parity_check(
         frames.insert(tf.clone(), bars_to_ohlcv(&bars));
     }
 
-    let reference_signals = signals_for_frames(&artifact, frames.clone())?;
-    let window_signals = signals_for_frames(&artifact, tail_frames(&frames, window))?;
+    let reference_signals = signals_for_frames(&artifact, frames.clone(), pip_size)?;
+    let window_signals = signals_for_frames(&artifact, tail_frames(&frames, window), pip_size)?;
 
     // Compare the freshest bars both runs cover — index by timestamp.
     let compare_tail = (window / 4).clamp(50, 400);

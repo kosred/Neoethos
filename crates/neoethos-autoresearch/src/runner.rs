@@ -660,7 +660,7 @@ fn hash_named(values: &NamedValues) -> String {
 pub fn run(args: RunArgs, settings: &Settings) -> Result<crate::verdict::SessionVerdict> {
     let base_config = DiscoveryConfig {
         evaluation_symbol: args.symbol.clone(),
-        ..DiscoveryConfig::from_settings(settings)
+        ..DiscoveryConfig::try_from_settings(settings)?
     }
     .apply_mode_overrides();
 
@@ -679,6 +679,15 @@ pub fn run_with_executor(
     base_config: DiscoveryConfig,
     executor: &mut dyn SweepExecutor,
 ) -> Result<crate::verdict::SessionVerdict> {
+    // `run()` already reaches this refusal through
+    // `DiscoveryConfig::try_from_settings`, but this function is public so
+    // test harnesses and alternate callers can supply a config directly.
+    // Gate again at the actual execution boundary: no synthetic executor may
+    // turn guessed costs or returns into an autoresearch verdict.
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
+
     let started = Instant::now();
 
     // ── S0 OPEN / RESUME ────────────────────────────────────────────────────
@@ -996,7 +1005,9 @@ fn open_or_resume(
         None => goals.primary().clone(),
     };
 
-    let pip_value_per_lot = base_config.evaluation_config(None).pip_value_per_lot;
+    let pip_value_per_lot = base_config
+        .try_evaluation_config(None)?
+        .pip_value_per_lot;
     let costs = frozen_cost_fields(&base_config, pip_value_per_lot);
     let cost_hash = hash_named(&costs);
 

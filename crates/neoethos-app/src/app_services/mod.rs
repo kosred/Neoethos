@@ -55,7 +55,6 @@ pub mod journal_analytics;
 pub mod journal_stats;
 pub mod live_journal;
 pub mod live_gate;
-pub mod pnl;
 pub mod reauth;
 pub mod live_spots;
 pub mod live_spots_streamer;

@@ -1,23 +1,28 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::ctrader_data::{CTraderAssetInfo, parse_asset_list_response};
 use crate::app_services::ctrader_messages::{
-    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
-    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
-    build_deal_list_request, build_reconcile_request, build_trader_request,
-    parse_ctrader_error_payload, parse_open_api_envelope,
+    CTraderPositionUnrealizedPnL, CTraderUnrealizedPnLSnapshot, ProductionCTraderOpenApiTransport,
+    build_account_auth_request, build_application_auth_request, build_asset_list_request,
+    build_deal_list_request,
+    build_get_position_unrealized_pnl_request, build_reconcile_request, build_trader_request,
+    parse_ctrader_error_payload, parse_get_position_unrealized_pnl_response, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,12 +54,6 @@ pub struct CTraderTraderSnapshot {
     /// bridge to render the right currency symbol on the dashboard.
     /// `None` only when the broker omitted the field (rare).
     pub deposit_asset_id: Option<i64>,
-    /// Sum of mark-to-market PnL for currently open positions (account currency).
-    /// Updated by the streaming/spot subsystem; defaults to 0.0 when no live
-    /// spot data is available. Read alongside `balance` to compute live equity:
-    /// `equity = balance + unrealized_pnl`. Critical for prop-firm rules that
-    /// limit drawdown by EQUITY, not balance.
-    pub unrealized_pnl: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +124,19 @@ pub struct CTraderAccountRuntimeSnapshot {
     pub trader: CTraderTraderSnapshot,
     pub reconcile: CTraderReconcileSnapshot,
     pub recent_deals: Vec<CTraderDealSnapshot>,
+    /// Sum of the broker-supplied `ProtoOAGetPositionUnrealizedPnLRes`
+    /// `netUnrealizedPnL` rows in account currency. Runtime loading fails when
+    /// this response or its scale is absent.
+    pub unrealized_pnl: f64,
+    /// The same validated broker rows keyed by position id. Keeping these in
+    /// the account snapshot prevents a second, time-skewed PnL request in UI
+    /// and risk consumers.
+    pub unrealized_pnl_by_position: BTreeMap<i64, CTraderPositionUnrealizedPnL>,
+    /// Broker-canonical deposit asset name resolved from the same account's
+    /// `ProtoOAAssetListRes`. No numeric-id lookup table or fiat fallback is
+    /// permitted because a wrong label changes the meaning of every monetary
+    /// value in this snapshot.
+    pub deposit_asset_name: String,
 }
 
 // The account-runtime backend (trait + production impl) loads trader balance /
@@ -389,17 +401,16 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
     }
 
     let trader = envelope.payload.trader;
-    let money_digits = required_money_digits(trader.money_digits, "trader.money_digits");
+    let money_digits = required_money_digits(trader.money_digits, "trader.money_digits")?;
     Ok(CTraderTraderSnapshot {
         account_id: envelope.payload.ctid_trader_account_id,
-        balance: scaled_money(trader.balance, money_digits),
+        balance: scaled_money(trader.balance, money_digits)?,
         leverage: trader.leverage_in_cents.map(|value| value as f64 / 100.0),
         trader_login: trader.trader_login,
         account_type: trader.account_type.map(account_type_label),
         broker_name: trader.broker_name,
         money_digits,
         deposit_asset_id: trader.deposit_asset_id,
-        unrealized_pnl: 0.0,
     })
 }
 
@@ -419,44 +430,56 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .payload
             .positions
             .into_iter()
-            .map(|position| CTraderPositionSnapshot {
-                swap: position.swap.map(|raw| {
-                    scaled_money(
-                        raw,
-                        required_money_digits(position.money_digits, "position.money_digits"),
+            .map(|position| -> Result<CTraderPositionSnapshot> {
+                let (swap, commission, mirroring_commission, used_margin) = if position
+                    .swap
+                    .is_some()
+                    || position.commission.is_some()
+                    || position.mirroring_commission.is_some()
+                    || position.used_margin.is_some()
+                {
+                    let money_digits =
+                        required_money_digits(position.money_digits, "position.money_digits")?;
+                    (
+                        position
+                            .swap
+                            .map(|raw| scaled_money(raw, money_digits))
+                            .transpose()?,
+                        position
+                            .commission
+                            .map(|raw| scaled_money(raw, money_digits))
+                            .transpose()?,
+                        position
+                            .mirroring_commission
+                            .map(|raw| scaled_money(raw, money_digits))
+                            .transpose()?,
+                        position
+                            .used_margin
+                            .map(|raw| scaled_unsigned_money(raw, money_digits))
+                            .transpose()?,
                     )
-                }),
-                commission: position.commission.map(|raw| {
-                    scaled_money(
-                        raw,
-                        required_money_digits(position.money_digits, "position.money_digits"),
-                    )
-                }),
-                mirroring_commission: position.mirroring_commission.map(|raw| {
-                    scaled_money(
-                        raw,
-                        required_money_digits(position.money_digits, "position.money_digits"),
-                    )
-                }),
-                used_margin: position.used_margin.map(|raw| {
-                    scaled_unsigned_money(
-                        raw,
-                        required_money_digits(position.money_digits, "position.money_digits"),
-                    )
-                }),
-                position_id: position.position_id,
-                symbol_id: position.trade_data.symbol_id,
-                trade_side: trade_side_label(position.trade_data.trade_side),
-                volume: volume_to_units(position.trade_data.volume),
-                open_timestamp_ms: position.trade_data.open_timestamp,
-                price: position.price,
-                stop_loss: position.stop_loss,
-                take_profit: position.take_profit,
-                label: position.trade_data.label,
-                comment: position.trade_data.comment,
-                client_order_id: position.trade_data.client_order_id,
+                } else {
+                    (None, None, None, None)
+                };
+                Ok(CTraderPositionSnapshot {
+                    swap,
+                    commission,
+                    mirroring_commission,
+                    used_margin,
+                    position_id: position.position_id,
+                    symbol_id: position.trade_data.symbol_id,
+                    trade_side: trade_side_label(position.trade_data.trade_side),
+                    volume: volume_to_units(position.trade_data.volume),
+                    open_timestamp_ms: position.trade_data.open_timestamp,
+                    price: position.price,
+                    stop_loss: position.stop_loss,
+                    take_profit: position.take_profit,
+                    label: position.trade_data.label,
+                    comment: position.trade_data.comment,
+                    client_order_id: position.trade_data.client_order_id,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         pending_orders: envelope
             .payload
             .orders
@@ -494,7 +517,7 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
         .deals
         .into_iter()
         .map(deal_payload_to_snapshot)
-        .collect())
+        .collect::<Result<Vec<_>>>()?)
 }
 
 /// Parse a `ProtoOADealListByPositionIdRes` (payload type 2180).
@@ -519,7 +542,7 @@ pub fn parse_deal_list_by_position_id_response(
         .deals
         .into_iter()
         .map(deal_payload_to_snapshot)
-        .collect())
+        .collect::<Result<Vec<_>>>()?)
 }
 
 /// Parse a `ProtoOAOrderListByPositionIdRes` (payload type 2184). The
@@ -574,7 +597,7 @@ pub fn parse_order_details_response(response_json: &str) -> Result<CTraderOrderD
             .deals
             .into_iter()
             .map(deal_payload_to_snapshot)
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -615,56 +638,44 @@ pub fn parse_symbol_category_list_response(
         .collect())
 }
 
-fn deal_payload_to_snapshot(deal: DealPayload) -> CTraderDealSnapshot {
-    let gross_profit = deal.close_position_detail.as_ref().map(|detail| {
-        scaled_money(
-            detail.gross_profit,
-            required_money_digits(detail.money_digits, "deal.close.money_digits"),
-        )
-    });
-    let fee = deal
-        .close_position_detail
-        .as_ref()
-        .map(|detail| {
-            scaled_money(
-                detail.commission,
-                required_money_digits(detail.money_digits, "deal.close.money_digits"),
-            )
-        })
-        .or_else(|| {
-            deal.commission.map(|commission| {
-                scaled_money(
-                    commission,
-                    required_money_digits(deal.money_digits, "deal.money_digits"),
+fn deal_payload_to_snapshot(deal: DealPayload) -> Result<CTraderDealSnapshot> {
+    let (gross_profit, close_fee, swap, pnl_conversion_fee) =
+        match deal.close_position_detail.as_ref() {
+            Some(detail) => {
+                let digits = required_money_digits(detail.money_digits, "deal.close.money_digits")?;
+                (
+                    Some(scaled_money(detail.gross_profit, digits)?),
+                    Some(scaled_money(detail.commission, digits)?),
+                    Some(scaled_money(detail.swap, digits)?),
+                    detail
+                        .pnl_conversion_fee
+                        .map(|fee| scaled_money(fee, digits))
+                        .transpose()?,
                 )
-            })
-        });
-    let swap = deal.close_position_detail.as_ref().map(|detail| {
-        scaled_money(
-            detail.swap,
-            required_money_digits(detail.money_digits, "deal.close.money_digits"),
-        )
-    });
-    let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
-        detail.pnl_conversion_fee.map(|fee| {
-            // F-CORE2 audit: previously used `unwrap_or(0)` for money_digits,
-            // which would 10^N-inflate the fee if the broker payload omitted
-            // the field. Use the shared helper that logs and defaults to 2
-            // (cTrader's documented account currency digit count).
-            scaled_money(
-                fee,
-                required_money_digits(
-                    detail.money_digits,
-                    "deal.close.pnl_conversion_fee.money_digits",
-                ),
-            )
-        })
-    });
-    let net_profit = gross_profit.map(|gross| {
-        gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0)
-    });
+            }
+            None => (None, None, None, None),
+        };
+    let fee = match close_fee {
+        Some(value) => Some(value),
+        None => match deal.commission {
+            Some(commission) => {
+                let digits = required_money_digits(deal.money_digits, "deal.money_digits")?;
+                Some(scaled_money(commission, digits)?)
+            }
+            None => None,
+        },
+    };
+    let net_profit = match (gross_profit, fee, swap) {
+        (Some(gross), Some(fee), Some(swap)) => {
+            // ProtoOAClosePositionDetail.pnlConversionFee is optional and is
+            // present only when the broker applied quote/deposit conversion.
+            let conversion_fee = pnl_conversion_fee.unwrap_or_default();
+            Some(gross + fee + swap + conversion_fee)
+        }
+        _ => None,
+    };
 
-    CTraderDealSnapshot {
+    Ok(CTraderDealSnapshot {
         deal_id: deal.deal_id,
         order_id: deal.order_id,
         position_id: deal.position_id,
@@ -684,7 +695,7 @@ fn deal_payload_to_snapshot(deal: DealPayload) -> CTraderDealSnapshot {
         swap,
         pnl_conversion_fee,
         net_profit,
-    }
+    })
 }
 
 fn order_payload_to_snapshot(order: OrderPayload) -> CTraderPendingOrderSnapshot {
@@ -715,11 +726,16 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         .context("cTrader account id must be numeric")?;
     // Resilient: retry transient cold-connection / CANT_ROUTE failures and
     // surface the real cTrader error instead of a misleading "received N"
-    // count. All 5 responses are required for a full account snapshot.
+    // count. All 7 responses are required for a broker-truthful account
+    // snapshot, including authoritative unrealized PnL and deposit-asset name.
     let responses = crate::app_services::ctrader_messages::send_sequence_resilient(
         transport,
         &[
-            build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+            build_application_auth_request(
+                &request.client_id,
+                &request.client_secret,
+                "app-auth-1",
+            ),
             build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
             build_trader_request(account_id, "trader-1"),
             build_reconcile_request(account_id, request.return_protection_orders, "reconcile-1"),
@@ -727,20 +743,23 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
                 &CTraderDealListRequest {
                     account_id,
                     from_timestamp_ms: Some(
-                        current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000,
+                        current_unix_millis()?
+                            - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000,
                     ),
                     to_timestamp_ms: Some(current_unix_millis()?),
                     max_rows: Some(DEFAULT_CTRADER_DEAL_MAX_ROWS),
                 },
                 "deals-1",
             ),
+            build_get_position_unrealized_pnl_request(account_id, "unrealized-pnl-1"),
+            build_asset_list_request(account_id, "asset-list-1"),
         ],
-        5,
+        7,
         "cTrader account runtime",
     )?;
-    if responses.len() != 5 {
+    if responses.len() != 7 {
         return Err(anyhow!(
-            "expected 5 cTrader account runtime responses, received {}",
+            "expected 7 cTrader account runtime responses, received {}",
             responses.len()
         ));
     }
@@ -753,12 +772,122 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
     ensure_success_payload_type(&responses[2], CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[3], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[4], CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[5],
+        CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(&responses[6], CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE)?;
+
+    let trader = parse_trader_response(&responses[2])?;
+    let reconcile = parse_reconcile_response(&responses[3])?;
+    let assets = parse_asset_list_response(&responses[6])?;
+    let deposit_asset_name = resolve_deposit_asset_name(&trader, &assets)?;
+    let broker_pnl = parse_get_position_unrealized_pnl_response(&responses[5])?;
+    let unrealized_pnl_by_position = reconcile_broker_unrealized_pnl(&reconcile, &broker_pnl)?;
+    let unrealized_pnl = unrealized_pnl_by_position
+        .values()
+        .map(|position| position.net_unrealized_pnl)
+        .sum();
 
     Ok(CTraderAccountRuntimeSnapshot {
-        trader: parse_trader_response(&responses[2])?,
-        reconcile: parse_reconcile_response(&responses[3])?,
+        trader,
+        reconcile,
         recent_deals: parse_deal_list_response(&responses[4])?,
+        unrealized_pnl,
+        unrealized_pnl_by_position,
+        deposit_asset_name,
     })
+}
+
+fn resolve_deposit_asset_name(
+    trader: &CTraderTraderSnapshot,
+    assets: &[CTraderAssetInfo],
+) -> Result<String> {
+    let deposit_asset_id = trader.deposit_asset_id.ok_or_else(|| {
+        anyhow!("cTrader trader response omitted required depositAssetId")
+    })?;
+    let mut matches = assets
+        .iter()
+        .filter(|asset| asset.asset_id == deposit_asset_id);
+    let asset = matches.next().ok_or_else(|| {
+        anyhow!(
+            "cTrader asset registry has no row for depositAssetId={deposit_asset_id}"
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "cTrader asset registry contains duplicate rows for depositAssetId={deposit_asset_id}"
+        ));
+    }
+    if asset.name.trim().is_empty() {
+        return Err(anyhow!(
+            "cTrader asset registry row for depositAssetId={deposit_asset_id} has an empty name"
+        ));
+    }
+    Ok(asset.name.clone())
+}
+
+fn reconcile_broker_unrealized_pnl(
+    reconcile: &CTraderReconcileSnapshot,
+    pnl: &CTraderUnrealizedPnLSnapshot,
+) -> Result<BTreeMap<i64, CTraderPositionUnrealizedPnL>> {
+    if pnl.account_id != reconcile.account_id {
+        return Err(anyhow!(
+            "cTrader unrealized-PnL account {} does not match reconcile account {}",
+            pnl.account_id,
+            reconcile.account_id
+        ));
+    }
+
+    let mut open_ids = BTreeSet::new();
+    for position in &reconcile.positions {
+        if !open_ids.insert(position.position_id) {
+            return Err(anyhow!(
+                "cTrader reconcile returned duplicate position {}",
+                position.position_id
+            ));
+        }
+    }
+
+    let mut pnl_ids = BTreeSet::new();
+    let mut by_position = BTreeMap::new();
+    for position in &pnl.positions {
+        if !pnl_ids.insert(position.position_id) {
+            return Err(anyhow!(
+                "cTrader unrealized-PnL response returned duplicate position {}",
+                position.position_id
+            ));
+        }
+        if !open_ids.contains(&position.position_id) {
+            return Err(anyhow!(
+                "cTrader unrealized-PnL response returned unknown position {}",
+                position.position_id
+            ));
+        }
+        if !position.gross_unrealized_pnl.is_finite()
+            || !position.net_unrealized_pnl.is_finite()
+        {
+            return Err(anyhow!(
+                "cTrader unrealized-PnL response returned non-finite values for position {}",
+                position.position_id
+            ));
+        }
+        by_position.insert(position.position_id, *position);
+    }
+    if pnl_ids != open_ids {
+        let missing: Vec<i64> = open_ids.difference(&pnl_ids).copied().collect();
+        return Err(anyhow!(
+            "cTrader unrealized-PnL response omitted open positions: {missing:?}"
+        ));
+    }
+    let total: f64 = by_position
+        .values()
+        .map(|position| position.net_unrealized_pnl)
+        .sum();
+    if !total.is_finite() {
+        return Err(anyhow!("cTrader unrealized-PnL total is not finite"));
+    }
+    Ok(by_position)
 }
 
 pub fn load_account_runtime(
@@ -937,7 +1066,9 @@ pub struct CTraderOrderHistoryBundle {
     pub has_more: bool,
 }
 
-fn historical_order_payload_to_snapshot(p: HistoricalOrderPayload) -> CTraderHistoricalOrderSnapshot {
+fn historical_order_payload_to_snapshot(
+    p: HistoricalOrderPayload,
+) -> CTraderHistoricalOrderSnapshot {
     CTraderHistoricalOrderSnapshot {
         order_id: p.order_id,
         position_id: p.position_id,
@@ -1046,19 +1177,22 @@ pub struct CTraderCashFlowBundle {
     pub entries: Vec<CTraderCashFlowSnapshot>,
 }
 
-fn cash_flow_payload_to_snapshot(p: DepositWithdrawPayload) -> CTraderCashFlowSnapshot {
-    let digits = required_money_digits(p.money_digits, "cashFlow.moneyDigits");
-    CTraderCashFlowSnapshot {
+fn cash_flow_payload_to_snapshot(p: DepositWithdrawPayload) -> Result<CTraderCashFlowSnapshot> {
+    let digits = required_money_digits(p.money_digits, "cashFlow.moneyDigits")?;
+    Ok(CTraderCashFlowSnapshot {
         balance_history_id: p.balance_history_id,
         operation_type: change_balance_type_label(p.operation_type),
         operation_type_code: p.operation_type,
-        balance: scaled_money(p.balance, digits),
-        delta: scaled_money(p.delta, digits),
-        equity: p.equity.map(|e| scaled_money(e, digits)),
+        balance: scaled_money(p.balance, digits)?,
+        delta: scaled_money(p.delta, digits)?,
+        equity: p
+            .equity
+            .map(|value| scaled_money(value, digits))
+            .transpose()?,
         change_balance_timestamp_ms: p.change_balance_timestamp,
         external_note: p.external_note,
         balance_version: p.balance_version,
-    }
+    })
 }
 
 pub fn parse_cash_flow_history_response(response_json: &str) -> Result<CTraderCashFlowBundle> {
@@ -1077,7 +1211,7 @@ pub fn parse_cash_flow_history_response(response_json: &str) -> Result<CTraderCa
             .deposit_withdraw
             .into_iter()
             .map(cash_flow_payload_to_snapshot)
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -1133,19 +1267,22 @@ pub fn parse_expected_margin_response(response_json: &str) -> Result<CTraderExpe
             envelope.payload_type
         ));
     }
-    let digits = required_money_digits(envelope.payload.money_digits, "expectedMargin.moneyDigits");
+    let digits =
+        required_money_digits(envelope.payload.money_digits, "expectedMargin.moneyDigits")?;
     Ok(CTraderExpectedMarginBundle {
         account_id: envelope.payload.ctid_trader_account_id,
         entries: envelope
             .payload
             .margin
             .into_iter()
-            .map(|m| CTraderExpectedMarginEntry {
-                volume_lots: volume_to_units(m.volume),
-                buy_margin: scaled_money(m.buy_margin, digits),
-                sell_margin: scaled_money(m.sell_margin, digits),
+            .map(|m| -> Result<CTraderExpectedMarginEntry> {
+                Ok(CTraderExpectedMarginEntry {
+                    volume_lots: volume_to_units(m.volume),
+                    buy_margin: scaled_money(m.buy_margin, digits)?,
+                    sell_margin: scaled_money(m.sell_margin, digits)?,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -1209,8 +1346,8 @@ pub struct CTraderServerVersionSnapshot {
 }
 
 pub fn parse_version_response(response_json: &str) -> Result<CTraderServerVersionSnapshot> {
-    let envelope: VersionEnvelope = serde_json::from_str(response_json)
-        .context("failed to parse cTrader version response")?;
+    let envelope: VersionEnvelope =
+        serde_json::from_str(response_json).context("failed to parse cTrader version response")?;
     if envelope.payload_type != CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE {
         return Err(anyhow!(
             "unexpected cTrader version payload type: {}",
@@ -1243,60 +1380,16 @@ pub(crate) fn ensure_success_payload_type(
     Ok(())
 }
 
-/// Apply the broker-side decimal precision to a raw money value.
-///
-/// Delegates to [`crate::app_services::ctrader_money::scale_ctrader_money_int`]
-/// — the single spec-compliant implementation per the 2026-05-15
-/// docs sweep (cTrader Open API §5.14: "Money is int64 scaled by
-/// 10^moneyDigits, per-entity"). The caller is responsible for
-/// resolving `Option<u32>` to a concrete value before invoking this
-/// helper — see [`required_money_digits`].
-///
-/// On out-of-range `digits` (the spec allows `[0, 10]`) we log an
-/// error and fall back to the legacy fiat default (2). The strict
-/// helper is what we'd want for fresh code, but this thin shim
-/// preserves the prior infallible signature used by hundreds of
-/// downstream call sites; the strict path is exposed directly via
-/// the `ctrader_money` module.
-fn scaled_money(value: i64, digits: u32) -> f64 {
-    match crate::app_services::ctrader_money::scale_ctrader_money_int(value, digits as i32) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(
-                target: "neoethos_app::ctrader",
-                money_digits = digits,
-                error = %err,
-                "cTrader money scaling rejected by spec helper; falling back to fiat default (2)"
-            );
-            (value as f64) / 100.0
-        }
-    }
+/// Apply the exact broker-side decimal precision to a raw money value.
+fn scaled_money(value: i64, digits: u32) -> Result<f64> {
+    crate::app_services::ctrader_money::scale_ctrader_money_int(value, digits as i32)
 }
 
-fn scaled_unsigned_money(value: u64, digits: u32) -> f64 {
-    match crate::app_services::ctrader_money::scale_ctrader_money_uint(value, digits as i32) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(
-                target: "neoethos_app::ctrader",
-                raw_value = value,
-                money_digits = digits,
-                error = %err,
-                "cTrader unsigned money scaling rejected by spec helper; falling back to fiat default (2)"
-            );
-            (value as f64) / 100.0
-        }
-    }
+fn scaled_unsigned_money(value: u64, digits: u32) -> Result<f64> {
+    crate::app_services::ctrader_money::scale_ctrader_money_uint(value, digits as i32)
 }
 
-/// Resolve `money_digits` from a broker payload. The cTrader OpenAPI
-/// schema declares this field as required; if it is somehow missing we
-/// emit a `tracing::error` (NOT a silent `unwrap_or(0)`) and fall back
-/// to a conservative scale of 2 — the de-facto default for all major
-/// fiat denominations. A silent default of `0` would have multiplied
-/// every reported balance / equity / commission by 100×, corrupting
-/// the operator's view of account state.
-fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
+fn required_money_digits(value: Option<u32>, field: &str) -> Result<u32> {
     crate::app_services::ctrader_money::required_money_digits(value, field)
 }
 

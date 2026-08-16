@@ -112,6 +112,10 @@ fn load_gate_config(settings: &Settings) -> PromotionGateConfig {
 }
 
 fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<PromotionResponseDto> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::Promotion)
+        .map_err(anyhow::Error::new)?;
+
     let config_path = super::state::current_config_path();
     let settings = Settings::from_yaml(&config_path)
         .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;

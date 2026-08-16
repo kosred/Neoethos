@@ -44,7 +44,6 @@ use crate::ensemble::{
 };
 use crate::exit_agent::ExitAgent;
 use crate::forecasting::hmm_regime::{HmmRegimeConfig, RegimeHmmExpert};
-use crate::soft_actor_critic::SoftActorCritic;
 use crate::parallel_trainer::{
     ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
     train_models_parallel_with_progress,
@@ -61,6 +60,7 @@ use crate::runtime::profile::{
 use crate::runtime::training_artifact::{
     write_model_runtime_artifact_contract_sidecar, write_training_model_artifact_contract_sidecar,
 };
+use crate::soft_actor_critic::SoftActorCritic;
 use crate::tree_models::config::ParamValue;
 use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBoostExpert};
 use crate::{
@@ -385,12 +385,11 @@ impl TrainingOrchestrator {
                 .unwrap_or(base_ohlcv.close.len()),
             None => base_ohlcv.close.len(),
         };
-        let hmm_observations: std::sync::Arc<
-            std::result::Result<ndarray::Array2<f64>, String>,
-        > = std::sync::Arc::new(
-            RegimeHmmExpert::ohlcv_to_features(
-                &base_ohlcv.close[..hmm_bar_count],
-                &base_ohlcv.high[..hmm_bar_count],
+        let hmm_observations: std::sync::Arc<std::result::Result<ndarray::Array2<f64>, String>> =
+            std::sync::Arc::new(
+                RegimeHmmExpert::ohlcv_to_features(
+                    &base_ohlcv.close[..hmm_bar_count],
+                    &base_ohlcv.high[..hmm_bar_count],
                 &base_ohlcv.low[..hmm_bar_count],
             )
             .map_err(|e| e.to_string()),
@@ -1045,12 +1044,8 @@ impl TrainingOrchestrator {
                 self.settings.system.max_training_rows_per_tf,
             ),
         ];
-        let active: Vec<(&str, usize)> = caps
-            .into_iter()
-            .filter(|(_, value)| *value > 0)
-            .collect();
-        let winner: Option<(&str, usize)> =
-            active.iter().copied().min_by_key(|(_, value)| *value);
+        let active: Vec<(&str, usize)> = caps.into_iter().filter(|(_, value)| *value > 0).collect();
+        let winner: Option<(&str, usize)> = active.iter().copied().min_by_key(|(_, value)| *value);
         if let Some((winning_field, winning_value)) = winner
             && active.iter().any(|(_, value)| *value != winning_value)
         {
@@ -2413,6 +2408,25 @@ impl TrainingOrchestrator {
     /// across every consumer (recorded 2026-08-08, deliberately deferred);
     /// the geometry fix above is what could land safely tonight.
     fn derive_labels(&self, ohlcv: &Ohlcv, symbol: &str) -> Result<Vec<i32>> {
+        let broker_truth = neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+            .map_err(anyhow::Error::new)?;
+        let pip_size = broker_truth
+            .exact_pip_size_v1(symbol)
+            .map_err(anyhow::Error::new)?;
+        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size)
+    }
+
+    /// Pure label-geometry oracle. This is deliberately private: production
+    /// training may reach it only through [`Self::derive_labels`] after the
+    /// typed broker-truth capability check. Unit tests use the same body to
+    /// retain adversarial formula coverage without weakening that boundary.
+    fn derive_labels_unchecked_test_oracle(
+        &self,
+        ohlcv: &Ohlcv,
+        symbol: &str,
+        pip_size: f64,
+    ) -> Result<Vec<i32>> {
         let n = ohlcv.close.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -2460,9 +2474,12 @@ impl TrainingOrchestrator {
         // full spread from the first tick: profit needs `move > cost`. Both
         // barriers therefore shift UP by the cost — the target gets further
         // away and the stop gets nearer, which is what the trade actually faces.
+        if !(pip_size.is_finite() && pip_size > 0.0) {
+            anyhow::bail!("derive_labels requires an exact positive broker pip size");
+        }
         let round_trip_cost = (self.settings.risk.backtest_spread_pips.max(0.0)
             + self.settings.risk.slippage_pips.max(0.0))
-            * neoethos_search::default_pip_size(symbol);
+            * pip_size;
         let round_trip_cost = if round_trip_cost.is_finite() {
             round_trip_cost
         } else {
@@ -2594,6 +2611,16 @@ impl TrainingOrchestrator {
         }
 
         Ok(labels)
+    }
+
+    #[cfg(test)]
+    fn derive_labels_test_oracle(
+        &self,
+        ohlcv: &Ohlcv,
+        symbol: &str,
+        pip_size: f64,
+    ) -> Result<Vec<i32>> {
+        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size)
     }
 }
 
@@ -3143,12 +3170,7 @@ const MIN_EMBARGO_BARS: usize = 20;
 
 /// Log at WARN when two integer fields that get `.max()`ed together disagree,
 /// naming both and the winner.
-fn log_knob_twin_disagreement(
-    field_a: &str,
-    value_a: usize,
-    field_b: &str,
-    value_b: usize,
-) {
+fn log_knob_twin_disagreement(field_a: &str, value_a: usize, field_b: &str, value_b: usize) {
     if value_a == value_b {
         return;
     }
@@ -4269,7 +4291,10 @@ fn optimize_model_config_cpcv(
         });
     }
 
-    let trials_completed = trials.iter().filter(|trial| trial.metrics.is_some()).count();
+    let trials_completed = trials
+        .iter()
+        .filter(|trial| trial.metrics.is_some())
+        .count();
     if trials_completed == 0 {
         // Every candidate failed under CPCV — let the caller fall back to the
         // single-holdout path instead of returning an unusable report.
@@ -5089,8 +5114,14 @@ mod tests {
         let lgbm = orch.default_model_params("lightgbm");
         assert_eq!(lgbm.get("num_leaves").map(String::as_str), Some("15"));
         assert_eq!(lgbm.get("max_depth").map(String::as_str), Some("4"));
-        assert_eq!(lgbm.get("feature_fraction").map(String::as_str), Some("0.8"));
-        assert_eq!(lgbm.get("bagging_fraction").map(String::as_str), Some("0.8"));
+        assert_eq!(
+            lgbm.get("feature_fraction").map(String::as_str),
+            Some("0.8")
+        );
+        assert_eq!(
+            lgbm.get("bagging_fraction").map(String::as_str),
+            Some("0.8")
+        );
         assert_eq!(lgbm.get("lambda_l2").map(String::as_str), Some("5.0"));
         assert!(lgbm.contains_key("min_data_in_leaf"));
 
@@ -5132,13 +5163,22 @@ mod tests {
         // and NO CPCV meta flag (15-path CV is wasteful on thin data).
         let thin = apply_overfit_overrides(&orch.settings, &base, 2700);
         assert_eq!(thin.params.get("max_depth").map(String::as_str), Some("3"));
-        assert_eq!(thin.params.get("n_estimators").map(String::as_str), Some("150"));
-        assert_eq!(thin.params.get("__hpo_trials").map(String::as_str), Some("1"));
+        assert_eq!(
+            thin.params.get("n_estimators").map(String::as_str),
+            Some("150")
+        );
+        assert_eq!(
+            thin.params.get("__hpo_trials").map(String::as_str),
+            Some("1")
+        );
         assert!(!thin.params.contains_key("__ml_cpcv"));
 
         // Thick: bar-scaled budget, no shrink, CPCV enabled.
         let thick = apply_overfit_overrides(&orch.settings, &base, 50_000);
-        assert_eq!(thick.params.get("n_estimators").map(String::as_str), Some("800"));
+        assert_eq!(
+            thick.params.get("n_estimators").map(String::as_str),
+            Some("800")
+        );
         assert_eq!(thick.params.get("max_depth").map(String::as_str), Some("4"));
         assert!(!thick.params.contains_key("__hpo_trials"));
         assert_eq!(thick.params.get("__ml_cpcv").map(String::as_str), Some("1"));
@@ -5242,8 +5282,8 @@ mod tests {
     #[test]
     fn hardware_plan_params_reach_the_deep_trainer_contract() {
         use neoethos_core::system::{
-            AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass, HardwareProfile,
-            TrainingPrecision, HARDWARE_PROFILE_SCHEMA_VERSION,
+            AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass,
+            HARDWARE_PROFILE_SCHEMA_VERSION, HardwareProfile, TrainingPrecision,
         };
 
         let mut orchestrator = orchestrator_with_models(&["mlp"]);
@@ -5271,18 +5311,14 @@ mod tests {
             timestamp: "test".to_string(),
             platform_label: "test".to_string(),
         };
-        let plan = HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, profile);
+        let plan =
+            HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, profile);
         let workload = plan
             .workload(WorkloadKind::DeepTraining)
             .expect("deep-training workload should exist");
         let mut params = HashMap::from([("batch_size".to_string(), "17".to_string())]);
 
-        orchestrator.apply_hardware_plan_params(
-            "mlp",
-            ModelFamily::Deep,
-            &plan,
-            &mut params,
-        );
+        orchestrator.apply_hardware_plan_params("mlp", ModelFamily::Deep, &plan, &mut params);
 
         assert_eq!(
             params.get("__planned_cpu_threads"),
@@ -5448,7 +5484,7 @@ mod tests {
         };
 
         let labels = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("aligned OHLCV should derive labels");
         assert_eq!(labels[0], 1);
     }
@@ -5479,7 +5515,13 @@ mod tests {
         let entry = 1.1000;
         // Rises to +0.0011 and stays there: past the bare target, short of the
         // target once the round trip is paid.
-        let close = vec![entry, entry + 0.0005, entry + 0.0011, entry + 0.0011, entry + 0.0011];
+        let close = vec![
+            entry,
+            entry + 0.0005,
+            entry + 0.0011,
+            entry + 0.0011,
+            entry + 0.0011,
+        ];
         let ohlcv = Ohlcv {
             timestamp: Some(vec![0, 1, 2, 3, 4]),
             open: close.clone(),
@@ -5490,7 +5532,7 @@ mod tests {
         };
 
         let labels = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("aligned OHLCV should derive labels");
         assert_ne!(
             labels[0], 1,
@@ -5503,7 +5545,7 @@ mod tests {
         orchestrator.settings.risk.backtest_spread_pips = 0.0;
         orchestrator.settings.risk.slippage_pips = 0.0;
         let costless = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("aligned OHLCV should derive labels");
         assert_eq!(
             costless[0], 1,
@@ -5583,7 +5625,7 @@ mod tests {
         let ohlcv = real_eurusd_m15_fixture();
         let share_of_longs = |orchestrator: &TrainingOrchestrator| {
             let labels = orchestrator
-                .derive_labels(&ohlcv, "EURUSD")
+                .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
                 .expect("real fixture bars must derive labels");
             let longs = labels.iter().filter(|&&label| label == 1).count();
             let shorts = labels.iter().filter(|&&label| label == -1).count();
@@ -5644,7 +5686,7 @@ mod tests {
 
         let orchestrator = orchestrator_with_models(&["lightgbm"]);
         let symmetric = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("labels derive");
         assert_eq!(
             symmetric[0], 1,
@@ -5655,7 +5697,7 @@ mod tests {
         let mut legacy = orchestrator_with_models(&["lightgbm"]);
         legacy.settings.models.label_geometry = "asymmetric".to_string();
         let asymmetric = legacy
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("labels derive");
         assert_eq!(
             asymmetric[0], -1,
@@ -5677,7 +5719,7 @@ mod tests {
             volume: None,
         };
         let err = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect_err("a typo in label_geometry must stop training, not pick a side silently");
         let message = err.to_string();
         assert!(
@@ -5708,9 +5750,32 @@ mod tests {
         };
 
         let err = orchestrator
-            .derive_labels(&ohlcv, "EURUSD")
+            .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect_err("misaligned OHLCV should fail");
         assert!(err.to_string().contains("aligned OHLCV series"));
+    }
+
+    #[test]
+    fn production_label_derivation_refuses_before_formula_or_input_validation() {
+        let orchestrator = orchestrator_with_models(&["lightgbm"]);
+        let malformed = Ohlcv {
+            timestamp: None,
+            open: vec![1.0, 2.0],
+            high: vec![1.0],
+            low: vec![1.0, 2.0],
+            close: vec![1.0, 2.0],
+            volume: None,
+        };
+
+        let error = orchestrator
+            .derive_labels(&malformed, "UNKNOWN-SYMBOL")
+            .expect_err("production labels must require exact broker evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1"),
+            "formula/input work ran before the broker-truth boundary: {error:#}"
+        );
     }
 
     #[test]
@@ -5950,9 +6015,7 @@ mod tests {
         // `target.with_extension(temp_extension)`. Re-derive the same path
         // here so the post-condition still pins the implementation.
         assert!(
-            !target_dir
-                .with_extension("tmp_training_dispatch")
-                .exists(),
+            !target_dir.with_extension("tmp_training_dispatch").exists(),
             "staged dir must be cleaned up after promote"
         );
 

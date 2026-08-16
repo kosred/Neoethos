@@ -45,7 +45,7 @@ pub struct Position {
 /// (which was never an ATR multiple — it is a multiple of the position's OWN
 /// stop distance), `min_lock_pips` → `trailing_min_lock_pips`. `pip_size`
 /// converts the lock from pips to price; the replay resolves it through
-/// `neoethos_search::default_pip_size`, the same helper the bracket path
+/// the exact broker `ProtoOASymbol` pip size, the same contract the bracket path
 /// already uses, so no pip number is invented here.
 ///
 /// The replay had NONE of this until 2026-08-10: it modelled the stop, the

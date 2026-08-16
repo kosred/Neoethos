@@ -115,16 +115,6 @@ const RETIRED: &[RetiredEnvVar] = &[
         replacement: "app_runtime.chart_merge_side",
         used_to: "chose mid/bid/ask for the chart-merge quote side",
     },
-    RetiredEnvVar {
-        name: "NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION",
-        replacement: "app_runtime.pnl_audit_drift_fraction",
-        used_to: "set the PnL drift threshold that logs an audit warning",
-    },
-    RetiredEnvVar {
-        name: "NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION",
-        replacement: "app_runtime.pnl_circuit_breaker_fraction",
-        used_to: "set the PnL drift threshold that HALTS the auto-trader",
-    },
 ];
 
 /// Scan the process environment for retired variable names and print one

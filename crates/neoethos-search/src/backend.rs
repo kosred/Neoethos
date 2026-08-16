@@ -354,6 +354,17 @@ pub fn evaluate_population_core_with_backend_and_audit(
     backend: EvaluationBackend,
     audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
 ) -> Result<Vec<[f64; 11]>, String> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(|error| error.to_string())?;
+    evaluate_population_core_with_backend_unchecked(inputs, backend, audit)
+}
+
+fn evaluate_population_core_with_backend_unchecked(
+    inputs: crate::eval::PopulationEvalInputs<'_>,
+    backend: EvaluationBackend,
+    audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
+) -> Result<Vec<[f64; 11]>, String> {
     use crate::gpu_native::cpu_strategy::{self, CpuStrategyCategory};
 
     backend.validate().map_err(|error| error.to_string())?;
@@ -429,6 +440,17 @@ pub fn evaluate_population_core_with_backend_and_audit(
         }
         _ => crate::eval::evaluate_population_core(inputs),
     }
+}
+
+/// Unit-only backend oracle. It preserves device/fallback dispatch tests while
+/// release callers remain unable to bypass the broker-real capability gate.
+#[cfg(test)]
+pub(crate) fn evaluate_population_core_with_backend_test_oracle(
+    inputs: crate::eval::PopulationEvalInputs<'_>,
+    backend: EvaluationBackend,
+    audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
+) -> Result<Vec<[f64; 11]>, String> {
+    evaluate_population_core_with_backend_unchecked(inputs, backend, audit)
 }
 
 #[cfg(not(feature = "gpu"))]

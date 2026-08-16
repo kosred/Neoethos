@@ -168,7 +168,7 @@ fn symbol_kind(symbol: &str) -> &'static str {
 /// Exposed as `pub(crate)` for use in `search_engine.rs::resolve_stop_target_arrays`
 /// (F-761 closure — replaces the hardcoded `0.0001` EURUSD-pip fallback
 /// with this symbol-aware lookup).
-pub fn default_pip_size(symbol: &str) -> f64 {
+pub(crate) fn default_pip_size(symbol: &str) -> f64 {
     // GROUP C remediation: empty symbol → NaN sentinel so downstream
     // pip math collapses and the fitness guard rejects the strategy.
     if symbol.trim().is_empty() {
@@ -337,7 +337,10 @@ pub const COMMISSION_SIDES_PER_ROUND_TRIP: f64 = 2.0;
 ///
 /// This has ZERO expected value in money. Charging the true cost creates no
 /// edge; it stops the search from selecting candidates on a subsidy.
-pub fn round_trip_commission_per_lot(quoted_per_lot: f64, quoted_is_per_side: bool) -> f64 {
+pub(crate) fn round_trip_commission_per_lot(
+    quoted_per_lot: f64,
+    quoted_is_per_side: bool,
+) -> f64 {
     if quoted_is_per_side {
         quoted_per_lot * COMMISSION_SIDES_PER_ROUND_TRIP
     } else {
@@ -345,7 +348,7 @@ pub fn round_trip_commission_per_lot(quoted_per_lot: f64, quoted_is_per_side: bo
     }
 }
 
-pub fn infer_market_cost_profile(
+pub(crate) fn infer_market_cost_profile(
     symbol: &str,
     account_currency: &str,
     price_hint: Option<f64>,
@@ -931,7 +934,7 @@ impl Default for EvaluationConfig {
 }
 
 impl EvaluationConfig {
-    pub fn for_symbol(
+    pub(crate) fn for_symbol(
         symbol: &str,
         account_currency: &str,
         price_hint: Option<f64>,

@@ -42,7 +42,7 @@
 //! break-even move and NO trailing stop anywhere, while both paths it claims to
 //! mirror move the stop once a trade reaches `+be_trigger_r × R`. It now reads
 //! the same `models.exit_policy` they do, through the one
-//! [`engine::EngineConfig::for_replay_from_settings`] adapter, and reports the
+//! [`engine::EngineConfig::try_for_replay_from_settings`] adapter, and reports the
 //! armed geometry (or its absence) in the fidelity list. With the shipped
 //! default — `trailing_enabled: false` — the numbers are unchanged.
 
@@ -51,11 +51,11 @@ pub mod contracts;
 pub mod data_replay;
 pub mod decision;
 pub mod engine;
-pub mod execution;
+mod execution;
 pub mod gene_signal;
 pub mod portfolio;
 pub mod position;
-pub mod replay;
+mod replay;
 pub mod risk;
 pub mod signal;
 
@@ -79,12 +79,8 @@ pub use gene_signal::{
     combine_gene_signals_with_confidence,
 };
 pub use decision::{DEFAULT_SYNTHETIC_STOP_FRAC, DecisionConfig, DecisionEngine};
-pub use engine::{
-    AutonomousEngine, DEFAULT_REPLAY_STARTING_BALANCE, EngineConfig, EngineStats,
-};
-pub use execution::{MockExecutionAdapter, ReplayCostModel};
+pub use engine::{EngineConfig, EngineStats};
 pub use portfolio::PortfolioRegistry;
 pub use position::{Position, PositionManager, TrailingPolicy};
-pub use replay::replay;
 pub use risk::{MaxOpenPositionsGate, PermissiveRiskGate};
 pub use signal::MomentumStubSignal;

@@ -710,6 +710,10 @@ impl RiskConfig {
     ///   Refused rather than repaired: a cost model that is two-thirds
     ///   configured charges numbers nobody chose.
     pub fn session_spread_pips(&self) -> Result<Option<SessionSpreadPips>, String> {
+        crate::current_broker_financial_truth_capability_v1()
+            .require(crate::BrokerFinancialOperationV1::HistoricalEvaluation)
+            .map_err(|error| error.to_string())?;
+
         let named = [
             (
                 "backtest_spread_pips_asian",
@@ -765,13 +769,17 @@ impl RiskConfig {
     ///
     /// Every evaluator subtracts this exactly once per closed trade, so this —
     /// not the per-side quote — is what belongs in `commission_per_trade`.
-    pub fn round_trip_commission_per_lot(&self) -> f64 {
+    pub fn round_trip_commission_per_lot(
+        &self,
+    ) -> Result<f64, crate::BrokerFinancialTruthErrorV1> {
+        crate::current_broker_financial_truth_capability_v1()
+            .require(crate::BrokerFinancialOperationV1::HistoricalEvaluation)?;
         let per_lot = self.commission_per_lot.max(0.0);
-        if self.commission_per_lot_is_per_side {
+        Ok(if self.commission_per_lot_is_per_side {
             per_lot * 2.0
         } else {
             per_lot
-        }
+        })
     }
 
     /// The cost band, ordered `(optimistic, pessimistic)`, sanitised.
@@ -2829,10 +2837,6 @@ pub struct AppRuntimeConfig {
     pub ctrader_stream_backoff_base_ms: u64,
     /// Chart-merge quote side (`mid`/`bid`/`ask`); empty → caller default.
     pub chart_merge_side: String,
-    /// PnL audit drift threshold (fraction of notional). Clamped [1e-5,0.05].
-    pub pnl_audit_drift_fraction: f64,
-    /// PnL circuit-breaker threshold (fraction). Clamped [1e-4,0.20].
-    pub pnl_circuit_breaker_fraction: f64,
 }
 
 impl Default for AppRuntimeConfig {
@@ -2846,8 +2850,6 @@ impl Default for AppRuntimeConfig {
             ctrader_stream_max_attempts: 3,
             ctrader_stream_backoff_base_ms: 200,
             chart_merge_side: String::new(),
-            pnl_audit_drift_fraction: 0.001,
-            pnl_circuit_breaker_fraction: 0.01,
         }
     }
 }

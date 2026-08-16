@@ -62,7 +62,9 @@ export default function PositionsTable({
               <td>{p.takeProfit ?? "—"}</td>
               <td className="muted">{ago(p.openTimestampMs)}</td>
               <td className={cls}><b>{p.pnlUsd >= 0 ? "+" : ""}{p.pnlUsd.toFixed(2)}</b></td>
-              <td className={cls}>{p.pnlPips >= 0 ? "+" : ""}{p.pnlPips.toFixed(1)}</td>
+              <td className={p.pnlPips == null ? "muted" : cls}>
+                {p.pnlPips == null ? "—" : `${p.pnlPips >= 0 ? "+" : ""}${p.pnlPips.toFixed(1)}`}
+              </td>
               {hasActions && (
                 <td style={{ whiteSpace: "nowrap" }}>
                   {onEdit && (

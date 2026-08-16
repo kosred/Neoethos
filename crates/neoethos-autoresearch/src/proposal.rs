@@ -352,7 +352,7 @@ impl Proposal {
     /// The full run spec: the config, the streaming plan, the cursor policy and
     /// the payoff ceiling that proves the proposal's own floor is reachable.
     pub fn resolve_spec(&self, base: &DiscoveryConfig) -> anyhow::Result<ProposedRunSpec> {
-        let pip_value_per_lot = base.evaluation_config(None).pip_value_per_lot;
+        let pip_value_per_lot = base.try_evaluation_config(None)?.pip_value_per_lot;
         let inputs = neoethos_search::run_identity::payoff_inputs_for_config(base, pip_value_per_lot);
         materialise(base, self, &inputs).map_err(|e| anyhow::anyhow!("{e}"))
     }

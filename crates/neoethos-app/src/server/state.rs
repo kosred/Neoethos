@@ -134,7 +134,9 @@ pub struct PositionPayload {
     /// the position row. `None` when cTrader didn't include it
     /// (unusual but possible mid-fill).
     pub open_timestamp_ms: Option<i64>,
-    pub pnl_pips: f64,
+    /// `None` until exact broker symbol/conversion provenance supports a pips
+    /// derivation. Never serialize unavailable pips as a financial zero.
+    pub pnl_pips: Option<f64>,
     pub pnl_usd: f64,
     /// Entry (open) price, stop-loss and take-profit as the broker reports
     /// them. Server-provided so the client renders the full row with ZERO

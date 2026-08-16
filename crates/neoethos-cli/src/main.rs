@@ -59,7 +59,10 @@ fn main() -> Result<()> {
             );
             eprintln!("──────────────────────────────────────────────────────────────");
             eprintln!("CONFIG NOT LOADED");
-            eprintln!("  tried: $CONFIG_FILE, then {}, then ./config.yaml", path.display());
+            eprintln!(
+                "  tried: $CONFIG_FILE, then {}, then ./config.yaml",
+                path.display()
+            );
             eprintln!("  {err:#}");
             eprintln!("  Built-in defaults are NOT your settings: they re-arm the export");
             eprintln!("  gates and risk limits you set deliberately, and they decide which");
@@ -491,8 +494,7 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         .collect();
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
+    let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
     println!(
         "Prepared {} base={} rows={} cols={}",
         symbol,
@@ -677,10 +679,10 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             neoethos_trader::replay_portfolio_from_dir(
                 &root,
                 &portfolio,
-                neoethos_trader::EngineConfig::for_replay_from_settings(
+                neoethos_trader::EngineConfig::try_for_replay_from_settings(
                     settings.as_ref(),
                     &default_symbol(settings.as_ref()),
-                ),
+                )?,
             )?
         } else {
             let models_root =
@@ -724,10 +726,10 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
                 &root,
                 &portfolio,
                 &models_root,
-                neoethos_trader::EngineConfig::for_replay_from_settings(
+                neoethos_trader::EngineConfig::try_for_replay_from_settings(
                     settings.as_ref(),
                     &default_symbol(settings.as_ref()),
-                ),
+                )?,
                 blend,
             )?
         }
@@ -746,7 +748,10 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
             &root,
             &symbol,
             &base,
-            neoethos_trader::EngineConfig::for_replay_from_settings(settings.as_ref(), &symbol),
+            neoethos_trader::EngineConfig::try_for_replay_from_settings(
+                settings.as_ref(),
+                &symbol,
+            )?,
         )?
     };
     println!("trader-replay (offline dry-run, zero broker calls):");
@@ -779,7 +784,8 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
     let root = parse_root(args, settings.as_ref());
     let config = settings
         .as_ref()
-        .map(neoethos_search::DiscoveryConfig::from_settings)
+        .map(neoethos_search::DiscoveryConfig::try_from_settings)
+        .transpose()?
         .unwrap_or_default();
     let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
         anyhow::anyhow!("forward-test requires --portfolio <live_portfolio.json>")
@@ -913,10 +919,10 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
             &root,
             &portfolio,
             &models_root,
-            neoethos_trader::EngineConfig::for_replay_from_settings(
+            neoethos_trader::EngineConfig::try_for_replay_from_settings(
                 settings.as_ref(),
                 &default_symbol(settings.as_ref()),
-            ),
+            )?,
             neoethos_trader::BlendConfig::from_config_values(
                 mode,
                 Some(gate_floor),
@@ -1085,7 +1091,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let defaults = settings
         .as_ref()
-        .map(neoethos_search::DiscoveryConfig::from_settings)
+        .map(neoethos_search::DiscoveryConfig::try_from_settings)
+        .transpose()?
         .unwrap_or_default();
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
@@ -1115,8 +1122,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
         &base,
         neoethos_data::MANDATORY_TFS,
     )?;
-    let features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
+    let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
     let base_ohlcv = dataset
         .frames
         .get(&base)
@@ -1161,7 +1167,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         let settings = resolve_cli_settings(args)?;
         let defaults = settings
             .as_ref()
-            .map(neoethos_search::DiscoveryConfig::from_settings)
+            .map(neoethos_search::DiscoveryConfig::try_from_settings)
+            .transpose()?
             .unwrap_or_default();
         let root = parse_root(args, settings.as_ref());
         // Folder-browse support (2026-05-14): when `--data-path` or
@@ -1605,7 +1612,8 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
 
         let mut config = settings
             .as_ref()
-            .map(neoethos_search::DiscoveryConfig::from_settings)
+            .map(neoethos_search::DiscoveryConfig::try_from_settings)
+            .transpose()?
             .unwrap_or_default();
         // Explicit overrides win over the config-derived values (same
         // precedence as env > config elsewhere). These let the TUI Discover
@@ -1751,7 +1759,10 @@ fn cmd_config_normalize(args: &[String]) -> Result<()> {
     let write = has_flag(args, "--write");
     let settings = resolve_cli_settings(args)?.unwrap_or_else(neoethos_core::Settings::default);
     let provenance = settings.provenance().describe();
-    let path = settings.provenance().path().map(std::path::Path::to_path_buf);
+    let path = settings
+        .provenance()
+        .path()
+        .map(std::path::Path::to_path_buf);
     let before = settings.overrides_against_defaults()?;
 
     println!("Config store: {provenance}");
@@ -1822,7 +1833,10 @@ fn cmd_config_normalize(args: &[String]) -> Result<()> {
     // any mismatch the operator's original file is put back before we return.
     let restore = |why: String| -> anyhow::Error {
         let _ = std::fs::copy(&backup, &path);
-        anyhow::anyhow!("{why}\nThe original store has been restored from {}.", backup.display())
+        anyhow::anyhow!(
+            "{why}\nThe original store has been restored from {}.",
+            backup.display()
+        )
     };
     let reloaded = neoethos_core::Settings::from_yaml(&path)
         .map_err(|e| restore(format!("the normalized store failed to load: {e}")))?;
@@ -1851,8 +1865,13 @@ fn cmd_config_normalize(args: &[String]) -> Result<()> {
     let lines = std::fs::read_to_string(&path)
         .map(|t| t.lines().count())
         .unwrap_or(0);
-    println!("Written     : {} ({lines} lines, was a full snapshot)", path.display());
-    println!("Verified    : reloads to identical settings; every other key now follows the default.");
+    println!(
+        "Written     : {} ({lines} lines, was a full snapshot)",
+        path.display()
+    );
+    println!(
+        "Verified    : reloads to identical settings; every other key now follows the default."
+    );
     Ok(())
 }
 
@@ -2732,10 +2751,7 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
 
     println!("{}", verdict.render());
     match neoethos_autoresearch::SessionStore::root() {
-        Ok(root) => println!(
-            "artifacts: {}",
-            root.join(&verdict.session_id).display()
-        ),
+        Ok(root) => println!("artifacts: {}", root.join(&verdict.session_id).display()),
         Err(err) => println!("artifacts: <store root unresolved: {err:#}>"),
     }
     Ok(())
@@ -3074,9 +3090,8 @@ fn resolve_cli_settings(args: &[String]) -> Result<Option<neoethos_core::Setting
     neoethos_core::Settings::load().map(Some)
 }
 
-
 // `replay_engine_config` MOVED 2026-08-10 (#229) to
-// `neoethos_trader::EngineConfig::for_replay_from_settings`, and DELETED here.
+// `neoethos_trader::EngineConfig::try_for_replay_from_settings`, and DELETED here.
 //
 // It was private to this binary, so `neoethos-app`'s `POST /autonomous/replay`
 // could not call it and passed `EngineConfig::default()` instead: zero spread,

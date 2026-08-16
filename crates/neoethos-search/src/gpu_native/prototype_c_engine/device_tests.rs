@@ -10,7 +10,7 @@ use crate::gpu_native::population_fixture::TinyPopulationFixture;
 use crate::gpu_native::prototype_population::{
     PropFirmRequirement, PrototypeBcRequirements, PrototypePopulationWorkload,
 };
-use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle;
+use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle_test_oracle as evaluate_population_oracle;
 
 struct DeviceRun {
     summary: crate::gpu_native::engine::HostSurvivorSummary,

@@ -31,7 +31,7 @@
 //! tries again — no point spamming the cTrader API with calls that
 //! will all 401.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use crate::app_services::broker_api::fetch_broker_symbols_blocking;
@@ -45,9 +45,7 @@ use crate::app_services::ctrader_live_auth::{
     CTraderEnvironment, CTraderLiveAuthBackend, CTraderTokenRefreshRequest,
     ProductionCTraderLiveAuthBackend,
 };
-use crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport;
-use crate::app_services::live_spots::get_tick;
-use crate::app_services::pnl::{BrokerPositionPnL, fetch_unrealized_pnl_for_all_positions};
+use crate::app_services::ctrader_messages::CTraderPositionUnrealizedPnL;
 use crate::app_services::secure_store::production_ctrader_token_store;
 
 use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
@@ -64,58 +62,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 #[allow(dead_code)] // referenced inside the cTrader-gated run() loop.
 const STALE_THRESHOLD: usize = 3;
 
-/// Map cTrader's numeric `depositAssetId` to a 3-letter ISO code
-/// for the dashboard currency badge. The full source of truth is
-/// `ProtoOAAssetListReq`, but pulling that registry on every refresh
-/// is wasteful when 95% of operators use one of the 8 majors below.
-///
-/// Returns `"EUR"` as the conservative fallback for unknown ids —
-/// most demo / FTMO accounts ARE EUR, and rendering an unfamiliar
-/// numeric id in the UI is strictly worse than rendering a slightly-
-/// wrong-but-readable label. When this returns the fallback we log
-/// the unknown id so #144's follow-up can grow the table.
-pub(crate) fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
-    match asset_id {
-        // Sourced from public Spotware OpenAPI samples + the cTrader
-        // sandbox catalog. Conservative subset — additions here are
-        // safe (purely widens the supported set).
-        Some(4) => "GBP",
-        Some(5) => "CHF",
-        Some(6) => "EUR",
-        Some(8) => "USD",
-        Some(14) => "JPY",
-        Some(23) => "AUD",
-        Some(25) => "NZD",
-        Some(27) => "CAD",
-        Some(36) => "PLN",
-        Some(id) => {
-            // F-285 fix (2026-05-25): the previous fallback returned
-            // "EUR" silently, mislabelling USD/CHF/GBP accounts at the
-            // UI. We now return an explicit "UNKNOWN" sentinel and
-            // emit a structured warn naming the unknown asset_id.
-            // The UI renders "UNKNOWN" as a banner-tagged warning
-            // (instead of showing wrong currency) and the operator
-            // sees the structured log line with the asset_id to
-            // add to this lookup.
-            tracing::warn!(
-                target: "neoethos_app::bridge",
-                asset_id = id,
-                "unknown cTrader depositAssetId; emitting UNKNOWN sentinel \
-                 (was: silently EUR). Add to asset_id_to_currency() to fix."
-            );
-            "UNKNOWN"
-        }
-        None => {
-            // F-285: same fix for the missing-asset_id path.
-            tracing::warn!(
-                target: "neoethos_app::bridge",
-                "cTrader account has no depositAssetId; emitting UNKNOWN sentinel"
-            );
-            "UNKNOWN"
-        }
-    }
-}
-
 /// Auto-sync `system.account_currency` in config.yaml to the broker's real
 /// deposit currency (known 3-letter codes only — never the UNKNOWN sentinel).
 ///
@@ -131,7 +77,9 @@ fn sync_account_currency_to_config(broker_ccy: &str) {
         return; // UNKNOWN sentinel or malformed — never write a guess to config
     }
     {
-        let Ok(mut last) = LAST_SYNCED.lock() else { return };
+        let Ok(mut last) = LAST_SYNCED.lock() else {
+            return;
+        };
         if last.as_deref() == Some(ccy.as_str()) {
             return; // already synced this currency in this process
         }
@@ -223,8 +171,7 @@ async fn run(state: AppApiState) {
     // mislabel positions until the operator restarted. Now the
     // bridge proactively refreshes the catalog every 24 hours so
     // symbol-ID drift is caught within a day automatically.
-    const SYMBOL_REFRESH_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(86_400);
+    const SYMBOL_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(86_400);
     let mut last_symbol_refresh: Option<std::time::Instant> = None;
 
     loop {
@@ -468,6 +415,10 @@ fn refresh_ctrader_token_if_needed(
 /// opened), this triggers a one-time lazy fetch so the dashboard
 /// shows correct names from the very first refresh.
 async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayload> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl)
+        .map_err(anyhow::Error::new)?;
+
     // Step 1: resolve credentials. `load_broker_settings` and the
     // secure store are both sync filesystem / keyring ops; we run
     // them on a blocking task so the tokio reactor stays free.
@@ -552,22 +503,34 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         );
     });
 
-    // Step 3: convert to wire payload. Equity is balance + unrealized
-    // PnL — the prop-firm-correct number per the comment in
-    // `CTraderTraderSnapshot::unrealized_pnl`.
+    // Step 3: convert the broker account snapshot to the wire payload.
+    // Equity is calculated only after the exact account-scoped
+    // ProtoOAGetPositionUnrealizedPnL response is validated below.
     let trader = &snapshot.trader;
     let balance = trader.balance;
-    let used_margin: f64 = snapshot
-        .reconcile
-        .positions
-        .iter()
-        .filter_map(|p| p.used_margin)
-        .sum();
-    // `equity` + `free_margin` are computed AFTER the per-position PnL fetch
-    // below (#3 fix): the broker's `trader.unrealized_pnl` is frequently 0 /
-    // stale on demo, leaving equity == balance and the dashboard's unrealized
-    // P/L at 0 even with losing open trades. We instead SUM the same
-    // broker-authoritative per-position PnL the positions table shows.
+    let used_margin = snapshot.reconcile.positions.iter().try_fold(
+        0.0_f64,
+        |running_total, position| -> anyhow::Result<f64> {
+            let margin = position.used_margin.ok_or_else(|| {
+                anyhow::Error::new(
+                    neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                        neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+                    ),
+                )
+            })?;
+            let total = running_total + margin;
+            if !total.is_finite() {
+                return Err(anyhow::Error::new(
+                    neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                        neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+                    ),
+                ));
+            }
+            Ok(total)
+        },
+    )?;
+    // `equity` and `free_margin` are computed only from that validated
+    // position set. A missing response, row, or conversion never becomes zero.
 
     // Resolve symbol_id → ticker name from the cached catalog. If the
     // catalog is empty *and* we actually have positions to label, do a
@@ -604,130 +567,24 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         }
     }
 
-    // #134 — pull broker-authoritative unrealized PnL per position
-    // and pass into `position_to_payload`. Broker does the FX
-    // conversion server-side so we don't have to chase per-symbol
-    // pip-value-in-account-currency conversion. Failure is
-    // non-fatal: positions still flow through with pnl_usd = 0.0
-    // (the pre-#134 behaviour) and a `warn!` documents the gap so
-    // the operator sees in the log that the dashboard's PnL
-    // column will be quiet until the next refresh.
-    let pnl_by_position: HashMap<i64, BrokerPositionPnL> = if has_positions {
-        let open_ids: Vec<i64> = snapshot
-            .reconcile
-            .positions
-            .iter()
-            .map(|p| p.position_id)
-            .collect();
-        let client_id_clone = ctrader.client_id.clone();
-        let client_secret_clone = ctrader.client_secret.clone();
-        let access_token_for_pnl = match production_ctrader_token_store()
-            .load_token_bundle_with_legacy_fallback()
-            .ok()
-            .flatten()
-        {
-            Some(tb) => tb.access_token,
-            None => {
-                // #149 follow-up: this branch early-returns with pnl_usd=0.0
-                // for every open position. That used to be a `debug!` which
-                // meant the user saw quiet zeroes in the dashboard with no
-                // signal anywhere unless RUST_LOG=debug. Promoted to `warn!`
-                // and called out the user-visible effect so an operator can
-                // tell from the log whether the column is actually $0.00 or
-                // just the keyring lookup blanked mid-refresh.
-                tracing::warn!(
-                    target: "neoethos_app::server::bridge",
-                    "skipped authoritative PnL fetch — token bundle vanished \
-                     mid-refresh; dashboard will show pnl_usd=0.0 for all \
-                     positions until the next bridge tick recovers it"
-                );
-                let currency =
-                    asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
-                let positions = snapshot
-                    .reconcile
-                    .positions
-                    .iter()
-                    .map(|p| position_to_payload(p, None, &HashMap::new(), &currency))
-                    .collect();
-                // No per-position PnL in this branch — fall back to the broker
-                // trader-snapshot unrealized field for equity/free_margin.
-                let equity = balance + snapshot.trader.unrealized_pnl;
-                return Ok(AccountSnapshotPayload {
-                    balance,
-                    equity,
-                    free_margin: (equity - used_margin).max(0.0),
-                    used_margin: if used_margin.is_sign_negative() && used_margin == 0.0 {
-                        0.0
-                    } else {
-                        used_margin
-                    },
-                    currency,
-                    fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
-                    positions,
-                });
-            }
-        };
-        let endpoint_host = environment.endpoint_host();
-        // Both `snapshot.trader.account_id` and `snapshot.reconcile.account_id`
-        // exist; they're the same value the broker echoes back on
-        // each call. Prefer the trader-side because the
-        // ProtoOATraderRes carries it as the canonical i64
-        // discriminator; reconcile sometimes elides it on empty
-        // result sets.
-        let account_id_i64 = snapshot.trader.account_id;
-        let pnl_result = tokio::task::spawn_blocking(move || {
-            let transport = ProductionCTraderOpenApiTransport::new(endpoint_host);
-            fetch_unrealized_pnl_for_all_positions(
-                &transport,
-                &client_id_clone,
-                &client_secret_clone,
-                &access_token_for_pnl,
-                account_id_i64,
-                &open_ids,
-            )
-        })
-        .await;
-        match pnl_result {
-            Ok(Ok(auth)) => auth.by_position,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    target: "neoethos_app::server::bridge",
-                    error = %err,
-                    "authoritative PnL fetch failed — positions will report \
-                     pnl_usd=0.0 this refresh cycle"
-                );
-                HashMap::new()
-            }
-            Err(join_err) => {
-                tracing::warn!(
-                    target: "neoethos_app::server::bridge",
-                    error = %join_err,
-                    "authoritative PnL blocking task panicked"
-                );
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
-
-    // #3 fix: account equity = balance + SUM of broker-authoritative
-    // per-position unrealized PnL (matches the positions table total). Falls
-    // back to the trader-snapshot field only when the per-position fetch was
-    // empty (e.g. it failed this cycle), never leaving equity silently == balance.
-    let account_unrealized: f64 = if pnl_by_position.is_empty() {
-        trader.unrealized_pnl
-    } else {
-        pnl_by_position.values().map(|p| p.net_unrealized_pnl).sum()
-    };
+    // The account-runtime request already fetched and reconciled one exact
+    // ProtoOAGetPositionUnrealizedPnLRes against this same open-position set.
+    // Reuse those rows so the bridge cannot mix two different broker instants.
+    let pnl_by_position = &snapshot.unrealized_pnl_by_position;
+    let account_unrealized = snapshot.unrealized_pnl;
     let equity = balance + account_unrealized;
-    let free_margin = (equity - used_margin).max(0.0);
+    let free_margin = equity - used_margin;
+    if !equity.is_finite() || !free_margin.is_finite() {
+        return Err(anyhow::Error::new(
+            neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+            ),
+        ));
+    }
 
-    // Compute the deposit currency once so every position payload
-    // gets the same account_currency string (needed by
-    // `compute_pnl_pips` for the A.3 fix) and the snapshot's
-    // top-level `currency` field stays in sync.
-    let account_currency = asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
+    // Compute the deposit currency once so the snapshot labels the broker's
+    // authoritative monetary PnL in the correct account currency.
+    let account_currency = snapshot.deposit_asset_name.clone();
 
     // Auto-sync `system.account_currency` in config.yaml to the broker's REAL
     // deposit currency. Live sizing already reads the broker value, but the
@@ -739,31 +596,14 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
     for p in &snapshot.reconcile.positions {
         let resolved_name = state.resolve_symbol_name(p.symbol_id).await;
-        positions.push(position_to_payload(
-            p,
-            resolved_name,
-            &pnl_by_position,
-            &account_currency,
-        ));
+        positions.push(position_to_payload(p, resolved_name, pnl_by_position)?);
     }
 
     Ok(AccountSnapshotPayload {
         balance,
         equity,
         free_margin,
-        used_margin: if used_margin.is_sign_negative() && used_margin == 0.0 {
-            // serde renders f64 `-0.0` literally as `-0.0`; the Flutter
-            // dashboard surfaced that as a janky "-$0.00 used margin"
-            // pill. Normalize the sign for any sum-derived zero so the
-            // wire shape stays clean.
-            0.0
-        } else {
-            used_margin
-        },
-        // #144: 8-currency lookup table from the trader payload's
-        // depositAssetId. EUR fallback for unknown ids, logged so
-        // we can grow the table. Full ProtoOAAssetListReq still
-        // a follow-up for the very-long-tail currencies.
+        used_margin,
         currency: account_currency,
         // Wall-clock at the moment we finished assembling this
         // snapshot. The Flutter Dashboard converts to local time
@@ -778,9 +618,8 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
 fn position_to_payload(
     p: &CTraderPositionSnapshot,
     resolved_name: Option<String>,
-    pnl_by_position: &HashMap<i64, BrokerPositionPnL>,
-    account_currency: &str,
-) -> PositionPayload {
+    pnl_by_position: &BTreeMap<i64, CTraderPositionUnrealizedPnL>,
+) -> anyhow::Result<PositionPayload> {
     // **2026-05-26 fix v2 (Κωνσταντίνος)**: corrected unit conversion
     // for the Close-Position endpoint. Empirical chain from live trace
     // against cTrader Demo account 47367144, position 262647379:
@@ -811,110 +650,18 @@ fn position_to_payload(
     //   `snapshot.volume (100_000) * 100`.
     let volume_units = (p.volume * 100.0).round() as i64;
 
-    // #134 — broker-authoritative net unrealized PnL in the account
-    // currency. The pnl module already handles money-digit scaling +
-    // FX conversion to the deposit currency, so we just plug it
-    // through. Missing rows (broker omitted the position, or the
-    // fetch failed earlier) fall back to 0.0 — pre-#134 behaviour.
+    // Broker-authoritative net unrealized PnL in the deposit currency. Missing
+    // rows are an integrity failure, not zero profit.
     let pnl_usd = pnl_by_position
         .get(&p.position_id)
         .map(|b| b.net_unrealized_pnl)
-        .unwrap_or(0.0);
+        .ok_or_else(|| {
+            anyhow::Error::new(neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+            ))
+        })?;
 
-    // Derive pnl_pips from the account-currency PnL via the symbol
-    // metadata table. **A.3 fix**: route through `SymbolMetadata::
-    // account_pnl_to_pips` which folds in the quote→account FX
-    // step explicitly. For quote == account_currency this is
-    // exact. For base == account we feed the live mid (below)
-    // so the helper can do the per-tick FX. For cross pairs
-    // (account is neither base nor quote) we don't have an FX
-    // rate yet — the helper returns NaN → 0.0 pips here, but the
-    // #142 live-tick override below recomputes pips directly from
-    // price_diff / pip_size, which is currency-free and works in
-    // every account configuration.
-    //
-    // We pull the live tick **once** here so the helper and the
-    // #142 override share the same observation; `get_tick` is a
-    // cheap mutex read but doing it twice would be a needless
-    // race window if a fresh tick arrived between the calls.
-    let tick = get_tick(p.symbol_id);
-    let live_mid = tick.as_ref().and_then(|t| t.mid_price());
-
-    let mut pnl_pips = compute_pnl_pips(
-        resolved_name.as_deref(),
-        pnl_usd,
-        p.volume,
-        account_currency,
-        // No FX registry wired yet — Phase B follow-up will
-        // populate this from a `BridgeBrokerFxCache` that
-        // subscribes to the symbols needed to bridge quote↔
-        // deposit currency. Until then, cross-currency accounts
-        // get 0.0 from this code path and rely on the
-        // currency-free live-tick override (#142, below).
-        None,
-        live_mid,
-    );
-
-    // #142: if the live_spots streamer has a fresh tick for this
-    // position's symbol AND we have an entry price, recompute
-    // pnl_pips directly from the live mid-price. The broker-derived
-    // pnl_pips above is up to 5 s stale (one bridge refresh
-    // interval); the live tick is < 2 s old. We OVERRIDE pnl_pips
-    // only — pnl_usd is left as the broker-authoritative number
-    // since recomputing it in account currency requires per-symbol
-    // FX conversion data we don't track yet. So the UI sees pips
-    // update at sub-2 s cadence while the dollar number refreshes
-    // on the 5 s bridge tick. Good enough for the live-overlay
-    // case; full live USD PnL is a follow-up.
-    if let Some(entry_price) = p.price {
-        if let Some(tick) = tick.as_ref() {
-            // Use the tick's freshness as the gate — > 5 s old and
-            // we'd just be replacing one stale number with another.
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let freshness_ms = now_ms - tick.received_at_unix_ms;
-            if freshness_ms <= 5_000 {
-                if let Some(mid) = live_mid {
-                    let price_diff = if p.trade_side.eq_ignore_ascii_case("Buy") {
-                        mid - entry_price
-                    } else {
-                        entry_price - mid
-                    };
-                    // GROUP D remediation (operator directive 2026-05-25):
-                    // pip_size via canonical symbol_metadata, falling back
-                    // to the legacy JPY heuristic only when metadata is
-                    // genuinely absent (preserves backwards-compat for
-                    // exotics not yet in the registry).
-                    let pip_size = resolved_name
-                        .as_deref()
-                        .and_then(neoethos_core::symbol_metadata::resolve)
-                        .map(|meta| meta.pip_size)
-                        .unwrap_or_else(|| {
-                            if resolved_name
-                                .as_deref()
-                                .map(|n| n.to_ascii_uppercase().ends_with("JPY"))
-                                .unwrap_or(false)
-                            {
-                                0.01
-                            } else {
-                                0.0001
-                            }
-                        });
-                    pnl_pips = price_diff / pip_size;
-                }
-            }
-        }
-    }
-
-    // Lots = base units / contract_size — SAME metadata the pips calc uses, so
-    // the UI shows cTrader's lots (1.17) not raw units (117000). Computed before
-    // the literal because `symbol:` moves `resolved_name`.
-    let volume_lots = resolved_name
-        .as_deref()
-        .and_then(neoethos_core::symbol_metadata::resolve)
-        .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
-        .map(|m| p.volume / m.contract_size);
-
-    PositionPayload {
+    Ok(PositionPayload {
         position_id: p.position_id,
         volume_units,
         // Resolved from the cached cTrader symbol catalog. Falls back
@@ -932,72 +679,19 @@ fn position_to_payload(
         // and the broker hadn't stamped it yet — UI shows "—" in
         // that case rather than guessing.
         open_timestamp_ms: p.open_timestamp_ms,
-        pnl_pips,
+        // cTrader returns authoritative PnL in deposit currency, not pips.
+        // Keep this explicitly unavailable until exact ProtoOASymbol
+        // pipPosition plus conversion-leg provenance is connected.
+        pnl_pips: None,
         pnl_usd,
         entry_price: p.price,
         stop_loss: p.stop_loss,
         take_profit: p.take_profit,
-        volume_lots,
-    }
-}
-
-/// Derive PnL in pips from broker-side net unrealized PnL (already
-/// in account currency, broker did the FX conversion) and the
-/// position's base-currency volume. Returns 0.0 when:
-///   - `pnl_account_ccy` is 0.0 (nothing to convert),
-///   - `volume_base_units` is 0.0 (defensive — shouldn't happen but
-///     a div-by-zero is unhelpful),
-///   - the symbol isn't in the metadata table (use 0.0 as a
-///     visible "unknown" rather than NaN which breaks JSON),
-///   - the symbol's `contract_size` is missing (defensive),
-///   - the account currency is **cross** to both base and quote AND
-///     no `quote_to_account_rate` is supplied — we fail loud (0.0)
-///     rather than guess; the operator sees the broken column and
-///     the live-tick override (#142) still produces correct pips
-///     from price_diff/pip_size without any FX dependency.
-///
-/// **A.3 fix (2026-05-27)**: prior implementation divided by
-/// `pip_value_quote * volume_lots`, treating pip-value-in-quote as
-/// if it were pip-value-in-account. For a GBP account trading
-/// EURUSD that under-reported pips by the USD/GBP factor (~25 %).
-/// We now route through `SymbolMetadata::account_pnl_to_pips`,
-/// which folds in the FX step explicitly.
-fn compute_pnl_pips(
-    resolved_name: Option<&str>,
-    pnl_account_ccy: f64,
-    volume_base_units: f64,
-    account_currency: &str,
-    quote_to_account_rate: Option<f64>,
-    live_price: Option<f64>,
-) -> f64 {
-    if !pnl_account_ccy.is_finite() || pnl_account_ccy == 0.0 {
-        return 0.0;
-    }
-    if !volume_base_units.is_finite() || volume_base_units <= 0.0 {
-        return 0.0;
-    }
-    let Some(name) = resolved_name else {
-        return 0.0;
-    };
-    let Some(meta) = neoethos_core::symbol_metadata::resolve(name) else {
-        return 0.0;
-    };
-    if !meta.contract_size.is_finite() || meta.contract_size <= 0.0 {
-        return 0.0;
-    }
-    // CTraderPositionSnapshot.volume is in base-currency UNITS
-    // (see the `volume_units` comment block above for the wire
-    // derivation). Convert to lots before handing off to the
-    // unit-conversion helper.
-    let lots = volume_base_units / meta.contract_size;
-    meta.account_pnl_to_pips(
-        pnl_account_ccy,
-        lots,
-        account_currency,
-        quote_to_account_rate,
-        live_price,
-    )
-    .unwrap_or(0.0)
+        // Exact lots require this position's broker `ProtoOASymbol.lotSize`.
+        // The account snapshot does not carry that joined row yet, so the UI
+        // receives an explicit absence instead of local contract-size math.
+        volume_lots: None,
+    })
 }
 
 #[cfg(test)]
@@ -1035,134 +729,33 @@ mod tests {
     #[test]
     fn position_to_payload_uses_broker_pnl_when_present() {
         let p = sample_position();
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert(
             42,
-            BrokerPositionPnL {
+            CTraderPositionUnrealizedPnL {
                 position_id: 42,
                 gross_unrealized_pnl: 12.5,
                 net_unrealized_pnl: 11.3,
-                money_digits: 2,
             },
         );
-        // EURUSD on a USD account: account == quote, so
-        // pip_value_in_account = pip_value_quote = $10/lot. Position
-        // base-units = 10,000 → lots = 0.1 → $1/pip.
-        // PnL 11.3 USD → 11.3 pips.
-        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &map, "USD");
+        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &map)
+            .expect("a complete broker PnL row is renderable");
         assert!((payload.pnl_usd - 11.3).abs() < 1e-9);
-        assert!((payload.pnl_pips - 11.3).abs() < 0.01);
+        assert_eq!(
+            payload.pnl_pips, None,
+            "pips stay unavailable until exact ProtoOASymbol/conversion provenance is wired"
+        );
     }
 
     #[test]
-    fn position_to_payload_zero_when_no_pnl_entry() {
+    fn position_to_payload_rejects_missing_broker_pnl_instead_of_zero_filling() {
         let p = sample_position();
-        let payload =
-            position_to_payload(&p, Some("EURUSD".to_string()), &HashMap::new(), "USD");
-        assert_eq!(payload.pnl_usd, 0.0);
-        assert_eq!(payload.pnl_pips, 0.0);
-    }
-
-    #[test]
-    fn position_to_payload_zero_pips_when_symbol_not_in_metadata() {
-        let p = sample_position();
-        let mut map = HashMap::new();
-        map.insert(
-            42,
-            BrokerPositionPnL {
-                position_id: 42,
-                gross_unrealized_pnl: 5.0,
-                net_unrealized_pnl: 5.0,
-                money_digits: 2,
-            },
-        );
-        // Resolved name is the placeholder — symbol_metadata::resolve
-        // returns None → pnl_pips falls back to 0.0 (visible
-        // "unknown", not NaN).
-        let payload = position_to_payload(&p, Some("sym#999".to_string()), &map, "USD");
-        assert_eq!(payload.pnl_usd, 5.0);
-        assert_eq!(payload.pnl_pips, 0.0);
-    }
-
-    /// **A.3 regression guard**: GBP account holding 0.1 lot EURUSD.
-    /// The broker tells us pnl_usd = £8 (it already did USD→GBP
-    /// server-side). Without an FX registry to convert pip values
-    /// from USD→GBP, `compute_pnl_pips` must return 0.0 (fail loud)
-    /// rather than the legacy ~25%-off approximation. The live-tick
-    /// override is the real source of pips for cross-currency
-    /// accounts until the FX cache lands in Phase B.
-    #[test]
-    fn compute_pnl_pips_cross_currency_returns_zero_without_fx_rate() {
-        let pips = compute_pnl_pips(
-            Some("EURUSD"),
-            8.0,         // £8 — broker-converted
-            10_000.0,    // base units = 0.1 lot
-            "GBP",       // account ccy is neither base (EUR) nor quote (USD)
-            None,        // no FX rate → helper returns None → 0.0 here
-            Some(1.0840),
-        );
-        assert_eq!(pips, 0.0, "must fail loud (0.0) when FX rate is unknown");
-    }
-
-    /// **A.3 happy path**: account == quote (USD account, EURUSD).
-    /// 0.1 lot, 20 USD PnL → exactly 20 pips.
-    #[test]
-    fn compute_pnl_pips_account_equals_quote_is_exact() {
-        let pips = compute_pnl_pips(
-            Some("EURUSD"),
-            20.0,
-            10_000.0,
-            "USD",
-            None,
-            None,
-        );
+        let error = position_to_payload(&p, Some("EURUSD".to_string()), &BTreeMap::new());
+        let error = error.expect_err("missing broker PnL must disable the snapshot");
         assert!(
-            (pips - 20.0).abs() < 1e-9,
-            "expected 20.0 pips, got {pips}"
-        );
-    }
-
-    /// **A.3 happy path**: account == base (EUR account, EURUSD).
-    /// 0.1 lot, broker tells us €9.23 PnL at a live mid of 1.0840:
-    /// pip_value_in_account = $10/1.0840 ≈ €9.225 per lot, so per
-    /// 0.1 lot that's ≈ €0.9225/pip → 9.23 / 0.9225 ≈ 10 pips.
-    #[test]
-    fn compute_pnl_pips_account_equals_base_uses_live_price() {
-        let pips = compute_pnl_pips(
-            Some("EURUSD"),
-            9.225,
-            10_000.0,
-            "EUR",
-            None,
-            Some(1.0840),
-        );
-        assert!(
-            (pips - 10.0).abs() < 0.05,
-            "expected ~10.0 pips, got {pips}"
-        );
-    }
-
-    #[test]
-    fn compute_pnl_pips_handles_zero_volume() {
-        assert_eq!(
-            compute_pnl_pips(Some("EURUSD"), 10.0, 0.0, "USD", None, None),
-            0.0
-        );
-        assert_eq!(
-            compute_pnl_pips(Some("EURUSD"), 10.0, f64::NAN, "USD", None, None),
-            0.0
-        );
-    }
-
-    #[test]
-    fn compute_pnl_pips_handles_nonfinite_pnl() {
-        assert_eq!(
-            compute_pnl_pips(Some("EURUSD"), f64::NAN, 10_000.0, "USD", None, None),
-            0.0
-        );
-        assert_eq!(
-            compute_pnl_pips(Some("EURUSD"), f64::INFINITY, 10_000.0, "USD", None, None),
-            0.0
+            error
+                .to_string()
+                .contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1)
         );
     }
 }

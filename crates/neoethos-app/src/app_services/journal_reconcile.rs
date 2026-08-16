@@ -80,6 +80,9 @@ fn closed_trade_from_deal(
     opened_at: &HashMap<i64, i64>,
 ) -> Option<ClosedTrade> {
     let net = d.net_profit?;
+    let gross_profit = d.gross_profit?;
+    let commission = d.fee?;
+    let swap = d.swap?;
     // Resolve the broker symbol NAME from the catalog the bridge threads in.
     // While the catalog is still EMPTY (cold start race), DEFER: recording is
     // idempotent on position_id and the deal stays in the broker's recent-deals
@@ -101,7 +104,7 @@ fn closed_trade_from_deal(
     let lots = neoethos_core::symbol_metadata::resolve(&symbol)
         .filter(|m| m.contract_size.is_finite() && m.contract_size > 0.0)
         .map(|m| d.filled_volume / m.contract_size)
-        .unwrap_or(d.filled_volume);
+        .filter(|lots| lots.is_finite() && *lots > 0.0)?;
     Some(ClosedTrade {
         schema_version: journal_store::new_schema_version(),
         recorded_at_unix_ms: journal_store::now_unix_ms(),
@@ -126,9 +129,9 @@ fn closed_trade_from_deal(
         entry_price: d.entry_price,
         exit_ts_ms: Some(d.execution_timestamp_ms),
         exit_price: d.execution_price,
-        gross_profit: d.gross_profit.unwrap_or(0.0),
-        commission: d.fee.unwrap_or(0.0),
-        swap: d.swap.unwrap_or(0.0),
+        gross_profit,
+        commission,
+        swap,
         net_profit: net,
         balance_after: None, // balance-after wiring is a follow-up polish
     })
@@ -140,6 +143,16 @@ pub fn reconcile_best_effort(
     runtime: &CTraderAccountRuntimeSnapshot,
     names: &HashMap<i64, String>,
 ) {
+    if let Err(error) = neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl)
+    {
+        tracing::error!(
+            target: "neoethos_app::journal_reconcile",
+            error = %error,
+            "live journal reconciliation disabled before local state access"
+        );
+        return;
+    }
     let Some(dir) = data_dir() else {
         return;
     };
@@ -157,11 +170,22 @@ pub fn reconcile_best_effort(
     let mut already_present = 0usize;
     let mut write_failed = 0usize;
     let mut opening_fills = 0usize;
+    let mut incomplete_broker_financials = 0usize;
     let mut deferred_cold_catalog = 0usize;
     for deal in &runtime.recent_deals {
         if deal.net_profit.is_none() {
             // An opening fill is not a closed trade; nothing is lost.
             opening_fills += 1;
+            continue;
+        }
+        if deal.gross_profit.is_none() || deal.fee.is_none() || deal.swap.is_none() {
+            incomplete_broker_financials += 1;
+            tracing::error!(
+                target: "neoethos_app::journal_reconcile",
+                deal_id = deal.deal_id,
+                position_id = deal.position_id,
+                "broker closing deal omitted a required financial component; refusing journal row"
+            );
             continue;
         }
         let Some(trade) =
@@ -190,13 +214,14 @@ pub fn reconcile_best_effort(
             }
         }
     }
-    if deferred_cold_catalog > 0 || write_failed > 0 {
+    if incomplete_broker_financials > 0 || deferred_cold_catalog > 0 || write_failed > 0 {
         tracing::warn!(
             target: "neoethos_app::journal_reconcile",
             deals_seen = runtime.recent_deals.len(),
             recorded, already_present, opening_fills,
-            deferred_cold_catalog, write_failed,
+            incomplete_broker_financials, deferred_cold_catalog, write_failed,
             "journal reconcile did not record every closing deal — \
+             {incomplete_broker_financials} had incomplete broker financials, \
              {deferred_cold_catalog} deferred until the broker symbol catalog \
              populates (retried on the next refresh), {write_failed} failed to write"
         );
@@ -214,14 +239,15 @@ pub fn reconcile_best_effort(
     // bounded (one point per realized trade) instead of one per heartbeat.
     if recorded_any {
         let balance = runtime.trader.balance;
+        let equity = runtime.trader.balance + runtime.unrealized_pnl;
         journal_store::append_equity_sample_best_effort(
             &dir,
             &EquitySample {
                 ts_ms: journal_store::now_unix_ms(),
                 balance,
-                // Floating PnL isn't summed here (kept off the hot path);
-                // balance is the realized-equity anchor for the curve.
-                equity: balance,
+                // Both inputs come from the same authenticated account runtime:
+                // trader balance plus ProtoOAGetPositionUnrealizedPnLRes net rows.
+                equity,
                 account_id: Some(account_id.clone()),
                 environment: Some(environment.clone()),
             },
@@ -296,5 +322,29 @@ mod entry_time_tests {
             trade.entry_ts_ms, None,
             "an entry stamped at the exit is not an entry time"
         );
+    }
+
+    #[test]
+    fn a_closing_deal_with_incomplete_broker_financials_is_not_recorded() {
+        for missing in ["gross", "commission", "swap"] {
+            let mut closing = deal(502, 1_700_003_600_000);
+            match missing {
+                "gross" => closing.gross_profit = None,
+                "commission" => closing.fee = None,
+                "swap" => closing.swap = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                closed_trade_from_deal(
+                    &closing,
+                    &catalog(),
+                    "acct",
+                    "Demo",
+                    &HashMap::new(),
+                )
+                .is_none(),
+                "journal accepted a closing deal missing {missing}"
+            );
+        }
     }
 }

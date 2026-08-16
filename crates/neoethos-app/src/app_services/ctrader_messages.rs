@@ -89,8 +89,7 @@ pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2
 pub const CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2164;
 /// Request for current per-position unrealized PnL computed on the broker.
 /// New in the 2026-05-14 upstream proto refresh (Batch 6). Used as an
-/// audit cross-check against the local PnL calculation; see
-/// `crates/neoethos-app/src/app_services/pnl.rs`.
+/// authoritative per-position PnL source consumed by the account runtime.
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE: u32 = 2187;
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE: u32 = 2188;
 // **Phase D.1b (2026-05-28)** — note: `CTRADER_OA_SYMBOL_CATEGORY_*`
@@ -748,9 +747,8 @@ pub fn build_reconcile_request(
 /// `payloadType` (filled by the envelope's `payload_type`) and
 /// `ctidTraderAccountId`; this matches the 2026-05-14 upstream refresh.
 ///
-/// Use [`crate::app_services::pnl::fetch_broker_unrealized_pnl`] for the
-/// full audit flow that compares broker values against the locally
-/// computed PnL on every reconcile tick.
+/// The authenticated account-runtime path requests this response alongside
+/// trader/reconcile/deal state and validates an exact one-to-one position set.
 pub fn build_get_position_unrealized_pnl_request(
     ctid_trader_account_id: i64,
     client_msg_id: impl Into<String>,

@@ -75,7 +75,7 @@ pub struct PositionDto {
     /// position row. None when cTrader didn't include a stamp in
     /// the reconcile payload (rare race window).
     pub open_timestamp_ms: Option<i64>,
-    pub pnl_pips: f64,
+    pub pnl_pips: Option<f64>,
     pub pnl_usd: f64,
     /// Entry price / SL / TP straight from the broker — no client merge.
     pub entry_price: Option<f64>,
@@ -223,7 +223,7 @@ mod tests {
                 side: "LONG".to_string(),
                 volume: 0.10,
                 open_timestamp_ms: None,
-                pnl_pips: 12.5,
+                pnl_pips: Some(12.5),
                 pnl_usd: 11.30,
                 entry_price: Some(1.0850),
                 stop_loss: None,

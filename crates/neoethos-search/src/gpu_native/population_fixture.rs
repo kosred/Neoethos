@@ -258,10 +258,13 @@ impl TinyPopulationFixture {
         backend: EvaluationBackend,
         audit: &CpuStrategyAuditContext,
     ) -> Result<Vec<[f64; 11]>, String> {
-        evaluate_population_core_with_backend_and_audit(
-            PopulationEvalInputs {
-                close: &self.close,
-                high: &self.high,
+        evaluate_population_core_with_backend_and_audit(self.inputs(), backend, audit)
+    }
+
+    fn inputs(&self) -> PopulationEvalInputs<'_> {
+        PopulationEvalInputs {
+            close: &self.close,
+            high: &self.high,
                 low: &self.low,
                 indicators: self.indicators.view(),
                 gene_offsets: &self.gene_offsets,
@@ -277,10 +280,20 @@ impl TinyPopulationFixture {
                 stop_vol_mult: &self.stop_vol_multipliers,
                 smc_data: &self.smc_data,
                 gene_smc_flags: &self.gene_smc_flags,
-                gate_threshold: 0.0,
-                weights: &self.smc_weights,
-                settings: &self.settings,
-            },
+            gate_threshold: 0.0,
+            weights: &self.smc_weights,
+            settings: &self.settings,
+        }
+    }
+
+    #[cfg(test)]
+    fn evaluate_test_oracle(
+        &self,
+        backend: EvaluationBackend,
+        audit: &CpuStrategyAuditContext,
+    ) -> Result<Vec<[f64; 11]>, String> {
+        crate::backend::evaluate_population_core_with_backend_test_oracle(
+            self.inputs(),
             backend,
             audit,
         )
@@ -372,10 +385,10 @@ mod tests {
         let first_audit = CpuStrategyAuditContext::validation_reference(1);
         let second_audit = CpuStrategyAuditContext::validation_reference(2);
         let first = fixture
-            .evaluate(EvaluationBackend::CPU_CANONICAL, &first_audit)
+            .evaluate_test_oracle(EvaluationBackend::CPU_CANONICAL, &first_audit)
             .unwrap();
         let second = fixture
-            .evaluate(EvaluationBackend::CPU_CANONICAL, &second_audit)
+            .evaluate_test_oracle(EvaluationBackend::CPU_CANONICAL, &second_audit)
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 8);
@@ -480,7 +493,7 @@ mod tests {
             accelerator_hint: crate::backend::AcceleratorHint::Any,
         };
         assert!(!backend.cpu_fallback_allowed());
-        let error = fixture.evaluate(backend, &audit).unwrap_err();
+        let error = fixture.evaluate_test_oracle(backend, &audit).unwrap_err();
         assert!(
             error.contains("compiled without a GPU backend"),
             "a ForbidCpu backend must fail closed, not run on the CPU: {error}"
@@ -494,7 +507,7 @@ mod tests {
         let fixture = TinyPopulationFixture::new(4, 128, 4);
         let audit = CpuStrategyAuditContext::production(3);
         let error = fixture
-            .evaluate(EvaluationBackend::GPU_REQUIRED, &audit)
+            .evaluate_test_oracle(EvaluationBackend::GPU_REQUIRED, &audit)
             .unwrap_err();
         assert!(error.contains("compiled without a GPU backend"));
         audit.snapshot().assert_zero_executed().unwrap();

@@ -29,7 +29,7 @@ use crate::position::PositionManager;
 ///
 /// **2026-08-10 (#229/#265): this is now a FALLBACK, not a default in use.**
 /// Both replay front-ends build their config through
-/// [`EngineConfig::for_replay_from_settings`], which takes
+/// [`EngineConfig::try_for_replay_from_settings`], which takes
 /// `risk.initial_balance`, so a replay reaches this constant only when
 /// `Settings` could not be read at all or the configured balance is unusable —
 /// and in both cases it says so at WARN and `common_warnings` marks the run
@@ -42,7 +42,7 @@ use crate::position::PositionManager;
 /// ranked percentage without anybody choosing it. It is reported instead, once
 /// per process, with both numbers, by
 /// `neoethos_search::eval::install_backtest_runtime_overrides_from_settings`.
-pub const DEFAULT_REPLAY_STARTING_BALANCE: f64 = 10_000.0;
+pub(crate) const DEFAULT_REPLAY_STARTING_BALANCE: f64 = 10_000.0;
 
 /// Engine-wide knobs (Phase 1).
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ pub struct EngineConfig {
     /// Transaction costs charged by the mock execution adapter. Defaults to
     /// ZERO — see [`crate::execution::ReplayCostModel`]; the zero case is
     /// reported, not hidden.
-    pub costs: crate::execution::ReplayCostModel,
+    pub(crate) costs: crate::execution::ReplayCostModel,
     /// The GA evaluator's time stop, in bars. `None` ⇒ no time stop.
     pub max_hold_bars: Option<u64>,
     /// The GA evaluator's / live loop's break-even + trailing stop (audit
@@ -96,7 +96,7 @@ impl EngineConfig {
     /// could actually run reported percentage drawdown against a balance that
     /// was not his, on fills that charged nothing. This entry point takes the
     /// four numbers and enforces the RULES about them; front-ends holding a
-    /// `Settings` should call [`EngineConfig::for_replay_from_settings`] below,
+    /// `Settings` should call [`EngineConfig::try_for_replay_from_settings`] below,
     /// which is the one adapter that reads those four fields off the config.
     ///
     /// * `initial_balance` — `risk.initial_balance`. A non-finite or
@@ -113,7 +113,7 @@ impl EngineConfig {
     ///   spread cannot be converted to price units without it, so the costs
     ///   stay ZERO and say so: a wrong cost is worse than a declared absent
     ///   one, because it looks like it was charged.
-    pub fn for_replay(
+    fn for_replay(
         initial_balance: f64,
         spread_pips: f64,
         slippage_pips: f64,
@@ -169,32 +169,34 @@ impl EngineConfig {
     /// the two front-ends produce byte-identical `EngineStats`. The CLI copy is
     /// DELETED; this is the only one.
     ///
-    /// `None` settings is not an error — it is a replay whose costs and balance
-    /// could not be resolved, which returns the synthetic default and says so
-    /// at WARN. `data_replay::common_warnings` then reports the run as
-    /// synthetic, so the disclosure survives.
+    /// The current release always returns the typed broker-truth refusal before
+    /// reading any of these settings. The private body remains only as the
+    /// future exact-broker adapter target; it cannot be called by a front-end.
     ///
     /// Commission is converted from the operator's round trip to the ONE-SIDE
     /// charge [`EngineConfig::for_replay`] documents, because the replay's
     /// execution adapter bills it on entry AND on exit.
-    pub fn for_replay_from_settings(
+    pub fn try_for_replay_from_settings(
         settings: Option<&neoethos_core::Settings>,
         symbol: &str,
-    ) -> Self {
-        let Some(settings) = settings else {
-            tracing::warn!(
-                target: "neoethos_trader::replay",
-                symbol,
-                "no config resolved — this replay fills at the mark, charging nothing, on a \
-                 synthetic balance"
-            );
-            return Self::default();
-        };
+    ) -> anyhow::Result<Self> {
+        neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::HistoricalReplay)
+            .map_err(anyhow::Error::new)?;
+
+        let settings = settings.ok_or_else(|| {
+            anyhow::anyhow!(
+                "replay settings are unavailable; exact broker financial inputs cannot be resolved"
+            )
+        })?;
         let pip_size = neoethos_core::symbol_metadata::global_table()
             .lookup(symbol)
             .map(|meta| meta.pip_size);
         let risk = &settings.risk;
-        let commission_per_side = risk.round_trip_commission_per_lot() / 2.0;
+        let commission_per_side = risk
+            .round_trip_commission_per_lot()
+            .map_err(anyhow::Error::new)?
+            / 2.0;
         tracing::info!(
             target: "neoethos_trader::replay",
             symbol,
@@ -254,7 +256,7 @@ impl EngineConfig {
         } else {
             None
         };
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -293,7 +295,7 @@ pub struct EngineStats {
 /// The trading loop, generic over the three trait seams so tests inject stubs
 /// and production injects the real Gene/ensemble signal, the core RiskManager,
 /// and the cTrader execution adapter — without the loop changing.
-pub struct AutonomousEngine<S, R, E> {
+pub(crate) struct AutonomousEngine<S, R, E> {
     registry: PortfolioRegistry,
     signal: S,
     risk: R,
@@ -346,23 +348,6 @@ impl<S: SignalEngine, R: RiskGate, E: ExecutionAdapter> AutonomousEngine<S, R, E
             executed: 0,
             blocked: 0,
         }
-    }
-
-    pub fn registry(&self) -> &PortfolioRegistry {
-        &self.registry
-    }
-
-    pub fn positions(&self) -> &PositionManager {
-        &self.positions
-    }
-
-    pub fn account(&self) -> &AccountSnapshot {
-        &self.account
-    }
-
-    /// Borrow the execution adapter (e.g. to read the mock fill log in tests).
-    pub fn execution(&self) -> &E {
-        &self.exec
     }
 
     pub fn stats(&self) -> EngineStats {

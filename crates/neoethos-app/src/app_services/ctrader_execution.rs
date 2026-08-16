@@ -6,10 +6,10 @@ use crate::app_services::ctrader_messages::{
     CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest,
     CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
     CTraderOpenApiTransport, build_account_auth_request, build_amend_order_request,
-    build_amend_position_sltp_request, build_application_auth_request,
-    build_cancel_order_request, build_close_position_request, build_new_order_request,
-    expected_response_payload_type, is_ctrader_auth_token_error, is_matching_open_api_response,
-    parse_ctrader_error_payload_parts, parse_open_api_envelope,
+    build_amend_position_sltp_request, build_application_auth_request, build_cancel_order_request,
+    build_close_position_request, build_new_order_request, expected_response_payload_type,
+    is_ctrader_auth_token_error, is_matching_open_api_response, parse_ctrader_error_payload_parts,
+    parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -539,7 +539,8 @@ impl ProductionCTraderExecutionBackend {
         // F-CORE3 closure (2026-05-25): routed through the canonical
         // `env_overrides::ctrader_read_timeout_secs` getter so the var
         // is grep-able from one place + clamped consistently.
-        let read_timeout_secs: u64 = crate::app_services::env_overrides::ctrader_read_timeout_secs();
+        let read_timeout_secs: u64 =
+            crate::app_services::env_overrides::ctrader_read_timeout_secs();
         if read_timeout_secs > 0 {
             let timeout = std::time::Duration::from_secs(read_timeout_secs);
             let apply_result = match socket.get_ref() {
@@ -880,50 +881,48 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
     let order = envelope.payload.order;
     let position = envelope.payload.position;
     let deal = envelope.payload.deal;
-    // Same defence as ctrader_account::required_money_digits — a missing
-    // money_digits field would silently scale every monetary value 100×
-    // because `10^0 = 1`. Default to 2 (typical fiat precision) and
-    // log loudly so the operator notices the protocol regression.
-    let money_digits = deal
-        .as_ref()
-        .and_then(|item| item.close_position_detail.as_ref())
-        .and_then(|detail| detail.money_digits)
-        .or_else(|| deal.as_ref().and_then(|item| item.money_digits));
-    let money_digits = crate::app_services::ctrader_money::required_money_digits(
-        money_digits,
-        "execution.money_digits",
-    );
-
-    let gross_profit = deal.as_ref().and_then(|item| {
-        item.close_position_detail
-            .as_ref()
-            .map(|detail| scaled_money(detail.gross_profit, money_digits))
-    });
-    let fee = deal.as_ref().and_then(|item| {
-        item.close_position_detail
-            .as_ref()
-            .map(|detail| scaled_money(detail.commission, money_digits))
-            .or_else(|| {
-                item.commission
-                    .map(|commission| scaled_money(commission, money_digits))
-            })
-    });
-    let swap = deal.as_ref().and_then(|item| {
-        item.close_position_detail
-            .as_ref()
-            .map(|detail| scaled_money(detail.swap, money_digits))
-    });
-    let pnl_conversion_fee = deal.as_ref().and_then(|item| {
-        item.close_position_detail
-            .as_ref()
-            .and_then(|detail| detail.pnl_conversion_fee)
-            .map(|fee| scaled_money(fee, money_digits))
-    });
-    let net_profit = match (gross_profit, fee, swap, pnl_conversion_fee) {
-        (Some(gross), fee, swap, pnl_fee) => {
-            Some(gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_fee.unwrap_or(0.0))
-        }
-        _ => None,
+    let (gross_profit, fee, swap, net_profit) = match deal.as_ref() {
+        Some(item) => match item.close_position_detail.as_ref() {
+            Some(detail) => {
+                let money_digits = crate::app_services::ctrader_money::required_money_digits(
+                    detail.money_digits,
+                    "execution.close_position_detail.money_digits",
+                )?;
+                let gross = scaled_money(detail.gross_profit, money_digits)?;
+                let fee = scaled_money(detail.commission, money_digits)?;
+                let swap = scaled_money(detail.swap, money_digits)?;
+                // ProtoOAClosePositionDetail.pnlConversionFee is optional and
+                // is present only when the broker applied quote/deposit
+                // conversion. Absence is therefore a broker-defined zero, not
+                // a locally reconstructed fee.
+                let conversion_fee = detail
+                    .pnl_conversion_fee
+                    .map(|raw| scaled_money(raw, money_digits))
+                    .transpose()?
+                    .unwrap_or_default();
+                (
+                    Some(gross),
+                    Some(fee),
+                    Some(swap),
+                    Some(gross + fee + swap + conversion_fee),
+                )
+            }
+            None => {
+                let fee = match item.commission {
+                    Some(raw) => {
+                        let money_digits =
+                            crate::app_services::ctrader_money::required_money_digits(
+                                item.money_digits,
+                                "execution.deal.money_digits",
+                            )?;
+                        Some(scaled_money(raw, money_digits)?)
+                    }
+                    None => None,
+                };
+                (None, fee, None, None)
+            }
+        },
+        None => (None, None, None, None),
     };
 
     Ok(CTraderExecutionOutcome {
@@ -1036,23 +1035,8 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
     })
 }
 
-fn scaled_money(raw: i64, money_digits: u32) -> f64 {
-    // Centralised cTrader spec helper (see ctrader_money.rs and
-    // docs/audits/research/ctrader_api_full_reference.md §5.14). Out-of-range
-    // `money_digits` triggers an error log + legacy fiat fallback so a single
-    // malformed broker payload cannot panic the execution event parser.
-    match crate::app_services::ctrader_money::scale_ctrader_money_int(raw, money_digits as i32) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(
-                target: "neoethos_app::ctrader",
-                money_digits,
-                error = %err,
-                "execution event money scaling rejected by spec helper; falling back to fiat default (2)"
-            );
-            (raw as f64) / 100.0
-        }
-    }
+fn scaled_money(raw: i64, money_digits: u32) -> Result<f64> {
+    crate::app_services::ctrader_money::scale_ctrader_money_int(raw, money_digits as i32)
 }
 
 fn volume_to_units(raw: i64) -> f64 {

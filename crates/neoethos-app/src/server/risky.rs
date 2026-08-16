@@ -81,6 +81,16 @@ pub async fn scenarios(
     State(_state): State<AppApiState>,
     Query(q): Query<RiskyScenarioQuery>,
 ) -> Response {
+    if let Err(error) = neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::RiskyMode)
+    {
+        return actionable_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Risky Mode financial projections are disabled until exact broker evidence is available.",
+            &anyhow::Error::new(error),
+        );
+    }
+
     let starting = q
         .starting_usd
         .filter(|v| v.is_finite() && *v > 0.0)

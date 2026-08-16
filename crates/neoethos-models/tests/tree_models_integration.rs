@@ -259,14 +259,16 @@ mod lightgbm_tests {
             ])),
         );
 
-        let result = model.fit(&train_df, &train_labels);
-        if let Err(err) = result {
-            assert!(
-                err.to_string()
-                    .contains("gpu-only mode requested but no GPU is available"),
-                "unexpected gpu-only error: {err}"
-            );
-        }
+        let err = model
+            .fit(&train_df, &train_labels)
+            .expect_err("gpu-only mode must never train on the resolved CPU device");
+        let message = err.to_string();
+        assert!(
+            message.contains("gpu-only mode is set")
+                && message.contains("resolved device is `cpu`")
+                && message.contains("models.tree_runtime.lightgbm_gpu"),
+            "unexpected gpu-only error: {err}"
+        );
     }
 }
 

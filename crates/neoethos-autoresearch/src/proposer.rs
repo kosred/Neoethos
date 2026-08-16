@@ -379,7 +379,9 @@ impl Proposer {
         let drawable = crate::objective::axis_b_live_check(&caps, scenario)
             .map_err(|inert| anyhow::anyhow!("{inert}"))?;
 
-        let pip_value_per_lot = base_config.evaluation_config(None).pip_value_per_lot;
+        let pip_value_per_lot = base_config
+            .try_evaluation_config(None)?
+            .pip_value_per_lot;
         let mut me = Self {
             caps,
             scenario,

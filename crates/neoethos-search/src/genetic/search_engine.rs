@@ -812,6 +812,9 @@ pub fn validation_genes_scenarios(
     prepared: &PreparedValidation,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
 ) -> Result<Vec<[f64; 11]>> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     if scenarios.is_empty() {
         return Ok(Vec::new());
     }
@@ -862,6 +865,9 @@ pub fn validation_genes_population(
     config: &EvaluationConfig,
     settings_template: &BacktestSettings,
 ) -> Result<Vec<[f64; 11]>> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     // Reports itself on first call — see `eval_telemetry`.
     //
     // This function was invisible. Its own in-tree measurement reads "eighteen
@@ -1000,6 +1006,9 @@ pub fn validation_genes_population_gathered(
     gathered_months: &[i64],
     gathered_days: &[i64],
 ) -> Result<Vec<[f64; 11]>> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     if genes.is_empty() || absolute_idx.is_empty() {
         return Ok(Vec::new());
     }
@@ -1336,6 +1345,9 @@ pub fn validation_genes_population_window(
     a: usize,
     b: usize,
 ) -> Result<Vec<[f64; 11]>> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     // Where a validation window's time actually goes.
     //
     // Eighteen of these calls take 413.6 s of a 452.4 s run — 23 s each — while
@@ -1469,6 +1481,29 @@ pub fn evaluate_genes(
     genes: &[Gene],
     config: &EvaluationConfig,
 ) -> Result<Vec<[f64; 11]>> {
+    evaluate_genes_impl(features, ohlcv, genes, config, false)
+}
+
+/// Unit-only scalar/population parity oracle. It is absent from release builds;
+/// production callers must enter through [`evaluate_genes`] and the broker-real
+/// capability boundary owned by the population evaluator.
+#[cfg(test)]
+pub(crate) fn evaluate_genes_test_oracle(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+) -> Result<Vec<[f64; 11]>> {
+    evaluate_genes_impl(features, ohlcv, genes, config, true)
+}
+
+fn evaluate_genes_impl(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    use_test_oracle: bool,
+) -> Result<Vec<[f64; 11]>> {
     // Reports itself on first call — see `eval_telemetry`.
     struct TelemetryGuard(&'static str, usize, std::time::Instant);
     impl Drop for TelemetryGuard {
@@ -1554,7 +1589,7 @@ pub fn evaluate_genes(
         &mut b_settings,
     )?;
 
-    crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
+    let inputs = crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
         high: &ohlcv.high,
         low: &ohlcv.low,
@@ -1575,8 +1610,15 @@ pub fn evaluate_genes(
         gate_threshold: config.smc_gate_threshold,
         weights: &smc_weights,
         settings: &b_settings,
-    })
-    .map_err(|e| anyhow!(e))
+    };
+    #[cfg(test)]
+    if use_test_oracle {
+        return crate::eval::evaluate_population_core_test_oracle(inputs)
+            .map_err(|error| anyhow!(error));
+    }
+    #[cfg(not(test))]
+    let _ = use_test_oracle;
+    crate::eval::evaluate_population_core(inputs).map_err(|error| anyhow!(error))
 }
 
 fn resolve_stop_target_arrays(

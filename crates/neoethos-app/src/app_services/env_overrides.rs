@@ -2,14 +2,14 @@
 //!
 //! Mirror of `neoethos_core::env_overrides` for the app crate's
 //! own knobs. Single grep-able file for every `NEOETHOS_BOT_CTRADER_*`,
-//! `NEOETHOS_BOT_PNL_*`, and `NEOETHOS_*` runtime override that the
+//! and `NEOETHOS_*` runtime override that the
 //! HTTP server / trading layer honours.
 //!
 //! ## Why this exists (F-CORE3 cluster consolidation, 2026-05-25)
 //!
 //! Before this module, the app crate spread `std::env::var(...)` reads
 //! across at least 10 files: `ctrader_execution.rs`, `ctrader_streaming.rs`,
-//! `ctrader_messages.rs`, `pnl.rs`, `server/mod.rs`, `live_journal.rs`,
+//! `ctrader_messages.rs`, `server/mod.rs`, `live_journal.rs`,
 //! `pending_actions.rs`, `risky_mode_persistence.rs`, etc. Each had its
 //! own local clamping helper, which:
 //!
@@ -183,16 +183,6 @@ pub fn ctrader_stream_backoff_base_ms() -> u64 {
 pub fn chart_merge_side_raw() -> Option<String> {
     let v = app_runtime().chart_merge_side.trim().to_ascii_lowercase();
     if v.is_empty() { None } else { Some(v) }
-}
-
-/// PnL audit drift threshold. Clamped `[1e-5, 0.05]`.
-pub fn pnl_audit_drift_fraction() -> f64 {
-    app_runtime().pnl_audit_drift_fraction.clamp(1e-5, 0.05)
-}
-
-/// PnL circuit-breaker threshold. Clamped `[1e-4, 0.20]`.
-pub fn pnl_circuit_breaker_fraction() -> f64 {
-    app_runtime().pnl_circuit_breaker_fraction.clamp(1e-4, 0.20)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +389,6 @@ mod tests {
         assert_eq!(ctrader_stream_backoff_base_ms(), 200);
         assert!(!ctrader_allow_partial_fill());
         assert!(chart_merge_side_raw().is_none());
-        assert!((pnl_audit_drift_fraction() - 0.001).abs() < 1e-9);
-        assert!((pnl_circuit_breaker_fraction() - 0.01).abs() < 1e-9);
         assert_eq!(server_bind_addr().to_string(), "127.0.0.1:7423");
     }
 }

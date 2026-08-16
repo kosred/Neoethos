@@ -67,6 +67,7 @@ pub struct OraclePopulationEvaluation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PopulationOracleError {
+    BrokerFinancialTruthUnavailable(String),
     IneligibleWorkload {
         reason: PrototypeBcIneligibilityReason,
         candidate_ids: Vec<u64>,
@@ -136,6 +137,7 @@ pub enum PopulationOracleError {
 impl fmt::Display for PopulationOracleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BrokerFinancialTruthUnavailable(message) => f.write_str(message),
             Self::IneligibleWorkload {
                 reason,
                 candidate_ids,
@@ -300,7 +302,8 @@ impl OutcomeSchedules {
     }
 }
 
-pub fn population_settings(
+#[cfg(test)]
+pub(crate) fn population_settings(
     workload: &PrototypePopulationWorkload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
     validate_population_oracle_workload(workload)?;
@@ -318,7 +321,7 @@ fn population_settings_unchecked(
 /// Device engines need the exact same mapping as the oracle but only own the
 /// dataset upload at that point, so the conversion is shared here rather than
 /// re-expressed per backend.
-pub fn population_settings_for_dataset(
+pub(crate) fn population_settings_for_dataset(
     dataset: &crate::gpu_native::prototype_a::PrototypeADatasetUpload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
     let source = dataset.settings.to_settings();
@@ -380,7 +383,7 @@ pub fn population_settings_for_dataset(
     })
 }
 
-pub fn validate_population_oracle_workload(
+pub(crate) fn validate_population_oracle_workload(
     workload: &PrototypePopulationWorkload,
 ) -> Result<(), PopulationOracleError> {
     for prototype in [
@@ -415,6 +418,17 @@ pub fn validate_population_oracle_workload(
 pub fn evaluate_population_oracle(
     workload: &PrototypePopulationWorkload,
 ) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(|error| {
+            PopulationOracleError::BrokerFinancialTruthUnavailable(error.to_string())
+        })?;
+    evaluate_population_oracle_unchecked_test_oracle(workload)
+}
+
+fn evaluate_population_oracle_unchecked_test_oracle(
+    workload: &PrototypePopulationWorkload,
+) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
     validate_population_oracle_workload(workload)?;
     let settings = population_settings_unchecked(workload)?;
     let signals = synthesize_population_signals(workload);
@@ -436,7 +450,15 @@ pub fn evaluate_population_oracle(
     })
 }
 
-pub fn emit_population_events(
+#[cfg(test)]
+pub(crate) fn evaluate_population_oracle_test_oracle(
+    workload: &PrototypePopulationWorkload,
+) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
+    evaluate_population_oracle_unchecked_test_oracle(workload)
+}
+
+#[cfg(test)]
+pub(crate) fn emit_population_events(
     workload: &PrototypePopulationWorkload,
 ) -> Result<Vec<NeoPopulationEvent>, PopulationOracleError> {
     validate_population_oracle_workload(workload)?;
@@ -446,7 +468,8 @@ pub fn emit_population_events(
     Ok(events)
 }
 
-pub fn validate_population_events(
+#[cfg(test)]
+pub(crate) fn validate_population_events(
     workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
 ) -> Result<(), PopulationOracleError> {
@@ -456,7 +479,8 @@ pub fn validate_population_events(
     validate_population_events_against_canonical(workload, events, &canonical)
 }
 
-pub fn resolve_population_outcomes(
+#[cfg(test)]
+pub(crate) fn resolve_population_outcomes(
     workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
 ) -> Result<Vec<NeoPopulationOutcome>, PopulationOracleError> {
@@ -752,7 +776,8 @@ fn resolve_outcome(outcome: &mut NeoPopulationOutcome, bar: usize, reason: i32) 
     outcome.exit_reason = reason;
 }
 
-pub fn reduce_population_outcomes(
+#[cfg(test)]
+pub(crate) fn reduce_population_outcomes(
     workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
     outcomes: &[NeoPopulationOutcome],
@@ -1002,6 +1027,7 @@ fn partition_candidate_event_ranges(
     Ok(ranges)
 }
 
+#[cfg(test)]
 fn validate_outcome_alignment(
     workload: &PrototypePopulationWorkload,
     events: &[NeoPopulationEvent],
@@ -1694,6 +1720,12 @@ mod tests {
     use ndarray::ArrayView2;
 
     const BARS: usize = 5;
+
+    fn evaluate_population_oracle(
+        workload: &PrototypePopulationWorkload,
+    ) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
+        super::evaluate_population_oracle_test_oracle(workload)
+    }
 
     fn canonical_cost_fixture() -> PrototypePopulationWorkload {
         let start = 1_700_000_000_000_i64;

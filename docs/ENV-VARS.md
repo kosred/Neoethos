@@ -49,8 +49,6 @@ path regardless of what config.yaml says.
 | `NEOETHOS_BOT_NUM_TRANSFORMERS` | usize | inherited | Override `models.num_transformers`. |
 | `NEOETHOS_BOT_PHASE5_CORE_MODELS` | comma-list | inherited | Override the Phase 5 core model list. |
 | `NEOETHOS_BOT_PHASE5_FILTER_META_BLENDER` | bool | inherited | Toggle the Phase-5 filter on `meta_blender`. |
-| `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION` | f64 | inherited | Drift fraction the cTrader PnL audit treats as acceptable (test fixture knob, see `crates/neoethos-app/tests/fixtures/ctrader/unrealized_pnl/README.md`). |
-| `NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION` | f64 | inherited | Hard ceiling above which the PnL audit raises a circuit-breaker error. |
 | `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` | string (`USD`, `EUR`, ...) | inherited | Legacy override for the prop-firm preset account currency. Honoured by both the CLI prop-firm command (`main.rs:414`) and `with_env_runtime_overrides`. |
 | `NEOETHOS_BOT_PROP_CONF_THRESHOLD` | f64 | inherited | Confidence threshold the prop-firm gate uses to filter ensemble signals. |
 | `NEOETHOS_BOT_PROP_SEARCH_ASYNC` | bool | inherited | Toggle async prop-firm search. |
@@ -77,7 +75,6 @@ editor surface:
 |---|---|
 | `NEOETHOS_BOT_AUTO_ENABLE_RLLIB` | `models.use_rllib_agent` |
 | `NEOETHOS_BOT_PROP_SEARCH_*` | `search.prop_firm.*` |
-| `NEOETHOS_BOT_PNL_AUDIT_*` | unified `risk.pnl_audit` block |
 
 Operators should migrate scripts away from these variables; the env-var
 fallback survives only for back-compat across the 0.4.x line and will

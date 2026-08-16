@@ -9,7 +9,10 @@ use crate::engine::{AutonomousEngine, EngineStats};
 
 /// Run `bars` (assumed already in ascending timestamp order) through `engine`
 /// and return the resulting stats snapshot.
-pub fn replay<S, R, E>(engine: &mut AutonomousEngine<S, R, E>, bars: &[crate::contracts::LiveBar]) -> EngineStats
+pub(crate) fn replay<S, R, E>(
+    engine: &mut AutonomousEngine<S, R, E>,
+    bars: &[crate::contracts::LiveBar],
+) -> EngineStats
 where
     S: SignalEngine,
     R: RiskGate,
@@ -86,7 +89,7 @@ mod tests {
             registry,
             MomentumStubSignal::new(3),
             PermissiveRiskGate,
-            MockExecutionAdapter::new(),
+            MockExecutionAdapter::default(),
             DecisionEngine::new(DecisionConfig::default()),
             EngineConfig::default(),
         );
@@ -101,9 +104,6 @@ mod tests {
         // closed it (reversal or SL/TP) — proving the full open→manage→close path.
         assert!(stats.positions_opened > 0, "expected at least one open");
         assert!(stats.positions_closed > 0, "expected at least one close");
-        // Mock adapter recorded fills (and made ZERO real broker calls — it
-        // cannot; it has no transport).
-        assert!(engine.execution().fill_count() > 0, "mock should record fills");
         // Equity bookkeeping stayed finite.
         assert!(stats.equity.is_finite());
     }
@@ -118,7 +118,7 @@ mod tests {
             registry,
             MomentumStubSignal::new(2),
             PermissiveRiskGate,
-            MockExecutionAdapter::new(),
+            MockExecutionAdapter::default(),
             DecisionEngine::default(),
             EngineConfig::default(),
         );
@@ -145,7 +145,7 @@ mod tests {
             registry,
             MomentumStubSignal::new(2),
             MaxOpenPositionsGate::new(1),
-            MockExecutionAdapter::new(),
+            MockExecutionAdapter::default(),
             DecisionEngine::default(),
             EngineConfig::default(),
         );

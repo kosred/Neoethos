@@ -862,7 +862,7 @@ mod tests {
     #[ignore = "models the retired event pipeline; superseded by gpu_matches_cpu_with_a_trailing_stop"]
     fn cuda_population_metrics_match_the_canonical_oracle() {
         use crate::gpu_native::engine::{BacktestEngine, DeviceFilterPolicy};
-        use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle;
+        use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle_test_oracle as evaluate_population_oracle;
 
         let fixture = TinyPopulationFixture::new(4, 192, 4);
         let workload = fixture

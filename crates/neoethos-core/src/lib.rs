@@ -1,4 +1,5 @@
 pub mod broker_config;
+pub mod broker_truth;
 pub mod config;
 pub mod contracts;
 pub mod domain;
@@ -34,6 +35,12 @@ pub use broker_config::{
     CTraderBrokerSettings, credentials_file_path,
     load_from_disk as load_broker_credentials_from_disk,
     save_to_disk as save_broker_credentials_to_disk,
+};
+pub use broker_truth::{
+    BROKER_FINANCIAL_TRUTH_SCHEMA_VERSION_V1, BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1,
+    BrokerFinancialOperationV1, BrokerFinancialTruthCapabilityV1, BrokerFinancialTruthErrorV1,
+    BrokerFinancialTruthPermitV1, MissingBrokerFinancialEvidenceV1,
+    current_broker_financial_truth_capability_v1,
 };
 pub use config::{NewsTradingMode, Settings, default_news_rss_feeds};
 pub use contracts::{

@@ -29,9 +29,7 @@ const PREFILTER_MAX_REFIT_FOLDS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct PrefilterSpec {
-    top_k: usize,
     insample_frac: f64,
-    min_per_tf: usize,
     max_hold_bars: usize,
     atr_period: usize,
     sl_atr_mult: f64,
@@ -350,9 +348,7 @@ fn main() -> anyhow::Result<()> {
     println!("cube rows={n_rows} cols={n_cols} normalize={normalize}");
 
     let spec = PrefilterSpec {
-        top_k,
         insample_frac: 0.80,
-        min_per_tf: 6,
         max_hold_bars: 35,
         atr_period: 14,
         sl_atr_mult: 2.5,

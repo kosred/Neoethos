@@ -146,9 +146,9 @@ pub use deflated::{
 
 pub use eval::{
     BacktestMetrics, BacktestRuntimeOverrides, BacktestSettings,
-    current_backtest_runtime_overrides, evaluate_population_core, fast_evaluate_strategy_core,
+    current_backtest_runtime_overrides, evaluate_population_core,
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
-    install_backtest_runtime_overrides_from_settings, simulate_trades_core,
+    install_backtest_runtime_overrides_from_settings, simulate_trades_broker_real,
 };
 // `pub use gauntlet::{GauntletConfig, StrategyGauntlet};` — DELETED 2026-05-26.
 pub use genetic::{
@@ -158,7 +158,7 @@ pub use genetic::{
     SmcWeightRuntimeOverrides, StrategyEvaluationRuntimeOverrides, SurvivorSelectionPolicy,
     current_determinism_policy, current_genetic_search_runtime_overrides,
     current_seen_signature_memory_runtime_overrides, current_strategy_evaluation_runtime_overrides,
-    default_pip_size, evaluate_genes, evolve_search, evolve_search_with_progress,
+    evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, install_genetic_search_runtime_overrides,
     install_genetic_search_runtime_overrides_from_env,
     install_genetic_search_runtime_overrides_from_settings,

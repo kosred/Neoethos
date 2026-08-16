@@ -100,7 +100,6 @@ struct Args {
     // doc comments. Flutter died 2026-06-22. Because the flag defaulted to
     // false and no spawner set it, removing it does NOT change behaviour: the
     // orphan help dialog was already unconditional on this path.
-
     /// PID of the parent GUI process. When set, the backend self-terminates
     /// within ~2s of that process exiting, so it never lingers as a windowless
     /// orphan holding port 7423 (the "app won't open" bug: the next launch
@@ -368,16 +367,14 @@ async fn async_main(args: Args, settings: Settings) -> Result<(), Box<dyn std::e
         );
         let env_dir_clone = env_dir.clone();
         let table = tokio::task::spawn_blocking(move || {
-            app_services::capture_symbols::build_symbol_metadata_table_from_catalog(
-                &env_dir_clone,
-            )
+            app_services::capture_symbols::build_symbol_metadata_table_from_catalog(&env_dir_clone)
         })
         .await
         .map_err(|e| anyhow::anyhow!("rebuild blocking task panicked: {e}"))??;
         let metadata_path = std::path::PathBuf::from("data").join("symbol_metadata.json");
-        table.save_to_disk(&metadata_path).map_err(|e| {
-            anyhow::anyhow!("write {}: {e}", metadata_path.display())
-        })?;
+        table
+            .save_to_disk(&metadata_path)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", metadata_path.display()))?;
         info!(
             target: "neoethos_app::rebuild_symbol_metadata",
             entries = table.entries.len(),
@@ -618,19 +615,26 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
         // that is the failure wearing the costume of a choice. The run is
         // refused and the reason is named.
         let discovery_config = match Settings::from_yaml(&runtime.config_path) {
-            Ok(settings) => {
-                let cfg = neoethos_search::DiscoveryConfig::from_settings(&settings);
-                info!(
-                    config_path = %runtime.config_path,
-                    population = cfg.population,
-                    generations = cfg.generations,
-                    min_history_years = cfg.runtime_overrides.min_history_years,
-                    "Headless: discovery config resolved FROM THE CONFIG FILE \
-                     (previously the compiled defaults, which ignored every \
-                     operator knob on this path)"
-                );
-                Some(cfg)
-            }
+            Ok(settings) => match neoethos_search::DiscoveryConfig::try_from_settings(&settings) {
+                Ok(cfg) => {
+                    info!(
+                        config_path = %runtime.config_path,
+                        population = cfg.population,
+                        generations = cfg.generations,
+                        min_history_years = cfg.runtime_overrides.min_history_years,
+                        "Headless: discovery config resolved from the config file"
+                    );
+                    Some(cfg)
+                }
+                Err(err) => {
+                    error!(
+                        config_path = %runtime.config_path,
+                        error = %err,
+                        "Headless: refusing to auto-start discovery because exact broker financial evidence is unavailable"
+                    );
+                    None
+                }
+            },
             Err(err) => {
                 error!(
                     config_path = %runtime.config_path,

@@ -186,6 +186,10 @@ impl Handle {
 /// tolerance of backtest). A Demo environment is unconditionally allowed — that
 /// is exactly how the demo fills accumulate. See [`crate::app_services::live_gate`].
 pub fn start(req: StartRequest) -> Result<Handle> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::LiveTrading)
+        .map_err(anyhow::Error::new)?;
+
     // 2026-08-09 (W2, second half): CAPTURE the environment this admission
     // decision is made against, and hand it to the loop.
     //
@@ -990,24 +994,17 @@ async fn run(
     let sizing_tf = base_tf.clone();
     // Balance + REAL account currency + quote→account FX, all on one blocking hop.
     let (account_balance, account_ccy, fx_quote_to_account) =
-        tokio::task::spawn_blocking(move || {
-            match crate::app_services::broker_api::fetch_account_runtime_blocking() {
-                Ok(snap) => {
-                    let bal = snap.trader.balance;
-                    let ccy = crate::server::bridge::asset_id_to_currency(
-                        snap.trader.deposit_asset_id,
-                    )
-                    .to_string();
-                    let fx = quote_ccy
-                        .as_deref()
-                        .and_then(|q| resolve_quote_to_account_rate(q, &ccy, &sizing_tf));
-                    (bal, ccy, fx)
-                }
-                Err(_) => (0.0, String::new(), None),
-            }
+        tokio::task::spawn_blocking(move || -> Result<(f64, String, Option<f64>)> {
+            let snap = crate::app_services::broker_api::fetch_account_runtime_blocking()?;
+            let balance = snap.trader.balance;
+            let account_currency = snap.deposit_asset_name;
+            let fx = quote_ccy.as_deref().and_then(|quote| {
+                resolve_quote_to_account_rate(quote, &account_currency, &sizing_tf)
+            });
+            Ok((balance, account_currency, fx))
         })
         .await
-        .unwrap_or((0.0, String::new(), None));
+        .map_err(|error| anyhow::anyhow!("account-runtime task failed: {error}"))??;
     tracing::info!(
         target: "neoethos_app::live_trading",
         %symbol,

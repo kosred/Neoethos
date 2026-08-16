@@ -50,7 +50,7 @@
 //! malformed broker payload that downstream code might still treat as
 //! authoritative for live order sizing.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 /// Maximum supported `moneyDigits` exponent. See module-level docs for
 /// the justification — `[0, 10]` matches the Spotware spec range and
@@ -96,52 +96,20 @@ pub fn scale_ctrader_money_uint(scaled: u64, money_digits: i32) -> Result<f64> {
     scale_ctrader_money_int(scaled as i64, money_digits)
 }
 
-/// Resolve a required per-entity `moneyDigits` exponent from broker
-/// payloads. Missing values keep the legacy fiat fallback but log
-/// loudly so malformed live payloads are visible.
-pub fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
-    value.unwrap_or_else(|| {
-        tracing::error!(
-            target: "neoethos_app::ctrader",
-            field,
-            "broker payload omitted required money_digits; defaulting to 2 \
-             (silent default to 0 would mis-scale monetary values)"
-        );
-        2
-    })
-}
-
-/// Inverse of [`scale_ctrader_money_int`] for outgoing values
-/// (e.g. when a future code path wants to emit a scaled monetary limit
-/// in the cTrader wire format).
-///
-/// Returns an error when:
-/// - `money_digits` is outside `[0, 10]`,
-/// - `actual` is non-finite (NaN / ±inf),
-/// - the scaled product cannot fit in an `i64`.
-///
-/// `#[allow(dead_code)]`: inverse of the scaled→display path that
-/// IS hot. Today the SDK receives prices and never sends, but the
-/// inverse will be reached when order-submission paths start quoting
-/// in display units. Tests below pin every numeric edge case.
-#[allow(dead_code)]
-pub fn unscale_to_ctrader_money_int(actual: f64, money_digits: i32) -> Result<i64> {
-    if !(0..=MAX_CTRADER_MONEY_DIGITS).contains(&money_digits) {
+/// Resolve the per-entity `moneyDigits` exponent required by a NeoEthos
+/// financial boundary. The protobuf field is optional on several cTrader
+/// entities, but without its presence the JSON transport does not prove the
+/// scale of a non-zero monetary integer. NeoEthos therefore fails closed rather
+/// than guessing a fiat precision.
+pub fn required_money_digits(value: Option<u32>, field: &str) -> Result<u32> {
+    let digits = value.ok_or_else(|| anyhow!("broker payload omitted {field}"))?;
+    if digits > MAX_CTRADER_MONEY_DIGITS as u32 {
         bail!(
-            "cTrader moneyDigits out of spec range [0, {}]: {}",
-            MAX_CTRADER_MONEY_DIGITS,
-            money_digits
+            "cTrader moneyDigits out of spec range [0, {}] for {field}: {digits}",
+            MAX_CTRADER_MONEY_DIGITS
         );
     }
-    if !actual.is_finite() {
-        bail!("cannot unscale non-finite value: {}", actual);
-    }
-    let multiplier = 10.0_f64.powi(money_digits);
-    let scaled = (actual * multiplier).round();
-    if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
-        bail!("scaled value overflows i64: {}", scaled);
-    }
-    Ok(scaled as i64)
+    Ok(digits)
 }
 
 #[cfg(test)]
@@ -163,11 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn scale_money_digits_two_matches_legacy_cents_behaviour() {
-        // The pre-fix code path hard-coded `value as f64 / 100.0`,
-        // which is exactly `scale_ctrader_money_int(_, 2)` for fiat
-        // accounts. Pin the equivalence so the migration cannot
-        // regress the default-currency case.
+    fn scale_money_digits_two_uses_the_broker_supplied_exponent() {
         assert_eq!(
             scale_ctrader_money_int(12_345, 2).expect("in-range"),
             123.45
@@ -200,53 +164,6 @@ mod tests {
         let err = scale_ctrader_money_int(1, 11).expect_err("must reject");
         assert!(
             err.to_string().contains("out of spec range"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn unscale_roundtrips_for_every_in_range_money_digits() {
-        // For each supported exponent, an integer value scaled and
-        // then unscaled must reproduce the original i64. We use a
-        // small integer so the `actual × 10^d` product stays inside
-        // f64's exact-integer interval (`2^53`).
-        for d in 0..=MAX_CTRADER_MONEY_DIGITS {
-            let original: i64 = 123_456_789;
-            let scaled = scale_ctrader_money_int(original, d).expect("in-range");
-            let unscaled = unscale_to_ctrader_money_int(scaled, d).expect("in-range");
-            assert_eq!(
-                unscaled, original,
-                "roundtrip failure at money_digits={d}: {scaled} → {unscaled}"
-            );
-        }
-    }
-
-    #[test]
-    fn unscale_rejects_non_finite_input() {
-        let err = unscale_to_ctrader_money_int(f64::NAN, 2).expect_err("must reject");
-        assert!(
-            err.to_string().contains("non-finite"),
-            "unexpected error: {err}"
-        );
-        let err = unscale_to_ctrader_money_int(f64::INFINITY, 2).expect_err("must reject");
-        assert!(
-            err.to_string().contains("non-finite"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn unscale_rejects_out_of_range_money_digits() {
-        assert!(unscale_to_ctrader_money_int(1.0, -1).is_err());
-        assert!(unscale_to_ctrader_money_int(1.0, 11).is_err());
-    }
-
-    #[test]
-    fn unscale_rejects_i64_overflow() {
-        // f64::MAX * 10^2 obviously can't fit in i64.
-        let err = unscale_to_ctrader_money_int(f64::MAX, 2).expect_err("must reject");
-        assert!(
-            err.to_string().contains("overflows"),
             "unexpected error: {err}"
         );
     }

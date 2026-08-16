@@ -157,7 +157,7 @@ impl DiscoveryRuntimeOverrides {
     /// There is no env reader. An out-of-range value keeps the default, and
     /// says so by name with both numbers — a knob that quietly reverts is
     /// indistinguishable from a knob that was honoured.
-    pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
+    pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
         overrides.prefilter_top_k = cfg.prefilter_top_k;
@@ -825,7 +825,17 @@ impl Default for DiscoveryConfig {
 }
 
 impl DiscoveryConfig {
-    pub fn from_settings(settings: &neoethos_core::Settings) -> Self {
+    /// Production settings adapter. Financial fields are unreachable until
+    /// the exact broker replay capability is installed; callers must not use
+    /// `from_settings` as a fallback after this refusal.
+    pub fn try_from_settings(settings: &neoethos_core::Settings) -> anyhow::Result<Self> {
+        neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+            .map_err(anyhow::Error::new)?;
+        Ok(Self::from_settings(settings))
+    }
+
+    pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
         // The cost model converts a pip value into the account currency, which
         // for a cross pair needs the bridging pair's price. This is the one
         // place every discovery path passes through holding the full Settings,
@@ -1432,7 +1442,21 @@ impl DiscoveryConfig {
         }
     }
 
-    pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
+    /// Checked public boundary for callers outside `neoethos-search`.
+    /// Financial configuration cannot be resolved until exact broker evidence
+    /// is installed; the crate-private builder remains only for gated internal
+    /// paths and formula tests during this disabled phase.
+    pub fn try_evaluation_config(
+        &self,
+        price_hint: Option<f64>,
+    ) -> anyhow::Result<EvaluationConfig> {
+        neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+            .map_err(anyhow::Error::new)?;
+        Ok(self.evaluation_config(price_hint))
+    }
+
+    pub(crate) fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
         let mut cfg = EvaluationConfig::for_symbol(
             &self.evaluation_symbol,
             &self.evaluation_account_currency,
@@ -1449,7 +1473,7 @@ impl DiscoveryConfig {
         cfg
     }
 
-    pub fn evaluation_config_with_smc_gate(
+    pub(crate) fn evaluation_config_with_smc_gate(
         &self,
         price_hint: Option<f64>,
         effective_smc_gate_threshold: f32,
@@ -2108,9 +2132,8 @@ fn discovery_backtest_settings(
         spread_pips: evaluation.spread_pips,
         commission_per_trade: evaluation.commission_per_trade,
         // THE WIRE (2026-08-09). `SessionSpreadProfile` has existed since the
-        // type was written; `spread_pips_for_bar` reads it on the CPU path
-        // (`eval.rs:843`) and `spread_pips_for_bar` in
-        // `prototype_b_population.cu:47` reads it on the card. Every production
+        // type was written; the active CPU evaluator resolves it per bar and
+        // `prototype_b_population.cu` mirrors that resolution on the card. Every production
         // construction site left it `None` — the only `Some(..)` in the tree
         // were under `#[cfg(test)]` — so the curve was dead code and a flat
         // spread was charged at every hour of the day. This is the single point
@@ -2329,6 +2352,9 @@ pub fn faithful_oos_eval(
     portfolio_path: &std::path::Path,
     oos_start_ts_ms: i64,
 ) -> anyhow::Result<Vec<GeneOosResult>> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
     let _scope = crate::eval_telemetry::CallerScope::enter("faithful_oos");
     let artifact = crate::load_live_portfolio_json(portfolio_path)?;
     if artifact.genes.is_empty() {
@@ -3144,7 +3170,9 @@ impl StreamingSearch {
     /// NEVER WRAPS. Running off the end returns `None` so the caller decides
     /// what a second pass means; a silent wrap would re-explore parameter
     /// regions the run already rejected and report them as new.
-    pub fn next_batch(&mut self) -> Option<std::sync::Arc<neoethos_data::core::hpc_ta::SweepBatch>> {
+    pub fn next_batch(
+        &mut self,
+    ) -> Option<std::sync::Arc<neoethos_data::core::hpc_ta::SweepBatch>> {
         if self.batch_columns == 0 || self.cursor >= self.space_len {
             return None;
         }
@@ -4555,9 +4583,7 @@ impl BaseQualityReject {
         match self {
             Self::AccountWiped => "base_quality.account_wiped",
             Self::ProfileNetExpectancy => "base_quality.profile_net_expectancy",
-            Self::ProfileExpectancySignificance => {
-                "base_quality.profile_expectancy_significance"
-            }
+            Self::ProfileExpectancySignificance => "base_quality.profile_expectancy_significance",
             Self::ProfileWinRate => "base_quality.profile_win_rate",
             Self::ProfilePayoffRatio => "base_quality.profile_payoff_ratio",
             Self::ProfileInMarket => "base_quality.profile_in_market",
@@ -4932,6 +4958,10 @@ pub fn run_discovery_cycle_with_holdout_and_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
+
     crate::gpu_native::capability::gpu_pipeline_preflight(
         crate::backend::current_evaluation_backend(),
         &crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline(),
@@ -5049,6 +5079,10 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
+
     // F-304 fix (2026-05-28): pre-flight bail. The cost-model NaN
     // guard at `strategy_gene::infer_market_cost_profile` returns
     // empty-string + NaN-sentinel values when `evaluation_symbol` or
@@ -5659,7 +5693,10 @@ where
         // left, and why" without needing the run's logs. Zero-count reasons are
         // not recorded — an absent bucket means the cause did not fire.
         for (reason, count) in [
-            ("prefilter_unrankable_correlation", census.columns_unrankable),
+            (
+                "prefilter_unrankable_correlation",
+                census.columns_unrankable,
+            ),
             (
                 "prefilter_below_worst_fold_top_k",
                 census
@@ -6129,7 +6166,10 @@ fn rolling_atr_f64(ohlcv: &Ohlcv, period: usize) -> Vec<f64> {
 ///
 /// The round-trip cost is charged into BOTH barriers, so the label answers
 /// "would this trade have paid" and not "did price move".
-fn first_passage_labels(ohlcv: &Ohlcv, spec: &PrefilterSpec) -> (FirstPassageLabels, PrefilterCensus) {
+fn first_passage_labels(
+    ohlcv: &Ohlcv,
+    spec: &PrefilterSpec,
+) -> (FirstPassageLabels, PrefilterCensus) {
     let n = ohlcv.close.len();
     let mut long_labels = vec![f32::NAN; n];
     let mut short_labels = vec![f32::NAN; n];
@@ -8238,12 +8278,10 @@ where
                 // exactly as the fused path does.
                 //
                 // The device's `spread_ticks` override replaces the whole
-                // per-bar lookup (`has_spread_override ? spread_override_pips :
-                // spread_pips_for_bar(...)`), and the CPU mirror clears the
-                // profile for the same reason (`eval.rs`). This arm set only the
-                // scalar — and `spread_pips_for_bar` returns `settings.spread_pips`
-                // ONLY when `timestamp_ms <= 0`; for every real bar it returns
-                // one of the three profile buckets, which this arm never touched.
+                // per-bar lookup, and the CPU mirror clears the profile for the
+                // same reason. This arm used to set only the scalar while leaving
+                // the profile active, so every real bar still used one of the
+                // three original buckets.
                 // With a profile configured the sensitivity test therefore ran at
                 // the ORIGINAL spread and reported that every strategy survives a
                 // cost it was never charged.
@@ -8528,11 +8566,13 @@ where
             }
             let chunk_len = chunk.len();
             let base = chunk_base;
-        let screened_rows: Vec<(Option<QualityCandidate>, crate::trial_returns::TrialReturnRow)> =
-            chunk
-            .into_par_iter()
-            .enumerate()
-            .map(|(local_position, ((candidate_idx, gene), sig))| {
+            let screened_rows: Vec<(
+                Option<QualityCandidate>,
+                crate::trial_returns::TrialReturnRow,
+            )> = chunk
+                .into_par_iter()
+                .enumerate()
+                .map(|(local_position, ((candidate_idx, gene), sig))| {
                 let position = base + local_position;
                 let trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,

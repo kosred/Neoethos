@@ -131,28 +131,6 @@ at the bottom.
 - **Recommendation:** set only for offline backtests / paper trading
   where no live broker is connected.
 
-### `NEOETHOS_BOT_PNL_AUDIT_DRIFT_FRACTION`
-- **Type:** `f64`, clamped `[1e-5, 0.05]`
-- **Default:** `0.001` (0.1 %)
-- **Effect:** drift threshold for the PnL audit log. When broker-side
-  unrealized PnL diverges from local mark-to-market by more than this
-  fraction of notional, a warning is logged. Helps detect bad
-  pip-value mappings before they cost money.
-- **Conservative:** `0.0005` (5bp — alert on small drift)
-- **Balanced:** `0.001` (10bp — default)
-- **Aggressive:** `0.005` (50bp — only loud drift)
-
-### `NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION`
-- **Type:** `f64`, clamped `[1e-4, 0.20]`
-- **Default:** `0.01` (1 %)
-- **Effect:** circuit-breaker threshold. When drift exceeds this
-  fraction of notional, the auto-trader halts pending operator review.
-  Upper bound is 20% so the breaker cannot be silenced by a typo.
-- **Conservative:** `0.005` (50bp — halt on small drift)
-- **Balanced:** `0.01`
-- **Aggressive:** `0.05` (5%) — only halt on major drift; not
-  recommended for prop-firm runs.
-
 ### `NEOETHOS_PROP_FIRM_PRESET` — **RETIRED in v0.4.36. INERT. Setting it changes nothing.**
 - **Set it instead:** `risk.preset` in the config file — enum `ftmo` |
   `myforexfunds` | `fundednext` | `the5ers` | `none`. The preset re-derives the

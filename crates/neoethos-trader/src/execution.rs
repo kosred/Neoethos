@@ -31,7 +31,7 @@ use crate::contracts::{ExecReport, ExecStatus, ExecutionAdapter, TradeIntent};
 /// `half_spread_price` is charged on BOTH legs (buy at ask, sell at bid), which
 /// is how a full round-turn spread gets paid exactly once.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReplayCostModel {
+pub(crate) struct ReplayCostModel {
     /// Half the quoted spread, in price units. Charged adversely on entry and
     /// on exit.
     pub half_spread_price: f64,
@@ -104,23 +104,11 @@ impl ReplayCostModel {
     }
 }
 
-/// One recorded simulated fill (for assertions + a dry-run trade log).
-#[derive(Debug, Clone)]
-pub struct MockFill {
-    pub kind: &'static str,
-    /// The price the engine observed (pre-cost).
-    pub mark_price: f64,
-    pub report: ExecReport,
-    /// Commission charged on this fill, in account currency.
-    pub commission: f64,
-}
-
 /// Simulates execution in-memory. Optionally rejects a fraction of intents to
 /// let tests exercise the rejection path (default: fill everything).
 #[derive(Debug, Default)]
-pub struct MockExecutionAdapter {
+pub(crate) struct MockExecutionAdapter {
     next_id: u64,
-    fills: Vec<MockFill>,
     costs: ReplayCostModel,
     commission_charged: f64,
     /// Direction + volume of each open position id, so a Close can be filled on
@@ -129,30 +117,12 @@ pub struct MockExecutionAdapter {
 }
 
 impl MockExecutionAdapter {
-    /// Zero-cost adapter — the historical Phase-1 behaviour, preserved so
-    /// existing loop tests keep asserting the mechanics rather than the costs.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Adapter that charges `costs` on every fill.
     pub fn with_costs(costs: ReplayCostModel) -> Self {
         Self {
             costs,
             ..Self::default()
         }
-    }
-
-    pub fn fills(&self) -> &[MockFill] {
-        &self.fills
-    }
-
-    pub fn fill_count(&self) -> usize {
-        self.fills.len()
-    }
-
-    pub fn cost_model(&self) -> ReplayCostModel {
-        self.costs
     }
 
     fn alloc_position_id(&mut self) -> String {
@@ -228,12 +198,6 @@ impl ExecutionAdapter for MockExecutionAdapter {
             },
         };
         self.commission_charged += commission;
-        self.fills.push(MockFill {
-            kind: intent.kind(),
-            mark_price,
-            report: report.clone(),
-            commission,
-        });
         Ok(report)
     }
 

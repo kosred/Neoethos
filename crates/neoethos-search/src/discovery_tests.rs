@@ -841,8 +841,14 @@ fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
         + census.label_vertical_short
         + census.label_ambiguous_short
         + census.label_undefined;
-    assert_eq!(counted_long, n, "long census does not cover every bar ({census:?})");
-    assert_eq!(counted_short, n, "short census does not cover every bar ({census:?})");
+    assert_eq!(
+        counted_long, n,
+        "long census does not cover every bar ({census:?})"
+    );
+    assert_eq!(
+        counted_short, n,
+        "short census does not cover every bar ({census:?})"
+    );
     assert!(
         census.label_up > 0,
         "an uptrending series with a reachable 2-ATR target must produce upper-barrier hits, \
@@ -1686,6 +1692,14 @@ fn valid_discovery_config() -> DiscoveryConfig {
     }
 }
 
+fn assert_broker_truth_precedes_legacy_config_math(error: &anyhow::Error) {
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1),
+        "discovery reached legacy config/cost handling before broker truth: {message}"
+    );
+}
+
 #[test]
 fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let features = sample_feature_frame();
@@ -1693,11 +1707,7 @@ fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let mut cfg = valid_discovery_config();
     cfg.evaluation_symbol = String::new();
     let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty symbol must bail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("evaluation_symbol is empty"),
-        "expected symbol-empty diagnostic, got: {msg}"
-    );
+    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -1708,11 +1718,7 @@ fn run_discovery_cycle_bails_on_empty_account_currency() {
     cfg.evaluation_account_currency = String::new();
     let err =
         run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty account_currency must bail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("evaluation_account_currency"),
-        "expected account-ccy-empty diagnostic, got: {msg}"
-    );
+    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -1722,10 +1728,7 @@ fn run_discovery_cycle_bails_on_nan_spread() {
     let mut cfg = valid_discovery_config();
     cfg.evaluation_spread_pips = f64::NAN;
     let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN spread must bail");
-    assert!(
-        err.to_string().contains("evaluation_spread_pips"),
-        "expected spread diagnostic, got: {err}"
-    );
+    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -1735,10 +1738,7 @@ fn run_discovery_cycle_bails_on_nan_commission() {
     let mut cfg = valid_discovery_config();
     cfg.evaluation_commission_per_trade = f64::NAN;
     let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN commission must bail");
-    assert!(
-        err.to_string().contains("evaluation_commission_per_trade"),
-        "expected commission diagnostic, got: {err}"
-    );
+    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -1749,10 +1749,7 @@ fn run_discovery_cycle_bails_on_whitespace_only_currency() {
     cfg.evaluation_account_currency = "   ".to_string();
     let err = run_discovery_cycle(&features, &ohlcv, &cfg)
         .expect_err("whitespace-only currency must bail");
-    assert!(
-        err.to_string().contains("evaluation_account_currency"),
-        "expected ccy-empty diagnostic, got: {err}"
-    );
+    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -2571,7 +2568,12 @@ fn the_target_profile_separates_win_rate_from_payoff() {
 fn display_mode_matches_the_engine_mode() {
     // (trading_mode, discovery_mode) -> the mode string the report must print.
     let cases: &[(&str, &str, &str, DiscoveryMode)] = &[
-        ("prop_firm", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
+        (
+            "prop_firm",
+            "prop_firm",
+            "prop_firm",
+            DiscoveryMode::PropFirm,
+        ),
         ("risky", "prop_firm", "risky", DiscoveryMode::Risky),
         ("growth", "prop_firm", "risky", DiscoveryMode::Risky),
         // The escape hatch wins over the master switch, in both vocabularies.
@@ -2580,7 +2582,12 @@ fn display_mode_matches_the_engine_mode() {
         ("risky", "legacy", "strict", DiscoveryMode::Strict),
         // Unknown trading modes fall back to prop_firm on both sides.
         ("", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
-        ("nonsense", "prop_firm", "prop_firm", DiscoveryMode::PropFirm),
+        (
+            "nonsense",
+            "prop_firm",
+            "prop_firm",
+            DiscoveryMode::PropFirm,
+        ),
     ];
 
     for (trading_mode, discovery_mode, expected_label, expected_engine) in cases {
@@ -2626,7 +2633,15 @@ fn discovery_mode_accepts_only_strict_and_legacy() {
             "models.discovery_mode = {accepted:?} must select the Strict pipeline"
         );
     }
-    for no_op in ["", "  ", "risky", "prop_firm", "growth", "permissive", "nonsense"] {
+    for no_op in [
+        "",
+        "  ",
+        "risky",
+        "prop_firm",
+        "growth",
+        "permissive",
+        "nonsense",
+    ] {
         assert_eq!(
             discovery_mode_from_config(no_op),
             None,
@@ -2815,7 +2830,8 @@ fn display_floors_match_the_enforced_ones() {
         // overrides, so this is the post-override floor set.
         let enforced = DiscoveryConfig::from_settings(&settings).filtering;
         // What `neoethos-cli config` and the Settings UI will print.
-        let shown = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings).filters;
+        let shown =
+            neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings).filters;
 
         let ctx = format!("trading_mode={trading_mode:?} discovery_mode={discovery_mode:?}");
         assert_eq!(
@@ -2886,7 +2902,6 @@ fn choosing_a_mode_changes_what_the_mode_says_it_changes() {
         strict.filtering.max_dd
     );
 }
-
 
 /// The "nonzero_signals" stage builds the SMC gate arrays once for the whole
 /// candidate pool instead of once per candidate. Pins that the pool-wide build
@@ -3449,112 +3464,382 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
     // justify why it cannot change selection.
     let table: &[(&str, KnobClass)] = &[
         // ── GA selection knobs (genetic::runtime_overrides) ──
-        ("NEOETHOS_BOT_DISABLE_SMC_GATE", Profile("/execution/genetic_search/smc_gate/disable_gate")),
-        ("NEOETHOS_BOT_NOVELTY_WEIGHT", Profile("/execution/genetic_search/novelty_weight")),
-        ("NEOETHOS_BOT_PROP_ARCHIVE_CAP", Profile("/execution/genetic_search/archive_cap_override")),
-        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET", Profile("/execution/genetic_search/archive_scoring/min_net")),
-        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF", Profile("/execution/genetic_search/archive_scoring/min_pf")),
-        ("NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE", Profile("/execution/genetic_search/archive_scoring/min_sharpe")),
-        ("NEOETHOS_BOT_PROP_ARCHIVE_MODE", Profile("/execution/genetic_search/archive_scoring/mode")),
-        ("NEOETHOS_BOT_PROP_CONVERGENCE_GENS", Profile("/execution/genetic_search/convergence_patience")),
-        ("NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC", Profile("/execution/genetic_search/convergence_min_elapsed_fraction")),
-        ("NEOETHOS_BOT_PROP_ELITE_FRACTION", Profile("/execution/genetic_search/selection/survivor_fraction")),
-        ("NEOETHOS_BOT_PROP_MIN_IMPROVEMENT", Profile("/execution/genetic_search/min_improvement")),
-        ("NEOETHOS_BOT_PROP_PARENT_SELECTION", Profile("/execution/genetic_search/selection/parent")),
-        ("NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS", Profile("/execution/genetic_search/selection/immigrant_ratio")),
-        ("NEOETHOS_BOT_PROP_SEEN_RETRY", Profile("/execution/genetic_search/seen_retry_attempts")),
-        ("NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE", Profile("/execution/genetic_search/selection/temperature")),
-        ("NEOETHOS_BOT_PROP_SMC_GATE_CURVE", Profile("/execution/genetic_search/smc_gate/curve")),
-        ("NEOETHOS_BOT_PROP_SMC_GATE_END", Profile("/execution/genetic_search/smc_gate/end")),
-        ("NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP", Profile("/execution/genetic_search/smc_gate/stagnation_step")),
-        ("NEOETHOS_BOT_PROP_SMC_GATE_START", Profile("/execution/genetic_search/smc_gate/start")),
-        ("NEOETHOS_BOT_PROP_STAGNATION_GENS", Profile("/execution/genetic_search/stagnation_patience")),
-        ("NEOETHOS_BOT_PROP_SURVIVOR_FRACTION", Profile("/execution/genetic_search/selection/survivor_fraction")),
-        ("NEOETHOS_BOT_PROP_SURVIVOR_SELECTION", Profile("/execution/genetic_search/selection/survivor")),
-        ("NEOETHOS_BOT_PROP_TOURNAMENT_SIZE", Profile("/execution/genetic_search/tournament_size_override")),
-        ("NEOETHOS_BOT_SEARCH_SEED", Profile("/execution/genetic_search/seed")),
+        (
+            "NEOETHOS_BOT_DISABLE_SMC_GATE",
+            Profile("/execution/genetic_search/smc_gate/disable_gate"),
+        ),
+        (
+            "NEOETHOS_BOT_NOVELTY_WEIGHT",
+            Profile("/execution/genetic_search/novelty_weight"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ARCHIVE_CAP",
+            Profile("/execution/genetic_search/archive_cap_override"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ARCHIVE_MIN_NET",
+            Profile("/execution/genetic_search/archive_scoring/min_net"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ARCHIVE_MIN_PF",
+            Profile("/execution/genetic_search/archive_scoring/min_pf"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ARCHIVE_MIN_SHARPE",
+            Profile("/execution/genetic_search/archive_scoring/min_sharpe"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ARCHIVE_MODE",
+            Profile("/execution/genetic_search/archive_scoring/mode"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_CONVERGENCE_GENS",
+            Profile("/execution/genetic_search/convergence_patience"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_CONVERGENCE_MIN_ELAPSED_FRAC",
+            Profile("/execution/genetic_search/convergence_min_elapsed_fraction"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_ELITE_FRACTION",
+            Profile("/execution/genetic_search/selection/survivor_fraction"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_MIN_IMPROVEMENT",
+            Profile("/execution/genetic_search/min_improvement"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_PARENT_SELECTION",
+            Profile("/execution/genetic_search/selection/parent"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_RANDOM_IMMIGRANTS",
+            Profile("/execution/genetic_search/selection/immigrant_ratio"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SEEN_RETRY",
+            Profile("/execution/genetic_search/seen_retry_attempts"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SELECTION_TEMPERATURE",
+            Profile("/execution/genetic_search/selection/temperature"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_GATE_CURVE",
+            Profile("/execution/genetic_search/smc_gate/curve"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_GATE_END",
+            Profile("/execution/genetic_search/smc_gate/end"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_GATE_STAGNATION_STEP",
+            Profile("/execution/genetic_search/smc_gate/stagnation_step"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_GATE_START",
+            Profile("/execution/genetic_search/smc_gate/start"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_STAGNATION_GENS",
+            Profile("/execution/genetic_search/stagnation_patience"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SURVIVOR_FRACTION",
+            Profile("/execution/genetic_search/selection/survivor_fraction"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SURVIVOR_SELECTION",
+            Profile("/execution/genetic_search/selection/survivor"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_TOURNAMENT_SIZE",
+            Profile("/execution/genetic_search/tournament_size_override"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_SEED",
+            Profile("/execution/genetic_search/seed"),
+        ),
         // ── Evaluation cost profile + SMC weights ──
-        ("NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY", Profile("/execution/strategy_eval/cost_profile/account_currency")),
-        ("NEOETHOS_BOT_PROP_COMMISSION", Profile("/execution/strategy_eval/cost_profile/commission_per_trade")),
-        ("NEOETHOS_BOT_PROP_PIP_VALUE", Profile("/execution/strategy_eval/cost_profile/pip_value")),
-        ("NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT", Profile("/execution/strategy_eval/cost_profile/pip_value_per_lot")),
-        ("NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", Profile("/execution/strategy_eval/cost_profile/quote_to_account_rate")),
-        ("NEOETHOS_BOT_PROP_SPREAD_PIPS", Profile("/execution/strategy_eval/cost_profile/spread_pips")),
-        ("NEOETHOS_BOT_PROP_SMC_GATE", Profile("/execution/strategy_eval/smc_weights/gate_threshold")),
-        ("NEOETHOS_BOT_PROP_SMC_W_BOS", Profile("/execution/strategy_eval/smc_weights/w_bos")),
-        ("NEOETHOS_BOT_PROP_SMC_W_CHOCH", Profile("/execution/strategy_eval/smc_weights/w_choch")),
-        ("NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT", Profile("/execution/strategy_eval/smc_weights/w_displacement")),
-        ("NEOETHOS_BOT_PROP_SMC_W_EQH", Profile("/execution/strategy_eval/smc_weights/w_eqh")),
-        ("NEOETHOS_BOT_PROP_SMC_W_EQL", Profile("/execution/strategy_eval/smc_weights/w_eql")),
-        ("NEOETHOS_BOT_PROP_SMC_W_FVG", Profile("/execution/strategy_eval/smc_weights/w_fvg")),
-        ("NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT", Profile("/execution/strategy_eval/smc_weights/w_inducement")),
-        ("NEOETHOS_BOT_PROP_SMC_W_LIQ", Profile("/execution/strategy_eval/smc_weights/w_liq")),
-        ("NEOETHOS_BOT_PROP_SMC_W_MTF", Profile("/execution/strategy_eval/smc_weights/w_mtf")),
-        ("NEOETHOS_BOT_PROP_SMC_W_OB", Profile("/execution/strategy_eval/smc_weights/w_ob")),
-        ("NEOETHOS_BOT_PROP_SMC_W_PREMIUM", Profile("/execution/strategy_eval/smc_weights/w_premium")),
-        ("NEOETHOS_BOT_PROP_SYMBOL", Profile("/execution/strategy_eval/cost_profile/symbol")),
-        ("NEOETHOS_BOT_REJECT_PIP_FALLBACK", Profile("/execution/strategy_eval/cost_profile/reject_pip_fallback")),
+        (
+            "NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY",
+            Profile("/execution/strategy_eval/cost_profile/account_currency"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_COMMISSION",
+            Profile("/execution/strategy_eval/cost_profile/commission_per_trade"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_PIP_VALUE",
+            Profile("/execution/strategy_eval/cost_profile/pip_value"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_PIP_VALUE_PER_LOT",
+            Profile("/execution/strategy_eval/cost_profile/pip_value_per_lot"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_QUOTE_TO_ACCOUNT_RATE",
+            Profile("/execution/strategy_eval/cost_profile/quote_to_account_rate"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SPREAD_PIPS",
+            Profile("/execution/strategy_eval/cost_profile/spread_pips"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_GATE",
+            Profile("/execution/strategy_eval/smc_weights/gate_threshold"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_BOS",
+            Profile("/execution/strategy_eval/smc_weights/w_bos"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_CHOCH",
+            Profile("/execution/strategy_eval/smc_weights/w_choch"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_DISPLACEMENT",
+            Profile("/execution/strategy_eval/smc_weights/w_displacement"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_EQH",
+            Profile("/execution/strategy_eval/smc_weights/w_eqh"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_EQL",
+            Profile("/execution/strategy_eval/smc_weights/w_eql"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_FVG",
+            Profile("/execution/strategy_eval/smc_weights/w_fvg"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_INDUCEMENT",
+            Profile("/execution/strategy_eval/smc_weights/w_inducement"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_LIQ",
+            Profile("/execution/strategy_eval/smc_weights/w_liq"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_MTF",
+            Profile("/execution/strategy_eval/smc_weights/w_mtf"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_OB",
+            Profile("/execution/strategy_eval/smc_weights/w_ob"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_W_PREMIUM",
+            Profile("/execution/strategy_eval/smc_weights/w_premium"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SYMBOL",
+            Profile("/execution/strategy_eval/cost_profile/symbol"),
+        ),
+        (
+            "NEOETHOS_BOT_REJECT_PIP_FALLBACK",
+            Profile("/execution/strategy_eval/cost_profile/reject_pip_fallback"),
+        ),
         // ── Backtest arithmetic + threads ──
-        ("NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY", Profile("/execution/backtest/initial_equity")),
-        ("NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS", Profile("/execution/backtest/month_capacity")),
-        ("NEOETHOS_BOT_RUST_THREADS", Profile("/execution/backtest/rayon_threads")),
-        ("RAYON_NUM_THREADS", Profile("/execution/backtest/rayon_threads")),
+        (
+            "NEOETHOS_BOT_BACKTEST_INITIAL_EQUITY",
+            Profile("/execution/backtest/initial_equity"),
+        ),
+        (
+            "NEOETHOS_BOT_BACKTEST_MAX_MONTH_BUCKETS",
+            Profile("/execution/backtest/month_capacity"),
+        ),
+        (
+            "NEOETHOS_BOT_RUST_THREADS",
+            Profile("/execution/backtest/rayon_threads"),
+        ),
+        (
+            "RAYON_NUM_THREADS",
+            Profile("/execution/backtest/rayon_threads"),
+        ),
         // ── Quality screen ──
-        ("NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH", Profile("/execution/quality/min_trades_per_month")),
-        ("NEOETHOS_BOT_TRADING_DAYS_PER_MONTH", Profile("/execution/quality/trading_days_per_month")),
+        (
+            "NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH",
+            Profile("/execution/quality/min_trades_per_month"),
+        ),
+        (
+            "NEOETHOS_BOT_TRADING_DAYS_PER_MONTH",
+            Profile("/execution/quality/trading_days_per_month"),
+        ),
         // ── Seen-signature memory (CROSS-RUN state) ──
-        ("NEOETHOS_BOT_PROP_SEEN_FILE", Profile("/execution/seen_memory/file_path")),
-        ("NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY", Profile("/execution/seen_memory/flush_every")),
-        ("NEOETHOS_BOT_PROP_SEEN_LOAD_MAX", Profile("/execution/seen_memory/load_max")),
-        ("NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES", Profile("/execution/seen_memory/max_entries")),
+        (
+            "NEOETHOS_BOT_PROP_SEEN_FILE",
+            Profile("/execution/seen_memory/file_path"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SEEN_FLUSH_EVERY",
+            Profile("/execution/seen_memory/flush_every"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SEEN_LOAD_MAX",
+            Profile("/execution/seen_memory/load_max"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SEEN_MAX_ENTRIES",
+            Profile("/execution/seen_memory/max_entries"),
+        ),
         // ── SMC gene-injection probabilities ──
         // ENABLE_P is the umbrella default for every p_* field and
         // FORCE_ENABLED=false zeroes force_ratio+min_flags; the profile
         // records the RESOLVED per-field values, so both umbrellas are
         // covered by the fields they feed.
-        ("NEOETHOS_BOT_PROP_SMC_ENABLE_P", Profile("/execution/smc_search/p_ob")),
-        ("NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED", Profile("/execution/smc_search/force_ratio")),
-        ("NEOETHOS_BOT_PROP_SMC_FORCE_RATIO", Profile("/execution/smc_search/force_ratio")),
-        ("NEOETHOS_BOT_PROP_SMC_MIN_FLAGS", Profile("/execution/smc_search/min_flags")),
-        ("NEOETHOS_BOT_PROP_SMC_P_BOS", Profile("/execution/smc_search/p_bos")),
-        ("NEOETHOS_BOT_PROP_SMC_P_CHOCH", Profile("/execution/smc_search/p_choch")),
-        ("NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT", Profile("/execution/smc_search/p_displacement")),
-        ("NEOETHOS_BOT_PROP_SMC_P_EQH", Profile("/execution/smc_search/p_eqh")),
-        ("NEOETHOS_BOT_PROP_SMC_P_EQL", Profile("/execution/smc_search/p_eql")),
-        ("NEOETHOS_BOT_PROP_SMC_P_FVG", Profile("/execution/smc_search/p_fvg")),
-        ("NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT", Profile("/execution/smc_search/p_inducement")),
-        ("NEOETHOS_BOT_PROP_SMC_P_LIQ", Profile("/execution/smc_search/p_liq")),
-        ("NEOETHOS_BOT_PROP_SMC_P_MTF", Profile("/execution/smc_search/p_mtf")),
-        ("NEOETHOS_BOT_PROP_SMC_P_OB", Profile("/execution/smc_search/p_ob")),
-        ("NEOETHOS_BOT_PROP_SMC_P_PREMIUM", Profile("/execution/smc_search/p_premium")),
+        (
+            "NEOETHOS_BOT_PROP_SMC_ENABLE_P",
+            Profile("/execution/smc_search/p_ob"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_FORCE_ENABLED",
+            Profile("/execution/smc_search/force_ratio"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_FORCE_RATIO",
+            Profile("/execution/smc_search/force_ratio"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_MIN_FLAGS",
+            Profile("/execution/smc_search/min_flags"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_BOS",
+            Profile("/execution/smc_search/p_bos"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_CHOCH",
+            Profile("/execution/smc_search/p_choch"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_DISPLACEMENT",
+            Profile("/execution/smc_search/p_displacement"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_EQH",
+            Profile("/execution/smc_search/p_eqh"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_EQL",
+            Profile("/execution/smc_search/p_eql"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_FVG",
+            Profile("/execution/smc_search/p_fvg"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_INDUCEMENT",
+            Profile("/execution/smc_search/p_inducement"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_LIQ",
+            Profile("/execution/smc_search/p_liq"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_MTF",
+            Profile("/execution/smc_search/p_mtf"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_OB",
+            Profile("/execution/smc_search/p_ob"),
+        ),
+        (
+            "NEOETHOS_BOT_PROP_SMC_P_PREMIUM",
+            Profile("/execution/smc_search/p_premium"),
+        ),
         // ── Adaptive stops ──
-        ("NEOETHOS_ADAPTIVE_STOPS", Profile("/execution/adaptive_stops_enabled")),
-        ("NEOETHOS_ADAPTIVE_STOP_RR", Profile("/execution/adaptive_stops_rr")),
+        (
+            "NEOETHOS_ADAPTIVE_STOPS",
+            Profile("/execution/adaptive_stops_enabled"),
+        ),
+        (
+            "NEOETHOS_ADAPTIVE_STOP_RR",
+            Profile("/execution/adaptive_stops_rr"),
+        ),
         // ── Feature cube (neoethos-data) ──
         // The RESOLVED value of `models.data_runtime.feature_cube_mode`, which
         // replaced the env var. Recorded, not exempted: the RAM and disk
         // assemblies are bit-identical BY TEST, not by construction, so the
         // artifact must say which one built the cube a run searched over.
-        ("NEOETHOS_FEATURE_CUBE_MODE", Profile("/execution/feature_cube_mode")),
+        (
+            "NEOETHOS_FEATURE_CUBE_MODE",
+            Profile("/execution/feature_cube_mode"),
+        ),
         // ── GPU lane ──
-        ("NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL", Profile("/execution/gpu/cuda_backtest_kernel_enabled")),
-        ("NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS", Profile("/execution/gpu/cuda_backtest_kernel_units")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", Profile("/execution/gpu/cuda_device_id")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES", Profile("/execution/gpu/multi_cuda_devices_env")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL", Profile("/execution/gpu/cuda_eval_kernel_enabled")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS", Profile("/execution/gpu/cuda_eval_kernel_units")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_PRECISION", Profile("/execution/gpu/cuda_precision")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", Profile("/execution/gpu/wgpu_device_env")),
-        ("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES", Profile("/execution/gpu/multi_wgpu_devices_env")),
-        ("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB", Profile("/execution/gpu/gpu_buffer_mb_env")),
-        ("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB", Profile("/execution/gpu/host_budget_mb_env")),
-        ("NEOETHOS_BOT_SEARCH_USE_IGPU", Profile("/execution/gpu/use_igpu_env")),
-        ("NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB", Profile("/execution/gpu/vram_budget_mb_env")),
-        ("NEOETHOS_BOT_TRAIN_PRECISION", Profile("/execution/gpu/cuda_precision")),
-        ("FOREX_TRAIN_PRECISION", Profile("/execution/gpu/cuda_precision")),
-        ("NEOETHOS_GPU_F64", Profile("/execution/gpu/gpu_f64_backtest")),
-        ("NEOETHOS_GPU_FUSED_EVAL", Profile("/execution/gpu/fused_eval_decision")),
-        ("NEOETHOS_REQUIRE_GPU", Profile("/execution/gpu/require_gpu_env")),
+        (
+            "NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL",
+            Profile("/execution/gpu/cuda_backtest_kernel_enabled"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS",
+            Profile("/execution/gpu/cuda_backtest_kernel_units"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE",
+            Profile("/execution/gpu/cuda_device_id"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES",
+            Profile("/execution/gpu/multi_cuda_devices_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL",
+            Profile("/execution/gpu/cuda_eval_kernel_enabled"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS",
+            Profile("/execution/gpu/cuda_eval_kernel_units"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
+            Profile("/execution/gpu/cuda_precision"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE",
+            Profile("/execution/gpu/wgpu_device_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES",
+            Profile("/execution/gpu/multi_wgpu_devices_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB",
+            Profile("/execution/gpu/gpu_buffer_mb_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB",
+            Profile("/execution/gpu/host_budget_mb_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_USE_IGPU",
+            Profile("/execution/gpu/use_igpu_env"),
+        ),
+        (
+            "NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB",
+            Profile("/execution/gpu/vram_budget_mb_env"),
+        ),
+        (
+            "NEOETHOS_BOT_TRAIN_PRECISION",
+            Profile("/execution/gpu/cuda_precision"),
+        ),
+        (
+            "FOREX_TRAIN_PRECISION",
+            Profile("/execution/gpu/cuda_precision"),
+        ),
+        (
+            "NEOETHOS_GPU_F64",
+            Profile("/execution/gpu/gpu_f64_backtest"),
+        ),
+        (
+            "NEOETHOS_GPU_FUSED_EVAL",
+            Profile("/execution/gpu/fused_eval_decision"),
+        ),
+        (
+            "NEOETHOS_REQUIRE_GPU",
+            Profile("/execution/gpu/require_gpu_env"),
+        ),
         (
             "NEOETHOS_BOT_SEARCH_VRAM_LOG",
             DiagnosticOnly(
@@ -3572,17 +3857,41 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         ),
         // ── Discovery config knobs (legacy env names; config-driven now, the
         //    profile records the RESOLVED config value) ──
-        ("NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY", Profile("/min_trades_per_day")),
+        (
+            "NEOETHOS_BOT_DISCOVERY_MIN_TRADES_PER_DAY",
+            Profile("/min_trades_per_day"),
+        ),
         ("NEOETHOS_BOT_DISCOVERY_MODE", Profile("/mode")),
         ("NEOETHOS_BOT_DISCOVERY_PERMISSIVE", Profile("/mode")),
-        ("NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE", Profile("/prop_firm_gate_params")),
-        ("NEOETHOS_BOT_FUNNEL_STAGE1_PCT", Profile("/funnel_stage1_pct")),
-        ("NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW", Profile("/stage1_window")),
-        ("NEOETHOS_BOT_MIN_HISTORY_YEARS", Profile("/min_history_years")),
-        ("NEOETHOS_BOT_PREFILTER_INSAMPLE", Profile("/prefilter_insample_frac")),
-        ("NEOETHOS_BOT_PREFILTER_MIN_PER_TF", Profile("/prefilter_min_per_timeframe")),
+        (
+            "NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE",
+            Profile("/prop_firm_gate_params"),
+        ),
+        (
+            "NEOETHOS_BOT_FUNNEL_STAGE1_PCT",
+            Profile("/funnel_stage1_pct"),
+        ),
+        (
+            "NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW",
+            Profile("/stage1_window"),
+        ),
+        (
+            "NEOETHOS_BOT_MIN_HISTORY_YEARS",
+            Profile("/min_history_years"),
+        ),
+        (
+            "NEOETHOS_BOT_PREFILTER_INSAMPLE",
+            Profile("/prefilter_insample_frac"),
+        ),
+        (
+            "NEOETHOS_BOT_PREFILTER_MIN_PER_TF",
+            Profile("/prefilter_min_per_timeframe"),
+        ),
         ("NEOETHOS_BOT_PREFILTER_TOP_K", Profile("/prefilter_top_k")),
-        ("NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS", Profile("/adaptive_thresholds")),
+        (
+            "NEOETHOS_BOT_PROP_ADAPTIVE_THRESHOLDS",
+            Profile("/adaptive_thresholds"),
+        ),
     ];
 
     // 1. The profile the classification is checked against: default config +
@@ -3661,9 +3970,11 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
     // iteration order leaking into the JSON (max_rows_by_timeframe is a
     // BTreeMap in the profile for exactly this reason).
     let mut config = DiscoveryConfig::default();
-    config
-        .max_rows_by_timeframe
-        .extend([("M1".to_string(), 100), ("M5".to_string(), 200), ("H1".to_string(), 50)]);
+    config.max_rows_by_timeframe.extend([
+        ("M1".to_string(), 100),
+        ("M5".to_string(), 200),
+        ("H1".to_string(), 50),
+    ]);
     let result = DiscoveryResult {
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
@@ -3679,10 +3990,16 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         funnel_profile: None,
         effective_smc_gate_threshold: f32::NAN,
     };
-    let a = serde_json::to_string(&build_discovery_profile(&config, &result))
-        .expect("profile must serialize");
-    let b = serde_json::to_string(&build_discovery_profile(&config, &result))
-        .expect("profile must serialize");
+    let mut a = build_discovery_profile(&config, &result);
+    let mut b = build_discovery_profile(&config, &result);
+    // Engine observations are intentionally process-global ambient telemetry
+    // and other parallel tests may add a bit between these two snapshots. The
+    // dedicated engine-profile test below verifies that field. Remove only
+    // that documented ambient input before checking deterministic encoding.
+    a.population_eval_engines.clear();
+    b.population_eval_engines.clear();
+    let a = serde_json::to_string(&a).expect("profile must serialize");
+    let b = serde_json::to_string(&b).expect("profile must serialize");
     assert_eq!(
         a, b,
         "two profile builds from the same config+environment serialized \
@@ -3985,7 +4302,10 @@ fn the_funnel_keeps_every_reject_reason_the_quality_screen_records() {
 #[test]
 fn a_cost_band_below_the_charged_cost_cannot_discriminate() {
     let baseline = crate::run_identity::cost_pips_round_trip(2.0, 14.0, 10.0);
-    assert!((baseline - 3.4).abs() < 1e-12, "shipped baseline is 3.4 pips");
+    assert!(
+        (baseline - 3.4).abs() < 1e-12,
+        "shipped baseline is 3.4 pips"
+    );
 
     assert!(
         !crate::discovery::cost_band_discriminates(Some((1.6, 2.4)), baseline),

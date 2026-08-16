@@ -638,7 +638,6 @@ fn main() -> anyhow::Result<()> {
         evidence: RowEvidence,
         /// Rows the repaired function used in the single 80% prefix window.
         prefix_used: u64,
-        prefix_skipped: u64,
     }
 
     let rows: Vec<Row> = (0..n_cols)
@@ -750,7 +749,6 @@ fn main() -> anyhow::Result<()> {
                 },
                 evidence: ev,
                 prefix_used: o.used as u64,
-                prefix_skipped: o.skipped as u64,
             }
         })
         .collect();

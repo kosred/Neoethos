@@ -42,6 +42,13 @@ pub struct PopulationEvalInputs<'a> {
 
 static RAYON_INIT: Once = Once::new();
 
+fn require_broker_real_historical_evaluation() -> anyhow::Result<()> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+}
+
 fn init_rayon() {
     RAYON_INIT.call_once(|| {
         // F-695 closure (2026-05-25 — F-CORE3): resolved through the
@@ -122,7 +129,7 @@ impl SessionSpreadProfile {
     }
 
     /// Resolve the bucket spread (pips) for a UTC unix-millisecond timestamp.
-    pub fn spread_pips_at(self, timestamp_ms: i64) -> f64 {
+    pub(crate) fn spread_pips_at(self, timestamp_ms: i64) -> f64 {
         match Self::bucket_index(timestamp_ms) {
             1 => self.overlap_pips,
             2 => self.late_ny_pips,
@@ -238,18 +245,6 @@ pub struct BacktestSettings {
     pub adaptive_rr: f64,
 }
 
-impl BacktestSettings {
-    /// Resolve the spread in pips for a single bar. Uses the typed
-    /// session profile when set, else the scalar `spread_pips`.
-    #[inline]
-    pub fn spread_pips_for_bar(&self, timestamp_ms: i64) -> f64 {
-        match self.session_spread_profile {
-            Some(profile) if timestamp_ms > 0 => profile.spread_pips_at(timestamp_ms),
-            _ => self.spread_pips,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BacktestMetrics {
     pub net_profit: f64,
@@ -294,8 +289,7 @@ pub const BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX: usize = 7;
 impl BacktestMetrics {
     /// Index of `monthly_target_hit_rate` in the array form. See
     /// [`BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX`] for history and producers.
-    pub const MONTHLY_TARGET_HIT_RATE_INDEX: usize =
-        BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX;
+    pub const MONTHLY_TARGET_HIT_RATE_INDEX: usize = BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX;
 
     pub fn from_metric_array(metrics: [f64; 11]) -> Self {
         // metrics[7] is monthly_target_hit_rate (see the const's doc). The STRUCT
@@ -333,7 +327,7 @@ impl BacktestMetrics {
             self.profit_factor,
             self.expectancy,
             0.0, // slot 7: monthly_target_hit_rate is not modelled by this struct
-                 // — see BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX
+            // — see BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX
             self.trade_count as f64,
             self.consistency,
             self.max_daily_drawdown,
@@ -358,11 +352,9 @@ impl Default for BacktestSettings {
         // GROUP C remediation (operator directive 2026-05-25): the
         // previous code called `infer_market_cost_profile("", "", ...)`
         // which silently fell back to EURUSD/USD. We now emit NaN
-        // sentinels so any caller that uses Default::default() WITHOUT
-        // then binding a real symbol via `for_symbol(...)` will be
-        // caught by the downstream NaN-fitness guard. Production
-        // backtests MUST construct via `for_symbol(...)` — see
-        // [`BacktestSettings::for_symbol`].
+        // sentinels. `Default` is now structural/test scaffolding only:
+        // production financial entry points fail at the broker-truth boundary
+        // before any caller can turn these fields into trades or metrics.
         Self {
             sl_pips: 20.0,
             tp_pips: 40.0,
@@ -417,62 +409,6 @@ impl Default for BacktestSettings {
             adaptive_base_pips: None,
             adaptive_vol_mult: 0.0,
             adaptive_rr: 2.0,
-        }
-    }
-}
-
-impl BacktestSettings {
-    /// **F-003 fix** (2026-05-25 — operator directive: kill the EURUSD-
-    /// fallback path).
-    ///
-    /// Real-data backtest entry point. Resolves the per-symbol cost
-    /// profile via [`crate::genetic::strategy_gene::infer_market_cost_profile`]
-    /// and populates `pip_value`, `pip_value_per_lot`, `spread_pips`,
-    /// `commission_per_trade` from it. Non-cost knobs (sl_pips, tp_pips,
-    /// trailing, etc.) inherit from `Default::default()` — callers can
-    /// override post-construction with struct-update syntax.
-    ///
-    /// **Mirrors** [`crate::genetic::strategy_gene::EvaluationConfig::for_symbol`]
-    /// — the audit identified the latter as the template for this method.
-    /// The two together kill the F-002 / F-012 / F-025 / F-033 / F-050
-    /// EURUSD-leak chain (audit GROUP C extension).
-    ///
-    /// ## Behaviour on empty / missing inputs
-    ///
-    /// `infer_market_cost_profile` returns NaN sentinels for empty
-    /// symbol / account_currency. Callers that fail to supply those will
-    /// get a `BacktestSettings` with NaN cost fields, which the
-    /// downstream NaN-fitness guard (see audit GROUP C remediation
-    /// 2026-05-25) catches loudly. No silent EURUSD fallback.
-    pub fn for_symbol(
-        symbol: &str,
-        account_currency: &str,
-        price_hint: Option<f64>,
-        spread_pips_override: Option<f64>,
-        commission_override: Option<f64>,
-    ) -> Self {
-        let profile = crate::genetic::strategy_gene::infer_market_cost_profile(
-            symbol,
-            account_currency,
-            price_hint,
-            spread_pips_override,
-            commission_override,
-        );
-        Self {
-            pip_value: profile.pip_value,
-            pip_value_per_lot: profile.pip_value_per_lot,
-            spread_pips: profile.spread_pips,
-            commission_per_trade: profile.commission_per_trade,
-            // **Phase C (2026-05-28)** — propagate broker-supplied
-            // swap & conversion fee. `infer_market_cost_profile`
-            // returns 0.0 when the broker hasn't provided these on
-            // `SymbolMetadata`, so the production behaviour is
-            // "no charge if no broker data" (conservative-rosy);
-            // populated values yield the real broker-aligned cost.
-            swap_long_pips_per_day: profile.swap_long_pips_per_day,
-            swap_short_pips_per_day: profile.swap_short_pips_per_day,
-            pnl_conversion_fee_rate: profile.pnl_conversion_fee_rate,
-            ..Self::default()
         }
     }
 }
@@ -865,7 +801,7 @@ fn risk_based_pos_lots(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn fast_evaluate_strategy_core(
+pub(crate) fn fast_evaluate_strategy_core(
     close: &[f64],
     high: &[f64],
     low: &[f64],
@@ -883,7 +819,11 @@ pub fn fast_evaluate_strategy_core(
             crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
         }
     }
-    let _telemetry = TelemetryGuard("eval::fast_evaluate_strategy_core", 1, std::time::Instant::now());
+    let _telemetry = TelemetryGuard(
+        "eval::fast_evaluate_strategy_core",
+        1,
+        std::time::Instant::now(),
+    );
     let n = close.len();
     if n == 0 {
         return [0.0; 11];
@@ -1154,9 +1094,9 @@ pub fn fast_evaluate_strategy_core(
                             // without this the amount protected varies per gene and
                             // is often below the cost of the trade.
                             let locked = entry_px + settings.trailing_min_lock_pips * pip;
-                            let candidate =
-                                (hi - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                                    .max(locked);
+                            let candidate = (hi
+                                - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                .max(locked);
                             if trail_px == 0.0 || candidate > trail_px {
                                 trail_px = candidate;
                             }
@@ -1185,9 +1125,9 @@ pub fn fast_evaluate_strategy_core(
                             // Mirror of the long floor: never closer to entry than
                             // the locked profit.
                             let locked = entry_px - settings.trailing_min_lock_pips * pip;
-                            let candidate =
-                                (lo + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                                    .min(locked);
+                            let candidate = (lo
+                                + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
+                                .min(locked);
                             if trail_px == 0.0 || candidate < trail_px {
                                 trail_px = candidate;
                             }
@@ -1463,7 +1403,7 @@ fn finalize_daily_drawdown_segment(day_peak: f64, day_low: f64, max_daily_dd: &m
     }
 }
 
-pub fn simulate_trades_core(
+pub(crate) fn simulate_trades_core(
     close: &[f64],
     high: &[f64],
     low: &[f64],
@@ -1752,6 +1692,22 @@ pub fn simulate_trades_core(
     trades
 }
 
+/// Public broker-real trade simulation boundary. The raw OHLC/cost simulator
+/// stays crate-private so external callers cannot skip the typed capability.
+pub fn simulate_trades_broker_real(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    settings: &BacktestSettings,
+) -> anyhow::Result<Vec<Trade>> {
+    require_broker_real_historical_evaluation()?;
+    Ok(simulate_trades_core(
+        close, high, low, timestamps, signals, settings,
+    ))
+}
+
 /// Synthesize the per-gene SMC-gated signals plus a per-bar confidence in
 /// `[0,1]` used by the risk-based position sizer. (The CPU population
 /// evaluator's single signal+confidence source.) Confidence is `0.0` where
@@ -1963,6 +1919,13 @@ fn prototype_b_card_present() -> bool {
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
+    require_broker_real_historical_evaluation().map_err(|error| error.to_string())?;
+    evaluate_population_core_unchecked(inputs)
+}
+
+fn evaluate_population_core_unchecked(
+    inputs: PopulationEvalInputs<'_>,
+) -> Result<Vec<[f64; 11]>, String> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -1973,7 +1936,11 @@ pub fn evaluate_population_core(
             crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
         }
     }
-    let _telemetry = TelemetryGuard("eval::evaluate_population_core", _telemetry_items, _telemetry_started);
+    let _telemetry = TelemetryGuard(
+        "eval::evaluate_population_core",
+        _telemetry_items,
+        _telemetry_started,
+    );
     let PopulationEvalInputs {
         close,
         high,
@@ -2154,13 +2121,13 @@ pub fn evaluate_population_core(
                     // Logged once per process; the GA calls this every generation.
                     static LOGGED: std::sync::Once = std::sync::Once::new();
                     LOGGED.call_once(|| {
-                    tracing::info!(
-                        target: "neoethos_search::eval",
-                        n_genes,
-                        n_samples,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "population evaluated on the GPU (whole population, no CPU lane)"
-                    );
+                        tracing::info!(
+                            target: "neoethos_search::eval",
+                            n_genes,
+                            n_samples,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "population evaluated on the GPU (whole population, no CPU lane)"
+                        );
                     });
                     crate::eval_telemetry::record_device(
                         "population_eval",
@@ -2182,7 +2149,6 @@ pub fn evaluate_population_core(
                     ));
                 }
             }
-
         }
     }
 
@@ -2222,6 +2188,16 @@ pub fn evaluate_population_core(
     Ok(results)
 }
 
+/// Non-production mathematical reference used only by unit-level parity tests.
+/// Production callers cannot compile this symbol and must pass the broker-real
+/// capability gate in [`evaluate_population_core`].
+#[cfg(test)]
+pub(crate) fn evaluate_population_core_test_oracle(
+    inputs: PopulationEvalInputs<'_>,
+) -> Result<Vec<[f64; 11]>, String> {
+    evaluate_population_core_unchecked(inputs)
+}
+
 /// AREA 2 / Stage A (2026-06-09) — shared GPU-try + CPU-fallback entry for the
 /// **validation tail** (the post-search Monte-Carlo / re-evaluation screens that
 /// today run 100% on CPU). It takes the EXACT same [`PopulationEvalInputs`] shape
@@ -2252,7 +2228,7 @@ pub fn evaluate_population_core(
 /// `net_profit` sits within f32 epsilon of zero — the parity test
 /// `gpu_montecarlo_batch_matches_cpu` pins this to within ±1 run.
 #[cfg(feature = "gpu")]
-pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2263,7 +2239,11 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
             crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
         }
     }
-    let _telemetry = TelemetryGuard("eval::validation_backtest_population", _telemetry_items, _telemetry_started);
+    let _telemetry = TelemetryGuard(
+        "eval::validation_backtest_population",
+        _telemetry_items,
+        _telemetry_started,
+    );
     let PopulationEvalInputs {
         close,
         high,
@@ -2566,7 +2546,9 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
 /// and the in-process reference the GPU benchmark harness (Task 6) checks parity
 /// against. There is exactly one CPU population implementation, so the reference
 /// can never drift from what actually runs.
-pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+pub(crate) fn validation_backtest_population_cpu(
+    inputs: PopulationEvalInputs<'_>,
+) -> Vec<[f64; 11]> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2577,7 +2559,11 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
             crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
         }
     }
-    let _telemetry = TelemetryGuard("eval::validation_backtest_population_cpu", _telemetry_items, _telemetry_started);
+    let _telemetry = TelemetryGuard(
+        "eval::validation_backtest_population_cpu",
+        _telemetry_items,
+        _telemetry_started,
+    );
     let PopulationEvalInputs {
         close,
         high,
@@ -2653,7 +2639,7 @@ pub fn validation_backtest_population_cpu(inputs: PopulationEvalInputs<'_>) -> V
 /// code path with or without the `gpu` feature. Behaviour is identical to the
 /// GPU twin's fallback arm: a full-population CPU re-evaluation.
 #[cfg(not(feature = "gpu"))]
-pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
     validation_backtest_population_cpu(inputs)
 }
 
@@ -2686,6 +2672,14 @@ pub fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[
 /// charged a flat one, and only on the fallback path — the worst place for a
 /// divergence to hide.
 pub fn validation_backtest_scenarios_cpu(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    require_broker_real_historical_evaluation()?;
+    validation_backtest_scenarios_cpu_unchecked(inputs, scenarios)
+}
+
+fn validation_backtest_scenarios_cpu_unchecked(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
 ) -> anyhow::Result<Vec<[f64; 11]>> {
@@ -2812,6 +2806,17 @@ pub fn validation_backtest_scenarios_cpu(
         .collect()
 }
 
+/// Non-production scenario mirror for formula/parity unit tests. This keeps
+/// mathematical coverage without exposing an unchecked financial entry point
+/// in release builds.
+#[cfg(test)]
+pub(crate) fn validation_backtest_scenarios_cpu_test_oracle(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    validation_backtest_scenarios_cpu_unchecked(inputs, scenarios)
+}
+
 /// Evaluate a scenario work list — ONE launch for the whole quality screen.
 ///
 /// The population twin sends one full-series scenario per gene, so a screen
@@ -2829,6 +2834,7 @@ pub fn validation_backtest_scenarios(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
 ) -> anyhow::Result<Vec<[f64; 11]>> {
+    require_broker_real_historical_evaluation()?;
     let n_scenarios = scenarios.len();
     if n_scenarios == 0 {
         return Ok(Vec::new());
@@ -3115,16 +3121,40 @@ mod scenario_mirror_tests {
         let smc_weights = [0.0_f32; 11];
 
         let population = validation_backtest_population_cpu(inputs(
-            &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st, &sl,
-            &tp, &flags, &smc_weights,
+            &close,
+            &indicators,
+            &smc,
+            &months,
+            &settings,
+            &offsets,
+            &idx,
+            &w,
+            &lt,
+            &st,
+            &sl,
+            &tp,
+            &flags,
+            &smc_weights,
         ));
         let work_list: Vec<_> = (0..2u64)
             .map(|g| scenario::base_scenario(g, g, close.len()))
             .collect();
-        let scenarios = validation_backtest_scenarios_cpu(
+        let scenarios = validation_backtest_scenarios_cpu_test_oracle(
             inputs(
-                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
-                &sl, &tp, &flags, &smc_weights,
+                &close,
+                &indicators,
+                &smc,
+                &months,
+                &settings,
+                &offsets,
+                &idx,
+                &w,
+                &lt,
+                &st,
+                &sl,
+                &tp,
+                &flags,
+                &smc_weights,
             ),
             &work_list,
         )
@@ -3163,10 +3193,22 @@ mod scenario_mirror_tests {
             scenario::spread_ticks_exact(4.0),
             scenario::commission_micros_exact(9.0),
         );
-        let rows = validation_backtest_scenarios_cpu(
+        let rows = validation_backtest_scenarios_cpu_test_oracle(
             inputs(
-                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
-                &sl, &tp, &flags, &smc_weights,
+                &close,
+                &indicators,
+                &smc,
+                &months,
+                &settings,
+                &offsets,
+                &idx,
+                &w,
+                &lt,
+                &st,
+                &sl,
+                &tp,
+                &flags,
+                &smc_weights,
             ),
             &[base, dear],
         )
@@ -3204,32 +3246,58 @@ mod scenario_mirror_tests {
 
         let mut work_list = vec![scenario::base_scenario(0, 0, close.len())];
         for run in 0..8u64 {
-            work_list.push(scenario::perturb_scenario(0, 1 + run, close.len(), 7717 ^ run));
+            work_list.push(scenario::perturb_scenario(
+                0,
+                1 + run,
+                close.len(),
+                7717 ^ run,
+            ));
         }
-        let rows = validation_backtest_scenarios_cpu(
+        let rows = validation_backtest_scenarios_cpu_test_oracle(
             inputs(
-                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
-                &sl, &tp, &flags, &smc_weights,
+                &close,
+                &indicators,
+                &smc,
+                &months,
+                &settings,
+                &offsets,
+                &idx,
+                &w,
+                &lt,
+                &st,
+                &sl,
+                &tp,
+                &flags,
+                &smc_weights,
             ),
             &work_list,
         )
         .expect("device-perturbation scenarios are reproducible on the CPU");
 
         assert_eq!(rows.len(), 9);
-        let distinct = rows[1..]
-            .iter()
-            .filter(|row| row[0] != rows[0][0])
-            .count();
+        let distinct = rows[1..].iter().filter(|row| row[0] != rows[0][0]).count();
         assert!(
             distinct >= 4,
             "only {distinct} of 8 perturbations moved net profit — the mirror is \
              probably evaluating the unperturbed gene"
         );
         // And it is deterministic: the same counters give the same numbers.
-        let again = validation_backtest_scenarios_cpu(
+        let again = validation_backtest_scenarios_cpu_test_oracle(
             inputs(
-                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
-                &sl, &tp, &flags, &smc_weights,
+                &close,
+                &indicators,
+                &smc,
+                &months,
+                &settings,
+                &offsets,
+                &idx,
+                &w,
+                &lt,
+                &st,
+                &sl,
+                &tp,
+                &flags,
+                &smc_weights,
             ),
             &work_list,
         )
@@ -3254,10 +3322,22 @@ mod scenario_mirror_tests {
         let mut windowed = scenario::base_scenario(0, 0, close.len());
         windowed.window_offset = 50;
         windowed.window_len = 100;
-        let error = validation_backtest_scenarios_cpu(
+        let error = validation_backtest_scenarios_cpu_test_oracle(
             inputs(
-                &close, &indicators, &smc, &months, &settings, &offsets, &idx, &w, &lt, &st,
-                &sl, &tp, &flags, &smc_weights,
+                &close,
+                &indicators,
+                &smc,
+                &months,
+                &settings,
+                &offsets,
+                &idx,
+                &w,
+                &lt,
+                &st,
+                &sl,
+                &tp,
+                &flags,
+                &smc_weights,
             ),
             &[windowed],
         )
@@ -3318,25 +3398,6 @@ mod overrides_tests {
         assert!((overlap - 0.5).abs() < 1e-9);
         assert!((late_ny - 1.0).abs() < 1e-9);
         assert!((pre_asian - 1.8).abs() < 1e-9);
-    }
-
-    #[test]
-    fn backtest_settings_spread_for_bar_uses_profile_when_present() {
-        let mut settings = BacktestSettings::default();
-        settings.spread_pips = 99.0;
-        // Without a profile, every bar uses the scalar.
-        assert!((settings.spread_pips_for_bar(0) - 99.0).abs() < 1e-9);
-        assert!((settings.spread_pips_for_bar(9 * 3_600_000) - 99.0).abs() < 1e-9);
-
-        settings.session_spread_profile = Some(SessionSpreadProfile {
-            asian_pips: 2.0,
-            overlap_pips: 0.5,
-            late_ny_pips: 1.5,
-        });
-        // With a profile, 09:00 UTC resolves to the overlap bucket.
-        assert!((settings.spread_pips_for_bar(9 * 3_600_000) - 0.5).abs() < 1e-9);
-        // Zero timestamp falls back to the scalar (no real-time signal).
-        assert!((settings.spread_pips_for_bar(0) - 99.0).abs() < 1e-9);
     }
 
     #[test]
@@ -5639,7 +5700,10 @@ mod cubecl_trailing_parity_tests {
         // per-bar stop the trail is built out of.
         for (label, fx) in [
             ("fixed stops", trailing_fixture(true)),
-            ("adaptive stops", trailing_fixture(true).with_adaptive_stops()),
+            (
+                "adaptive stops",
+                trailing_fixture(true).with_adaptive_stops(),
+            ),
         ] {
             let gpu = match crate::cubecl_eval::try_evaluate_population_cuda(
                 &fx.close,
@@ -5672,7 +5736,9 @@ mod cubecl_trailing_parity_tests {
                              ({label}): {e}"
                         );
                     }
-                    eprintln!("CubeCL trailing parity SKIPPED ({label}, no usable GPU device): {e}");
+                    eprintln!(
+                        "CubeCL trailing parity SKIPPED ({label}, no usable GPU device): {e}"
+                    );
                     return;
                 }
             };
@@ -5784,9 +5850,27 @@ mod trailing_parity_tests {
         settings.trailing_min_lock_pips = 2.0;
 
         let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
-            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
-            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &months,
+            &days,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &stop_vol_mult,
+            &smc,
+            &gene_smc,
+            0.0,
+            &[1.0f32; 11],
+            &settings,
+            None,
         ) {
             Ok(rows) => rows,
             // No card here: the assertion is worth nothing without one, and a
@@ -5798,13 +5882,26 @@ mod trailing_parity_tests {
         };
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
-            close: &close, high: &high, low: &low, indicators: indicators.view(),
-            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
-            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
-            month_idx: &months, day_idx: &days, timestamps: &timestamps,
-            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
-            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
-            weights: &[1.0f32; 11], settings: &settings,
+            close: &close,
+            high: &high,
+            low: &low,
+            indicators: indicators.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &months,
+            day_idx: &days,
+            timestamps: &timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc,
+            gene_smc_flags: &gene_smc,
+            gate_threshold: 0.0,
+            weights: &[1.0f32; 11],
+            settings: &settings,
         });
 
         assert_eq!(gpu.len(), cpu.len());
@@ -5877,9 +5974,27 @@ mod trailing_parity_tests {
         });
 
         let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
-            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
-            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &months,
+            &days,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &stop_vol_mult,
+            &smc,
+            &gene_smc,
+            0.0,
+            &[1.0f32; 11],
+            &settings,
+            None,
         ) {
             Ok(rows) => rows,
             Err(err) => {
@@ -5889,13 +6004,26 @@ mod trailing_parity_tests {
         };
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
-            close: &close, high: &high, low: &low, indicators: indicators.view(),
-            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
-            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
-            month_idx: &months, day_idx: &days, timestamps: &timestamps,
-            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
-            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
-            weights: &[1.0f32; 11], settings: &settings,
+            close: &close,
+            high: &high,
+            low: &low,
+            indicators: indicators.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &months,
+            day_idx: &days,
+            timestamps: &timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc,
+            gene_smc_flags: &gene_smc,
+            gate_threshold: 0.0,
+            weights: &[1.0f32; 11],
+            settings: &settings,
         });
 
         for (gene, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
@@ -5975,9 +6103,27 @@ mod trailing_parity_tests {
         });
 
         let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close, &high, &low, indicators.view(), &gene_offsets, &gene_indices, &gene_weights,
-            &long_thr, &short_thr, &months, &days, &timestamps, &sl_pips, &tp_pips,
-            &stop_vol_mult, &smc, &gene_smc, 0.0, &[1.0f32; 11], &settings, None,
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &months,
+            &days,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &stop_vol_mult,
+            &smc,
+            &gene_smc,
+            0.0,
+            &[1.0f32; 11],
+            &settings,
+            None,
         ) {
             Ok(rows) => rows,
             Err(err) => {
@@ -5987,13 +6133,26 @@ mod trailing_parity_tests {
         };
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
-            close: &close, high: &high, low: &low, indicators: indicators.view(),
-            gene_offsets: &gene_offsets, gene_indices: &gene_indices,
-            gene_weights: &gene_weights, long_thr: &long_thr, short_thr: &short_thr,
-            month_idx: &months, day_idx: &days, timestamps: &timestamps,
-            sl_pips: &sl_pips, tp_pips: &tp_pips, stop_vol_mult: &stop_vol_mult,
-            smc_data: &smc, gene_smc_flags: &gene_smc, gate_threshold: 0.0,
-            weights: &[1.0f32; 11], settings: &settings,
+            close: &close,
+            high: &high,
+            low: &low,
+            indicators: indicators.view(),
+            gene_offsets: &gene_offsets,
+            gene_indices: &gene_indices,
+            gene_weights: &gene_weights,
+            long_thr: &long_thr,
+            short_thr: &short_thr,
+            month_idx: &months,
+            day_idx: &days,
+            timestamps: &timestamps,
+            sl_pips: &sl_pips,
+            tp_pips: &tp_pips,
+            stop_vol_mult: &stop_vol_mult,
+            smc_data: &smc,
+            gene_smc_flags: &gene_smc,
+            gate_threshold: 0.0,
+            weights: &[1.0f32; 11],
+            settings: &settings,
         });
 
         // Guard the guard: with a flat 0.0 scalar and these buckets, a kernel

@@ -17,7 +17,8 @@
 //! test that can only reach these paths through a six-minute session is a test
 //! nobody runs while changing them.
 
-mod support;
+#[path = "support/matrix.rs"]
+mod matrix;
 
 use neoethos_autoresearch::journal::{CostBandCounts, Record, SearchRecord, SweepKind};
 use neoethos_autoresearch::judge::{JudgeThresholds, ScreenConjunct, ScreenResult, screen_sweep};
@@ -25,7 +26,7 @@ use neoethos_autoresearch::session::{BlockId, ChampionRow, Session, SweepEvidenc
 use neoethos_autoresearch::shuffle::{ControlKind, ShuffleNull};
 use neoethos_search::deflated::analyse_bytes;
 
-use support::{Evidence, TRIALS, matrix_for};
+use matrix::{TRIALS, matrix_for};
 
 /// The identity of the slot that FAILS the screen while carrying the highest
 /// expectancy in the sweep — the overfit outlier.
@@ -99,8 +100,8 @@ fn record(slot: usize, config_hash: &str, e: f64, discriminates: bool) -> Search
 /// with slot 1's identity while keeping slot 0's monthly returns.
 fn two_slot_sweep(survivor_row_hash: &str) -> (SweepEvidence, Vec<f64>, Vec<f64>) {
     let sweep = SweepId(1);
-    let (outlier_bytes, outlier_series) = matrix_for(Evidence::Strong, 11);
-    let (survivor_bytes, survivor_series) = matrix_for(Evidence::Strong, 22);
+    let (outlier_bytes, outlier_series) = matrix_for(11);
+    let (survivor_bytes, survivor_series) = matrix_for(22);
     let period_keys: Vec<i64> = (0..survivor_series.len() as i64).map(|i| 24_300 + i).collect();
 
     let evidence = SweepEvidence {

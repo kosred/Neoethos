@@ -205,7 +205,7 @@ fn run_prototype_b(
     pricing: DevicePricing,
 ) -> Result<PopulationBenchmarkOutcome> {
     use neoethos_search::gpu_native::prototype_b_engine::create_prototype_b_engine;
-    use neoethos_search::gpu_native::trade_invariants::{audit_device_outcomes, PriceSeries};
+    use neoethos_search::gpu_native::trade_invariants::{PriceSeries, audit_device_outcomes};
 
     let mut engine = create_prototype_b_engine(device, session_id, max_events)
         .map_err(|error| anyhow::anyhow!("Prototype B is unavailable: {error}"))?;
@@ -577,11 +577,10 @@ mod tests {
             })
             .unwrap();
         let eligibility = workload.common_bc_intersection(PrototypeKind::BWarpCooperative);
-        // The pricing comes from the workload's own oracle, exactly as the
-        // production call site at `execute` builds it. No literal is invented
-        // here: a fixture price that drifted from the settings the kernel is
-        // handed would make this test assert against a world that cannot exist.
-        let reference = evaluate_population_oracle(&workload).unwrap();
+        // This test exercises only the typed missing-CUDA refusal. Reading the
+        // workload's own fixed-width settings avoids running the financial
+        // oracle, which is production-gated until exact broker replay exists.
+        let reference_settings = &workload.dataset.settings;
         let error = run_prototype_b(
             &workload,
             &eligibility,
@@ -590,8 +589,8 @@ mod tests {
             1,
             4096,
             DevicePricing {
-                pip_value: reference.settings.pip_value,
-                pip_value_per_lot: reference.settings.pip_value_per_lot,
+                pip_value: reference_settings.pip_value,
+                pip_value_per_lot: reference_settings.pip_value_per_lot,
             },
         )
         .unwrap_err();

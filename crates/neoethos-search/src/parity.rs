@@ -110,9 +110,10 @@ mod tests {
     use super::*;
     use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
     use crate::genetic::{
-        EvaluationConfig, Gene, evaluate_genes, month_day_indices,
+        EvaluationConfig, Gene, month_day_indices,
         signals_and_confidence_for_gene_with_config,
     };
+    use crate::genetic::search_engine::evaluate_genes_test_oracle;
     use ndarray::arr2;
     use neoethos_data::{FeatureFrame, Ohlcv};
 
@@ -226,7 +227,7 @@ mod tests {
         let ohlcv = fixture_ohlcv(&frame);
         let genes = fixture_genes();
         let config = eval_config();
-        let candidate = evaluate_genes(&frame, &ohlcv, &genes, &config)
+        let candidate = evaluate_genes_test_oracle(&frame, &ohlcv, &genes, &config)
             .expect("population evaluator should score fixture genes");
 
         let (_months, days) = month_day_indices(&frame.timestamps);

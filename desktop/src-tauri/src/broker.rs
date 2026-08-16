@@ -11,8 +11,8 @@ use tauri::async_runtime::spawn_blocking;
 
 use neoethos_app::app_services::broker_api;
 use neoethos_app::app_services::broker_persistence::load_broker_settings;
-use neoethos_app::app_services::secure_store::production_ctrader_token_store;
 use neoethos_app::app_services::live_spots_streamer;
+use neoethos_app::app_services::secure_store::production_ctrader_token_store;
 
 // ── DTOs (camelCase for the web UI) ───────────────────────────────────────────
 
@@ -34,7 +34,6 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
 }
-
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,7 +117,6 @@ pub struct ExecResult {
     pub message: String,
 }
 
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReauthResult {
@@ -126,21 +124,6 @@ pub struct ReauthResult {
     pub refresh_token_present: bool,
     pub access_token_len: usize,
     pub message: String,
-}
-
-fn asset_currency(asset_id: Option<i64>) -> String {
-    match asset_id {
-        Some(4) => "GBP",
-        Some(5) => "CHF",
-        Some(6) => "EUR",
-        Some(8) => "USD",
-        Some(14) => "JPY",
-        Some(23) => "AUD",
-        Some(25) => "NZD",
-        Some(27) => "CAD",
-        _ => "EUR",
-    }
-    .to_string()
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -167,7 +150,12 @@ pub async fn broker_status() -> Result<BrokerStatus, String> {
             .find(|a| a.enabled_for_execution)
             .or_else(|| ct.accounts.first())
             .map(|a| a.account_id.clone());
-        BrokerStatus { configured, has_token, environment, account_id }
+        BrokerStatus {
+            configured,
+            has_token,
+            environment,
+            account_id,
+        }
     })
     .await
     .map_err(|e| e.to_string())
@@ -195,7 +183,13 @@ pub async fn broker_chart(
                 continue;
             }
             last = t;
-            out.push(Candle { time: t, open: b.open, high: b.high, low: b.low, close: b.close });
+            out.push(Candle {
+                time: t,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+            });
         }
         Ok::<Vec<Candle>, String>(out)
     })
@@ -228,7 +222,9 @@ pub async fn broker_accounts() -> Result<Vec<AccountInfo>, String> {
                     let label = format!(
                         "{kind} · {} · login {}",
                         a.broker_title,
-                        a.trader_login.map(|l| l.to_string()).unwrap_or_else(|| "—".into())
+                        a.trader_login
+                            .map(|l| l.to_string())
+                            .unwrap_or_else(|| "—".into())
                     );
                     let enabled = enabled_id.as_deref() == Some(a.account_id.as_str());
                     AccountInfo {
@@ -268,7 +264,12 @@ pub async fn select_account(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no broker_credentials.toml — authenticate first".to_string())?;
 
-        if !state.ctrader.accounts.iter().any(|a| a.account_id == account_id) {
+        if !state
+            .ctrader
+            .accounts
+            .iter()
+            .any(|a| a.account_id == account_id)
+        {
             state.ctrader.accounts.push(BrokerAccountTarget {
                 account_id: account_id.clone(),
                 label: label.unwrap_or_else(|| account_id.clone()),
@@ -332,8 +333,12 @@ pub async fn account_snapshot() -> Result<AccountSnapshot, String> {
                 take_profit: p.take_profit,
             })
             .collect();
-        let currency = asset_currency(snap.trader.deposit_asset_id);
-        let broker = snap.trader.broker_name.clone().unwrap_or_else(|| "cTrader".to_string());
+        let currency = snap.deposit_asset_name;
+        let broker = snap
+            .trader
+            .broker_name
+            .clone()
+            .unwrap_or_else(|| "cTrader".to_string());
         // Auto-built descriptor, e.g. "LIVE · FTMO · 200k USD · 1:30".
         let mut label = format!(
             "{} · {} · {}",
@@ -349,8 +354,8 @@ pub async fn account_snapshot() -> Result<AccountSnapshot, String> {
         Ok::<AccountSnapshot, String>(AccountSnapshot {
             account_id: snap.trader.account_id,
             balance: snap.trader.balance,
-            equity: snap.trader.balance + snap.trader.unrealized_pnl,
-            unrealized_pnl: snap.trader.unrealized_pnl,
+            equity: snap.trader.balance + snap.unrealized_pnl,
+            unrealized_pnl: snap.unrealized_pnl,
             currency,
             open_positions: positions.len(),
             positions,
@@ -410,9 +415,8 @@ pub async fn place_order(
 #[tauri::command]
 pub async fn close_position(position_id: i64, volume: i64) -> Result<ExecResult, String> {
     spawn_blocking(move || {
-        let outcome =
-            broker_api::close_position_blocking(position_id, volume, None)
-                .map_err(|e| e.to_string())?;
+        let outcome = broker_api::close_position_blocking(position_id, volume, None)
+            .map_err(|e| e.to_string())?;
         Ok::<ExecResult, String>(ExecResult {
             status: format!("{:?}", outcome.status),
             order_id: outcome.order_id,
@@ -478,8 +482,13 @@ pub async fn refresh_broker_costs() -> Result<String, String> {
         // 3. write the canonical metadata the cost model reads
         let path = std::path::PathBuf::from("data").join("symbol_metadata.json");
         let n = table.entries.len();
-        table.save_to_disk(&path).map_err(|e| format!("write: {e}"))?;
-        Ok::<String, String>(format!("Refreshed real costs for {n} symbols → {}", path.display()))
+        table
+            .save_to_disk(&path)
+            .map_err(|e| format!("write: {e}"))?;
+        Ok::<String, String>(format!(
+            "Refreshed real costs for {n} symbols → {}",
+            path.display()
+        ))
     })
     .await
     .map_err(|e| e.to_string())?

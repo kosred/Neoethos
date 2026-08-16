@@ -208,6 +208,10 @@ fn backtest_metrics_for(portfolio_path: &str) -> Result<PromotionMetrics> {
 /// * **Win rate / profit factor / trade count** were already trade-derived and
 ///   therefore already symbol-scoped.
 pub fn evaluate_for_portfolio(portfolio_path: &str) -> Result<DemoForwardDecision> {
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::LiveTrading)
+        .map_err(anyhow::Error::new)?;
+
     let artifact = neoethos_search::load_live_portfolio_json(portfolio_path)
         .with_context(|| format!("load live portfolio {portfolio_path}"))?;
     let symbol = artifact.symbol;

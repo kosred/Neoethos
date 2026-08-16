@@ -14,8 +14,7 @@
 This directory is *intended* to hold **real, captured**
 `ProtoOAOrderListByPositionIdRes` JSON envelopes.
 Synthetic broker payloads are forbidden here per the 2026-05-15
-operator directive (no-silent-fallback / no-synthetic-data) — same
-policy as the sibling `unrealized_pnl/` fixture directory.
+operator directive (no-silent-fallback / no-synthetic-data).
 
 ## Schema reference
 

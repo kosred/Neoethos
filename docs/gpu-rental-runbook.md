@@ -95,43 +95,27 @@ did not reach the build — do not start a long run.
 - **Bill control**: hibernate/destroy the box the moment the run finishes.
   Discovery writes its artifacts to `cache/`; copy them off first.
 
-## Benchmarking + tuning the GPU (do this once per new card)
+## Benchmarking + tuning the GPU
 
-Task 6 of the GPU remediation. The harness measures GPU eval throughput and
-peak memory, but **only after** proving the GPU output matches the CPU
-reference bar-for-bar — a faster path that disagrees is a failure, not a win.
+Historical trade/cost/PnL benchmarking is currently fail-closed. The old
+`gpu_eval_bench` example was removed because it could price synthetic trades
+from flat/session spread and operator-estimated cost inputs. Do not recreate or
+use that path.
 
-```bash
-# 1. Correctness gate FIRST. This fails loud (not skips) under require-GPU.
-NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-nvidia \
-  gpu_cpu_parity -- --nocapture
+GPU compilation, device discovery, or a successful kernel launch are not proof
+of financial correctness. Throughput tuning becomes valid only after the
+reviewed hardware harness has all of the following for the exact card
+architecture and loaded artifact:
 
-# 2. Throughput, once parity is green. Prints one row per workload shape with
-#    cpu_ms, gpu_ms, speedup, evals/s, cube MB, and a per-row parity verdict.
-#    Exits non-zero if ANY shape breaks parity.
-NEOETHOS_REQUIRE_GPU=1 cargo run --release -p neoethos-search \
-  --features gpu-nvidia --example gpu_eval_bench
-```
+- independent CPU formula truth for the feature/signal stage;
+- synchronized broker-captured Bid/Ask and conversion legs for the same bars;
+- the exact `ProtoOASymbol` unit contract;
+- broker deal/PnL reconciliation; and
+- full CPU/GPU parity for validity, signals, ordered trades, ledger, and metrics.
 
-Read the output before trusting any number:
-
-- **`NEOETHOS_REQUIRE_GPU true` + a real adapter line** — the run used the GPU.
-  If instead it panicked with "require-GPU set but the GPU lane failed", the
-  card/driver is not usable yet; fix that before reading timings.
-- **`parity OK`** on every row is the precondition for looking at `speedup`.
-  A `parity FAIL` row means the kernel is wrong on this hardware — stop and
-  report it; do not tune around it.
-- **`speedup` below 1.0x on the `small` shape is expected** — kernel launch +
-  transfer overhead dominates tiny populations. The GPU earns its keep on the
-  `medium`/`large` shapes. This is why tiny workloads stay on the CPU lane.
-
-Only after parity is green across all shapes, tune within the memory guardrail:
-sweep `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB` and the stream/batch knobs, re-run the
-bench, and keep a setting only if it (a) keeps parity, (b) stays under the
-card's VRAM budget (see the `auto-tuned memory budgets` log line), and (c)
-actually speeds up the `medium`/`large` shapes. Record the winning values by
-**capability class** (e.g. "48 GB discrete NVIDIA"), never by marketing model
-name, so the setting ports to the next card of the same class.
+Until that evidence-backed harness is present, keep the financial evaluator
+disabled. Feature/signal-only measurements must be labelled as such and cannot
+be used for promotion, Risky Mode, Prop-Firm Mode, or live eligibility.
 
 ## After the run
 

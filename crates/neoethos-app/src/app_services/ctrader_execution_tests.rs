@@ -162,6 +162,39 @@ fn execution_event_scales_close_detail_money_digits_four_fields() {
 }
 
 #[test]
+fn execution_event_rejects_close_financials_without_broker_scale() {
+    let response = r#"{
+        "payloadType": 2126,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "executionType": 3,
+            "deal": {
+                "dealId": 3001,
+                "orderId": 8001,
+                "positionId": 9001,
+                "filledVolume": 10000000,
+                "symbolId": 14,
+                "executionTimestamp": 1710000201000,
+                "tradeSide": 1,
+                "closePositionDetail": {
+                    "grossProfit": 1250,
+                    "swap": -15,
+                    "commission": -40
+                }
+            }
+        }
+    }"#;
+
+    let error = parse_execution_outcome(response)
+        .expect_err("execution financials without moneyDigits must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("execution.close_position_detail.money_digits")
+    );
+}
+
+#[test]
 fn order_error_event_maps_failed_outcome() {
     let response = r#"{
         "payloadType": 2132,

@@ -6,6 +6,10 @@ use crate::gpu_native::semantics::{
     DISCOVERY_SEMANTICS_VERSION, TRADING_SEMANTICS_VERSION, discovery_semantics_hash,
     semantics_hash_hex, trading_semantics_hash,
 };
+use neoethos_core::broker_truth::{
+    BrokerFinancialOperationV1, BrokerFinancialTruthErrorV1,
+    current_broker_financial_truth_capability_v1,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -309,6 +313,7 @@ pub struct PopulationBenchmarkOutcome {
 
 #[derive(Debug)]
 pub enum PopulationBenchmarkError {
+    BrokerFinancialTruthUnavailable(BrokerFinancialTruthErrorV1),
     Engine(crate::gpu_native::engine::EngineError),
     CpuStrategyExecuted(crate::gpu_native::cpu_strategy::CpuStrategyAuditError),
     NoSupportedCandidates,
@@ -318,6 +323,7 @@ pub enum PopulationBenchmarkError {
 impl fmt::Display for PopulationBenchmarkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BrokerFinancialTruthUnavailable(error) => write!(f, "{error}"),
             Self::Engine(error) => write!(f, "{error}"),
             Self::CpuStrategyExecuted(error) => write!(f, "{error}"),
             Self::NoSupportedCandidates => write!(
@@ -333,6 +339,12 @@ impl fmt::Display for PopulationBenchmarkError {
 }
 
 impl std::error::Error for PopulationBenchmarkError {}
+
+impl From<BrokerFinancialTruthErrorV1> for PopulationBenchmarkError {
+    fn from(error: BrokerFinancialTruthErrorV1) -> Self {
+        Self::BrokerFinancialTruthUnavailable(error)
+    }
+}
 
 impl From<crate::gpu_native::engine::EngineError> for PopulationBenchmarkError {
     fn from(error: crate::gpu_native::engine::EngineError) -> Self {
@@ -361,6 +373,9 @@ where
     use crate::gpu_native::cpu_strategy::CpuStrategyAuditContext;
     use crate::gpu_native::engine::DeviceFilterPolicy;
     use std::time::Instant;
+
+    let _broker_truth = current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)?;
 
     let coverage_summary = eligibility.coverage();
     if coverage_summary.supported_candidates == 0 {
@@ -450,6 +465,117 @@ fn engine_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_native::engine::{
+        BacktestEngine, DatasetHandle, DeviceEventHandle, DeviceFilterPolicy,
+        DeviceMetricsHandle, DeviceSelectionHandle, EngineCapabilities, EngineError,
+        EngineIdentity, EngineStatus, GeneBufferHandle, GpuDiscoverySession, HostSurvivorSummary,
+        ScenarioBufferHandle, SynchronizationMode,
+    };
+    use crate::gpu_native::population_fixture::TinyPopulationFixture;
+    use crate::gpu_native::prototype_bc::PrototypeKind;
+    use crate::gpu_native::prototype_population::{
+        PropFirmRequirement, PrototypeBcRequirements,
+    };
+
+    struct PoisonEngine {
+        session: GpuDiscoverySession,
+    }
+
+    impl PoisonEngine {
+        fn new() -> Self {
+            Self {
+                session: GpuDiscoverySession::new(
+                    EngineIdentity {
+                        session_id: 1,
+                        backend_id: 1,
+                        device_id: 1,
+                    },
+                    SynchronizationMode::Blocking,
+                ),
+            }
+        }
+    }
+
+    impl BacktestEngine for PoisonEngine {
+        type Backend = ();
+
+        fn status(&self) -> EngineStatus {
+            panic!("the broker-truth gate must run before reading engine status")
+        }
+
+        fn capabilities(&self) -> EngineCapabilities {
+            panic!("the broker-truth gate must run before reading engine capabilities")
+        }
+
+        fn session(&self) -> &GpuDiscoverySession<Self::Backend> {
+            &self.session
+        }
+
+        fn upload_dataset(&mut self, _bytes: &[u8]) -> Result<DatasetHandle, EngineError> {
+            panic!("the broker-truth gate must run before uploading a dataset")
+        }
+
+        fn upload_genes(&mut self, _bytes: &[u8]) -> Result<GeneBufferHandle, EngineError> {
+            panic!("the broker-truth gate must run before uploading genes")
+        }
+
+        fn upload_scenarios(&mut self, _bytes: &[u8]) -> Result<ScenarioBufferHandle, EngineError> {
+            panic!("the broker-truth gate must run before uploading scenarios")
+        }
+
+        fn evaluate(
+            &mut self,
+            _dataset: DatasetHandle,
+            _genes: GeneBufferHandle,
+            _scenarios: ScenarioBufferHandle,
+            _wait_for: Option<DeviceEventHandle>,
+        ) -> Result<(DeviceMetricsHandle, Option<DeviceEventHandle>), EngineError> {
+            panic!("the broker-truth gate must run before GPU financial evaluation")
+        }
+
+        fn filter(
+            &mut self,
+            _metrics: DeviceMetricsHandle,
+            _policy: DeviceFilterPolicy,
+            _wait_for: Option<DeviceEventHandle>,
+        ) -> Result<(DeviceSelectionHandle, Option<DeviceEventHandle>), EngineError> {
+            panic!("the broker-truth gate must run before filtering financial metrics")
+        }
+
+        fn readback_compact(
+            &mut self,
+            _selection: DeviceSelectionHandle,
+            _wait_for: Option<DeviceEventHandle>,
+        ) -> Result<HostSurvivorSummary, EngineError> {
+            panic!("the broker-truth gate must run before reading financial metrics")
+        }
+    }
+
+    #[test]
+    fn public_gpu_benchmark_refuses_before_touching_the_engine() {
+        let workload = TinyPopulationFixture::new(2, 128, 4)
+            .population_workload(PrototypeBcRequirements {
+                prop_firm_state: PropFirmRequirement::NotRequested,
+            })
+            .expect("build structural benchmark workload");
+        let eligibility = workload.common_bc_intersection(PrototypeKind::BWarpCooperative);
+        let mut engine = PoisonEngine::new();
+
+        let error = execute_population_benchmark(
+            &mut engine,
+            &workload,
+            &eligibility,
+            &PopulationBenchmarkOptions::default(),
+        )
+        .expect_err("financial GPU benchmarking must require exact broker evidence");
+
+        assert!(
+            error
+                .to_string()
+                .contains("BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1"),
+            "the refusal must be typed and versioned, got: {error}"
+        );
+    }
 
     #[test]
     fn summary_reports_median_p95_and_variance() {

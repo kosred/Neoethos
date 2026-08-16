@@ -20,7 +20,7 @@
 //! the button could only ever run the momentum stub.
 //!
 //! Both are fixed by calling what the CLI calls:
-//! `EngineConfig::for_replay_from_settings` (the ONE `Settings` -> config
+//! `EngineConfig::try_for_replay_from_settings` (the ONE `Settings` -> config
 //! adapter) and `replay_portfolio_from_dir` for a supplied portfolio. Parity is
 //! now a property of the arguments, and both front-ends pass the same ones.
 //!
@@ -102,8 +102,19 @@ pub async fn replay(State(state): State<AppApiState>, body: Option<Json<ReplayBo
     // CLI's `trader-replay` produce identical `EngineStats`. They now call the
     // SAME adapter, so the two front-ends cannot report different numbers for
     // the same history.
-    let engine_cfg =
-        neoethos_trader::EngineConfig::for_replay_from_settings(settings.as_ref(), &symbol);
+    let engine_cfg = match neoethos_trader::EngineConfig::try_for_replay_from_settings(
+        settings.as_ref(),
+        &symbol,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return actionable_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Historical financial replay is disabled until exact broker evidence is available.",
+                &error,
+            );
+        }
+    };
 
     // The replay reads + crunches a whole history synchronously — keep it off the
     // async runtime's worker threads.

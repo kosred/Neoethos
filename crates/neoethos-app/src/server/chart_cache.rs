@@ -158,22 +158,8 @@ pub fn put(symbol: &str, timeframe: &str, limit: usize, dto: ChartDto) {
     lock_cache().put(key, dto);
 }
 
-/// Invalidate every cached entry. Currently only used by the
-/// in-module tests to isolate test state; the production
-/// invalidation path uses [`clear_symbol`] because both data-
-/// modification routes (`/data/fetch` and `/data/import`) operate
-/// on a single symbol at a time.
-///
-/// **Gated `#[cfg(test)]`** to keep the production binary's
-/// dead-code surface honest — if we later add a global "reset
-/// cache" admin endpoint, lift the gate at that commit.
-#[cfg(test)]
-fn clear_all() {
-    lock_cache().entries.clear();
-}
-
 /// Invalidate every entry for a given symbol. More targeted than
-/// `clear_all`; called when only one symbol's Vortex file was rewritten.
+/// a global clear; called when only one symbol's Vortex file was rewritten.
 pub fn clear_symbol(symbol: &str) {
     lock_cache().entries.retain(|k, _| k.symbol != symbol);
 }
@@ -201,27 +187,28 @@ mod tests {
 
     #[test]
     fn hit_after_put() {
-        clear_all();
         put("TEST_HIT", "M1", 100, fake_dto("TEST_HIT"));
         let hit = get("TEST_HIT", "M1", 100);
         assert!(hit.is_some(), "freshly inserted entry must be a hit");
         assert_eq!(hit.unwrap().symbol, "TEST_HIT");
+        clear_symbol("TEST_HIT");
     }
 
     #[test]
     fn miss_on_unknown_key() {
-        clear_all();
         let miss = get("NEVER_INSERTED", "M5", 100);
         assert!(miss.is_none());
     }
 
     #[test]
     fn clear_symbol_drops_only_that_symbol() {
-        clear_all();
-        put("AAA", "M1", 100, fake_dto("AAA"));
-        put("BBB", "M1", 100, fake_dto("BBB"));
-        clear_symbol("AAA");
-        assert!(get("AAA", "M1", 100).is_none());
-        assert!(get("BBB", "M1", 100).is_some());
+        const REMOVED: &str = "CACHE_TEST_CLEAR_REMOVED";
+        const RETAINED: &str = "CACHE_TEST_CLEAR_RETAINED";
+        put(REMOVED, "M1", 100, fake_dto(REMOVED));
+        put(RETAINED, "M1", 100, fake_dto(RETAINED));
+        clear_symbol(REMOVED);
+        assert!(get(REMOVED, "M1", 100).is_none());
+        assert!(get(RETAINED, "M1", 100).is_some());
+        clear_symbol(RETAINED);
     }
 }

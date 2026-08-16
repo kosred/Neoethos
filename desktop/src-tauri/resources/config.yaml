@@ -501,5 +501,3 @@ app_runtime:
   ctrader_stream_max_attempts: 3
   ctrader_stream_backoff_base_ms: 200
   chart_merge_side: ''
-  pnl_audit_drift_fraction: 0.001
-  pnl_circuit_breaker_fraction: 0.01

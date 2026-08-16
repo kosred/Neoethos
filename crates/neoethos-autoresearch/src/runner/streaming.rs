@@ -527,7 +527,10 @@ impl SweepExecutor for StreamingSweepExecutor {
                     neoethos_search::run_identity::cost_pips_round_trip(
                         request.config.evaluation_spread_pips,
                         request.config.evaluation_commission_per_trade,
-                        request.config.evaluation_config(None).pip_value_per_lot,
+                        request
+                            .config
+                            .try_evaluation_config(None)?
+                            .pip_value_per_lot,
                     ),
                 ),
                 ..CostBandCounts::default()
@@ -555,6 +558,10 @@ impl SweepExecutor for StreamingSweepExecutor {
     /// check here is repeated inside [`Self::evaluate_oos`], which is what makes
     /// skipping the preflight expensive rather than dangerous.
     fn oos_preflight(&self, portfolio: &super::PromotionPortfolio) -> Result<()> {
+        neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::Promotion)
+            .map_err(anyhow::Error::new)?;
+
         // The adaptive-stop hazard, refused rather than approximated.
         //
         // When adaptive stops are installed, a gene's effective SL is
@@ -687,15 +694,15 @@ impl SweepExecutor for StreamingSweepExecutor {
 
         for gene in &portfolio.genes {
             let signals = neoethos_search::genetic::signals_for_gene(&features, gene);
-            let settings = oos_backtest_settings(&config, gene);
-            let trades = neoethos_search::eval::simulate_trades_core(
+            let settings = oos_backtest_settings(&config, gene)?;
+            let trades = neoethos_search::simulate_trades_broker_real(
                 &base.close,
                 &base.high,
                 &base.low,
                 timestamps,
                 &signals,
                 &settings,
-            );
+            )?;
             for trade in trades
                 .iter()
                 .filter(|t| t.entry_time >= self.oos_window.start_ms)
@@ -989,9 +996,9 @@ fn apply_shuffle_control(
 fn oos_backtest_settings(
     config: &DiscoveryConfig,
     gene: &Gene,
-) -> neoethos_search::eval::BacktestSettings {
-    let evaluation = config.evaluation_config(None);
-    neoethos_search::eval::BacktestSettings {
+) -> Result<neoethos_search::eval::BacktestSettings> {
+    let evaluation = config.try_evaluation_config(None)?;
+    Ok(neoethos_search::eval::BacktestSettings {
         sl_pips: if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
             gene.sl_pips
         } else {
@@ -1032,7 +1039,7 @@ fn oos_backtest_settings(
         risk_per_trade_min: config.risk_per_trade_min,
         risk_per_trade_max: config.risk_per_trade_max,
         ..neoethos_search::eval::BacktestSettings::default()
-    }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -202,11 +202,23 @@ pub async fn discovery_start(
     // Reuse the `settings` already loaded (+ warned) at the top of this handler
     // — no second read, no second warning. Parity unification 2026-06-04.
     let mut config = match settings.as_ref() {
-        Some(settings) => neoethos_search::DiscoveryConfig::from_settings(settings),
-        // Settings load already failed + warned above; fall back to the engine
-        // default (evaluation_symbol/account_currency empty → cost-model NaN
-        // guard fails loud until config.yaml is fixed).
-        None => neoethos_search::DiscoveryConfig::default(),
+        Some(settings) => match neoethos_search::DiscoveryConfig::try_from_settings(settings) {
+            Ok(config) => config,
+            Err(error) => {
+                return actionable_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Discovery is disabled until synchronized broker financial evidence is available.",
+                    &error,
+                );
+            }
+        },
+        None => {
+            return actionable_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Discovery can't start because config.yaml could not be loaded; compiled financial defaults are not a valid fallback.",
+                &anyhow::anyhow!("settings unavailable"),
+            );
+        }
     };
     // Body-supplied symbol always wins (operator picked it on the UI).
     config.evaluation_symbol = symbol.clone();
@@ -494,7 +506,10 @@ async fn preflight_discovery_data_root(
             symbol_up,
         );
     }
-    if !discovered.iter().any(|tf| tf.eq_ignore_ascii_case(&base_tf_up)) {
+    if !discovered
+        .iter()
+        .any(|tf| tf.eq_ignore_ascii_case(&base_tf_up))
+    {
         anyhow::bail!(
             "{} is on disk but timeframe {} is missing — available: {} ({})",
             symbol_up,

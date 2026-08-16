@@ -65,8 +65,6 @@ pub struct LightGBMExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
     #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
-    gpu_only_disabled: bool,
-    #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
     feature_columns: Vec<String>,
     #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
     training_summary: Option<TrainingSummaryMetadata>,
@@ -94,7 +92,6 @@ impl LightGBMExpert {
                 gpu_only,
                 cpu_threads: Some(cpu_threads),
             },
-            gpu_only_disabled: false,
             feature_columns: Vec::new(),
             training_summary: None,
             local_fallback: None,
@@ -561,16 +558,24 @@ impl LightGBMExpert {
                 y,
                 self.stored_training_summary(),
             )?);
-            self.gpu_only_disabled = false;
             self.model = None;
             Ok(())
         }
         #[cfg(feature = "lightgbm")]
         {
-            if self.config.gpu_only && gpu_count() == 0 {
-                self.gpu_only_disabled = true;
-                self.model = None;
-                anyhow::bail!("LightGBM gpu-only mode requested but no GPU is available");
+            // Resolve the device once and fail before allocating a dataset or
+            // entering native training. `gpu_only` means no CPU fallback,
+            // regardless of whether the missing prerequisite is the config
+            // opt-in, CUDA build feature, explicit device policy, or hardware.
+            let device_type = self.effective_device_type();
+            if self.config.gpu_only && device_type != "cuda" {
+                anyhow::bail!(
+                    "LightGBM gpu-only mode is set but the resolved device is `{device_type}`. \
+                     Check, in this order: models.tree_runtime.lightgbm_gpu (must be true), \
+                     that this binary was built with --features gpu-cuda (the CUDA tree \
+                     learner), models.tree_runtime.device (must not be `cpu`), and that a \
+                     GPU is visible to this process."
+                );
             }
 
             let (flat_x, _rows, cols) = dataframe_to_row_major_vec(x)?;
@@ -592,18 +597,6 @@ impl LightGBMExpert {
             // wrote "gpu" — LightGBM's OpenCL learner — whenever a card was
             // visible, without ever consulting effective_device_type(), which
             // was simultaneously reporting "cpu" into the runtime artifact.
-            let device_type = self.effective_device_type();
-            if self.config.gpu_only && device_type != "cuda" {
-                // gpu_only means "no silent CPU fallback". Resolving to cpu
-                // here IS that fallback, so say why instead of doing it.
-                anyhow::bail!(
-                    "LightGBM gpu-only mode is set but the resolved device is `{device_type}`. \
-                     Check, in this order: models.tree_runtime.lightgbm_gpu (must be true), \
-                     that this binary was built with --features gpu-cuda (the CUDA tree \
-                     learner), models.tree_runtime.device (must not be `cpu`), and that a \
-                     GPU is visible to this process."
-                );
-            }
             params["device_type"] = serde_json::json!(device_type.clone());
             tracing::info!(
                 target: "neoethos_models::lightgbm",
@@ -661,7 +654,6 @@ impl LightGBMExpert {
                 y,
                 self.stored_training_summary(),
             )?);
-            self.gpu_only_disabled = false;
             self.model = Some(model);
             Ok(())
         }
@@ -686,9 +678,6 @@ impl ExpertModel for LightGBMExpert {
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
         #[cfg(not(feature = "lightgbm"))]
         let _ = x;
-        if self.gpu_only_disabled {
-            anyhow::bail!("LightGBM disabled: gpu-only mode requested without an available GPU");
-        }
         #[cfg(feature = "lightgbm")]
         {
             ensure_feature_columns_match(&self.feature_columns, x)?;
@@ -844,7 +833,6 @@ impl ExpertModel for LightGBMExpert {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
             }
             self.model = None;
-            self.gpu_only_disabled = false;
             Ok(())
         }
         #[cfg(feature = "lightgbm")]
@@ -929,7 +917,6 @@ impl ExpertModel for LightGBMExpert {
                     }
                 }
             }
-            self.gpu_only_disabled = false;
             Ok(())
         }
     }
