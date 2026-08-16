@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     // Owned, so the `raw_args` vector can be moved into `args` further down.
     let subcommand: String = raw_args.get(1).cloned().unwrap_or_default();
-    let mut startup_settings = match neoethos_core::Settings::load() {
+    let startup_settings = match neoethos_core::Settings::load() {
         Ok(s) => s,
         Err(err) => {
             let path = neoethos_core::config::user_config_path();
@@ -121,7 +121,19 @@ fn main() -> Result<()> {
         },
     };
     warn_retired_env_vars();
-    startup_settings.apply_process_cpu_assignment(process_cpu_assignment);
+    let coordination_scope = if process_cpu_assignment.is_some() {
+        neoethos_core::execution_budget::CoordinationScope::ManagedProcessTree
+    } else {
+        neoethos_core::execution_budget::CoordinationScope::ProcessLocal
+    };
+    let execution_budget_inputs = neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
+        &startup_settings,
+        process_cpu_assignment,
+        coordination_scope,
+    )?;
+    neoethos_core::execution_budget::install_process_budget(
+        execution_budget_inputs.request().clone(),
+    )?;
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(

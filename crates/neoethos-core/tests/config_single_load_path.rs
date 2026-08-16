@@ -19,7 +19,7 @@
 //!
 //! `cargo test -p neoethos-core --test config_single_load_path`
 
-use neoethos_core::config::{user_config_path, ConfigSource, Settings};
+use neoethos_core::config::{ConfigSource, Settings, user_config_path};
 use std::path::{Path, PathBuf};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -42,6 +42,14 @@ fn load_yaml(tag: &str, yaml: &str) -> anyhow::Result<Settings> {
     let out = Settings::from_yaml(&path);
     let _ = std::fs::remove_file(&path);
     out
+}
+
+fn lookup<'a>(doc: &'a serde_yaml_ng::Value, dotted: &str) -> Option<&'a serde_yaml_ng::Value> {
+    let mut cursor = doc;
+    for segment in dotted.split('.') {
+        cursor = cursor.get(segment)?;
+    }
+    Some(cursor)
 }
 
 fn repo_root() -> PathBuf {
@@ -235,6 +243,46 @@ fn a_hardware_derived_key_in_a_file_is_ignored() {
     assert_ne!(
         loaded.system.num_gpus, 7,
         "a hardware-derived field must NOT be settable from a file"
+    );
+}
+
+#[test]
+fn zero_cpu_caps_fail_with_the_exact_key() {
+    for (tag, yaml, key) in [
+        (
+            "zero-canonical-cpu",
+            "system:\n  hardware:\n    cpu_budget: 0\n",
+            "system.hardware.cpu_budget",
+        ),
+        (
+            "zero-legacy-cpu",
+            "models:\n  backtest_runtime:\n    rayon_threads: 0\n",
+            "models.backtest_runtime.rayon_threads",
+        ),
+    ] {
+        let error = load_yaml(tag, yaml).expect_err("zero CPU cap must fail closed");
+        assert!(
+            format!("{error:#}").contains(key),
+            "error must name `{key}` exactly: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn legacy_rayon_cap_loads_but_is_never_written_back() {
+    let loaded = load_yaml(
+        "legacy-rayon-cap",
+        "models:\n  backtest_runtime:\n    rayon_threads: 3\n",
+    )
+    .expect("positive legacy cap remains readable for one compatibility window");
+    assert_eq!(loaded.models.backtest_runtime.rayon_threads, Some(3));
+
+    let saved = loaded
+        .as_override_document()
+        .expect("override document must serialize");
+    assert!(
+        lookup(&saved, "models.backtest_runtime.rayon_threads").is_none(),
+        "the legacy cap must be omitted on save so it cannot become permanent"
     );
 }
 
@@ -667,10 +715,7 @@ fn the_env_override_layer_is_gone() {
 /// operator-set.
 #[test]
 fn save_writes_only_overrides_and_never_prunes_a_money_key() {
-    let dir = std::env::temp_dir().join(format!(
-        "neoethos-save-overrides-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("neoethos-save-overrides-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("config.yaml");
 

@@ -236,7 +236,7 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
     // This is the shape this ledger exists to catch in the USEFUL direction: the
     // knob was never garbage, it was a capability with no consumer, and deleting
     // it at any point in the last months would have deleted the goal.
-    // ─── the three hardware-derived fields. RECLASSIFIED 2026-08-10 from
+    // ─── the remaining hardware-derived fields. RECLASSIFIED 2026-08-10 from
     // `WrittenNeverRead` to `Unwired`, because the claim stopped being true:
     // the writer that made them written — `AutoTuner::apply`, which had zero
     // callers — went out with the `NEOETHOS_BOT_*` layer (`system.rs:1354`
@@ -245,7 +245,7 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
     // in both directions precisely so a stale claim cannot sit here.
     //
     // They are still SCHEDULED FOR DELETION and are not deleted yet.
-    // `pending-A.md` §A3: all three are `#[serde(skip)]` and listed in
+    // `pending-A.md` §A3: both are `#[serde(skip)]` and listed in
     // `load_seal::RETIRED_KEYS` as `Derived`, so a value for them in a file is
     // NAMED AT WARN and ignored and `Settings::save` no longer writes them —
     // but the struct fields survive until the shard that owns `system.rs`
@@ -257,20 +257,6 @@ const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
     // fails as stale, exactly so that a half-landed deletion cannot pass
     // quietly. If this test fails with "ledger entry for an unknown field", the
     // fix is to remove the entry, not to re-add the field.
-    (
-        "SystemConfig::n_jobs",
-        Inert::Unwired,
-        "the mechanism is the hardware probe, not this field. Its former writer — \
-         `AutoTuner::apply`, `self.settings.system.n_jobs = hints.n_jobs` — was DELETED with \
-         the NEOETHOS_BOT_* layer, so this is no longer WrittenNeverRead; it is simply unread. \
-         Every consumer reads `AutoTuneHints::n_jobs`/`available_parallelism()`. One of the two \
-         false passes that motivated the 2026-08-09 rewrite. The value in the shipped config \
-         (11) is the fingerprint of `available_parallelism() - 1` on a 12-core box, pickled into \
-         YAML by `Settings::save` and then shipped to every other machine; it is now \
-         `#[serde(skip)]` + a `Derived` entry in `load_seal::RETIRED_KEYS`, so a file that still \
-         carries `n_jobs:` is named at WARN and ignored rather than obeyed. OWNER: operator — \
-         DELETE the field; rayon width is a property of the box, not of a config file.",
-    ),
     (
         "SystemConfig::num_gpus",
         Inert::Unwired,
@@ -361,7 +347,9 @@ fn workspace_root() -> PathBuf {
 }
 
 fn config_rs() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("config.rs")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("config.rs")
 }
 
 /// The struct graph declared in `config.rs`, rooted at `Settings`.
@@ -415,7 +403,9 @@ fn base_type(ty: &str) -> String {
         }
         // lifetimes: `&'a Foo`
         if let Some(rest) = t.strip_prefix('\'') {
-            t = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_').trim_start();
+            t = rest
+                .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+                .trim_start();
         }
     }
     let head = t.split(['<', ',', ' ', ')', '>']).next().unwrap_or("");
@@ -481,16 +471,26 @@ fn parse_config_model(src: &str) -> ConfigModel {
             continue;
         };
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("pub ") else { continue };
-        let Some((name, ty)) = rest.split_once(':') else { continue };
+        let Some(rest) = trimmed.strip_prefix("pub ") else {
+            continue;
+        };
+        let Some((name, ty)) = rest.split_once(':') else {
+            continue;
+        };
         let name = name.trim();
         if name.is_empty()
-            || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
             continue;
         }
         let ty = base_type(ty.trim_end().trim_end_matches(','));
-        model.structs.entry(owner).or_default().push((name.to_string(), ty));
+        model
+            .structs
+            .entry(owner)
+            .or_default()
+            .push((name.to_string(), ty));
     }
 
     for (owner, fields) in &model.structs {
@@ -501,7 +501,11 @@ fn parse_config_model(src: &str) -> ConfigModel {
     for fields in model.structs.values() {
         for (f, ty) in fields {
             if struct_names.contains(ty) {
-                model.installs.entry(f.clone()).or_default().insert(ty.clone());
+                model
+                    .installs
+                    .entry(f.clone())
+                    .or_default()
+                    .insert(ty.clone());
             }
         }
     }
@@ -652,7 +656,11 @@ fn raw_string_hashes(b: &[u8], mut i: usize) -> Option<(usize, usize)> {
         hashes += 1;
         i += 1;
     }
-    if i < b.len() && b[i] == b'"' { Some((i + 1, hashes)) } else { None }
+    if i < b.len() && b[i] == b'"' {
+        Some((i + 1, hashes))
+    } else {
+        None
+    }
 }
 
 fn is_ident_byte(c: u8) -> bool {
@@ -784,7 +792,10 @@ fn scrutinee_text<'a>(code: &'a str, pat_start: usize, pat_end: usize) -> Option
     // A match arm: the scrutinee is the `match` header of the enclosing block.
     if code[k..].starts_with("=>") || code[k..].starts_with("if ") {
         let open = enclosing_open_brace(b, pat_start)?;
-        let start = code[..open].rfind([';', '{', '}']).map(|p| p + 1).unwrap_or(0);
+        let start = code[..open]
+            .rfind([';', '{', '}'])
+            .map(|p| p + 1)
+            .unwrap_or(0);
         let header = code[start..open].trim();
         let at = header.rfind("match ")?;
         return Some(header[at + "match ".len()..].trim());
@@ -868,7 +879,9 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
     // unresolvable receiver the moment it is unwrapped.
     let mut option_inner: Bindings = BTreeMap::new();
     let bind = |name: &str, ty: &str, out: &mut Bindings| {
-        out.entry(name.to_string()).or_default().insert(ty.to_string());
+        out.entry(name.to_string())
+            .or_default()
+            .insert(ty.to_string());
     };
 
     // (1) `ident: [&][mut ][path::]Type`
@@ -926,11 +939,7 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
             }
             // `Option<T>` / `Result<T, _>`: remember the `T` so a later
             // `Some(x)` / `Ok(x)` over this name resolves instead of vanishing.
-            if generic_or_end
-                && (ty == "Option" || ty == "Result")
-                && k < b.len()
-                && b[k] == b'<'
-            {
+            if generic_or_end && (ty == "Option" || ty == "Result") && k < b.len() && b[k] == b'<' {
                 let inner = base_type(&code[k + 1..]);
                 if model.structs.contains_key(&inner) {
                     bind(&bindee, &inner, &mut option_inner);
@@ -949,7 +958,9 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
         if !before_ok || at + 4 >= b.len() || is_ident_byte(b[at + 4]) {
             continue;
         }
-        let Some(brace) = code[at..].find('{') else { break };
+        let Some(brace) = code[at..].find('{') else {
+            break;
+        };
         let header = &code[at + 4..at + brace];
         let header = header.split(" where ").next().unwrap_or(header);
         let target = header.rsplit(" for ").next().unwrap_or(header);
@@ -969,13 +980,17 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
         if at > 0 && is_ident_byte(b[at - 1]) {
             continue;
         }
-        let Some((name, after)) = ident_at(b, at + 3) else { continue };
+        let Some((name, after)) = ident_at(b, at + 3) else {
+            continue;
+        };
         let stop = code[after..]
             .find('{')
             .map(|e| after + e)
             .unwrap_or(code.len().min(after + 400));
         let header = &code[after..stop];
-        let Some(arrow) = header.rfind("->") else { continue };
+        let Some(arrow) = header.rfind("->") else {
+            continue;
+        };
         let ty = base_type(header[arrow + 2..].split(" where ").next().unwrap_or(""));
         if model.structs.contains_key(&ty) {
             bind(&format!("{name}()"), &ty, &mut out);
@@ -997,7 +1012,9 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
         while j < b.len() && (b[j] as char).is_whitespace() {
             j += 1;
         }
-        let Some((bindee, mut k)) = ident_at(b, j) else { continue };
+        let Some((bindee, mut k)) = ident_at(b, j) else {
+            continue;
+        };
         while k < b.len() && (b[k] as char).is_whitespace() {
             k += 1;
         }
@@ -1035,7 +1052,9 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
             if at > 0 && is_ident_byte(b[at - 1]) {
                 continue;
             }
-            let Some((bindee, after)) = ident_at(b, at + kw.len()) else { continue };
+            let Some((bindee, after)) = ident_at(b, at + kw.len()) else {
+                continue;
+            };
             // Only a bare binding: `Some(p)`. `Some(Foo(x))`, `Some(compute())`
             // and `Some(Enum::Variant)` bind nothing here.
             if b.get(after) != Some(&b')') {
@@ -1044,7 +1063,9 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
             if !bindee.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
                 continue; // a unit variant, not a binding
             }
-            let Some(scrutinee) = scrutinee_text(code, at, after + 1) else { continue };
+            let Some(scrutinee) = scrutinee_text(code, at, after + 1) else {
+                continue;
+            };
             let mut candidates: BTreeSet<String> = BTreeSet::new();
             for tok in scrutinee.split(|c: char| !is_ident_byte(c as u8)) {
                 if tok.is_empty() {
@@ -1068,7 +1089,10 @@ fn collect_facts(code: &str, model: &ConfigModel) -> FileFacts {
         }
     }
 
-    FileFacts { bindings: out, self_scopes }
+    FileFacts {
+        bindings: out,
+        self_scopes,
+    }
 }
 
 /// The config type an initialiser expression evaluates to, when that is
@@ -1167,8 +1191,12 @@ fn receiver_chain(b: &[u8], dot: usize) -> Vec<String> {
             break;
         }
         if b[p - 1] == b')' {
-            let Some(open) = match_paren_back(b, p - 1) else { break };
-            let Some((name, start)) = ident_ending_before(b, open) else { break };
+            let Some(open) = match_paren_back(b, p - 1) else {
+                break;
+            };
+            let Some((name, start)) = ident_ending_before(b, open) else {
+                break;
+            };
             chain.push(format!("{name}()"));
             p = start;
         } else if let Some((seg, start)) = ident_ending_before(b, p) {
@@ -1200,7 +1228,12 @@ fn is_assignment_target(b: &[u8], k: usize) -> bool {
     if b.get(k + 1) == Some(&b'=') {
         return false; // ==
     }
-    if k > 0 && matches!(b[k - 1], b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^') {
+    if k > 0
+        && matches!(
+            b[k - 1],
+            b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
+        )
+    {
         return false; // !=, >=, +=, …
     }
     true
@@ -1249,7 +1282,9 @@ fn attribute(
     model: &ConfigModel,
     pos: usize,
 ) -> Vec<Read> {
-    let Some(r1) = chain.first() else { return Vec::new() };
+    let Some(r1) = chain.first() else {
+        return Vec::new();
+    };
 
     // (a) receiver bound to a config type that declares the field.
     let mut owners: BTreeSet<String> = BTreeSet::new();
@@ -1289,7 +1324,10 @@ fn attribute(
         return Vec::new();
     }
     let owner = owners.into_iter().next().expect("len == 1");
-    let mut out = vec![Read { owner: owner.clone(), field: field.to_string() }];
+    let mut out = vec![Read {
+        owner: owner.clone(),
+        field: field.to_string(),
+    }];
 
     // Reading `prefilter_top_k` off `discovery_runtime` is also a read of
     // `discovery_runtime` itself — but only for the parent that installs THIS
@@ -1311,13 +1349,19 @@ fn attribute(
                 Some(r2) => {
                     let mut candidates: BTreeSet<String> = facts.types_at(r2, pos);
                     candidates.extend(model.installs.get(r2).into_iter().flatten().cloned());
-                    parents.into_iter().filter(|p| candidates.contains(p)).collect()
+                    parents
+                        .into_iter()
+                        .filter(|p| candidates.contains(p))
+                        .collect()
                 }
                 None => Vec::new(),
             }
         };
         for parent in chosen {
-            out.push(Read { owner: parent, field: r1.clone() });
+            out.push(Read {
+                owner: parent,
+                field: r1.clone(),
+            });
         }
     }
     out
@@ -1326,7 +1370,14 @@ fn attribute(
 fn collect_sources(root: &Path, out: &mut Vec<PathBuf>) {
     // `.claude` holds other worktrees of this same repo — scanning them would
     // let a stale checkout satisfy the guard for the tree under test.
-    const SKIP: &[&str] = &["target", ".git", ".claude", "node_modules", "vendor", "dist"];
+    const SKIP: &[&str] = &[
+        "target",
+        ".git",
+        ".claude",
+        "node_modules",
+        "vendor",
+        "dist",
+    ];
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -1410,7 +1461,10 @@ fn credit_config_rs_accessors(src: &str, model: &ConfigModel, index: &mut ReadIn
             continue;
         }
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("pub fn ").or_else(|| trimmed.strip_prefix("fn ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("fn "))
+        {
             current_fn = ident_at(rest.as_bytes(), 0).map(|(n, _)| n);
         }
         let (Some(owner), Some(func)) = (current_impl.as_ref(), current_fn.as_ref()) else {
@@ -1420,7 +1474,9 @@ fn credit_config_rs_accessors(src: &str, model: &ConfigModel, index: &mut ReadIn
         while let Some(rel) = line[from..].find("self.") {
             let at = from + rel + 5;
             from = at;
-            let Some((field, _)) = ident_at(line.as_bytes(), at) else { continue };
+            let Some((field, _)) = ident_at(line.as_bytes(), at) else {
+                continue;
+            };
             if !model.declares(owner, &field) {
                 continue;
             }
@@ -1452,7 +1508,9 @@ fn reporting_ranges(rel: &str, code: &str) -> Vec<(usize, usize)> {
                 continue;
             }
             // The body starts at the first `{` after the signature.
-            let Some(open) = code[at..].find('{').map(|o| at + o) else { continue };
+            let Some(open) = code[at..].find('{').map(|o| at + o) else {
+                continue;
+            };
             let end = match_brace_forward(b, open).unwrap_or(code.len());
             out.push((at, end));
         }
@@ -1461,7 +1519,9 @@ fn reporting_ranges(rel: &str, code: &str) -> Vec<(usize, usize)> {
 }
 
 fn in_range(ranges: &[(usize, usize)], pos: usize) -> bool {
-    ranges.iter().any(|(start, end)| pos >= *start && pos <= *end)
+    ranges
+        .iter()
+        .any(|(start, end)| pos >= *start && pos <= *end)
 }
 
 fn scan_workspace(model: &ConfigModel) -> ReadIndex {
@@ -1470,8 +1530,12 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
     let mut files = Vec::new();
     collect_sources(&root, &mut files);
 
-    let all_field_names: BTreeSet<&String> =
-        model.reachable.iter().flat_map(|t| model.declares.get(t)).flatten().collect();
+    let all_field_names: BTreeSet<&String> = model
+        .reachable
+        .iter()
+        .flat_map(|t| model.declares.get(t))
+        .flatten()
+        .collect();
 
     let mut index = ReadIndex::default();
     for file in files {
@@ -1506,7 +1570,10 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
                     continue;
                 }
                 let open = at + needle.len() + code[at + needle.len()..].find('{').unwrap_or(0);
-                let close = code[open..].find('}').map(|e| open + e).unwrap_or(code.len());
+                let close = code[open..]
+                    .find('}')
+                    .map(|e| open + e)
+                    .unwrap_or(code.len());
                 let body = &code[open + 1..close];
                 for tok in body.split(|c: char| !is_ident_byte(c as u8)) {
                     if model.declares(ty, tok) {
@@ -1709,7 +1776,12 @@ fn every_settings_field_reaches_a_qualified_consumer() {
         let mut near = index
             .unqualified
             .get(field)
-            .map(|v| format!("  looks-like-a-read (receiver unresolved): {}", v.join(", ")))
+            .map(|v| {
+                format!(
+                    "  looks-like-a-read (receiver unresolved): {}",
+                    v.join(", ")
+                )
+            })
             .unwrap_or_default();
         if index.written.contains(&key) {
             near.push_str(
@@ -1749,9 +1821,17 @@ fn every_settings_field_reaches_a_qualified_consumer() {
          changes nothing is the defect this test exists to stop.",
         no_reader.len() + scaffolding_only.len(),
         no_reader.len(),
-        if no_reader.is_empty() { "  (none)".into() } else { no_reader.join("\n") },
+        if no_reader.is_empty() {
+            "  (none)".into()
+        } else {
+            no_reader.join("\n")
+        },
         scaffolding_only.len(),
-        if scaffolding_only.is_empty() { "  (none)".into() } else { scaffolding_only.join("\n") },
+        if scaffolding_only.is_empty() {
+            "  (none)".into()
+        } else {
+            scaffolding_only.join("\n")
+        },
     );
 }
 
@@ -1777,7 +1857,9 @@ fn the_no_qualified_reader_ledger_is_exact() {
             continue;
         }
         if !model.reachable.contains(owner) {
-            problems.push(format!("`{key}`: `{owner}` is not reachable from `Settings`"));
+            problems.push(format!(
+                "`{key}`: `{owner}` is not reachable from `Settings`"
+            ));
         }
         if why.trim().len() < 40 || !why.contains("OWNER:") {
             problems.push(format!(
@@ -1836,7 +1918,9 @@ fn the_reporting_only_list_is_exact() {
     for (path, func, why) in REPORTING_ONLY {
         let file = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
         let Ok(raw) = std::fs::read_to_string(&file) else {
-            problems.push(format!("`{path}` is listed in REPORTING_ONLY but cannot be read"));
+            problems.push(format!(
+                "`{path}` is listed in REPORTING_ONLY but cannot be read"
+            ));
             continue;
         };
         let code = strip_noncode(&raw);
@@ -1848,7 +1932,9 @@ fn the_reporting_only_list_is_exact() {
             ));
         }
         if why.trim().len() < 40 {
-            problems.push(format!("`{path}::{func}` must say why it is a reporter, not a reader"));
+            problems.push(format!(
+                "`{path}::{func}` must say why it is a reporter, not a reader"
+            ));
         }
     }
     assert!(
@@ -1980,8 +2066,7 @@ fn the_bundled_seed_config_declares_nothing_settings_would_drop() {
     let seed = std::fs::read_to_string(&seed_path).expect("bundled seed config must be readable");
 
     let model = model();
-    let known: BTreeSet<&String> =
-        model.structs.values().flatten().map(|(f, _)| f).collect();
+    let known: BTreeSet<&String> = model.structs.values().flatten().map(|(f, _)| f).collect();
 
     let mut unknown = Vec::new();
     let mut skip_indent: Option<usize> = None;
@@ -2109,10 +2194,16 @@ mod scanner {
         // The exact false pass: `AutoTuneHints::inference_batch_size` satisfied
         // `ModelsConfig::inference_batch_size` for a knob nothing read.
         let out = reads("fn f(h: &AutoTuneHints) { let _ = h.inference_batch_size; }");
-        assert!(out.is_empty(), "unqualified read must not attribute: {out:?}");
+        assert!(
+            out.is_empty(),
+            "unqualified read must not attribute: {out:?}"
+        );
 
         let out = reads("fn f(s: &BacktestSettings) { let _ = s.trailing_min_lock_pips; }");
-        assert!(out.is_empty(), "unqualified read must not attribute: {out:?}");
+        assert!(
+            out.is_empty(),
+            "unqualified read must not attribute: {out:?}"
+        );
     }
 
     #[test]
@@ -2189,7 +2280,10 @@ mod scanner {
         assert!(is_assignment_target(b, k), "`= x` must read as a write");
 
         // …but a comparison and a compound assignment both READ.
-        for src in ["if s.models.inference_batch_size == 4 {}", "s.models.inference_batch_size += 1;"] {
+        for src in [
+            "if s.models.inference_batch_size == 4 {}",
+            "s.models.inference_batch_size += 1;",
+        ] {
             let code = strip_noncode(src);
             let b = code.as_bytes();
             let dot = code.find(".inference_batch_size").expect("access");
@@ -2269,7 +2363,10 @@ mod scanner {
         );
         // …and it must NOT credit the identically-named `RiskConfig` field.
         assert!(
-            !out.contains(&("RiskConfig".to_string(), "trailing_min_lock_pips".to_string())),
+            !out.contains(&(
+                "RiskConfig".to_string(),
+                "trailing_min_lock_pips".to_string()
+            )),
             "the risk copy is a different struct: {out:?}"
         );
 
@@ -2311,14 +2408,20 @@ mod scanner {
             "fn f() { match whatever() { Some(p) => { let _ = p.trailing_min_lock_pips; } \
              None => {} } }",
         );
-        assert!(out.is_empty(), "an unresolved receiver must credit nothing: {out:?}");
+        assert!(
+            out.is_empty(),
+            "an unresolved receiver must credit nothing: {out:?}"
+        );
 
         // A constructor is not a pattern: `Some(cfg)` here binds nothing.
         let out = reads(
             "fn f() { let cfg = mystery(); let wrapped = Some(cfg); \
              let _ = cfg.trailing_min_lock_pips; }",
         );
-        assert!(out.is_empty(), "a constructor call must bind nothing: {out:?}");
+        assert!(
+            out.is_empty(),
+            "a constructor call must bind nothing: {out:?}"
+        );
     }
 
     #[test]
@@ -2329,7 +2432,10 @@ mod scanner {
             "fn f(a: &ExitPolicyConfig, b: &RiskConfig) { let p: ExitPolicyConfig = *a; \
              let p: RiskConfig = *b; let _ = p.trailing_min_lock_pips; }",
         );
-        assert!(out.is_empty(), "an ambiguous receiver must credit nothing: {out:?}");
+        assert!(
+            out.is_empty(),
+            "an ambiguous receiver must credit nothing: {out:?}"
+        );
     }
 
     #[test]
@@ -2344,8 +2450,12 @@ mod scanner {
         let stripped = strip_noncode(src);
         let facts = collect_facts(&stripped, &model);
 
-        let inside = stripped.find("self.trailing_min_lock_pips").expect("first read");
-        let outside = stripped.rfind("self.trailing_min_lock_pips").expect("second read");
+        let inside = stripped
+            .find("self.trailing_min_lock_pips")
+            .expect("first read");
+        let outside = stripped
+            .rfind("self.trailing_min_lock_pips")
+            .expect("second read");
         assert!(
             facts.types_at("self", inside).contains("RiskConfig"),
             "`self` must resolve inside `impl RiskConfig`"
@@ -2365,10 +2475,17 @@ mod scanner {
                    let _ = settings.models.discovery_runtime.prefilter_top_k; }\n";
         let code = strip_noncode(src);
         let ranges = reporting_ranges("crates/neoethos-search/src/discovery.rs", &code);
-        assert_eq!(ranges.len(), 1, "exactly the reporter must be ranged: {ranges:?}");
+        assert_eq!(
+            ranges.len(),
+            1,
+            "exactly the reporter must be ranged: {ranges:?}"
+        );
         let reporter_read = code.find("settings.risk").expect("reporter read");
         let real_read = code.find("settings.models").expect("real read");
-        assert!(in_range(&ranges, reporter_read), "the reporter's read must be inside its range");
+        assert!(
+            in_range(&ranges, reporter_read),
+            "the reporter's read must be inside its range"
+        );
         assert!(
             !in_range(&ranges, real_read),
             "a read outside the reporter must keep its credit"

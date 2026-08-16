@@ -161,18 +161,6 @@ pub struct SystemConfig {
     pub poll_interval_seconds: u64,
     pub metrics_db_path: PathBuf,
     pub cache_dir: PathBuf,
-    /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. `#[serde(skip)]` since
-    /// 2026-08-10: nothing reads this field (`config_has_recipient.rs:210-233`),
-    /// and `Settings::save` serialises the WHOLE struct on every write, so one
-    /// click on any control used to pickle the detector's answer into the YAML
-    /// as a literal. `n_jobs: 11` in the operator's live store is
-    /// `available_parallelism() - 1` on a 12-core box, frozen - and then
-    /// carried to a machine with different cores. The value is detected at
-    /// runtime; an `n_jobs:` key in a file is now named at WARN and ignored
-    /// (see `RETIRED_KEYS`). Deleting the field is blocked on `system.rs`
-    /// (AutoTuner still assigns it) - routed to `pending-A.md`.
-    #[serde(skip)]
-    pub n_jobs: usize,
     pub enable_gpu_preference: String,
     // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
     // (`discovery_auto_cap` / `discovery_max_rows` / `discovery_stream`). They
@@ -213,14 +201,15 @@ pub struct SystemConfig {
 ///
 /// All-`None`/empty defaults reproduce the historical env-absent behaviour.
 ///
-/// ⚠ `NEOETHOS_BOT_CPU_BUDGET` is a partial exception: neoethos-cli still reads
-/// it directly in `main()` and passes it to `apply_process_cpu_assignment`. One
-/// name, two readers, one of them dead — which is precisely the argument for a
-/// single resolution point rather than simply relocating the variables.
+/// CPU capacity is resolved by `ExecutionBudgetInputs` from this typed setting,
+/// an optional legacy read-only cap, and an optional parent assignment. No
+/// caller mutates persistent settings to carry ephemeral process capacity.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HardwareConfig {
-    /// CPU thread budget for model training; `None` = auto (cores-based).
+    /// Maximum workers for every CPU-heavy workload in this process. `None` =
+    /// effective logical threads minus the fixed two-thread stability reserve.
+    /// An explicit value can only narrow that automatic ceiling.
     pub cpu_budget: Option<usize>,
     /// Forced training precision; `None` = auto per accelerator.
     pub training_precision: Option<crate::system::TrainingPrecision>,
@@ -234,10 +223,6 @@ pub struct HardwareConfig {
 
 impl Default for SystemConfig {
     fn default() -> Self {
-        let n_jobs = std::thread::available_parallelism()
-            .map(|n| (n.get() - 1).max(1))
-            .unwrap_or(1);
-
         Self {
             // F-129 fix (2026-05-25): the previous defaults hardcoded
             // `symbol = "EURUSD"` + `symbols = vec!["EURUSD"]`. Both
@@ -278,7 +263,6 @@ impl Default for SystemConfig {
             poll_interval_seconds: 60,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
             cache_dir: PathBuf::from("cache"),
-            n_jobs,
             enable_gpu_preference: "auto".to_string(),
             // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
             // (see struct decl). The real row cap is `models.prop_search_max_rows`.
@@ -727,7 +711,10 @@ impl RiskConfig {
     ///   configured charges numbers nobody chose.
     pub fn session_spread_pips(&self) -> Result<Option<SessionSpreadPips>, String> {
         let named = [
-            ("backtest_spread_pips_asian", self.backtest_spread_pips_asian),
+            (
+                "backtest_spread_pips_asian",
+                self.backtest_spread_pips_asian,
+            ),
             (
                 "backtest_spread_pips_overlap",
                 self.backtest_spread_pips_overlap,
@@ -2068,8 +2055,10 @@ pub struct BacktestRuntimeConfig {
     pub initial_equity: f64,
     /// Max monthly PnL buckets retained for consistency math (> 0).
     pub month_capacity: usize,
-    /// Explicit rayon thread-pool size. `None` → one worker per logical
-    /// core (rayon default).
+    /// One-release read-only compatibility cap. New configurations use
+    /// `system.hardware.cpu_budget`; this legacy field is accepted with a WARN
+    /// but is never written back out.
+    #[serde(skip_serializing)]
     pub rayon_threads: Option<usize>,
 }
 
@@ -3005,7 +2994,7 @@ pub use load_seal::{ConfigOverride, ConfigProvenance, ConfigSource, Settings};
 /// open by design, and why `ModelsConfig` is still unsealed.
 mod load_seal {
     use super::{
-        user_config_path, AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig,
+        AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig, user_config_path,
     };
     use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
     use serde::{Deserialize, Deserializer, Serialize};
@@ -3380,8 +3369,9 @@ mod load_seal {
             path: "system.n_jobs",
             kind: RetiredKind::Derived,
             note: "hardware-derived. A value here is a detector output that `Settings::save` \
-                   pickled back in as an input — `n_jobs: 11` is `available_parallelism()-1` on \
-                   a 12-core box, frozen into the file and then carried to other machines",
+                   pickled back in as an input. The runtime now uses effective \
+                   `available_parallelism()` minus the fixed two-thread reserve, then applies \
+                   only typed narrowing caps",
         },
         RetiredKey {
             path: "system.num_gpus",
@@ -3865,7 +3855,10 @@ mod load_seal {
             let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|err| {
                 anyhow::anyhow!("config file {} is not valid YAML: {err}", path.display())
             })?;
-            Self::from_raw(raw, ConfigProvenance::record(source, Some(path.to_path_buf())))
+            Self::from_raw(
+                raw,
+                ConfigProvenance::record(source, Some(path.to_path_buf())),
+            )
         }
 
         /// THE resolution order, and the only one. **Two branches, then the
@@ -3944,6 +3937,19 @@ mod load_seal {
             if raw.is_null() {
                 raw = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
             }
+            for key in [
+                "system.hardware.cpu_budget",
+                "models.backtest_runtime.rayon_threads",
+            ] {
+                if get_dotted(&raw, key).and_then(serde_yaml_ng::Value::as_u64) == Some(0) {
+                    anyhow::bail!(
+                        "config key `{key}` must be greater than zero; omit it or use null for \
+                         automatic effective logical threads minus the fixed two-thread reserve"
+                    );
+                }
+            }
+            let legacy_cpu_cap_present =
+                get_dotted(&raw, "models.backtest_runtime.rayon_threads").is_some();
             prune_retired_keys(&mut raw, &origin);
 
             // Which of the preset-seeded fields the operator typed EXPLICITLY.
@@ -3960,6 +3966,29 @@ mod load_seal {
             let wire = serde_yaml_ng::from_value::<SettingsWire>(raw)
                 .map_err(|err| unknown_key_error(err, &origin))?;
             let mut settings = Self::mint(wire, provenance);
+            if legacy_cpu_cap_present {
+                let legacy_value = settings.models.backtest_runtime.rayon_threads;
+                let warning_origin = origin.clone();
+                say_once(
+                    format!(
+                        "legacy-cpu-budget:{warning_origin}:{}",
+                        legacy_value
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "null".to_string())
+                    ),
+                    move || {
+                        tracing::warn!(
+                            target: "neoethos_core::config",
+                            key = "models.backtest_runtime.rayon_threads",
+                            replacement = "system.hardware.cpu_budget",
+                            value = ?legacy_value,
+                            config = %warning_origin,
+                            "legacy CPU cap is accepted for one read-only compatibility window; \
+                             it narrows the same process budget but will be omitted on save"
+                        );
+                    },
+                );
+            }
             settings.reconcile_preset(preset_explicit, &explicit);
             settings.validate_safety_bounds();
             settings.report_ambiguous_sentinels(&origin);
@@ -3983,8 +4012,7 @@ mod load_seal {
             // `resolved_config` collapses "risky" and "growth" onto the same
             // ladder; this must agree with it or the cap and the ranking would
             // describe two different runs.
-            let risky_ladder =
-                matches!(self.system.trading_mode.as_str(), "risky" | "growth");
+            let risky_ladder = matches!(self.system.trading_mode.as_str(), "risky" | "growth");
             let seeds = PresetSeeds::for_preset(preset, risky_ladder);
             let name = preset.as_str();
 
@@ -4425,18 +4453,6 @@ fn platform_user_config_path() -> PathBuf {
 }
 
 impl Settings {
-    /// Apply an ephemeral CPU share assigned by a parent scheduler before any
-    /// process-wide thread pool or hardware policy is initialized. This keeps
-    /// the core/model budget and the search evaluator's Rayon pool aligned.
-    /// `None` (or zero) preserves the operator's persistent configuration.
-    pub fn apply_process_cpu_assignment(&mut self, assignment: Option<usize>) {
-        let Some(threads) = assignment.filter(|threads| *threads > 0) else {
-            return;
-        };
-        self.system.hardware.cpu_budget = Some(threads);
-        self.models.backtest_runtime.rayon_threads = Some(threads);
-    }
-
     /// Sanity-check loaded RiskConfig values against prop-firm-safe bounds.
     ///
     /// We can't reject the load — config consumers expect a non-fatal load —
@@ -4578,9 +4594,7 @@ impl Settings {
                 serde_yaml_ng::Value::Mapping(m) => {
                     let inner: Vec<String> = m
                         .iter()
-                        .map(|(k, v)| {
-                            format!("{}: {}", k.as_str().unwrap_or_default(), render(v))
-                        })
+                        .map(|(k, v)| format!("{}: {}", k.as_str().unwrap_or_default(), render(v)))
                         .collect();
                     format!("{{{}}}", inner.join(", "))
                 }
@@ -4713,12 +4727,14 @@ mod tests {
             s.models.hpo_trials_by_model.insert(k.to_string(), v);
             s.models.prop_search_max_rows_by_tf.insert(k.to_string(), v);
         }
-        s.models
-            .model_param_overrides
-            .insert("zeta".to_string(), HashMap::from([("b".to_string(), "1".to_string())]));
-        s.models
-            .model_param_overrides
-            .insert("alpha".to_string(), HashMap::from([("a".to_string(), "0".to_string())]));
+        s.models.model_param_overrides.insert(
+            "zeta".to_string(),
+            HashMap::from([("b".to_string(), "1".to_string())]),
+        );
+        s.models.model_param_overrides.insert(
+            "alpha".to_string(),
+            HashMap::from([("a".to_string(), "0".to_string())]),
+        );
 
         let a = serde_yaml_ng::to_string(&s).unwrap();
         let b = serde_yaml_ng::to_string(&s).unwrap();
@@ -4751,7 +4767,10 @@ mod tests {
         // bail in `run_discovery_cycle` catches the omission with an
         // actionable error.
         let settings = Settings::default();
-        assert_eq!(settings.system.symbol, "", "default symbol must be empty per F-129");
+        assert_eq!(
+            settings.system.symbol, "",
+            "default symbol must be empty per F-129"
+        );
         assert_eq!(
             settings.system.account_currency, "",
             "default account_currency must be empty per F-304"
@@ -4795,7 +4814,9 @@ mod tests {
         let m1 = sys.resolve_higher_timeframes("M1");
         assert_eq!(
             m1,
-            vec!["M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"],
+            vec![
+                "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"
+            ],
             "M1 base → all canonical above M1"
         );
         assert!(!m1.iter().any(|tf| tf == "M1"), "base itself is excluded");
@@ -4805,14 +4826,21 @@ mod tests {
         // which is precisely why an untouched UI sends no override and lets this
         // resolver decide (parity with the CLI).
         let h1 = sys.resolve_higher_timeframes("H1");
-        assert!(h1.contains(&"M5".to_string()), "lower TFs retained under multi-res");
+        assert!(
+            h1.contains(&"M5".to_string()),
+            "lower TFs retained under multi-res"
+        );
         assert!(h1.contains(&"H4".to_string()), "higher TFs retained");
         assert!(!h1.iter().any(|tf| tf == "H1"), "base itself is excluded");
         assert_eq!(h1.len(), 10, "all 11 canonical minus the base");
 
         // Effective-base relativity: an overridden base trims itself out even
         // when it differs from `self.base_timeframe`.
-        assert!(!sys.resolve_higher_timeframes("H4").iter().any(|tf| tf == "H4"));
+        assert!(
+            !sys.resolve_higher_timeframes("H4")
+                .iter()
+                .any(|tf| tf == "H4")
+        );
     }
 
     #[test]
@@ -4854,7 +4882,6 @@ mod tests {
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
     }
-
 }
 
 /// Profit the trail locks once it engages, in pips.

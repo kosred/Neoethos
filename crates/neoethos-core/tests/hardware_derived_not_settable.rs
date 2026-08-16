@@ -30,8 +30,9 @@
 //! named the fields would have to be rewritten by whoever chose.
 
 use neoethos_core::config::Settings;
+use neoethos_core::execution_budget::{CapacityDetection, CoordinationScope, LogicalThreadCount};
 use neoethos_core::system::{
-    HardwareRuntimeOverrides, RETIRED_DERIVED_KEYS, resolve_cpu_budget, retired_derived_key,
+    ExecutionBudgetInputs, RETIRED_DERIVED_KEYS, WorkloadDemand, WorkloadKind, retired_derived_key,
 };
 
 /// Knobs that decide **what the search finds**, not how it fits in memory.
@@ -158,11 +159,17 @@ fn the_ignored_message_names_the_key_the_reason_and_the_number() {
     // `system.n_jobs` is the one whose value is cheap enough to state outright,
     // and it is also the one whose stale copy is provably in the shipped config.
     let n_jobs = retired_derived_key("system.n_jobs").expect("system.n_jobs is retired");
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let expected =
-        resolve_cpu_budget(cores, &HardwareRuntimeOverrides::from_settings(&settings)).to_string();
+    let expected = ExecutionBudgetInputs::from_settings_and_parent(
+        &settings,
+        None,
+        CoordinationScope::ProcessLocal,
+    )
+    .expect("default settings are valid")
+    .resolve()
+    .expect("typed cap provenance is valid")
+    .effective_worker_limit
+    .get()
+    .to_string();
     assert_eq!(
         n_jobs.computed_value(&settings).as_deref(),
         Some(expected.as_str()),
@@ -180,22 +187,124 @@ fn the_ignored_message_names_the_key_the_reason_and_the_number() {
 /// peak resource use — the never-OOM invariant inverted.
 #[test]
 fn the_operator_may_narrow_the_cpu_budget_but_never_raise_it() {
-    let mut overrides = HardwareRuntimeOverrides::default();
+    let mut settings = Settings::default();
 
-    assert_eq!(resolve_cpu_budget(12, &overrides), 11, "auto = cores - 1");
+    let resolve = |settings: &Settings| {
+        ExecutionBudgetInputs::from_settings_parent_and_detection(
+            settings,
+            None,
+            supplied_detection(12),
+            CoordinationScope::ProcessLocal,
+        )
+        .expect("positive setting")
+        .resolve()
+        .expect("typed cap provenance")
+        .effective_worker_limit
+        .get()
+    };
 
-    overrides.cpu_budget = Some(4);
-    assert_eq!(resolve_cpu_budget(12, &overrides), 4, "asking for less works");
-
-    overrides.cpu_budget = Some(9_999);
     assert_eq!(
-        resolve_cpu_budget(12, &overrides),
-        12,
-        "asking for more than the machine has must clamp to the machine, not honour the request"
+        resolve(&settings),
+        10,
+        "auto = effective logical threads - 2"
     );
 
-    overrides.cpu_budget = Some(0);
-    assert_eq!(resolve_cpu_budget(12, &overrides), 1, "never zero threads");
+    settings.system.hardware.cpu_budget = Some(4);
+    assert_eq!(resolve(&settings), 4, "asking for less works");
+
+    settings.system.hardware.cpu_budget = Some(9_999);
+    assert_eq!(
+        resolve(&settings),
+        10,
+        "an oversized cap must not consume the fixed two-thread stability reserve"
+    );
+}
+
+fn supplied_detection(effective_logical_threads: usize) -> CapacityDetection {
+    CapacityDetection::supplied(
+        LogicalThreadCount::new(effective_logical_threads).expect("test capacity must be positive"),
+    )
+}
+
+#[test]
+fn typed_inputs_apply_every_cap_by_minimum_without_mutating_settings() {
+    let mut settings = Settings::default();
+    settings.system.hardware.cpu_budget = Some(9);
+    settings.models.backtest_runtime.rayon_threads = Some(7);
+
+    let resolved = ExecutionBudgetInputs::from_settings_parent_and_detection(
+        &settings,
+        Some(5),
+        supplied_detection(12),
+        CoordinationScope::ManagedProcessTree,
+    )
+    .expect("positive caps are valid")
+    .resolve()
+    .expect("cap provenance is valid");
+
+    assert_eq!(resolved.automatic_worker_limit.get(), 10);
+    assert_eq!(resolved.effective_worker_limit.get(), 5);
+    assert_eq!(settings.system.hardware.cpu_budget, Some(9));
+    assert_eq!(settings.models.backtest_runtime.rayon_threads, Some(7));
+}
+
+#[test]
+fn zero_cpu_caps_are_rejected_with_the_exact_config_key() {
+    let mut canonical = Settings::default();
+    canonical.system.hardware.cpu_budget = Some(0);
+    let error = ExecutionBudgetInputs::from_settings_parent_and_detection(
+        &canonical,
+        None,
+        supplied_detection(12),
+        CoordinationScope::ProcessLocal,
+    )
+    .expect_err("zero canonical cap must fail");
+    assert!(error.to_string().contains("system.hardware.cpu_budget"));
+
+    let mut legacy = Settings::default();
+    legacy.models.backtest_runtime.rayon_threads = Some(0);
+    let error = ExecutionBudgetInputs::from_settings_parent_and_detection(
+        &legacy,
+        None,
+        supplied_detection(12),
+        CoordinationScope::ProcessLocal,
+    )
+    .expect_err("zero legacy cap must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("models.backtest_runtime.rayon_threads")
+    );
+}
+
+#[test]
+fn workload_demand_uses_the_installed_capacity_without_hidden_8_16_or_2_clamps() {
+    let settings = Settings::default();
+    let resolved = ExecutionBudgetInputs::from_settings_parent_and_detection(
+        &settings,
+        None,
+        supplied_detection(64),
+        CoordinationScope::ProcessLocal,
+    )
+    .expect("default settings are valid")
+    .resolve()
+    .expect("resolution succeeds");
+    assert_eq!(resolved.effective_worker_limit.get(), 62);
+
+    for workload in [WorkloadKind::DataIngestion, WorkloadKind::Inference] {
+        let demand = WorkloadDemand::for_parallel_units(workload, 64);
+        assert_eq!(
+            demand.granted_workers(&resolved),
+            62,
+            "{workload:?} must be able to use every admitted worker when useful work exists"
+        );
+    }
+
+    let small = WorkloadDemand::for_parallel_units(WorkloadKind::DataIngestion, 3);
+    assert_eq!(small.granted_workers(&resolved), 3);
+
+    let ui = WorkloadDemand::lightweight_control(WorkloadKind::Ui);
+    assert_eq!(ui.granted_workers(&resolved), 0);
 }
 
 /// Close the loop from the source side: `system.rs` decides the hardware, and it
@@ -224,7 +333,12 @@ fn system_rs_resolves_no_environment_variable() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    for forbidden in ["env::var", "env::set_var", "env::remove_var", "use std::env"] {
+    for forbidden in [
+        "env::var",
+        "env::set_var",
+        "env::remove_var",
+        "use std::env",
+    ] {
         assert!(
             !code.contains(forbidden),
             "`{forbidden}` reappeared in crates/neoethos-core/src/system.rs. The hardware \

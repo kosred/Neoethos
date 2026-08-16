@@ -41,14 +41,8 @@ pub struct TreeRuntimeOverrides {
     pub early_stop_patience: Option<usize>,
     pub early_stop_min_delta: Option<f64>,
     pub lightgbm_gpu: bool,
-    /// The operator's CPU thread budget for the native tree pools, from
-    /// `models.backtest_runtime.rayon_threads` — the SAME field
-    /// `neoethos-search` resolves `RAYON_NUM_THREADS` to.
-    ///
-    /// Closes the asymmetry recorded as D-F4: one variable, two crates, two
-    /// answers. `neoethos-search` retired `RAYON_NUM_THREADS` to this field;
-    /// `neoethos-models` kept reading the raw variable on every tree train.
-    /// Both now read one field.
+    /// One-release read-only compatibility cap. New runs install the shared
+    /// process budget from `system.hardware.cpu_budget` before model startup.
     pub rayon_threads: Option<usize>,
 }
 
@@ -129,39 +123,26 @@ mod tree_runtime_tests {
 }
 
 pub fn cpu_threads_hint() -> usize {
-    // Config-driven CPU budget (was NEOETHOS_BOT_RUST_THREADS / _CPU_THREADS /
-    // _CPU_BUDGET). Reads the single core hardware knob so the models and the
-    // core hardware planner agree on the budget. The standard rayon
-    // RAYON_NUM_THREADS is still honored as a fallback, then cores-1.
-    if let Some(n) = neoethos_core::system::current_hardware_runtime_overrides()
-        .cpu_budget
-        .filter(|n| *n > 0)
-    {
-        return n;
+    if let Some(installed) = neoethos_core::execution_budget::installed_process_budget() {
+        return installed.resolved().effective_worker_limit.get();
     }
-    // ⚠ AUDIT #279 — RESOLVED 2026-08-10. The read stays; the ENV read does not.
-    //
-    // The history matters, because the naive fix here is wrong in both
-    // directions. A refuter pass once concluded `RAYON_NUM_THREADS` was dead
-    // on the strength of an orphaned `from_env` in
-    // `neoethos-search/src/.../eval.rs`. It was not: this function runs on
-    // every tree train (`parallel_trainer.rs:19`, `catboost.rs:414`,
-    // `catboost.rs:702`), so deleting the knob outright would have taken away
-    // the tree trainers' only thread control whenever
-    // `system.hardware.cpu_budget` is unset.
-    //
-    // The real defect was the ASYMMETRY: `neoethos-search` retired the
-    // variable to `models.backtest_runtime.rayon_threads` while this crate
-    // kept reading the raw environment — one variable, two crates, two
-    // answers, and only one of them recorded in the artifact. Both crates now
-    // read the one field. The thread control survives; the second channel does
-    // not. An exported `RAYON_NUM_THREADS` is NOT reported as retired: it is a
-    // standard rayon variable that still sizes rayon's own global pool, and
-    // claiming we ignore it would be a different lie.
-    if let Some(n) = current_tree_runtime().rayon_threads {
-        return n;
-    }
-    num_cpus::get().saturating_sub(1).max(1)
+
+    // Unit tests and library-only embedders may reach this before a top-level
+    // installer. Use the exact same leaf resolver, optionally narrowed by the
+    // one-window legacy field; never recreate a local cores-minus-one rule.
+    let mut request = neoethos_core::execution_budget::ExecutionBudgetRequest::detect(
+        neoethos_core::execution_budget::CoordinationScope::ProcessLocal,
+    );
+    request.legacy_persistent_limit = current_tree_runtime().rayon_threads.map(|threads| {
+        neoethos_core::execution_budget::BudgetCap::legacy(
+            neoethos_core::execution_budget::WorkerLimit::new(threads)
+                .expect("loaded legacy CPU cap is positive"),
+        )
+    });
+    neoethos_core::execution_budget::resolve_execution_budget(request)
+        .expect("tree-model fallback constructs valid CPU cap provenance")
+        .effective_worker_limit
+        .get()
 }
 
 pub fn tree_device_preference() -> DevicePreference {

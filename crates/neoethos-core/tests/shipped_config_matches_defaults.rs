@@ -299,12 +299,23 @@ fn live_store() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-fn flatten(prefix: &str, v: &serde_yaml_ng::Value, out: &mut BTreeMap<String, serde_yaml_ng::Value>) {
+fn flatten(
+    prefix: &str,
+    v: &serde_yaml_ng::Value,
+    out: &mut BTreeMap<String, serde_yaml_ng::Value>,
+) {
     match v {
         serde_yaml_ng::Value::Mapping(m) if !m.is_empty() && !OPAQUE_MAPS.contains(&prefix) => {
             for (k, val) in m {
-                let key = k.as_str().map(str::to_owned).unwrap_or_else(|| format!("{k:?}"));
-                let path = if prefix.is_empty() { key } else { format!("{prefix}.{key}") };
+                let key = k
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{k:?}"));
+                let path = if prefix.is_empty() {
+                    key
+                } else {
+                    format!("{prefix}.{key}")
+                };
                 flatten(&path, val, out);
             }
         }
@@ -419,7 +430,9 @@ fn default_for<'a>(
 fn is_known_key(defaults: &BTreeMap<String, serde_yaml_ng::Value>, path: &str) -> bool {
     canonical_path(defaults, path).is_some()
         || OPAQUE_MAPS.contains(&path)
-        || OPAQUE_MAPS.iter().any(|m| path.starts_with(&format!("{m}.")))
+        || OPAQUE_MAPS
+            .iter()
+            .any(|m| path.starts_with(&format!("{m}.")))
 }
 
 /// Numeric-tolerant equality, so `0.8` and `0.80` do not read as a drift.
@@ -434,11 +447,15 @@ fn registered<'a>(
     table: &'a [(&'a str, &'a str, &'a str)],
     path: &str,
 ) -> Option<(serde_yaml_ng::Value, &'a str)> {
-    table.iter().find(|(p, _, _)| *p == path).map(|(_, v, why)| {
-        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(v)
-            .unwrap_or_else(|e| panic!("registry value `{v}` for {path} is not valid YAML: {e}"));
-        (parsed, *why)
-    })
+    table
+        .iter()
+        .find(|(p, _, _)| *p == path)
+        .map(|(_, v, why)| {
+            let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(v).unwrap_or_else(|e| {
+                panic!("registry value `{v}` for {path} is not valid YAML: {e}")
+            });
+            (parsed, *why)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +520,23 @@ fn repo_config_contains_no_key_that_is_not_a_settings_field() {
         &root_config(),
         "Remedy: delete the key from config.yaml, or restore the field it names.",
     );
+}
+
+#[test]
+fn shipped_configs_never_publish_the_legacy_rayon_cpu_cap() {
+    for path in [
+        root_config(),
+        repo_root().join("desktop/src-tauri/resources/config.yaml"),
+    ] {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        assert!(
+            !text.contains("rayon_threads:"),
+            "{} still publishes models.backtest_runtime.rayon_threads; only \
+             system.hardware.cpu_budget may be persisted",
+            path.display()
+        );
+    }
 }
 
 /// The operator's store must still OPEN THE APP.
@@ -599,7 +633,10 @@ fn live_store_divergences_from_the_defaults_are_registered_decisions() {
 #[test]
 fn every_pinned_path_is_a_real_field() {
     let defaults = default_leaves();
-    let dead: Vec<&&str> = PINNED.iter().filter(|k| !defaults.contains_key(**k)).collect();
+    let dead: Vec<&&str> = PINNED
+        .iter()
+        .filter(|k| !defaults.contains_key(**k))
+        .collect();
     assert!(
         dead.is_empty(),
         "these pinned paths are not fields of Settings, so they guard nothing — the field was \
@@ -610,8 +647,10 @@ fn every_pinned_path_is_a_real_field() {
 #[test]
 fn every_registered_path_is_pinned() {
     let mut orphans = Vec::new();
-    for (table, name) in [(ROOT_REGISTERED, "ROOT_REGISTERED"), (LIVE_REGISTERED, "LIVE_REGISTERED")]
-    {
+    for (table, name) in [
+        (ROOT_REGISTERED, "ROOT_REGISTERED"),
+        (LIVE_REGISTERED, "LIVE_REGISTERED"),
+    ] {
         for (p, _, _) in table {
             if !PINNED.contains(p) {
                 orphans.push(format!("{name}: {p}"));
@@ -690,13 +729,11 @@ fn the_repo_config_exists_and_parses() {
 /// [`PINNED`] list. [`ROOT_REGISTERED`] carries the reason for the pinned ones;
 /// this carries the rest, so that the annotations B wrote into the 935-line
 /// file survive the collapse in the one place that is checked.
-const ROOT_NOTES: &[(&str, &str)] = &[
-    (
-        "system.trading_mode",
-        "The profile this file exists to describe. NOT merged with models.discovery_mode — that \
+const ROOT_NOTES: &[(&str, &str)] = &[(
+    "system.trading_mode",
+    "The profile this file exists to describe. NOT merged with models.discovery_mode — that \
          merge was overturned by the refuters and is never to be executed.",
-    ),
-];
+)];
 
 const PROFILE_HEADER: &str = "\
 # ============================================================================
@@ -813,7 +850,11 @@ fn the_repo_profile_carries_only_its_overrides() {
          restore their fields) and re-run:\n{}",
         path.display(),
         unknown.len(),
-        unknown.iter().map(|k| format!("  - {k}")).collect::<Vec<_>>().join("\n"),
+        unknown
+            .iter()
+            .map(|k| format!("  - {k}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 
     let mut kept: Vec<(&String, &serde_yaml_ng::Value)> = Vec::new();
@@ -884,7 +925,8 @@ fn the_repo_profile_carries_only_its_overrides() {
         kept.len(),
         dropped.len(),
         if dropped.is_empty() {
-            "  (no key dropped — only the header, ordering or a value's rendering changed)".to_string()
+            "  (no key dropped — only the header, ordering or a value's rendering changed)"
+                .to_string()
         } else {
             dropped.join("\n")
         },

@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Settings;
 use crate::contracts::CANONICAL_TIMEFRAMES;
+use crate::execution_budget::{CoordinationScope, installed_process_budget};
+use crate::system::ExecutionBudgetInputs;
 
 /// One resolved field — captures both the operator-supplied value and
 /// the value the system will actually use, plus where the resolution
@@ -56,6 +58,9 @@ pub enum ResolvedSource {
     /// report exists to answer "which value won and where did it come from";
     /// it must not be the thing that gets that wrong.
     ModeDerived,
+    /// Derived from the OS/cgroup/affinity-aware process capacity and the
+    /// fixed stability reserve, then narrowed by typed caps.
+    CapacityDerived,
     /// Built-in default (operator did not set anything).
     Default,
 }
@@ -66,6 +71,7 @@ impl ResolvedSource {
             Self::Config => "config",
             Self::SentinelExpanded => "sentinel→resolved",
             Self::ModeDerived => "mode",
+            Self::CapacityDerived => "process-capacity",
             Self::Default => "default",
         }
     }
@@ -155,6 +161,18 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub fn from_settings(s: &Settings) -> Self {
+        let cpu_budget = installed_process_budget()
+            .map(|installed| installed.resolved().clone())
+            .unwrap_or_else(|| {
+                ExecutionBudgetInputs::from_settings_and_parent(
+                    s,
+                    None,
+                    CoordinationScope::ProcessLocal,
+                )
+                .unwrap_or_else(|error| panic!("invalid CPU execution budget input: {error}"))
+                .resolve()
+                .unwrap_or_else(|error| panic!("invalid CPU execution budget request: {error}"))
+            });
         // Search section ---------------------------------------------------
         let max_indicators_raw = s.models.prop_search_max_indicators;
         let max_indicators_resolved = if max_indicators_raw == 0 {
@@ -271,6 +289,26 @@ impl ResolvedConfig {
         let mut display_fields = Vec::new();
         push_field(
             &mut display_fields,
+            "system.hardware",
+            "cpu_budget",
+            s.system
+                .hardware
+                .cpu_budget
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
+            cpu_budget.effective_worker_limit.get().to_string(),
+            if s.system.hardware.cpu_budget.is_some() {
+                ResolvedSource::Config
+            } else {
+                ResolvedSource::CapacityDerived
+            },
+            Some(
+                "effective logical threads minus the fixed two-thread stability reserve; \
+                 persistent, legacy, and parent values only narrow this ceiling",
+            ),
+        );
+        push_field(
+            &mut display_fields,
             "search",
             "max_indicators",
             max_indicators_raw.to_string(),
@@ -315,7 +353,9 @@ impl ResolvedConfig {
             s.models.prop_search_population_auto.to_string(),
             s.models.prop_search_population_auto.to_string(),
             ResolvedSource::Config,
-            Some("true + CUDA card: GA population raised to the card's fits ceiling (≤16384) — SEARCHES MORE, results differ; run log records the resolved value"),
+            Some(
+                "true + CUDA card: GA population raised to the card's fits ceiling (≤16384) — SEARCHES MORE, results differ; run log records the resolved value",
+            ),
         );
         push_field(
             &mut display_fields,

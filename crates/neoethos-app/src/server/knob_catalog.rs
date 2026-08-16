@@ -195,7 +195,7 @@ const SCHEMA_VERSION: u32 = 2;
 /// Build the catalog. Each entry reads its `current` value from the
 /// installed runtime overrides; the static parts come from the
 /// catalog array.
-fn build_catalog() -> Vec<KnobEntry> {
+pub fn build_catalog() -> Vec<KnobEntry> {
     use neoethos_search::current_genetic_search_runtime_overrides as ga;
     use neoethos_search::current_quality_runtime_overrides as quality;
     use neoethos_search::current_strategy_evaluation_runtime_overrides as strat;
@@ -213,8 +213,7 @@ fn build_catalog() -> Vec<KnobEntry> {
     // operator's store once; an unreadable config falls back to the compiled
     // defaults, which is exactly what the engine would use, so the catalog
     // cannot show a number the run would not use.
-    let models = neoethos_core::Settings::from_yaml(super::state::current_config_path())
-        .map(|s| s.models)
+    let settings = neoethos_core::Settings::from_yaml(super::state::current_config_path())
         .unwrap_or_else(|err| {
             tracing::warn!(
                 target: "neoethos_app::knob_catalog",
@@ -222,16 +221,49 @@ fn build_catalog() -> Vec<KnobEntry> {
                 "could not read the config for the knob catalog — showing the compiled \
                  defaults, which is what a run with an unreadable config would also use"
             );
-            neoethos_core::config::ModelsConfig::default()
+            neoethos_core::Settings::default()
+        });
+    let models = &settings.models;
+    let resolved_cpu_budget = neoethos_core::execution_budget::installed_process_budget()
+        .map(|installed| installed.resolved().clone())
+        .unwrap_or_else(|| {
+            neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
+                &settings,
+                None,
+                neoethos_core::execution_budget::CoordinationScope::ProcessLocal,
+            )
+            .unwrap_or_else(|error| panic!("invalid CPU execution budget input: {error}"))
+            .resolve()
+            .unwrap_or_else(|error| panic!("invalid CPU execution budget request: {error}"))
         });
 
     vec![
-        // ── Section 1 — Broker connectivity ──────────────────────────────
+        // ── Section 1 — System hardware ──────────────────────────────────
+        KnobEntry {
+            id: "system.hardware.cpu_budget",
+            section: "System hardware",
+            label: "Maximum CPU workers",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: None,
+            },
+            default: "auto: effective logical threads - 2",
+            current: resolved_cpu_budget.effective_worker_limit.get().to_string(),
+            help_short: "Auto uses effective logical threads minus two reserved threads; a value can only narrow that process ceiling.",
+            help_long: "The effective logical-thread count comes from the OS/cgroup/affinity-aware process view. Auto keeps a fixed two-thread stability reserve when at least three threads are available. This is the only persistent CPU-width knob; every Rayon, native-library, parser, model, and child-process worker count is admitted beneath the same ceiling.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        // ── Section 2 — Broker connectivity ──────────────────────────────
         KnobEntry {
             id: "ctrader.read_timeout_secs",
             section: "Broker connectivity (cTrader)",
             label: "Read timeout (seconds)",
-            kind: KnobKind::Int { min: Some(0), max: Some(3600) },
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(3600),
+            },
             default: "30",
             current: "30".to_string(), // Read inline in execute_via_session; no typed cache yet.
             help_short: "Caps the TCP read for cTrader execution; 0 disables.",
@@ -244,7 +276,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.max_attempts",
             section: "Broker connectivity (cTrader)",
             label: "Max execution attempts",
-            kind: KnobKind::Int { min: Some(1), max: Some(5) },
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(5),
+            },
             default: "3",
             current: "3".to_string(),
             help_short: "Initial + retries per cTrader order. Retry safety relies on the broker deduping by clientOrderId.",
@@ -257,7 +292,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.backoff_base_ms",
             section: "Broker connectivity (cTrader)",
             label: "Retry backoff base (ms)",
-            kind: KnobKind::Int { min: Some(10), max: Some(2000) },
+            kind: KnobKind::Int {
+                min: Some(10),
+                max: Some(2000),
+            },
             default: "200",
             current: "200".to_string(),
             help_short: "Base backoff in ms; doubles per attempt with 0-99ms jitter, capped at 5s total.",
@@ -283,7 +321,9 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.chart_merge_side",
             section: "Broker connectivity (cTrader)",
             label: "Chart merge side",
-            kind: KnobKind::Enum { variants: &["mid", "bid", "ask"] },
+            kind: KnobKind::Enum {
+                variants: &["mid", "bid", "ask"],
+            },
             default: "mid",
             current: "mid".to_string(),
             help_short: "Which side of the spread the chart layer uses when one price is needed.",
@@ -292,7 +332,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "mid",
             preset_aggressive: "mid",
         },
-
         // ── Section 2 — Risk & PnL ─────────────────────────────────────
         KnobEntry {
             id: "risk.account_currency",
@@ -304,10 +343,8 @@ fn build_catalog() -> Vec<KnobEntry> {
                 .account_currency
                 .clone()
                 .unwrap_or_else(|| "(unset)".to_string()),
-            help_short:
-                "ISO-4217 code (USD/EUR/GBP/JPY/CHF/CAD/AUD/NZD…) for the funded account. Required.",
-            help_long:
-                "Drives the pip-value math in the risk gate. With a wrong account currency, position sizing is wrong (e.g. treating GBP as USD overstates risk by ~20%). Operator-supplied via Settings → Broker Setup once; never auto-defaulted.",
+            help_short: "ISO-4217 code (USD/EUR/GBP/JPY/CHF/CAD/AUD/NZD…) for the funded account. Required.",
+            help_long: "Drives the pip-value math in the risk gate. With a wrong account currency, position sizing is wrong (e.g. treating GBP as USD overstates risk by ~20%). Operator-supplied via Settings → Broker Setup once; never auto-defaulted.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -320,8 +357,7 @@ fn build_catalog() -> Vec<KnobEntry> {
             default: "data/symbol_metadata.json",
             current: "data/symbol_metadata.json".to_string(),
             help_short: "Overrides the on-disk symbol-metadata JSON file.",
-            help_long:
-                "By default the bot reads `data/symbol_metadata.json` (auto-populated from the cTrader ProtoOASymbol records). Override to point at a frozen snapshot for reproducible offline backtests.",
+            help_long: "By default the bot reads `data/symbol_metadata.json` (auto-populated from the cTrader ProtoOASymbol records). Override to point at a frozen snapshot for reproducible offline backtests.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -333,8 +369,7 @@ fn build_catalog() -> Vec<KnobEntry> {
             kind: KnobKind::Path,
             default: "(platform default — %LOCALAPPDATA% on Windows)",
             current: "(platform default)".to_string(),
-            help_short:
-                "Where logs and persistent state live. Override to redirect to a portable drive or RAM disk.",
+            help_short: "Where logs and persistent state live. Override to redirect to a portable drive or RAM disk.",
             // ⚠ One of exactly three catalog entries whose environment
             // variable is STILL LIVE after the 2026-08-10 consolidation, and
             // the only one that can change WHICH CONFIG FILE the process
@@ -345,8 +380,7 @@ fn build_catalog() -> Vec<KnobEntry> {
             // `neoethos-core`, which this wave could not edit; recorded as A9
             // in the handoff. Said out loud in the help text rather than left
             // for an operator to discover.
-            help_long:
-                "By default `dirs::data_local_dir()` resolves to `%LOCALAPPDATA%/NeoEthos` on Windows. Override only if you have a specific reason (portable installation, faster disk, segregated backup target). ⚠ This one is still driven by the `NEOETHOS_USER_DATA_DIR` environment variable, not by this file — and it decides which config file the process reads, so setting it changes the answer to every other question on this screen. The startup log names it explicitly when it is in force.",
+            help_long: "By default `dirs::data_local_dir()` resolves to `%LOCALAPPDATA%/NeoEthos` on Windows. Override only if you have a specific reason (portable installation, faster disk, segregated backup target). ⚠ This one is still driven by the `NEOETHOS_USER_DATA_DIR` environment variable, not by this file — and it decides which config file the process reads, so setting it changes the answer to every other question on this screen. The startup log names it explicitly when it is in force.",
             preset_conservative: "",
             preset_balanced: "",
             preset_aggressive: "",
@@ -370,7 +404,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pnl_audit_drift_fraction",
             section: "Risk & PnL safety",
             label: "PnL audit drift threshold",
-            kind: KnobKind::Float { min: Some(1e-5), max: Some(0.05) },
+            kind: KnobKind::Float {
+                min: Some(1e-5),
+                max: Some(0.05),
+            },
             default: "0.001",
             current: "0.001".to_string(),
             help_short: "Drift threshold (fraction of notional) above which a PnL audit warning is logged.",
@@ -383,7 +420,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pnl_circuit_breaker_fraction",
             section: "Risk & PnL safety",
             label: "PnL circuit breaker",
-            kind: KnobKind::Float { min: Some(1e-4), max: Some(0.20) },
+            kind: KnobKind::Float {
+                min: Some(1e-4),
+                max: Some(0.20),
+            },
             default: "0.01",
             current: "0.01".to_string(),
             help_short: "Drift threshold (fraction of notional) that halts the auto-trader for operator review.",
@@ -409,7 +449,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "models.blend_gate_floor",
             section: "Risk & PnL safety",
             label: "Live blend floor (how small ML may shrink a gene entry)",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.34",
             current: format!("{}", models.blend_gate_floor),
             help_short: "Smallest fraction of its size a validated gene entry may be shrunk to by a lukewarm ensemble.",
@@ -422,7 +465,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "models.blend_veto_below",
             section: "Risk & PnL safety",
             label: "Live blend veto (skip the bar below this multiplier)",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.15",
             current: format!("{}", models.blend_veto_below),
             help_short: "Effective multiplier below which the live blend SKIPS the bar instead of sizing it to the floor.",
@@ -444,15 +490,20 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "false",
             preset_aggressive: "false",
         },
-
         // ── Section 3 — Discovery / GA ─────────────────────────────────
         KnobEntry {
             id: "ga.seed",
             section: "Discovery / GA search",
             label: "RNG seed (deterministic)",
-            kind: KnobKind::Int { min: Some(0), max: None },
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: None,
+            },
             default: "(unset — non-deterministic)",
-            current: ga_overrides.seed.map(|s| s.to_string()).unwrap_or_else(|| "(unset)".to_string()),
+            current: ga_overrides
+                .seed
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
             help_short: "Setting any value makes the GA run deterministic. Unset → OS-RNG seed.",
             help_long: "Set during validation runs to compare changes apples-to-apples. Leave unset for production search so the GA gets fresh randomness.",
             preset_conservative: "",
@@ -463,7 +514,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.novelty_weight",
             section: "Discovery / GA search",
             label: "Novelty bonus weight",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.0",
             current: format!("{}", ga_overrides.novelty_weight),
             help_short: "Favours diverse genes during selection; 0 = pure fitness ranking.",
@@ -476,7 +530,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.stagnation_patience",
             section: "Discovery / GA search",
             label: "Stagnation patience (generations)",
-            kind: KnobKind::Int { min: Some(1), max: Some(50) },
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(50),
+            },
             default: "2",
             current: format!("{}", ga_overrides.stagnation_patience),
             help_short: "Generations of no-progress before the SOFT diversity kick / gate relaxation triggers.",
@@ -489,7 +546,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.convergence_patience",
             section: "Discovery / GA search",
             label: "Convergence patience (generations)",
-            kind: KnobKind::Int { min: Some(0), max: Some(5000) },
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(5000),
+            },
             default: "250",
             current: format!("{}", ga_overrides.convergence_patience),
             help_short: "Flat generations before the combo HARD early-stops — but ONLY after the wall-clock floor (see below). 0 = never (run to the time cap).",
@@ -502,7 +562,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.min_improvement",
             section: "Discovery / GA search",
             label: "Min improvement epsilon",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.000000000001",
             current: format!("{}", ga_overrides.min_improvement),
             help_short: "Minimum top-fitness gain counted as real progress when measuring stagnation.",
@@ -515,7 +578,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.convergence_min_elapsed_fraction",
             section: "Discovery / GA search",
             label: "Convergence min-elapsed fraction",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.5",
             current: format!("{}", ga_overrides.convergence_min_elapsed_fraction),
             help_short: "Fraction of the per-combo time budget that MUST elapse before the convergence early-stop may fire.",
@@ -528,7 +594,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.tournament_size",
             section: "Discovery / GA search",
             label: "Tournament size override",
-            kind: KnobKind::Int { min: Some(2), max: Some(64) },
+            kind: KnobKind::Int {
+                min: Some(2),
+                max: Some(64),
+            },
             default: "(derived: max(pop/12, 3))",
             current: ga_overrides
                 .tournament_size_override
@@ -544,7 +613,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_start",
             section: "Discovery / GA search",
             label: "SMC gate start threshold",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.75",
             current: format!("{}", smc.start),
             help_short: "Where the SMC confluence gate begins each run.",
@@ -557,7 +629,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_end",
             section: "Discovery / GA search",
             label: "SMC gate end threshold",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(1.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             default: "0.35",
             current: format!("{}", smc.end),
             help_short: "Floor for the SMC confluence gate.",
@@ -579,13 +654,15 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "false",
             preset_aggressive: "false",
         },
-
         // ── Section 5 — Quality / acceptance ───────────────────────────
         KnobEntry {
             id: "quality.min_trades_per_month",
             section: "Quality / acceptance filtering",
             label: "Min trades per month",
-            kind: KnobKind::Int { min: Some(1), max: Some(200) },
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(200),
+            },
             default: "4",
             current: format!("{}", quality_overrides.min_trades_per_month),
             help_short: "Strategies with fewer trades/month than this are rejected as undersampled.",
@@ -598,7 +675,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "quality.trading_days_per_month",
             section: "Quality / acceptance filtering",
             label: "Trading days per month",
-            kind: KnobKind::Float { min: Some(1.0), max: Some(31.0) },
+            kind: KnobKind::Float {
+                min: Some(1.0),
+                max: Some(31.0),
+            },
             default: "21.0",
             current: format!("{}", quality_overrides.trading_days_per_month),
             help_short: "Used to normalize trade frequency across calendars.",
@@ -607,13 +687,15 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "21.0",
             preset_aggressive: "21.0",
         },
-
         // ── Section 1 cont. — Broker streaming + transport ────────────
         KnobEntry {
             id: "ctrader.stream_max_attempts",
             section: "Broker connectivity (cTrader)",
             label: "Streaming max attempts",
-            kind: KnobKind::Int { min: Some(1), max: Some(5) },
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(5),
+            },
             default: "3",
             current: "3".to_string(),
             help_short: "Max attempts for `load_live_chart_update` poll (stateless, safe to retry).",
@@ -626,7 +708,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ctrader.stream_backoff_base_ms",
             section: "Broker connectivity (cTrader)",
             label: "Streaming backoff base (ms)",
-            kind: KnobKind::Int { min: Some(10), max: Some(2000) },
+            kind: KnobKind::Int {
+                min: Some(10),
+                max: Some(2000),
+            },
             default: "200",
             current: "200".to_string(),
             help_short: "Streaming-layer retry backoff base; doubles per attempt, capped at 5s total.",
@@ -635,13 +720,15 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "200",
             preset_aggressive: "100",
         },
-
         // ── Section 2 cont. — Risk knobs ─────────────────────────────
         KnobEntry {
             id: "risk.quote_to_account_rate",
             section: "Risk & PnL safety",
             label: "Quote→account FX rate override",
-            kind: KnobKind::Float { min: Some(0.000_001), max: None },
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
             default: "(unset — broker-derived)",
             current: cost
                 .quote_to_account_rate
@@ -657,7 +744,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pip_value",
             section: "Cost model / pip-value",
             label: "Per-pip account-currency value (override)",
-            kind: KnobKind::Float { min: Some(0.000_001), max: None },
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
             default: "(broker symbol metadata)",
             current: cost
                 .pip_value
@@ -673,7 +763,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "risk.pip_value_per_lot",
             section: "Cost model / pip-value",
             label: "Per-lot pip value (override)",
-            kind: KnobKind::Float { min: Some(0.000_001), max: None },
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
             default: "(broker symbol metadata)",
             current: cost
                 .pip_value_per_lot
@@ -689,7 +782,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "cost.spread_pips",
             section: "Cost model / pip-value",
             label: "Spread override (pips)",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(100.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(100.0),
+            },
             default: "(broker-quoted)",
             current: cost
                 .spread_pips
@@ -705,7 +801,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "cost.commission_per_trade",
             section: "Cost model / pip-value",
             label: "Commission per trade (override)",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(50.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(50.0),
+            },
             default: "(broker-quoted)",
             current: cost
                 .commission_per_trade
@@ -717,13 +816,15 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "",
             preset_aggressive: "0.0",
         },
-
         // ── Section 3 cont. — GA archive / selection / SMC gate curve ─
         KnobEntry {
             id: "ga.archive_cap",
             section: "Discovery / GA search",
             label: "Archive capacity override",
-            kind: KnobKind::Int { min: Some(0), max: Some(200_000) },
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(200_000),
+            },
             default: "(derived: min(pop × gens, 50000))",
             current: ga_overrides
                 .archive_cap_override
@@ -739,7 +840,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_curve",
             section: "Discovery / GA search",
             label: "SMC gate curve exponent",
-            kind: KnobKind::Float { min: Some(0.1), max: Some(5.0) },
+            kind: KnobKind::Float {
+                min: Some(0.1),
+                max: Some(5.0),
+            },
             default: "1.0",
             current: format!("{}", smc.curve),
             help_short: "Power-curve exponent for the SMC gate decay between start and end.",
@@ -752,7 +856,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.smc_gate_stagnation_step",
             section: "Discovery / GA search",
             label: "SMC gate stagnation-relax step",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(0.5) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.5),
+            },
             default: "0.03",
             current: format!("{}", smc.stagnation_step),
             help_short: "How much the SMC gate relaxes per stagnant generation (after patience exceeded).",
@@ -765,7 +872,9 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_mode",
             section: "Discovery / GA search",
             label: "Archive scoring mode",
-            kind: KnobKind::Enum { variants: &["net", "pf", "sharpe"] },
+            kind: KnobKind::Enum {
+                variants: &["net", "pf", "sharpe"],
+            },
             default: "net",
             current: ga_overrides.archive_scoring.mode.clone(),
             help_short: "Which metric gates archive admission: net P&L, profit factor, or Sharpe.",
@@ -778,7 +887,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_net",
             section: "Discovery / GA search",
             label: "Archive min net P&L",
-            kind: KnobKind::Float { min: None, max: None },
+            kind: KnobKind::Float {
+                min: None,
+                max: None,
+            },
             default: "0.0",
             current: format!("{}", ga_overrides.archive_scoring.min_net),
             help_short: "Floor for net P&L below which strategies are NOT archived.",
@@ -791,7 +903,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_pf",
             section: "Discovery / GA search",
             label: "Archive min profit factor",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(10.0) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(10.0),
+            },
             default: "1.0",
             current: format!("{}", ga_overrides.archive_scoring.min_pf),
             help_short: "Floor for profit factor (gross_win / gross_loss) below which strategies are NOT archived.",
@@ -804,7 +919,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.archive_min_sharpe",
             section: "Discovery / GA search",
             label: "Archive min Sharpe ratio",
-            kind: KnobKind::Float { min: None, max: None },
+            kind: KnobKind::Float {
+                min: None,
+                max: None,
+            },
             default: "0.0",
             current: format!("{}", ga_overrides.archive_scoring.min_sharpe),
             help_short: "Floor for Sharpe (only enforced when `archive_mode = sharpe`).",
@@ -847,7 +965,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.random_immigrants",
             section: "Discovery / GA search",
             label: "Random immigrants ratio",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(0.95) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.95),
+            },
             default: "0.25",
             current: format!("{}", ga_overrides.selection.immigrant_ratio),
             help_short: "Fraction of each generation replaced with fresh random genes (diversity injection).",
@@ -860,7 +981,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.survivor_fraction",
             section: "Discovery / GA search",
             label: "Survivor fraction (elite carry-over)",
-            kind: KnobKind::Float { min: Some(0.0), max: Some(0.95) },
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.95),
+            },
             default: "0.10",
             current: format!("{}", ga_overrides.selection.survivor_fraction),
             help_short: "Fraction of top genes carried unchanged to the next generation.",
@@ -873,7 +997,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "ga.selection_temperature",
             section: "Discovery / GA search",
             label: "Selection temperature",
-            kind: KnobKind::Float { min: Some(0.001), max: Some(10.0) },
+            kind: KnobKind::Float {
+                min: Some(0.001),
+                max: Some(10.0),
+            },
             default: "0.75",
             current: format!("{}", ga_overrides.selection.temperature),
             help_short: "Softness of the selection probability distribution.",
@@ -882,15 +1009,20 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "0.75",
             preset_aggressive: "1.5",
         },
-
         // ── Section 6 — Backtest runtime ───────────────────────────────
         KnobEntry {
             id: "backtest.initial_equity",
             section: "Backtest runtime",
             label: "Initial equity",
-            kind: KnobKind::Float { min: Some(100.0), max: Some(10_000_000.0) },
+            kind: KnobKind::Float {
+                min: Some(100.0),
+                max: Some(10_000_000.0),
+            },
             default: "100000.0",
-            current: format!("{}", neoethos_search::current_backtest_runtime_overrides().initial_equity),
+            current: format!(
+                "{}",
+                neoethos_search::current_backtest_runtime_overrides().initial_equity
+            ),
             help_short: "Starting equity for the backtest simulation, independent of any live account.",
             help_long: "100k USD is the prop-firm baseline (most challenges fund at $100k). Use 10k for a smaller-account stress test, or 1M to see how compounding scales.",
             preset_conservative: "100000.0",
@@ -919,32 +1051,21 @@ fn build_catalog() -> Vec<KnobEntry> {
             // history the buckets can hold. Raising the floor can only make the
             // scored record LONGER, never shorter — the safer direction, per
             // non-negotiable #2.
-            kind: KnobKind::Int { min: Some(240), max: Some(1200) },
+            kind: KnobKind::Int {
+                min: Some(240),
+                max: Some(1200),
+            },
             default: "240",
-            current: format!("{}", neoethos_search::current_backtest_runtime_overrides().month_capacity),
+            current: format!(
+                "{}",
+                neoethos_search::current_backtest_runtime_overrides().month_capacity
+            ),
             help_short: "How many months of per-month statistics are kept. Truncating this TRUNCATES THE RECORD every gene is scored on.",
             help_long: "Not merely a RAM cap, despite what this text used to say. `month_capacity` sizes the `monthly_pnls` series, which becomes metric slot 7, which carries a weight of 0.45 in the prop-firm objective (`named.rs:161`) — the largest single term. Set it below the length of your history and every gene is ranked on the first N months of that history, and the resulting score looks entirely normal. 240 = 20 years and is the default and the minimum; raise to 600 for 50-year MT5 historical imports. There is no reason to lower it.",
             preset_conservative: "240",
             preset_balanced: "240",
             preset_aggressive: "600",
         },
-        KnobEntry {
-            id: "backtest.rayon_threads",
-            section: "Backtest runtime",
-            label: "Rayon worker threads",
-            kind: KnobKind::Int { min: Some(1), max: Some(256) },
-            default: "(num CPU cores)",
-            current: neoethos_search::current_backtest_runtime_overrides()
-                .rayon_threads
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "(num CPU cores)".to_string()),
-            help_short: "Rayon worker thread count (also honours `RAYON_NUM_THREADS`).",
-            help_long: "Default uses all logical cores. Lower (cpu_cores - 2) to keep CPU available for other tasks (Conservative). Pin to your physical-core count for prop-firm validation runs (no hyperthread contention).",
-            preset_conservative: "",
-            preset_balanced: "",
-            preset_aggressive: "",
-        },
-
         KnobEntry {
             id: "stop_target.tail_max_bars",
             section: "Backtest runtime",
@@ -955,7 +1076,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             // for being dead. (It never carried an env var either; the
             // `env_var` field that used to say so was removed from every entry
             // on 2026-08-10 — see the tombstone on `KnobEntry`.)
-            kind: KnobKind::Int { min: Some(0), max: Some(100_000_000) },
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(100_000_000),
+            },
             default: "0",
             current: format!(
                 "{}",
@@ -971,7 +1095,10 @@ fn build_catalog() -> Vec<KnobEntry> {
             id: "stop_target.tail_step",
             section: "Backtest runtime",
             label: "Adaptive-stop tail sampling stride",
-            kind: KnobKind::Int { min: Some(1), max: Some(1_000) },
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(1_000),
+            },
             default: "1",
             current: format!(
                 "{}",
@@ -983,7 +1110,6 @@ fn build_catalog() -> Vec<KnobEntry> {
             preset_balanced: "1",
             preset_aggressive: "1",
         },
-
         // ── Section 7 — Logging / server ─────────────────────────────
         KnobEntry {
             id: "log.rust_log",
@@ -1100,8 +1226,7 @@ mod tests {
             generated_at_unix_ms: 0,
             knobs: catalog,
         };
-        let json =
-            serde_json::to_string(&response).expect("catalog must serialize without error");
+        let json = serde_json::to_string(&response).expect("catalog must serialize without error");
         assert!(json.contains("\"schemaVersion\":2"));
         assert!(json.contains("\"id\":\"ctrader.max_attempts\""));
     }

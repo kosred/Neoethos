@@ -1,5 +1,10 @@
 use crate::config::Settings;
 use crate::contracts::{DeviceAssignment, RuntimeDegradedReason};
+use neoethos_execution_budget::{
+    BudgetCap, BudgetCapProvenance, CapacityDetection, CoordinationScope, ExecutionBudgetRequest,
+    LogicalThreadCount, ResolutionError, ResolvedExecutionBudget, WorkerLimit,
+    installed_process_budget, resolve_execution_budget,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use std::process::Command;
@@ -28,6 +33,8 @@ pub struct HardwareProfile {
     /// shape) for files written by older builds.
     #[serde(default = "crate::schema_version::default_v1")]
     pub schema_version: crate::schema_version::SchemaVersion,
+    /// Host inventory captured with this profile. It is not the process worker
+    /// ceiling; affinity/cgroup-aware capacity comes from available_parallelism.
     pub cpu_cores: usize,
     pub total_ram_gb: f64,
     pub available_ram_gb: f64,
@@ -55,7 +62,6 @@ pub struct HardwareProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HardwareRuntimeOverrides {
-    pub cpu_budget: Option<usize>,
     pub training_precision: Option<TrainingPrecision>,
     pub cuda_precisions: Option<Vec<TrainingPrecision>>,
     pub rocm_precisions: Option<Vec<TrainingPrecision>>,
@@ -73,17 +79,15 @@ impl HardwareRuntimeOverrides {
     // nothing is lost — but anyone who set one and watched precision not change
     // was fighting a function with no caller.
     //
-    // NOTE: NEOETHOS_BOT_CPU_BUDGET is NOT dead overall — neoethos-cli reads it
-    // directly in main() and feeds it to apply_process_cpu_assignment. Only this
-    // path was dead. That asymmetry is exactly why a single resolution point
-    // matters more than moving the vars around.
+    // CPU width is no longer installed through this compatibility struct.
+    // `ExecutionBudgetInputs` keeps the persistent, legacy, and parent caps
+    // distinct and resolves them once before runtime initialization.
 
     /// Config-driven constructor. A `hardware_from_settings_default_matches_default`
     /// test guarantees a fresh `Settings` reproduces [`Self::default`].
     pub fn from_settings(s: &crate::config::Settings) -> Self {
         let c = &s.system.hardware;
         Self {
-            cpu_budget: c.cpu_budget,
             training_precision: c.training_precision,
             cuda_precisions: c.cuda_precisions.clone(),
             rocm_precisions: c.rocm_precisions.clone(),
@@ -106,6 +110,115 @@ impl HardwareRuntimeOverrides {
             AcceleratorBackend::Cpu => None,
         }
     }
+}
+
+/// Typed, non-mutating inputs to the single process CPU-capacity resolver.
+///
+/// `Settings` remains persistent operator intent. A parent assignment is a
+/// separate ephemeral cap and is never written back into either the canonical
+/// or legacy settings field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBudgetInputs {
+    request: ExecutionBudgetRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBudgetInputError {
+    key: &'static str,
+}
+
+impl std::fmt::Display for ExecutionBudgetInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{}` must be greater than zero", self.key)
+    }
+}
+
+impl std::error::Error for ExecutionBudgetInputError {}
+
+impl ExecutionBudgetInputs {
+    pub fn from_settings_and_parent(
+        settings: &Settings,
+        parent_assignment: Option<usize>,
+        coordination_scope: CoordinationScope,
+    ) -> Result<Self, ExecutionBudgetInputError> {
+        Self::from_settings_parent_and_detection(
+            settings,
+            parent_assignment,
+            CapacityDetection::detect(),
+            coordination_scope,
+        )
+    }
+
+    /// Deterministic form for tests and callers that already performed the
+    /// process-capacity preflight.
+    pub fn from_settings_parent_and_detection(
+        settings: &Settings,
+        parent_assignment: Option<usize>,
+        detection: CapacityDetection,
+        coordination_scope: CoordinationScope,
+    ) -> Result<Self, ExecutionBudgetInputError> {
+        let persistent_limit = cap_from_value(
+            "system.hardware.cpu_budget",
+            settings.system.hardware.cpu_budget,
+            BudgetCapProvenance::PersistentSetting,
+        )?;
+        let legacy_persistent_limit = cap_from_value(
+            "models.backtest_runtime.rayon_threads",
+            settings.models.backtest_runtime.rayon_threads,
+            BudgetCapProvenance::LegacyPersistentSetting,
+        )?;
+        let parent_limit = cap_from_value(
+            "--cpu-threads",
+            parent_assignment,
+            BudgetCapProvenance::ParentAssignment,
+        )?;
+
+        Ok(Self {
+            request: ExecutionBudgetRequest {
+                host_logical_threads: None,
+                detection,
+                persistent_limit,
+                legacy_persistent_limit,
+                parent_limit,
+                coordination_scope,
+            },
+        })
+    }
+
+    pub fn with_host_logical_threads(
+        mut self,
+        host_logical_threads: usize,
+    ) -> Result<Self, ExecutionBudgetInputError> {
+        self.request.host_logical_threads =
+            Some(LogicalThreadCount::new(host_logical_threads).map_err(|_| {
+                ExecutionBudgetInputError {
+                    key: "hardware_profile.cpu_cores",
+                }
+            })?);
+        Ok(self)
+    }
+
+    pub fn request(&self) -> &ExecutionBudgetRequest {
+        &self.request
+    }
+
+    pub fn resolve(self) -> Result<ResolvedExecutionBudget, ResolutionError> {
+        resolve_execution_budget(self.request)
+    }
+}
+
+fn cap_from_value(
+    key: &'static str,
+    value: Option<usize>,
+    provenance: BudgetCapProvenance,
+) -> Result<Option<BudgetCap>, ExecutionBudgetInputError> {
+    value
+        .map(|value| {
+            WorkerLimit::new(value)
+                .map(|limit| BudgetCap::new(limit, provenance))
+                .map_err(|_| ExecutionBudgetInputError { key })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -194,6 +307,42 @@ pub enum WorkloadKind {
     Ui,
 }
 
+/// CPU work a concrete job can usefully execute in parallel.
+///
+/// This is demand, not another capacity authority. The granted width is the
+/// smaller of useful parallel units and the already-resolved process limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadDemand {
+    pub workload: WorkloadKind,
+    pub parallel_units: usize,
+    pub owns_cpu_worker_pool: bool,
+}
+
+impl WorkloadDemand {
+    pub const fn for_parallel_units(workload: WorkloadKind, parallel_units: usize) -> Self {
+        Self {
+            workload,
+            parallel_units,
+            owns_cpu_worker_pool: true,
+        }
+    }
+
+    pub const fn lightweight_control(workload: WorkloadKind) -> Self {
+        Self {
+            workload,
+            parallel_units: 0,
+            owns_cpu_worker_pool: false,
+        }
+    }
+
+    pub fn granted_workers(self, budget: &ResolvedExecutionBudget) -> usize {
+        if !self.owns_cpu_worker_pool {
+            return 0;
+        }
+        self.parallel_units.min(budget.effective_worker_limit.get())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuBudget {
     pub threads: usize,
@@ -201,9 +350,10 @@ pub struct CpuBudget {
 
 impl CpuBudget {
     pub fn new(threads: usize) -> Self {
-        Self {
-            threads: threads.max(1),
-        }
+        // Zero is meaningful for orchestration-only lanes such as UI control:
+        // they own no private CPU worker pool. CPU-heavy jobs are admitted via
+        // the positive WorkerLimit in neoethos-execution-budget.
+        Self { threads }
     }
 }
 
@@ -257,6 +407,9 @@ pub struct WorkloadExecutionPlan {
     pub device: String,
     pub device_ids: Vec<usize>,
     pub precision: TrainingPrecision,
+    /// Useful parallel units declared before admission.
+    pub requested_cpu_threads: usize,
+    /// Granted workers, never above the installed process capacity.
     pub cpu_threads: usize,
     pub batch_size: usize,
     pub memory_budget_gb: f64,
@@ -288,8 +441,20 @@ impl WorkloadExecutionPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CpuCapacityDiagnostics {
+    /// Legacy host inventory only; never used as the process ceiling.
+    pub host_logical_threads: Option<usize>,
+    /// OS/cgroup/affinity-aware capacity visible to this process.
+    pub effective_logical_threads: usize,
+    pub reserved_logical_threads: usize,
+    pub installed_worker_limit: usize,
+    pub coordination_scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HardwareExecutionPlan {
     pub profile: HardwareProfile,
+    pub cpu_capacity: CpuCapacityDiagnostics,
     pub gpu_enabled: bool,
     pub primary_backend: AcceleratorBackend,
     pub preferred_precision: TrainingPrecision,
@@ -310,6 +475,35 @@ impl HardwareExecutionPlan {
         settings: &Settings,
         profile: HardwareProfile,
         runtime_overrides: &HardwareRuntimeOverrides,
+    ) -> Self {
+        let resolved_budget = installed_process_budget()
+            .map(|installed| installed.resolved().clone())
+            .unwrap_or_else(|| {
+                ExecutionBudgetInputs::from_settings_and_parent(
+                    settings,
+                    None,
+                    CoordinationScope::ProcessLocal,
+                )
+                .and_then(|inputs| inputs.with_host_logical_threads(profile.cpu_cores.max(1)))
+                .unwrap_or_else(|error| panic!("invalid CPU execution budget input: {error}"))
+                .resolve()
+                .unwrap_or_else(|error| panic!("invalid CPU execution budget request: {error}"))
+            });
+        Self::from_settings_profile_overrides_and_budget(
+            settings,
+            profile,
+            runtime_overrides,
+            &resolved_budget,
+        )
+    }
+
+    /// Deterministic planner entry used when startup has already installed or
+    /// tests have explicitly supplied the resolved process capacity.
+    pub fn from_settings_profile_overrides_and_budget(
+        settings: &Settings,
+        profile: HardwareProfile,
+        runtime_overrides: &HardwareRuntimeOverrides,
+        resolved_budget: &ResolvedExecutionBudget,
     ) -> Self {
         let preference = normalize_accelerator_preference(&settings.system.enable_gpu_preference);
         let cuda_devices = profile.devices_for_backend(AcceleratorBackend::Cuda);
@@ -344,7 +538,7 @@ impl HardwareExecutionPlan {
             );
         }
 
-        let cpu_budget = resolve_cpu_budget(profile.cpu_cores.max(1), runtime_overrides);
+        let cpu_budget = resolved_budget.effective_worker_limit.get();
         let host_memory_budget_gb = profile.available_ram_gb.max(1.0);
         let device_ids: Vec<usize> = if gpu_enabled {
             backend_devices.iter().map(|device| device.id).collect()
@@ -394,9 +588,11 @@ impl HardwareExecutionPlan {
                 .map(|device| device.device_string())
                 .unwrap_or_else(|| "cpu".to_string())
         };
-        let search_device_ids = search_gpu_enabled
-            .then(|| backend_devices.iter().map(|device| device.id).collect())
-            .unwrap_or_default();
+        let search_device_ids = if search_gpu_enabled {
+            backend_devices.iter().map(|device| device.id).collect()
+        } else {
+            Vec::new()
+        };
         let search_backend = if search_gpu_enabled {
             primary_backend
         } else {
@@ -430,7 +626,12 @@ impl HardwareExecutionPlan {
                 },
                 runtime_overrides,
             ),
-            cpu_threads: cpu_budget.clamp(1, 8),
+            requested_cpu_threads: cpu_budget,
+            cpu_threads: WorkloadDemand::for_parallel_units(
+                WorkloadKind::DataIngestion,
+                cpu_budget,
+            )
+            .granted_workers(resolved_budget),
             batch_size: 0,
             memory_budget_gb: host_memory_budget_gb * 0.20,
             notes: vec![
@@ -444,6 +645,7 @@ impl HardwareExecutionPlan {
             device: "cpu".to_string(),
             device_ids: Vec::new(),
             precision: TrainingPrecision::Fp32,
+            requested_cpu_threads: cpu_budget,
             cpu_threads: cpu_budget,
             batch_size: 0,
             memory_budget_gb: host_memory_budget_gb * 0.35,
@@ -458,6 +660,7 @@ impl HardwareExecutionPlan {
             device: search_device,
             device_ids: search_device_ids,
             precision: TrainingPrecision::Fp32,
+            requested_cpu_threads: cpu_budget,
             cpu_threads: cpu_budget,
             batch_size: if search_gpu_enabled {
                 train_batch_size
@@ -486,6 +689,7 @@ impl HardwareExecutionPlan {
                 Vec::new()
             },
             precision: TrainingPrecision::Fp32,
+            requested_cpu_threads: cpu_budget,
             cpu_threads: cpu_budget,
             batch_size: if tree_gpu_enabled { train_batch_size } else { 64 },
             memory_budget_gb: planned_memory_budget_gb(&profile, tree_backend, 0.35, 0.70),
@@ -497,14 +701,10 @@ impl HardwareExecutionPlan {
             device: primary_device.clone(),
             device_ids: device_ids.clone(),
             precision: preferred_precision,
+            requested_cpu_threads: cpu_budget,
             cpu_threads: cpu_budget,
             batch_size: train_batch_size,
-            memory_budget_gb: planned_memory_budget_gb(
-                &profile,
-                primary_backend,
-                0.55,
-                0.80,
-            ),
+            memory_budget_gb: planned_memory_budget_gb(&profile, primary_backend, 0.55, 0.80),
             notes: vec![format!(
                 "Burn/deep training should use planner policy with effective precision {}.",
                 preferred_precision.as_str()
@@ -518,12 +718,9 @@ impl HardwareExecutionPlan {
             } else {
                 "cpu".to_string()
             },
-            device_ids: if rl_gpu_enabled {
-                vec![0]
-            } else {
-                Vec::new()
-            },
+            device_ids: if rl_gpu_enabled { vec![0] } else { Vec::new() },
             precision: TrainingPrecision::Fp32,
+            requested_cpu_threads: cpu_budget,
             cpu_threads: cpu_budget,
             batch_size: if rl_gpu_enabled { train_batch_size } else { 64 },
             memory_budget_gb: planned_memory_budget_gb(&profile, rl_backend, 0.35, 0.70),
@@ -538,14 +735,11 @@ impl HardwareExecutionPlan {
             device: primary_device,
             device_ids,
             precision: preferred_precision,
-            cpu_threads: cpu_budget.clamp(1, 16),
+            requested_cpu_threads: cpu_budget,
+            cpu_threads: WorkloadDemand::for_parallel_units(WorkloadKind::Inference, cpu_budget)
+                .granted_workers(resolved_budget),
             batch_size: infer_batch_size,
-            memory_budget_gb: planned_memory_budget_gb(
-                &profile,
-                primary_backend,
-                0.20,
-                0.50,
-            ),
+            memory_budget_gb: planned_memory_budget_gb(&profile, primary_backend, 0.20, 0.50),
             notes: vec![
                 "Inference uses smaller reserved budget so live execution and UI stay responsive."
                     .to_string(),
@@ -557,10 +751,12 @@ impl HardwareExecutionPlan {
             device: "cpu".to_string(),
             device_ids: Vec::new(),
             precision: TrainingPrecision::Fp32,
-            cpu_threads: 2.min(cpu_budget).max(1),
+            requested_cpu_threads: 0,
+            cpu_threads: WorkloadDemand::lightweight_control(WorkloadKind::Ui)
+                .granted_workers(resolved_budget),
             batch_size: 0,
             memory_budget_gb: host_memory_budget_gb * 0.05,
-            notes: vec!["UI stays message-channel driven and never owns ML/GPU work.".to_string()],
+            notes: vec!["UI stays message-channel driven and owns no private CPU worker pool; any CPU-heavy UI request enters the shared admission broker.".to_string()],
         });
 
         // ── Name every configured value this plan is about to override ──────
@@ -624,6 +820,15 @@ impl HardwareExecutionPlan {
 
         let plan = Self {
             profile,
+            cpu_capacity: CpuCapacityDiagnostics {
+                host_logical_threads: resolved_budget
+                    .host_logical_threads
+                    .map(LogicalThreadCount::get),
+                effective_logical_threads: resolved_budget.effective_logical_threads.get(),
+                reserved_logical_threads: resolved_budget.reserved_logical_threads,
+                installed_worker_limit: resolved_budget.effective_worker_limit.get(),
+                coordination_scope: format!("{:?}", resolved_budget.coordination_scope),
+            },
             gpu_enabled,
             primary_backend,
             preferred_precision,
@@ -652,8 +857,12 @@ impl HardwareExecutionPlan {
             self.workloads
                 .iter()
                 .map(|plan| format!(
-                    "{:?}:{}:{}:{}",
-                    plan.workload, plan.device, plan.batch_size, plan.cpu_threads
+                    "{:?}:{}:{}:{}:{}",
+                    plan.workload,
+                    plan.device,
+                    plan.batch_size,
+                    plan.requested_cpu_threads,
+                    plan.cpu_threads
                 ))
                 .collect::<Vec<_>>()
                 .join(","),
@@ -673,7 +882,11 @@ impl HardwareExecutionPlan {
 
         tracing::info!(
             target: "neoethos_core::system",
-            cpu_cores = self.profile.cpu_cores as u64,
+            host_logical_threads = self.profile.cpu_cores as u64,
+            effective_logical_threads = self.cpu_capacity.effective_logical_threads as u64,
+            reserved_logical_threads = self.cpu_capacity.reserved_logical_threads as u64,
+            installed_worker_limit = self.cpu_capacity.installed_worker_limit as u64,
+            coordination_scope = %self.cpu_capacity.coordination_scope,
             available_ram_gb = self.profile.available_ram_gb,
             detected_gpus = self.profile.num_gpus as u64,
             backend = self.primary_backend.as_str(),
@@ -687,7 +900,8 @@ impl HardwareExecutionPlan {
                 workload = ?plan.workload,
                 backend = plan.backend.as_str(),
                 device = %plan.device,
-                cpu_threads = plan.cpu_threads as u64,
+                requested_cpu_workers = plan.requested_cpu_threads as u64,
+                granted_cpu_workers = plan.cpu_threads as u64,
                 batch_size = plan.batch_size as u64,
                 memory_budget_gb = plan.memory_budget_gb,
                 "hardware plan workload assignment"
@@ -805,7 +1019,11 @@ pub fn current_hardware_runtime_overrides() -> &'static HardwareRuntimeOverrides
 /// both must yield the host value untouched, or an ordinary machine starts
 /// sizing itself against a phantom limit.
 fn tighter_of(host: u64, limit: u64) -> u64 {
-    if limit > 0 && limit < host { limit } else { host }
+    if limit > 0 && limit < host {
+        limit
+    } else {
+        host
+    }
 }
 
 fn clamp_to_cgroup(sys: &System, host_total: u64, host_available: u64) -> (u64, u64) {
@@ -1393,10 +1611,9 @@ impl HardwareProfile {
 // must land on its own, with its own before/after measurement, and be tracked as
 // its own item. It is recorded as one; it is not silently smuggled in here.
 //
-// The surviving derivation helpers (`resolve_cpu_budget`, `training_batch_size`,
-// `inference_batch_size`, `min_gpu_memory_gb`, `planned_memory_budget_gb`) are
-// below and are now `pub`, so a retired config key can be reported together with
-// the number this machine actually computes for it.
+// The surviving batch/memory derivation helpers are below. CPU capacity has no
+// legacy helper: `ExecutionBudgetInputs` is the only resolver, including for
+// retired-key diagnostics.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn stable_hex_hash(value: &str) -> String {
@@ -1538,22 +1755,6 @@ pub fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     }
 }
 
-/// Effective CPU thread budget — CAPACITY, with one operator lever.
-///
-/// The machine supplies the ceiling (`total_cores`); `system.hardware.cpu_budget`
-/// may only narrow it, never raise it above the cores that exist. That is the
-/// shape every hardware knob in this file should have: the probe sets the bound,
-/// the operator may ask for less.
-pub fn resolve_cpu_budget(
-    total_cores: usize,
-    runtime_overrides: &HardwareRuntimeOverrides,
-) -> usize {
-    if let Some(n) = runtime_overrides.cpu_budget {
-        return n.min(total_cores).max(1);
-    }
-    total_cores.saturating_sub(1).max(1)
-}
-
 /// A config key that used to be settable and is now computed from the machine.
 ///
 /// A stale copy of one of these in the operator's file must not be reported as a
@@ -1572,16 +1773,16 @@ pub struct RetiredDerivedKey {
 
 /// Every key retired by the 2026-08-09 derive pass (D2 ⟷ D4).
 ///
-/// These are CAPACITY knobs by the test in [`resolve_cpu_budget`]'s doc: a
-/// machine with twice the RAM wants a different number, and only because of the
-/// hardware. Deliberately ABSENT from this table — they change the answer, not
-/// the footprint, and stay settable: `hpo_trials`, `prop_search_population`,
+/// These are CAPACITY knobs: a machine with twice the RAM wants a different
+/// number, and only because of the hardware. Deliberately ABSENT from this table
+/// — they change the answer, not the footprint, and stay settable:
+/// `hpo_trials`, `prop_search_population`,
 /// `prop_search_generations`, `prop_search_max_hours`, `prop_search_max_rows`,
 /// `cpcv_max_rows`, `l1_feature_selection_sample_limit`, `global_max_rows`.
 pub const RETIRED_DERIVED_KEYS: &[RetiredDerivedKey] = &[
     RetiredDerivedKey {
         key: "system.n_jobs",
-        derived_from: "available_parallelism() minus one, then narrowed by system.hardware.cpu_budget",
+        derived_from: "effective available_parallelism() minus the fixed two-thread stability reserve, then narrowed by system.hardware.cpu_budget",
         set_instead: Some("system.hardware.cpu_budget"),
     },
     RetiredDerivedKey {
@@ -1619,13 +1820,15 @@ impl RetiredDerivedKey {
     pub fn computed_value(&self, settings: &Settings) -> Option<String> {
         match self.key {
             "system.n_jobs" => {
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1);
-                Some(
-                    resolve_cpu_budget(cores, &HardwareRuntimeOverrides::from_settings(settings))
-                        .to_string(),
+                let resolved = ExecutionBudgetInputs::from_settings_and_parent(
+                    settings,
+                    None,
+                    CoordinationScope::ProcessLocal,
                 )
+                .ok()?
+                .resolve()
+                .ok()?;
+                Some(resolved.effective_worker_limit.get().to_string())
             }
             _ => None,
         }
@@ -1667,15 +1870,29 @@ mod tests {
     }
 
     #[test]
-    fn process_cpu_assignment_overrides_persistent_setting() {
+    fn parent_cpu_assignment_is_a_separate_cap_and_does_not_mutate_settings() {
         let mut settings = crate::config::Settings::default();
         settings.system.hardware.cpu_budget = Some(12);
         settings.models.backtest_runtime.rayon_threads = Some(12);
+        let original_canonical = settings.system.hardware.cpu_budget;
+        let original_legacy = settings.models.backtest_runtime.rayon_threads;
 
-        settings.apply_process_cpu_assignment(Some(3));
+        let resolved = ExecutionBudgetInputs::from_settings_parent_and_detection(
+            &settings,
+            Some(3),
+            CapacityDetection::supplied(LogicalThreadCount::new(64).expect("positive")),
+            CoordinationScope::ManagedProcessTree,
+        )
+        .expect("positive caps")
+        .resolve()
+        .expect("valid provenance");
 
-        assert_eq!(settings.system.hardware.cpu_budget, Some(3));
-        assert_eq!(settings.models.backtest_runtime.rayon_threads, Some(3));
+        assert_eq!(resolved.effective_worker_limit.get(), 3);
+        assert_eq!(settings.system.hardware.cpu_budget, original_canonical);
+        assert_eq!(
+            settings.models.backtest_runtime.rayon_threads,
+            original_legacy
+        );
     }
 
     #[cfg(feature = "gpu-wgpu")]
@@ -1785,6 +2002,51 @@ mod tests {
     }
 
     #[test]
+    fn hardware_plan_uses_process_capacity_not_legacy_profile_inventory() {
+        let settings = Settings::default();
+        let resolved = ExecutionBudgetInputs::from_settings_parent_and_detection(
+            &settings,
+            None,
+            CapacityDetection::supplied(LogicalThreadCount::new(12).expect("positive")),
+            CoordinationScope::ProcessLocal,
+        )
+        .expect("default settings")
+        .with_host_logical_threads(64)
+        .expect("positive inventory")
+        .resolve()
+        .expect("valid provenance");
+        let plan = HardwareExecutionPlan::from_settings_profile_overrides_and_budget(
+            &settings,
+            profile(0, 0.0),
+            &HardwareRuntimeOverrides::from_settings(&settings),
+            &resolved,
+        );
+
+        assert_eq!(plan.profile.cpu_cores, 64, "profile is inventory only");
+        assert_eq!(plan.cpu_capacity.effective_logical_threads, 12);
+        assert_eq!(plan.cpu_capacity.installed_worker_limit, 10);
+        assert_eq!(
+            plan.workload(WorkloadKind::DataIngestion)
+                .expect("data workload")
+                .cpu_threads,
+            10
+        );
+        assert_eq!(
+            plan.workload(WorkloadKind::Inference)
+                .expect("inference workload")
+                .cpu_threads,
+            10
+        );
+        assert_eq!(
+            plan.workload(WorkloadKind::Ui)
+                .expect("UI control lane")
+                .cpu_threads,
+            0,
+            "UI control owns no private worker pool"
+        );
+    }
+
+    #[test]
     fn gpu_memory_budget_is_derived_from_device_memory_not_host_ram() {
         let mut settings = Settings::default();
         settings.system.enable_gpu_preference = "cuda".to_string();
@@ -1865,11 +2127,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_runtime_overrides_resolve_cpu_budget_and_precision_without_env() {
+    fn canonical_cpu_setting_and_precision_override_resolve_without_env() {
         let mut settings = Settings::default();
         settings.system.enable_gpu_preference = "cuda".to_string();
+        settings.system.hardware.cpu_budget = Some(4);
         let runtime_overrides = HardwareRuntimeOverrides {
-            cpu_budget: Some(4),
             training_precision: Some(TrainingPrecision::Bf16),
             ..HardwareRuntimeOverrides::default()
         };
