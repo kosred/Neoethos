@@ -634,8 +634,8 @@ impl GpuIndicatorEngine {
         // is the difference between the device reproducing the CPU's series and
         // shifting it.
         let first_valid_hlc_max_of_firsts = {
-            let fh = first_valid_1(&ohlcv.high)
-                .context("GpuIndicatorEngine: high is entirely NaN")?;
+            let fh =
+                first_valid_1(&ohlcv.high).context("GpuIndicatorEngine: high is entirely NaN")?;
             let fl =
                 first_valid_1(&ohlcv.low).context("GpuIndicatorEngine: low is entirely NaN")?;
             fh.max(fl).max(first_valid_close)
@@ -682,9 +682,7 @@ impl GpuIndicatorEngine {
                  high, low and close",
             )?;
         let first_valid_high_low_volume = (0..n)
-            .find(|&i| {
-                !ohlcv.high[i].is_nan() && !ohlcv.low[i].is_nan() && !volume[i].is_nan()
-            })
+            .find(|&i| !ohlcv.high[i].is_nan() && !ohlcv.low[i].is_nan() && !volume[i].is_nan())
             .context("GpuIndicatorEngine: no bar has all of high, low and volume")?;
         let first_valid_hlcv = (0..n)
             .find(|&i| {
@@ -734,8 +732,8 @@ impl GpuIndicatorEngine {
         // `donchian.rs:183-188` -- the MAX of two INDEPENDENT scans, not the
         // first index at which both are non-NaN.
         let first_valid_high_low_max_of_firsts = {
-            let fh = first_valid_1(&ohlcv.high)
-                .context("GpuIndicatorEngine: high is entirely NaN")?;
+            let fh =
+                first_valid_1(&ohlcv.high).context("GpuIndicatorEngine: high is entirely NaN")?;
             let fl =
                 first_valid_1(&ohlcv.low).context("GpuIndicatorEngine: low is entirely NaN")?;
             fh.max(fl)
@@ -749,9 +747,7 @@ impl GpuIndicatorEngine {
             .find(|&i| ohlcv.close[i].is_finite())
             .context("GpuIndicatorEngine: no close value is finite")?;
         let first_valid_open_close_volume = (0..n)
-            .find(|&i| {
-                !ohlcv.open[i].is_nan() && !ohlcv.close[i].is_nan() && !volume[i].is_nan()
-            })
+            .find(|&i| !ohlcv.open[i].is_nan() && !ohlcv.close[i].is_nan() && !volume[i].is_nan())
             .context("GpuIndicatorEngine: no bar has all of open, close and volume")?;
         // qstick.rs:235-243 -- open and close, neither NaN, at the same index.
         let first_valid_open_close = (0..n)
@@ -767,7 +763,9 @@ impl GpuIndicatorEngine {
                     && ohlcv.low[i].is_finite()
                     && ohlcv.close[i].is_finite()
             })
-            .context("GpuIndicatorEngine: no bar has all four of open, high, low and close finite")?;
+            .context(
+                "GpuIndicatorEngine: no bar has all four of open, high, low and close finite",
+            )?;
         // bop.rs:209-211 -- the SAME four series, but `!is_nan`, which accepts
         // an infinity the scan above rejects.
         let first_valid_ohlc4_non_nan = (0..n)
@@ -777,7 +775,9 @@ impl GpuIndicatorEngine {
                     && !ohlcv.low[i].is_nan()
                     && !ohlcv.close[i].is_nan()
             })
-            .context("GpuIndicatorEngine: no bar has all four of open, high, low and close non-NaN")?;
+            .context(
+                "GpuIndicatorEngine: no bar has all four of open, high, low and close non-NaN",
+            )?;
         // andean_oscillator.rs:244 -- open and close, both finite.
         let first_valid_open_close_finite = (0..n)
             .find(|&i| ohlcv.open[i].is_finite() && ohlcv.close[i].is_finite())
@@ -830,9 +830,9 @@ impl GpuIndicatorEngine {
         let device_hl2 = runtime
             .upload_f64(&hl2)
             .with_context(|| format!("upload_f64(hl2, {n} bars) failed on {device_name}"))?;
-        let device_hlcc4 = runtime.upload_f64(&hlcc4).with_context(|| {
-            format!("upload_f64(hlcc4, {n} bars) failed on {device_name}")
-        })?;
+        let device_hlcc4 = runtime
+            .upload_f64(&hlcc4)
+            .with_context(|| format!("upload_f64(hlcc4, {n} bars) failed on {device_name}"))?;
         let device_timestamps = runtime
             .upload_i64(&timestamps)
             .with_context(|| format!("upload_i64(timestamps, {n} bars) failed on {device_name}"))?;
@@ -1110,9 +1110,7 @@ impl GpuIndicatorEngine {
             // ------------------------------------------------------- closer 5
             // ultosc.rs:391-401 -- a CONSECUTIVE PAIR, because the true range
             // reads close[i-1]. At least one bar later than first_valid_hlc.
-            F64FirstValidRule::HlcConsecutivePairNonNan => {
-                self.first_valid_hlc_consecutive_pair
-            }
+            F64FirstValidRule::HlcConsecutivePairNonNan => self.first_valid_hlc_consecutive_pair,
             // volume_zone_oscillator.rs:271 -- VOLUME ALONE, is_finite. Close
             // is deliberately absent: a non-finite close is a signed-negative
             // bar inside the loop, not a skipped one.
@@ -1313,10 +1311,10 @@ impl GpuIndicatorEngine {
     /// Sweep one indicator across `periods`, emitting `{id}_{period}` columns
     /// in the given order.
     ///
-    /// Applies the SAME `(period as f64) * 1.25 >= n` pre-flight skip the CPU
-    /// sweep applies (`hpc_ta::cpu_multi_period_columns`), so the column SET
-    /// produced by this lane is identical to the CPU lane's for any frame
-    /// length.
+    /// Applies the SAME `(period as f64) * 1.25 >= n` pre-flight rule as the
+    /// CPU sweep. Non-computable periods do not launch, but they still emit an
+    /// all-NaN column in the requested position so the feature schema is frame
+    /// invariant and identical across CPU/CUDA lanes.
     pub fn sweep_columns(
         &self,
         spec: &GpuSweepSpec,
@@ -1325,17 +1323,22 @@ impl GpuIndicatorEngine {
         let kept: Vec<usize> = periods
             .iter()
             .copied()
-            .filter(|&p| (p as f64) * 1.25 < self.n as f64)
+            .filter(|&period| period_fits_frame(period, self.n))
             .collect();
-        if kept.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows = self.sweep_periods(spec, &kept)?;
-        Ok(kept
-            .into_iter()
-            .zip(rows)
-            .map(|(period, values)| (format!("{}_{}", spec.id, period), values))
-            .collect())
+        let rows = if kept.is_empty() {
+            Vec::new()
+        } else {
+            self.sweep_periods(spec, &kept)?
+        };
+        assemble_sweep_columns(spec.id, periods, self.n, rows)
+    }
+
+    /// Whether this request issues a kernel launch rather than returning only
+    /// schema-preserving all-NaN placeholders.
+    pub fn has_launchable_period(&self, periods: &[usize]) -> bool {
+        periods
+            .iter()
+            .any(|&period| period_fits_frame(period, self.n))
     }
 
     /// Block until every launch issued so far has retired. Called once at the
@@ -1353,6 +1356,46 @@ impl GpuIndicatorEngine {
     pub fn device_ordinal(&self) -> u32 {
         self.device_ordinal
     }
+}
+
+#[inline]
+fn period_fits_frame(period: usize, n: usize) -> bool {
+    (period as f64) * 1.25 < n as f64
+}
+
+/// Reinsert frame-dependent preflight misses without changing the requested
+/// schema. `computed_rows` contains exactly the fitting periods, in request
+/// order; a length mismatch is a device-contract error rather than a partial
+/// result.
+fn assemble_sweep_columns(
+    indicator_id: &str,
+    periods: &[usize],
+    n: usize,
+    computed_rows: Vec<Vec<f64>>,
+) -> Result<Vec<(String, Vec<f64>)>> {
+    let expected_rows = periods
+        .iter()
+        .filter(|&&period| period_fits_frame(period, n))
+        .count();
+    if computed_rows.len() != expected_rows {
+        bail!(
+            "{indicator_id}: expected {expected_rows} computed period rows before schema assembly, got {}",
+            computed_rows.len()
+        );
+    }
+
+    let mut rows = computed_rows.into_iter();
+    let mut columns = Vec::with_capacity(periods.len());
+    for &period in periods {
+        let values = if period_fits_frame(period, n) {
+            rows.next().expect("computed row count checked above")
+        } else {
+            vec![f64::NAN; n]
+        };
+        columns.push((format!("{indicator_id}_{period}"), values));
+    }
+    debug_assert!(rows.next().is_none());
+    Ok(columns)
 }
 
 #[cfg(test)]
@@ -1408,6 +1451,20 @@ mod tests {
         }
     }
 
+    /// `hpc_ta` maps a requested TSI period to the named window pair
+    /// `(long_period = period, short_period = round(period * 13 / 25))`.
+    /// The CUDA row therefore has to consume the requested anchor.  The old
+    /// invariant declaration discarded it and returned 25/13 for every row.
+    #[test]
+    fn tsi_cuda_contract_consumes_the_coupled_window_anchor() {
+        let tsi = f64_kernel_for("tsi").expect("TSI must have an f64 CUDA kernel");
+        assert!(
+            !tsi.kernel.is_period_invariant(),
+            "TSI is coupled-window swept in production; an invariant CUDA row silently ignores \
+             long_period/short_period and computes a different feature"
+        );
+    }
+
     /// THE ANTI-ROT ASSERTION, and the reason no count appears in this file's
     /// prose any more.
     ///
@@ -1441,9 +1498,12 @@ mod tests {
         let mut no_kernel: Vec<&str> = Vec::new();
 
         for &id in MULTI_PERIOD_IDS.iter() {
-            let info = get_indicator(id)
-                .unwrap_or_else(|| panic!("{id}: in MULTI_PERIOD_IDS but not in the vector-ta \
-                                           registry — the CPU sweep cannot compute it either"));
+            let info = get_indicator(id).unwrap_or_else(|| {
+                panic!(
+                    "{id}: in MULTI_PERIOD_IDS but not in the vector-ta \
+                                           registry — the CPU sweep cannot compute it either"
+                )
+            });
             if info.outputs.len() > 1 {
                 // Emits ZERO columns on EITHER lane (`hpc_ta.rs:291` swallows
                 // the `InvalidParam` from `output_id: None`), so it is not a
@@ -1517,5 +1577,19 @@ mod tests {
                  the kernel close"
             );
         }
+    }
+
+    #[test]
+    fn preflight_misses_remain_in_the_gpu_schema_as_nan_columns() {
+        let periods = [7, 21, 50, 100, 200];
+        let n = 100;
+        let computed = vec![vec![7.0; n], vec![21.0; n], vec![50.0; n]];
+        let columns = assemble_sweep_columns("sma", &periods, n, computed).unwrap();
+
+        let names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["sma_7", "sma_21", "sma_50", "sma_100", "sma_200"]);
+        assert!(columns[3].1.iter().all(|value| value.is_nan()));
+        assert!(columns[4].1.iter().all(|value| value.is_nan()));
+        assert!(columns[0].1.iter().all(|&value| value == 7.0));
     }
 }

@@ -58,6 +58,9 @@ wasm-opt = false
 [package.metadata.wasm-pack.profile.dev]
 wasm-opt = false
 
+[build-dependencies]
+jobserver = "0.1.34"
+
 [features]
 cuda = [
     "cust",

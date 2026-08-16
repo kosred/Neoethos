@@ -199,7 +199,7 @@ impl VocabularyBudget {
     /// The operator must never have to infer why a run searched a narrower
     /// vocabulary than the last one: the numbers that produced the cap are in
     /// the line.
-    pub fn log(&self, stage: &str, planned_columns: usize, admitted_columns: usize) {
+    pub fn log(&self, stage: &str, planned_columns: usize, admitted_planned_columns: usize) {
         tracing::info!(
             target: "neoethos_data::feature_budget",
             stage,
@@ -209,8 +209,11 @@ impl VocabularyBudget {
             column_mb = format!("{:.2}", column_bytes(self.rows) as f64 / 1e6),
             max_columns = self.max_columns,
             planned_columns,
-            admitted_columns,
-            admitted_gb = format!("{:.2}", self.planned_bytes(admitted_columns) as f64 / 1e9),
+            admitted_columns = admitted_planned_columns,
+            admitted_gb = format!(
+                "{:.2}",
+                self.planned_bytes(admitted_planned_columns) as f64 / 1e9
+            ),
             "indicator vocabulary budget (f64 staging peak, derived from free RAM — never from a \
              user parameter)"
         );
@@ -226,13 +229,13 @@ impl VocabularyBudget {
                  status quo would be a silent regression. Expect memory pressure."
             );
         }
-        if admitted_columns < planned_columns {
+        if admitted_planned_columns < planned_columns {
             tracing::warn!(
                 target: "neoethos_data::feature_budget",
                 stage,
                 planned_columns,
-                admitted_columns,
-                deferred = planned_columns - admitted_columns,
+                admitted_columns = admitted_planned_columns,
+                deferred = planned_columns - admitted_planned_columns,
                 "the indicator vocabulary was TRUNCATED to fit this machine — the search will \
                  explore a narrower feature space than a larger box would. The deferred ids are \
                  listed by name under reason=over_budget in the indicator census."
@@ -329,7 +332,10 @@ mod tests {
         // A machine with 100 MB free would arithmetically afford 3 columns.
         let b = VocabularyBudget::from_available(REFERENCE_ROWS, 100_000_000);
         assert_eq!(b.max_columns, MIN_COLUMNS);
-        assert!(b.floor_binds, "the floor overriding hardware must be reported");
+        assert!(
+            b.floor_binds,
+            "the floor overriding hardware must be reported"
+        );
     }
 
     #[test]

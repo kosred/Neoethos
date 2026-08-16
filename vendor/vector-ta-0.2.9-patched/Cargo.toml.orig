@@ -37,6 +37,9 @@ include = [
   "/kernels/ptx/**",
 ]
 
+[build-dependencies]
+jobserver = "0.1.34"
+
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
 proptest = "1.7.0"

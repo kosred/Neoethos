@@ -117,11 +117,28 @@ __device__ __forceinline__ void neo_fill_warmup(double* row, int n, int warm) {
     for (int i = 0; i < warm; ++i) row[i] = neo_qnan();
 }
 
+// Exact operation-for-operation counterpart of sma.rs::compensated_add.
+// `-fmad=false` is mandatory for this translation unit: contracting either
+// subtraction/addition would change the correction term and therefore the
+// SMA's semantic result.
+__device__ __forceinline__ void neo_compensated_add(
+    double value,
+    double* sum,
+    double* correction)
+{
+    const double adjusted = value - *correction;
+    const double next = *sum + adjusted;
+    *correction = (next - *sum) - adjusted;
+    *sum = next;
+}
+
 // ============================================================================
 // SMA — reference: sma.rs::sma_scalar
 //   warm = first_valid + period - 1
-//   period == 1 is a copy; otherwise a running window sum seeded by a forward
-//   sum over [first, first+period), then `sum += d[i] - d[i-period]`.
+//   period == 1 is a copy; otherwise a Kahan-compensated running window sum
+//   seeded by a forward sum over [first, first+period).  Eviction and insertion
+//   are deliberately TWO compensated operations; combining them first loses
+//   the low bits before the correction can observe them.
 //   The running sum is a cross-bar accumulation, so this is one thread per
 //   column even though "an SMA" sounds embarrassingly parallel: recomputing
 //   each window independently would give a DIFFERENT f64 value.
@@ -155,12 +172,16 @@ extern "C" __global__ void neoethos_sma_batch_f64(
     if (warm >= n) return;
 
     double sum = 0.0;
-    for (int k = 0; k < period; ++k) sum += prices[first_valid + k];
+    double correction = 0.0;
+    for (int k = 0; k < period; ++k) {
+        neo_compensated_add(prices[first_valid + k], &sum, &correction);
+    }
     const double inv = 1.0 / (double)period;
 
     row[warm] = sum * inv;
     for (int i = first_valid + period; i < n; ++i) {
-        sum += prices[i] - prices[i - period];
+        neo_compensated_add(-prices[i - period], &sum, &correction);
+        neo_compensated_add(prices[i], &sum, &correction);
         row[i] = sum * inv;
     }
 }
@@ -903,18 +924,19 @@ extern "C" __global__ void neoethos_mfi_batch_f64(
 //    indicator comes OUT of the table until the divergence is explained — it is
 //    not the kernel below that is wrong in that case.
 //
-// 2. THREE OF THESE IGNORE `period`, AND THAT IS FAITHFUL, NOT A BUG.
+// 2. TWO OF THE FIRST THREE IGNORE `period`, AND THAT IS FAITHFUL, NOT A BUG.
 //    `compute_obv_batch` (cpu_batch.rs:3897) takes `|_params|` and builds
-//    `ObvParams::default()`. `compute_tsi_batch` (cpu_batch.rs:4708) reads
-//    `long_period` (default 25) and `short_period` (default 13) and never looks
-//    for `period`. `vwap` is anchored by calendar bucket and its only parameter
-//    is `anchor`. So `obv_7 .. obv_200` are five byte-identical CPU columns, and
-//    the kernel must produce five byte-identical rows. Computing "obv with
-//    period 7" would be a different indicator and would fail parity for a reason
-//    that looks like rounding and is not. Each such kernel is marked
-//    PERIOD-INVARIANT and its thread computes the whole series ignoring
-//    `periods[r]`. `medprice` and `wclprice` are period-invariant for the
-//    simpler reason that they have no period parameter at all.
+//    `ObvParams::default()`. `vwap` is anchored by calendar bucket and its only
+//    parameter is `anchor`. So `obv_7 .. obv_200` are five byte-identical CPU
+//    columns, and the kernel must produce five byte-identical rows. Computing
+//    "obv with period 7" would be a different indicator and would fail parity
+//    for a reason that looks like rounding and is not. Each such kernel is
+//    marked PERIOD-INVARIANT and its thread computes the whole series ignoring
+//    `periods[r]`. TSI is different: although vector-ta names its parameters
+//    `long_period` and `short_period`, `hpc_ta` deliberately maps the requested
+//    sweep anchor to that named pair, so its kernel must consume `periods[r]`.
+//    `medprice` and `wclprice` are period-invariant for the simpler reason that
+//    they have no period parameter at all.
 //
 // Everything in the first batch's header still binds here: no `float`, no `f`
 // suffix, no f32 intrinsic, no fast math, `fma()` exactly where and only where
@@ -937,18 +959,19 @@ extern "C" __global__ void neoethos_mfi_batch_f64(
 // truncated here.
 #define ADXR_MAX_PERIOD 512
 
-// TSI's periods are the dispatcher's defaults and are NOT the swept `period`.
-#define TSI_LONG 25
-#define TSI_SHORT 13
+// NeoEthos uses the requested period as TSI's long-window anchor and scales
+// the short window with the official/default 25:13 relationship.  Keep the
+// defaults named here because they define that ratio; they are not hard-coded
+// execution windows.
+#define TSI_DEFAULT_LONG 25
+#define TSI_DEFAULT_SHORT 13
 
 // ============================================================================
-// TSI — reference: tsi.rs::tsi_scalar_classic
-//   PERIOD-INVARIANT. long = 25, short = 13, so warm = first_valid + 38 for
-//   every row.
-//   `tsi_with_kernel` maps Auto -> Scalar and then, because long == 25 &&
-//   short == 13, takes `tsi_scalar_classic` specifically — so this reference is
-//   the one that actually runs, AVX feature or not. That makes tsi the safest
-//   of the three sweep-completing kernels.
+// TSI — references: tsi.rs::tsi_scalar_classic and tsi_compute_into_inline
+//   `periods[r]` is the named `long_period`; `short_period` is the same rounded
+//   25:13 scaling performed by hpc_ta::sweep_params.  The default row (25/13)
+//   takes `tsi_scalar_classic`; every other CPU row takes
+//   `tsi_compute_into_inline`.  Both use the recurrence reproduced below.
 //   Both EMA pairs are plain `alpha * x + (1 - alpha) * prev`; the CPU does NOT
 //   use mul_add here, so neither does this, and `-fmad=false` is what stops
 //   nvcc contracting it behind our back.
@@ -965,18 +988,28 @@ extern "C" __global__ void neoethos_tsi_batch_f64(
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_combos) return;
-    (void)periods;  // PERIOD-INVARIANT: see the batch header.
+
+    const int long_period = periods[r];
+    // For positive i32 periods this integer expression is exactly
+    // round(long_period * 13.0 / 25.0): denominator 25 is odd, so a half tie
+    // cannot occur.  Widen before multiplying to make overflow impossible.
+    long long scaled_short =
+        ((long long)long_period * TSI_DEFAULT_SHORT + (TSI_DEFAULT_LONG / 2)) /
+        TSI_DEFAULT_LONG;
+    const int short_period = (int)(scaled_short < 1 ? 1 : scaled_short);
 
     double* row = out + (size_t)r * (size_t)n;
     if (first_valid < 0 || first_valid >= n) { neo_fill_warmup(row, n, n); return; }
 
-    const int warm = first_valid + TSI_LONG + TSI_SHORT;
+    const long long warm64 =
+        (long long)first_valid + (long long)long_period + (long long)short_period;
+    const int warm = warm64 < (long long)n ? (int)warm64 : n;
     neo_fill_warmup(row, n, warm);
 
     if (first_valid + 1 >= n) return;
 
-    const double long_alpha = 2.0 / ((double)TSI_LONG + 1.0);
-    const double short_alpha = 2.0 / ((double)TSI_SHORT + 1.0);
+    const double long_alpha = 2.0 / ((double)long_period + 1.0);
+    const double short_alpha = 2.0 / ((double)short_period + 1.0);
     const double long_1minus = 1.0 - long_alpha;
     const double short_1minus = 1.0 - short_alpha;
 

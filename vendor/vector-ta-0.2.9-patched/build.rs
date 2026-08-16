@@ -1,13 +1,23 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::env;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn main() {
+    // Cargo grants this build script one implicit job slot. Connect before
+    // opening any other descriptors (required by jobserver::Client::from_env
+    // on Unix), then require one token for every additional NVCC worker.
+    let cargo_jobserver = unsafe { jobserver::Client::from_env() };
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/cuda");
     println!("cargo:rerun-if-changed=kernels/ptx");
-    println!("cargo:rerun-if-changed=kernels/cubin");
 
     // Sentinels first. `target_archs()` re-emits both with the real values
     // when kernels are compiled from source, and a later `cargo:rustc-env`
@@ -20,7 +30,7 @@ fn main() {
 
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         if env::var("CARGO_FEATURE_CUDA_BUILD_PTX").is_ok() {
-            compile_cuda_kernels();
+            compile_cuda_kernels(cargo_jobserver.as_ref());
         } else {
             stage_prebuilt_ptx();
         }
@@ -28,6 +38,182 @@ fn main() {
 
     if is_nightly() {
         println!("cargo:rustc-cfg=rustc_is_nightly");
+    }
+}
+
+#[derive(Debug)]
+struct KernelJob {
+    cuda_path: String,
+    rel_src: &'static str,
+    ptx_name: &'static str,
+}
+
+thread_local! {
+    /// Filled synchronously by the existing 300+ compile declarations, then
+    /// drained exactly once by `run_queued_kernel_jobs`.
+    static KERNEL_JOBS: RefCell<Vec<KernelJob>> = const { RefCell::new(Vec::new()) };
+}
+
+fn configured_nvcc_width(job_count: usize) -> usize {
+    let cargo_width = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(1);
+    let host_width = std::thread::available_parallelism()
+        .map(|width| width.get())
+        .unwrap_or(1);
+    cargo_width.min(host_width).min(job_count).max(1)
+}
+
+fn pop_kernel_job(queue: &Mutex<VecDeque<KernelJob>>) -> Option<KernelJob> {
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop_front()
+}
+
+fn record_kernel_failure(
+    cancelled: &AtomicBool,
+    failure: &Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    payload: Box<dyn std::any::Any + Send>,
+) {
+    let mut slot = failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(payload);
+    }
+    cancelled.store(true, Ordering::Release);
+}
+
+/// Reject duplicate sources or output names before concurrent writers exist.
+fn validate_unique_kernel_jobs(jobs: &[KernelJob]) {
+    let mut source_outputs = HashSet::with_capacity(jobs.len());
+    let mut output_names = HashSet::with_capacity(jobs.len());
+    for job in jobs {
+        if !source_outputs.insert((job.rel_src, job.ptx_name)) {
+            panic!(
+                "vector-ta: duplicate CUDA build declaration for {} -> {}; refusing before \
+                 launching nvcc because parallel writers would race on the same artifacts",
+                job.rel_src, job.ptx_name
+            );
+        }
+        if !output_names.insert(job.ptx_name) {
+            panic!(
+                "vector-ta: CUDA output name {} is shared by more than one source; refusing \
+                 before launching nvcc",
+                job.ptx_name
+            );
+        }
+    }
+}
+
+/// Drain the declared kernel jobs without creating a second parallelism
+/// authority. The build-script thread owns Cargo's implicit slot; every extra
+/// worker acquires/releases one token from Cargo's inherited jobserver around
+/// exactly one source's PTX+fatbin compile.
+fn run_queued_kernel_jobs(cargo_jobserver: Option<&jobserver::Client>) {
+    let jobs = KERNEL_JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+    if jobs.is_empty() {
+        return;
+    }
+    validate_unique_kernel_jobs(&jobs);
+
+    let width = configured_nvcc_width(jobs.len());
+    eprintln!(
+        "vector-ta build info: queued {} NVCC source jobs; configured shared width {}",
+        jobs.len(),
+        width
+    );
+
+    let Some(cargo_jobserver) = cargo_jobserver else {
+        println!(
+            "cargo:warning=vector-ta could not inherit Cargo's jobserver; compiling NVCC jobs \
+             serially rather than creating an unmanaged worker pool"
+        );
+        for job in jobs {
+            compile_kernel_now(job);
+        }
+        return;
+    };
+
+    if width == 1 {
+        for job in jobs {
+            compile_kernel_now(job);
+        }
+        return;
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    // Reserve the first job for the build-script thread before token workers
+    // can pop anything. This is what makes `cargo -j1` and narrow jobservers
+    // deadlock-free: the implicit slot always performs useful work.
+    let first = pop_kernel_job(&queue).expect("the non-empty NVCC queue lost its first job");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let failure: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> =
+        Arc::new(Mutex::new(None));
+
+    std::thread::scope(|scope| {
+        for _ in 1..width {
+            let queue = Arc::clone(&queue);
+            let cancelled = Arc::clone(&cancelled);
+            let failure = Arc::clone(&failure);
+            let client = cargo_jobserver.clone();
+            scope.spawn(move || {
+                while !cancelled.load(Ordering::Acquire) {
+                    let Some(job) = pop_kernel_job(&queue) else {
+                        break;
+                    };
+                    let token = match client.acquire() {
+                        Ok(token) => token,
+                        Err(error) => {
+                            record_kernel_failure(
+                                &cancelled,
+                                &failure,
+                                Box::new(format!(
+                                    "failed to acquire a Cargo jobserver token for NVCC: {error}"
+                                )),
+                            );
+                            break;
+                        }
+                    };
+                    if cancelled.load(Ordering::Acquire) {
+                        drop(token);
+                        break;
+                    }
+                    let result = catch_unwind(AssertUnwindSafe(|| compile_kernel_now(job)));
+                    drop(token);
+                    if let Err(payload) = result {
+                        record_kernel_failure(&cancelled, &failure, payload);
+                        break;
+                    }
+                }
+            });
+        }
+
+        let mut next = Some(first);
+        while let Some(job) = next {
+            let result = catch_unwind(AssertUnwindSafe(|| compile_kernel_now(job)));
+            if let Err(payload) = result {
+                record_kernel_failure(&cancelled, &failure, payload);
+                break;
+            }
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            next = pop_kernel_job(&queue);
+        }
+    });
+
+    let failure_payload = {
+        let mut failure_guard = failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failure_guard.take()
+    };
+    if let Some(payload) = failure_payload {
+        resume_unwind(payload);
     }
 }
 
@@ -902,6 +1088,30 @@ fn fast_math_requested(rel_src: &str) -> bool {
     on
 }
 
+/// Refuse the old arbitrary compiler escape hatch before any output is made.
+///
+/// `NVCC_ARGS` used to be appended *after* the f64 precision flags. That made
+/// it possible for ambient build configuration to re-enable fast math, FMA,
+/// flush-to-zero, approximate division/sqrt, nested compiler threads, or even
+/// a different architecture/output. NeoEthos exposes reviewed typed controls
+/// for those decisions; unversioned free-form arguments cannot be part of a
+/// truthful, reproducible CUDA artifact.
+fn reject_free_form_nvcc_args() {
+    match env::var("NVCC_ARGS") {
+        Ok(value) if !value.trim().is_empty() => panic!(
+            "vector-ta: NVCC_ARGS is unsupported because arbitrary trailing CUDA flags can \
+             override the strict f64 precision, architecture, output, and Cargo-jobserver \
+             contracts. Remove NVCC_ARGS and use the reviewed CUDA_ARCHS, CUDA_DEBUG, and \
+             CUDA_FILTER controls instead. Refusing before launching nvcc; received {value:?}."
+        ),
+        Ok(_) | Err(env::VarError::NotPresent) => {}
+        Err(env::VarError::NotUnicode(_)) => panic!(
+            "vector-ta: NVCC_ARGS contains non-Unicode data. Refusing an uninspectable CUDA \
+             compiler argument before launching nvcc."
+        ),
+    }
+}
+
 fn stage_prebuilt_ptx() {
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILT_PTX_DIR");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILT_CUBIN_DIR");
@@ -1052,7 +1262,7 @@ Enable `--features cuda-build-ptx` to compile PTX artifacts with nvcc.",
     }
 }
 
-fn compile_cuda_kernels() {
+fn compile_cuda_kernels(cargo_jobserver: Option<&jobserver::Client>) {
     println!("cargo:rerun-if-changed=kernels/cuda");
 
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
@@ -1065,6 +1275,8 @@ fn compile_cuda_kernels() {
     println!("cargo:rerun-if-env-changed=CUDA_FAST_MATH");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILD_PTX_DIR");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILD_CUBIN_DIR");
+
+    reject_free_form_nvcc_args();
 
     let cuda_path = find_cuda_path();
 
@@ -1355,12 +1567,6 @@ fn compile_cuda_kernels() {
         "kernels/cuda/moving_averages/vwma_kernel.cu",
         "vwma_kernel.ptx",
     );
-    compile_kernel(
-        &cuda_path,
-        "kernels/cuda/moving_averages/vidya_kernel.cu",
-        "vidya_kernel.ptx",
-    );
-
     compile_kernel(
         &cuda_path,
         "kernels/cuda/moving_averages/vwmacd_kernel.cu",
@@ -2660,6 +2866,8 @@ fn compile_cuda_kernels() {
     );
 
     compile_kernel(&cuda_path, "kernels/cuda/lpc_kernel.cu", "lpc_kernel.ptx");
+
+    run_queued_kernel_jobs(cargo_jobserver);
 }
 
 fn find_cuda_path() -> String {
@@ -2827,10 +3035,8 @@ fn append_windows_nvcc_host_args(cmd: &mut std::process::Command) {
 #[cfg(not(target_os = "windows"))]
 fn append_windows_nvcc_host_args(_cmd: &mut std::process::Command) {}
 
-fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
-    use std::process::Command;
-
-    let src_path = if let Ok(root) = env::var("CUDA_KERNEL_DIR") {
+fn kernel_source_path(rel_src: &str) -> String {
+    if let Ok(root) = env::var("CUDA_KERNEL_DIR") {
         let root = root.trim_end_matches(['/', '\\']);
         let prefix = "kernels/cuda/";
         if rel_src.starts_with(prefix) {
@@ -2840,38 +3046,64 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         }
     } else {
         rel_src.to_string()
-    };
+    }
+}
 
+fn cuda_filter_matches(rel_src: &str) -> bool {
+    let Ok(filter) = env::var("CUDA_FILTER") else {
+        return true;
+    };
+    filter
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .map(str::trim)
+        .any(|token| !token.is_empty() && rel_src.contains(token))
+}
+
+/// Record one source job. The 300+ existing declarations stay declarative and
+/// deterministic; no child process is launched until the shared Cargo-aware
+/// scheduler drains the complete queue.
+fn compile_kernel(cuda_path: &str, rel_src: &'static str, ptx_name: &'static str) {
+    let src_path = kernel_source_path(rel_src);
     println!("cargo:rerun-if-changed={}", src_path);
+
+    if !cuda_filter_matches(rel_src) {
+        eprintln!("Skipping {} due to CUDA_FILTER", rel_src);
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+        let placeholder = ".version 7.0
+.target compute_80
+.address_size 64
+// placeholder PTX (no kernels)
+";
+        std::fs::write(out_dir.join(ptx_name), placeholder).expect("write placeholder PTX");
+        std::fs::write(out_dir.join(fatbin_name_for_ptx(ptx_name)), [])
+            .expect("write placeholder cubin");
+        return;
+    }
+
+    KERNEL_JOBS.with(|queue| {
+        queue.borrow_mut().push(KernelJob {
+            cuda_path: cuda_path.to_string(),
+            rel_src,
+            ptx_name,
+        });
+    });
+}
+
+fn compile_kernel_now(job: KernelJob) {
+    use std::process::Command;
+
+    let KernelJob {
+        cuda_path,
+        rel_src,
+        ptx_name,
+    } = job;
+    let src_path = kernel_source_path(rel_src);
 
     let cubin_name = fatbin_name_for_ptx(ptx_name);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let ptx_path = out_dir.join(ptx_name);
     let cubin_path = out_dir.join(&cubin_name);
-
-    if let Ok(filt) = env::var("CUDA_FILTER") {
-        let mut any = false;
-        for tok in filt.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
-            let t = tok.trim();
-            if !t.is_empty() && rel_src.contains(t) {
-                any = true;
-                break;
-            }
-        }
-        if !any {
-            eprintln!("Skipping {} due to CUDA_FILTER", rel_src);
-
-            let placeholder = ".version 7.0
-.target compute_80
-.address_size 64
-// placeholder PTX (no kernels)
-";
-            std::fs::write(&ptx_path, placeholder).expect("write placeholder PTX");
-            std::fs::write(&cubin_path, []).expect("write placeholder cubin");
-            return;
-        }
-    }
 
     if cfg!(target_os = "windows") && env::var("VCINSTALLDIR").is_err() {
         eprintln!(
@@ -2992,14 +3224,6 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         src_path.as_str(),
     ]);
 
-    if let Ok(extra) = env::var("NVCC_ARGS") {
-        for tok in extra.split_whitespace() {
-            if !tok.is_empty() {
-                cmd.arg(tok);
-            }
-        }
-    }
-
     if cfg!(target_os = "windows") {
         append_windows_nvcc_host_args(&mut cmd);
     }
@@ -3066,14 +3290,6 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         cubin_path.to_str().expect("fatbin path"),
         src_path.as_str(),
     ]);
-
-    if let Ok(extra) = env::var("NVCC_ARGS") {
-        for tok in extra.split_whitespace() {
-            if !tok.is_empty() {
-                fat_cmd.arg(tok);
-            }
-        }
-    }
 
     if cfg!(target_os = "windows") {
         append_windows_nvcc_host_args(&mut fat_cmd);
@@ -3159,10 +3375,5 @@ fn find_vs_installation() -> Result<String, ()> {
         }
     }
 
-    Err(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn find_vs_installation() -> Result<String, ()> {
     Err(())
 }

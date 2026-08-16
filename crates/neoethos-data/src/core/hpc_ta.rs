@@ -95,7 +95,9 @@ pub fn set_indicator_compute_policy(
 ) -> Result<(), IndicatorComputePolicy> {
     match POLICY_OVERRIDE.set(policy) {
         Ok(()) => Ok(()),
-        Err(_) => Err(*POLICY_OVERRIDE.get().expect("just failed to set, so it is set")),
+        Err(_) => Err(*POLICY_OVERRIDE
+            .get()
+            .expect("just failed to set, so it is set")),
     }
 }
 
@@ -160,6 +162,45 @@ pub enum IndicatorComputePolicy {
     RequireGpu,
 }
 
+/// The exact vocabulary admission decision used by one classic-TA execution.
+///
+/// This is captured while the production run still owns the budget decision.
+/// Callers must not reconstruct it after the columns have been allocated:
+/// `VocabularyBudget` is derived from currently available memory, so a second
+/// probe can describe a different machine state and report a false admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassicTaExecutionReport {
+    pub budget_rows: usize,
+    pub available_bytes_at_admission: u64,
+    pub max_columns: usize,
+    pub admitted_indicator_ids: Vec<&'static str>,
+    pub budget_deferred_indicator_ids: Vec<&'static str>,
+    /// Columns requested by the complete base vocabulary, before admission.
+    pub planned_base_columns: usize,
+    /// Columns represented by the admitted base IDs.
+    pub admitted_base_columns: usize,
+    pub historical_sweep_reserved_columns: usize,
+    pub historical_sweep_produced_columns: usize,
+    pub extended_mode: &'static str,
+    pub extended_admitted_indicator_ids: Vec<&'static str>,
+    pub extended_budget_deferred_indicator_ids: Vec<&'static str>,
+    pub extended_budget_columns: usize,
+    pub extended_planned_columns: usize,
+    pub produced_columns: usize,
+}
+
+/// Classic-TA values and the ledger/admission facts from the same execution.
+///
+/// The large f64 columns are owned exactly once. Existing production callers
+/// use the value-only wrappers below; audit/parity callers consume this type so
+/// their evidence cannot drift from the execution it describes.
+#[derive(Debug)]
+pub struct ClassicTaComputation {
+    pub columns: Vec<(String, Vec<f64>)>,
+    pub report: ClassicTaExecutionReport,
+    pub ledger: IndicatorLedger,
+}
+
 /// The multi-period sweep, with an explicit lane policy.
 ///
 /// # The device lane is f64 end to end
@@ -196,8 +237,17 @@ pub fn compute_classic_ta_columns_with_policy(
     ohlcv: &Ohlcv,
     policy: IndicatorComputePolicy,
 ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+    Ok(compute_classic_ta_columns_with_policy_report(ohlcv, policy)?.columns)
+}
+
+/// Execute with an explicit lane policy and return the exact admission ledger
+/// captured by that same run.
+pub fn compute_classic_ta_columns_with_policy_report(
+    ohlcv: &Ohlcv,
+    policy: IndicatorComputePolicy,
+) -> anyhow::Result<ClassicTaComputation> {
     let rows = ohlcv.len();
-    compute_classic_ta_columns_sized(ohlcv, policy, rows)
+    compute_classic_ta_columns_sized_report(ohlcv, policy, rows)
 }
 
 /// The real entry point: same as [`compute_classic_ta_columns_with_policy`] but
@@ -229,9 +279,38 @@ pub fn compute_classic_ta_columns_sized(
     policy: IndicatorComputePolicy,
     budget_rows: usize,
 ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+    Ok(compute_classic_ta_columns_sized_report(ohlcv, policy, budget_rows)?.columns)
+}
+
+/// Sized form of [`compute_classic_ta_columns_with_policy_report`].
+pub fn compute_classic_ta_columns_sized_report(
+    ohlcv: &Ohlcv,
+    policy: IndicatorComputePolicy,
+    budget_rows: usize,
+) -> anyhow::Result<ClassicTaComputation> {
     let n = ohlcv.len();
     if n == 0 {
-        return Ok(vec![]);
+        return Ok(ClassicTaComputation {
+            columns: Vec::new(),
+            report: ClassicTaExecutionReport {
+                budget_rows: 0,
+                available_bytes_at_admission: 0,
+                max_columns: 0,
+                admitted_indicator_ids: Vec::new(),
+                budget_deferred_indicator_ids: Vec::new(),
+                planned_base_columns: 0,
+                admitted_base_columns: 0,
+                historical_sweep_reserved_columns: 0,
+                historical_sweep_produced_columns: 0,
+                extended_mode: "empty_frame",
+                extended_admitted_indicator_ids: Vec::new(),
+                extended_budget_deferred_indicator_ids: Vec::new(),
+                extended_budget_columns: 0,
+                extended_planned_columns: 0,
+                produced_columns: 0,
+            },
+            ledger: IndicatorLedger::new(),
+        });
     }
     let budget_rows = budget_rows.max(n);
 
@@ -313,7 +392,16 @@ pub fn compute_classic_ta_columns_sized(
         .map(|&id| {
             let mut out: Vec<(String, Vec<f64>)> = Vec::new();
             let mut ledger = IndicatorLedger::new();
-            dispatch_indicator_outputs(&candles, id, id, &[], n, Kernel::Auto, &mut out, &mut ledger);
+            dispatch_indicator_outputs(
+                &candles,
+                id,
+                id,
+                &[],
+                n,
+                Kernel::Auto,
+                &mut out,
+                &mut ledger,
+            );
             (out, ledger)
         })
         .collect();
@@ -340,7 +428,13 @@ pub fn compute_classic_ta_columns_sized(
         cols.append(&mut produced);
         ledger.merge(led);
     }
-    base_budget.log("base-vocabulary", planned_columns, cols.len());
+    // Admission is a pre-compute planning fact. `cols.len()` is the number
+    // that survived dispatch and may be smaller because of unknown outputs,
+    // unsupported capabilities or kernel errors; passing it here falsely
+    // labels those defects as RAM deferrals. The indicator ledger below owns
+    // production failures, while this line reports only the actual budget
+    // decision.
+    base_budget.log("base-vocabulary", planned_columns, base_admitted_plan);
 
     // 3. Multi-period variants for the most critical indicators. Appended
     //    after the base columns to preserve the original ordering exactly.
@@ -478,6 +572,11 @@ pub fn compute_classic_ta_columns_sized(
             (groups, deferred, "budget_prefix", extended_budget)
         }
     };
+    let extended_admitted_indicator_ids = ext_groups.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let extended_planned_columns = ext_groups
+        .iter()
+        .map(|(id, periods)| planned_output_count(id) * periods.len())
+        .sum();
     if !ext_groups.is_empty() {
         let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_groups
             .par_iter()
@@ -542,9 +641,21 @@ pub fn compute_classic_ta_columns_sized(
         let mut seen: HashSet<u64> = HashSet::with_capacity(cols.len());
         let mut names: HashSet<&str> = HashSet::with_capacity(cols.len());
         let mut collisions: Vec<&str> = Vec::new();
+        let mut infinite_columns: Vec<(&str, usize, usize, f64)> = Vec::new();
         for (name, values) in &cols {
             if !names.insert(name.as_str()) {
                 collisions.push(name.as_str());
+            }
+            let mut infinite_count = 0usize;
+            let mut first_infinite: Option<(usize, f64)> = None;
+            for (row, &value) in values.iter().enumerate() {
+                if value.is_infinite() {
+                    infinite_count += 1;
+                    first_infinite.get_or_insert((row, value));
+                }
+            }
+            if let Some((row, value)) = first_infinite {
+                infinite_columns.push((name.as_str(), infinite_count, row, value));
             }
             if !seen.insert(series_fingerprint(values)) {
                 ledger.duplicate_column(name);
@@ -560,6 +671,17 @@ pub fn compute_classic_ta_columns_sized(
                  real feature. Rename the sweep suffix for the id(s) involved.",
                 collisions.len(),
                 collisions.iter().take(20).collect::<Vec<_>>()
+            );
+        }
+        if !infinite_columns.is_empty() {
+            anyhow::bail!(
+                "the indicator pass emitted infinity in {} column(s): {:?}. NaN is the explicit \
+                 validity representation for warmup/gaps; +/-infinity is never a valid market \
+                 feature. Repair the independently reviewed formula or exclude the indicator \
+                 statically from the production vocabulary — never clamp, zero-fill, or drop it \
+                 based on this frame.",
+                infinite_columns.len(),
+                infinite_columns.iter().take(20).collect::<Vec<_>>()
             );
         }
     }
@@ -603,7 +725,29 @@ pub fn compute_classic_ta_columns_sized(
         );
     }
 
-    Ok(cols)
+    let report = ClassicTaExecutionReport {
+        budget_rows,
+        available_bytes_at_admission: budget.available_bytes,
+        max_columns: budget.max_columns,
+        admitted_indicator_ids: admitted,
+        budget_deferred_indicator_ids: deferred,
+        planned_base_columns: planned_columns,
+        admitted_base_columns: base_admitted_plan,
+        historical_sweep_reserved_columns: sweep_reserved,
+        historical_sweep_produced_columns: sweep_actual,
+        extended_mode: ext_mode,
+        extended_admitted_indicator_ids,
+        extended_budget_deferred_indicator_ids: ext_deferred,
+        extended_budget_columns: extended_budget,
+        extended_planned_columns,
+        produced_columns: cols.len(),
+    };
+
+    Ok(ClassicTaComputation {
+        columns: cols,
+        report,
+        ledger,
+    })
 }
 
 /// Dispatch ONE indicator across all of its declared outputs, appending each
@@ -699,26 +843,26 @@ fn dispatch_indicator_outputs(
                     continue;
                 }
                 match flatten_indicator_series(output.series, n) {
-                Ok((values, raw_len)) => {
-                    if raw_len > n {
-                        // The tail was dropped. A discard is a discard even when
-                        // the column survives it.
-                        ledger.dropped(
-                            id,
-                            &name,
-                            DropReason::Truncated,
-                            format!("kernel returned {raw_len} values for {n} bars; head kept"),
-                        );
+                    Ok((values, raw_len)) => {
+                        if raw_len > n {
+                            // The tail was dropped. A discard is a discard even when
+                            // the column survives it.
+                            ledger.dropped(
+                                id,
+                                &name,
+                                DropReason::Truncated,
+                                format!("kernel returned {raw_len} values for {n} bars; head kept"),
+                            );
+                        }
+                        if excluded.is_some() {
+                            // The exclusion table said this id cannot produce. It
+                            // did. That means the table is stale, which is a thing
+                            // to fix, not to shrug at.
+                            ledger.stale_exclusion(id);
+                        }
+                        ledger.produced(id);
+                        out.push((name.clone(), values));
                     }
-                    if excluded.is_some() {
-                        // The exclusion table said this id cannot produce. It
-                        // did. That means the table is stale, which is a thing
-                        // to fix, not to shrug at.
-                        ledger.stale_exclusion(id);
-                    }
-                    ledger.produced(id);
-                    out.push((name.clone(), values));
-                }
                     Err(e) => {
                         discard = Some((DropReason::ShortSeries, e.to_string()));
                     }
@@ -1274,12 +1418,20 @@ const COUPLED_WINDOWS: &[(&str, &[(&str, i64)])] = &[
     // the window that sets the indicator's timescale.
     (
         "macd",
-        &[("slow_period", 26), ("fast_period", 12), ("signal_period", 9)],
+        &[
+            ("slow_period", 26),
+            ("fast_period", 12),
+            ("signal_period", 9),
+        ],
     ),
     // registry.rs PARAM_STOCH: fastk 14, slowk 3, slowd 3. Anchored on fastk.
     (
         "stoch",
-        &[("fastk_period", 14), ("slowk_period", 3), ("slowd_period", 3)],
+        &[
+            ("fastk_period", 14),
+            ("slowk_period", 3),
+            ("slowd_period", 3),
+        ],
     ),
     // registry.rs PARAM_TSI (line 3030): long_period 25, short_period 13. tsi
     // declares NEITHER `period` nor `length`, so it used to fall through to
@@ -1288,10 +1440,7 @@ const COUPLED_WINDOWS: &[(&str, &[(&str, i64)])] = &[
     // [tsi, tsi_7, tsi_21, tsi_50, tsi_100, tsi_200]. Anchored on long_period,
     // the window that sets the timescale, with short_period scaled to keep the
     // 25:13 ratio that IS the indicator.
-    (
-        "tsi",
-        &[("long_period", 25), ("short_period", 13)],
-    ),
+    ("tsi", &[("long_period", 25), ("short_period", 13)]),
 ];
 
 /// Window-parameter keys the sweep knows how to drive directly.
@@ -1355,8 +1504,10 @@ fn unmatched_window_keys(ind_id: &str) -> Vec<&'static str> {
     info.params
         .iter()
         .filter(|p| {
-            matches!(p.kind, vector_ta::indicators::registry::IndicatorParamKind::Int)
-                && (p.key.contains("period") || p.key.contains("length"))
+            matches!(
+                p.kind,
+                vector_ta::indicators::registry::IndicatorParamKind::Int
+            ) && (p.key.contains("period") || p.key.contains("length"))
         })
         .map(|p| p.key)
         .collect()
@@ -1506,7 +1657,9 @@ fn sweep_one_id_ledgered(
 fn cpu_multi_period_all(candles: &Candles, n: usize) -> Vec<(String, Vec<f64>)> {
     let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = MULTI_PERIOD_IDS
         .par_iter()
-        .map(|&ind_id| cpu_multi_period_columns_ledgered(candles, ind_id, &ALT_PERIODS, n, Kernel::Auto))
+        .map(|&ind_id| {
+            cpu_multi_period_columns_ledgered(candles, ind_id, &ALT_PERIODS, n, Kernel::Auto)
+        })
         .collect();
     let mut cols = Vec::new();
     let mut ledger = IndicatorLedger::new();
@@ -1658,10 +1811,9 @@ fn compute_multi_period_columns(
     // Per-indicator slots, filled in `MULTI_PERIOD_IDS` order so the emitted
     // column order matches the pure-CPU path exactly.
     let mut slots: Vec<Vec<(String, Vec<f64>)>> = vec![Vec::new(); MULTI_PERIOD_IDS.len()];
-    // Tracked explicitly rather than inferred from `slots[i].is_empty()`: on a
-    // frame short enough that every period is skipped by the 1.25x pre-flight
-    // guard, a device sweep legitimately returns ZERO columns, and an
-    // emptiness test would then re-run it on the CPU and mislabel the lane.
+    // Tracked explicitly rather than inferred from `slots[i].is_empty()` so a
+    // successful device request that emits only schema-preserving all-NaN
+    // placeholders is still recorded as handled, without a CPU re-run.
     let mut device_handled = vec![false; MULTI_PERIOD_IDS.len()];
     let mut gpu_ids: Vec<&'static str> = Vec::new();
     let mut cpu_ids: Vec<(&'static str, IndicatorLane)> = Vec::new();
@@ -1685,7 +1837,7 @@ fn compute_multi_period_columns(
                 // longer cost five launches. Counting columns here would
                 // silently re-inflate this back to the old number and hide the
                 // improvement.
-                if !cols.is_empty() {
+                if engine.has_launchable_period(&ALT_PERIODS) {
                     device_calls += 1;
                 }
                 gpu_time += t0.elapsed();
@@ -1744,7 +1896,12 @@ fn compute_multi_period_columns(
     let t0 = Instant::now();
     let cpu_filled: Vec<(usize, Vec<(String, Vec<f64>)>)> = cpu_pending
         .par_iter()
-        .map(|&(i, id)| (i, cpu_multi_period_columns(candles, id, &ALT_PERIODS, n, Kernel::Auto)))
+        .map(|&(i, id)| {
+            (
+                i,
+                cpu_multi_period_columns(candles, id, &ALT_PERIODS, n, Kernel::Auto),
+            )
+        })
         .collect();
     cpu_time += t0.elapsed();
     for (i, cols) in cpu_filled {
@@ -1851,18 +2008,17 @@ pub fn compute_single_indicator(
     // `output_id: None` fails with "output_id is required for
     // multi-output indicators". Single-output indicators use `None`
     // (the library's default output).
-    let output_ids: Vec<Option<&'static str>> =
-        vector_ta::indicators::registry::list_indicators()
-            .iter()
-            .find(|i| i.id == indicator_id)
-            .map(|info| {
-                if info.outputs.len() <= 1 {
-                    vec![None]
-                } else {
-                    info.outputs.iter().map(|o| Some(o.id)).collect()
-                }
-            })
-            .unwrap_or_else(|| vec![None]);
+    let output_ids: Vec<Option<&'static str>> = vector_ta::indicators::registry::list_indicators()
+        .iter()
+        .find(|i| i.id == indicator_id)
+        .map(|info| {
+            if info.outputs.len() <= 1 {
+                vec![None]
+            } else {
+                info.outputs.iter().map(|o| Some(o.id)).collect()
+            }
+        })
+        .unwrap_or_else(|| vec![None]);
 
     let mut lines = Vec::with_capacity(output_ids.len());
     for out_id in output_ids {
@@ -1909,7 +2065,10 @@ pub fn compute_single_indicator(
 /// Returns `(values, raw_value_count)`. The raw count is handed back so the
 /// caller can LEDGER a truncation instead of performing one silently — this
 /// function used to be the last uncounted discard on the repaired path.
-fn flatten_indicator_series(series: IndicatorSeries, n: usize) -> anyhow::Result<(Vec<f64>, usize)> {
+fn flatten_indicator_series(
+    series: IndicatorSeries,
+    n: usize,
+) -> anyhow::Result<(Vec<f64>, usize)> {
     match series {
         IndicatorSeries::F64(v) => normalize_indicator_len(v, n),
         IndicatorSeries::I32(v) => {
@@ -1956,7 +2115,6 @@ fn normalize_indicator_len(v: Vec<f64>, n: usize) -> anyhow::Result<(Vec<f64>, u
         anyhow::bail!("indicator returned {} values, expected ≥{}", raw, n)
     }
 }
-
 
 #[cfg(test)]
 mod streaming_advance_tests {
@@ -2025,7 +2183,11 @@ mod streaming_advance_tests {
             }
         }
         assert_eq!(cursor, space.len());
-        assert_eq!(seen.len(), space.len(), "every pair must appear exactly once");
+        assert_eq!(
+            seen.len(),
+            space.len(),
+            "every pair must appear exactly once"
+        );
         let unique: HashSet<SweepPair> = seen.iter().copied().collect();
         assert_eq!(unique.len(), space.len(), "no pair may appear twice");
         let space_set: HashSet<SweepPair> = space.iter().copied().collect();
@@ -2110,7 +2272,10 @@ mod streaming_advance_tests {
     fn installing_a_working_set_returns_the_previous_one() {
         let batch = std::sync::Arc::new(extended_sweep_batch(0, 8));
         let previous = install_extended_sweep_working_set(Some(batch.clone()));
-        assert_eq!(current_extended_sweep_working_set().as_deref(), Some(&*batch));
+        assert_eq!(
+            current_extended_sweep_working_set().as_deref(),
+            Some(&*batch)
+        );
         let restored = install_extended_sweep_working_set(previous);
         assert_eq!(restored.as_deref(), Some(&*batch));
         assert!(current_extended_sweep_working_set().is_none());
@@ -2201,6 +2366,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execution_report_accounts_for_the_exact_production_admission() {
+        let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
+        let run =
+            compute_classic_ta_columns_with_policy_report(&ohlcv, IndicatorComputePolicy::Cpu)
+                .unwrap();
+        let report = &run.report;
+
+        assert_eq!(report.produced_columns, run.columns.len());
+        assert_eq!(report.budget_rows, ohlcv.len());
+        assert_eq!(
+            report.admitted_indicator_ids.len() + report.budget_deferred_indicator_ids.len(),
+            ALL_INDICATORS.len(),
+            "every base indicator must be classified by the execution that actually ran"
+        );
+        assert_eq!(
+            report.planned_base_columns,
+            ALL_INDICATORS
+                .iter()
+                .map(|id| planned_output_count(id))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            report.admitted_base_columns,
+            report
+                .admitted_indicator_ids
+                .iter()
+                .map(|id| planned_output_count(id))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            report.extended_planned_columns,
+            report
+                .extended_admitted_indicator_ids
+                .iter()
+                .map(|id| planned_output_count(id) * ALT_PERIODS.len())
+                .sum::<usize>()
+        );
+        assert!(
+            report
+                .admitted_indicator_ids
+                .iter()
+                .all(|id| !report.budget_deferred_indicator_ids.contains(id)),
+            "an indicator cannot be both admitted and deferred"
+        );
+        assert_eq!(
+            run.ledger.duplicate_count(),
+            report.produced_columns - {
+                let unique = run
+                    .columns
+                    .iter()
+                    .map(|(_, values)| series_fingerprint(values))
+                    .collect::<HashSet<_>>();
+                unique.len()
+            }
+        );
+    }
+
     // =======================================================================
     // The 341-silent-drop regression guards.
     //
@@ -2274,7 +2497,12 @@ mod tests {
             compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
         assert!(!cols.is_empty());
         for (name, v) in &cols {
-            assert_eq!(v.len(), n, "column '{name}' is {} values, expected {n}", v.len());
+            assert_eq!(
+                v.len(),
+                n,
+                "column '{name}' is {} values, expected {n}",
+                v.len()
+            );
         }
     }
 
@@ -2294,7 +2522,10 @@ mod tests {
     #[test]
     fn the_column_set_is_independent_of_the_frame_length() {
         let full = crate::test_fixtures::ctrader_sample_ohlcv();
-        assert!(full.len() > 60, "fixture too short to truncate meaningfully");
+        assert!(
+            full.len() > 60,
+            "fixture too short to truncate meaningfully"
+        );
         let short = Ohlcv {
             timestamp: full.timestamp.as_ref().map(|t| t[..60].to_vec()),
             open: full.open[..60].to_vec(),
@@ -2319,7 +2550,10 @@ mod tests {
             names_a.len(),
             names_b.len()
         );
-        assert_eq!(names_a, names_b, "column names/order differ between frame lengths");
+        assert_eq!(
+            names_a, names_b,
+            "column names/order differ between frame lengths"
+        );
         for (name, v) in &b {
             assert_eq!(v.len(), 60, "column '{name}' is not frame length");
         }
@@ -2494,9 +2728,9 @@ mod tests {
             .unwrap_or(false);
 
         // REAL data. 100 bars clears the 7/21/50 periods under the 1.25x
-        // pre-flight guard; 100 and 200 are skipped by BOTH lanes, which is
-        // itself part of what the column-set assertion below checks. The
-        // full-length check is the CLI feature build on the box.
+        // pre-flight guard; 100 and 200 launch on neither lane but remain
+        // present as all-NaN schema placeholders. The full-length check is the
+        // CLI feature build on the box.
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
         let n = ohlcv.len();
         assert!(n >= 64, "fixture too short to sweep anything: {n} bars");
@@ -2539,6 +2773,16 @@ mod tests {
         );
 
         let mut worst_overall = 0.0f64;
+        let mut mismatch_count = 0usize;
+        let mut mismatch_examples = Vec::new();
+        const MAX_MISMATCH_EXAMPLES: usize = 256;
+
+        let mut record_mismatch = |message: String| {
+            mismatch_count += 1;
+            if mismatch_examples.len() < MAX_MISMATCH_EXAMPLES {
+                mismatch_examples.push(message);
+            }
+        };
         for spec in GPU_SWEEP_SPECS {
             let gpu = engine
                 .sweep_columns(spec, &ALT_PERIODS)
@@ -2575,32 +2819,44 @@ mod tests {
             // tolerance question.
             let gpu_names: Vec<&str> = gpu.iter().map(|(k, _)| k.as_str()).collect();
             let cpu_names: Vec<&str> = cpu.iter().map(|(k, _)| k.as_str()).collect();
-            assert_eq!(
-                gpu_names, cpu_names,
-                "{}: column set/name/order differs between lanes",
-                spec.id
-            );
+            if gpu_names != cpu_names {
+                record_mismatch(format!(
+                    "{}: column set/name/order differs between lanes: gpu={gpu_names:?} cpu={cpu_names:?}",
+                    spec.id
+                ));
+                continue;
+            }
 
             let (abs_tol, rel_tol) = parity_tolerance(spec.id);
             let mut worst = 0.0f64;
             let mut worst_at = String::new();
 
             for ((name, gcol), (_, ccol)) in gpu.iter().zip(cpu.iter()) {
-                assert_eq!(gcol.len(), ccol.len(), "{name}: length differs between lanes");
+                if gcol.len() != ccol.len() {
+                    record_mismatch(format!(
+                        "{name}: length differs between lanes: gpu={} cpu={}",
+                        gcol.len(),
+                        ccol.len()
+                    ));
+                    continue;
+                }
                 for (j, (&g, &c)) in gcol.iter().zip(ccol.iter()).enumerate() {
-                    assert_eq!(
-                        g.is_nan(),
-                        c.is_nan(),
-                        "{name}[{j}]: NaN mask differs (gpu={g} cpu={c}) — the warmup boundary \
-                         is structural, so the two lanes are computing different windows"
-                    );
+                    if g.is_nan() != c.is_nan() {
+                        record_mismatch(format!(
+                            "{name}[{j}]: NaN mask differs (gpu={g} cpu={c}) — the warmup boundary \
+                             is structural, so the two lanes are computing different windows"
+                        ));
+                        continue;
+                    }
                     if c.is_nan() {
                         continue;
                     }
-                    assert!(
-                        g.is_finite(),
-                        "{name}[{j}]: device produced {g} where the CPU produced a finite {c}"
-                    );
+                    if !g.is_finite() {
+                        record_mismatch(format!(
+                            "{name}[{j}]: device produced {g} where the CPU produced a finite {c}"
+                        ));
+                        continue;
+                    }
                     let delta = (g - c).abs();
                     let allowed = abs_tol + rel_tol * c.abs();
                     // Track the normalised overshoot so "worst" is comparable
@@ -2610,11 +2866,12 @@ mod tests {
                         worst = ratio;
                         worst_at = format!("{name}[{j}] gpu={g} cpu={c} |d|={delta}");
                     }
-                    assert!(
-                        delta <= allowed,
-                        "{name}[{j}]: |gpu-cpu| = {delta} > {allowed} \
-                         (abs_tol={abs_tol}, rel_tol={rel_tol}) — gpu={g} cpu={c}"
-                    );
+                    if delta > allowed {
+                        record_mismatch(format!(
+                            "{name}[{j}]: |gpu-cpu| = {delta} > {allowed} \
+                             (abs_tol={abs_tol}, rel_tol={rel_tol}) — gpu={g} cpu={c}"
+                        ));
+                    }
                 }
             }
             worst_overall = worst_overall.max(worst);
@@ -2624,7 +2881,15 @@ mod tests {
             );
         }
 
-        engine.synchronize().expect("synchronize after parity sweep");
+        engine
+            .synchronize()
+            .expect("synchronize after parity sweep");
+        assert!(
+            mismatch_count == 0,
+            "GPU/CPU f64 parity found {mismatch_count} mismatches; first {}:\n{}",
+            mismatch_examples.len(),
+            mismatch_examples.join("\n")
+        );
         eprintln!(
             "parity worst across all indicators: {worst_overall:.4} of budget. \
              0.0 means the two lanes are BIT-IDENTICAL on this frame. That is now a legitimate \

@@ -7,8 +7,6 @@ use crate::utilities::helpers::{
 #[cfg(feature = "python")]
 use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -291,26 +289,34 @@ fn sma_prepare<'a>(
 
 #[inline]
 fn sma_compute_into(data: &[f64], period: usize, first: usize, kernel: Kernel, out: &mut [f64]) {
-    unsafe {
-        match kernel {
-            Kernel::Scalar | Kernel::ScalarBatch => {
-                sma_scalar(data, period, first, out);
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 | Kernel::Avx2Batch => {
-                sma_scalar(data, period, first, out);
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 | Kernel::Avx512Batch => {
-                sma_avx512(data, period, first, out);
-            }
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
-                sma_scalar(data, period, first, out);
-            }
-            _ => unreachable!(),
-        }
+    // SMA is a stateful sliding sum. The removed AVX and global-prefix paths
+    // reassociated that sum and accumulated history-dependent error, so a
+    // runtime-selected CPU ISA changed the indicator values. Keep one reviewed
+    // compensated recurrence for every public kernel selector; the batch path
+    // still parallelizes independent period rows.
+    match kernel {
+        Kernel::Scalar
+        | Kernel::ScalarBatch
+        | Kernel::Avx2
+        | Kernel::Avx2Batch
+        | Kernel::Avx512
+        | Kernel::Avx512Batch => unsafe { sma_scalar(data, period, first, out) },
+        _ => unreachable!(),
     }
+}
+
+/// Add one term with Kahan compensation.
+///
+/// The correction is part of the running SMA state. In particular, removing
+/// the outgoing value and adding the incoming value are two compensated
+/// operations; collapsing them to `incoming - outgoing` first loses the low
+/// bits before the compensator can observe them.
+#[inline(always)]
+fn compensated_add(sum: &mut f64, correction: &mut f64, value: f64) {
+    let adjusted = value - *correction;
+    let next = *sum + adjusted;
+    *correction = (next - *sum) - adjusted;
+    *sum = next;
 }
 
 #[inline(always)]
@@ -330,221 +336,18 @@ pub unsafe fn sma_scalar(data: &[f64], period: usize, first: usize, out: &mut [f
     }
 
     let mut sum = 0.0;
+    let mut correction = 0.0;
     for k in 0..period {
-        sum += *dp.add(first + k);
+        compensated_add(&mut sum, &mut correction, *dp.add(first + k));
     }
     let inv = 1.0 / (period as f64);
 
     *op.add(first + period - 1) = sum * inv;
 
     for i in (first + period)..len {
-        sum += *dp.add(i) - *dp.add(i - period);
+        compensated_add(&mut sum, &mut correction, -*dp.add(i - period));
+        compensated_add(&mut sum, &mut correction, *dp.add(i));
         *op.add(i) = sum * inv;
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline]
-pub unsafe fn sma_avx2(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    use core::arch::x86_64::*;
-    debug_assert!(period >= 1);
-    debug_assert_eq!(data.len(), out.len());
-
-    let len = data.len();
-    let dp = data.as_ptr();
-    let op = out.as_mut_ptr();
-
-    if period == 1 {
-        let mut i = first;
-        while i < len {
-            *op.add(i) = *dp.add(i);
-            i += 1;
-        }
-        return;
-    }
-
-    let mut acc256 = _mm256_setzero_pd();
-    let mut k = 0usize;
-    let base = first;
-    let p4 = period & !3;
-
-    while k < p4 {
-        let v = _mm256_loadu_pd(dp.add(base + k));
-        acc256 = _mm256_add_pd(acc256, v);
-        k += 4;
-    }
-
-    let hadd = _mm256_hadd_pd(acc256, acc256);
-    let lo = _mm256_castpd256_pd128(hadd);
-    let hi = _mm256_extractf128_pd(hadd, 1);
-    let sum128 = _mm_add_sd(lo, hi);
-    let mut sum = _mm_cvtsd_f64(sum128);
-
-    while k < period {
-        sum += *dp.add(base + k);
-        k += 1;
-    }
-
-    let inv = 1.0 / (period as f64);
-    let inv_v = _mm256_set1_pd(inv);
-    let mut warm = first + period - 1;
-    *op.add(warm) = sum.mul_add(inv, 0.0);
-
-    let mut i = warm + 1;
-    let end = len;
-    let stride = 4usize;
-
-    while i + stride - 1 < end {
-        let v_new = _mm256_loadu_pd(dp.add(i));
-        let v_old = _mm256_loadu_pd(dp.add(i - period));
-        let d = _mm256_sub_pd(v_new, v_old);
-
-        let d_lo = _mm256_castpd256_pd128(d);
-        let d_hi = _mm256_extractf128_pd(d, 1);
-
-        let t_lo = _mm_unpacklo_pd(_mm_setzero_pd(), d_lo);
-        let p_lo = _mm_add_pd(d_lo, t_lo);
-
-        let t_hi = _mm_unpacklo_pd(_mm_setzero_pd(), d_hi);
-        let mut p_hi = _mm_add_pd(d_hi, t_hi);
-
-        let carry = _mm_permute_pd(p_lo, 0b11);
-        p_hi = _mm_add_pd(p_hi, carry);
-
-        let mut prefix = _mm256_castpd128_pd256(p_lo);
-        prefix = _mm256_insertf128_pd(prefix, p_hi, 1);
-
-        let sum_v = _mm256_set1_pd(sum);
-        let sums = _mm256_add_pd(sum_v, prefix);
-
-        let out_v = _mm256_mul_pd(sums, inv_v);
-        _mm256_storeu_pd(op.add(i), out_v);
-
-        let sums_hi = _mm256_extractf128_pd(sums, 1);
-        let last = _mm_unpackhi_pd(sums_hi, sums_hi);
-        sum = _mm_cvtsd_f64(last);
-
-        i += stride;
-    }
-
-    while i < end {
-        sum += *dp.add(i) - *dp.add(i - period);
-        *op.add(i) = sum.mul_add(inv, 0.0);
-        i += 1;
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline]
-pub fn sma_avx512(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    if period <= 32 {
-        unsafe { sma_avx512_short(data, period, first, out) }
-    } else {
-        unsafe { sma_avx512_long(data, period, first, out) }
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-#[inline]
-pub unsafe fn sma_avx512_short(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    sma_avx512_long(data, period, first, out);
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-#[inline]
-pub unsafe fn sma_avx512_long(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    use core::arch::x86_64::*;
-    debug_assert!(period >= 1);
-    debug_assert_eq!(data.len(), out.len());
-
-    let len = data.len();
-    let dp = data.as_ptr();
-    let op = out.as_mut_ptr();
-
-    if period == 1 {
-        let mut i = first;
-        while i < len {
-            *op.add(i) = *dp.add(i);
-            i += 1;
-        }
-        return;
-    }
-
-    let mut acc512 = _mm512_setzero_pd();
-    let mut k = 0usize;
-    let base = first;
-    let p8 = period & !7;
-
-    while k < p8 {
-        let v = _mm512_loadu_pd(dp.add(base + k));
-        acc512 = _mm512_add_pd(acc512, v);
-        k += 8;
-    }
-
-    let acc_lo256 = _mm512_castpd512_pd256(acc512);
-    let acc_hi256 = _mm512_extractf64x4_pd(acc512, 1);
-    let acc256 = _mm256_add_pd(acc_lo256, acc_hi256);
-
-    let hadd = _mm256_hadd_pd(acc256, acc256);
-    let lo = _mm256_castpd256_pd128(hadd);
-    let hi = _mm256_extractf128_pd(hadd, 1);
-    let sum128 = _mm_add_sd(lo, hi);
-    let mut sum = _mm_cvtsd_f64(sum128);
-
-    while k < period {
-        sum += *dp.add(base + k);
-        k += 1;
-    }
-
-    let inv = 1.0 / (period as f64);
-    let inv_v = _mm512_set1_pd(inv);
-    let warm = first + period - 1;
-    *op.add(warm) = sum.mul_add(inv, 0.0);
-
-    let idx_sl1 = _mm512_set_epi64(6, 5, 4, 3, 2, 1, 0, 0);
-
-    let idx_sl2 = _mm512_set_epi64(5, 4, 3, 2, 1, 0, 0, 0);
-
-    let idx_sl4 = _mm512_set_epi64(3, 2, 1, 0, 0, 0, 0, 0);
-
-    let mut i = warm + 1;
-    let end = len;
-
-    while i + 7 < end {
-        let v_new = _mm512_loadu_pd(dp.add(i));
-        let v_old = _mm512_loadu_pd(dp.add(i - period));
-        let d = _mm512_sub_pd(v_new, v_old);
-
-        let mut pref = d;
-        let sh1 = _mm512_maskz_permutexvar_pd(0b1111_1110, idx_sl1, pref);
-        pref = _mm512_add_pd(pref, sh1);
-
-        let sh2 = _mm512_maskz_permutexvar_pd(0b1111_1100, idx_sl2, pref);
-        pref = _mm512_add_pd(pref, sh2);
-
-        let sh4 = _mm512_maskz_permutexvar_pd(0b1111_0000, idx_sl4, pref);
-        pref = _mm512_add_pd(pref, sh4);
-
-        let sums = _mm512_add_pd(_mm512_set1_pd(sum), pref);
-
-        let out_v = _mm512_mul_pd(sums, inv_v);
-        _mm512_storeu_pd(op.add(i), out_v);
-
-        let sums_hi256 = _mm512_extractf64x4_pd(sums, 1);
-        let sums_hi128 = _mm256_extractf128_pd(sums_hi256, 1);
-        let last = _mm_unpackhi_pd(sums_hi128, sums_hi128);
-        sum = _mm_cvtsd_f64(last);
-
-        i += 8;
-    }
-
-    while i < end {
-        sum += *dp.add(i) - *dp.add(i - period);
-        *op.add(i) = sum.mul_add(inv, 0.0);
-        i += 1;
     }
 }
 
@@ -554,6 +357,7 @@ pub struct SmaStream {
     buffer: Vec<f64>,
     head: usize,
     sum: f64,
+    correction: f64,
     count: usize,
     inv: f64,
 
@@ -577,6 +381,7 @@ impl SmaStream {
             buffer: vec![0.0; period],
             head: 0,
             sum: 0.0,
+            correction: 0.0,
             count: 0,
             inv: (period as f64).recip(),
             use_mask,
@@ -598,13 +403,14 @@ impl SmaStream {
     pub fn update(&mut self, value: f64) -> Option<f64> {
         if self.period == 1 {
             self.sum = value;
+            self.correction = 0.0;
             self.buffer[0] = value;
             self.count = 1;
             return Some(value);
         }
 
         if self.count < self.period {
-            self.sum += value;
+            compensated_add(&mut self.sum, &mut self.correction, value);
             self.buffer[self.head] = value;
             self.advance_head();
             self.count += 1;
@@ -615,7 +421,8 @@ impl SmaStream {
         }
 
         let old = self.buffer[self.head];
-        self.sum += value - old;
+        compensated_add(&mut self.sum, &mut self.correction, -old);
+        compensated_add(&mut self.sum, &mut self.correction, value);
         self.buffer[self.head] = value;
         self.advance_head();
         Some(self.sum * self.inv)
@@ -846,85 +653,10 @@ fn sma_batch_inner(
 }
 
 #[inline(always)]
-unsafe fn sma_batch_row_prefixsum_scalar(
-    ps: &[f64],
-    period: usize,
-    mut i: usize,
-    cols: usize,
-    inv: f64,
-    dst: *mut f64,
-) {
-    while i < cols {
-        let s_hi = *ps.get_unchecked(i);
-        let s_lo = *ps.get_unchecked(i - period);
-        *dst.add(i) = (s_hi - s_lo) * inv;
-        i += 1;
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn sma_batch_row_prefixsum_avx2(
-    ps: &[f64],
-    period: usize,
-    mut i: usize,
-    cols: usize,
-    inv: f64,
-    dst: *mut f64,
-) {
-    use core::arch::x86_64::*;
-
-    let inv_v = _mm256_set1_pd(inv);
-    let ps_ptr = ps.as_ptr();
-    let lanes = 4usize;
-
-    while i + (lanes - 1) < cols {
-        let hi = _mm256_loadu_pd(ps_ptr.add(i));
-        let lo = _mm256_loadu_pd(ps_ptr.add(i - period));
-        let diff = _mm256_sub_pd(hi, lo);
-        let out_v = _mm256_mul_pd(diff, inv_v);
-        _mm256_storeu_pd(dst.add(i), out_v);
-        i += lanes;
-    }
-
-    sma_batch_row_prefixsum_scalar(ps, period, i, cols, inv, dst);
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-#[inline]
-unsafe fn sma_batch_row_prefixsum_avx512(
-    ps: &[f64],
-    period: usize,
-    mut i: usize,
-    cols: usize,
-    inv: f64,
-    dst: *mut f64,
-) {
-    use core::arch::x86_64::*;
-
-    let inv_v = _mm512_set1_pd(inv);
-    let ps_ptr = ps.as_ptr();
-    let lanes = 8usize;
-
-    while i + (lanes - 1) < cols {
-        let hi = _mm512_loadu_pd(ps_ptr.add(i));
-        let lo = _mm512_loadu_pd(ps_ptr.add(i - period));
-        let diff = _mm512_sub_pd(hi, lo);
-        let out_v = _mm512_mul_pd(diff, inv_v);
-        _mm512_storeu_pd(dst.add(i), out_v);
-        i += lanes;
-    }
-
-    sma_batch_row_prefixsum_scalar(ps, period, i, cols, inv, dst);
-}
-
-#[inline(always)]
 fn sma_batch_inner_into(
     data: &[f64],
     sweep: &SmaBatchRange,
-    kern: Kernel,
+    _kern: Kernel,
     parallel: bool,
     out: &mut [f64],
 ) -> Result<Vec<SmaParams>, SmaError> {
@@ -953,17 +685,6 @@ fn sma_batch_inner_into(
         step: sweep.period.2,
     })?;
 
-    let actual_kern = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
-    let actual_kern = match actual_kern {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        other => other,
-    };
-
     let out_uninit: &mut [MaybeUninit<f64>] = unsafe {
         core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
     };
@@ -974,46 +695,10 @@ fn sma_batch_inner_into(
         .collect();
     init_matrix_prefixes(out_uninit, cols, &warm);
 
-    let mut ps = vec![0.0_f64; cols];
-    if first < cols {
-        ps[first] = data[first];
-        for i in (first + 1)..cols {
-            ps[i] = ps[i - 1] + data[i];
-        }
-    }
-
     let do_row = |row: usize, dst_mu: &mut [MaybeUninit<f64>]| unsafe {
         let period = combos[row].period.unwrap();
-        let warm = first + period - 1;
-
         let dst = core::slice::from_raw_parts_mut(dst_mu.as_mut_ptr() as *mut f64, dst_mu.len());
-        if warm >= cols {
-            return;
-        }
-        let inv = (period as f64).recip();
-
-        let s_hi = *ps.get_unchecked(warm);
-        let s_lo = if warm >= period {
-            *ps.get_unchecked(warm - period)
-        } else {
-            0.0
-        };
-        dst[warm] = (s_hi - s_lo) * inv;
-
-        let mut i = warm + 1;
-        if i >= cols {
-            return;
-        }
-
-        let dst_ptr = dst.as_mut_ptr();
-        match actual_kern {
-            Kernel::Scalar => sma_batch_row_prefixsum_scalar(&ps, period, i, cols, inv, dst_ptr),
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 => sma_batch_row_prefixsum_avx2(&ps, period, i, cols, inv, dst_ptr),
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 => sma_batch_row_prefixsum_avx512(&ps, period, i, cols, inv, dst_ptr),
-            _ => sma_batch_row_prefixsum_scalar(&ps, period, i, cols, inv, dst_ptr),
-        }
+        sma_scalar(data, period, first, dst);
     };
 
     if parallel {
@@ -1033,39 +718,6 @@ fn sma_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[inline(always)]
-unsafe fn sma_row_scalar(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
-    sma_scalar(data, period, first, out);
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sma_row_avx2(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
-    sma_avx2(data, period, first, out);
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sma_row_avx512(data: &[f64], first: usize, period: usize, out: &mut [f64]) {
-    if period <= 32 {
-        sma_avx512_short(data, period, first, out);
-    } else {
-        sma_avx512_long(data, period, first, out);
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sma_row_avx512_short(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    sma_avx512_short(data, period, first, out);
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sma_row_avx512_long(data: &[f64], period: usize, first: usize, out: &mut [f64]) {
-    sma_avx512_long(data, period, first, out);
 }
 
 #[cfg(feature = "python")]
@@ -1652,6 +1304,7 @@ mod tests {
         }
         Ok(())
     }
+
     fn check_sma_partial_params(
         test_name: &str,
         kernel: Kernel,

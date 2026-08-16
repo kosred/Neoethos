@@ -275,8 +275,9 @@ pub enum F64Kernel {
     // eighteen ids already had kernels; five (stoch, macd, bollinger_bands,
     // keltner, supertrend) are multi-output and emit no CPU column at all, so
     // these three were the entire remainder of the REACHABLE sweep.
-    /// Single price series. Sequential. PERIOD-INVARIANT — the CPU dispatcher
-    /// reads `long_period`/`short_period` and never looks at `period`.
+    /// Single price series. Sequential. NeoEthos treats each requested period
+    /// as the named `long_period` anchor and scales `short_period` with the
+    /// documented/default 25:13 relation before comparing with the CPU row.
     Tsi,
     /// (close, volume). Sequential. PERIOD-INVARIANT — `compute_obv_batch`
     /// takes `|_params|`.
@@ -2082,17 +2083,15 @@ impl F64Kernel {
     /// swept `period` at all, so every row of the sweep is byte-identical.
     ///
     /// This is FAITHFUL, not a defect to be fixed here: `compute_obv_batch`
-    /// (cpu_batch.rs:3897) takes `|_params|`, `compute_tsi_batch`
-    /// (cpu_batch.rs:4708) reads `long_period`/`short_period` only, and
+    /// (cpu_batch.rs:3897) takes `|_params|`, while
     /// `vwap`/`medprice`/`wclprice` have no period parameter. The CPU emits
-    /// five identical columns for `[7,21,50,100,200]`, so the kernel must emit
-    /// five identical rows. Reported so telemetry can explain the redundant
-    /// work instead of leaving it to be discovered.
+    /// identical columns for those ids, so their kernels must emit identical
+    /// rows. TSI is deliberately absent: NeoEthos maps its sweep to the named
+    /// `long_period`/`short_period` pair before either lane runs.
     pub fn is_period_invariant(self) -> bool {
         matches!(
             self,
-            F64Kernel::Tsi
-                | F64Kernel::Adosc
+            F64Kernel::Adosc
                 // ------------------------------------ closer 5, round 3
                 // Seven of the nine. `Rsmk` reads a parameter literally named
                 // `period` (cpu_batch.rs:16479) and `CorrectedMovingAverage`
@@ -5398,6 +5397,19 @@ mod tests {
             before, 338,
             "F64Kernel::ALL has {before} entries. If a variant was added to the enum, add it here \
              too — otherwise entry_points_are_f64_and_unique silently stops covering it."
+        );
+    }
+
+    /// NeoEthos sweeps TSI by using the requested period as `long_period` and
+    /// scaling `short_period` with the documented 25:13 default ratio.  Calling
+    /// this row invariant makes the CUDA kernel discard that production
+    /// contract and compute the default 25/13 series for every requested row.
+    #[test]
+    fn tsi_coupled_window_is_not_period_invariant() {
+        assert!(
+            !F64Kernel::Tsi.is_period_invariant(),
+            "TSI must consume the requested long-period anchor; treating it as invariant makes \
+             CUDA disagree with the named long_period/short_period CPU request"
         );
     }
 

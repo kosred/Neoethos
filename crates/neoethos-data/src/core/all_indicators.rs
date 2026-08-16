@@ -1,3 +1,26 @@
+/// A vector-ta indicator that exists as a library API but is deliberately not
+/// eligible for NeoEthos feature generation, strategy search, or training.
+///
+/// Exclusions are static mathematical/capability decisions.  They must never
+/// depend on the current frame, otherwise two datasets could acquire different
+/// feature schemas.  Keep the evidence beside the id so a future replacement
+/// can remove the exclusion only after a new independent oracle is green.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionIndicatorExclusion {
+    pub id: &'static str,
+    pub reason: &'static str,
+    pub evidence: &'static str,
+}
+
+pub const PRODUCTION_INDICATOR_EXCLUSIONS: &[ProductionIndicatorExclusion] =
+    &[ProductionIndicatorExclusion {
+        id: "exponential_trend",
+        reason: "the published recurrence repeatedly multiplies its price-level anchor by a \
+                 factor tending to two, exceeds finite f64 on valid long inputs, and cannot \
+                 recover after the anchor becomes non-finite",
+        evidence: "TradingView CDb3oR6A source v1 (2025-04-18); real EURUSD M5 Vortex row 7475",
+    }];
+
 pub const ALL_INDICATORS: &[&str] = &[
     "absolute_strength_index_oscillator",
     "accumulation_swing_index",
@@ -103,7 +126,6 @@ pub const ALL_INDICATORS: &[&str] = &[
     "eri",
     "evasive_supertrend",
     "ewma_volatility",
-    "exponential_trend",
     "fibonacci_entry_bands",
     "fibonacci_trailing_stop",
     "fisher",

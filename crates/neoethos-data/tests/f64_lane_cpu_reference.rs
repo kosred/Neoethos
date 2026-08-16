@@ -30,11 +30,55 @@
 //! divergence is explained, because until then there is no single CPU answer to
 //! be in parity WITH.
 
+use vector_ta::indicators::damiani_volatmeter::{
+    DamianiVolatmeterBatchBuilder, DamianiVolatmeterInput, DamianiVolatmeterParams,
+    damiani_volatmeter_into_slice, damiani_volatmeter_with_kernel,
+};
 use vector_ta::indicators::dispatch::{
-    compute_cpu, IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV, ParamValue,
+    IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV, ParamValue, compute_cpu,
+};
+use vector_ta::indicators::moving_averages::sma::{
+    SmaBatchRange, SmaInput, SmaParams, SmaStream, sma_batch_with_kernel, sma_with_kernel,
 };
 use vector_ta::utilities::data_loader::Candles;
 use vector_ta::utilities::enums::Kernel;
+use vector_ta::utilities::helpers::alloc_with_nan_prefix;
+
+/// The original open-source Pine v6 implementation updates its anchor with
+/// this recurrence on every bar of a bullish segment:
+///
+/// `_initial := _initial * (1 + (1 - exp(-exp_rate * bars_elapsed)))`
+///
+/// Source (published 2025-04-18, MPL-2.0):
+/// https://www.tradingview.com/script/CDb3oR6A-Exponential-Trend-AlgoAlpha/
+///
+/// The multiplier tends to two, so a sufficiently long segment necessarily
+/// exceeds the finite f64 range.  The real 200,000-row EURUSD Vortex fixture
+/// reaches `+inf` at row 7,475 and never recovers because the crossover logic
+/// rejects a non-finite anchor.  Matching that value on CUDA would reproduce a
+/// defect, not establish mathematical truth.
+#[test]
+fn production_vocabulary_excludes_the_unbounded_exponential_trend_recurrence() {
+    let mut anchor = 1.0f64;
+    let exp_rate = 0.00003f64;
+    let first_non_finite = (0usize..20_000).find(|&bars_elapsed| {
+        let multiplier = 1.0 + (1.0 - (-exp_rate * bars_elapsed as f64).exp());
+        anchor *= multiplier;
+        !anchor.is_finite()
+    });
+
+    assert!(
+        first_non_finite.is_some(),
+        "the published recurrence fixture no longer demonstrates its finite-range defect; \
+         re-review the source before changing the production exclusion"
+    );
+    assert!(
+        !neoethos_data::core::all_indicators::ALL_INDICATORS.contains(&"exponential_trend"),
+        "exponential_trend is still in the production feature vocabulary even though its \
+         published recurrence exceeds f64 on finite input; do not clamp or treat CPU/CUDA \
+         agreement on +inf as correctness"
+    );
+}
 
 /// Every indicator THIS CRATE's f64 device lane can launch, plus the moving
 /// averages and volatility ids kept ahead of it.
@@ -88,7 +132,9 @@ const PERIODS: &[i64] = &[1, 7, 14, 21, 50, 100, 200];
 /// term is zero, and a wide range so true-range picks a different one of its
 /// three candidates from bar to bar.
 fn candles(n: usize) -> Candles {
-    let ts: Vec<i64> = (0..n as i64).map(|i| 1_600_000_000_000 + i * 300_000).collect();
+    let ts: Vec<i64> = (0..n as i64)
+        .map(|i| 1_600_000_000_000 + i * 300_000)
+        .collect();
     let (mut o, mut h, mut l, mut c, mut v) = (
         Vec::with_capacity(n),
         Vec::with_capacity(n),
@@ -177,6 +223,15 @@ fn compute(id: &str, cd: &Candles, period: i64, kernel: Kernel) -> Option<Vec<f6
         key: "period",
         value: ParamValue::Int(period),
     }];
+    compute_with_params(id, cd, &params, kernel)
+}
+
+fn compute_with_params(
+    id: &str,
+    cd: &Candles,
+    params: &[ParamKV],
+    kernel: Kernel,
+) -> Option<Vec<f64>> {
     let out = compute_cpu(IndicatorComputeRequest {
         indicator_id: id,
         output_id: None,
@@ -209,6 +264,311 @@ fn first_difference(a: &[f64], b: &[f64]) -> Option<(usize, f64, f64)> {
         }
     }
     None
+}
+
+/// Length of the leading run of NaN values.
+fn nan_prefix(values: &[f64]) -> usize {
+    values.iter().take_while(|value| value.is_nan()).count()
+}
+
+/// The SMA is the arithmetic mean of the current window. Its numerical error
+/// must therefore be bounded by the window, not by the total history processed
+/// before that window.
+///
+/// Every input below is exactly representable as `1 + ticks * 2^-52`, so the
+/// exact real-number window sum is `period + sum(ticks) * 2^-52`. Keeping the
+/// tick sum in `i64` gives this test an independent oracle that shares neither
+/// the production rolling recurrence nor its batch prefix sums. The 250k-bar
+/// run is deliberately long enough to expose both old defects: rolling error
+/// accumulated with history, while subtracting two large prefix sums lost low
+/// bits through cancellation.
+#[test]
+fn long_run_sma_stays_within_one_ulp_of_exact_window_mean() {
+    const LEN: usize = 250_000;
+    let ticks: Vec<i64> = (0..LEN)
+        .map(|i| {
+            let i = i as u64;
+            ((i * 17 + (i / 97) * 31 + ((i * i) >> 7)) % 257) as i64
+        })
+        .collect();
+    let data: Vec<f64> = ticks
+        .iter()
+        .map(|&tick| 1.0 + tick as f64 * f64::EPSILON)
+        .collect();
+
+    for period in [7usize, 21, 50, 100, 200] {
+        let input = SmaInput::from_slice(
+            &data,
+            SmaParams {
+                period: Some(period),
+            },
+        );
+        let scalar = sma_with_kernel(&input, Kernel::Scalar)
+            .expect("scalar SMA on exact-tick fixture")
+            .values;
+        let batch = sma_batch_with_kernel(
+            &data,
+            &SmaBatchRange {
+                period: (period, period, 0),
+            },
+            Kernel::ScalarBatch,
+        )
+        .expect("batch SMA on exact-tick fixture");
+        let batch = batch
+            .values_for(&SmaParams {
+                period: Some(period),
+            })
+            .expect("one requested batch row");
+        let mut stream = SmaStream::try_new(SmaParams {
+            period: Some(period),
+        })
+        .expect("stream SMA on exact-tick fixture");
+
+        let mut exact_tick_sum: i64 = ticks[..period].iter().sum();
+        for row in 0..LEN {
+            let streamed = stream.update(data[row]);
+            if row + 1 < period {
+                assert!(scalar[row].is_nan(), "scalar warmup at row {row}");
+                assert!(batch[row].is_nan(), "batch warmup at row {row}");
+                assert!(streamed.is_none(), "stream warmup at row {row}");
+                continue;
+            }
+            if row >= period {
+                exact_tick_sum += ticks[row] - ticks[row - period];
+            }
+            let expected = 1.0 + (exact_tick_sum as f64 / period as f64) * f64::EPSILON;
+            let streamed = streamed.expect("stream value after warmup");
+
+            for (lane, actual) in [
+                ("scalar", scalar[row]),
+                ("batch", batch[row]),
+                ("stream", streamed),
+            ] {
+                let ulps = actual.to_bits().abs_diff(expected.to_bits());
+                assert!(
+                    ulps <= 1,
+                    "SMA({period}) {lane} accumulated history-dependent error at row {row}: \
+                     actual={actual:.17e} expected={expected:.17e} ({ulps} ulp)"
+                );
+            }
+            assert_eq!(
+                scalar[row].to_bits(),
+                batch[row].to_bits(),
+                "SMA({period}) scalar and batch use different arithmetic at row {row}"
+            );
+            assert_eq!(
+                scalar[row].to_bits(),
+                streamed.to_bits(),
+                "SMA({period}) scalar and stream use different arithmetic at row {row}"
+            );
+        }
+    }
+}
+
+/// A caller-owned output slice is storage, not an implicit input to the
+/// indicator. Damiani's lag suppressor reads earlier `vol` cells, so every
+/// cell it can observe must be initialized by the implementation before the
+/// recurrence starts. This specifically catches the old
+/// `alloc_with_nan_prefix`/`into_slice` behaviour where the first lag reads
+/// whatever bytes happened to be in the destination tail.
+#[test]
+fn damiani_output_is_independent_of_destination_contents() {
+    let cd = candles(256);
+    let input = DamianiVolatmeterInput::from_slice(&cd.close, DamianiVolatmeterParams::default());
+
+    let mut zero_vol = vec![0.0; cd.close.len()];
+    let mut zero_anti = vec![0.0; cd.close.len()];
+    damiani_volatmeter_into_slice(&mut zero_vol, &mut zero_anti, &input, Kernel::Scalar)
+        .expect("Damiani scalar run with zero-filled destination");
+
+    let mut poisoned_vol = vec![12_345.25; cd.close.len()];
+    let mut poisoned_anti = vec![-98_765.5; cd.close.len()];
+    damiani_volatmeter_into_slice(
+        &mut poisoned_vol,
+        &mut poisoned_anti,
+        &input,
+        Kernel::Scalar,
+    )
+    .expect("Damiani scalar run with nonzero destination");
+
+    assert_eq!(
+        first_difference(&zero_vol, &poisoned_vol),
+        None,
+        "Damiani vol depends on bytes supplied by the caller instead of only on market input"
+    );
+    assert_eq!(
+        first_difference(&zero_anti, &poisoned_anti),
+        None,
+        "Damiani anti depends on bytes supplied by the caller instead of only on market input"
+    );
+}
+
+#[test]
+fn vector_ta_safe_output_allocator_initializes_every_element() {
+    let values = alloc_with_nan_prefix(16, 3);
+    assert_eq!(values.len(), 16);
+    assert!(
+        values.iter().all(|value| value.is_nan()),
+        "a safe Vec<f64> must not expose an uninitialized or poison tail; got {values:?}"
+    );
+}
+
+/// Independent, deliberately simple implementation of the published Damiani
+/// equations for a single price slice (`high == low == close`):
+///
+/// * LineP = ATR(vis) / ATR(sed) + (LineP[1] - LineP[3]) / 2
+/// * LineM = threshold - StdDev(vis) / StdDev(sed)
+///
+/// Formula sources:
+/// https://www.mql5.com/en/code/21700
+/// https://vectoralpha.dev/projects/ta/indicators/damiani_volatmeter/
+///
+/// This is intentionally O(n * window) and shares no production helper. It is
+/// a mathematical oracle for a tiny fixture, not an optimized implementation.
+fn published_damiani_reference(
+    prices: &[f64],
+    vis_atr: usize,
+    vis_std: usize,
+    sed_atr: usize,
+    sed_std: usize,
+    threshold: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = prices.len();
+    let needed = *[vis_atr, vis_std, sed_atr, sed_std, 3]
+        .iter()
+        .max()
+        .unwrap();
+
+    let mut tr = vec![0.0; n];
+    for i in 1..n {
+        tr[i] = (prices[i] - prices[i - 1]).abs();
+    }
+
+    fn wilder_atr(tr: &[f64], period: usize) -> Vec<f64> {
+        let mut out = vec![f64::NAN; tr.len()];
+        let mut seed = 0.0;
+        for (i, &value) in tr.iter().enumerate() {
+            if i < period {
+                seed += value;
+                if i + 1 == period {
+                    out[i] = seed / period as f64;
+                }
+            } else {
+                out[i] = ((period as f64 - 1.0) * out[i - 1] + value) / period as f64;
+            }
+        }
+        out
+    }
+
+    fn population_std(window: &[f64]) -> f64 {
+        let mean = window.iter().copied().sum::<f64>() / window.len() as f64;
+        let variance = window
+            .iter()
+            .map(|&x| {
+                let d = x - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / window.len() as f64;
+        variance.max(0.0).sqrt()
+    }
+
+    let atr_vis = wilder_atr(&tr, vis_atr);
+    let atr_sed = wilder_atr(&tr, sed_atr);
+    let mut vol = vec![f64::NAN; n];
+    let mut anti = vec![f64::NAN; n];
+
+    for i in needed..n {
+        let p1 = vol
+            .get(i.wrapping_sub(1))
+            .copied()
+            .filter(|x| x.is_finite())
+            .unwrap_or(0.0);
+        let p3 = vol
+            .get(i.wrapping_sub(3))
+            .copied()
+            .filter(|x| x.is_finite())
+            .unwrap_or(0.0);
+        let sed = if atr_sed[i] != 0.0 {
+            atr_sed[i]
+        } else {
+            atr_sed[i] + f64::EPSILON
+        };
+        vol[i] = atr_vis[i] / sed + 0.5 * (p1 - p3);
+
+        let std_vis = population_std(&prices[i + 1 - vis_std..=i]);
+        let std_sed = population_std(&prices[i + 1 - sed_std..=i]);
+        let std_sed_safe = if std_sed != 0.0 {
+            std_sed
+        } else {
+            std_sed + f64::EPSILON
+        };
+        anti[i] = threshold - std_vis / std_sed_safe;
+    }
+
+    (vol, anti)
+}
+
+#[test]
+fn damiani_matches_published_formula_and_batch_contract() {
+    let prices = [
+        100.0, 101.5, 100.25, 103.0, 102.0, 104.75, 106.0, 105.25, 108.5, 107.0, 109.75, 111.0,
+    ];
+    let params = DamianiVolatmeterParams {
+        vis_atr: Some(2),
+        vis_std: Some(3),
+        sed_atr: Some(4),
+        sed_std: Some(5),
+        threshold: Some(1.4),
+    };
+    let input = DamianiVolatmeterInput::from_slice(&prices, params.clone());
+    let actual = damiani_volatmeter_with_kernel(&input, Kernel::Scalar)
+        .expect("Damiani scalar formula fixture");
+    let (expected_vol, expected_anti) = published_damiani_reference(&prices, 2, 3, 4, 5, 1.4);
+
+    for i in 0..prices.len() {
+        assert_eq!(
+            actual.vol[i].is_nan(),
+            expected_vol[i].is_nan(),
+            "vol validity differs at {i}"
+        );
+        assert_eq!(
+            actual.anti[i].is_nan(),
+            expected_anti[i].is_nan(),
+            "anti validity differs at {i}"
+        );
+        if expected_vol[i].is_finite() {
+            assert!(
+                (actual.vol[i] - expected_vol[i]).abs() <= 1e-12,
+                "vol formula differs at {i}: actual={} expected={}",
+                actual.vol[i],
+                expected_vol[i]
+            );
+            assert!(
+                // The independent oracle uses a two-pass deviation sum while
+                // production maintains rolling sum/sum_sq state. Their
+                // algebra is identical but their f64 association is not.
+                (actual.anti[i] - expected_anti[i]).abs() <= 1e-10,
+                "anti formula differs at {i}: actual={} expected={}",
+                actual.anti[i],
+                expected_anti[i]
+            );
+        }
+    }
+
+    let batch = DamianiVolatmeterBatchBuilder::new()
+        .vis_atr_range(2, 2, 0)
+        .vis_std_range(3, 3, 0)
+        .sed_atr_range(4, 4, 0)
+        .sed_std_range(5, 5, 0)
+        .threshold_range(1.4, 1.4, 0.0)
+        .kernel(Kernel::ScalarBatch)
+        .apply_slice(&prices)
+        .expect("Damiani batch formula fixture");
+    let batch_vol = batch.vol_for(&params).expect("Damiani batch vol row");
+    let batch_anti = batch.anti_for(&params).expect("Damiani batch anti row");
+    assert_eq!(first_difference(&actual.vol, batch_vol), None);
+    assert_eq!(first_difference(&actual.anti, batch_anti), None);
 }
 
 /// Indicators whose kernel is written and compiled but which are deliberately
@@ -344,11 +704,6 @@ fn each_indicator_uses_the_first_valid_rule_its_table_row_declares() {
     let gapped = gapped_candles(3000);
     const PERIOD: i64 = 14;
 
-    /// Length of the leading run of NaN.
-    fn nan_prefix(v: &[f64]) -> usize {
-        v.iter().take_while(|x| x.is_nan()).count()
-    }
-
     /// What the gapped fixture must produce.
     enum Want {
         /// The warmup shifts by exactly this many bars, i.e. `first_valid`.
@@ -430,20 +785,19 @@ fn each_indicator_uses_the_first_valid_rule_its_table_row_declares() {
     );
 }
 
-/// Four of the claimed indicators ignore the swept `period` entirely, so their
+/// Three of the claimed indicators ignore the swept `period` entirely, so their
 /// kernels must emit identical rows for every period.
 ///
 /// That is faithful to the CPU, not a defect: `compute_obv_batch` takes
-/// `|_params|`, `compute_tsi_batch` reads `long_period`/`short_period` only,
-/// and `medprice`/`wclprice` have no period parameter — so `hpc_ta` already
-/// emits five byte-identical columns per frame for each of them. It is
+/// `|_params|`, and `medprice`/`wclprice` have no period parameter — so `hpc_ta`
+/// already emits five byte-identical columns per frame for each of them. It is
 /// surprising enough to pin here, so a future dispatcher change that STARTS
 /// honouring `period` for one of them fails this test instead of silently
 /// making the device lane wrong.
 #[test]
 fn period_invariant_indicators_really_are_period_invariant() {
     let cd = candles(2000);
-    for &id in &["tsi", "obv", "medprice", "wclprice"] {
+    for &id in &["obv", "medprice", "wclprice"] {
         let base = compute(id, &cd, 7, Kernel::Scalar)
             .unwrap_or_else(|| panic!("{id}: no series for period 7"));
         for &period in &[21i64, 50, 200] {
@@ -455,6 +809,44 @@ fn period_invariant_indicators_really_are_period_invariant() {
                  its kernel — which ignores periods[r] — is now wrong"
             );
         }
+    }
+}
+
+/// TSI has two independent named windows. NeoEthos' period sweep anchors the
+/// long window and scales the short one with the default 25:13 relation; a
+/// generic `period` parameter is not the production request. Pin the named
+/// tuples and their structural warmup so the old five-copies-of-25/13 path
+/// cannot return unnoticed.
+#[test]
+fn tsi_coupled_window_rows_are_distinct_and_have_named_warmups() {
+    let cd = candles(2000);
+    let cases = [(7i64, 4i64), (21, 11), (50, 26)];
+    let mut rows = Vec::new();
+    for &(long, short) in &cases {
+        let params = [
+            ParamKV {
+                key: "long_period",
+                value: ParamValue::Int(long),
+            },
+            ParamKV {
+                key: "short_period",
+                value: ParamValue::Int(short),
+            },
+        ];
+        let row = compute_with_params("tsi", &cd, &params, Kernel::Scalar)
+            .unwrap_or_else(|| panic!("TSI {long}/{short} did not produce a row"));
+        assert_eq!(
+            nan_prefix(&row),
+            (long + short) as usize,
+            "TSI {long}/{short} warmup must be first_valid + long + short"
+        );
+        rows.push(row);
+    }
+    for pair in rows.windows(2) {
+        assert!(
+            first_difference(&pair[0], &pair[1]).is_some(),
+            "two different named TSI window pairs produced byte-identical rows"
+        );
     }
 }
 

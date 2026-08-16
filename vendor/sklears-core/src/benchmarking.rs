@@ -1158,22 +1158,6 @@ impl CacheAnalyzer {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn read_perf_counters(&self) -> Result<CacheStats> {
-        // Linux perf_event_open implementation
-        // This would use the perf_event_open syscall to read hardware counters
-        Ok(CacheStats {
-            l1_hits: 0,
-            l1_misses: 0,
-            l2_hits: 0,
-            l2_misses: 0,
-            l3_hits: 0,
-            l3_misses: 0,
-            branch_mispredictions: 0,
-            tlb_misses: 0,
-        })
-    }
-
     #[cfg(target_arch = "aarch64")]
     fn read_arm_pmu_counters(&self) -> Result<CacheStats> {
         // ARM Performance Monitoring Unit implementation
@@ -1790,4 +1774,3 @@ pub struct CacheAnalysis {
     pub best_efficiency: f64,
     pub worst_efficiency: f64,
 }
-

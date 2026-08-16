@@ -101,36 +101,15 @@ macro_rules! skip_if_unsupported {
 }
 #[inline(always)]
 pub fn alloc_with_nan_prefix(len: usize, warm: usize) -> Vec<f64> {
-    use std::mem::{self, MaybeUninit};
-
-    let warm = warm.min(len);
-
-    let mut buf: Vec<MaybeUninit<f64>> = Vec::with_capacity(len);
-
-    #[cfg(not(debug_assertions))]
-    {
-        unsafe {
-            buf.set_len(len);
-        }
-        for i in 0..warm {
-            buf[i].write(f64::from_bits(0x7ff8_0000_0000_0000));
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        for _ in 0..warm {
-            buf.push(MaybeUninit::new(f64::from_bits(0x7ff8_0000_0000_0000)));
-        }
-        for _ in warm..len {
-            buf.push(MaybeUninit::new(f64::from_bits(0x11111111_11111111)));
-        }
-    }
-
-    let ptr = buf.as_mut_ptr() as *mut f64;
-    let cap = buf.capacity();
-    mem::forget(buf);
-    unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    // A `Vec<f64>` is a safe, initialized-value container. The former release
+    // implementation set its length while only initializing `[0, warm)`, then
+    // exposed the uninitialized tail as safe `f64` values. That is undefined
+    // behaviour, and recursive indicators such as Damiani demonstrably read
+    // those cells before overwriting them. Full NaN initialization is the only
+    // sound contract for this return type; callers remain free to overwrite
+    // the computable tail immediately.
+    let _ = warm;
+    vec![f64::NAN; len]
 }
 
 #[inline]

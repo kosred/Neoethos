@@ -2,10 +2,7 @@ use crate::utilities::data_loader::{source_type, Candles};
 #[cfg(all(feature = "python", feature = "cuda"))]
 use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
 use crate::utilities::enums::Kernel;
-use crate::utilities::helpers::{
-    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
-};
+use crate::utilities::helpers::{detect_best_batch_kernel, detect_best_kernel};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -386,8 +383,13 @@ pub fn damiani_volatmeter_with_kernel(
 
     let len = close.len();
     let warm_end = first + needed - 1;
-    let mut vol = alloc_with_nan_prefix(len, warm_end.min(len));
-    let mut anti = alloc_with_nan_prefix(len, warm_end.min(len));
+    // The lag suppressor reads `vol[i - 1]` and `vol[i - 3]`. Those cells can
+    // precede the first computed output, so the entire recurrence state must
+    // be initialized before the kernel starts. The former warm-prefix-only
+    // allocation left the tail uninitialized and made identical inputs depend
+    // on allocator contents in release builds.
+    let mut vol = vec![f64::NAN; len];
+    let mut anti = vec![f64::NAN; len];
 
     unsafe {
         match chosen {
@@ -444,6 +446,13 @@ pub fn damiani_volatmeter_into_slice(
             got: anti_dst.len(),
         });
     }
+
+    // Output storage is not an input. Damiani's lag recurrence observes
+    // earlier output cells before all of them have been produced, so erase
+    // every caller-provided byte and establish the same NaN -> zero-lag seed
+    // used by the allocating and CUDA paths.
+    vol_dst.fill(f64::NAN);
+    anti_dst.fill(f64::NAN);
 
     unsafe {
         match chosen {
@@ -1001,37 +1010,10 @@ fn damiani_volatmeter_batch_inner(
             step: 0,
         })?;
 
-    let mut vol_mu = make_uninit_matrix(rows, cols);
-    let mut anti_mu = make_uninit_matrix(rows, cols);
-
-    let warm_per_row: Vec<usize> = combos
-        .iter()
-        .map(|p| {
-            let needed = *[
-                p.vis_atr.unwrap(),
-                p.vis_std.unwrap(),
-                p.sed_atr.unwrap(),
-                p.sed_std.unwrap(),
-                3,
-            ]
-            .iter()
-            .max()
-            .unwrap();
-            first + needed - 1
-        })
-        .collect();
-
-    init_matrix_prefixes(&mut vol_mu, cols, &warm_per_row);
-    init_matrix_prefixes(&mut anti_mu, cols, &warm_per_row);
-
-    let mut vol_guard = core::mem::ManuallyDrop::new(vol_mu);
-    let mut anti_guard = core::mem::ManuallyDrop::new(anti_mu);
-    let vol: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(vol_guard.as_mut_ptr() as *mut f64, vol_guard.len())
-    };
-    let anti: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(anti_guard.as_mut_ptr() as *mut f64, anti_guard.len())
-    };
+    // Each row is recurrence state, not write-only output. Full initialization
+    // is required because the first computed values read earlier row cells.
+    let mut vol = vec![f64::NAN; _total];
+    let mut anti = vec![f64::NAN; _total];
 
     let do_row = |row: usize, out_vol: &mut [f64], out_anti: &mut [f64]| unsafe {
         let prm = &combos[row];
@@ -1125,22 +1107,6 @@ fn damiani_volatmeter_batch_inner(
         }
     }
 
-    let vol = unsafe {
-        Vec::from_raw_parts(
-            vol_guard.as_mut_ptr() as *mut f64,
-            vol_guard.len(),
-            vol_guard.capacity(),
-        )
-    };
-
-    let anti = unsafe {
-        Vec::from_raw_parts(
-            anti_guard.as_mut_ptr() as *mut f64,
-            anti_guard.len(),
-            anti_guard.capacity(),
-        )
-    };
-
     Ok(DamianiVolatmeterBatchOutput {
         vol,
         anti,
@@ -1215,6 +1181,12 @@ fn damiani_volatmeter_batch_inner_into(
 
     let do_row = |row: usize, out_vol: &mut [f64], out_anti: &mut [f64]| {
         let p = &combos[row];
+
+        // The caller may reuse arbitrary storage. Damiani reads its own prior
+        // output values, so establish a deterministic recurrence state per row
+        // before dispatching any scalar/SIMD implementation.
+        out_vol.fill(f64::NAN);
+        out_anti.fill(f64::NAN);
 
         let close = data;
         let high = data;
