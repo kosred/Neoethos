@@ -9,7 +9,14 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use neoethos_core::execution_budget::{
+    InstalledExecutionBudget, StartupEvent, StartupRuntimeKind, StartupTrace,
+    format_startup_diagnostics, parse_parent_cpu_assignment,
+};
 use serde::Serialize;
+
+const EMBEDDED_CONFIG_YAML: &[u8] = include_bytes!("../resources/config.yaml");
+const EMBEDDED_SYMBOL_METADATA_JSON: &[u8] = include_bytes!("../resources/symbol_metadata.json");
 
 mod broker;
 
@@ -123,50 +130,20 @@ mod backend {
             port.to_string(),
         );
 
-        // ── Config resolution + load happen HERE, synchronously, on the
-        // setup thread — BEFORE the server task spawns and before any dialog
-        // would be racing a window. Audit #125/#289: a config miss must stop
-        // the app, not silently become a different trading policy.
-        let config_path = super::RESOLVED_CONFIG_PATH.get().cloned().unwrap_or_else(|| {
-            // Unreachable in `run()` (prepare_data_root always records one),
-            // but a future caller must not silently inherit the CWD.
-            super::fatal_config_error(
-                "the data root was never established, so no config.yaml path exists",
-                "internal ordering error: backend::start() ran before prepare_data_root()",
-            )
-        });
-        eprintln!("config → {}", config_path.display());
-        // Same process-wide install the CLI/main.rs perform, now with the
-        // ABSOLUTE path so `/settings` GET+POST and `Settings::load` cannot
-        // diverge if anything later changes the working directory.
-        server::state::install_config_path(config_path.clone());
-        // F-005: say which env-var overrides are live before anything
-        // acts on them. The desktop shell reads the same env as the
-        // headless binary — NEOETHOS_USER_DATA_DIR in particular, which
-        // relocates the whole data root — so it needs the same line in
-        // its log.
-        neoethos_core::env_overrides::log_active_overrides_at_startup();
-        // Audit S05: install EVERY runtime override from settings, exactly
-        // as the headless main.rs does, via the one shared installer. The
-        // desktop previously installed NONE, so config.yaml runtime knobs
-        // (search population, hardware CPU budget, feature normalization,
-        // tree threads, app-server runtime) were silently ignored here.
-        //
-        // Audit #125: this was `.unwrap_or_else(|_| Settings::default())`.
-        // `Settings::default()` is NOT the shipped configuration — #289
-        // records that `ModelsConfig::default()` still encodes the
-        // pre-2026-06-06 posture and re-arms `require_walkforward_for_export`
-        // + `prop_firm_min_pass_rate`, i.e. it changes WHICH STRATEGIES MAY
-        // REACH LIVE. Swallowing the load error swapped the operator's
-        // trading policy for a different one without a word. It is now fatal.
-        let settings = match neoethos_core::Settings::from_yaml(&config_path) {
-            Ok(s) => s,
-            Err(e) => super::fatal_config_error(
-                &format!("could not load {}", config_path.display()),
-                &format!("{e:#}"),
-            ),
-        };
-        neoethos_app::install_runtime_overrides_from_settings(&settings);
+        // Config resolution, load, budget installation, and runtime override
+        // installation have already completed on the initial synchronous
+        // thread. Reloading here used to create a second policy boundary after
+        // Tauri had already initialized its async executor.
+        let config_path = super::RESOLVED_CONFIG_PATH
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                super::fatal_config_error(
+                    "the data root was never established, so no config.yaml path exists",
+                    "internal ordering error: backend::start() ran before desktop preflight",
+                )
+            });
+        eprintln!("preloaded config → {}", config_path.display());
 
         tauri::async_runtime::spawn(async move {
             let state = server::state::AppApiState::new();
@@ -540,9 +517,7 @@ fn resolve_data_root() -> PathBuf {
 ///      (via `neoethos_core::config::user_config_path()`).
 /// On first run it SEEDS config.yaml (+ default symbol costs) from the bundled
 /// read-only defaults, then chdirs to the root so every relative read resolves.
-fn prepare_data_root(app: &tauri::App) {
-    use tauri::Manager;
-
+fn prepare_data_root() -> Result<PathBuf, String> {
     // ONE reader for this override, and it is not here. `user_config_path()`
     // (which this function calls below) already resolves it through
     // `env_overrides::user_data_dir_override()`; this shell used to read the
@@ -559,7 +534,10 @@ fn prepare_data_root(app: &tauri::App) {
     if !overridden && std::path::Path::new("config.yaml").exists() {
         eprintln!("data root → current dir (config.yaml present)");
         record_config_path(PathBuf::from("config.yaml"));
-        return;
+        return RESOLVED_CONFIG_PATH
+            .get()
+            .cloned()
+            .ok_or_else(|| "failed to record current-directory config path".to_string());
     }
 
     // Installed launch with an arbitrary CWD (Start-Menu / Explorer shortcut
@@ -577,9 +555,11 @@ fn prepare_data_root(app: &tauri::App) {
             Ok(()) => {
                 eprintln!("data root → exe dir (config.yaml present): {}", dir.display());
                 record_config_path(dir.join("config.yaml"));
-                return;
+                return RESOLVED_CONFIG_PATH.get().cloned().ok_or_else(|| {
+                    "failed to record executable-directory config path".to_string()
+                });
             }
-            Err(e) => eprintln!("set working dir {} failed: {e}", dir.display()),
+            Err(e) => return Err(format!("set working dir {} failed: {e}", dir.display())),
         }
     }
 
@@ -589,9 +569,8 @@ fn prepare_data_root(app: &tauri::App) {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    if let Err(e) = std::fs::create_dir_all(&root) {
-        eprintln!("could not create data root {}: {e}", root.display());
-    }
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("could not create data root {}: {error}", root.display()))?;
 
     // First run: seed the editable config + default symbol costs from the
     // bundled read-only defaults so a fresh install works out of the box.
@@ -601,50 +580,48 @@ fn prepare_data_root(app: &tauri::App) {
     // failure arms now say plainly that the app will refuse to start, and
     // `backend::start` enforces it.
     if !cfg_path.exists() {
-        match app
-            .path()
-            .resolve("resources/config.yaml", tauri::path::BaseDirectory::Resource)
-        {
-            Ok(res) => match std::fs::copy(&res, &cfg_path) {
-                Ok(_) => eprintln!("seeded default config → {}", cfg_path.display()),
-                Err(e) => eprintln!(
-                    "seed config {} → {} FAILED: {e} — the app will refuse to start rather \
-                     than run on built-in defaults",
-                    res.display(),
-                    cfg_path.display()
-                ),
-            },
-            Err(e) => eprintln!(
-                "bundled resources/config.yaml could not be resolved: {e} — the app will \
-                 refuse to start rather than run on built-in defaults"
-            ),
-        }
-        let data = root.join("data");
-        let _ = std::fs::create_dir_all(&data);
-        if let Ok(res) = app
-            .path()
-            .resolve("resources/symbol_metadata.json", tauri::path::BaseDirectory::Resource)
-        {
-            let dst = data.join("symbol_metadata.json");
-            if !dst.exists() {
-                let _ = std::fs::copy(&res, &dst);
-            }
-        }
+        write_new_seed(&cfg_path, EMBEDDED_CONFIG_YAML)?;
+        eprintln!("seeded embedded default config → {}", cfg_path.display());
+    }
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).map_err(|error| {
+        format!(
+            "could not create seed data directory {}: {error}",
+            data.display()
+        )
+    })?;
+    let metadata_path = data.join("symbol_metadata.json");
+    if !metadata_path.exists() {
+        write_new_seed(&metadata_path, EMBEDDED_SYMBOL_METADATA_JSON)?;
     }
 
-    if let Err(e) = std::env::set_current_dir(&root) {
-        // Audit #125: this failure used to be survivable-looking. It is not —
-        // every relative read in the engine resolves against the CWD. The
-        // config path recorded below is ABSOLUTE, so the config half is now
-        // immune; the data half still depends on the chdir, so say so.
-        eprintln!(
-            "set working dir {} failed: {e} — relative data/cache/model paths will resolve \
-             against the process CWD instead",
+    std::env::set_current_dir(&root).map_err(|error| {
+        format!(
+            "set working dir {} failed: {error}; refusing to resolve data/cache/model paths \
+             against a different directory",
             root.display()
-        );
-    }
+        )
+    })?;
     record_config_path(cfg_path);
     eprintln!("data root → {}", root.display());
+    RESOLVED_CONFIG_PATH
+        .get()
+        .cloned()
+        .ok_or_else(|| "failed to record resolved config path".to_string())
+}
+
+fn write_new_seed(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create first-run seed {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("write first-run seed {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync first-run seed {}: {error}", path.display()))
 }
 
 #[derive(Serialize)]
@@ -833,16 +810,155 @@ fn warn_retired_env_vars() {
     }
 }
 
+struct DesktopRuntimeGuard {
+    runtime: tokio::runtime::Runtime,
+    worker_threads: usize,
+}
+
+impl DesktopRuntimeGuard {
+    fn build(worker_threads: usize) -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build managed desktop Tokio runtime: {error}"))?;
+        Ok(Self {
+            runtime,
+            worker_threads,
+        })
+    }
+
+    fn install_for_tauri(&self) {
+        // Tauri requires this call before `Builder` and documents that the
+        // underlying Tokio runtime must not be dropped while its global handle
+        // exists. `run` keeps this guard through the complete event loop.
+        tauri::async_runtime::set(self.runtime.handle().clone());
+    }
+}
+
+struct PreparedDesktopStartup {
+    runtime_guard: DesktopRuntimeGuard,
+    installed_budget: &'static InstalledExecutionBudget,
+    trace: StartupTrace,
+}
+
+fn prepare_desktop_startup(raw_args: &[String]) -> Result<PreparedDesktopStartup, String> {
+    let mut trace = StartupTrace::default();
+    warn_retired_env_vars();
+    let config_path = prepare_data_root()?;
+    trace
+        .record(StartupEvent::ConfigurationSeededOrLocated)
+        .map_err(|error| error.to_string())?;
+    let settings = neoethos_core::Settings::from_yaml(&config_path)
+        .map_err(|error| format!("load {}: {error:#}", config_path.display()))?;
+    trace
+        .record(StartupEvent::ConfigurationLoaded)
+        .map_err(|error| error.to_string())?;
+
+    let parent_cpu_assignment =
+        parse_parent_cpu_assignment(raw_args).map_err(|error| error.to_string())?;
+    trace
+        .record(StartupEvent::ParentCpuCapParsed)
+        .map_err(|error| error.to_string())?;
+    let coordination_scope = if parent_cpu_assignment.is_some() {
+        neoethos_core::execution_budget::CoordinationScope::ManagedProcessTree
+    } else {
+        neoethos_core::execution_budget::CoordinationScope::ProcessLocal
+    };
+    let budget_inputs = neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
+        &settings,
+        parent_cpu_assignment.map(|limit| limit.get()),
+        coordination_scope,
+    )
+    .map_err(|error| error.to_string())?;
+    budget_inputs
+        .clone()
+        .resolve()
+        .map_err(|error| error.to_string())?;
+    trace
+        .record(StartupEvent::CpuBudgetResolved)
+        .map_err(|error| error.to_string())?;
+    let installed_budget =
+        neoethos_core::execution_budget::install_process_budget(budget_inputs.request().clone())
+            .map_err(|error| error.to_string())?;
+    trace
+        .record(StartupEvent::CpuBudgetInstalled)
+        .map_err(|error| error.to_string())?;
+
+    neoethos_app::server::state::install_config_path(config_path);
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
+    neoethos_app::install_runtime_overrides_from_settings(&settings);
+    trace
+        .record(StartupEvent::RuntimeSettingsInstalled)
+        .map_err(|error| error.to_string())?;
+
+    let worker_threads = installed_budget.resolved().effective_worker_limit.get();
+    let runtime_guard = DesktopRuntimeGuard::build(worker_threads)?;
+    trace
+        .record(StartupEvent::TokioRuntimeBuilt)
+        .map_err(|error| error.to_string())?;
+    runtime_guard.install_for_tauri();
+    trace
+        .record(StartupEvent::TauriAsyncRuntimeInstalled)
+        .map_err(|error| error.to_string())?;
+
+    Ok(PreparedDesktopStartup {
+        runtime_guard,
+        installed_budget,
+        trace,
+    })
+}
+
+/// Perform the real preflight and runtime installation but stop before opening
+/// a window. The direct exit preserves Tauri's no-runtime-drop contract.
+pub fn startup_diagnostics() -> ! {
+    let raw_args: Vec<String> = std::env::args().collect();
+    match prepare_desktop_startup(&raw_args) {
+        Ok(startup) => {
+            eprintln!(
+                "{}",
+                format_startup_diagnostics(
+                    "neoethos-desktop",
+                    startup.installed_budget,
+                    StartupRuntimeKind::Tauri,
+                    Some(startup.runtime_guard.worker_threads),
+                    &startup.trace,
+                )
+            );
+            std::mem::forget(startup.runtime_guard);
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("desktop startup preflight failed: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let raw_args: Vec<String> = std::env::args().collect();
+    let mut startup = prepare_desktop_startup(&raw_args)
+        .unwrap_or_else(|error| fatal_config_error("desktop startup preflight failed", &error));
+    startup
+        .trace
+        .record(StartupEvent::ApplicationBuilderStarted)
+        .unwrap_or_else(|error| {
+            fatal_config_error("desktop startup order is invalid", &error.to_string())
+        });
+    eprintln!(
+        "{}",
+        format_startup_diagnostics(
+            "neoethos-desktop",
+            startup.installed_budget,
+            StartupRuntimeKind::Tauri,
+            Some(startup.runtime_guard.worker_threads),
+            &startup.trace,
+        )
+    );
+
+    let run_result = tauri::Builder::default()
         .setup(|app| {
-            // Before anything resolves a path: name every deleted env var that
-            // is still set. A stale export must not be able to mean nothing in
-            // silence.
-            warn_retired_env_vars();
-            // STANDARD per-user data root (no hardcoded paths) + first-run seed.
-            prepare_data_root(app);
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -930,6 +1046,10 @@ pub fn run() {
                 std::process::exit(0);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    // `tauri::async_runtime::set` owns a process-global handle. Keep its
+    // underlying runtime alive until process teardown, including error exit.
+    std::mem::forget(startup.runtime_guard);
+    run_result.expect("error while running tauri application");
 }

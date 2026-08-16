@@ -35,6 +35,10 @@ use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gossip::api::Event;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
+use neoethos_execution_budget::{
+    StartupEvent, StartupRuntimeKind, StartupTrace, detected_request_with_parent,
+    format_startup_diagnostics, install_process_budget, parse_parent_cpu_assignment,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -172,6 +176,7 @@ type Peers = Arc<Mutex<HashMap<EndpointId, PeerInfo>>>;
 struct Args {
     data_dir: PathBuf,
     app_url: String,
+    startup_diagnostics: bool,
 }
 
 fn resolve_app_url(explicit: Option<String>) -> String {
@@ -190,18 +195,37 @@ fn resolve_app_url(explicit: Option<String>) -> String {
     "http://127.0.0.1:7423".to_string()
 }
 
-fn parse_args() -> Args {
+fn parse_args(raw_args: &[String]) -> Result<Option<Args>> {
     let mut data_dir = PathBuf::from("mesh-data");
     let mut app_url_explicit: Option<String> = None;
-    let mut it = std::env::args().skip(1);
+    let mut startup_diagnostics = false;
+    let mut it = raw_args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--data-dir" => data_dir = it.next().map(PathBuf::from).unwrap_or(data_dir),
-            "--app-url" => app_url_explicit = it.next(),
+            "--data-dir" => {
+                data_dir = it
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--data-dir requires a path"))?;
+            }
+            "--app-url" => {
+                app_url_explicit = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--app-url requires a URL"))?
+                        .clone(),
+                );
+            }
+            "--cpu-threads" => {
+                it.next()
+                    .ok_or_else(|| anyhow::anyhow!("--cpu-threads requires a value"))?;
+            }
+            value if value.starts_with("--cpu-threads=") => {}
+            "--startup-diagnostics" => startup_diagnostics = true,
             "-h" | "--help" => {
                 eprintln!(
                     "neoethos-mesh — fully-automatic P2P work-distribution sidecar\n\n\
-                     USAGE:\n  neoethos-mesh [--data-dir <dir>] [--app-url <http://127.0.0.1:PORT>]\n\n\
+                     USAGE:\n  neoethos-mesh [--data-dir <dir>] [--app-url <http://127.0.0.1:PORT>] \
+                     [--cpu-threads <positive integer>] [--startup-diagnostics]\n\n\
                      --data-dir  where identity.key lives (default: ./mesh-data)\n\
                      --app-url   local NeoEthos app API. Auto-detected from the\n\
                                  desktop app's port file, else http://127.0.0.1:7423\n\n\
@@ -209,12 +233,16 @@ fn parse_args() -> Args {
                      Joins the swarm automatically; never touches the trading engine\n\
                      directly, only its HTTP API."
                 );
-                std::process::exit(0);
+                return Ok(None);
             }
-            other => eprintln!("(ignoring unknown arg: {other})"),
+            other => anyhow::bail!("unknown argument `{other}`"),
         }
     }
-    Args { data_dir, app_url: resolve_app_url(app_url_explicit) }
+    Ok(Some(Args {
+        data_dir,
+        app_url: resolve_app_url(app_url_explicit),
+        startup_diagnostics,
+    }))
 }
 
 // ── Identity ──────────────────────────────────────────────────────────────────
@@ -647,8 +675,20 @@ async fn run_one_job(
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let Some(args) = parse_args(&raw_args)? else {
+        return Ok(());
+    };
+    let mut startup_trace = StartupTrace::default();
+    let parent_cpu_assignment = parse_parent_cpu_assignment(&raw_args)?;
+    startup_trace.record(StartupEvent::ParentCpuCapParsed)?;
+    let request = detected_request_with_parent(parent_cpu_assignment);
+    neoethos_execution_budget::resolve_execution_budget(request.clone())?;
+    startup_trace.record(StartupEvent::CpuBudgetResolved)?;
+    let installed = install_process_budget(request)?;
+    startup_trace.record(StartupEvent::CpuBudgetInstalled)?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -656,7 +696,45 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args();
+    let runtime_workers = installed.resolved().effective_worker_limit.get();
+    let managed_runtime = build_managed_runtime(runtime_workers)?;
+    startup_trace.record(StartupEvent::TokioRuntimeBuilt)?;
+    if args.startup_diagnostics {
+        eprintln!(
+            "{}",
+            format_startup_diagnostics(
+                "neoethos-mesh",
+                installed,
+                StartupRuntimeKind::Tokio,
+                Some(runtime_workers),
+                &startup_trace,
+            )
+        );
+        return Ok(());
+    }
+    startup_trace.record(StartupEvent::ApplicationBuilderStarted)?;
+    tracing::info!(
+        target: "neoethos_mesh::startup",
+        "{}",
+        format_startup_diagnostics(
+            "neoethos-mesh",
+            installed,
+            StartupRuntimeKind::Tokio,
+            Some(runtime_workers),
+            &startup_trace,
+        )
+    );
+    managed_runtime.block_on(async_main(args))
+}
+
+fn build_managed_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+}
+
+async fn async_main(args: Args) -> Result<()> {
     tracing::info!(app = %args.app_url, "NeoEthos Mesh — automatic P2P work distribution");
 
     let secret_key = load_or_create_secret(&args.data_dir)?;

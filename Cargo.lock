@@ -7266,6 +7266,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
+ "tokio",
 ]
 
 [[package]]
@@ -7294,6 +7295,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "neoethos-execution-budget",
  "reqwest 0.13.4",
  "rmcp",
  "schemars 1.2.1",

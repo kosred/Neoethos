@@ -12,6 +12,10 @@ use neoethos_app::{app_services, app_state, server};
 use app_state::AppRuntimeConfig;
 use clap::Parser;
 use neoethos_core::Settings;
+use neoethos_core::execution_budget::{
+    StartupEvent, StartupRuntimeKind, StartupTrace, format_startup_diagnostics,
+    parse_parent_cpu_assignment, startup_diagnostics_requested,
+};
 use neoethos_core::logging::{
     setup_logging, show_double_click_help_dialog_if_orphaned, write_subsystem_record,
 };
@@ -165,24 +169,21 @@ struct Args {
     /// `data/symbol_metadata.json`. No network I/O. ~1 s.
     #[arg(long, default_value_t = false)]
     rebuild_symbol_metadata: bool,
+
+    /// Internal parent-to-child CPU assignment. The value only narrows the
+    /// automatic effective-logical-threads-minus-two process budget.
+    #[arg(long, value_name = "POSITIVE_INTEGER")]
+    cpu_threads: Option<String>,
+
+    /// Resolve and install startup policy, build the managed Tokio runtime,
+    /// print one structured diagnostic line to stderr, then exit.
+    #[arg(long, default_value_t = false)]
+    startup_diagnostics: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    setup_logging(true)?;
-    // Say out loud what the environment is changing underneath this run.
-    // Built 2026-05-25 with the sole purpose of making silent overrides
-    // visible — and called by nothing until 2026-08-02, so the visibility
-    // mechanism was itself invisible. 215 NEOETHOS_* names can redirect a
-    // run; this makes them show up in the log, which is the precondition for
-    // retiring them in favour of the single config. Observability only.
-    //
-    // (Two independent fixes added this call in two spots and the merge kept
-    // both — each run logged every override twice. One call now.)
-    neoethos_core::env_overrides::log_active_overrides_at_startup();
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let args = Args::parse_from(&raw_args);
     // #101 follow-up + #179: the help dialog must fire BEFORE the
     // config-load step below, otherwise an orphaned double-click whose
     // CWD lacks `config.yaml` exits silently with `windows_subsystem =
@@ -196,6 +197,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // was at runtime — nothing set either signal after Flutter died 2026-06-22.
     show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
 
+    let settings = Settings::from_yaml(&args.config)?;
+    let mut startup_trace = StartupTrace::default();
+    startup_trace.record(StartupEvent::ConfigurationLoaded)?;
+
+    let parent_cpu_assignment = parse_parent_cpu_assignment(&raw_args)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    startup_trace.record(StartupEvent::ParentCpuCapParsed)?;
+    let coordination_scope = if parent_cpu_assignment.is_some() {
+        neoethos_core::execution_budget::CoordinationScope::ManagedProcessTree
+    } else {
+        neoethos_core::execution_budget::CoordinationScope::ProcessLocal
+    };
+    let budget_inputs = neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
+        &settings,
+        parent_cpu_assignment.map(|limit| limit.get()),
+        coordination_scope,
+    )?;
+    budget_inputs.clone().resolve()?;
+    startup_trace.record(StartupEvent::CpuBudgetResolved)?;
+    let installed =
+        neoethos_core::execution_budget::install_process_budget(budget_inputs.request().clone())?;
+    startup_trace.record(StartupEvent::CpuBudgetInstalled)?;
+
+    // Logging and environment diagnostics may initialize process-global
+    // state, so they run only after the immutable CPU budget is installed.
+    setup_logging(true)?;
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
+
+    // Config-consolidation (audit S05): every runtime override comes from the
+    // single config via ONE shared installer, before any executor can observe
+    // a default or initialize a dependency-owned worker pool.
+    neoethos_app::install_runtime_overrides_from_settings(&settings);
+    startup_trace.record(StartupEvent::RuntimeSettingsInstalled)?;
+
+    let runtime_workers = installed.resolved().effective_worker_limit.get();
+    let managed_runtime = build_managed_runtime(runtime_workers)?;
+    startup_trace.record(StartupEvent::TokioRuntimeBuilt)?;
+    let startup_diagnostics = startup_diagnostics_requested(&raw_args);
+    debug_assert_eq!(startup_diagnostics, args.startup_diagnostics);
+    debug_assert_eq!(args.cpu_threads.is_some(), parent_cpu_assignment.is_some());
+    if startup_diagnostics {
+        eprintln!(
+            "{}",
+            format_startup_diagnostics(
+                "neoethos-app",
+                installed,
+                StartupRuntimeKind::Tokio,
+                Some(runtime_workers),
+                &startup_trace,
+            )
+        );
+        return Ok(());
+    }
+
+    startup_trace.record(StartupEvent::ApplicationBuilderStarted)?;
+    info!(
+        target: "neoethos_app::startup",
+        "{}",
+        format_startup_diagnostics(
+            "neoethos-app",
+            installed,
+            StartupRuntimeKind::Tokio,
+            Some(runtime_workers),
+            &startup_trace,
+        )
+    );
+    managed_runtime.block_on(async_main(args, settings))
+}
+
+fn build_managed_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+}
+
+async fn async_main(args: Args, settings: Settings) -> Result<(), Box<dyn std::error::Error>> {
     // Tie this backend's lifetime to the GUI that spawned it (#179 follow-up).
     // A detached spawn would otherwise linger as a windowless orphan holding
     // port 7423 — which makes the NEXT app launch see a live backend and
@@ -205,11 +283,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn_parent_watchdog(parent_pid);
     }
 
-    let settings = Settings::from_yaml(&args.config)?;
-    // Config-consolidation (audit S05): every runtime override comes from the
-    // single config via ONE shared installer, so the headless binary and the
-    // Tauri desktop shell resolve identical engine state.
-    neoethos_app::install_runtime_overrides_from_settings(&settings);
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
         args.local,

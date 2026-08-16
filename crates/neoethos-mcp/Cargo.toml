@@ -40,6 +40,7 @@ name = "neoethos_mcp"
 path = "src/lib.rs"
 
 [dependencies]
+neoethos-execution-budget.workspace = true
 # Official Model Context Protocol SDK, server role, stdio transport.
 # Pinned EXACTLY: rmcp 3.x moved 3.0.0 -> 3.1.2 in ten days; upgrades are
 # deliberate, not drive-by (design §1.1). MCP spec 2026-07-28 — the same

@@ -2053,8 +2053,9 @@ const MAP_VALUED_FIELDS: &[&str] = &[
 
 #[test]
 fn the_bundled_seed_config_declares_nothing_settings_would_drop() {
-    // `desktop/src-tauri/resources/config.yaml` is what the installer copies
-    // into the user data dir on first run. `Settings` does NOT derive
+    // `desktop/src-tauri/resources/config.yaml` is embedded in the desktop
+    // binary and written into the user data dir on first run. `Settings` does
+    // NOT derive
     // `deny_unknown_fields`, so a key here that no longer exists on the struct
     // is read, ignored, and never mentioned — a shipped default with no final
     // recipient, seeded onto every fresh install.

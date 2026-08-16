@@ -2,5 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-  app_lib::run();
+    if std::env::args().any(|argument| argument == "--startup-diagnostics") {
+        app_lib::startup_diagnostics();
+    }
+    app_lib::run();
 }

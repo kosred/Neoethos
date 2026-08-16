@@ -13,15 +13,15 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use neoethos_execution_budget::{
+    StartupEvent, StartupRuntimeKind, StartupTrace, detected_request_with_parent,
+    format_startup_diagnostics, install_process_budget, parse_parent_cpu_assignment,
+};
 use neoethos_mcp::{AppState, Config, router};
 
-fn config_path() -> PathBuf {
-    std::env::args()
-        .skip(1)
-        .zip(std::env::args().skip(2))
-        .find(|(f, _)| f == "--config")
-        .map(|(_, v)| PathBuf::from(v))
-        .unwrap_or_else(|| PathBuf::from("mcp_servers.json"))
+struct Args {
+    config_path: PathBuf,
+    startup_diagnostics: bool,
 }
 
 async fn serve_api(state: AppState, port: u16) -> Result<()> {
@@ -55,29 +55,64 @@ async fn serve_api(state: AppState, port: u16) -> Result<()> {
         .context("serve")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let Some(args) = parse_args(&raw_args)? else {
+        return Ok(());
+    };
+    let (cfg, config_warning) = load_config(&args.config_path)?;
+    let mut startup_trace = StartupTrace::default();
+    startup_trace.record(StartupEvent::ConfigurationLoaded)?;
+    let parent_cpu_assignment = parse_parent_cpu_assignment(&raw_args)?;
+    startup_trace.record(StartupEvent::ParentCpuCapParsed)?;
+    let request = detected_request_with_parent(parent_cpu_assignment);
+    neoethos_execution_budget::resolve_execution_budget(request.clone())?;
+    startup_trace.record(StartupEvent::CpuBudgetResolved)?;
+    let installed = install_process_budget(request)?;
+    startup_trace.record(StartupEvent::CpuBudgetInstalled)?;
+
     let env_filter = if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::EnvFilter::try_from_default_env().context("parse RUST_LOG")?
     } else {
         tracing_subscriber::EnvFilter::new("neoethos_mcp=info,rmcp=warn")
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    if let Some(warning) = config_warning {
+        tracing::warn!("{warning}");
+    }
 
-    let path = config_path();
-    let cfg: Config = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).context("parse mcp config")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!("no MCP config at {} — starting with no servers", path.display());
-            Config::default()
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("read MCP config {}", path.display()));
-        }
-    };
+    let runtime_workers = installed.resolved().effective_worker_limit.get();
+    let managed_runtime = build_managed_runtime(runtime_workers)?;
+    startup_trace.record(StartupEvent::TokioRuntimeBuilt)?;
+    if args.startup_diagnostics {
+        eprintln!(
+            "{}",
+            format_startup_diagnostics(
+                "neoethos-mcp",
+                installed,
+                StartupRuntimeKind::Tokio,
+                Some(runtime_workers),
+                &startup_trace,
+            )
+        );
+        return Ok(());
+    }
+    startup_trace.record(StartupEvent::ApplicationBuilderStarted)?;
+    tracing::info!(
+        target: "neoethos_mcp::startup",
+        "{}",
+        format_startup_diagnostics(
+            "neoethos-mcp",
+            installed,
+            StartupRuntimeKind::Tokio,
+            Some(runtime_workers),
+            &startup_trace,
+        )
+    );
+    managed_runtime.block_on(async_main(cfg))
+}
 
+async fn async_main(cfg: Config) -> Result<()> {
     let state = AppState::connect_configured(&cfg.servers).await;
     let port = cfg.port.unwrap_or(7431);
     let serve_result = serve_api(state.clone(), port).await;
@@ -85,4 +120,66 @@ async fn main() -> Result<()> {
 
     serve_result?;
     shutdown_result.context("shut down MCP services")
+}
+
+fn build_managed_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+}
+
+fn load_config(path: &PathBuf) -> Result<(Config, Option<String>)> {
+    match std::fs::read_to_string(path) {
+        Ok(serialized) => Ok((
+            serde_json::from_str(&serialized).context("parse mcp config")?,
+            None,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((
+            Config::default(),
+            Some(format!(
+                "no MCP config at {} — starting with no servers",
+                path.display()
+            )),
+        )),
+        Err(error) => Err(error).with_context(|| format!("read MCP config {}", path.display())),
+    }
+}
+
+fn parse_args(raw_args: &[String]) -> Result<Option<Args>> {
+    let mut config_path = PathBuf::from("mcp_servers.json");
+    let mut startup_diagnostics = false;
+    let mut index = 1;
+    while index < raw_args.len() {
+        match raw_args[index].as_str() {
+            "--config" => {
+                index += 1;
+                config_path = raw_args
+                    .get(index)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
+            }
+            "--cpu-threads" => {
+                index += 1;
+                raw_args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--cpu-threads requires a value"))?;
+            }
+            value if value.starts_with("--cpu-threads=") => {}
+            "--startup-diagnostics" => startup_diagnostics = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "neoethos-mcp [--config <path>] [--cpu-threads <positive integer>] \
+                     [--startup-diagnostics]"
+                );
+                return Ok(None);
+            }
+            unknown => anyhow::bail!("unknown argument `{unknown}`"),
+        }
+        index += 1;
+    }
+    Ok(Some(Args {
+        config_path,
+        startup_diagnostics,
+    }))
 }

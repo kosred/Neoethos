@@ -1,4 +1,8 @@
 use anyhow::{Context, Result};
+use neoethos_core::execution_budget::{
+    StartupEvent, StartupRuntimeKind, StartupTrace, format_startup_diagnostics,
+    parse_parent_cpu_assignment, startup_diagnostics_requested,
+};
 use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,18 +14,6 @@ mod gpu_bench_snapshot;
 mod tui;
 
 fn main() -> Result<()> {
-    setup_logging(false)?;
-    // Say out loud what the environment is changing underneath this run.
-    //
-    // This function was written for exactly this call and had ZERO callers — its
-    // own doc says "Designed to be called once in the binary's main() after
-    // setup_logging". Meanwhile the workspace carries 215 distinct NEOETHOS_*
-    // names across 183 `env::var` sites, and an env var that silently alters a
-    // run is how `apply_mode_overrides`, the search runtime overrides and the
-    // OOS holdout each spent months meaning something weaker than they claimed.
-    // Nothing here changes behaviour; it makes the behaviour visible, which is
-    // the precondition for retiring these in favour of the single config.
-    neoethos_core::env_overrides::log_active_overrides_at_startup();
     // Config-consolidation: search runtime overrides come from the single
     // config (canonical user config.yaml), not the environment. (S2a:
     // genetic search; rest staged.)
@@ -96,6 +88,8 @@ fn main() -> Result<()> {
             neoethos_core::Settings::default()
         }
     };
+    let mut startup_trace = StartupTrace::default();
+    startup_trace.record(StartupEvent::ConfigurationLoaded)?;
     // CPU budget for THIS process — an internal parent→child handoff, not an
     // operator knob.
     //
@@ -109,17 +103,8 @@ fn main() -> Result<()> {
     //
     // It is now `--cpu-threads`: visible in the process list, scoped to the
     // one invocation it was written for, and FATAL when malformed.
-    let process_cpu_assignment = match parse_flag(&raw_args, "--cpu-threads") {
-        None => None,
-        Some(raw) => match raw.trim().parse::<usize>() {
-            Ok(v) if v > 0 => Some(v),
-            _ => anyhow::bail!(
-                "--cpu-threads expects a positive integer, got `{raw}`. This flag is set by \
-                 the schedule orchestrator on the children it spawns; there is no reason to \
-                 pass it by hand. Refusing to run rather than guess a core budget."
-            ),
-        },
-    };
+    let process_cpu_assignment = parse_parent_cpu_assignment(&raw_args)?;
+    startup_trace.record(StartupEvent::ParentCpuCapParsed)?;
     warn_retired_env_vars();
     let coordination_scope = if process_cpu_assignment.is_some() {
         neoethos_core::execution_budget::CoordinationScope::ManagedProcessTree
@@ -128,12 +113,19 @@ fn main() -> Result<()> {
     };
     let execution_budget_inputs = neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
         &startup_settings,
-        process_cpu_assignment,
+        process_cpu_assignment.map(|limit| limit.get()),
         coordination_scope,
     )?;
-    neoethos_core::execution_budget::install_process_budget(
+    execution_budget_inputs.clone().resolve()?;
+    startup_trace.record(StartupEvent::CpuBudgetResolved)?;
+    let installed = neoethos_core::execution_budget::install_process_budget(
         execution_budget_inputs.request().clone(),
     )?;
+    startup_trace.record(StartupEvent::CpuBudgetInstalled)?;
+    // Logging and environment diagnostics may initialize process-global
+    // state, so they run only after the immutable CPU budget is installed.
+    setup_logging(false)?;
+    neoethos_core::env_overrides::log_active_overrides_at_startup();
     neoethos_search::install_search_runtime_overrides_from_settings(&startup_settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(&startup_settings);
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(
@@ -148,6 +140,20 @@ fn main() -> Result<()> {
             .data_runtime
             .rebuild_stale_higher_tfs,
     );
+    startup_trace.record(StartupEvent::RuntimeSettingsInstalled)?;
+    if startup_diagnostics_requested(&raw_args) {
+        eprintln!(
+            "{}",
+            format_startup_diagnostics(
+                "neoethos-cli",
+                installed,
+                StartupRuntimeKind::Synchronous,
+                None,
+                &startup_trace,
+            )
+        );
+        return Ok(());
+    }
     // Same vector the config-load guard above already collected.
     let args: Vec<String> = raw_args;
     if args.len() < 2 {
@@ -3424,6 +3430,7 @@ fn maybe_blank(s: &str) -> &str {
 
 fn print_help() {
     println!("neoethos-cli");
+    println!("  [--cpu-threads N] [--startup-diagnostics]");
     println!("  symbols --root data");
     println!("  timeframes --symbol EURUSD --root data");
     println!("  load --symbol EURUSD --timeframe M1 --root data");

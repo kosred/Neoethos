@@ -165,6 +165,233 @@ pub enum CoordinationScope {
     ManagedProcessTree,
 }
 
+impl CoordinationScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessLocal => "process_local",
+            Self::ManagedProcessTree => "managed_process_tree",
+        }
+    }
+}
+
+pub const CPU_THREADS_FLAG: &str = "--cpu-threads";
+pub const STARTUP_DIAGNOSTICS_FLAG: &str = "--startup-diagnostics";
+
+/// Parse the ephemeral parent-to-child CPU assignment before any async
+/// runtime exists. The parser is intentionally shared by every executable so
+/// zero, malformed, inline, missing, and duplicate values cannot acquire
+/// subtly different meanings at different process boundaries.
+pub fn parse_parent_cpu_assignment(
+    args: &[String],
+) -> Result<Option<WorkerLimit>, ParentCpuAssignmentError> {
+    let mut parsed = None;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        let raw = if arg == CPU_THREADS_FLAG {
+            index += 1;
+            args.get(index)
+                .ok_or(ParentCpuAssignmentError::MissingValue)?
+                .as_str()
+        } else if let Some(raw) = arg.strip_prefix("--cpu-threads=") {
+            raw
+        } else {
+            index += 1;
+            continue;
+        };
+
+        if parsed.is_some() {
+            return Err(ParentCpuAssignmentError::Duplicate);
+        }
+        let value = raw
+            .parse::<usize>()
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| ParentCpuAssignmentError::InvalidValue(raw.to_string()))?;
+        parsed = Some(WorkerLimit(value));
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+pub fn startup_diagnostics_requested(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == STARTUP_DIAGNOSTICS_FLAG)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParentCpuAssignmentError {
+    MissingValue,
+    InvalidValue(String),
+    Duplicate,
+}
+
+impl fmt::Display for ParentCpuAssignmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue => {
+                write!(f, "{CPU_THREADS_FLAG} requires one positive integer value")
+            }
+            Self::InvalidValue(value) => write!(
+                f,
+                "{CPU_THREADS_FLAG} expects a positive integer, got `{value}`"
+            ),
+            Self::Duplicate => write!(f, "{CPU_THREADS_FLAG} may be supplied only once"),
+        }
+    }
+}
+
+impl Error for ParentCpuAssignmentError {}
+
+/// Construct the zero-config request used by isolated sidecars. A parent cap
+/// always changes the coordination scope and is re-clamped against the
+/// child's own effective process capacity by the normal resolver.
+pub fn detected_request_with_parent(parent: Option<WorkerLimit>) -> ExecutionBudgetRequest {
+    let coordination_scope = if parent.is_some() {
+        CoordinationScope::ManagedProcessTree
+    } else {
+        CoordinationScope::ProcessLocal
+    };
+    let mut request = ExecutionBudgetRequest::detect(coordination_scope);
+    request.parent_limit = parent.map(BudgetCap::parent);
+    request
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StartupEvent {
+    ConfigurationSeededOrLocated,
+    ConfigurationLoaded,
+    ParentCpuCapParsed,
+    CpuBudgetResolved,
+    CpuBudgetInstalled,
+    ImportSignalPreflightCompleted,
+    RuntimeSettingsInstalled,
+    TokioRuntimeBuilt,
+    TauriAsyncRuntimeInstalled,
+    ApplicationBuilderStarted,
+}
+
+impl StartupEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigurationSeededOrLocated => "configuration_seeded_or_located",
+            Self::ConfigurationLoaded => "configuration_loaded",
+            Self::ParentCpuCapParsed => "parent_cpu_cap_parsed",
+            Self::CpuBudgetResolved => "cpu_budget_resolved",
+            Self::CpuBudgetInstalled => "cpu_budget_installed",
+            Self::ImportSignalPreflightCompleted => "import_signal_preflight_completed",
+            Self::RuntimeSettingsInstalled => "runtime_settings_installed",
+            Self::TokioRuntimeBuilt => "tokio_runtime_built",
+            Self::TauriAsyncRuntimeInstalled => "tauri_async_runtime_installed",
+            Self::ApplicationBuilderStarted => "application_builder_started",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartupTrace {
+    events: Vec<StartupEvent>,
+}
+
+impl StartupTrace {
+    pub fn record(&mut self, event: StartupEvent) -> Result<(), StartupOrderError> {
+        if let Some(previous) = self.events.last().copied()
+            && event <= previous
+        {
+            return Err(StartupOrderError {
+                previous,
+                next: event,
+            });
+        }
+        self.events.push(event);
+        Ok(())
+    }
+
+    pub fn events(&self) -> &[StartupEvent] {
+        &self.events
+    }
+
+    fn csv(&self) -> String {
+        self.events
+            .iter()
+            .map(|event| event.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartupOrderError {
+    pub previous: StartupEvent,
+    pub next: StartupEvent,
+}
+
+impl fmt::Display for StartupOrderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "startup event `{}` cannot follow `{}`",
+            self.next.as_str(),
+            self.previous.as_str()
+        )
+    }
+}
+
+impl Error for StartupOrderError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupRuntimeKind {
+    Synchronous,
+    Tokio,
+    Tauri,
+}
+
+impl StartupRuntimeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Synchronous => "synchronous",
+            Self::Tokio => "tokio",
+            Self::Tauri => "tauri",
+        }
+    }
+}
+
+/// Stable, one-line startup evidence suitable for stderr (including stdio MCP
+/// processes whose stdout must remain JSON-RPC clean).
+pub fn format_startup_diagnostics(
+    executable: &str,
+    installed: &InstalledExecutionBudget,
+    runtime_kind: StartupRuntimeKind,
+    runtime_worker_threads: Option<usize>,
+    trace: &StartupTrace,
+) -> String {
+    let resolved = installed.resolved();
+    let capacity_source = match resolved.capacity_source {
+        CapacityDetectionSource::AvailableParallelism => "available_parallelism",
+        CapacityDetectionSource::SuppliedForResolution => "supplied_for_resolution",
+        CapacityDetectionSource::FallbackOneAfterDetectionFailure => {
+            "fallback_one_after_detection_failure"
+        }
+    };
+    let runtime_workers = runtime_worker_threads
+        .map(|workers| workers.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "NEOETHOS_STARTUP_V1 executable={executable} effective_logical_threads={} \
+         reserved_logical_threads={} automatic_worker_limit={} effective_worker_limit={} \
+         capacity_source={capacity_source} coordination_scope={} runtime_kind={} \
+         runtime_worker_threads={runtime_workers} events={}",
+        resolved.effective_logical_threads.get(),
+        resolved.reserved_logical_threads,
+        resolved.automatic_worker_limit.get(),
+        resolved.effective_worker_limit.get(),
+        resolved.coordination_scope.as_str(),
+        runtime_kind.as_str(),
+        trace.csv(),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionBudgetRequest {
     pub host_logical_threads: Option<LogicalThreadCount>,
