@@ -691,11 +691,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoethos-execution-budget"
+version = "0.1.0"
+
+[[package]]
 name = "neoethos-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "neoethos-execution-budget",
  "rmcp",
  "serde",
  "serde_json",

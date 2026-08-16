@@ -20,6 +20,7 @@ name = "neoethos-mcp"
 path = "src/main.rs"
 
 [dependencies]
+neoethos-execution-budget = { path = "../crates/neoethos-execution-budget" }
 # Official Model Context Protocol SDK (client role + HTTP & child-process
 # transports for remote servers like cTrader and local ones like filesystem).
 rmcp = { version = "2.1", features = [

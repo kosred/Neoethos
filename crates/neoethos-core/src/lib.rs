@@ -21,6 +21,12 @@ pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 
+/// The single process-capacity and CPU-permit authority. Re-exporting the
+/// zero-dependency leaf keeps root-engine consumers on the exact same types as
+/// the isolated MCP and mesh workspaces without moving runtime policy into
+/// this larger foundation crate.
+pub use neoethos_execution_budget as execution_budget;
+
 pub use broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
     CTRADER_CREATE_DEMO_ACCOUNT_URL, CTRADER_CREATE_LIVE_ACCOUNT_URL, CTraderBrokerEnvironment,

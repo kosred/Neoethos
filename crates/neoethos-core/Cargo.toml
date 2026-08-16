@@ -13,6 +13,7 @@ gpu-rocm = []
 gpu-wgpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
+neoethos-execution-budget.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml_ng = "0.10.0"

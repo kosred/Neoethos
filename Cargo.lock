@@ -7209,6 +7209,7 @@ dependencies = [
  "chrono",
  "config",
  "dirs 5.0.1",
+ "neoethos-execution-budget",
  "pollster",
  "reqwest 0.13.4",
  "rusqlite",
@@ -7265,6 +7266,10 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
 ]
+
+[[package]]
+name = "neoethos-execution-budget"
+version = "0.1.0"
 
 [[package]]
 name = "neoethos-gpu-contracts"
