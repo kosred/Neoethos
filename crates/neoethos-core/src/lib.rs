@@ -7,6 +7,7 @@ pub mod domain;
 // B migrates the 6 existing call sites (config / symbol_metadata /
 // system / logging / broker_config / resolved_config) to use them.
 pub mod env_overrides;
+pub mod execution;
 pub mod logging;
 pub mod resolved_config;
 pub mod scheduler;

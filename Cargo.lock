@@ -7211,6 +7211,7 @@ dependencies = [
  "dirs 5.0.1",
  "neoethos-execution-budget",
  "pollster",
+ "rayon",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",

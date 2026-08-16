@@ -558,6 +558,16 @@ impl CpuPermitBroker {
         }
     }
 
+    /// True only when the transfer was issued by this exact broker instance.
+    /// Width equality is insufficient: a lease from another broker would
+    /// create a second capacity authority and allow aggregate oversubscription.
+    pub fn owns_transfer(&self, transfer: &CpuLeaseTransfer) -> bool {
+        transfer
+            .lease
+            .as_ref()
+            .is_some_and(|lease| Arc::ptr_eq(&self.inner, &lease.broker))
+    }
+
     /// Acquire immediately without bypassing an already queued request.
     pub fn try_acquire(&self, request: CpuPermitRequest) -> Result<Option<CpuLease>, AcquireError> {
         reject_nested_acquisition()?;
@@ -771,6 +781,28 @@ impl Drop for ActiveLeaseScope {
             debug_assert!(current > 0, "active CPU lease scope underflow");
             depth.set(current.saturating_sub(1));
         });
+    }
+}
+
+/// Opaque worker-lifetime proof used by a private lease-bound executor pool.
+///
+/// A cached pool retains idle OS threads between calls, so wrapping only the
+/// parent `install` closure is insufficient: Rayon may steal a nested job onto
+/// another worker whose thread-local scope was never marked. The budgeted
+/// executor enters this scope once in each private worker's spawn closure and
+/// retains the guard until that worker exits. The private pool itself remains
+/// unreachable unless its owner accepts a matching transferred lease.
+#[must_use = "dropping the worker scope re-enables fresh permit acquisition on this thread"]
+pub struct LeaseBoundWorkerScope {
+    _active: ActiveLeaseScope,
+}
+
+/// Enter the active-lease scope for the lifetime of one private executor
+/// worker. General workload code must use [`CpuLease::scope`] instead; this
+/// function exists for the worker-spawn boundary in `BudgetedCpuExecutor`.
+pub fn enter_lease_bound_worker_scope() -> LeaseBoundWorkerScope {
+    LeaseBoundWorkerScope {
+        _active: ActiveLeaseScope::enter(),
     }
 }
 
