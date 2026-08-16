@@ -27,6 +27,7 @@
 - Create: `crates/neoethos-data/tests/feature_store_contract.rs`
 - Create: `crates/neoethos-models/tests/fixtures/model_frame_contract_v1.json`
 - Create: `crates/neoethos-models/tests/model_frame_contract.rs`
+- Modify: `crates/neoethos-data/tests/vocabulary_restoration_measured.rs`
 - Create: `docs/audits/2026-08-15-vortex-polars-baseline.md`
 - Modify: `.gitignore` only if `target/audit-logs/` is not already ignored
 
