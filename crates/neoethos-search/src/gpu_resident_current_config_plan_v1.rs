@@ -394,9 +394,16 @@ pub(crate) struct CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
     _identity_sha256: [u8; 32],
 }
 
+impl CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
+    pub(crate) const fn identity_sha256(&self) -> [u8; 32] {
+        self._identity_sha256
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentConfigResidentSearchSlice2PlanErrorV2 {
     ImplementationPending,
+    IdentityReceiptMismatch,
 }
 
 mod slice2_plan_seal_v2 {

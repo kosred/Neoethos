@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 
 use neoethos_core::Settings;
+use sha2::{Digest as _, Sha256 as IndependentSha256V2};
 
 use super::*;
 use crate::discovery::{PropFirmGateOverrides, resolve_prefilter_financial_geometry_v1};
 use crate::validation::PropFirmRiskRules;
 
 const REQUIRED_RATE_V1: u64 = 223_106_667;
+const CURRENT_CONFIG_SLICE2_PLAN_IDENTITY_KNOWN_SHA256_V2: [u8; 32] = [
+    0x7d, 0x09, 0x56, 0xe0, 0xdd, 0x7a, 0x24, 0x00, 0xc8, 0xbc, 0xd4, 0xfa, 0xda, 0x51, 0xef, 0xa6,
+    0xe1, 0xd1, 0x79, 0x23, 0xbb, 0x39, 0x98, 0xbf, 0xe5, 0xd1, 0x7a, 0x72, 0xbd, 0x2b, 0x1f, 0xb3,
+];
 
 #[derive(Clone, Copy)]
 struct AdmissionFixtureV1 {
@@ -521,16 +526,91 @@ fn current_config_slice2_facts_v2() -> CurrentConfigResidentSearchSlice2PlanFact
     }
 }
 
+fn current_config_slice2_base_v1() -> SealedCurrentConfigResidentSearchPlanV1 {
+    let (config, runtime) = config_and_runtime();
+    seal(&config, &runtime, AdmissionFixtureV1::default())
+        .expect("the already-GREEN current-config V1 plan must seal")
+}
+
+fn independent_current_config_slice2_identity_oracle_v2(
+    base_v1: &SealedCurrentConfigResidentSearchPlanV1,
+    facts: &CurrentConfigResidentSearchSlice2PlanFactsV2,
+) -> [u8; 32] {
+    let mut hash = IndependentSha256V2::new();
+    hash.update(CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2.as_bytes());
+    hash.update(base_v1.plan_identity_sha256());
+    hash.update(facts.population.to_le_bytes());
+    hash.update(facts.maximum_generations.to_le_bytes());
+    hash.update(facts.maximum_runtime_millis.to_le_bytes());
+    hash.update(facts.maximum_terms_per_gene.to_le_bytes());
+    hash.update(facts.gene_signature_word_count.to_le_bytes());
+    hash.update(facts.novelty_weight_bits.to_le_bytes());
+    hash.update(facts.novelty_neighbors.to_le_bytes());
+    hash.update(facts.permanent_archive_capacity.to_le_bytes());
+    hash.update(facts.calibration_active_count.to_le_bytes());
+    hash.update(facts.maximum_jaccard_union.to_le_bytes());
+    hash.update(facts.maximum_jaccard_cross_product.to_le_bytes());
+    hash.update(facts.maximum_archive_knn_distance_count.to_le_bytes());
+    hash.update(facts.maximum_archive_knn_popcount_word_count.to_le_bytes());
+    hash.update(
+        facts
+            .required_archive_knn_distance_items_per_second
+            .to_le_bytes(),
+    );
+    hash.update(
+        facts
+            .required_archive_knn_popcount_words_per_second
+            .to_le_bytes(),
+    );
+    hash.update(facts.layout_alignment_bytes.to_le_bytes());
+    hash.update(facts.archive_gene_scalars_bytes.to_le_bytes());
+    hash.update(facts.archive_term_indices_bytes.to_le_bytes());
+    hash.update(facts.archive_term_weights_bytes.to_le_bytes());
+    hash.update(facts.archive_metric_rows_bytes.to_le_bytes());
+    hash.update(facts.archive_signatures_bytes.to_le_bytes());
+    hash.update(facts.archive_hashes_bytes.to_le_bytes());
+    hash.update(facts.current_population_signatures_bytes.to_le_bytes());
+    hash.update(facts.novelty_scores_bytes.to_le_bytes());
+    hash.update(facts.exact_top_k_keys_bytes.to_le_bytes());
+    hash.update(facts.admission_flags_bytes.to_le_bytes());
+    hash.update(facts.admission_offsets_bytes.to_le_bytes());
+    hash.update(facts.archive_control_and_seal_bytes.to_le_bytes());
+    hash.update(facts.control_subtotal_bytes.to_le_bytes());
+    hash.update(facts.slice2_replacement_subtotal_bytes.to_le_bytes());
+    hash.update(facts.replaced_v1_scoring_bytes.to_le_bytes());
+    hash.update(facts.slice2_net_additional_bytes.to_le_bytes());
+    hash.update([facts.current_source_kind_wire]);
+    hash.update([facts.archive_source_kind_wire]);
+    hash.update(facts.current_ordinal_exclusive_end.to_le_bytes());
+    hash.update(facts.archive_ordinal_exclusive_end.to_le_bytes());
+    hash.update([facts.binary64_operation_sequence_wire]);
+    hash.update([facts.binary64_math_mode_wire]);
+    hash.update([facts.binary64_tolerance_policy_wire]);
+    hash.update(facts.binary64_absolute_tolerance_bits.to_le_bytes());
+    hash.update(facts.binary64_relative_tolerance_bits.to_le_bytes());
+    hash.update(facts.binary64_max_ulp_distance.to_le_bytes());
+    hash.update(facts.novelty_semantics_identity_sha256);
+    hash.update(facts.archive_capacity_identity_sha256);
+    hash.update(facts.calibration_active_count_identity_sha256);
+    hash.update(facts.layout_identity_sha256);
+    hash.update(facts.calibration_identity_sha256);
+    hash.update(facts.source_kind_encoding_identity_sha256);
+    hash.update(facts.current_ordinal_domain_identity_sha256);
+    hash.update(facts.archive_ordinal_domain_identity_sha256);
+    hash.update(facts.tie_order_identity_sha256);
+    hash.update(facts.binary64_operation_sequence_identity_sha256);
+    hash.update(facts.binary64_math_mode_identity_sha256);
+    hash.update(facts.binary64_tolerance_identity_sha256);
+    hash.finalize().into()
+}
+
 fn seal_current_config_slice2_v2(
     facts_v2: CurrentConfigResidentSearchSlice2PlanFactsV2,
 ) -> Result<
     SealedCurrentConfigResidentSearchSlice2PlanV2,
     CurrentConfigResidentSearchSlice2PlanErrorV2,
 > {
-    let (config, runtime) = config_and_runtime();
-    let base_v1 = seal(&config, &runtime, AdmissionFixtureV1::default())
-        .expect("the already-GREEN current-config V1 plan must seal");
-    seal_current_config_resident_search_slice2_plan_v2(base_v1, facts_v2)
+    seal_current_config_resident_search_slice2_plan_v2(current_config_slice2_base_v1(), facts_v2)
 }
 
 fn require_current_config_slice2_v2(
@@ -561,12 +641,22 @@ fn assert_slice2_facts_rejected_before_allocation(
 #[test]
 fn slice2_current_config_facts_layout_and_binary64_contract_are_exact() {
     let expected = current_config_slice2_facts_v2();
+    let base_v1 = current_config_slice2_base_v1();
+    let identity_oracle = independent_current_config_slice2_identity_oracle_v2(&base_v1, &expected);
+    assert_eq!(
+        identity_oracle,
+        CURRENT_CONFIG_SLICE2_PLAN_IDENTITY_KNOWN_SHA256_V2
+    );
     let plan = require_current_config_slice2_v2(expected);
     let facts = plan.facts_v2();
 
     assert_eq!(
         CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2,
         "neoethos.current-config-resident-search-slice2-plan.v2"
+    );
+    assert_eq!(
+        plan.identity_receipt_v2().identity_sha256(),
+        identity_oracle
     );
     assert_eq!(facts, &expected);
     assert_eq!(facts.population, 200);
@@ -686,6 +776,10 @@ fn slice2_current_config_facts_layout_and_binary64_contract_are_exact() {
 fn slice2_identity_inputs_change_run_identity_and_reject_stale_receipts_independently() {
     let baseline_facts = current_config_slice2_facts_v2();
     let baseline_plan = require_current_config_slice2_v2(baseline_facts);
+    assert_eq!(
+        baseline_plan.validate_identity_receipt_v2(baseline_plan.identity_receipt_v2()),
+        Ok(())
+    );
 
     macro_rules! assert_identity_change {
         ($label:literal, $field:ident, $replacement:expr) => {{
@@ -698,10 +792,9 @@ fn slice2_identity_inputs_change_run_identity_and_reject_stale_receipts_independ
                 "{} identity did not alter the Slice2 run identity",
                 $label
             );
-            assert!(
-                changed_plan
-                    .validate_identity_receipt_v2(baseline_plan.identity_receipt_v2())
-                    .is_err(),
+            assert_eq!(
+                changed_plan.validate_identity_receipt_v2(baseline_plan.identity_receipt_v2()),
+                Err(CurrentConfigResidentSearchSlice2PlanErrorV2::IdentityReceiptMismatch),
                 "{} mutation accepted the old Slice2 identity receipt",
                 $label
             );
