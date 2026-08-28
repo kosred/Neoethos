@@ -3,16 +3,16 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 3
+Version: 4
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
 
-Version 3 supersedes the review candidate at commit
-`def68c428b625126e48302f1443d210e64846e84`. Its version-2 manifest remains an
-immutable historical receipt; the version-3 manifest binds this corrected
-document.
+Version 4 supersedes the version-3 design at commit
+`06cf3fb578333c23b1fe241ba68999789ef79151`. The version-2 and version-3
+manifests remain immutable historical receipts; the version-4 manifest alone
+binds this corrected document.
 
 ## Outcome and boundary
 
@@ -59,7 +59,7 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated through version 3
+## Review corrections incorporated through version 4
 
 | Finding | Versioned decision |
 | --- | --- |
@@ -68,7 +68,7 @@ headless `DiscoveryResult` remain later gates.
 | Rational comparison could overflow | The comparator widens to `u64` only after a checked host preflight proves the maximum cross product; device inputs are range-validated against that receipt. |
 | Existing composite cannot insert post-rank/pre-rotation | A three-state typed transaction separates score/rank, archive staging, and evolution/publication. |
 | Readiness was listed as a RED | Unchanged readiness is a continuously GREEN invariant, not a missing behavior. |
-| Opacity was a source-string assertion | Public opacity and move-only ownership use executable `compile_fail` doctests; missing archive allocation is a behavioral pre-allocation RED. |
+| Opacity was a source-string assertion | Public opacity and move-only ownership use the executable compiler-UI contract sealed in R7; missing archive allocation is a behavioral pre-allocation RED. |
 | Hash collision behavior was unspecified | Hashes are accelerators only; equality falls back to the exact full gene and unequal colliding genes both survive. |
 | `23_707_648` bytes was ambiguous | It replaces three V1 scoring regions and is a net `23_699_200`-byte increase before the unchanged fitness/decision/CUB regions. |
 | Calibration could benchmark an easy case | The exact production fixed-K kernel is benchmarked with `P=200`, a prefilled `A=50_000` archive, `W=4`, and `K=15`. |
@@ -76,7 +76,12 @@ headless `DiscoveryResult` remain later gates.
 | One-hour claim was too broad | Slice 2 proves a necessary novelty-stage lower bound only; a later combined deadline gate must cover every Search stage. |
 | GREEN readiness/headless assertions named no executable authority | Version 3 binds the existing behavioral readiness function in `resident_search_generation_v2_production_contract` and adds a prepared-native behavioral refusal test with an independent post-trim allocation scope. |
 | Calibration rejection covered only exact and under-rate receipts | Version 3 executes empty-archive, smaller-K, proxy-kernel, stale-build, foreign-device and shape-drift rejections and proves a valid novelty-only receipt cannot satisfy the separate headless deadline/readiness gate. |
-| Opacity/interception tests could pass vacuously | Version 3 requires exact rustc diagnostic codes plus compile-pass controls for R7, and live positive-control calls plus an interposer-disabled rejection for the independent CUDA interception layer. |
+| Opacity/interception tests could pass vacuously | R7 requires compiler JSON, tracked stderr and a compile-pass control; the independent CUDA interception layer requires live positive controls plus an interposer-disabled rejection. |
+| The interception epoch began after Search admission | Version 4 seals the epoch after the whole trim carrier exists but before combined Search admission, accounts for every declared admission allocation, classifies the one trim-ready stream wait as an asynchronous device dependency, and keeps the boundary live through the one terminal projection. |
+| Cross-source ties had no wire encoding | Version 4 fixes `Current = 0` and `Archive = 1`, seals disjoint ordinal domains, binds them into run identity, and adds a cutoff tie fixture with equal distance and equal gene identity across sources. |
+| Final novelty floating-point semantics were open | Version 4 fixes rational selection, integer-to-binary64 conversion, division and accumulation order, strict round-to-nearest-even math mode, and an absolute/relative/ULP acceptance tuple bound into every plan, calibration receipt and run identity. |
+| Calibration negatives did not independently exercise all sealed bounds | Version 4 adds `A=49_999`, `K=16`, and orthogonal distance-rate/popcount-rate failures, with exact typed refusals and zero combined-Search allocations. |
+| R7 and R8 lacked executable topology/count authority | Version 4 replaces doctest counting with compiler JSON plus tracked stderr for one positive and nine negative UI fixtures, seals the exact feature/cfg topology, and names the R8 files, tests and fixture counts. |
 
 ## Current source constraints
 
@@ -156,7 +161,20 @@ counts and identities only.
 The native begin call must validate that the trim-ready event, population
 stream, generation stream, scoring/archive stream, device, context, pool,
 full-workspace identity and parent owner all name the same admitted run. It
-waits for the trim-ready event on that stream before any Search kernel.
+enqueues exactly one `cudaStreamWaitEvent` or `cuStreamWaitEvent`, according to
+the one symbol resolved by the linked production object, on the admitted Search
+stream before any Search kernel. This is an asynchronous device dependency: it
+does not query or wait for the event on the host.
+
+The independent interception epoch is sealed only after the complete trimmed
+carrier and its ready-event identity exist and after the test validator's
+bounded expected-value H2D upload, but before the first combined Search
+admission call. Consequently all admission allocations are inside the epoch.
+The layout receipt declares their exact allocator symbol, order, aligned byte
+count and category; the intercept ledger must equal that declaration. The epoch
+does not close at event record. It remains live through successful nonblocking
+query of the one terminal event and host projection of the one compact terminal
+receipt.
 
 ### Completion and cleanup
 
@@ -316,9 +334,69 @@ Equal fractions use the total tie key:
 (gene_identity, source_kind, source_ordinal)
 ```
 
-The selected `min(K, available)` keys are accumulated in that exact order and
-then converted to `f64`. CPU/device comparison uses a documented tolerance for
-the final division; it does not claim bitwise host-log parity.
+`source_kind` is a versioned one-byte wire value: `Current = 0` and
+`Archive = 1`; every other value is a device fault. `Current` ordinals are
+sealed unsigned values in `[0, P)`. `Archive` ordinals are sealed unsigned
+values in `[0, archive_count_at_start_of_g)`. They are deliberately disjoint
+domains even when their numeric values match. Self-exclusion applies only to
+`(Current, candidate_ordinal)`; it never excludes an archive record. The
+encoding, both ordinal-domain rules and the tie-key order have separate
+semantics identities and all three feed the current-config plan identity,
+calibration receipt and final run identity.
+
+R2 and R9 contain an exact cutoff fixture with fourteen strictly nearer
+neighbors followed by one current and one archive neighbor having the same
+distance fraction and the same `gene_identity`. With `K=15`, the current
+neighbor must occupy slot fifteen because `Current(0) < Archive(1)`; swapping
+the source encoding must alter run identity and the old receipt must be
+rejected.
+
+### Sealed binary64 mean
+
+Rational numerators and denominators remain integers through comparison and
+top-K selection. After the selected keys have been sorted by the complete
+neighbor order `(rational_distance, gene_identity, source_kind,
+source_ordinal)`, the device computes their mean in this sole allowed order,
+where every operation rounds once to IEEE-754 binary64 round-to-nearest,
+ties-to-even:
+
+```text
+q = min(K, available_neighbors)
+sum = +0.0_f64
+for j in 0..q in selected total-key order:
+    n = exact_u32_to_f64(numerator[j])
+    d = exact_u32_to_f64(denominator[j])
+    term = rn_div(n, d)
+    sum = rn_add(sum, term)
+novelty = rn_div(sum, exact_u32_to_f64(q))
+```
+
+All integers are at most 32 (or 15 for `q`) and therefore convert exactly. The
+CUDA implementation uses `__ddiv_rn` and `__dadd_rn`, is compiled without
+`--use_fast_math` and with exact switches `--ftz=false --prec-div=true
+--fmad=false`, and forbids reassociation. The complete compiler/flag digest is
+bound as `binary64_rn_strict_v1`. No reduction tree, FMA, reciprocal
+approximation, extended accumulator, conversion before top-K selection or
+alternate order is equivalent.
+
+The CPU oracle independently selects fractions with checked `u128` cross
+products, verifies their exact checked rational sum, and then emulates the
+sealed binary64 sequence above. Expected `+0.0` must match its exact bit pattern.
+For every non-zero finite expected value, device acceptance requires all three
+conditions simultaneously:
+
+```text
+absolute_error <= 2^-50
+relative_error <= 2^-48
+nonnegative_binary64_ulp_distance <= 4
+```
+
+ULP distance is the difference between the ordered `u64` encodings of two
+non-negative finite values. NaN, infinity, negative zero, a sign difference or
+failure of any one bound is a mismatch. The operation-sequence identity, math
+mode identity and exact `(2^-50, 2^-48, 4 ULP)` policy are fields of the plan,
+calibration receipt, validator receipt and run identity; none is a test-runner
+constant or host-log convention.
 
 ### Archive admission and full-gene equality
 
@@ -420,7 +498,10 @@ compares each field before the first full Search allocation.
 
 The calibration receipt is bound to the exact device UUID, context, stream,
 memory pool, CUDA build/math identity, kernel semantics, `P=200`, `A=50_000`,
-`W=4`, `K=15`, `M=16`, union/cross-product bounds and plan identity.
+`W=4`, `K=15`, `M=16`, union/cross-product bounds, `Current=0`/`Archive=1`
+source encoding and ordinal domains, binary64 operation sequence,
+`binary64_rn_strict_v1`, the exact `(2^-50, 2^-48, 4 ULP)` policy and plan/run
+identity.
 
 Calibration must use the production fixed-K kernel with an archive actually
 prefilled to 50,000 valid deterministic signatures. Empty-archive execution,
@@ -439,19 +520,32 @@ negative matrix independently requires:
 
 - an empty active archive, inactive-tail-only work or `archive_count != 50_000`
   cannot mint a calibration receipt;
-- `K != 15`, including the exact `K=14` smaller-neighbor control, cannot mint
-  the current-config receipt;
+- `A=49_999` is an exact capacity control and fails with
+  `ResidentArchiveKnnCalibrationErrorV2::ArchiveCapacityMismatch` before any
+  calibration or Search allocation;
+- `K != 15`, including exact `K=14` and `K=16` controls, fails with
+  `ResidentArchiveKnnCalibrationErrorV2::NeighborCountMismatch` before any
+  calibration or Search allocation;
 - a popcount-only/proxy kernel or a foreign kernel-semantics identity cannot
   mint it even if its measured rate is high;
 - a receipt from a stale CUDA build/math identity, another device UUID,
   context, stream or memory pool is rejected by admission;
 - independent `P`, `A`, `W` and `M` shape mutations are rejected; and
-- a correctly bound but deliberately under-rate receipt is rejected.
+- a test-only sealed receipt with distance rate `55_776_666` while popcount
+  rate remains at least `223_106_667` fails with
+  `ResidentSearchAdmissionErrorV2::ArchiveKnnDistanceRateBelowMinimum`;
+- a separate sealed receipt with popcount rate `223_106_666` while distance
+  rate remains at least `55_776_667` fails with
+  `ResidentSearchAdmissionErrorV2::ArchiveKnnPopcountRateBelowMinimum`.
 
 Every rejection asserts the exact typed stage/reason and independently observes
-zero generation, scoring and archive allocations. Tests mutate opaque receipt
-fields only from a crate-private fixture module; no production caller gains a
-constructor or raw field access.
+zero combined-admission calls and zero generation, scoring and archive Search
+allocations. Shape and K/A preflight refusals additionally observe zero
+calibration allocations. The two rate controls derive from a real completed
+calibration but are independently re-sealed only by a crate-private fixture;
+their already released calibration scratch is not a Search allocation. Tests
+mutate opaque receipt fields only from that fixture module; no production caller
+gains a constructor or raw field access.
 
 This is only a necessary novelty-stage lower bound. Passing it does not prove
 that evaluation, scoring reductions, GA, archive staging, launch overhead and
@@ -479,13 +573,33 @@ around:
 - runtime and driver D2H copies, synchronous and asynchronous;
 - stream, event, context and device synchronization calls.
 
-The intercept scope begins after the one-time trim/Search admission and ends at
-the terminal event. It records call kind, byte count and phase independently of
-the Search receipt. The multi-generation oracle requires zero D2H and zero
-synchronization inside that scope. At the terminal boundary it permits exactly
-one bounded compact receipt D2H after the combined commit and before the event;
-no gene, metric, signature or archive payload is permitted. Production receipt
-counters must independently agree with the interception log.
+The measured epoch begins after the whole trimmed carrier and trim-ready event
+are sealed but before the first combined Search admission call. The expected
+validator payload has already been uploaded H2D. The epoch records call kind,
+symbol, byte count, stream/event identity and phase independently of the Search
+receipt. Combined admission must perform exactly the declared allocation ledger
+from the layout receipt; every allocator call and aligned byte count is observed
+inside the epoch. Any undeclared allocation, missing declared allocation,
+different symbol/order/size or any allocation after admission is a failure.
+
+The trim-ready dependency is exactly one intercepted `cudaStreamWaitEvent` or
+`cuStreamWaitEvent` on the admitted Search stream and exact sealed ready event.
+It is classified as an asynchronous stream dependency, not host synchronization.
+`cudaEventSynchronize`, `cudaStreamSynchronize`, `cudaDeviceSynchronize`,
+`cuEventSynchronize`, `cuStreamSynchronize`, `cuCtxSynchronize` and equivalent
+covered host-blocking calls remain forbidden.
+
+From epoch seal through admission, the async trim-ready dependency and every
+generation enqueue, the oracle requires zero D2H and zero host synchronization.
+After the final combined commit, terminal seal may enqueue exactly one bounded
+compact asynchronous D2H on the admitted stream and immediately record exactly
+one terminal event. No gene, metric, signature or archive payload is permitted.
+The host may only poll that exact event nonblockingly; it may not inspect the D2H
+destination until the query returns success. The epoch remains live through
+that success and the single bounded host projection, then closes. There is no
+second D2H, event, host wait or synchronization at the boundary. Production
+receipt counters, the declared admission ledger and the interception log must
+all agree independently.
 
 The test binary link-wraps the exact runtime and driver symbols referenced by
 the production native objects. The interception state lives only in the
@@ -495,7 +609,7 @@ records the wrapped-symbol manifest and fails if a production object resolves a
 covered call to an unwrapped symbol or an unexpected CUDA transfer/sync symbol.
 
 Zero calls are accepted only after a non-vacuity handshake in the same process.
-Before the measured scope, the test issues one bounded known allocation followed
+Before the measured epoch, the test issues one bounded known allocation followed
 by its checked release through each wrapped allocator entry point, one bounded
 known D2H and one known synchronization through each runtime/driver API family
 that the production wrapper can reach. The interceptor must record the nonce,
@@ -504,14 +618,15 @@ return for every control call. It then seals a fresh measurement epoch; Search
 cannot reset or write that epoch. A separate child run with the interposer
 disabled, a missing symbol hook, a wrong PID/nonce or a dropped control record
 must be rejected even if its reported measured counters are all zero. Controls
-occur outside the Search timing and zero-boundary scope.
+occur outside the Search timing and measured epoch. The epoch counter can be
+sealed once but cannot be reset; a second seal attempt is an exact rejection.
 
 The RTX oracle does not evade that boundary to inspect arrays. Before the
-intercept scope, the CPU oracle creates the deterministic fixture and its
+measured epoch, the CPU oracle creates the deterministic fixture and its
 expected per-generation neighbor, novelty, rank and archive digests. A
 test-only device validator receives those expected values by H2D, follows each
 combined commit on the admitted stream, checks exact integer/order fields and
-the documented novelty tolerance, and latches only bounded mismatch bits and
+the receipt-bound binary64 tolerance, and latches only bounded mismatch bits and
 digests into the terminal seal. The single compact D2H returns those results.
 The validator has no production symbol and cannot authorize admission; the
 production kernels and independent API intercept remain separate authorities.
@@ -527,8 +642,12 @@ Path: `crates/neoethos-search/src/gpu_resident_current_config_plan_v1_tests.rs`
 
 Assertions:
 
-- exact current dimensions, work bounds, rational bounds and memory fields;
-- novelty/archive/layout/calibration identities alter the run identity;
+- exact current dimensions, work bounds, rational bounds, memory fields,
+  `Current=0`/`Archive=1` encoding and sealed ordinal domains;
+- exact binary64 operation-sequence/math-mode identities and the
+  `(2^-50, 2^-48, 4 ULP)` tuple;
+- novelty/archive/layout/calibration/source-kind/ordinal/math/tolerance
+  identities independently alter the run identity and reject an old receipt;
 - checked overflow and any current-config extent drift fail before allocation.
 
 ### R2: exact rational kNN CPU oracle
@@ -537,8 +656,14 @@ Path: `crates/neoethos-gpu-cuda/src/resident_archive_knn_v2_tests.rs`
 
 Hand-computed fixtures cover current plus archive neighbors, exact self
 exclusion, fewer than K, duplicate zero-distance neighbors, zero union, total
-tie ordering and checked comparator limits. The oracle uses checked `u128`
-cross products.
+tie ordering and checked comparator limits. The exact `K=15` cutoff fixture has
+fourteen nearer neighbors plus equal-distance/equal-identity current and archive
+neighbors and proves `Current(0)` wins the last slot. Out-of-domain current,
+archive and source-kind values fault. The oracle uses checked `u128` cross
+products, independently verifies the exact rational sum, and emulates the
+sealed binary64 sequence. Exact `+0.0`, each tolerance boundary, four-ULP
+acceptance, five-ULP rejection, and independent absolute/relative-bound
+rejections are executable cases rather than comments.
 
 ### R3: archive timing, ordering and cap
 
@@ -571,47 +696,83 @@ Path: `crates/neoethos-gpu-cuda/src/resident_search_v2_tests.rs`
 A combined admission with a missing/zero archive arena, mismatched aligned
 field, insufficient reserve or foreign calibration returns a typed admission
 error while generation/scoring/archive allocation counters all remain zero.
-The exact valid receipt performs the declared allocation count once; no later
-generation allocates.
+The exact valid receipt performs the layout receipt's declared allocator-symbol,
+order, aligned-byte and category ledger once inside the pre-admission
+interception epoch; no later generation allocates.
 
 ### R7: executable move-only opacity
 
-Path: public doctests in
-`crates/neoethos-gpu-cuda/src/resident_archive_knn_v2.rs`, executed by the exact
-`neoethos-gpu-cuda` doc-test target with `--no-default-features --features
-cuda-device-fixtures`.
+Authority is the tracked compiler-UI harness, not rustdoc:
 
-Public owner documentation contains paired compile-pass and `compile_fail`
-doctests under the exact contract feature that exports the opaque public owner.
-The compile-pass control imports and moves each public owner and receipt through
-its supported typed API, proving that crate resolution, feature selection and
-the positive surface are live without constructing a GPU resource. Every
-negative fence is annotated `compile_fail,E####`, never bare `compile_fail`, so
-an unrelated compilation error is not a pass. The exact authored diagnostics
-cover eight negative fences:
+- runner:
+  `crates/neoethos-search/tests/resident_search_slice2_compile_contract.rs`;
+- shared fixture package:
+  `crates/neoethos-search/tests/ui/resident_search_slice2/Cargo.toml`;
+- sources and normalized stderr:
+  `crates/neoethos-search/tests/ui/resident_search_slice2/{pass,fail}/`.
 
-- cloning a move-only owner fails with `E0599`, and a generic `Copy` bound fails
-  with `E0277`;
-- four separate trim-map, event, archive-pointer and population-field probes
-  each fail with `E0616`;
-- calling the private staged-receipt constructor fails with `E0624`, and
-  directly constructing a ranked receipt with private fields fails with
-  `E0451`.
+The runner performs exactly ten isolated compiler invocations with
+`--message-format=json` under
+`--no-default-features --features resident-search-slice2-device-fixtures`. It
+parses compiler JSON, requires the expected primary diagnostic code and exact
+authored source span, and compares the compiler's normalized rendered diagnostic
+against the tracked `.stderr` receipt. Any extra primary error, unresolved
+crate, feature drift, skipped fixture, warning-only result or stderr drift is a
+failure. The positive fixture must exit successfully with zero diagnostics.
+Rustdoc prose may illustrate the API but is not evidence and no doctest count is
+claimed.
 
-The gate requires exactly one positive and eight negative doctest results. It
-rejects an unrelated diagnostic, missing crate/feature, skipped or `no_run`
-negative snippet, warning-only output, or a negative snippet that compiles. Thus
-a broken test topology cannot masquerade as opacity. The normal R6 behavioral
-test supplies the separate missing combined archive-preallocation RED. No
+The exact fixture set is one positive plus nine negatives:
+
+| Fixture | Required result |
+| --- | --- |
+| `pass/typed_surface.rs` | imports and moves every owner/receipt through the supported typed surface without creating a GPU resource |
+| `fail/clone_owner_e0599.rs` | `E0599` |
+| `fail/copy_owner_e0277.rs` | `E0277` |
+| `fail/read_trim_map_e0616.rs` | `E0616` |
+| `fail/read_trim_event_e0616.rs` | `E0616` |
+| `fail/read_archive_pointer_e0616.rs` | `E0616` |
+| `fail/read_population_field_e0616.rs` | `E0616` |
+| `fail/call_staged_constructor_e0624.rs` | `E0624` |
+| `fail/construct_ranked_receipt_e0451.rs` | `E0451` |
+| `fail/novelty_receipt_as_full_deadline_e0308.rs` | `E0308` at the argument that passes `ResidentArchiveKnnCalibrationReceiptV2` to the sink requiring `FullResidentDiscoveryDeadlineReceiptV1` |
+
+The positive fixture names both receipt types and calls correctly typed sinks
+through divergent value suppliers, so private constructors are not needed and
+the `E0308` negative cannot pass because a type is missing. The gate requires
+exactly `1` positive and `9` negative results. The normal R6 behavioral test
+supplies the separate missing combined archive-preallocation RED. No
 source-string/token assertion is accepted for either property.
 
 ### R8: transactional faults and cleanup
 
-All eleven metric positions are independently replaced with NaN and infinity;
-additional cases cover malformed/zero-union signatures, archive bounds,
-receipt-address drift and comparator-range drift. Every case leaves the packed
-commit word unchanged, publishes no staged tail, returns a compact terminal
-fault, performs checked terminal cleanup and permits a fresh unrelated run.
+Path: `crates/neoethos-gpu-cuda/src/resident_archive_knn_v2_tests.rs`, registered
+as `#[cfg(all(test, feature = "cuda"))] mod resident_archive_knn_v2_tests;`.
+Exactly these four named tests are the R8 authority:
+
+1. `r8_all_eleven_metric_slots_reject_nan_and_infinity_atomically` executes
+   exactly 22 injections: each metric slot `0..=10` is replaced once with the
+   canonical quiet NaN and once with positive infinity.
+2. `r8_structural_fault_matrix_is_atomic` executes exactly six injections:
+   signature word count `3`, signature word count `5`, zero union,
+   `archive_count=50_001`, boxed receipt-address drift and comparator
+   union/cross-product-bound drift.
+3. `r8_fault_cleanup_is_checked_once_and_owner_never_reused` executes exactly
+   four terminal states: event-proved semantic fault, `NotReady`, unknown CUDA
+   outcome and unproved event. Only the first may perform normal checked cleanup;
+   the other three retain or deliberately leak the armed composite. A second
+   cleanup or reuse attempt is rejected in all four cases.
+4. `r8_every_recoverable_fault_allows_a_fresh_unrelated_run` repeats the 22
+   metric and six structural fixtures, for exactly 28 fault/fresh-run pairs,
+   and requires a separately admitted valid run with a different run token to
+   publish successfully after each pair.
+
+Every one of the 28 metric/structural cases leaves the packed commit word
+unchanged, publishes no staged tail, returns the exact compact terminal fault
+and preserves the declared allocation ledger. The module also contains one
+valid baseline control; it is not counted as an injection or fault/fresh pair.
+The test runner asserts the literal case counts so deleting a loop member cannot
+silently reduce coverage.
 
 ### R9: real RTX behavior and calibration
 
@@ -625,21 +786,32 @@ One self-authenticating sequence runs:
 
 1. `resident_archive_knn_v2_calibration_rejects_nonrepresentative_receipts_on_real_cuda`:
    exact production fixed-K calibration with a genuinely prefilled 50,000-entry
-   archive, plus executable rejection of empty/inactive-tail archive, `K=14`,
-   proxy/popcount kernel and deliberately under-rate controls;
+   archive, plus executable rejection of empty/inactive-tail archive,
+   `A=49_999`, `K=14`, `K=16`, proxy/popcount kernel, a distance-under-rate
+   while popcount passes control and a popcount-under-rate while distance passes
+   control. Every case returns the exact typed refusal listed above; every
+   preflight-shape refusal has zero calibration allocations and every case has
+   zero combined-Search allocations;
 2. `resident_archive_knn_v2_admission_rejects_stale_foreign_or_shape_drift_receipts_before_allocation`:
    current-capacity allocation admission, including executable rejection of a
    stale CUDA build/math identity, foreign UUID/context/stream/pool receipt and
-   independent `P`, `A`, `W` and `M` shape drift, with zero Search allocation
-   deltas on every rejection;
+   independent `P`, `A`, `W` and `M` shape drift, source-kind/ordinal identity
+   drift, binary64 operation/math-mode drift and each tolerance-field drift,
+   with the exact typed binding/field refusal, zero combined-admission calls and
+   zero generation/scoring/archive allocation deltas on every rejection;
 3. at least three resident generations compared to the independent CPU oracle
    by the preloaded test-only device validator for neighbor identities, novelty
-   values, rank, archive content/count and `g+1` visibility;
+   values under the receipt-bound `(2^-50, 2^-48, 4 ULP)` policy, rank, archive
+   content/count and `g+1` visibility. The exact cross-source cutoff fixture
+   proves `Current(0)` precedes `Archive(1)` and is bound to the run identity;
 4. duplicate, adversarial collision, cap and all fault/cleanup cases;
-5. interception assertions for zero intermediate D2H/synchronization and one
-   compact terminal D2H, accepted only after the positive-control handshake has
+5. interception assertions spanning pre-admission epoch seal through terminal
+   projection: the exact declared admission allocation ledger, exactly one
+   asynchronously classified trim-ready stream wait, zero pre-terminal D2H and
+   host synchronization, one compact terminal D2H/event/projection, and no later
+   allocation. Acceptance requires the positive-control handshake to have
    observed every wrapped runtime/driver family and an interposer-disabled child
-   has been rejected.
+   to have been rejected.
 
 The separately classified prepared-headless GREEN invariant below runs before
 and after this sequence. It is evidence in the final receipt, but it is never an
@@ -648,6 +820,40 @@ R9 RED and a failure stops the sequence rather than authorizing implementation.
 The device sequence records GPU UUID/name/compute capability/memory, exact
 command and environment, source and binary hashes, receipt/counter values and
 exit status. It runs once after an independent source review says safe to run.
+
+## Exact test-only feature and cfg topology
+
+The implementation may use only this topology:
+
+- `neoethos-gpu-cuda/src/lib.rs` registers production
+  `resident_archive_knn_v2` under `#[cfg(feature = "cuda")]`, R8 under
+  `#[cfg(all(test, feature = "cuda"))]`, and
+  `resident_archive_knn_v2_device_tests` under
+  `#[cfg(all(test, feature = "cuda-device-fixtures"))]`;
+- the external-compile and device fixture façade is
+  `resident_archive_knn_v2_device_fixture`, registered under
+  `#[cfg(feature = "cuda-device-fixtures")]` because integration/UI targets
+  compile the library without `cfg(test)`; the façade contains no production
+  constructor and is absent unless the non-default fixture feature is explicit;
+- the native interception translation unit is compiled only when
+  `CARGO_FEATURE_CUDA_DEVICE_FIXTURES` is present and is never linked by the
+  plain `cuda`, default, application or production feature closures;
+- `neoethos-search` adds exactly
+  `resident-search-slice2-device-fixtures = ["gpu-b-native",
+  "neoethos-gpu-cuda/cuda-device-fixtures"]`; it is absent from every default,
+  application and production aggregate;
+- `prepared_discovery_run_input_v3.rs` registers the headless invariant exactly
+  as `#[cfg(all(test, feature = "resident-search-slice2-device-fixtures"))]`
+  with its explicit `#[path = ...]` child module;
+- Cargo target `resident_search_slice2_compile_contract` has
+  `required-features = ["resident-search-slice2-device-fixtures"]`; its shared
+  fixture package forwards only that feature and is never a workspace/default
+  target.
+
+No `cfg(test)`-only item is treated as visible to an integration test, and no
+test-only feature is allowed to unify into a production or application build.
+Source-contract tests assert these exact attributes and negative feature
+closures.
 
 ## Continuously GREEN invariants
 
@@ -679,7 +885,8 @@ public surrogate. The fixture first creates the real current-config plan and
 whole `ResidentTrimmedPopulationSessionV1`, then supplies a correctly sealed
 novelty calibration receipt but no `FullResidentDiscoveryDeadlineReceiptV1`.
 Only after trim setup does it open an independent Search-allocation interception
-epoch. The call must reach the private entry, return the exact missing-full-run-
+epoch, after the whole carrier is sealed and before the first possible combined
+Search-admission call. The call must reach the private entry, return the exact missing-full-run-
 deadline/readiness error, leave the carrier under its checked cleanup lease, and
 show zero combined-admission calls and zero generation, scoring or archive
 allocation deltas in that epoch. The test also rejects CPU Search, host
@@ -723,9 +930,13 @@ The first implementation may touch only the bounded archive/transaction seam:
   `resident_trim_prefilter_v1.rs`;
 - build registration and focused contract/device test modules, including the
   test-only prepared-headless GREEN invariant module and its non-production
-  fixture feature in `crates/neoethos-search/Cargo.toml`, plus only the
-  `#[cfg(test)]` child-module registration in
-  `prepared_discovery_run_input_v3.rs`.
+  fixture feature and compiler-UI target in
+  `crates/neoethos-search/Cargo.toml`, plus only the exact
+  `#[cfg(all(test, feature = "resident-search-slice2-device-fixtures"))]`
+  child-module registration in `prepared_discovery_run_input_v3.rs`;
+- the tracked R7 fixture package/sources/stderr and the non-default
+  `resident_archive_knn_v2_device_fixture` façade required by the exact topology
+  above.
 
 The old current-only mean-Jaccard path is not modified into a look-alike. It
 remains unreachable from current-config production and may be removed only
