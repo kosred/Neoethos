@@ -155,7 +155,7 @@ fn training_accepts_an_exact_search_receipt_without_requiring_the_search_feature
 }
 
 #[test]
-fn configured_nvidia_preflight_checks_only_the_exact_plan_but_keeps_cuda_fail_closed() {
+fn configured_nvidia_preflight_checks_only_the_exact_plan_and_rejects_every_cpu_substitution() {
     let source = read("crates/neoethos-models/src/training_orchestrator.rs");
     let preflight = function_body(
         &source,
@@ -166,12 +166,7 @@ fn configured_nvidia_preflight_checks_only_the_exact_plan_but_keeps_cuda_fail_cl
         "self.create_dispatch_plan()?",
         "self.validate_dispatch_plan(&dispatch_plan)?",
         "AcceleratorBackend::Cuda",
-        "model_requires_cuda_in_full_nvidia_run",
-        "supports_gpu_for_model",
-        "full_nvidia_device_policy_for_config",
-        "CudaDevicePolicy::Gpu { ordinal: 0 }",
-        "CudaDevicePolicy::Cpu",
-        "configured_cuda_models > 0",
+        "self.validate_nvidia_model_config_v1(&config)?",
     ] {
         assert!(
             preflight.contains(required),
@@ -183,6 +178,16 @@ fn configured_nvidia_preflight_checks_only_the_exact_plan_but_keeps_cuda_fail_cl
             && !preflight.contains("missing production ensemble voters"),
         "configured training incorrectly requires models that are absent from its exact plan"
     );
+    for forbidden in [
+        "CudaDevicePolicy::Cpu",
+        "CPU-only model",
+        "configured_cuda_models",
+    ] {
+        assert!(
+            !preflight.contains(forbidden),
+            "configured NVIDIA preflight still admits partial GPU execution via `{forbidden}`"
+        );
+    }
 }
 
 #[test]
@@ -231,7 +236,7 @@ fn persisted_training_profile_uses_the_same_canonical_timeframe_resolver_as_exec
 }
 
 #[test]
-fn full_nvidia_training_routes_gpu_capable_models_to_cuda_and_cpu_only_bayes_explicitly() {
+fn full_nvidia_training_refuses_the_explicit_cpu_bayes_boundary_until_its_gpu_route_exists() {
     let statistical = read("crates/neoethos-models/src/statistical/common.rs");
     let policy = function_body(&statistical, "pub fn statistical_device_policy(");
     for required in [
@@ -264,6 +269,15 @@ fn full_nvidia_training_routes_gpu_capable_models_to_cuda_and_cpu_only_bayes_exp
             "full-run config does not pin the exact GPU/CPU model policy `{required}`"
         );
     }
+
+    let models = read("crates/neoethos-models/src/training_orchestrator.rs");
+    let validator = function_body(&models, "fn validate_nvidia_model_config_v1(");
+    assert!(
+        validator.contains("supports_gpu_for_model")
+            && validator.contains("CudaDevicePolicy::Gpu { ordinal: 0 }")
+            && !validator.contains("CudaDevicePolicy::Cpu"),
+        "the explicit bayes CPU boundary must make full-GPU preflight fail, not become a fallback"
+    );
 }
 
 #[test]
@@ -318,13 +332,23 @@ fn full_run_preflights_the_complete_training_dispatch_on_exact_cuda_zero() {
         "WorkloadKind::TreeTraining",
         "WorkloadKind::DeepTraining",
         "WorkloadKind::RlTraining",
-        "model_requires_cuda_in_full_nvidia_run",
-        "supports_gpu_for_model",
-        "CudaDevicePolicy::Gpu { ordinal: 0 }",
+        "self.validate_nvidia_model_config_v1(&config)?",
     ] {
         assert!(
             preflight.contains(required),
             "full NVIDIA training preflight is missing `{required}`"
+        );
+    }
+
+    let strict_model = function_body(&models, "fn validate_nvidia_model_config_v1(");
+    for required in [
+        "supports_gpu_for_model",
+        "full_nvidia_device_policy_for_config",
+        "CudaDevicePolicy::Gpu { ordinal: 0 }",
+    ] {
+        assert!(
+            strict_model.contains(required),
+            "strict full-GPU model authority is missing `{required}`"
         );
     }
 

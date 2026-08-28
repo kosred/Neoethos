@@ -437,11 +437,40 @@ impl TrainingOrchestrator {
         }
     }
 
+    /// Prove that one configured model has a compiled GPU implementation and
+    /// is pinned to the exact CUDA device admitted by the full-run hardware
+    /// plan. A full-GPU run never treats an explicit CPU plan as an acceptable
+    /// substitute: unsupported models stop before feature construction,
+    /// Search, or training spends accelerator time.
+    fn validate_nvidia_model_config_v1(&self, config: &ModelConfig) -> Result<()> {
+        let canonical = canonical_model_name(&config.name);
+        anyhow::ensure!(
+            crate::registry::supports_gpu_for_model(canonical, config.capability_family),
+            "full NVIDIA model `{}` has no compiled GPU implementation in this build",
+            config.name
+        );
+
+        let policy = self.full_nvidia_device_policy_for_config(config)?;
+        let parsed = crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+            format!(
+                "full NVIDIA model `{}` has invalid device policy `{policy}`",
+                config.name
+            )
+        })?;
+        anyhow::ensure!(
+            policy.trim().contains(':')
+                && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+            "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+            config.name
+        );
+        Ok(())
+    }
+
     /// Validate the complete configured model expansion and its exact CUDA/CPU
     /// routing before a canonical full run spends time building features or
     /// searching. This is deliberately stricter than ordinary CPU-capable
-    /// training: every compiled CUDA surface must target ordinal zero, while
-    /// every model without a CUDA implementation is explicitly pinned to CPU.
+    /// training: every selected model must have a compiled GPU implementation
+    /// and target exact CUDA ordinal zero. There is no CPU substitution.
     pub fn preflight_full_nvidia_cuda_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
@@ -504,47 +533,7 @@ impl TrainingOrchestrator {
         );
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            let requires_cuda =
-                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
-            if requires_cuda {
-                anyhow::ensure!(
-                    crate::registry::supports_gpu_for_model(
-                        canonical_model_name(&config.name),
-                        config.capability_family,
-                    ),
-                    "full NVIDIA build lacks the CUDA implementation required by model `{}`",
-                    config.name
-                );
-                let policy = self.full_nvidia_device_policy_for_config(&config)?;
-                let parsed =
-                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
-                        format!(
-                            "full NVIDIA model `{}` has invalid device policy `{policy}`",
-                            config.name
-                        )
-                    })?;
-                anyhow::ensure!(
-                    policy.trim().contains(':')
-                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
-                    "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
-                    config.name
-                );
-            } else {
-                let policy = config.params.get("device").with_context(|| {
-                    format!(
-                        "CPU-only model `{}` lacks an explicit CPU device policy",
-                        config.name
-                    )
-                })?;
-                anyhow::ensure!(
-                    matches!(
-                        crate::common::parse_cuda_device_policy(policy)?,
-                        crate::common::CudaDevicePolicy::Cpu
-                    ),
-                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
-                    config.name
-                );
-            }
+            self.validate_nvidia_model_config_v1(&config)?;
             planned_models.push(config.name);
         }
         Ok(planned_models)
@@ -629,57 +618,11 @@ impl TrainingOrchestrator {
             "configured NVIDIA training resolved an empty model plan"
         );
 
-        let mut configured_cuda_models = 0_usize;
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            let requires_cuda =
-                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
-            if requires_cuda {
-                configured_cuda_models += 1;
-                anyhow::ensure!(
-                    crate::registry::supports_gpu_for_model(
-                        canonical_model_name(&config.name),
-                        config.capability_family,
-                    ),
-                    "configured NVIDIA build lacks the CUDA implementation required by model `{}`",
-                    config.name
-                );
-                let policy = self.full_nvidia_device_policy_for_config(&config)?;
-                let parsed =
-                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
-                        format!(
-                            "configured NVIDIA model `{}` has invalid device policy `{policy}`",
-                            config.name
-                        )
-                    })?;
-                anyhow::ensure!(
-                    policy.trim().contains(':')
-                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
-                    "configured NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
-                    config.name
-                );
-            } else {
-                let policy = config.params.get("device").with_context(|| {
-                    format!(
-                        "CPU-only model `{}` lacks an explicit CPU device policy",
-                        config.name
-                    )
-                })?;
-                anyhow::ensure!(
-                    matches!(
-                        crate::common::parse_cuda_device_policy(policy)?,
-                        crate::common::CudaDevicePolicy::Cpu
-                    ),
-                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
-                    config.name
-                );
-            }
+            self.validate_nvidia_model_config_v1(&config)?;
             planned_models.push(config.name);
         }
-        anyhow::ensure!(
-            configured_cuda_models > 0,
-            "configured NVIDIA training plan contains no CUDA-backed model"
-        );
         Ok(planned_models)
     }
 
@@ -6326,6 +6269,49 @@ mod tests {
         orchestrator.settings.system.device = "mystery_gpu".to_string();
 
         assert_eq!(orchestrator.preferred_burn_device_policy(), "gpu");
+    }
+
+    #[test]
+    fn full_nvidia_model_validation_rejects_a_model_without_a_compiled_gpu_route() {
+        let orchestrator = orchestrator_with_models(&["online_hoeffding"]);
+        let config = ModelConfig {
+            name: "online_hoeffding".to_string(),
+            model_type: ModelType::OnlineHoeffding,
+            capability_family: ModelFamily::Adaptive,
+            capability_state: CapabilityState::Verified,
+            params: HashMap::from([("device".to_string(), "cpu".to_string())]),
+        };
+
+        let error = orchestrator
+            .validate_nvidia_model_config_v1(&config)
+            .expect_err("full NVIDIA admission must reject every model without a GPU route");
+        let message = error.to_string();
+        assert!(
+            message.contains("online_hoeffding")
+                && message.contains("no compiled GPU implementation"),
+            "full-GPU refusal must name the exact missing model and capability: {message}"
+        );
+    }
+
+    #[cfg(feature = "statistical-gpu")]
+    #[test]
+    fn full_nvidia_model_validation_rejects_cpu_policy_even_when_gpu_code_is_compiled() {
+        let orchestrator = orchestrator_with_models(&["logistic"]);
+        let config = ModelConfig {
+            name: "logistic".to_string(),
+            model_type: ModelType::Logistic,
+            capability_family: ModelFamily::Meta,
+            capability_state: CapabilityState::Verified,
+            params: HashMap::from([("device".to_string(), "cpu".to_string())]),
+        };
+
+        let error = orchestrator
+            .validate_nvidia_model_config_v1(&config)
+            .expect_err("compiled GPU code must not excuse an explicit CPU policy");
+        assert!(
+            error.to_string().contains("exact CUDA ordinal 0"),
+            "CPU policy must fail as a device mismatch, not silently fall back: {error:#}"
+        );
     }
 
     #[test]
