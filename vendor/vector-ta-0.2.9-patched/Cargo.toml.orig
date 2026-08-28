@@ -1,0 +1,157 @@
+[package]
+name = "vector-ta"
+version = "0.2.9"
+edition = "2021"
+description = "High-performance Rust technical analysis indicators with optional SIMD/CUDA."
+license = "Apache-2.0"
+readme = "README.md"
+autobins = false
+homepage = "https://vectoralpha.dev/projects/ta"
+documentation = "https://vectoralpha.dev/projects/ta"
+repository = "https://github.com/VectorAlpha-dev/VectorTA"
+
+
+
+
+keywords = ["technical-analysis", "trading", "indicators", "finance"]
+categories = ["algorithms"]
+
+
+include = [
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/COPYRIGHT",
+  "/build.rs",
+  "/build_support/**/*.rs",
+  "/src/lib.rs",
+  "/src/bin/generate_references.rs",
+  "/src/bin/profile_yang_zhang_cuda.rs",
+  "/src/cuda/**/*.rs",
+  "/src/indicators/**/*.rs",
+  "/src/utilities/**/*.rs",
+  "/src/data/README.md",
+  "/src/data/**/*.vortex",
+  "/benches/**",
+  "/kernels/cuda/**/*.cu",
+  "/kernels/cuda/**/*.cuh",
+  "/tests/native_cuda_build_harness.rs",
+]
+
+[build-dependencies]
+jobserver = "0.1.34"
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+jobserver = "0.1.34"
+proptest = "1.7.0"
+
+[[bench]]
+name = "indicator_benchmark"
+harness = false
+
+[[bench]]
+name = "cuda_bench"
+harness = false
+required-features = ["cuda-build-native"]
+
+[[bench]]
+name = "cuda_dispatch_vram_benchmark"
+harness = false
+required-features = ["cuda-build-native"]
+
+[[bench]]
+name = "pattern_recognition_cuda_benchmark"
+harness = false
+required-features = ["cuda-build-native"]
+
+[[bin]]
+name = "generate_references"
+path = "src/bin/generate_references.rs"
+
+[[bin]]
+name = "profile_yang_zhang_cuda"
+path = "src/bin/profile_yang_zhang_cuda.rs"
+
+[[test]]
+name = "native_cuda_build_harness"
+path = "tests/native_cuda_build_harness.rs"
+harness = false
+
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4.39", default-features = false, features = ["std"] }
+thiserror = "2.0.9"
+once_cell = "1.21.3"
+paste = "1.0.15"
+anyhow = "1.0.98"
+aligned-vec = "0.6.4"
+itertools = "0.14.0"
+smallvec = "1.15.1"
+float-cmp = "0.10.0"
+cust = { version = "0.3.2", optional = true }
+cust_derive = { version = "0.2.0", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.10.0"
+ctor = "0.4.2"
+vortex-array = "0.67.0"
+vortex-file = "0.67.0"
+vortex-io = "0.67.0"
+vortex-layout = "0.67.0"
+vortex-session = "0.67.0"
+
+[lib]
+name = "vector_ta"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+doctest = false
+
+[profile.release]
+opt-level       = 3
+codegen-units   = 255
+incremental = false
+
+overflow-checks = false
+debug = false
+strip = "none"
+split-debuginfo = "unpacked"
+lto = "fat"
+
+
+[profile.bench]
+
+opt-level = 3
+lto = "fat"
+codegen-units = 255
+incremental = false
+overflow-checks = false
+debug = false
+strip = "none"
+split-debuginfo = "unpacked"
+
+[profile.dev]
+
+
+[profile.dev.build-override]
+
+opt-level = 0
+codegen-units = 16
+
+[features]
+default = []
+proptest = []
+nightly-avx = []
+cuda-build-native = ["cust", "cust_derive"]
+
+[profile.release.build-override]
+
+
+codegen-units = 255
+
+[profile.bench.build-override]
+
+codegen-units = 255

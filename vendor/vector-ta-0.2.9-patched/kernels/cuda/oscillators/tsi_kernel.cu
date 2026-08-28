@@ -1,0 +1,298 @@
+#ifndef _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+#define _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+#endif
+
+#include <cuda_runtime.h>
+#include <math.h>
+
+static __device__ __forceinline__ float clampf(float x, float lo, float hi) {
+    return fminf(hi, fmaxf(lo, x));
+}
+
+
+struct EmaKahan {
+    float y;
+    float c;
+};
+
+static __device__ __forceinline__ void ema_seed(EmaKahan& s, float seed) {
+    s.y = seed;
+    s.c = 0.0f;
+}
+
+
+static __device__ __forceinline__ void ema_update(EmaKahan& s, float a, float x) {
+    float d    = x - s.y;
+    float incr = fmaf(a, d, 0.0f);
+    float u    = incr - s.c;
+    float t    = s.y + u;
+    s.c        = (t - s.y) - u;
+    s.y        = t;
+}
+
+extern "C" __global__
+void tsi_batch_f32(const float* __restrict__ prices,
+                   const int* __restrict__ longs,
+                   const int* __restrict__ shorts,
+                   int series_len,
+                   int first_valid,
+                   int n_combos,
+                   float* __restrict__ out) {
+
+    const int combo = blockIdx.x;
+    if (combo >= n_combos) return;
+
+    if (threadIdx.x != 0) return;
+    if (first_valid < 0 || first_valid + 1 >= series_len) return;
+
+    const int base = combo * series_len;
+    const int L = longs[combo];
+    const int S = shorts[combo];
+    if (L <= 0 || S <= 0) return;
+
+    const int warm = first_valid + L + S;
+
+    const int warm_stop = warm < series_len ? warm : series_len;
+    for (int i = 0; i < warm_stop; ++i) out[base + i] = NAN;
+
+    const float aL = 2.0f / (float(L) + 1.0f);
+    const float aS = 2.0f / (float(S) + 1.0f);
+
+    float prev  = prices[first_valid];
+    float nextv = prices[first_valid + 1];
+    if (!isfinite(nextv)) return;
+
+    float first_m = nextv - prev;
+    prev = nextv;
+
+    EmaKahan numL, numS, denL, denS;
+    ema_seed(numL, first_m);
+    ema_seed(numS, first_m);
+    float first_am = fabsf(first_m);
+    ema_seed(denL, first_am);
+    ema_seed(denS, first_am);
+
+    for (int i = first_valid + 2; i < series_len; ++i) {
+        float cur = prices[i];
+        if (!isfinite(cur)) {
+            if (i >= warm) out[base + i] = NAN;
+            continue;
+        }
+        float m = cur - prev; prev = cur;
+        float am = fabsf(m);
+
+
+        ema_update(numL, aL, m);        ema_update(numS, aS, numL.y);
+        ema_update(denL, aL, am);       ema_update(denS, aS, denL.y);
+
+        if (i >= warm) {
+            float den = denS.y;
+            if (den == 0.0f || !isfinite(den)) {
+                out[base + i] = NAN;
+            } else {
+                float v = 100.0f * (numS.y / den);
+                out[base + i] = clampf(v, -100.0f, 100.0f);
+            }
+        }
+    }
+}
+
+
+extern "C" __global__
+void tsi_many_series_one_param_f32(const float* __restrict__ prices_tm,
+                                   int long_p,
+                                   int short_p,
+                                   int num_series,
+                                   int series_len,
+                                   const int* __restrict__ first_valids,
+                                   float* __restrict__ out_tm) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= num_series) return;
+    if (long_p <= 0 || short_p <= 0) return;
+
+    const float aL = 2.0f / (float(long_p) + 1.0f);
+    const float aS = 2.0f / (float(short_p) + 1.0f);
+
+    const int first = max(0, first_valids[s]);
+    if (first >= series_len) return;
+    const int warm = first + long_p + short_p;
+
+
+    const int warm_stop = warm < series_len ? warm : series_len;
+    for (int t = 0; t < warm_stop; ++t) {
+        out_tm[t * num_series + s] = NAN;
+    }
+
+    if (series_len <= first + 1) return;
+    const int idx0 = first * num_series + s;
+    float prev  = prices_tm[idx0];
+    float nextv = prices_tm[idx0 + num_series];
+    if (!isfinite(nextv)) return;
+
+    float first_m = nextv - prev;
+    prev = nextv;
+
+    EmaKahan numL, numS, denL, denS;
+    ema_seed(numL, first_m);
+    ema_seed(numS, first_m);
+    float first_am = fabsf(first_m);
+    ema_seed(denL, first_am);
+    ema_seed(denS, first_am);
+
+    for (int t = first + 2; t < series_len; ++t) {
+        const int idx = t * num_series + s;
+        float cur = prices_tm[idx];
+        if (!isfinite(cur)) {
+            if (t >= warm) out_tm[idx] = NAN;
+            continue;
+        }
+
+        float m = cur - prev; prev = cur;
+        float am = fabsf(m);
+
+        ema_update(numL, aL, m);        ema_update(numS, aS, numL.y);
+        ema_update(denL, aL, am);       ema_update(denS, aS, denL.y);
+
+        if (t >= warm) {
+            float den = denS.y;
+            if (den == 0.0f || !isfinite(den)) {
+                out_tm[idx] = NAN;
+            } else {
+                float v = 100.0f * (numS.y / den);
+                out_tm[idx] = clampf(v, -100.0f, 100.0f);
+            }
+        }
+    }
+}
+
+
+extern "C" __global__
+void tsi_prepare_momentum_f32(const float* __restrict__ prices,
+                              int series_len,
+                              int first_valid,
+                              float* __restrict__ mom,
+                              float* __restrict__ amom)
+{
+    const int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= series_len) return;
+
+
+    float mv = NAN;
+    float av = NAN;
+
+    if (first_valid >= 0 && (first_valid + 1) < series_len && t > first_valid) {
+
+
+        const float cur  = prices[t];
+        const float prev = prices[t - 1];
+        if (isfinite(cur) && isfinite(prev)) {
+            mv = cur - prev;
+            av = fabsf(mv);
+        }
+    }
+
+    mom[t]  = mv;
+    amom[t] = av;
+}
+
+
+extern "C" __global__
+void tsi_one_series_many_params_tm_f32(const float* __restrict__ mom,
+                                       const float* __restrict__ amom,
+                                       const int*   __restrict__ longs,
+                                       const int*   __restrict__ shorts,
+                                       int series_len,
+                                       int first_valid,
+                                       int n_combos,
+                                       float* __restrict__ out_tm) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+
+    const int L = longs[combo];
+    const int S = shorts[combo];
+    if (L <= 0 || S <= 0) return;
+
+    const int warm = first_valid + L + S;
+    const float aL = 2.0f / (float(L) + 1.0f);
+    const float aS = 2.0f / (float(S) + 1.0f);
+
+
+    const int warm_stop = warm < series_len ? warm : series_len;
+    for (int t = 0; t < warm_stop; ++t) {
+        out_tm[t * n_combos + combo] = NAN;
+    }
+    if (first_valid + 1 >= series_len) return;
+
+
+    float first_m = mom[first_valid + 1];
+    if (!isfinite(first_m)) return;
+
+    EmaKahan numL, numS, denL, denS;
+    ema_seed(numL, first_m);
+    ema_seed(numS, first_m);
+    float first_am = fabsf(first_m);
+    ema_seed(denL, first_am);
+    ema_seed(denS, first_am);
+
+
+    for (int t = first_valid + 2; t < series_len; ++t) {
+        const float m = mom[t];
+        if (!isfinite(m)) {
+            if (t >= warm) out_tm[t * n_combos + combo] = NAN;
+            continue;
+        }
+        const float am = amom[t];
+
+
+        ema_update(numL, aL, m);
+        ema_update(numS, aS, numL.y);
+
+        ema_update(denL, aL, am);
+        ema_update(denS, aS, denL.y);
+
+        if (t >= warm) {
+            const float den = denS.y;
+            if (den == 0.0f || !isfinite(den)) {
+                out_tm[t * n_combos + combo] = NAN;
+            } else {
+                float v = 100.0f * (numS.y / den);
+                out_tm[t * n_combos + combo] = clampf(v, -100.0f, 100.0f);
+            }
+        }
+    }
+}
+
+
+extern "C" __global__
+void transpose_tm_to_rm_f32(const float* __restrict__ in_tm,
+                            int rows, int cols,
+                            float* __restrict__ out_rm)
+{
+    __shared__ float tile[32][33];
+
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int yy = y + j;
+        if (x < cols && yy < rows) {
+            tile[threadIdx.y + j][threadIdx.x] = in_tm[yy * cols + x];
+        }
+    }
+    __syncthreads();
+
+
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        int yy = y + j;
+        if (x < rows && yy < cols) {
+            out_rm[yy * rows + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}

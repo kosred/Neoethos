@@ -1,0 +1,34 @@
+[package]
+name = "catboost-rust"
+version = "0.3.8"
+edition = "2024"
+description = "Rust bindings for CatBoost, a gradient boosting library for machine learning. Downloads CatBoost binaries at runtime for cross-platform compatibility."
+license = "Apache-2.0"
+repository = "https://github.com/aryehlev/catboost-rust"
+keywords = ["machine-learning", "gradient-boosting", "catboost", "ml"]
+categories = ["science"]
+readme = "README.md"
+rust-version = "1.85"
+
+[build-dependencies]
+bindgen = "0.72.0"
+ureq = "2.0"
+
+[features]
+gpu = []
+
+[[test]]
+name = "build_script_contract"
+path = "tests/build_script_contract.rs"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "advanced_usage"
+path = "examples/advanced_usage.rs"
+
+[[example]]
+name = "gpu_usage"
+path = "examples/gpu_usage.rs"

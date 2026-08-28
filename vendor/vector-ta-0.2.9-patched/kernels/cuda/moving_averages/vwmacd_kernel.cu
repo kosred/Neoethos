@@ -1,0 +1,960 @@
+#include <cuda_runtime.h>
+#include <math.h>
+
+static __device__ __forceinline__ float f32_nan() {
+    return __int_as_float(0x7fffffff);
+}
+
+extern "C" __global__ void vwmacd_build_prefix_one_series_f64(
+    const float* __restrict__ prices,
+    const float* __restrict__ volumes,
+    int len,
+    int first_valid,
+    double* __restrict__ pv_prefix,
+    double* __restrict__ vol_prefix)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (len < 0) return;
+
+    double acc_pv = 0.0;
+    double acc_vol = 0.0;
+    for (int i = 0; i < len; ++i) {
+        if (i >= first_valid) {
+            const double p = (double)prices[i];
+            const double v = (double)volumes[i];
+            if (isnan(p) || isnan(v) || isnan(acc_pv) || isnan(acc_vol)) {
+                acc_pv = nan("");
+                acc_vol = nan("");
+            } else {
+                acc_pv += p * v;
+                acc_vol += v;
+            }
+            pv_prefix[i] = acc_pv;
+            vol_prefix[i] = acc_vol;
+        } else {
+            pv_prefix[i] = 0.0;
+            vol_prefix[i] = 0.0;
+        }
+    }
+}
+
+
+extern "C" __global__ void vwmacd_build_prefix_time_major_f64(
+    const float* __restrict__ prices_tm,
+    const float* __restrict__ volumes_tm,
+    const int* __restrict__ first_valids,
+    int cols,
+    int rows,
+    double* __restrict__ pv_prefix_tm,
+    double* __restrict__ vol_prefix_tm)
+{
+    const int series = blockIdx.x * blockDim.x + threadIdx.x;
+    if (series >= cols || rows < 0) return;
+
+    const int first_valid = first_valids[series];
+    double acc_pv = 0.0;
+    double acc_vol = 0.0;
+
+    for (int r = 0; r < rows; ++r) {
+        const int idx = r * cols + series;
+        if (r >= first_valid) {
+            const double p = (double)prices_tm[idx];
+            const double v = (double)volumes_tm[idx];
+            if (isnan(p) || isnan(v) || isnan(acc_pv) || isnan(acc_vol)) {
+                acc_pv = nan("");
+                acc_vol = nan("");
+            } else {
+                acc_pv += p * v;
+                acc_vol += v;
+            }
+            pv_prefix_tm[idx] = acc_pv;
+            vol_prefix_tm[idx] = acc_vol;
+        } else {
+            pv_prefix_tm[idx] = 0.0;
+            vol_prefix_tm[idx] = 0.0;
+        }
+    }
+}
+
+
+extern "C" __global__ void vwmacd_batch_f32(
+    const double* __restrict__ pv_prefix,
+    const double* __restrict__ vol_prefix,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    float* __restrict__ out_macd,
+    float* __restrict__ out_signal,
+    float* __restrict__ out_hist)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+
+    const int base = row * len;
+
+
+    for (int i = 0; i < len; ++i) {
+        out_macd[base + i] = f32_nan();
+        out_signal[base + i] = f32_nan();
+        out_hist[base + i] = f32_nan();
+    }
+
+
+    for (int t = warm_macd; t < len; ++t) {
+        const int prev_f = t - f;
+        const int prev_s = t - s;
+
+        double sum_pv_f = pv_prefix[t];
+        double sum_v_f  = vol_prefix[t];
+        if (prev_f >= 0) {
+            sum_pv_f -= pv_prefix[prev_f];
+            sum_v_f  -= vol_prefix[prev_f];
+        }
+
+        double sum_pv_s = pv_prefix[t];
+        double sum_v_s  = vol_prefix[t];
+        if (prev_s >= 0) {
+            sum_pv_s -= pv_prefix[prev_s];
+            sum_v_s  -= vol_prefix[prev_s];
+        }
+
+        float macd_val = f32_nan();
+        if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+            const double fast_vwma = sum_pv_f / sum_v_f;
+            const double slow_vwma = sum_pv_s / sum_v_s;
+            macd_val = (float)(fast_vwma - slow_vwma);
+        }
+        out_macd[base + t] = macd_val;
+    }
+
+
+    if (warm_macd < len) {
+        const float alpha = 2.0f / (float)(g + 1);
+        const float beta  = 1.0f - alpha;
+        const int start = warm_macd;
+        const int warm_end = min(start + g, len);
+
+        if (start < len) {
+            float mean = out_macd[base + start];
+            out_signal[base + start] = mean;
+            int count = 1;
+            for (int i = start + 1; i < warm_end; ++i) {
+                const float x = out_macd[base + i];
+
+                const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+                mean = (float)m;
+                out_signal[base + i] = mean;
+                ++count;
+            }
+
+            float prev = mean;
+            for (int i = warm_end; i < len; ++i) {
+                const float x = out_macd[base + i];
+                prev = beta * prev + alpha * x;
+                out_signal[base + i] = prev;
+            }
+        }
+    }
+
+
+    for (int i = 0; i < min(warm_hist, len); ++i) {
+        out_signal[base + i] = f32_nan();
+        out_hist[base + i] = f32_nan();
+    }
+    for (int i = warm_hist; i < len; ++i) {
+        const float m = out_macd[base + i];
+        const float sgn = out_signal[base + i];
+        out_hist[base + i] = (!isnan(m) && !isnan(sgn)) ? (m - sgn) : f32_nan();
+    }
+}
+
+
+extern "C" __global__ void vwmacd_batch_macd_tiled_f32(
+    const double* __restrict__ pv_prefix,
+    const double* __restrict__ vol_prefix,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    int len,
+    int first_valid,
+    int n_rows,
+    float* __restrict__ out_macd)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= n_rows || t >= len) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int base = row * len;
+
+    if (t < warm_macd) {
+        out_macd[base + t] = f32_nan();
+        return;
+    }
+
+    const int prev_f = t - f;
+    const int prev_s = t - s;
+
+    double sum_pv_f = pv_prefix[t];
+    double sum_v_f  = vol_prefix[t];
+    if (prev_f >= 0) {
+        sum_pv_f -= pv_prefix[prev_f];
+        sum_v_f  -= vol_prefix[prev_f];
+    }
+
+    double sum_pv_s = pv_prefix[t];
+    double sum_v_s  = vol_prefix[t];
+    if (prev_s >= 0) {
+        sum_pv_s -= pv_prefix[prev_s];
+        sum_v_s  -= vol_prefix[prev_s];
+    }
+
+    float macd_val = f32_nan();
+    if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+        const double fast_vwma = sum_pv_f / sum_v_f;
+        const double slow_vwma = sum_pv_s / sum_v_s;
+        macd_val = (float)(fast_vwma - slow_vwma);
+    }
+    out_macd[base + t] = macd_val;
+}
+
+
+extern "C" __global__ void vwmacd_batch_signal_serial_f32(
+    const float* __restrict__ out_macd,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    float* __restrict__ out_signal)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+    const int base = row * len;
+
+    if (warm_macd >= len) return;
+
+    const float alpha = 2.0f / (float)(g + 1);
+    const float beta  = 1.0f - alpha;
+    const int start = warm_macd;
+    const int warm_end = min(start + g, len);
+
+    float mean = out_macd[base + start];
+    int count = 1;
+    for (int i = start + 1; i < warm_end; ++i) {
+        const float x = out_macd[base + i];
+        const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+        mean = (float)m;
+        ++count;
+    }
+
+    if (warm_hist < len) {
+        out_signal[base + warm_hist] = mean;
+    }
+
+    float prev = mean;
+    for (int i = warm_end; i < len; ++i) {
+        const float x = out_macd[base + i];
+        prev = beta * prev + alpha * x;
+        out_signal[base + i] = prev;
+    }
+}
+
+
+extern "C" __global__ void vwmacd_batch_hist_tiled_f32(
+    const float* __restrict__ out_macd,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    float* __restrict__ out_signal,
+    float* __restrict__ out_hist)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= n_rows || t >= len) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+    const int base = row * len;
+
+    if (t < warm_hist) {
+        out_signal[base + t] = f32_nan();
+        out_hist[base + t] = f32_nan();
+        return;
+    }
+
+    const float m = out_macd[base + t];
+    const float sgn = out_signal[base + t];
+    out_hist[base + t] = (!isnan(m) && !isnan(sgn)) ? (m - sgn) : f32_nan();
+}
+
+
+extern "C" __global__ void vwmacd_many_series_one_param_time_major_f32(
+    const double* __restrict__ pv_prefix_tm,
+    const double* __restrict__ vol_prefix_tm,
+    const int*    __restrict__ first_valids,
+    int fast,
+    int slow,
+    int signal,
+    int cols,
+    int rows,
+    float* __restrict__ out_macd_tm,
+    float* __restrict__ out_signal_tm,
+    float* __restrict__ out_hist_tm)
+{
+    const int series = blockIdx.x * blockDim.x + threadIdx.x;
+    if (series >= cols) return;
+
+    const int fv = first_valids[series];
+    const int warm_macd = fv + (fast > slow ? fast : slow) - 1;
+    const int warm_hist = warm_macd + signal - 1;
+
+
+    for (int r = 0; r < rows; ++r) {
+        const int idx = r * cols + series;
+        out_macd_tm[idx] = f32_nan();
+        out_signal_tm[idx] = f32_nan();
+        out_hist_tm[idx] = f32_nan();
+    }
+
+
+    for (int r = warm_macd; r < rows; ++r) {
+        const int prev_f = r - fast;
+        const int prev_s = r - slow;
+        const int idx = r * cols + series;
+
+        double sum_pv_f = pv_prefix_tm[idx];
+        double sum_v_f  = vol_prefix_tm[idx];
+        if (prev_f >= 0) {
+            const int pidx = prev_f * cols + series;
+            sum_pv_f -= pv_prefix_tm[pidx];
+            sum_v_f  -= vol_prefix_tm[pidx];
+        }
+        double sum_pv_s = pv_prefix_tm[idx];
+        double sum_v_s  = vol_prefix_tm[idx];
+        if (prev_s >= 0) {
+            const int pidx = prev_s * cols + series;
+            sum_pv_s -= pv_prefix_tm[pidx];
+            sum_v_s  -= vol_prefix_tm[pidx];
+        }
+
+        float macd_val = f32_nan();
+        if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+            const double fast_vwma = sum_pv_f / sum_v_f;
+            const double slow_vwma = sum_pv_s / sum_v_s;
+            macd_val = (float)(fast_vwma - slow_vwma);
+        }
+        out_macd_tm[idx] = macd_val;
+    }
+
+
+    if (warm_macd < rows) {
+        const float alpha = 2.0f / (float)(signal + 1);
+        const float beta  = 1.0f - alpha;
+        const int start = warm_macd;
+        const int warm_end = min(start + signal, rows);
+        if (start < rows) {
+            float mean = out_macd_tm[start * cols + series];
+            out_signal_tm[start * cols + series] = mean;
+            int count = 1;
+            for (int r = start + 1; r < warm_end; ++r) {
+                const float x = out_macd_tm[r * cols + series];
+                const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+                mean = (float)m;
+                out_signal_tm[r * cols + series] = mean;
+                ++count;
+            }
+            float prev = mean;
+            for (int r = warm_end; r < rows; ++r) {
+                const float x = out_macd_tm[r * cols + series];
+                prev = beta * prev + alpha * x;
+                out_signal_tm[r * cols + series] = prev;
+            }
+        }
+    }
+
+
+    for (int r = 0; r < min(warm_hist, rows); ++r) {
+        out_signal_tm[r * cols + series] = f32_nan();
+        out_hist_tm[r * cols + series] = f32_nan();
+    }
+    for (int r = warm_hist; r < rows; ++r) {
+        const int idx = r * cols + series;
+        const float m = out_macd_tm[idx];
+        const float s = out_signal_tm[idx];
+        out_hist_tm[idx] = (!isnan(m) && !isnan(s)) ? (m - s) : f32_nan();
+    }
+}
+
+
+// ===========================================================================
+// f64 LANE  --  shard S5
+// ===========================================================================
+//
+// The f32 entry points above are LEFT IN PLACE because the generated f32
+// dispatcher and this indicator's own `*_wrapper.rs` still launch them by
+// name. Everything below is the SAME algorithm at f64, in this same file, and
+// it is what the NeoEthos f64 lane consumes. Nothing here narrows, and nothing
+// here is fast-math:
+//
+//   * every `float` data pointer, local and shared array is `double`
+//   * every f32 literal lost its `f` suffix
+//   * expf/sqrtf/fmaxf/fminf/fabsf/powf/logf -> exp/sqrt/fmax/fmin/fabs/pow/log
+//   * __fadd_rn/__fsub_rn/__fmul_rn -> __dadd_rn/__dsub_rn/__dmul_rn
+//     __fmaf_rn -> __fma_rn  (ONE rounding, matching `f64::mul_add`)
+//     __fdividef -> __ddiv_rn and __frcp_rn -> __drcp_rn: those two are the
+//     FAST APPROXIMATE divide and reciprocal, and their f64 images here are
+//     the correctly-rounded operations, not a wider approximation
+//   * an f32 NaN bit pattern is NOT a NaN when reinterpreted as f64 --
+//     `__longlong_as_double(0x7fc00000)` is 2.09e-314, a finite denormal that
+//     compares ORDERED against everything, so a warmup prefix meant to read
+//     NaN would read ~0.0 instead. Every such site became the f64 pattern
+//     (0x7ff8000000000000 / 0x7fffffffffffffff).
+//   * every epsilon was RE-DERIVED at f64 width from the CPU reference rather
+//     than carried over; see the per-file note where one exists.
+// ===========================================================================
+
+static __device__ __forceinline__ double f64_nan() {
+    return __longlong_as_double(0x7fffffffffffffffULL);
+}
+extern "C" __global__ void vwmacd_build_prefix_one_series_all_f64(
+    const double* __restrict__ prices,
+    const double* __restrict__ volumes,
+    int len,
+    int first_valid,
+    double* __restrict__ pv_prefix,
+    double* __restrict__ vol_prefix)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (len < 0) return;
+
+    double acc_pv = 0.0;
+    double acc_vol = 0.0;
+    for (int i = 0; i < len; ++i) {
+        if (i >= first_valid) {
+            const double p = (double)prices[i];
+            const double v = (double)volumes[i];
+            if (isnan(p) || isnan(v) || isnan(acc_pv) || isnan(acc_vol)) {
+                acc_pv = nan("");
+                acc_vol = nan("");
+            } else {
+                acc_pv += p * v;
+                acc_vol += v;
+            }
+            pv_prefix[i] = acc_pv;
+            vol_prefix[i] = acc_vol;
+        } else {
+            pv_prefix[i] = 0.0;
+            vol_prefix[i] = 0.0;
+        }
+    }
+}
+extern "C" __global__ void vwmacd_build_prefix_time_major_all_f64(
+    const double* __restrict__ prices_tm,
+    const double* __restrict__ volumes_tm,
+    const int* __restrict__ first_valids,
+    int cols,
+    int rows,
+    double* __restrict__ pv_prefix_tm,
+    double* __restrict__ vol_prefix_tm)
+{
+    const int series = blockIdx.x * blockDim.x + threadIdx.x;
+    if (series >= cols || rows < 0) return;
+
+    const int first_valid = first_valids[series];
+    double acc_pv = 0.0;
+    double acc_vol = 0.0;
+
+    for (int r = 0; r < rows; ++r) {
+        const int idx = r * cols + series;
+        if (r >= first_valid) {
+            const double p = (double)prices_tm[idx];
+            const double v = (double)volumes_tm[idx];
+            if (isnan(p) || isnan(v) || isnan(acc_pv) || isnan(acc_vol)) {
+                acc_pv = nan("");
+                acc_vol = nan("");
+            } else {
+                acc_pv += p * v;
+                acc_vol += v;
+            }
+            pv_prefix_tm[idx] = acc_pv;
+            vol_prefix_tm[idx] = acc_vol;
+        } else {
+            pv_prefix_tm[idx] = 0.0;
+            vol_prefix_tm[idx] = 0.0;
+        }
+    }
+}
+extern "C" __global__ void vwmacd_batch_f64(
+    const double* __restrict__ pv_prefix,
+    const double* __restrict__ vol_prefix,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    double* __restrict__ out_macd,
+    double* __restrict__ out_signal,
+    double* __restrict__ out_hist)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+
+    const int base = row * len;
+
+
+    for (int i = 0; i < len; ++i) {
+        out_macd[base + i] = f64_nan();
+        out_signal[base + i] = f64_nan();
+        out_hist[base + i] = f64_nan();
+    }
+
+
+    for (int t = warm_macd; t < len; ++t) {
+        const int prev_f = t - f;
+        const int prev_s = t - s;
+
+        double sum_pv_f = pv_prefix[t];
+        double sum_v_f  = vol_prefix[t];
+        if (prev_f >= 0) {
+            sum_pv_f -= pv_prefix[prev_f];
+            sum_v_f  -= vol_prefix[prev_f];
+        }
+
+        double sum_pv_s = pv_prefix[t];
+        double sum_v_s  = vol_prefix[t];
+        if (prev_s >= 0) {
+            sum_pv_s -= pv_prefix[prev_s];
+            sum_v_s  -= vol_prefix[prev_s];
+        }
+
+        double macd_val = f64_nan();
+        if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+            const double fast_vwma = sum_pv_f / sum_v_f;
+            const double slow_vwma = sum_pv_s / sum_v_s;
+            macd_val = (double)(fast_vwma - slow_vwma);
+        }
+        out_macd[base + t] = macd_val;
+    }
+
+
+    if (warm_macd < len) {
+        const double alpha = 2.0 / (double)(g + 1);
+        const double beta  = 1.0 - alpha;
+        const int start = warm_macd;
+        const int warm_end = min(start + g, len);
+
+        if (start < len) {
+            double mean = out_macd[base + start];
+            out_signal[base + start] = mean;
+            int count = 1;
+            for (int i = start + 1; i < warm_end; ++i) {
+                const double x = out_macd[base + i];
+
+                const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+                mean = (double)m;
+                out_signal[base + i] = mean;
+                ++count;
+            }
+
+            double prev = mean;
+            for (int i = warm_end; i < len; ++i) {
+                const double x = out_macd[base + i];
+                prev = beta * prev + alpha * x;
+                out_signal[base + i] = prev;
+            }
+        }
+    }
+
+
+    for (int i = 0; i < min(warm_hist, len); ++i) {
+        out_signal[base + i] = f64_nan();
+        out_hist[base + i] = f64_nan();
+    }
+    for (int i = warm_hist; i < len; ++i) {
+        const double m = out_macd[base + i];
+        const double sgn = out_signal[base + i];
+        out_hist[base + i] = (!isnan(m) && !isnan(sgn)) ? (m - sgn) : f64_nan();
+    }
+}
+extern "C" __global__ void vwmacd_batch_macd_tiled_f64(
+    const double* __restrict__ pv_prefix,
+    const double* __restrict__ vol_prefix,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    int len,
+    int first_valid,
+    int n_rows,
+    double* __restrict__ out_macd)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= n_rows || t >= len) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int base = row * len;
+
+    if (t < warm_macd) {
+        out_macd[base + t] = f64_nan();
+        return;
+    }
+
+    const int prev_f = t - f;
+    const int prev_s = t - s;
+
+    double sum_pv_f = pv_prefix[t];
+    double sum_v_f  = vol_prefix[t];
+    if (prev_f >= 0) {
+        sum_pv_f -= pv_prefix[prev_f];
+        sum_v_f  -= vol_prefix[prev_f];
+    }
+
+    double sum_pv_s = pv_prefix[t];
+    double sum_v_s  = vol_prefix[t];
+    if (prev_s >= 0) {
+        sum_pv_s -= pv_prefix[prev_s];
+        sum_v_s  -= vol_prefix[prev_s];
+    }
+
+    double macd_val = f64_nan();
+    if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+        const double fast_vwma = sum_pv_f / sum_v_f;
+        const double slow_vwma = sum_pv_s / sum_v_s;
+        macd_val = (double)(fast_vwma - slow_vwma);
+    }
+    out_macd[base + t] = macd_val;
+}
+extern "C" __global__ void vwmacd_batch_signal_serial_f64(
+    const double* __restrict__ out_macd,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    double* __restrict__ out_signal)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+    const int base = row * len;
+
+    if (warm_macd >= len) return;
+
+    const double alpha = 2.0 / (double)(g + 1);
+    const double beta  = 1.0 - alpha;
+    const int start = warm_macd;
+    const int warm_end = min(start + g, len);
+
+    double mean = out_macd[base + start];
+    int count = 1;
+    for (int i = start + 1; i < warm_end; ++i) {
+        const double x = out_macd[base + i];
+        const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+        mean = (double)m;
+        ++count;
+    }
+
+    if (warm_hist < len) {
+        out_signal[base + warm_hist] = mean;
+    }
+
+    double prev = mean;
+    for (int i = warm_end; i < len; ++i) {
+        const double x = out_macd[base + i];
+        prev = beta * prev + alpha * x;
+        out_signal[base + i] = prev;
+    }
+}
+extern "C" __global__ void vwmacd_batch_hist_tiled_f64(
+    const double* __restrict__ out_macd,
+    const int* __restrict__ fasts,
+    const int* __restrict__ slows,
+    const int* __restrict__ sigs,
+    int len,
+    int first_valid,
+    int n_rows,
+    double* __restrict__ out_signal,
+    double* __restrict__ out_hist)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= n_rows || t >= len) return;
+
+    const int f = fasts[row];
+    const int s = slows[row];
+    const int g = sigs[row];
+    const int warm_macd = first_valid + (f > s ? f : s) - 1;
+    const int warm_hist = warm_macd + g - 1;
+    const int base = row * len;
+
+    if (t < warm_hist) {
+        out_signal[base + t] = f64_nan();
+        out_hist[base + t] = f64_nan();
+        return;
+    }
+
+    const double m = out_macd[base + t];
+    const double sgn = out_signal[base + t];
+    out_hist[base + t] = (!isnan(m) && !isnan(sgn)) ? (m - sgn) : f64_nan();
+}
+extern "C" __global__ void vwmacd_many_series_one_param_time_major_f64(
+    const double* __restrict__ pv_prefix_tm,
+    const double* __restrict__ vol_prefix_tm,
+    const int*    __restrict__ first_valids,
+    int fast,
+    int slow,
+    int signal,
+    int cols,
+    int rows,
+    double* __restrict__ out_macd_tm,
+    double* __restrict__ out_signal_tm,
+    double* __restrict__ out_hist_tm)
+{
+    const int series = blockIdx.x * blockDim.x + threadIdx.x;
+    if (series >= cols) return;
+
+    const int fv = first_valids[series];
+    const int warm_macd = fv + (fast > slow ? fast : slow) - 1;
+    const int warm_hist = warm_macd + signal - 1;
+
+
+    for (int r = 0; r < rows; ++r) {
+        const int idx = r * cols + series;
+        out_macd_tm[idx] = f64_nan();
+        out_signal_tm[idx] = f64_nan();
+        out_hist_tm[idx] = f64_nan();
+    }
+
+
+    for (int r = warm_macd; r < rows; ++r) {
+        const int prev_f = r - fast;
+        const int prev_s = r - slow;
+        const int idx = r * cols + series;
+
+        double sum_pv_f = pv_prefix_tm[idx];
+        double sum_v_f  = vol_prefix_tm[idx];
+        if (prev_f >= 0) {
+            const int pidx = prev_f * cols + series;
+            sum_pv_f -= pv_prefix_tm[pidx];
+            sum_v_f  -= vol_prefix_tm[pidx];
+        }
+        double sum_pv_s = pv_prefix_tm[idx];
+        double sum_v_s  = vol_prefix_tm[idx];
+        if (prev_s >= 0) {
+            const int pidx = prev_s * cols + series;
+            sum_pv_s -= pv_prefix_tm[pidx];
+            sum_v_s  -= vol_prefix_tm[pidx];
+        }
+
+        double macd_val = f64_nan();
+        if (!isnan(sum_v_f) && !isnan(sum_v_s) && sum_v_f != 0.0 && sum_v_s != 0.0) {
+            const double fast_vwma = sum_pv_f / sum_v_f;
+            const double slow_vwma = sum_pv_s / sum_v_s;
+            macd_val = (double)(fast_vwma - slow_vwma);
+        }
+        out_macd_tm[idx] = macd_val;
+    }
+
+
+    if (warm_macd < rows) {
+        const double alpha = 2.0 / (double)(signal + 1);
+        const double beta  = 1.0 - alpha;
+        const int start = warm_macd;
+        const int warm_end = min(start + signal, rows);
+        if (start < rows) {
+            double mean = out_macd_tm[start * cols + series];
+            out_signal_tm[start * cols + series] = mean;
+            int count = 1;
+            for (int r = start + 1; r < warm_end; ++r) {
+                const double x = out_macd_tm[r * cols + series];
+                const double m = ((double)(count) * (double)mean + (double)x) / (double)(count + 1);
+                mean = (double)m;
+                out_signal_tm[r * cols + series] = mean;
+                ++count;
+            }
+            double prev = mean;
+            for (int r = warm_end; r < rows; ++r) {
+                const double x = out_macd_tm[r * cols + series];
+                prev = beta * prev + alpha * x;
+                out_signal_tm[r * cols + series] = prev;
+            }
+        }
+    }
+
+
+    for (int r = 0; r < min(warm_hist, rows); ++r) {
+        out_signal_tm[r * cols + series] = f64_nan();
+        out_hist_tm[r * cols + series] = f64_nan();
+    }
+    for (int r = warm_hist; r < rows; ++r) {
+        const int idx = r * cols + series;
+        const double m = out_macd_tm[idx];
+        const double s = out_signal_tm[idx];
+        out_hist_tm[idx] = (!isnan(m) && !isnan(s)) ? (m - s) : f64_nan();
+    }
+}
+
+/* ===========================================================================
+ * NEOETHOS f64 LANE  --  closer 5, round 3   (vwmacd)
+ *
+ * CPU reference: `vwmacd_scalar_classic` (src/indicators/vwmacd.rs:711),
+ *   reached from `vwmacd_prepare` (:1637) whose `chosen` is FORCED to
+ *   `Kernel::Scalar` whenever the three ma types are the CPU defaults
+ *   sma/sma/ema (:1711-1714). So the scalar path is not one option among
+ *   several here -- it is THE path the dispatcher takes, and therefore the
+ *   only oracle.
+ *
+ * Column: output_id "value" -> `VwmacdOutputField::Macd`
+ *   (cpu_batch.rs:5711-5713).
+ *
+ * PERIOD-INVARIANT: `compute_vwmacd_batch` reads `fast`/`fast_period` (12),
+ *   `slow`/`slow_period` (26) and `signal`/`signal_period` (9)
+ *   (cpu_batch.rs:5736-5741) and NEVER a parameter named `period`, so five
+ *   swept periods produce five identical CPU columns and this kernel emits
+ *   five identical rows.
+ *
+ * Input: (close, volume) -- `extract_close_volume_input("vwmacd", .., "close")`
+ *   (cpu_batch.rs:5709) -> F64InputKind::CloseVolume.
+ *
+ * FIRST-VALID: `first_valid_pair` (:317-321) is the first index at which
+ *   close AND volume are BOTH non-NaN -- exactly
+ *   F64FirstValidRule::AllInputsNonNan over the two series this kind names.
+ *
+ * Shape: ONE THREAD PER COLUMN, bars ascending. The four volume-weighted
+ *   accumulators (f_cv, f_v, s_cv, s_v) are carried subtract-then-add across
+ *   bars; a prefix-sum reformulation would re-associate every one of them and
+ *   the macd feeds a threshold comparison.
+ *
+ * Roundings, counted against the CPU line:
+ *   `let cv_i = close[i] * v_i;`               (:742)  -- ONE multiply, no fma.
+ *   `f_cv += cv_i; f_v += v_i; s_cv += cv_i; s_v += v_i;` (:744-747)
+ *   `dst_macd[i] = fast_vwma - slow_vwma;`     (:769)  -- two divides, one sub.
+ *   The CPU does NOT use mul_add anywhere on this column, so neither does this
+ *   kernel: an fma here would drop a rounding the reference performs.
+ *
+ * NaN semantics: the CPU guards only `f_v != 0.0 && s_v != 0.0` (:766) and
+ *   lets a NaN close or volume propagate through the sums. Reproduced as
+ *   written -- there is no max/min on this column, so rule 4 does not bite.
+ *
+ * Retires nothing: the five MIXED `float*`/`double*` stages in this file stay
+ *   for the 180 wrappers that still call them. Our lane never touches them --
+ *   `F64Kernel::Vwmacd` resolves to THIS symbol by table, never by suffix.
+ * =========================================================================== */
+
+#ifndef NEO_F64_NAN
+#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
+#endif
+
+/* Defaults from cpu_batch.rs:5736-5741. */
+#define NEO_VWMACD_FAST   12
+#define NEO_VWMACD_SLOW   26
+#define NEO_VWMACD_SIGNAL 9
+
+extern "C" __global__
+void vwmacd_neo_batch_f64(const double* __restrict__ close,
+                          const double* __restrict__ volume,
+                          int n,
+                          const int* __restrict__ periods,
+                          int n_combos,
+                          int first_valid,
+                          double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)periods; /* period-invariant -- see header */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+
+    const int fast   = NEO_VWMACD_FAST;
+    const int slow   = NEO_VWMACD_SLOW;
+    const int signal = NEO_VWMACD_SIGNAL;
+
+    /* `vwmacd_prepare` :1688 refuses any of the three above `len`. */
+    if (fast > n || slow > n || signal > n) return;
+
+    const int first = first_valid;
+    if (first < 0 || first >= n) return;
+    /* :1699 -- NotEnoughValidData. */
+    if (n - first < slow) return;
+
+    const int macd_warm = first + (fast > slow ? fast : slow) - 1;
+
+    double f_cv = 0.0, f_v = 0.0, s_cv = 0.0, s_v = 0.0;
+
+    for (int i = first; i < n; ++i) {
+        const double v_i  = volume[i];
+        const double cv_i = close[i] * v_i;
+
+        f_cv += cv_i;
+        f_v  += v_i;
+        s_cv += cv_i;
+        s_v  += v_i;
+
+        const int n_since_first = i - first + 1;
+        if (n_since_first > fast) {
+            const int    j    = i - fast;
+            const double v_o  = volume[j];
+            const double cv_o = close[j] * v_o;
+            f_cv -= cv_o;
+            f_v  -= v_o;
+        }
+        if (n_since_first > slow) {
+            const int    j    = i - slow;
+            const double v_o  = volume[j];
+            const double cv_o = close[j] * v_o;
+            s_cv -= cv_o;
+            s_v  -= v_o;
+        }
+
+        if (i >= macd_warm) {
+            if (f_v != 0.0 && s_v != 0.0) {
+                const double fast_vwma = f_cv / f_v;
+                const double slow_vwma = s_cv / s_v;
+                o[i] = fast_vwma - slow_vwma;
+            } else {
+                o[i] = NEO_F64_NAN;
+            }
+        }
+    }
+}

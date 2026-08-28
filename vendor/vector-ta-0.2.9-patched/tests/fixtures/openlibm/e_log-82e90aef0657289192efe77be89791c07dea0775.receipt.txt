@@ -1,0 +1,8 @@
+OpenLibm e_log.c immutable Fisher f64 v2 audit receipt
+commit=82e90aef0657289192efe77be89791c07dea0775
+source_url=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/src/e_log.c
+license_url=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/LICENSE.md
+sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD
+license=Sun fdlibm notice embedded in e_log.c
+runtime_dependency=false
+purpose=immutable audit oracle for constants and branch order only

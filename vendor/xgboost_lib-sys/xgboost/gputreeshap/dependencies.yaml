@@ -1,0 +1,69 @@
+# Dependency list for https://github.com/rapidsai/dependency-file-generator
+files:
+  build:
+    output: none
+    includes:
+      - build
+      - cuda_version
+      - cuda
+      - docs
+  checks:
+    output: none
+    includes:
+      - checks
+channels:
+  - rapidsai
+  - conda-forge
+dependencies:
+  build:
+    common:
+      - output_types: conda
+        packages:
+          - binutils
+          - cmake
+          - gcc=11.*
+          - gxx=11.*
+          - make
+  checks:
+    common:
+      - output_types: [conda, requirements]
+        packages:
+          - pre-commit
+  cuda_version:
+    specific:
+      - output_types: conda
+        matrices:
+          - matrix:
+              cuda: "11.8"
+            packages:
+              - cuda-version=11.8
+          - matrix:
+              cuda: "12.0"
+            packages:
+              - cuda-version=12.0
+          - matrix:
+              cuda: "12.2"
+            packages:
+              - cuda-version=12.2
+          - matrix:
+              cuda: "12.5"
+            packages:
+              - cuda-version=12.5
+  cuda:
+    specific:
+      - output_types: conda
+        matrices:
+          - matrix:
+              cuda: "12.*"
+            packages:
+              - cuda-nvcc
+              - cuda-cudart-dev
+          - matrix:
+              cuda: "11.*"
+            # GPUTreeShap CI uses the container's CUDA 11.8.
+            packages:
+  docs:
+    common:
+      - output_types: conda
+        packages:
+          - doxygen

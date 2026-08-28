@@ -1,0 +1,40 @@
+[package]
+name = "lightgbm3"
+version = "1.0.10"
+edition = "2021"
+authors = [
+  "Dmitry Mottl <dmitry.mottl@gmail.com>",
+  "vaaaaanquish <6syun9@gmail.com>",
+  "paq <89paku@gmail.com>",
+  "Benjamin Ellis <benjaminjellis@protonmail.com>",
+]
+license = "MIT"
+repository = "https://github.com/Mottl/lightgbm3-rs"
+description = "Rust bindings for LightGBM library"
+documentation = "https://docs.rs/lightgbm3/"
+keywords = ["lightgbm", "machine-learning", "gradient-boosting"]
+categories = ["api-bindings", "science"]
+readme = "README.md"
+exclude = [".gitignore", ".github", ".gitmodules", "examples", "benches", "lightgbm3-sys"]
+
+[dependencies]
+lightgbm3-sys = { path = "lightgbm3-sys", version = "1" }
+serde_json = "1"
+polars = { version = ">=0.47", optional = true }
+
+[features]
+default = []
+polars = ["dep:polars"]
+openmp = ["lightgbm3-sys/openmp"]
+gpu    = ["lightgbm3-sys/gpu"]
+cuda   = ["lightgbm3-sys/cuda"]
+
+[[bench]]
+name = "regression"
+path = "benches/regression.rs"
+harness = false
+
+[dev-dependencies]
+rand = "0.9"
+rand_distr = "0.5"
+csv = "1.3"

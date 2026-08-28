@@ -1,0 +1,2061 @@
+use crate::utilities::data_loader::Candles;
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::collections::VecDeque;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use thiserror::Error;
+
+const DEFAULT_LENGTH: usize = 50;
+const DEFAULT_MULT: f64 = 2.0;
+const DEFAULT_ALPHA: f64 = 1.0;
+const DEFAULT_BETA: f64 = 0.5;
+const TWO_PI: f64 = core::f64::consts::PI * 2.0;
+const WEIGHT_SUM_EPS: f64 = 1e-12;
+
+#[derive(Debug, Clone)]
+pub enum AdjustableMaAlternatingExtremitiesData<'a> {
+    Candles {
+        candles: &'a Candles,
+    },
+    Slices {
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AdjustableMaAlternatingExtremitiesOutput {
+    pub ma: Vec<f64>,
+    pub upper: Vec<f64>,
+    pub lower: Vec<f64>,
+    pub extremity: Vec<f64>,
+    pub state: Vec<f64>,
+    pub changed: Vec<f64>,
+    pub smoothed_open: Vec<f64>,
+    pub smoothed_high: Vec<f64>,
+    pub smoothed_low: Vec<f64>,
+    pub smoothed_close: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AdjustableMaAlternatingExtremitiesOutputField {
+    Ma,
+    Upper,
+    Lower,
+    Extremity,
+    State,
+    Changed,
+    SmoothedOpen,
+    SmoothedHigh,
+    SmoothedLow,
+    SmoothedClose,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdjustableMaAlternatingExtremitiesParams {
+    pub length: Option<usize>,
+    pub mult: Option<f64>,
+    pub alpha: Option<f64>,
+    pub beta: Option<f64>,
+}
+
+impl Default for AdjustableMaAlternatingExtremitiesParams {
+    fn default() -> Self {
+        Self {
+            length: Some(DEFAULT_LENGTH),
+            mult: Some(DEFAULT_MULT),
+            alpha: Some(DEFAULT_ALPHA),
+            beta: Some(DEFAULT_BETA),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdjustableMaAlternatingExtremitiesInput<'a> {
+    pub data: AdjustableMaAlternatingExtremitiesData<'a>,
+    pub params: AdjustableMaAlternatingExtremitiesParams,
+}
+
+impl<'a> AdjustableMaAlternatingExtremitiesInput<'a> {
+    #[inline]
+    pub fn from_candles(
+        candles: &'a Candles,
+        params: AdjustableMaAlternatingExtremitiesParams,
+    ) -> Self {
+        Self {
+            data: AdjustableMaAlternatingExtremitiesData::Candles { candles },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn from_slices(
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        params: AdjustableMaAlternatingExtremitiesParams,
+    ) -> Self {
+        Self {
+            data: AdjustableMaAlternatingExtremitiesData::Slices { high, low, close },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, AdjustableMaAlternatingExtremitiesParams::default())
+    }
+
+    #[inline(always)]
+    pub fn get_length(&self) -> usize {
+        self.params.length.unwrap_or(DEFAULT_LENGTH)
+    }
+    #[inline(always)]
+    pub fn get_mult(&self) -> f64 {
+        self.params.mult.unwrap_or(DEFAULT_MULT)
+    }
+    #[inline(always)]
+    pub fn get_alpha(&self) -> f64 {
+        self.params.alpha.unwrap_or(DEFAULT_ALPHA)
+    }
+    #[inline(always)]
+    pub fn get_beta(&self) -> f64 {
+        self.params.beta.unwrap_or(DEFAULT_BETA)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AdjustableMaAlternatingExtremitiesBuilder {
+    length: Option<usize>,
+    mult: Option<f64>,
+    alpha: Option<f64>,
+    beta: Option<f64>,
+    kernel: Kernel,
+}
+
+impl Default for AdjustableMaAlternatingExtremitiesBuilder {
+    fn default() -> Self {
+        Self {
+            length: None,
+            mult: None,
+            alpha: None,
+            beta: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl AdjustableMaAlternatingExtremitiesBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn length(mut self, value: usize) -> Self {
+        self.length = Some(value);
+        self
+    }
+    #[inline(always)]
+    pub fn mult(mut self, value: f64) -> Self {
+        self.mult = Some(value);
+        self
+    }
+    #[inline(always)]
+    pub fn alpha(mut self, value: f64) -> Self {
+        self.alpha = Some(value);
+        self
+    }
+    #[inline(always)]
+    pub fn beta(mut self, value: f64) -> Self {
+        self.beta = Some(value);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, value: Kernel) -> Self {
+        self.kernel = value;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(
+        self,
+        candles: &Candles,
+    ) -> Result<AdjustableMaAlternatingExtremitiesOutput, AdjustableMaAlternatingExtremitiesError>
+    {
+        let input = AdjustableMaAlternatingExtremitiesInput::from_candles(
+            candles,
+            AdjustableMaAlternatingExtremitiesParams {
+                length: self.length,
+                mult: self.mult,
+                alpha: self.alpha,
+                beta: self.beta,
+            },
+        );
+        adjustable_ma_alternating_extremities_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> Result<AdjustableMaAlternatingExtremitiesOutput, AdjustableMaAlternatingExtremitiesError>
+    {
+        let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
+            high,
+            low,
+            close,
+            AdjustableMaAlternatingExtremitiesParams {
+                length: self.length,
+                mult: self.mult,
+                alpha: self.alpha,
+                beta: self.beta,
+            },
+        );
+        adjustable_ma_alternating_extremities_with_kernel(&input, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(
+        self,
+    ) -> Result<AdjustableMaAlternatingExtremitiesStream, AdjustableMaAlternatingExtremitiesError>
+    {
+        AdjustableMaAlternatingExtremitiesStream::try_new(
+            AdjustableMaAlternatingExtremitiesParams {
+                length: self.length,
+                mult: self.mult,
+                alpha: self.alpha,
+                beta: self.beta,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum AdjustableMaAlternatingExtremitiesError {
+    #[error("adjustable_ma_alternating_extremities: input data slice is empty")]
+    EmptyInputData,
+    #[error(
+        "adjustable_ma_alternating_extremities: data length mismatch: high={high}, low={low}, close={close}"
+    )]
+    DataLengthMismatch {
+        high: usize,
+        low: usize,
+        close: usize,
+    },
+    #[error("adjustable_ma_alternating_extremities: all values are NaN")]
+    AllValuesNaN,
+    #[error(
+        "adjustable_ma_alternating_extremities: invalid length: length = {length}, data length = {data_len}"
+    )]
+    InvalidLength { length: usize, data_len: usize },
+    #[error(
+        "adjustable_ma_alternating_extremities: not enough valid data: needed = {needed}, valid = {valid}"
+    )]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("adjustable_ma_alternating_extremities: invalid mult: {mult}")]
+    InvalidMult { mult: f64 },
+    #[error("adjustable_ma_alternating_extremities: invalid alpha: {alpha}")]
+    InvalidAlpha { alpha: f64 },
+    #[error("adjustable_ma_alternating_extremities: invalid beta: {beta}")]
+    InvalidBeta { beta: f64 },
+    #[error(
+        "adjustable_ma_alternating_extremities: degenerate kernel weights for alpha={alpha}, beta={beta}"
+    )]
+    DegenerateKernel { alpha: f64, beta: f64 },
+    #[error(
+        "adjustable_ma_alternating_extremities: output length mismatch: expected {expected}, got {got}"
+    )]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error(
+        "adjustable_ma_alternating_extremities: invalid range: start={start}, end={end}, step={step}"
+    )]
+    InvalidRange {
+        start: String,
+        end: String,
+        step: String,
+    },
+    #[error("adjustable_ma_alternating_extremities: invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputWarmups {
+    ma: usize,
+    open: usize,
+    bands: usize,
+}
+
+#[derive(Clone)]
+struct PreparedInput<'a> {
+    high: &'a [f64],
+    low: &'a [f64],
+    close: &'a [f64],
+    len: usize,
+    length: usize,
+    mult: f64,
+    weights: Vec<f64>,
+    first: usize,
+    warmups: OutputWarmups,
+    kernel: Kernel,
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities(
+    input: &AdjustableMaAlternatingExtremitiesInput<'_>,
+) -> Result<AdjustableMaAlternatingExtremitiesOutput, AdjustableMaAlternatingExtremitiesError> {
+    adjustable_ma_alternating_extremities_with_kernel(input, Kernel::Auto)
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities_with_kernel(
+    input: &AdjustableMaAlternatingExtremitiesInput<'_>,
+    kernel: Kernel,
+) -> Result<AdjustableMaAlternatingExtremitiesOutput, AdjustableMaAlternatingExtremitiesError> {
+    let prepared = prepare_input(input, kernel)?;
+
+    let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+    let mut upper = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+    let mut lower = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+    let mut extremity = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+    let mut state = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+    let mut changed = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+    let mut smoothed_open = alloc_with_nan_prefix(prepared.len, prepared.warmups.open);
+    let mut smoothed_high = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+    let mut smoothed_low = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+    let mut smoothed_close = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+
+    compute_into_slices(
+        &prepared,
+        &mut ma,
+        &mut upper,
+        &mut lower,
+        &mut extremity,
+        &mut state,
+        &mut changed,
+        &mut smoothed_open,
+        &mut smoothed_high,
+        &mut smoothed_low,
+        &mut smoothed_close,
+    );
+
+    Ok(AdjustableMaAlternatingExtremitiesOutput {
+        ma,
+        upper,
+        lower,
+        extremity,
+        state,
+        changed,
+        smoothed_open,
+        smoothed_high,
+        smoothed_low,
+        smoothed_close,
+    })
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities_into(
+    input: &AdjustableMaAlternatingExtremitiesInput<'_>,
+    ma: &mut [f64],
+    upper: &mut [f64],
+    lower: &mut [f64],
+    extremity: &mut [f64],
+    state: &mut [f64],
+    changed: &mut [f64],
+    smoothed_open: &mut [f64],
+    smoothed_high: &mut [f64],
+    smoothed_low: &mut [f64],
+    smoothed_close: &mut [f64],
+) -> Result<(), AdjustableMaAlternatingExtremitiesError> {
+    adjustable_ma_alternating_extremities_into_slices(
+        input,
+        Kernel::Auto,
+        ma,
+        upper,
+        lower,
+        extremity,
+        state,
+        changed,
+        smoothed_open,
+        smoothed_high,
+        smoothed_low,
+        smoothed_close,
+    )
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities_into_slices(
+    input: &AdjustableMaAlternatingExtremitiesInput<'_>,
+    kernel: Kernel,
+    ma: &mut [f64],
+    upper: &mut [f64],
+    lower: &mut [f64],
+    extremity: &mut [f64],
+    state: &mut [f64],
+    changed: &mut [f64],
+    smoothed_open: &mut [f64],
+    smoothed_high: &mut [f64],
+    smoothed_low: &mut [f64],
+    smoothed_close: &mut [f64],
+) -> Result<(), AdjustableMaAlternatingExtremitiesError> {
+    let prepared = prepare_input(input, kernel)?;
+    let expected = prepared.len;
+    for out in [
+        ma.len(),
+        upper.len(),
+        lower.len(),
+        extremity.len(),
+        state.len(),
+        changed.len(),
+        smoothed_open.len(),
+        smoothed_high.len(),
+        smoothed_low.len(),
+        smoothed_close.len(),
+    ] {
+        if out != expected {
+            return Err(
+                AdjustableMaAlternatingExtremitiesError::OutputLengthMismatch {
+                    expected,
+                    got: out,
+                },
+            );
+        }
+    }
+    ma.fill(f64::NAN);
+    upper.fill(f64::NAN);
+    lower.fill(f64::NAN);
+    extremity.fill(f64::NAN);
+    state.fill(f64::NAN);
+    changed.fill(f64::NAN);
+    smoothed_open.fill(f64::NAN);
+    smoothed_high.fill(f64::NAN);
+    smoothed_low.fill(f64::NAN);
+    smoothed_close.fill(f64::NAN);
+    compute_into_slices(
+        &prepared,
+        ma,
+        upper,
+        lower,
+        extremity,
+        state,
+        changed,
+        smoothed_open,
+        smoothed_high,
+        smoothed_low,
+        smoothed_close,
+    );
+    Ok(())
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities_output_into_slice(
+    dst: &mut [f64],
+    input: &AdjustableMaAlternatingExtremitiesInput<'_>,
+    kernel: Kernel,
+    field: AdjustableMaAlternatingExtremitiesOutputField,
+) -> Result<(), AdjustableMaAlternatingExtremitiesError> {
+    let prepared = prepare_input(input, kernel)?;
+    if dst.len() != prepared.len {
+        return Err(
+            AdjustableMaAlternatingExtremitiesError::OutputLengthMismatch {
+                expected: prepared.len,
+                got: dst.len(),
+            },
+        );
+    }
+
+    dst.fill(f64::NAN);
+    let _ = prepared.kernel;
+    match field {
+        AdjustableMaAlternatingExtremitiesOutputField::Ma
+        | AdjustableMaAlternatingExtremitiesOutputField::SmoothedClose => {
+            weighted_filter_into(&prepared, prepared.close, dst);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::SmoothedHigh => {
+            weighted_filter_into(&prepared, prepared.high, dst);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::SmoothedLow => {
+            weighted_filter_into(&prepared, prepared.low, dst);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::SmoothedOpen => {
+            let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
+            compute_smoothed_open(&prepared, &ma, dst);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::Upper => {
+            let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
+            compute_selected_deviation_band(&prepared, &ma, dst, true);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::Lower => {
+            let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
+            compute_selected_deviation_band(&prepared, &ma, dst, false);
+        }
+        AdjustableMaAlternatingExtremitiesOutputField::Extremity
+        | AdjustableMaAlternatingExtremitiesOutputField::State
+        | AdjustableMaAlternatingExtremitiesOutputField::Changed => {
+            let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
+            let mut upper = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+            let mut lower = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
+            compute_deviation_bands(&prepared, &ma, &mut upper, &mut lower);
+            compute_selected_state_output(&prepared, &upper, &lower, dst, field);
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn resolve_data<'a>(
+    input: &'a AdjustableMaAlternatingExtremitiesInput<'a>,
+) -> Result<(&'a [f64], &'a [f64], &'a [f64]), AdjustableMaAlternatingExtremitiesError> {
+    match &input.data {
+        AdjustableMaAlternatingExtremitiesData::Candles { candles } => Ok((
+            candles.high.as_slice(),
+            candles.low.as_slice(),
+            candles.close.as_slice(),
+        )),
+        AdjustableMaAlternatingExtremitiesData::Slices { high, low, close } => {
+            if high.len() != low.len() || high.len() != close.len() {
+                return Err(
+                    AdjustableMaAlternatingExtremitiesError::DataLengthMismatch {
+                        high: high.len(),
+                        low: low.len(),
+                        close: close.len(),
+                    },
+                );
+            }
+            Ok((high, low, close))
+        }
+    }
+}
+
+#[inline]
+fn prepare_input<'a>(
+    input: &'a AdjustableMaAlternatingExtremitiesInput<'a>,
+    kernel: Kernel,
+) -> Result<PreparedInput<'a>, AdjustableMaAlternatingExtremitiesError> {
+    let (high, low, close) = resolve_data(input)?;
+    let len = close.len();
+    if len == 0 {
+        return Err(AdjustableMaAlternatingExtremitiesError::EmptyInputData);
+    }
+    let first = (0..len)
+        .find(|&i| high[i].is_finite() && low[i].is_finite() && close[i].is_finite())
+        .ok_or(AdjustableMaAlternatingExtremitiesError::AllValuesNaN)?;
+
+    let length = input.get_length();
+    let mult = input.get_mult();
+    let alpha = input.get_alpha();
+    let beta = input.get_beta();
+
+    if length < 2 || length > len {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidLength {
+            length,
+            data_len: len,
+        });
+    }
+    if !mult.is_finite() || mult < 1.0 {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidMult { mult });
+    }
+    if !alpha.is_finite() || alpha < 0.0 {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidAlpha { alpha });
+    }
+    if !beta.is_finite() || beta < 0.0 {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidBeta { beta });
+    }
+    let needed = (length * 2) - 1;
+    let longest_run = longest_finite_hlc_run(high, low, close);
+    if longest_run < needed {
+        return Err(
+            AdjustableMaAlternatingExtremitiesError::NotEnoughValidData {
+                needed,
+                valid: longest_run,
+            },
+        );
+    }
+
+    let weights = adjustable_ma_alternating_extremities_exact_weights(length, alpha, beta)?;
+    let ma_warm = first + length - 1;
+    Ok(PreparedInput {
+        high,
+        low,
+        close,
+        len,
+        length,
+        mult,
+        weights,
+        first,
+        warmups: OutputWarmups {
+            ma: ma_warm,
+            open: ma_warm + 2,
+            bands: first + (length * 2) - 2,
+        },
+        kernel: kernel.to_non_batch(),
+    })
+}
+
+#[inline]
+fn longest_finite_hlc_run(high: &[f64], low: &[f64], close: &[f64]) -> usize {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for index in 0..close.len() {
+        if high[index].is_finite() && low[index].is_finite() && close[index].is_finite() {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+#[inline]
+fn for_each_finite_hlc_run(
+    prepared: &PreparedInput<'_>,
+    min_len: usize,
+    mut visit: impl FnMut(usize, usize),
+) {
+    let mut cursor = 0usize;
+    while cursor < prepared.len {
+        while cursor < prepared.len
+            && !(prepared.high[cursor].is_finite()
+                && prepared.low[cursor].is_finite()
+                && prepared.close[cursor].is_finite())
+        {
+            cursor += 1;
+        }
+        let run_start = cursor;
+        while cursor < prepared.len
+            && prepared.high[cursor].is_finite()
+            && prepared.low[cursor].is_finite()
+            && prepared.close[cursor].is_finite()
+        {
+            cursor += 1;
+        }
+        let run_end = cursor;
+        if run_end.saturating_sub(run_start) >= min_len {
+            visit(run_start, run_end);
+        }
+    }
+}
+
+/// Builds the canonical normalized coefficient row consumed by both the CPU
+/// implementation and the resident f64 CUDA launcher.
+#[inline]
+pub(crate) fn adjustable_ma_alternating_extremities_exact_weights(
+    length: usize,
+    alpha: f64,
+    beta: f64,
+) -> Result<Vec<f64>, AdjustableMaAlternatingExtremitiesError> {
+    let denom = (length - 1) as f64;
+    let mut weights = Vec::with_capacity(length);
+    let mut sum = 0.0;
+    for i in 0..length {
+        let x = i as f64 / denom;
+        let w = (TWO_PI * x.powf(alpha)).sin() * (1.0 - x.powf(beta));
+        weights.push(w);
+        sum += w;
+    }
+    if !sum.is_finite() || sum.abs() <= WEIGHT_SUM_EPS {
+        return Err(AdjustableMaAlternatingExtremitiesError::DegenerateKernel { alpha, beta });
+    }
+    let inv_sum = 1.0 / sum;
+    for weight in &mut weights {
+        *weight *= inv_sum;
+    }
+    Ok(weights)
+}
+
+#[inline]
+fn compute_into_slices(
+    prepared: &PreparedInput<'_>,
+    ma: &mut [f64],
+    upper: &mut [f64],
+    lower: &mut [f64],
+    extremity: &mut [f64],
+    state: &mut [f64],
+    changed: &mut [f64],
+    smoothed_open: &mut [f64],
+    smoothed_high: &mut [f64],
+    smoothed_low: &mut [f64],
+    smoothed_close: &mut [f64],
+) {
+    let _ = prepared.kernel;
+    weighted_filter_into(prepared, prepared.close, ma);
+    weighted_filter_into(prepared, prepared.high, smoothed_high);
+    weighted_filter_into(prepared, prepared.low, smoothed_low);
+    smoothed_close.copy_from_slice(ma);
+    compute_smoothed_open(prepared, ma, smoothed_open);
+    compute_deviation_bands(prepared, ma, upper, lower);
+    compute_state_and_extremity(prepared, upper, lower, extremity, state, changed);
+}
+
+#[inline]
+fn weighted_filter_into(prepared: &PreparedInput<'_>, source: &[f64], out: &mut [f64]) {
+    for_each_finite_hlc_run(prepared, prepared.length, |run_start, run_end| {
+        let start = run_start + prepared.length - 1;
+        for i in start..run_end {
+            let mut acc = 0.0;
+            for j in 0..prepared.length {
+                acc += source[i - j] * prepared.weights[j];
+            }
+            out[i] = acc;
+        }
+    });
+}
+
+#[inline]
+fn compute_smoothed_open(prepared: &PreparedInput<'_>, smoothed_close: &[f64], out: &mut [f64]) {
+    for_each_finite_hlc_run(prepared, prepared.length + 2, |run_start, run_end| {
+        let start = run_start + prepared.length + 1;
+        for i in start..run_end {
+            out[i] = 0.5 * (smoothed_close[i - 1] + smoothed_close[i - 2]);
+        }
+    });
+}
+
+#[inline]
+fn compute_deviation_bands(
+    prepared: &PreparedInput<'_>,
+    ma: &[f64],
+    upper: &mut [f64],
+    lower: &mut [f64],
+) {
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let ma_start = run_start + prepared.length - 1;
+        let band_start = run_start + needed - 1;
+        let mut rolling = 0.0;
+        for i in ma_start..=band_start {
+            rolling += (prepared.close[i] - ma[i]).abs();
+        }
+        let first_dev = (rolling / prepared.length as f64) * prepared.mult;
+        upper[band_start] = ma[band_start] + first_dev;
+        lower[band_start] = ma[band_start] - first_dev;
+        for i in (band_start + 1)..run_end {
+            rolling += (prepared.close[i] - ma[i]).abs();
+            rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
+            let dev = (rolling / prepared.length as f64) * prepared.mult;
+            upper[i] = ma[i] + dev;
+            lower[i] = ma[i] - dev;
+        }
+    });
+}
+
+#[inline]
+fn compute_selected_deviation_band(
+    prepared: &PreparedInput<'_>,
+    ma: &[f64],
+    out: &mut [f64],
+    upper: bool,
+) {
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let ma_start = run_start + prepared.length - 1;
+        let band_start = run_start + needed - 1;
+        let mut rolling = 0.0;
+        for i in ma_start..=band_start {
+            rolling += (prepared.close[i] - ma[i]).abs();
+        }
+        let first_dev = (rolling / prepared.length as f64) * prepared.mult;
+        out[band_start] = if upper {
+            ma[band_start] + first_dev
+        } else {
+            ma[band_start] - first_dev
+        };
+        for i in (band_start + 1)..run_end {
+            rolling += (prepared.close[i] - ma[i]).abs();
+            rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
+            let dev = (rolling / prepared.length as f64) * prepared.mult;
+            out[i] = if upper { ma[i] + dev } else { ma[i] - dev };
+        }
+    });
+}
+
+#[inline]
+fn pine_cross(prev_a: f64, prev_b: f64, curr_a: f64, curr_b: f64) -> bool {
+    if !(prev_a.is_finite() && prev_b.is_finite() && curr_a.is_finite() && curr_b.is_finite()) {
+        return false;
+    }
+    (curr_a > curr_b && prev_a <= prev_b) || (curr_a < curr_b && prev_a >= prev_b)
+}
+
+#[inline]
+fn compute_state_and_extremity(
+    prepared: &PreparedInput<'_>,
+    upper: &[f64],
+    lower: &[f64],
+    extremity: &mut [f64],
+    state: &mut [f64],
+    changed: &mut [f64],
+) {
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let start = run_start + needed - 1;
+        state[start] = 0.0;
+        changed[start] = 0.0;
+        extremity[start] = lower[start];
+        for i in (start + 1)..run_end {
+            let prev_state = state[i - 1];
+            let cross_high = pine_cross(
+                prepared.high[i - 1],
+                upper[i - 1],
+                prepared.high[i],
+                upper[i],
+            );
+            let cross_low =
+                pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
+            let next_state = if cross_high {
+                1.0
+            } else if cross_low {
+                0.0
+            } else {
+                prev_state
+            };
+            state[i] = next_state;
+            changed[i] = if (next_state - prev_state).abs() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+            extremity[i] = if next_state >= 0.5 {
+                upper[i]
+            } else {
+                lower[i]
+            };
+        }
+    });
+}
+
+#[inline]
+fn compute_selected_state_output(
+    prepared: &PreparedInput<'_>,
+    upper: &[f64],
+    lower: &[f64],
+    out: &mut [f64],
+    field: AdjustableMaAlternatingExtremitiesOutputField,
+) {
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let start = run_start + needed - 1;
+        let mut prev_state = 0.0;
+        out[start] = match field {
+            AdjustableMaAlternatingExtremitiesOutputField::Extremity => lower[start],
+            AdjustableMaAlternatingExtremitiesOutputField::State
+            | AdjustableMaAlternatingExtremitiesOutputField::Changed => 0.0,
+            _ => unreachable!(),
+        };
+        for i in (start + 1)..run_end {
+            let cross_high = pine_cross(
+                prepared.high[i - 1],
+                upper[i - 1],
+                prepared.high[i],
+                upper[i],
+            );
+            let cross_low =
+                pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
+            let next_state = if cross_high {
+                1.0
+            } else if cross_low {
+                0.0
+            } else {
+                prev_state
+            };
+            out[i] = match field {
+                AdjustableMaAlternatingExtremitiesOutputField::Extremity => {
+                    if next_state >= 0.5 {
+                        upper[i]
+                    } else {
+                        lower[i]
+                    }
+                }
+                AdjustableMaAlternatingExtremitiesOutputField::State => next_state,
+                AdjustableMaAlternatingExtremitiesOutputField::Changed => {
+                    if (next_state - prev_state).abs() > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => unreachable!(),
+            };
+            prev_state = next_state;
+        }
+    });
+}
+
+#[derive(Clone, Debug)]
+pub struct AdjustableMaAlternatingExtremitiesBatchRange {
+    pub length: (usize, usize, usize),
+    pub mult: (f64, f64, f64),
+    pub alpha: (f64, f64, f64),
+    pub beta: (f64, f64, f64),
+}
+
+impl Default for AdjustableMaAlternatingExtremitiesBatchRange {
+    fn default() -> Self {
+        Self {
+            length: (DEFAULT_LENGTH, DEFAULT_LENGTH, 0),
+            mult: (DEFAULT_MULT, DEFAULT_MULT, 0.0),
+            alpha: (DEFAULT_ALPHA, DEFAULT_ALPHA, 0.0),
+            beta: (DEFAULT_BETA, DEFAULT_BETA, 0.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AdjustableMaAlternatingExtremitiesBatchOutput {
+    pub ma: Vec<f64>,
+    pub upper: Vec<f64>,
+    pub lower: Vec<f64>,
+    pub extremity: Vec<f64>,
+    pub state: Vec<f64>,
+    pub changed: Vec<f64>,
+    pub smoothed_open: Vec<f64>,
+    pub smoothed_high: Vec<f64>,
+    pub smoothed_low: Vec<f64>,
+    pub smoothed_close: Vec<f64>,
+    pub combos: Vec<AdjustableMaAlternatingExtremitiesParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl AdjustableMaAlternatingExtremitiesBatchOutput {
+    pub fn row_for_params(
+        &self,
+        params: &AdjustableMaAlternatingExtremitiesParams,
+    ) -> Option<usize> {
+        let length = params.length.unwrap_or(DEFAULT_LENGTH);
+        let mult = params.mult.unwrap_or(DEFAULT_MULT);
+        let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA);
+        let beta = params.beta.unwrap_or(DEFAULT_BETA);
+        self.combos.iter().position(|combo| {
+            combo.length.unwrap_or(DEFAULT_LENGTH) == length
+                && (combo.mult.unwrap_or(DEFAULT_MULT) - mult).abs() <= 1e-12
+                && (combo.alpha.unwrap_or(DEFAULT_ALPHA) - alpha).abs() <= 1e-12
+                && (combo.beta.unwrap_or(DEFAULT_BETA) - beta).abs() <= 1e-12
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AdjustableMaAlternatingExtremitiesBatchBuilder {
+    range: AdjustableMaAlternatingExtremitiesBatchRange,
+    kernel: Kernel,
+}
+
+impl Default for AdjustableMaAlternatingExtremitiesBatchBuilder {
+    fn default() -> Self {
+        Self {
+            range: AdjustableMaAlternatingExtremitiesBatchRange::default(),
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl AdjustableMaAlternatingExtremitiesBatchBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn range(mut self, value: AdjustableMaAlternatingExtremitiesBatchRange) -> Self {
+        self.range = value;
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, value: Kernel) -> Self {
+        self.kernel = value;
+        self
+    }
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> Result<
+        AdjustableMaAlternatingExtremitiesBatchOutput,
+        AdjustableMaAlternatingExtremitiesError,
+    > {
+        adjustable_ma_alternating_extremities_batch_with_kernel(
+            high,
+            low,
+            close,
+            &self.range,
+            self.kernel,
+        )
+    }
+    #[inline(always)]
+    pub fn apply(
+        self,
+        candles: &Candles,
+    ) -> Result<
+        AdjustableMaAlternatingExtremitiesBatchOutput,
+        AdjustableMaAlternatingExtremitiesError,
+    > {
+        self.apply_slices(
+            candles.high.as_slice(),
+            candles.low.as_slice(),
+            candles.close.as_slice(),
+        )
+    }
+}
+
+fn axis_usize(
+    (start, end, step): (usize, usize, usize),
+) -> Result<Vec<usize>, AdjustableMaAlternatingExtremitiesError> {
+    if step == 0 || start == end {
+        return Ok(vec![start]);
+    }
+    let mut out = Vec::new();
+    if start <= end {
+        let mut current = start;
+        while current <= end {
+            out.push(current);
+            match current.checked_add(step) {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+    } else {
+        let mut current = start;
+        while current >= end {
+            out.push(current);
+            match current.checked_sub(step) {
+                Some(next) => current = next,
+                None => break,
+            }
+            if current < end {
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidRange {
+            start: start.to_string(),
+            end: end.to_string(),
+            step: step.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn axis_f64(
+    (start, end, step): (f64, f64, f64),
+) -> Result<Vec<f64>, AdjustableMaAlternatingExtremitiesError> {
+    let eps = 1e-12;
+    if !start.is_finite() || !end.is_finite() || !step.is_finite() {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidRange {
+            start: start.to_string(),
+            end: end.to_string(),
+            step: step.to_string(),
+        });
+    }
+    if step.abs() < eps || (start - end).abs() < eps {
+        return Ok(vec![start]);
+    }
+    let mut out = Vec::new();
+    let dir = if end >= start { 1.0 } else { -1.0 };
+    let step_eff = dir * step.abs();
+    let mut current = start;
+    if dir > 0.0 {
+        while current <= end + eps {
+            out.push(current);
+            current += step_eff;
+        }
+    } else {
+        while current >= end - eps {
+            out.push(current);
+            current += step_eff;
+        }
+    }
+    if out.is_empty() {
+        return Err(AdjustableMaAlternatingExtremitiesError::InvalidRange {
+            start: start.to_string(),
+            end: end.to_string(),
+            step: step.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn expand_grid(
+    range: &AdjustableMaAlternatingExtremitiesBatchRange,
+) -> Result<Vec<AdjustableMaAlternatingExtremitiesParams>, AdjustableMaAlternatingExtremitiesError>
+{
+    let lengths = axis_usize(range.length)?;
+    let mults = axis_f64(range.mult)?;
+    let alphas = axis_f64(range.alpha)?;
+    let betas = axis_f64(range.beta)?;
+    let total = lengths
+        .len()
+        .checked_mul(mults.len())
+        .and_then(|v| v.checked_mul(alphas.len()))
+        .and_then(|v| v.checked_mul(betas.len()))
+        .ok_or_else(|| AdjustableMaAlternatingExtremitiesError::InvalidRange {
+            start: range.length.0.to_string(),
+            end: range.length.1.to_string(),
+            step: range.length.2.to_string(),
+        })?;
+    let mut out = Vec::with_capacity(total);
+    for &length in &lengths {
+        for &mult in &mults {
+            for &alpha in &alphas {
+                for &beta in &betas {
+                    out.push(AdjustableMaAlternatingExtremitiesParams {
+                        length: Some(length),
+                        mult: Some(mult),
+                        alpha: Some(alpha),
+                        beta: Some(beta),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+pub fn adjustable_ma_alternating_extremities_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    range: &AdjustableMaAlternatingExtremitiesBatchRange,
+    kernel: Kernel,
+) -> Result<AdjustableMaAlternatingExtremitiesBatchOutput, AdjustableMaAlternatingExtremitiesError>
+{
+    if high.len() != low.len() || high.len() != close.len() {
+        return Err(
+            AdjustableMaAlternatingExtremitiesError::DataLengthMismatch {
+                high: high.len(),
+                low: low.len(),
+                close: close.len(),
+            },
+        );
+    }
+    let batch_kernel = match kernel {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        _ => return Err(AdjustableMaAlternatingExtremitiesError::InvalidKernelForBatch(kernel)),
+    };
+    let single_kernel = batch_kernel.to_non_batch();
+    let combos = expand_grid(range)?;
+    let rows = combos.len();
+    let cols = close.len();
+    if cols == 0 {
+        return Err(AdjustableMaAlternatingExtremitiesError::EmptyInputData);
+    }
+    let _ = rows.checked_mul(cols).ok_or_else(|| {
+        AdjustableMaAlternatingExtremitiesError::InvalidRange {
+            start: range.length.0.to_string(),
+            end: range.length.1.to_string(),
+            step: range.length.2.to_string(),
+        }
+    })?;
+
+    let first = (0..cols)
+        .find(|&i| high[i].is_finite() && low[i].is_finite() && close[i].is_finite())
+        .ok_or(AdjustableMaAlternatingExtremitiesError::AllValuesNaN)?;
+    let ma_warm: Vec<usize> = combos
+        .iter()
+        .map(|params| first + params.length.unwrap_or(DEFAULT_LENGTH) - 1)
+        .collect();
+    let band_warm: Vec<usize> = combos
+        .iter()
+        .map(|params| first + (params.length.unwrap_or(DEFAULT_LENGTH) * 2) - 2)
+        .collect();
+    let open_warm: Vec<usize> = ma_warm.iter().map(|warm| warm + 2).collect();
+
+    let mut ma_mu = make_uninit_matrix(rows, cols);
+    let mut upper_mu = make_uninit_matrix(rows, cols);
+    let mut lower_mu = make_uninit_matrix(rows, cols);
+    let mut extremity_mu = make_uninit_matrix(rows, cols);
+    let mut state_mu = make_uninit_matrix(rows, cols);
+    let mut changed_mu = make_uninit_matrix(rows, cols);
+    let mut smoothed_open_mu = make_uninit_matrix(rows, cols);
+    let mut smoothed_high_mu = make_uninit_matrix(rows, cols);
+    let mut smoothed_low_mu = make_uninit_matrix(rows, cols);
+    let mut smoothed_close_mu = make_uninit_matrix(rows, cols);
+
+    init_matrix_prefixes(&mut ma_mu, cols, &ma_warm);
+    init_matrix_prefixes(&mut upper_mu, cols, &band_warm);
+    init_matrix_prefixes(&mut lower_mu, cols, &band_warm);
+    init_matrix_prefixes(&mut extremity_mu, cols, &band_warm);
+    init_matrix_prefixes(&mut state_mu, cols, &band_warm);
+    init_matrix_prefixes(&mut changed_mu, cols, &band_warm);
+    init_matrix_prefixes(&mut smoothed_open_mu, cols, &open_warm);
+    init_matrix_prefixes(&mut smoothed_high_mu, cols, &ma_warm);
+    init_matrix_prefixes(&mut smoothed_low_mu, cols, &ma_warm);
+    init_matrix_prefixes(&mut smoothed_close_mu, cols, &ma_warm);
+
+    let mut ma_guard = ManuallyDrop::new(ma_mu);
+    let mut upper_guard = ManuallyDrop::new(upper_mu);
+    let mut lower_guard = ManuallyDrop::new(lower_mu);
+    let mut extremity_guard = ManuallyDrop::new(extremity_mu);
+    let mut state_guard = ManuallyDrop::new(state_mu);
+    let mut changed_guard = ManuallyDrop::new(changed_mu);
+    let mut smoothed_open_guard = ManuallyDrop::new(smoothed_open_mu);
+    let mut smoothed_high_guard = ManuallyDrop::new(smoothed_high_mu);
+    let mut smoothed_low_guard = ManuallyDrop::new(smoothed_low_mu);
+    let mut smoothed_close_guard = ManuallyDrop::new(smoothed_close_mu);
+
+    let ma = unsafe { mu_slice_as_f64_slice_mut(&mut ma_guard) };
+    let upper = unsafe { mu_slice_as_f64_slice_mut(&mut upper_guard) };
+    let lower = unsafe { mu_slice_as_f64_slice_mut(&mut lower_guard) };
+    let extremity = unsafe { mu_slice_as_f64_slice_mut(&mut extremity_guard) };
+    let state = unsafe { mu_slice_as_f64_slice_mut(&mut state_guard) };
+    let changed = unsafe { mu_slice_as_f64_slice_mut(&mut changed_guard) };
+    let smoothed_open = unsafe { mu_slice_as_f64_slice_mut(&mut smoothed_open_guard) };
+    let smoothed_high = unsafe { mu_slice_as_f64_slice_mut(&mut smoothed_high_guard) };
+    let smoothed_low = unsafe { mu_slice_as_f64_slice_mut(&mut smoothed_low_guard) };
+    let smoothed_close = unsafe { mu_slice_as_f64_slice_mut(&mut smoothed_close_guard) };
+
+    let run_row = |row: usize,
+                   ma_row: &mut [f64],
+                   upper_row: &mut [f64],
+                   lower_row: &mut [f64],
+                   extremity_row: &mut [f64],
+                   state_row: &mut [f64],
+                   changed_row: &mut [f64],
+                   open_row: &mut [f64],
+                   sh_row: &mut [f64],
+                   sl_row: &mut [f64],
+                   sc_row: &mut [f64]|
+     -> Result<(), AdjustableMaAlternatingExtremitiesError> {
+        let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
+            high,
+            low,
+            close,
+            combos[row].clone(),
+        );
+        adjustable_ma_alternating_extremities_into_slices(
+            &input,
+            single_kernel,
+            ma_row,
+            upper_row,
+            lower_row,
+            extremity_row,
+            state_row,
+            changed_row,
+            open_row,
+            sh_row,
+            sl_row,
+            sc_row,
+        )
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ma.par_chunks_mut(cols)
+            .zip(upper.par_chunks_mut(cols))
+            .zip(lower.par_chunks_mut(cols))
+            .zip(extremity.par_chunks_mut(cols))
+            .zip(state.par_chunks_mut(cols))
+            .zip(changed.par_chunks_mut(cols))
+            .zip(smoothed_open.par_chunks_mut(cols))
+            .zip(smoothed_high.par_chunks_mut(cols))
+            .zip(smoothed_low.par_chunks_mut(cols))
+            .zip(smoothed_close.par_chunks_mut(cols))
+            .enumerate()
+            .try_for_each(
+                |(
+                    row,
+                    (
+                        (
+                            (
+                                (
+                                    (
+                                        (
+                                            (((ma_row, upper_row), lower_row), extremity_row),
+                                            state_row,
+                                        ),
+                                        changed_row,
+                                    ),
+                                    open_row,
+                                ),
+                                sh_row,
+                            ),
+                            sl_row,
+                        ),
+                        sc_row,
+                    ),
+                )| {
+                    run_row(
+                        row,
+                        ma_row,
+                        upper_row,
+                        lower_row,
+                        extremity_row,
+                        state_row,
+                        changed_row,
+                        open_row,
+                        sh_row,
+                        sl_row,
+                        sc_row,
+                    )
+                },
+            )?;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for row in 0..rows {
+            let start = row * cols;
+            let end = start + cols;
+            run_row(
+                row,
+                &mut ma[start..end],
+                &mut upper[start..end],
+                &mut lower[start..end],
+                &mut extremity[start..end],
+                &mut state[start..end],
+                &mut changed[start..end],
+                &mut smoothed_open[start..end],
+                &mut smoothed_high[start..end],
+                &mut smoothed_low[start..end],
+                &mut smoothed_close[start..end],
+            )?;
+        }
+    }
+
+    Ok(AdjustableMaAlternatingExtremitiesBatchOutput {
+        ma: unsafe { vec_f64_from_mu_guard(ma_guard) },
+        upper: unsafe { vec_f64_from_mu_guard(upper_guard) },
+        lower: unsafe { vec_f64_from_mu_guard(lower_guard) },
+        extremity: unsafe { vec_f64_from_mu_guard(extremity_guard) },
+        state: unsafe { vec_f64_from_mu_guard(state_guard) },
+        changed: unsafe { vec_f64_from_mu_guard(changed_guard) },
+        smoothed_open: unsafe { vec_f64_from_mu_guard(smoothed_open_guard) },
+        smoothed_high: unsafe { vec_f64_from_mu_guard(smoothed_high_guard) },
+        smoothed_low: unsafe { vec_f64_from_mu_guard(smoothed_low_guard) },
+        smoothed_close: unsafe { vec_f64_from_mu_guard(smoothed_close_guard) },
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdjustableMaAlternatingExtremitiesStreamOutput {
+    pub ma: f64,
+    pub upper: f64,
+    pub lower: f64,
+    pub extremity: f64,
+    pub state: f64,
+    pub changed: f64,
+    pub smoothed_open: f64,
+    pub smoothed_high: f64,
+    pub smoothed_low: f64,
+    pub smoothed_close: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdjustableMaAlternatingExtremitiesStream {
+    length: usize,
+    mult: f64,
+    weights: Vec<f64>,
+    highs: VecDeque<f64>,
+    lows: VecDeque<f64>,
+    closes: VecDeque<f64>,
+    abs_diffs: VecDeque<f64>,
+    rolling_abs_sum: f64,
+    prev_high: Option<f64>,
+    prev_low: Option<f64>,
+    prev_upper: Option<f64>,
+    prev_lower: Option<f64>,
+    prev_state: f64,
+    last_close_1: Option<f64>,
+    last_close_2: Option<f64>,
+}
+
+impl AdjustableMaAlternatingExtremitiesStream {
+    pub fn try_new(
+        params: AdjustableMaAlternatingExtremitiesParams,
+    ) -> Result<Self, AdjustableMaAlternatingExtremitiesError> {
+        let length = params.length.unwrap_or(DEFAULT_LENGTH);
+        let mult = params.mult.unwrap_or(DEFAULT_MULT);
+        let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA);
+        let beta = params.beta.unwrap_or(DEFAULT_BETA);
+        if length < 2 {
+            return Err(AdjustableMaAlternatingExtremitiesError::InvalidLength {
+                length,
+                data_len: length,
+            });
+        }
+        if !mult.is_finite() || mult < 1.0 {
+            return Err(AdjustableMaAlternatingExtremitiesError::InvalidMult { mult });
+        }
+        let weights = adjustable_ma_alternating_extremities_exact_weights(length, alpha, beta)?;
+        Ok(Self {
+            length,
+            mult,
+            weights,
+            highs: VecDeque::with_capacity(length),
+            lows: VecDeque::with_capacity(length),
+            closes: VecDeque::with_capacity(length),
+            abs_diffs: VecDeque::with_capacity(length),
+            rolling_abs_sum: 0.0,
+            prev_high: None,
+            prev_low: None,
+            prev_upper: None,
+            prev_lower: None,
+            prev_state: 0.0,
+            last_close_1: None,
+            last_close_2: None,
+        })
+    }
+
+    pub fn update(
+        &mut self,
+        high: f64,
+        low: f64,
+        close: f64,
+    ) -> Option<AdjustableMaAlternatingExtremitiesStreamOutput> {
+        if !(high.is_finite() && low.is_finite() && close.is_finite()) {
+            self.reset_segment();
+            return None;
+        }
+        push_ring(&mut self.highs, self.length, high);
+        push_ring(&mut self.lows, self.length, low);
+        push_ring(&mut self.closes, self.length, close);
+        if self.closes.len() < self.length {
+            return None;
+        }
+        let ma = dot_recent(&self.closes, &self.weights);
+        let smoothed_high = dot_recent(&self.highs, &self.weights);
+        let smoothed_low = dot_recent(&self.lows, &self.weights);
+        let smoothed_open = self
+            .last_close_1
+            .zip(self.last_close_2)
+            .map(|(a, b)| 0.5 * (a + b))
+            .unwrap_or(f64::NAN);
+        let abs_diff = (close - ma).abs();
+        self.abs_diffs.push_back(abs_diff);
+        self.rolling_abs_sum += abs_diff;
+        if self.abs_diffs.len() > self.length {
+            if let Some(removed) = self.abs_diffs.pop_front() {
+                self.rolling_abs_sum -= removed;
+            }
+        }
+        self.last_close_2 = self.last_close_1;
+        self.last_close_1 = Some(ma);
+        if self.abs_diffs.len() < self.length {
+            return None;
+        }
+        let dev = (self.rolling_abs_sum / self.length as f64) * self.mult;
+        let upper = ma + dev;
+        let lower = ma - dev;
+        let cross_high = self
+            .prev_high
+            .zip(self.prev_upper)
+            .map(|(ph, pu)| pine_cross(ph, pu, high, upper))
+            .unwrap_or(false);
+        let cross_low = self
+            .prev_low
+            .zip(self.prev_lower)
+            .map(|(pl, plow)| pine_cross(pl, plow, low, lower))
+            .unwrap_or(false);
+        let next_state = if cross_high {
+            1.0
+        } else if cross_low {
+            0.0
+        } else {
+            self.prev_state
+        };
+        let changed = if (next_state - self.prev_state).abs() > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        let extremity = if next_state >= 0.5 { upper } else { lower };
+        self.prev_high = Some(high);
+        self.prev_low = Some(low);
+        self.prev_upper = Some(upper);
+        self.prev_lower = Some(lower);
+        self.prev_state = next_state;
+        Some(AdjustableMaAlternatingExtremitiesStreamOutput {
+            ma,
+            upper,
+            lower,
+            extremity,
+            state: next_state,
+            changed,
+            smoothed_open,
+            smoothed_high,
+            smoothed_low,
+            smoothed_close: ma,
+        })
+    }
+
+    #[inline]
+    fn reset_segment(&mut self) {
+        self.highs.clear();
+        self.lows.clear();
+        self.closes.clear();
+        self.abs_diffs.clear();
+        self.rolling_abs_sum = 0.0;
+        self.prev_high = None;
+        self.prev_low = None;
+        self.prev_upper = None;
+        self.prev_lower = None;
+        self.prev_state = 0.0;
+        self.last_close_1 = None;
+        self.last_close_2 = None;
+    }
+}
+
+#[inline]
+fn push_ring(queue: &mut VecDeque<f64>, len: usize, value: f64) {
+    if queue.len() == len {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
+#[inline]
+fn dot_recent(queue: &VecDeque<f64>, weights: &[f64]) -> f64 {
+    let mut acc = 0.0;
+    for (i, value) in queue.iter().rev().enumerate() {
+        acc += value * weights[i];
+    }
+    acc
+}
+
+#[inline(always)]
+unsafe fn mu_slice_as_f64_slice_mut(buf: &mut ManuallyDrop<Vec<MaybeUninit<f64>>>) -> &mut [f64] {
+    core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f64, buf.len())
+}
+
+#[inline(always)]
+unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> {
+    let mut buf = buf;
+    Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq_or_both_nan(lhs: f64, rhs: f64) -> bool {
+        (lhs.is_nan() && rhs.is_nan()) || lhs == rhs
+    }
+
+    fn assert_series_eq(lhs: &[f64], rhs: &[f64]) {
+        assert_eq!(lhs.len(), rhs.len());
+        for i in 0..lhs.len() {
+            assert!(
+                eq_or_both_nan(lhs[i], rhs[i]),
+                "mismatch at index {i}: lhs={} rhs={}",
+                lhs[i],
+                rhs[i]
+            );
+        }
+    }
+
+    fn sample_ohlc(len: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut high = Vec::with_capacity(len);
+        let mut low = Vec::with_capacity(len);
+        let mut close = Vec::with_capacity(len);
+        for i in 0..len {
+            let base = 100.0 + (i as f64 * 0.17).sin() * 4.0 + i as f64 * 0.03;
+            close.push(base);
+            high.push(base + 1.5 + (i as f64 * 0.11).cos().abs());
+            low.push(base - 1.5 - (i as f64 * 0.07).sin().abs());
+        }
+        (high, low, close)
+    }
+
+    fn assert_series_close(lhs: &[f64], rhs: &[f64]) {
+        assert_eq!(lhs.len(), rhs.len());
+        for (index, (&actual, &expected)) in lhs.iter().zip(rhs).enumerate() {
+            if actual.is_nan() && expected.is_nan() {
+                continue;
+            }
+            let tolerance = 1e-11 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "mismatch at {index}: actual={actual:?} expected={expected:?} \
+                 tolerance={tolerance}"
+            );
+        }
+    }
+
+    /// Direct formula oracle derived from the published kernel equation and
+    /// extremity rules. It deliberately recomputes every deviation window and
+    /// does not call any production helper, stream, or batch implementation.
+    fn independent_formula(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        length: usize,
+        mult: f64,
+        alpha: f64,
+        beta: f64,
+    ) -> AdjustableMaAlternatingExtremitiesOutput {
+        let len = close.len();
+        let mut output = AdjustableMaAlternatingExtremitiesOutput {
+            ma: vec![f64::NAN; len],
+            upper: vec![f64::NAN; len],
+            lower: vec![f64::NAN; len],
+            extremity: vec![f64::NAN; len],
+            state: vec![f64::NAN; len],
+            changed: vec![f64::NAN; len],
+            smoothed_open: vec![f64::NAN; len],
+            smoothed_high: vec![f64::NAN; len],
+            smoothed_low: vec![f64::NAN; len],
+            smoothed_close: vec![f64::NAN; len],
+        };
+        let denominator = (length - 1) as f64;
+        let mut weights: Vec<f64> = (0..length)
+            .map(|index| {
+                let x = index as f64 / denominator;
+                (core::f64::consts::TAU * x.powf(alpha)).sin() * (1.0 - x.powf(beta))
+            })
+            .collect();
+        let weight_sum: f64 = weights.iter().sum();
+        for weight in &mut weights {
+            *weight /= weight_sum;
+        }
+
+        let mut cursor = 0usize;
+        while cursor < len {
+            while cursor < len
+                && !(high[cursor].is_finite()
+                    && low[cursor].is_finite()
+                    && close[cursor].is_finite())
+            {
+                cursor += 1;
+            }
+            let run_start = cursor;
+            while cursor < len
+                && high[cursor].is_finite()
+                && low[cursor].is_finite()
+                && close[cursor].is_finite()
+            {
+                cursor += 1;
+            }
+            let run_end = cursor;
+            if run_end.saturating_sub(run_start) < length {
+                continue;
+            }
+
+            let ma_start = run_start + length - 1;
+            for index in ma_start..run_end {
+                let mut close_value = 0.0;
+                let mut high_value = 0.0;
+                let mut low_value = 0.0;
+                for offset in 0..length {
+                    close_value += close[index - offset] * weights[offset];
+                    high_value += high[index - offset] * weights[offset];
+                    low_value += low[index - offset] * weights[offset];
+                }
+                output.ma[index] = close_value;
+                output.smoothed_close[index] = close_value;
+                output.smoothed_high[index] = high_value;
+                output.smoothed_low[index] = low_value;
+            }
+            for index in (ma_start + 2)..run_end {
+                output.smoothed_open[index] = 0.5 * (output.ma[index - 1] + output.ma[index - 2]);
+            }
+
+            let needed = (length * 2) - 1;
+            if run_end - run_start < needed {
+                continue;
+            }
+            let band_start = run_start + needed - 1;
+            for index in band_start..run_end {
+                let deviation = (0..length)
+                    .map(|offset| (close[index - offset] - output.ma[index - offset]).abs())
+                    .sum::<f64>()
+                    / length as f64
+                    * mult;
+                output.upper[index] = output.ma[index] + deviation;
+                output.lower[index] = output.ma[index] - deviation;
+            }
+
+            let mut state = 0.0_f64;
+            output.state[band_start] = state;
+            output.changed[band_start] = 0.0;
+            output.extremity[band_start] = output.lower[band_start];
+            for index in (band_start + 1)..run_end {
+                let crossed_high = (high[index] > output.upper[index]
+                    && high[index - 1] <= output.upper[index - 1])
+                    || (high[index] < output.upper[index]
+                        && high[index - 1] >= output.upper[index - 1]);
+                let crossed_low = (low[index] > output.lower[index]
+                    && low[index - 1] <= output.lower[index - 1])
+                    || (low[index] < output.lower[index]
+                        && low[index - 1] >= output.lower[index - 1]);
+                let next_state = if crossed_high {
+                    1.0
+                } else if crossed_low {
+                    0.0
+                } else {
+                    state
+                };
+                output.state[index] = next_state;
+                output.changed[index] = f64::from(next_state != state);
+                output.extremity[index] = if next_state >= 0.5 {
+                    output.upper[index]
+                } else {
+                    output.lower[index]
+                };
+                state = next_state;
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn formula_and_validity_recover_independently_after_a_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut high, mut low, mut close) = sample_ohlc(220);
+        high[90] = f64::NAN;
+        low[90] = f64::NAN;
+        close[90] = f64::NAN;
+        let params = AdjustableMaAlternatingExtremitiesParams {
+            length: Some(8),
+            mult: Some(1.75),
+            alpha: Some(1.0),
+            beta: Some(0.5),
+        };
+        let actual = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                params.clone(),
+            ),
+        )?;
+        let expected = independent_formula(&high, &low, &close, 8, 1.75, 1.0, 0.5);
+
+        assert_series_close(&actual.ma, &expected.ma);
+        assert_series_close(&actual.upper, &expected.upper);
+        assert_series_close(&actual.lower, &expected.lower);
+        assert_series_close(&actual.extremity, &expected.extremity);
+        assert_series_close(&actual.state, &expected.state);
+        assert_series_close(&actual.changed, &expected.changed);
+        assert_series_close(&actual.smoothed_open, &expected.smoothed_open);
+        assert_series_close(&actual.smoothed_high, &expected.smoothed_high);
+        assert_series_close(&actual.smoothed_low, &expected.smoothed_low);
+        assert_series_close(&actual.smoothed_close, &expected.smoothed_close);
+        for (field, expected_series) in [
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Ma,
+                expected.ma.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Upper,
+                expected.upper.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Lower,
+                expected.lower.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Extremity,
+                expected.extremity.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::State,
+                expected.state.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Changed,
+                expected.changed.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedOpen,
+                expected.smoothed_open.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedHigh,
+                expected.smoothed_high.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedLow,
+                expected.smoothed_low.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedClose,
+                expected.smoothed_close.as_slice(),
+            ),
+        ] {
+            let mut selected = vec![f64::NAN; close.len()];
+            adjustable_ma_alternating_extremities_output_into_slice(
+                &mut selected,
+                &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                    &high,
+                    &low,
+                    &close,
+                    params.clone(),
+                ),
+                Kernel::Scalar,
+                field,
+            )?;
+            assert_series_close(&selected, expected_series);
+        }
+        assert!(
+            expected.upper[105].is_finite(),
+            "the second finite segment must recover after its own 15-bar warmup"
+        );
+
+        let mut stream = AdjustableMaAlternatingExtremitiesStream::try_new(params)?;
+        for index in 0..close.len() {
+            let streamed = stream.update(high[index], low[index], close[index]);
+            if expected.upper[index].is_finite() {
+                let streamed = streamed.expect("the stream must recover on the same bar");
+                assert!((streamed.upper - expected.upper[index]).abs() <= 1e-10);
+                assert!((streamed.lower - expected.lower[index]).abs() <= 1e-10);
+                assert_eq!(streamed.state, expected.state[index]);
+                assert_eq!(streamed.changed, expected.changed[index]);
+            } else {
+                assert!(
+                    streamed.is_none(),
+                    "the stream bridged an undefined window at index {index}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_family_requires_one_complete_finite_hlc_run() {
+        let mut high = (0..21)
+            .map(|index| 101.0 + index as f64)
+            .collect::<Vec<_>>();
+        let mut low = (0..21).map(|index| 99.0 + index as f64).collect::<Vec<_>>();
+        let mut close = (0..21)
+            .map(|index| 100.0 + index as f64)
+            .collect::<Vec<_>>();
+        high[10] = f64::NAN;
+        low[10] = f64::NAN;
+        close[10] = f64::NAN;
+        let error = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                AdjustableMaAlternatingExtremitiesParams {
+                    length: Some(8),
+                    mult: Some(1.75),
+                    alpha: Some(1.0),
+                    beta: Some(0.5),
+                },
+            ),
+        )
+        .expect_err("two incomplete segments cannot form one valid output window");
+        assert!(matches!(
+            error,
+            AdjustableMaAlternatingExtremitiesError::NotEnoughValidData {
+                needed: 15,
+                valid: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn constant_series_produces_flat_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        let n = 180;
+        let high = vec![101.0; n];
+        let low = vec![99.0; n];
+        let close = vec![100.0; n];
+        let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
+            &high,
+            &low,
+            &close,
+            AdjustableMaAlternatingExtremitiesParams::default(),
+        );
+        let out = adjustable_ma_alternating_extremities(&input)?;
+        let start = DEFAULT_LENGTH * 2 - 2;
+        for i in start..n {
+            assert!((out.ma[i] - 100.0).abs() <= 1e-9);
+            assert!((out.upper[i] - 100.0).abs() <= 1e-9);
+            assert!((out.lower[i] - 100.0).abs() <= 1e-9);
+            assert!((out.extremity[i] - 100.0).abs() <= 1e-9);
+            assert_eq!(out.state[i], 0.0);
+            assert_eq!(out.changed[i], 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
+        let (high, low, close) = sample_ohlc(256);
+        let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
+            &high,
+            &low,
+            &close,
+            AdjustableMaAlternatingExtremitiesParams::default(),
+        );
+        let baseline = adjustable_ma_alternating_extremities(&input)?;
+        let n = close.len();
+        let mut ma = vec![0.0; n];
+        let mut upper = vec![0.0; n];
+        let mut lower = vec![0.0; n];
+        let mut extremity = vec![0.0; n];
+        let mut state = vec![0.0; n];
+        let mut changed = vec![0.0; n];
+        let mut smoothed_open = vec![0.0; n];
+        let mut smoothed_high = vec![0.0; n];
+        let mut smoothed_low = vec![0.0; n];
+        let mut smoothed_close = vec![0.0; n];
+        adjustable_ma_alternating_extremities_into(
+            &input,
+            &mut ma,
+            &mut upper,
+            &mut lower,
+            &mut extremity,
+            &mut state,
+            &mut changed,
+            &mut smoothed_open,
+            &mut smoothed_high,
+            &mut smoothed_low,
+            &mut smoothed_close,
+        )?;
+        assert_series_eq(&baseline.ma, &ma);
+        assert_series_eq(&baseline.upper, &upper);
+        assert_series_eq(&baseline.lower, &lower);
+        assert_series_eq(&baseline.extremity, &extremity);
+        assert_series_eq(&baseline.state, &state);
+        assert_series_eq(&baseline.changed, &changed);
+        assert_series_eq(&baseline.smoothed_open, &smoothed_open);
+        assert_series_eq(&baseline.smoothed_high, &smoothed_high);
+        assert_series_eq(&baseline.smoothed_low, &smoothed_low);
+        assert_series_eq(&baseline.smoothed_close, &smoothed_close);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_matches_batch() -> Result<(), Box<dyn std::error::Error>> {
+        let (high, low, close) = sample_ohlc(240);
+        let params = AdjustableMaAlternatingExtremitiesParams::default();
+        let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
+            &high,
+            &low,
+            &close,
+            params.clone(),
+        );
+        let batch = adjustable_ma_alternating_extremities(&input)?;
+        let mut stream = AdjustableMaAlternatingExtremitiesStream::try_new(params)?;
+        for i in 0..close.len() {
+            match stream.update(high[i], low[i], close[i]) {
+                Some(out) => {
+                    assert!((out.ma - batch.ma[i]).abs() <= 1e-9);
+                    assert!((out.upper - batch.upper[i]).abs() <= 1e-9);
+                    assert!((out.lower - batch.lower[i]).abs() <= 1e-9);
+                    assert!((out.extremity - batch.extremity[i]).abs() <= 1e-9);
+                    assert!((out.state - batch.state[i]).abs() <= 1e-9);
+                    assert!((out.changed - batch.changed[i]).abs() <= 1e-9);
+                }
+                None => {
+                    assert!(batch.upper[i].is_nan());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_default_row_matches_single() -> Result<(), Box<dyn std::error::Error>> {
+        let (high, low, close) = sample_ohlc(180);
+        let params = AdjustableMaAlternatingExtremitiesParams::default();
+        let single = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                params.clone(),
+            ),
+        )?;
+        let batch = adjustable_ma_alternating_extremities_batch_with_kernel(
+            &high,
+            &low,
+            &close,
+            &AdjustableMaAlternatingExtremitiesBatchRange::default(),
+            Kernel::ScalarBatch,
+        )?;
+        assert_eq!(batch.rows, 1);
+        assert_series_eq(&batch.ma[..close.len()], single.ma.as_slice());
+        assert_series_eq(&batch.extremity[..close.len()], single.extremity.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn state_and_extremity_invariants_hold() -> Result<(), Box<dyn std::error::Error>> {
+        let (high, low, close) = sample_ohlc(320);
+        let out = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                AdjustableMaAlternatingExtremitiesParams::default(),
+            ),
+        )?;
+        let start = DEFAULT_LENGTH * 2 - 2;
+        for i in start..close.len() {
+            assert!(out.state[i] == 0.0 || out.state[i] == 1.0);
+            if out.state[i] == 1.0 {
+                assert!((out.extremity[i] - out.upper[i]).abs() <= 1e-12);
+            } else {
+                assert!((out.extremity[i] - out.lower[i]).abs() <= 1e-12);
+            }
+            if i > start {
+                let expected_changed = if (out.state[i] - out.state[i - 1]).abs() > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert_eq!(out.changed[i], expected_changed);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_params_are_rejected() {
+        let (high, low, close) = sample_ohlc(160);
+        let err = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                AdjustableMaAlternatingExtremitiesParams {
+                    length: Some(1),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AdjustableMaAlternatingExtremitiesError::InvalidLength { .. }
+        ));
+        let err = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                AdjustableMaAlternatingExtremitiesParams {
+                    mult: Some(0.5),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AdjustableMaAlternatingExtremitiesError::InvalidMult { .. }
+        ));
+    }
+}

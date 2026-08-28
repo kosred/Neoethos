@@ -1,0 +1,1733 @@
+use crate::utilities::data_loader::{Candles, source_type};
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
+};
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+use core::arch::x86_64::*;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+use std::error::Error;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use thiserror::Error;
+
+impl<'a> AsRef<[f64]> for AoInput<'a> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[f64] {
+        match &self.data {
+            AoData::Slice(slice) => slice,
+            AoData::Candles { candles, source } if source.eq_ignore_ascii_case("hl2") => {
+                &candles.hl2
+            }
+            AoData::Candles { candles, source } => source_type(candles, source),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AoData<'a> {
+    Candles {
+        candles: &'a Candles,
+        source: &'a str,
+    },
+    Slice(&'a [f64]),
+}
+
+#[derive(Debug, Clone)]
+pub struct AoOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AoParams {
+    pub short_period: Option<usize>,
+    pub long_period: Option<usize>,
+}
+
+impl Default for AoParams {
+    fn default() -> Self {
+        Self {
+            short_period: Some(5),
+            long_period: Some(34),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AoInput<'a> {
+    pub data: AoData<'a>,
+    pub params: AoParams,
+}
+
+impl<'a> AoInput<'a> {
+    #[inline]
+    pub fn from_candles(c: &'a Candles, s: &'a str, p: AoParams) -> Self {
+        Self {
+            data: AoData::Candles {
+                candles: c,
+                source: s,
+            },
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn from_slice(sl: &'a [f64], p: AoParams) -> Self {
+        Self {
+            data: AoData::Slice(sl),
+            params: p,
+        }
+    }
+    #[inline]
+    pub fn with_default_candles(c: &'a Candles) -> Self {
+        Self::from_candles(c, "hl2", AoParams::default())
+    }
+    #[inline]
+    pub fn get_short(&self) -> usize {
+        self.params.short_period.unwrap_or(5)
+    }
+    #[inline]
+    pub fn get_long(&self) -> usize {
+        self.params.long_period.unwrap_or(34)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct AoBuilder {
+    short_period: Option<usize>,
+    long_period: Option<usize>,
+    kernel: Kernel,
+}
+
+impl Default for AoBuilder {
+    fn default() -> Self {
+        Self {
+            short_period: None,
+            long_period: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl AoBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[inline(always)]
+    pub fn short_period(mut self, n: usize) -> Self {
+        self.short_period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn long_period(mut self, n: usize) -> Self {
+        self.long_period = Some(n);
+        self
+    }
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<AoOutput, AoError> {
+        let p = AoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        let i = AoInput::from_candles(c, "hl2", p);
+        ao_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn apply_slice(self, d: &[f64]) -> Result<AoOutput, AoError> {
+        let p = AoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        let i = AoInput::from_slice(d, p);
+        ao_with_kernel(&i, self.kernel)
+    }
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<AoStream, AoError> {
+        let p = AoParams {
+            short_period: self.short_period,
+            long_period: self.long_period,
+        };
+        AoStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum AoError {
+    #[error("ao: Input data slice is empty.")]
+    EmptyInputData,
+    #[error("ao: All values are NaN.")]
+    AllValuesNaN,
+    #[error("ao: Invalid periods: short={short}, long={long}")]
+    InvalidPeriods { short: usize, long: usize },
+    #[error("ao: Short period must be less than long period: short={short}, long={long}")]
+    ShortPeriodNotLess { short: usize, long: usize },
+    #[error("ao: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+    #[error("ao: High and low arrays must have same length: high={high_len}, low={low_len}")]
+    MismatchedArrayLengths { high_len: usize, low_len: usize },
+    #[error("ao: output length mismatch: expected = {expected}, got = {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("ao: invalid kernel for batch: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+    #[error("ao: invalid range: start={start}, end={end}, step={step}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+    #[error("ao: invalid input: {0}")]
+    InvalidInput(String),
+}
+
+#[inline]
+pub fn ao(input: &AoInput) -> Result<AoOutput, AoError> {
+    ao_with_kernel(input, Kernel::Auto)
+}
+
+pub fn ao_into(input: &AoInput, out: &mut [f64]) -> Result<(), AoError> {
+    let (data, short, long, first, len) = ao_prepare(input)?;
+    if out.len() != len {
+        return Err(AoError::OutputLengthMismatch {
+            expected: len,
+            got: out.len(),
+        });
+    }
+
+    let warmup_end = first + long - 1;
+    let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+    for v in &mut out[..warmup_end.min(len)] {
+        *v = qnan;
+    }
+
+    let chosen = Kernel::Scalar;
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => ao_scalar(data, short, long, first, out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                ao_scalar(data, short, long, first, out)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub fn ao_into_slice(dst: &mut [f64], input: &AoInput, kern: Kernel) -> Result<(), AoError> {
+    let (data, short, long, first, len) = ao_prepare(input)?;
+    if dst.len() != len {
+        return Err(AoError::OutputLengthMismatch {
+            expected: len,
+            got: dst.len(),
+        });
+    }
+
+    let chosen = match kern {
+        Kernel::Auto => Kernel::Scalar,
+        k => k,
+    };
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => ao_scalar(data, short, long, first, dst),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                ao_scalar(data, short, long, first, dst)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let warmup_end = first + long - 1;
+    for v in &mut dst[..warmup_end] {
+        *v = f64::NAN;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn ao_prepare<'a>(input: &'a AoInput) -> Result<(&'a [f64], usize, usize, usize, usize), AoError> {
+    let data = input.as_ref();
+    if data.is_empty() {
+        return Err(AoError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(AoError::AllValuesNaN)?;
+    let len = data.len();
+    let short = input.get_short();
+    let long = input.get_long();
+
+    if short == 0 || long == 0 {
+        return Err(AoError::InvalidPeriods { short, long });
+    }
+    if short >= long {
+        return Err(AoError::ShortPeriodNotLess { short, long });
+    }
+    if len - first < long {
+        return Err(AoError::NotEnoughValidData {
+            needed: long,
+            valid: len - first,
+        });
+    }
+    Ok((data, short, long, first, len))
+}
+
+pub fn ao_with_kernel(input: &AoInput, kernel: Kernel) -> Result<AoOutput, AoError> {
+    let (data, short, long, first, len) = ao_prepare(input)?;
+
+    let chosen = match kernel {
+        Kernel::Auto => Kernel::Scalar,
+        other => other,
+    };
+
+    let warmup_period = first + long - 1;
+
+    let mut out = alloc_with_nan_prefix(len, warmup_period);
+
+    unsafe {
+        match chosen {
+            Kernel::Scalar | Kernel::ScalarBatch => ao_scalar(data, short, long, first, &mut out),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                ao_scalar(data, short, long, first, &mut out)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(AoOutput { values: out })
+}
+
+#[inline]
+pub fn compute_hl2(high: &[f64], low: &[f64]) -> Result<Vec<f64>, AoError> {
+    if high.len() != low.len() {
+        return Err(AoError::MismatchedArrayLengths {
+            high_len: high.len(),
+            low_len: low.len(),
+        });
+    }
+    if high.is_empty() {
+        return Err(AoError::EmptyInputData);
+    }
+
+    let mut out = alloc_with_nan_prefix(high.len(), 0);
+
+    for i in 0..high.len() {
+        unsafe {
+            *out.get_unchecked_mut(i) = (*high.get_unchecked(i) + *low.get_unchecked(i)) * 0.5;
+        }
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+pub fn ao_scalar(data: &[f64], short: usize, long: usize, first: usize, out: &mut [f64]) {
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let warm = first + long - 1;
+    if warm >= len {
+        return;
+    }
+
+    let inv_s = 1.0 / (short as f64);
+    let inv_l = 1.0 / (long as f64);
+
+    unsafe {
+        let base = data.as_ptr();
+
+        let mut long_sum = 0.0f64;
+        let mut p = base.add(first);
+        for _ in 0..(long - 1) {
+            long_sum += *p;
+            p = p.add(1);
+        }
+
+        let mut short_sum = 0.0f64;
+        let mut ps = base.add(first + long - short);
+        for _ in 0..(short - 1) {
+            short_sum += *ps;
+            ps = ps.add(1);
+        }
+
+        let mut head = base.add(warm);
+        let mut tail_long = base.add(first);
+        let mut tail_short = base.add(first + long - short);
+        let mut outp = out.as_mut_ptr().add(warm);
+
+        let mut i = warm;
+
+        while i + 1 < len {
+            let v0 = *head;
+            long_sum += v0;
+            short_sum += v0;
+            *outp = short_sum.mul_add(inv_s, -long_sum * inv_l);
+            long_sum -= *tail_long;
+            short_sum -= *tail_short;
+            head = head.add(1);
+            tail_long = tail_long.add(1);
+            tail_short = tail_short.add(1);
+            outp = outp.add(1);
+            i += 1;
+
+            let v1 = *head;
+            long_sum += v1;
+            short_sum += v1;
+            *outp = short_sum.mul_add(inv_s, -long_sum * inv_l);
+            long_sum -= *tail_long;
+            short_sum -= *tail_short;
+            head = head.add(1);
+            tail_long = tail_long.add(1);
+            tail_short = tail_short.add(1);
+            outp = outp.add(1);
+            i += 1;
+        }
+
+        while i < len {
+            let v = *head;
+            long_sum += v;
+            short_sum += v;
+            *outp = short_sum.mul_add(inv_s, -long_sum * inv_l);
+            long_sum -= *tail_long;
+            short_sum -= *tail_short;
+            head = head.add(1);
+            tail_long = tail_long.add(1);
+            tail_short = tail_short.add(1);
+            outp = outp.add(1);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn ao_avx512(data: &[f64], short: usize, long: usize, first: usize, out: &mut [f64]) {
+    if long <= 32 {
+        unsafe { ao_avx512_short(data, short, long, first, out) }
+    } else {
+        unsafe { ao_avx512_long(data, short, long, first, out) }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub fn ao_avx2(data: &[f64], short: usize, long: usize, first: usize, out: &mut [f64]) {
+    unsafe { ao_scalar(data, short, long, first, out) }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn ao_avx512_short(
+    data: &[f64],
+    short: usize,
+    long: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    ao_scalar(data, short, long, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn ao_avx512_long(
+    data: &[f64],
+    short: usize,
+    long: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    ao_scalar(data, short, long, first, out)
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ao_avx2_prefixsum(
+    data: &[f64],
+    short: usize,
+    long: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    use core::arch::x86_64::*;
+
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let warm = first + long - 1;
+    if warm >= len {
+        return;
+    }
+
+    let suffix_len = len - first;
+    let mut pref = Vec::<f64>::with_capacity(suffix_len + 1);
+    pref.push(0.0);
+    let mut acc = 0.0f64;
+    let p = data.as_ptr().add(first);
+    for k in 0..suffix_len {
+        acc += *p.add(k);
+        pref.push(acc);
+    }
+    let pref_ptr = pref.as_ptr();
+
+    let n_out = len - warm;
+    let out_base = out.as_mut_ptr().add(warm);
+
+    let inv_s = _mm256_set1_pd(1.0 / (short as f64));
+    let inv_l = _mm256_set1_pd(1.0 / (long as f64));
+
+    let cur0 = pref_ptr.add(long);
+    let mut cur = cur0;
+    let mut prev_s = cur0.sub(short);
+    let mut prev_l = cur0.sub(long);
+    let mut dst = out_base;
+
+    let vec_chunks = n_out / 4;
+    for _ in 0..vec_chunks {
+        let pc = _mm256_loadu_pd(cur);
+        let ps = _mm256_loadu_pd(prev_s);
+        let pl = _mm256_loadu_pd(prev_l);
+
+        let short_sum = _mm256_sub_pd(pc, ps);
+        let long_sum = _mm256_sub_pd(pc, pl);
+
+        let z = _mm256_mul_pd(long_sum, inv_l);
+        let ao = _mm256_fmsub_pd(short_sum, inv_s, z);
+
+        _mm256_storeu_pd(dst, ao);
+
+        cur = cur.add(4);
+        prev_s = prev_s.add(4);
+        prev_l = prev_l.add(4);
+        dst = dst.add(4);
+    }
+
+    let tail = n_out & 3;
+    for t in 0..tail {
+        let i_cur = long + (vec_chunks * 4 + t);
+        let pc = *pref_ptr.add(i_cur);
+        let ps = *pref_ptr.add(i_cur - short);
+        let pl = *pref_ptr.add(i_cur - long);
+        let y = pc - ps;
+        let z = pc - pl;
+        *dst.add(t) = y.mul_add(1.0 / (short as f64), -(z * (1.0 / (long as f64))));
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn ao_avx512_prefixsum(
+    data: &[f64],
+    short: usize,
+    long: usize,
+    first: usize,
+    out: &mut [f64],
+) {
+    use core::arch::x86_64::*;
+
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let warm = first + long - 1;
+    if warm >= len {
+        return;
+    }
+
+    let suffix_len = len - first;
+    let mut pref = Vec::<f64>::with_capacity(suffix_len + 1);
+    pref.push(0.0);
+    let mut acc = 0.0f64;
+    let p = data.as_ptr().add(first);
+    for k in 0..suffix_len {
+        acc += *p.add(k);
+        pref.push(acc);
+    }
+    let pref_ptr = pref.as_ptr();
+
+    let n_out = len - warm;
+    let out_base = out.as_mut_ptr().add(warm);
+
+    let inv_s = _mm512_set1_pd(1.0 / (short as f64));
+    let inv_l = _mm512_set1_pd(1.0 / (long as f64));
+
+    let cur0 = pref_ptr.add(long);
+    let mut cur = cur0;
+    let mut prev_s = cur0.sub(short);
+    let mut prev_l = cur0.sub(long);
+    let mut dst = out_base;
+
+    let vec_chunks = n_out / 8;
+    for _ in 0..vec_chunks {
+        let pc = _mm512_loadu_pd(cur);
+        let ps = _mm512_loadu_pd(prev_s);
+        let pl = _mm512_loadu_pd(prev_l);
+
+        let short_sum = _mm512_sub_pd(pc, ps);
+        let long_sum = _mm512_sub_pd(pc, pl);
+
+        let z = _mm512_mul_pd(long_sum, inv_l);
+        let ao = _mm512_fmsub_pd(short_sum, inv_s, z);
+
+        _mm512_storeu_pd(dst, ao);
+
+        cur = cur.add(8);
+        prev_s = prev_s.add(8);
+        prev_l = prev_l.add(8);
+        dst = dst.add(8);
+    }
+
+    let tail = n_out & 7;
+    for t in 0..tail {
+        let i_cur = long + (vec_chunks * 8 + t);
+        let pc = *pref_ptr.add(i_cur);
+        let ps = *pref_ptr.add(i_cur - short);
+        let pl = *pref_ptr.add(i_cur - long);
+        let y = pc - ps;
+        let z = pc - pl;
+        *dst.add(t) = y.mul_add(1.0 / (short as f64), -(z * (1.0 / (long as f64))));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AoStream {
+    short: usize,
+    long: usize,
+    inv_short: f64,
+    inv_long: f64,
+
+    buf: Vec<f64>,
+
+    head: usize,
+
+    filled: usize,
+
+    short_sum: f64,
+    long_sum: f64,
+}
+
+impl AoStream {
+    pub fn try_new(params: AoParams) -> Result<Self, AoError> {
+        let short = params.short_period.unwrap_or(5);
+        let long = params.long_period.unwrap_or(34);
+        if short == 0 || long == 0 {
+            return Err(AoError::InvalidPeriods { short, long });
+        }
+        if short >= long {
+            return Err(AoError::ShortPeriodNotLess { short, long });
+        }
+        Ok(Self {
+            short,
+            long,
+            inv_short: 1.0 / (short as f64),
+            inv_long: 1.0 / (long as f64),
+            buf: vec![0.0; long],
+            head: 0,
+            filled: 0,
+            short_sum: 0.0,
+            long_sum: 0.0,
+        })
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, value: f64) -> Option<f64> {
+        let old_long = if self.filled == self.long {
+            self.buf[self.head]
+        } else {
+            0.0
+        };
+
+        let old_short = if self.filled >= self.short {
+            let idx = if self.head >= self.short {
+                self.head - self.short
+            } else {
+                self.head + self.long - self.short
+            };
+            self.buf[idx]
+        } else {
+            0.0
+        };
+
+        self.buf[self.head] = value;
+
+        self.head += 1;
+        if self.head == self.long {
+            self.head = 0;
+        }
+
+        if self.filled < self.long {
+            self.filled += 1;
+        }
+
+        self.long_sum += value - old_long;
+        self.short_sum += value - old_short;
+
+        if self.filled == self.long {
+            Some(
+                self.short_sum
+                    .mul_add(self.inv_short, -(self.long_sum * self.inv_long)),
+            )
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.filled = 0;
+        self.short_sum = 0.0;
+        self.long_sum = 0.0;
+        for x in &mut self.buf {
+            *x = 0.0;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AoBatchRange {
+    pub short_period: (usize, usize, usize),
+    pub long_period: (usize, usize, usize),
+}
+
+impl Default for AoBatchRange {
+    fn default() -> Self {
+        Self {
+            short_period: (5, 5, 0),
+            long_period: (34, 283, 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AoBatchBuilder {
+    range: AoBatchRange,
+    kernel: Kernel,
+}
+
+impl AoBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+    pub fn short_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.short_period = (start, end, step);
+        self
+    }
+    pub fn short_static(mut self, v: usize) -> Self {
+        self.range.short_period = (v, v, 0);
+        self
+    }
+    pub fn long_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.long_period = (start, end, step);
+        self
+    }
+    pub fn long_static(mut self, v: usize) -> Self {
+        self.range.long_period = (v, v, 0);
+        self
+    }
+    pub fn apply_slice(self, data: &[f64]) -> Result<AoBatchOutput, AoError> {
+        ao_batch_with_kernel(data, &self.range, self.kernel)
+    }
+    pub fn with_default_slice(data: &[f64], k: Kernel) -> Result<AoBatchOutput, AoError> {
+        AoBatchBuilder::new().kernel(k).apply_slice(data)
+    }
+    pub fn apply_candles(self, c: &Candles, src: &str) -> Result<AoBatchOutput, AoError> {
+        let slice = source_type(c, src);
+        self.apply_slice(slice)
+    }
+    pub fn with_default_candles(c: &Candles) -> Result<AoBatchOutput, AoError> {
+        AoBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c, "hl2")
+    }
+}
+
+pub fn ao_batch_with_kernel(
+    data: &[f64],
+    sweep: &AoBatchRange,
+    k: Kernel,
+) -> Result<AoBatchOutput, AoError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        other => return Err(AoError::InvalidKernelForBatch(other)),
+    };
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => unreachable!(),
+    };
+    ao_batch_par_slice(data, sweep, simd)
+}
+
+#[derive(Clone, Debug)]
+pub struct AoBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<AoParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+impl AoBatchOutput {
+    pub fn row_for_params(&self, p: &AoParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.short_period.unwrap_or(5) == p.short_period.unwrap_or(5)
+                && c.long_period.unwrap_or(34) == p.long_period.unwrap_or(34)
+        })
+    }
+    pub fn values_for(&self, p: &AoParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid_checked(r: &AoBatchRange) -> Result<Vec<AoParams>, AoError> {
+    fn axis_usize((start, end, step): (usize, usize, usize)) -> Result<Vec<usize>, AoError> {
+        if step == 0 {
+            return Ok(vec![start]);
+        }
+        if start == end {
+            return Ok(vec![start]);
+        }
+        let mut out = Vec::new();
+        if start < end {
+            let mut v = start;
+            while v <= end {
+                out.push(v);
+                match v.checked_add(step) {
+                    Some(next) => {
+                        if next == v {
+                            break;
+                        }
+                        v = next;
+                    }
+                    None => break,
+                }
+            }
+        } else {
+            let mut v = start;
+            while v >= end {
+                out.push(v);
+                if v < end + step {
+                    break;
+                }
+                v -= step;
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(AoError::InvalidRange { start, end, step });
+        }
+        Ok(out)
+    }
+    let shorts = axis_usize(r.short_period)?;
+    let longs = axis_usize(r.long_period)?;
+
+    let cap = shorts
+        .len()
+        .checked_mul(longs.len())
+        .ok_or_else(|| AoError::InvalidInput("rows*cols overflow".into()))?;
+    let mut out = Vec::with_capacity(cap);
+    for &s in &shorts {
+        for &l in &longs {
+            if s < l && s > 0 && l > 0 {
+                out.push(AoParams {
+                    short_period: Some(s),
+                    long_period: Some(l),
+                });
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(AoError::InvalidInput(
+            "no valid parameter combinations".into(),
+        ));
+    }
+    Ok(out)
+}
+
+#[inline(always)]
+pub fn ao_batch_slice(
+    data: &[f64],
+    sweep: &AoBatchRange,
+    kern: Kernel,
+) -> Result<AoBatchOutput, AoError> {
+    ao_batch_inner(data, sweep, kern, false)
+}
+#[inline(always)]
+pub fn ao_batch_par_slice(
+    data: &[f64],
+    sweep: &AoBatchRange,
+    kern: Kernel,
+) -> Result<AoBatchOutput, AoError> {
+    ao_batch_inner(data, sweep, kern, true)
+}
+#[inline(always)]
+fn ao_batch_inner_into(
+    data: &[f64],
+    sweep: &AoBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<AoParams>, AoError> {
+    let combos = expand_grid_checked(sweep)?;
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(AoError::AllValuesNaN)?;
+    let max_long = combos.iter().map(|c| c.long_period.unwrap()).max().unwrap();
+    if data.len() - first < max_long {
+        return Err(AoError::NotEnoughValidData {
+            needed: max_long,
+            valid: data.len() - first,
+        });
+    }
+    let rows = combos.len();
+    let cols = data.len();
+    let do_row = |row: usize, out_row: &mut [f64]| unsafe {
+        let short = combos[row].short_period.unwrap();
+        let long = combos[row].long_period.unwrap();
+        match kern {
+            Kernel::Scalar => ao_row_scalar(data, first, short, long, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 => ao_row_avx2(data, first, short, long, out_row),
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 => ao_row_avx512(data, first, short, long, out_row),
+            _ => unreachable!(),
+        }
+    };
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            out.par_chunks_mut(cols)
+                .enumerate()
+                .for_each(|(row, slice)| do_row(row, slice));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (row, slice) in out.chunks_mut(cols).enumerate() {
+                do_row(row, slice);
+            }
+        }
+    } else {
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+    Ok(combos)
+}
+
+#[inline(always)]
+fn ao_batch_inner(
+    data: &[f64],
+    sweep: &AoBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<AoBatchOutput, AoError> {
+    let combos = expand_grid_checked(sweep)?;
+    let rows = combos.len();
+    let cols = data.len();
+
+    if cols == 0 {
+        return Err(AoError::EmptyInputData);
+    }
+
+    let first = data
+        .iter()
+        .position(|x| !x.is_nan())
+        .ok_or(AoError::AllValuesNaN)?;
+    let max_long = combos.iter().map(|c| c.long_period.unwrap()).max().unwrap();
+    if data.len() - first < max_long {
+        return Err(AoError::NotEnoughValidData {
+            needed: max_long,
+            valid: data.len() - first,
+        });
+    }
+
+    let _total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| AoError::InvalidInput("rows*cols overflow".into()))?;
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+
+    let warm: Vec<usize> = combos
+        .iter()
+        .map(|c| first + c.long_period.unwrap() - 1)
+        .collect();
+
+    init_matrix_prefixes(&mut buf_mu, cols, &warm);
+
+    let mut buf_guard = std::mem::ManuallyDrop::new(buf_mu);
+    let values_ptr = buf_guard.as_mut_ptr() as *mut f64;
+    let values_len = buf_guard.len();
+    let values_cap = buf_guard.capacity();
+
+    let values = unsafe {
+        let slice = std::slice::from_raw_parts_mut(values_ptr, values_len);
+
+        ao_batch_inner_into(data, sweep, kern, parallel, slice)?;
+
+        Vec::from_raw_parts(values_ptr, values_len, values_cap)
+    };
+
+    Ok(AoBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+#[inline(always)]
+unsafe fn ao_row_scalar(data: &[f64], first: usize, short: usize, long: usize, out: &mut [f64]) {
+    ao_scalar(data, short, long, first, out)
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn ao_row_avx2(data: &[f64], first: usize, short: usize, long: usize, out: &mut [f64]) {
+    ao_scalar(data, short, long, first, out)
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn ao_row_avx512(
+    data: &[f64],
+    first: usize,
+    short: usize,
+    long: usize,
+    out: &mut [f64],
+) {
+    if long <= 32 {
+        ao_row_avx512_short(data, first, short, long, out);
+    } else {
+        ao_row_avx512_long(data, first, short, long, out);
+    }
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn ao_row_avx512_short(
+    data: &[f64],
+    first: usize,
+    short: usize,
+    long: usize,
+    out: &mut [f64],
+) {
+    ao_scalar(data, short, long, first, out)
+}
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn ao_row_avx512_long(
+    data: &[f64],
+    first: usize,
+    short: usize,
+    long: usize,
+    out: &mut [f64],
+) {
+    ao_scalar(data, short, long, first, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+    use paste::paste;
+
+    #[test]
+    fn test_ao_into_matches_api() {
+        let len = 256;
+        let mut data = Vec::with_capacity(len);
+        for i in 0..len {
+            let x = i as f64;
+            data.push((x * 0.01).mul_add(1.0, (x * 0.0314159).sin()));
+        }
+
+        let input = AoInput::from_slice(&data, AoParams::default());
+
+        let base = ao(&input).expect("ao() should succeed");
+
+        let mut out = vec![0.0f64; len];
+        ao_into(&input, &mut out).expect("ao_into() should succeed");
+
+        assert_eq!(base.values.len(), out.len());
+
+        fn eq_or_both_nan(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || (a == b)
+        }
+
+        for i in 0..len {
+            assert!(
+                eq_or_both_nan(base.values[i], out[i]),
+                "Mismatch at index {}: got {}, expected {}",
+                i,
+                out[i],
+                base.values[i]
+            );
+        }
+    }
+
+    fn check_ao_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+        let partial_params = AoParams {
+            short_period: Some(3),
+            long_period: None,
+        };
+        let input = AoInput::from_candles(&candles, "hl2", partial_params);
+        let result = ao_with_kernel(&input, kernel)?;
+        assert_eq!(result.values.len(), candles.close.len());
+        Ok(())
+    }
+    fn check_ao_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+        let input = AoInput::with_default_candles(&candles);
+        let result = ao_with_kernel(&input, kernel)?;
+        let expected_last_five = [-1671.3, -1401.6706, -1262.3559, -1178.4941, -1157.4118];
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-1,
+                "[{}] AO {:?} mismatch at idx {}: got {}, expected {}",
+                test_name,
+                kernel,
+                i,
+                val,
+                expected_last_five[i]
+            );
+        }
+        Ok(())
+    }
+    fn check_ao_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+        let input = AoInput::with_default_candles(&candles);
+        match input.data {
+            AoData::Candles { source, .. } => assert_eq!(source, "hl2"),
+            _ => panic!("Expected AoData::Candles"),
+        }
+        let output = ao_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+        Ok(())
+    }
+    fn check_ao_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = [10.0, 20.0, 30.0];
+        let params = AoParams {
+            short_period: Some(0),
+            long_period: Some(34),
+        };
+        let input = AoInput::from_slice(&input_data, params);
+        let res = ao_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] AO should fail with zero period",
+            test_name
+        );
+        Ok(())
+    }
+    fn check_ao_period_exceeds_length(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = [10.0, 20.0, 30.0];
+        let params = AoParams {
+            short_period: Some(5),
+            long_period: Some(10),
+        };
+        let input = AoInput::from_slice(&data_small, params);
+        let res = ao_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] AO should fail with period exceeding length",
+            test_name
+        );
+        Ok(())
+    }
+    fn check_ao_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = [42.0];
+        let params = AoParams {
+            short_period: Some(5),
+            long_period: Some(34),
+        };
+        let input = AoInput::from_slice(&single_point, params);
+        let res = ao_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] AO should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+    fn check_ao_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+        let first_params = AoParams {
+            short_period: Some(5),
+            long_period: Some(34),
+        };
+        let first_input = AoInput::from_candles(&candles, "hl2", first_params);
+        let first_result = ao_with_kernel(&first_input, kernel)?;
+        let second_params = AoParams {
+            short_period: Some(3),
+            long_period: Some(10),
+        };
+        let second_input = AoInput::from_slice(&first_result.values, second_params);
+        let second_result = ao_with_kernel(&second_input, kernel)?;
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        Ok(())
+    }
+    fn check_ao_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+        let input = AoInput::from_candles(
+            &candles,
+            "hl2",
+            AoParams {
+                short_period: Some(5),
+                long_period: Some(34),
+            },
+        );
+        let res = ao_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+        if res.values.len() > 240 {
+            for (i, &val) in res.values[240..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    240 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_ao_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let test_params = vec![
+            AoParams::default(),
+            AoParams {
+                short_period: Some(2),
+                long_period: Some(10),
+            },
+            AoParams {
+                short_period: Some(3),
+                long_period: Some(20),
+            },
+            AoParams {
+                short_period: Some(10),
+                long_period: Some(50),
+            },
+            AoParams {
+                short_period: Some(20),
+                long_period: Some(100),
+            },
+            AoParams {
+                short_period: Some(5),
+                long_period: Some(200),
+            },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = AoInput::from_candles(&candles, "hl2", params.clone());
+            let result = ao_with_kernel(&input, kernel)?;
+
+            for (i, &val) in result.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+						 with params: short={}, long={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(5),
+                        params.long_period.unwrap_or(34),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+						 with params: short={}, long={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(5),
+                        params.long_period.unwrap_or(34),
+                        param_idx
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+						 with params: short={}, long={} (param set {})",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.short_period.unwrap_or(5),
+                        params.long_period.unwrap_or(34),
+                        param_idx
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_ao_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_ao_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (1usize..=50).prop_flat_map(|short_period| {
+            ((short_period + 1)..=100).prop_flat_map(move |long_period| {
+                (
+                    prop::collection::vec(
+                        (-1e6f64..1e6f64).prop_filter("finite", |x| x.is_finite()),
+                        long_period..400,
+                    ),
+                    Just(short_period),
+                    Just(long_period),
+                )
+            })
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(data, short_period, long_period)| {
+                let params = AoParams {
+                    short_period: Some(short_period),
+                    long_period: Some(long_period),
+                };
+                let input = AoInput::from_slice(&data, params);
+
+                let AoOutput { values: out } = ao_with_kernel(&input, kernel).unwrap();
+
+                let AoOutput { values: ref_out } = ao_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                for i in 0..(long_period - 1) {
+                    prop_assert!(
+                        out[i].is_nan(),
+                        "Expected NaN during warmup at index {}, got {}",
+                        i,
+                        out[i]
+                    );
+                }
+
+                for i in (long_period - 1)..data.len() {
+                    prop_assert!(
+                        out[i].is_finite(),
+                        "Expected finite value after warmup at index {}, got {}",
+                        i,
+                        out[i]
+                    );
+                }
+
+                if data.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-10) && data.len() >= long_period
+                {
+                    for i in (long_period - 1)..data.len() {
+                        prop_assert!(
+                            out[i].abs() < 1e-9,
+                            "For constant data, AO should be 0 at index {}, got {}",
+                            i,
+                            out[i]
+                        );
+                    }
+                }
+
+                if data.len() >= long_period {
+                    for i in (long_period - 1)..data.len() {
+                        let short_start = i + 1 - short_period;
+                        let long_start = i + 1 - long_period;
+
+                        let long_window = &data[long_start..=i];
+                        let window_min = long_window.iter().cloned().fold(f64::INFINITY, f64::min);
+                        let window_max = long_window
+                            .iter()
+                            .cloned()
+                            .fold(f64::NEG_INFINITY, f64::max);
+
+                        let theoretical_max = window_max - window_min;
+
+                        prop_assert!(
+                            out[i].abs() <= theoretical_max + 1e-9,
+                            "AO value {} at index {} exceeds theoretical max {}",
+                            out[i],
+                            i,
+                            theoretical_max
+                        );
+                    }
+                }
+
+                if short_period == 1 && long_period == 2 && data.len() >= 2 {
+                    for i in 1..data.len() {
+                        let expected = data[i] - (data[i] + data[i - 1]) / 2.0;
+                        let actual = out[i];
+                        prop_assert!(
+							(actual - expected).abs() < 1e-9,
+							"Special case (short=1, long=2) mismatch at index {}: expected {}, got {}",
+							i,
+							expected,
+							actual
+						);
+                    }
+                }
+
+                let is_increasing = data.windows(2).all(|w| w[1] > w[0] + 1e-10);
+                let is_decreasing = data.windows(2).all(|w| w[1] < w[0] - 1e-10);
+
+                if is_increasing && data.len() >= long_period {
+                    for i in (long_period - 1)..data.len() {
+                        prop_assert!(
+							out[i] > -1e-9,
+							"For strictly increasing data, AO should be positive at index {}, got {}",
+							i,
+							out[i]
+						);
+                    }
+                }
+
+                if is_decreasing && data.len() >= long_period {
+                    for i in (long_period - 1)..data.len() {
+                        prop_assert!(
+							out[i] < 1e-9,
+							"For strictly decreasing data, AO should be negative at index {}, got {}",
+							i,
+							out[i]
+						);
+                    }
+                }
+
+                if data.len() >= 3 {
+                    let diffs: Vec<f64> = data.windows(2).map(|w| w[1] - w[0]).collect();
+                    let is_linear = diffs.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10);
+
+                    if is_linear && data.len() >= long_period + 10 {
+                        let stable_start = long_period + 5;
+                        if stable_start < data.len() - 1 {
+                            let stable_values = &out[stable_start..];
+                            if stable_values.len() >= 2 {
+                                let first_stable = stable_values[0];
+                                for (idx, &val) in stable_values.iter().enumerate() {
+                                    prop_assert!(
+										(val - first_stable).abs() < 1e-8,
+										"For linear data, AO should stabilize. Value at {} differs from stable value: {} vs {}",
+										stable_start + idx,
+										val,
+										first_stable
+									);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for i in 0..data.len() {
+                    let y = out[i];
+                    let r = ref_out[i];
+
+                    if y.is_nan() || r.is_nan() {
+                        prop_assert!(
+                            y.is_nan() && r.is_nan(),
+                            "NaN mismatch at index {}: kernel={:?} is_nan={}, scalar is_nan={}",
+                            i,
+                            kernel,
+                            y.is_nan(),
+                            r.is_nan()
+                        );
+                        continue;
+                    }
+
+                    let y_bits = y.to_bits();
+                    let r_bits = r.to_bits();
+                    let ulp_diff: u64 = y_bits.abs_diff(r_bits);
+
+                    prop_assert!(
+                        (y - r).abs() <= 1e-9 || ulp_diff <= 4,
+                        "Kernel mismatch at index {}: kernel={:?} value={}, scalar value={}, \
+						 diff={}, ULP diff={}",
+                        i,
+                        kernel,
+                        y,
+                        r,
+                        (y - r).abs(),
+                        ulp_diff
+                    );
+                }
+
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_ao_tests {
+        ($($test_fn:ident),*) => {
+            paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+            }
+        }
+    }
+    generate_all_ao_tests!(
+        check_ao_partial_params,
+        check_ao_accuracy,
+        check_ao_default_candles,
+        check_ao_zero_period,
+        check_ao_period_exceeds_length,
+        check_ao_very_small_dataset,
+        check_ao_reinput,
+        check_ao_nan_handling,
+        check_ao_no_poison
+    );
+
+    #[cfg(feature = "proptest")]
+    generate_all_ao_tests!(check_ao_property);
+
+    #[test]
+    fn test_output_len_mismatch_error() {
+        let data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let params = AoParams {
+            short_period: Some(2),
+            long_period: Some(3),
+        };
+        let input = AoInput::from_slice(&data, params);
+
+        let mut wrong_sized_buf = vec![0.0; 10];
+
+        let result = ao_into_slice(&mut wrong_sized_buf, &input, Kernel::Auto);
+        assert!(result.is_err());
+
+        if let Err(AoError::OutputLengthMismatch { expected, got }) = result {
+            assert_eq!(expected, 5);
+            assert_eq!(got, 10);
+        } else {
+            panic!("Expected OutputLenMismatch error");
+        }
+    }
+
+    #[test]
+    fn test_invalid_kernel_error() {
+        let data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let sweep = AoBatchRange::default();
+
+        let result = ao_batch_with_kernel(&data, &sweep, Kernel::Scalar);
+        assert!(result.is_err());
+
+        if let Err(AoError::InvalidKernelForBatch(kernel)) = result {
+            assert!(matches!(kernel, Kernel::Scalar));
+        } else {
+            panic!("Expected InvalidKernel error");
+        }
+    }
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+        let output = AoBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c, "hl2")?;
+        let def = AoParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+        assert_eq!(row.len(), c.close.len());
+        let expected = [-1671.3, -1401.6706, -1262.3559, -1178.4941, -1157.4118];
+        let start = row.len() - 5;
+        for (i, &v) in row[start..].iter().enumerate() {
+            assert!(
+                (v - expected[i]).abs() < 1e-1,
+                "[{test}] default-row mismatch at idx {i}: {v} vs {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+
+        let test_configs = vec![
+            (2, 10, 2, 15, 40, 5),
+            (5, 20, 5, 30, 60, 10),
+            (10, 30, 10, 40, 100, 20),
+            (3, 3, 0, 10, 50, 10),
+            (5, 15, 5, 34, 34, 0),
+        ];
+
+        for (cfg_idx, &(short_start, short_end, short_step, long_start, long_end, long_step)) in
+            test_configs.iter().enumerate()
+        {
+            let sweep = AoBatchRange {
+                short_period: (short_start, short_end, short_step),
+                long_period: (long_start, long_end, long_step),
+            };
+
+            let output = ao_batch_with_kernel(source_type(&c, "hl2"), &sweep, kernel)?;
+
+            for (row, combo) in output.combos.iter().enumerate() {
+                let row_start = row * output.cols;
+                let row_end = row_start + output.cols;
+                let row_values = &output.values[row_start..row_end];
+
+                for (col, &val) in row_values.iter().enumerate() {
+                    if val.is_nan() {
+                        continue;
+                    }
+
+                    let bits = val.to_bits();
+                    let idx = row * output.cols + col;
+
+                    if bits == 0x11111111_11111111 {
+                        panic!(
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+							 at row {} col {} (flat index {}) with params: short={}, long={}",
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.short_period.unwrap_or(5),
+                            combo.long_period.unwrap_or(34)
+                        );
+                    }
+
+                    if bits == 0x22222222_22222222 {
+                        panic!(
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+							 at row {} col {} (flat index {}) with params: short={}, long={}",
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.short_period.unwrap_or(5),
+                            combo.long_period.unwrap_or(34)
+                        );
+                    }
+
+                    if bits == 0x33333333_33333333 {
+                        panic!(
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+							 at row {} col {} (flat index {}) with params: short={}, long={}",
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.short_period.unwrap_or(5),
+                            combo.long_period.unwrap_or(34)
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                }
+            }
+        };
+    }
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_no_poison);
+}

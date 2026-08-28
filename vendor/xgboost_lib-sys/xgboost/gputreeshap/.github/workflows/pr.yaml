@@ -1,0 +1,31 @@
+name: pr
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-builder:
+    needs:
+      - checks
+      - cpp-build-test
+    secrets: inherit
+    uses: rapidsai/shared-workflows/.github/workflows/pr-builder.yaml@branch-24.10
+  checks:
+    secrets: inherit
+    uses: rapidsai/shared-workflows/.github/workflows/checks.yaml@branch-24.10
+    with:
+      enable_check_generated_files: false
+  cpp-build-test:
+    needs: checks
+    secrets: inherit
+    uses: rapidsai/shared-workflows/.github/workflows/conda-cpp-tests.yaml@branch-24.10
+    with:
+      build_type: pull-request
+      script: ci/build_and_test.sh
+      matrix_filter: map(select(.ARCH == "amd64"))

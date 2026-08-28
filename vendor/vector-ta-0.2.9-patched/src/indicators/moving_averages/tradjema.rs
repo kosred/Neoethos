@@ -1,0 +1,2281 @@
+use crate::utilities::data_loader::Candles;
+use crate::utilities::enums::Kernel;
+use crate::utilities::helpers::{
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+
+use std::convert::AsRef;
+use std::error::Error;
+use std::mem::MaybeUninit;
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub enum TradjemaData<'a> {
+    Candles {
+        candles: &'a Candles,
+    },
+    Slices {
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TradjemaOutput {
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradjemaParams {
+    pub length: Option<usize>,
+    pub mult: Option<f64>,
+}
+
+impl Default for TradjemaParams {
+    fn default() -> Self {
+        Self {
+            length: Some(40),
+            mult: Some(10.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TradjemaInput<'a> {
+    pub data: TradjemaData<'a>,
+    pub params: TradjemaParams,
+}
+
+impl<'a> TradjemaInput<'a> {
+    #[inline]
+    pub fn from_candles(candles: &'a Candles, params: TradjemaParams) -> Self {
+        Self {
+            data: TradjemaData::Candles { candles },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn from_slices(
+        high: &'a [f64],
+        low: &'a [f64],
+        close: &'a [f64],
+        params: TradjemaParams,
+    ) -> Self {
+        Self {
+            data: TradjemaData::Slices { high, low, close },
+            params,
+        }
+    }
+
+    #[inline]
+    pub fn with_default_candles(candles: &'a Candles) -> Self {
+        Self::from_candles(candles, TradjemaParams::default())
+    }
+
+    #[inline]
+    pub fn get_length(&self) -> usize {
+        self.params.length.unwrap_or(40)
+    }
+
+    #[inline]
+    pub fn get_mult(&self) -> f64 {
+        self.params.mult.unwrap_or(10.0)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct TradjemaBuilder {
+    length: Option<usize>,
+    mult: Option<f64>,
+    kernel: Kernel,
+}
+
+impl Default for TradjemaBuilder {
+    fn default() -> Self {
+        Self {
+            length: None,
+            mult: None,
+            kernel: Kernel::Auto,
+        }
+    }
+}
+
+impl TradjemaBuilder {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn length(mut self, n: usize) -> Self {
+        self.length = Some(n);
+        self
+    }
+
+    #[inline(always)]
+    pub fn mult(mut self, m: f64) -> Self {
+        self.mult = Some(m);
+        self
+    }
+
+    #[inline(always)]
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline(always)]
+    pub fn apply(self, c: &Candles) -> Result<TradjemaOutput, TradjemaError> {
+        let p = TradjemaParams {
+            length: self.length,
+            mult: self.mult,
+        };
+        let i = TradjemaInput::from_candles(c, p);
+        tradjema_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> Result<TradjemaOutput, TradjemaError> {
+        let p = TradjemaParams {
+            length: self.length,
+            mult: self.mult,
+        };
+        let i = TradjemaInput::from_slices(high, low, close, p);
+        tradjema_with_kernel(&i, self.kernel)
+    }
+
+    #[inline(always)]
+    pub fn into_stream(self) -> Result<TradjemaStream, TradjemaError> {
+        let p = TradjemaParams {
+            length: self.length,
+            mult: self.mult,
+        };
+        TradjemaStream::try_new(p)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TradjemaError {
+    #[error("tradjema: Input data slice is empty.")]
+    EmptyInputData,
+
+    #[error("tradjema: All values are NaN.")]
+    AllValuesNaN,
+
+    #[error("tradjema: Invalid length: length = {length}, data length = {data_len}")]
+    InvalidLength { length: usize, data_len: usize },
+
+    #[error("tradjema: Not enough valid data: needed = {needed}, valid = {valid}")]
+    NotEnoughValidData { needed: usize, valid: usize },
+
+    #[error("tradjema: OHLC data length mismatch")]
+    MissingData,
+
+    #[error("tradjema: Invalid multiplier: {mult}")]
+    InvalidMult { mult: f64 },
+
+    #[error("tradjema: Output length mismatch: expected {expected}, got {got}")]
+    OutputLengthMismatch { expected: usize, got: usize },
+
+    #[error("tradjema: Invalid length range (start={start}, end={end}, step={step})")]
+    InvalidLengthRange {
+        start: usize,
+        end: usize,
+        step: usize,
+    },
+
+    #[error("tradjema: Invalid mult range (start={start}, end={end}, step={step})")]
+    InvalidMultRange { start: f64, end: f64, step: f64 },
+
+    #[error("tradjema: non-batch kernel passed to batch path: {0:?}")]
+    InvalidKernelForBatch(Kernel),
+}
+
+#[inline(always)]
+fn tradjema_prepare<'a>(
+    input: &'a TradjemaInput,
+    kernel: Kernel,
+) -> Result<(&'a [f64], &'a [f64], &'a [f64], usize, usize, f64, Kernel), TradjemaError> {
+    let (high, low, close) = match &input.data {
+        TradjemaData::Candles { candles } => {
+            (&candles.high[..], &candles.low[..], &candles.close[..])
+        }
+        TradjemaData::Slices { high, low, close } => {
+            if high.len() != low.len() || low.len() != close.len() {
+                return Err(TradjemaError::MissingData);
+            }
+            (*high, *low, *close)
+        }
+    };
+
+    let len = close.len();
+    if len == 0 {
+        return Err(TradjemaError::EmptyInputData);
+    }
+
+    let first = close
+        .iter()
+        .position(|v| !v.is_nan())
+        .ok_or(TradjemaError::AllValuesNaN)?;
+    let length = input.get_length();
+    if length < 2 || length > len {
+        return Err(TradjemaError::InvalidLength {
+            length,
+            data_len: len,
+        });
+    }
+    if len - first < length {
+        return Err(TradjemaError::NotEnoughValidData {
+            needed: length,
+            valid: len - first,
+        });
+    }
+
+    let mult = input.get_mult();
+    if mult <= 0.0 || !mult.is_finite() {
+        return Err(TradjemaError::InvalidMult { mult });
+    }
+
+    let chosen = match kernel {
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Auto => detect_best_kernel(),
+        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+        Kernel::Auto => Kernel::Scalar,
+        k => k,
+    };
+    Ok((high, low, close, length, first, mult, chosen))
+}
+
+#[inline]
+pub fn tradjema(input: &TradjemaInput) -> Result<TradjemaOutput, TradjemaError> {
+    tradjema_with_kernel(input, Kernel::Auto)
+}
+
+pub fn tradjema_with_kernel(
+    input: &TradjemaInput,
+    kernel: Kernel,
+) -> Result<TradjemaOutput, TradjemaError> {
+    let (h, l, c, length, first, mult, chosen) = tradjema_prepare(input, kernel)?;
+    let warm = first + length - 1;
+    let mut out = alloc_with_nan_prefix(c.len(), warm);
+    tradjema_compute_into(h, l, c, length, mult, first, chosen, &mut out);
+    Ok(TradjemaOutput { values: out })
+}
+
+#[inline]
+pub fn tradjema_into(input: &TradjemaInput, out: &mut [f64]) -> Result<(), TradjemaError> {
+    let (h, l, c, length, first, mult, chosen) = tradjema_prepare(input, Kernel::Auto)?;
+    if out.len() != c.len() {
+        return Err(TradjemaError::OutputLengthMismatch {
+            expected: c.len(),
+            got: out.len(),
+        });
+    }
+
+    let warm = first + length - 1;
+    let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+    let w = warm.min(out.len());
+    for v in &mut out[..w] {
+        *v = qnan;
+    }
+
+    tradjema_compute_into(h, l, c, length, mult, first, chosen, out);
+    Ok(())
+}
+
+#[inline]
+pub fn tradjema_into_slice(
+    dst: &mut [f64],
+    input: &TradjemaInput,
+    kern: Kernel,
+) -> Result<(), TradjemaError> {
+    let (h, l, c, length, first, mult, chosen) = tradjema_prepare(input, kern)?;
+    if dst.len() != c.len() {
+        return Err(TradjemaError::OutputLengthMismatch {
+            expected: c.len(),
+            got: dst.len(),
+        });
+    }
+    tradjema_compute_into(h, l, c, length, mult, first, chosen, dst);
+
+    let warm = first + length - 1;
+    for v in &mut dst[..warm] {
+        *v = f64::NAN;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn tradjema_compute_into_scalar(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    length: usize,
+    mult: f64,
+    first: usize,
+    out: &mut [f64],
+) {
+    debug_assert_eq!(high.len(), low.len());
+    debug_assert_eq!(low.len(), close.len());
+    debug_assert_eq!(close.len(), out.len());
+    debug_assert!(length >= 2);
+
+    let n = out.len();
+    let warm = first + length - 1;
+    if warm >= n {
+        return;
+    }
+    if length == 40 {
+        tradjema_compute_into_scalar_len40(high, low, close, mult, first, out);
+        return;
+    }
+
+    let alpha = 2.0 / (length as f64 + 1.0);
+
+    let cap = length;
+    let mut min_vals = vec![0.0f64; cap];
+    let mut min_idx = vec![0usize; cap];
+    let mut max_vals = vec![0.0f64; cap];
+    let mut max_idx = vec![0usize; cap];
+    let (mut min_head, mut min_tail) = (0usize, 0usize);
+    let (mut max_head, mut max_tail) = (0usize, 0usize);
+
+    #[inline(always)]
+    fn inc(i: &mut usize, cap: usize) {
+        *i += 1;
+        if *i == cap {
+            *i = 0;
+        }
+    }
+    #[inline(always)]
+    fn dec(i: usize, cap: usize) -> usize {
+        if i == 0 { cap - 1 } else { i - 1 }
+    }
+    #[inline(always)]
+    fn minq_push(
+        v: f64,
+        idx: usize,
+        vals: &mut [f64],
+        id: &mut [usize],
+        head: &mut usize,
+        tail: &mut usize,
+        cap: usize,
+    ) {
+        let mut back = dec(*tail, cap);
+        while *tail != *head && unsafe { *vals.get_unchecked(back) } > v {
+            *tail = back;
+            back = dec(*tail, cap);
+        }
+        unsafe {
+            *vals.get_unchecked_mut(*tail) = v;
+            *id.get_unchecked_mut(*tail) = idx;
+        }
+        inc(tail, cap);
+    }
+    #[inline(always)]
+    fn maxq_push(
+        v: f64,
+        idx: usize,
+        vals: &mut [f64],
+        id: &mut [usize],
+        head: &mut usize,
+        tail: &mut usize,
+        cap: usize,
+    ) {
+        let mut back = dec(*tail, cap);
+        while *tail != *head && unsafe { *vals.get_unchecked(back) } < v {
+            *tail = back;
+            back = dec(*tail, cap);
+        }
+        unsafe {
+            *vals.get_unchecked_mut(*tail) = v;
+            *id.get_unchecked_mut(*tail) = idx;
+        }
+        inc(tail, cap);
+    }
+    #[inline(always)]
+    fn q_expire(
+        cur: usize,
+        len: usize,
+        id: &mut [usize],
+        head: &mut usize,
+        tail: &mut usize,
+        cap: usize,
+    ) {
+        let lim = cur.saturating_sub(len);
+        while *head != *tail && unsafe { *id.get_unchecked(*head) } <= lim {
+            inc(head, cap);
+        }
+    }
+
+    #[inline(always)]
+    fn max3(a: f64, b: f64, c: f64) -> f64 {
+        let m = if a > b { a } else { b };
+        if m > c { m } else { c }
+    }
+
+    let tr0 = unsafe { *high.get_unchecked(first) - *low.get_unchecked(first) };
+    minq_push(
+        tr0,
+        first,
+        &mut min_vals,
+        &mut min_idx,
+        &mut min_head,
+        &mut min_tail,
+        cap,
+    );
+    maxq_push(
+        tr0,
+        first,
+        &mut max_vals,
+        &mut max_idx,
+        &mut max_head,
+        &mut max_tail,
+        cap,
+    );
+    let mut last_tr = tr0;
+
+    let mut i = first + 1;
+    while i <= warm {
+        let hi = unsafe { *high.get_unchecked(i) };
+        let lo = unsafe { *low.get_unchecked(i) };
+        let pc1 = unsafe { *close.get_unchecked(i - 1) };
+        let tr = max3(hi - lo, (hi - pc1).abs(), (lo - pc1).abs());
+        minq_push(
+            tr,
+            i,
+            &mut min_vals,
+            &mut min_idx,
+            &mut min_head,
+            &mut min_tail,
+            cap,
+        );
+        maxq_push(
+            tr,
+            i,
+            &mut max_vals,
+            &mut max_idx,
+            &mut max_head,
+            &mut max_tail,
+            cap,
+        );
+        last_tr = tr;
+        i += 1;
+    }
+
+    let tr_low = unsafe { *min_vals.get_unchecked(min_head) };
+    let tr_high = unsafe { *max_vals.get_unchecked(max_head) };
+    let denom = tr_high - tr_low;
+    let tr_adj0 = if denom != 0.0 {
+        (last_tr - tr_low) / denom
+    } else {
+        0.0
+    };
+    let a0 = alpha * (1.0 + tr_adj0 * mult);
+    let src0 = unsafe { *close.get_unchecked(warm - 1) };
+    let mut y = src0.mul_add(a0, 0.0);
+    unsafe {
+        *out.get_unchecked_mut(warm) = y;
+    }
+
+    i = warm + 1;
+    while i < n {
+        q_expire(i, length, &mut min_idx, &mut min_head, &mut min_tail, cap);
+        q_expire(i, length, &mut max_idx, &mut max_head, &mut max_tail, cap);
+
+        let hi = unsafe { *high.get_unchecked(i) };
+        let lo = unsafe { *low.get_unchecked(i) };
+        let pc1 = unsafe { *close.get_unchecked(i - 1) };
+        let tr = max3(hi - lo, (hi - pc1).abs(), (lo - pc1).abs());
+        minq_push(
+            tr,
+            i,
+            &mut min_vals,
+            &mut min_idx,
+            &mut min_head,
+            &mut min_tail,
+            cap,
+        );
+        maxq_push(
+            tr,
+            i,
+            &mut max_vals,
+            &mut max_idx,
+            &mut max_head,
+            &mut max_tail,
+            cap,
+        );
+
+        let lo_tr = unsafe { *min_vals.get_unchecked(min_head) };
+        let hi_tr = unsafe { *max_vals.get_unchecked(max_head) };
+        let den = hi_tr - lo_tr;
+        let tr_adj = if den != 0.0 { (tr - lo_tr) / den } else { 0.0 };
+        let a = alpha * (1.0 + tr_adj * mult);
+        let src = pc1;
+        y = (src - y).mul_add(a, y);
+        unsafe {
+            *out.get_unchecked_mut(i) = y;
+        }
+
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn tradjema_compute_into_scalar_len40(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    mult: f64,
+    first: usize,
+    out: &mut [f64],
+) {
+    let n = out.len();
+    let warm = first + 39;
+    if warm >= n {
+        return;
+    }
+
+    let alpha = 2.0 / 41.0;
+    let mut min_vals = [0.0f64; 40];
+    let mut min_idx = [0usize; 40];
+    let mut max_vals = [0.0f64; 40];
+    let mut max_idx = [0usize; 40];
+    let (mut min_head, mut min_tail) = (0usize, 0usize);
+    let (mut max_head, mut max_tail) = (0usize, 0usize);
+
+    #[inline(always)]
+    fn inc(i: &mut usize) {
+        *i += 1;
+        if *i == 40 {
+            *i = 0;
+        }
+    }
+    #[inline(always)]
+    fn dec(i: usize) -> usize {
+        if i == 0 { 39 } else { i - 1 }
+    }
+    #[inline(always)]
+    fn minq_push(
+        v: f64,
+        idx: usize,
+        vals: &mut [f64; 40],
+        id: &mut [usize; 40],
+        head: &mut usize,
+        tail: &mut usize,
+    ) {
+        let mut back = dec(*tail);
+        while *tail != *head && unsafe { *vals.get_unchecked(back) } > v {
+            *tail = back;
+            back = dec(*tail);
+        }
+        unsafe {
+            *vals.get_unchecked_mut(*tail) = v;
+            *id.get_unchecked_mut(*tail) = idx;
+        }
+        inc(tail);
+    }
+    #[inline(always)]
+    fn maxq_push(
+        v: f64,
+        idx: usize,
+        vals: &mut [f64; 40],
+        id: &mut [usize; 40],
+        head: &mut usize,
+        tail: &mut usize,
+    ) {
+        let mut back = dec(*tail);
+        while *tail != *head && unsafe { *vals.get_unchecked(back) } < v {
+            *tail = back;
+            back = dec(*tail);
+        }
+        unsafe {
+            *vals.get_unchecked_mut(*tail) = v;
+            *id.get_unchecked_mut(*tail) = idx;
+        }
+        inc(tail);
+    }
+    #[inline(always)]
+    fn q_expire(cur: usize, id: &mut [usize; 40], head: &mut usize, tail: &mut usize) {
+        let lim = cur.saturating_sub(40);
+        while *head != *tail && unsafe { *id.get_unchecked(*head) } <= lim {
+            inc(head);
+        }
+    }
+
+    #[inline(always)]
+    fn max3(a: f64, b: f64, c: f64) -> f64 {
+        let m = if a > b { a } else { b };
+        if m > c { m } else { c }
+    }
+
+    let tr0 = unsafe { *high.get_unchecked(first) - *low.get_unchecked(first) };
+    minq_push(
+        tr0,
+        first,
+        &mut min_vals,
+        &mut min_idx,
+        &mut min_head,
+        &mut min_tail,
+    );
+    maxq_push(
+        tr0,
+        first,
+        &mut max_vals,
+        &mut max_idx,
+        &mut max_head,
+        &mut max_tail,
+    );
+    let mut last_tr = tr0;
+
+    let mut i = first + 1;
+    while i <= warm {
+        let hi = unsafe { *high.get_unchecked(i) };
+        let lo = unsafe { *low.get_unchecked(i) };
+        let pc1 = unsafe { *close.get_unchecked(i - 1) };
+        let tr = max3(hi - lo, (hi - pc1).abs(), (lo - pc1).abs());
+        minq_push(
+            tr,
+            i,
+            &mut min_vals,
+            &mut min_idx,
+            &mut min_head,
+            &mut min_tail,
+        );
+        maxq_push(
+            tr,
+            i,
+            &mut max_vals,
+            &mut max_idx,
+            &mut max_head,
+            &mut max_tail,
+        );
+        last_tr = tr;
+        i += 1;
+    }
+
+    let tr_low = unsafe { *min_vals.get_unchecked(min_head) };
+    let tr_high = unsafe { *max_vals.get_unchecked(max_head) };
+    let denom = tr_high - tr_low;
+    let tr_adj0 = if denom != 0.0 {
+        (last_tr - tr_low) / denom
+    } else {
+        0.0
+    };
+    let a0 = alpha * (1.0 + tr_adj0 * mult);
+    let src0 = unsafe { *close.get_unchecked(warm - 1) };
+    let mut y = src0.mul_add(a0, 0.0);
+    unsafe {
+        *out.get_unchecked_mut(warm) = y;
+    }
+
+    i = warm + 1;
+    while i < n {
+        q_expire(i, &mut min_idx, &mut min_head, &mut min_tail);
+        q_expire(i, &mut max_idx, &mut max_head, &mut max_tail);
+
+        let hi = unsafe { *high.get_unchecked(i) };
+        let lo = unsafe { *low.get_unchecked(i) };
+        let pc1 = unsafe { *close.get_unchecked(i - 1) };
+        let tr = max3(hi - lo, (hi - pc1).abs(), (lo - pc1).abs());
+        minq_push(
+            tr,
+            i,
+            &mut min_vals,
+            &mut min_idx,
+            &mut min_head,
+            &mut min_tail,
+        );
+        maxq_push(
+            tr,
+            i,
+            &mut max_vals,
+            &mut max_idx,
+            &mut max_head,
+            &mut max_tail,
+        );
+
+        let lo_tr = unsafe { *min_vals.get_unchecked(min_head) };
+        let hi_tr = unsafe { *max_vals.get_unchecked(max_head) };
+        let den = hi_tr - lo_tr;
+        let tr_adj = if den != 0.0 { (tr - lo_tr) / den } else { 0.0 };
+        let a = alpha * (1.0 + tr_adj * mult);
+        let src = pc1;
+        y = (src - y).mul_add(a, y);
+        unsafe {
+            *out.get_unchecked_mut(i) = y;
+        }
+
+        i += 1;
+    }
+}
+
+#[inline(always)]
+fn tradjema_compute_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    length: usize,
+    mult: f64,
+    first: usize,
+    kern: Kernel,
+    out: &mut [f64],
+) {
+    unsafe {
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            if matches!(kern, Kernel::Scalar | Kernel::ScalarBatch) {
+                tradjema_compute_into_scalar(high, low, close, length, mult, first, out);
+                return;
+            }
+        }
+        match kern {
+            Kernel::Scalar | Kernel::ScalarBatch => {
+                tradjema_compute_into_scalar(high, low, close, length, mult, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx2 | Kernel::Avx2Batch => {
+                tradjema_compute_into_avx2(high, low, close, length, mult, first, out)
+            }
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            Kernel::Avx512 | Kernel::Avx512Batch => {
+                tradjema_compute_into_avx512(high, low, close, length, mult, first, out)
+            }
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
+                tradjema_compute_into_scalar(high, low, close, length, mult, first, out)
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn tradjema_compute_into_avx2(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    length: usize,
+    mult: f64,
+    first: usize,
+    out: &mut [f64],
+) {
+    tradjema_compute_into_scalar(high, low, close, length, mult, first, out);
+}
+
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn tradjema_compute_into_avx512(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    length: usize,
+    mult: f64,
+    first: usize,
+    out: &mut [f64],
+) {
+    tradjema_compute_into_scalar(high, low, close, length, mult, first, out);
+}
+
+#[derive(Debug, Clone)]
+pub struct TradjemaStream {
+    length: usize,
+    mult: f64,
+    alpha: f64,
+
+    i: usize,
+    filled: bool,
+
+    prev_close: f64,
+    tradjema: f64,
+
+    min_vals: Vec<f64>,
+    min_idx: Vec<usize>,
+    max_vals: Vec<f64>,
+    max_idx: Vec<usize>,
+    min_head: usize,
+    min_tail: usize,
+    max_head: usize,
+    max_tail: usize,
+}
+
+impl TradjemaStream {
+    pub fn try_new(params: TradjemaParams) -> Result<Self, TradjemaError> {
+        let length = params.length.unwrap_or(40);
+        let mult = params.mult.unwrap_or(10.0);
+
+        if length < 2 {
+            return Err(TradjemaError::InvalidLength {
+                length,
+                data_len: 0,
+            });
+        }
+        if mult <= 0.0 || !mult.is_finite() {
+            return Err(TradjemaError::InvalidMult { mult });
+        }
+        let cap = length;
+
+        Ok(Self {
+            length,
+            mult,
+            alpha: 2.0 / (length as f64 + 1.0),
+
+            i: 0,
+            filled: false,
+
+            prev_close: f64::NAN,
+            tradjema: f64::NAN,
+
+            min_vals: vec![0.0; cap],
+            min_idx: vec![0; cap],
+            max_vals: vec![0.0; cap],
+            max_idx: vec![0; cap],
+            min_head: 0,
+            min_tail: 0,
+            max_head: 0,
+            max_tail: 0,
+        })
+    }
+
+    #[inline(always)]
+    fn inc(i: &mut usize, cap: usize) {
+        *i += 1;
+        if *i == cap {
+            *i = 0;
+        }
+    }
+    #[inline(always)]
+    fn dec(i: usize, cap: usize) -> usize {
+        if i == 0 { cap - 1 } else { i - 1 }
+    }
+    #[inline(always)]
+    fn minq_push(&mut self, v: f64, idx: usize) {
+        let cap = self.length;
+        let mut back = Self::dec(self.min_tail, cap);
+
+        while self.min_tail != self.min_head && self.min_vals[back] > v {
+            self.min_tail = back;
+            back = Self::dec(self.min_tail, cap);
+        }
+        self.min_vals[self.min_tail] = v;
+        self.min_idx[self.min_tail] = idx;
+        Self::inc(&mut self.min_tail, cap);
+    }
+    #[inline(always)]
+    fn maxq_push(&mut self, v: f64, idx: usize) {
+        let cap = self.length;
+        let mut back = Self::dec(self.max_tail, cap);
+
+        while self.max_tail != self.max_head && self.max_vals[back] < v {
+            self.max_tail = back;
+            back = Self::dec(self.max_tail, cap);
+        }
+        self.max_vals[self.max_tail] = v;
+        self.max_idx[self.max_tail] = idx;
+        Self::inc(&mut self.max_tail, cap);
+    }
+    #[inline(always)]
+    fn q_expire(
+        head: &mut usize,
+        tail: &mut usize,
+        id: &mut [usize],
+        cur: usize,
+        len: usize,
+        cap: usize,
+    ) {
+        let lim = cur.saturating_sub(len);
+        while *head != *tail && id[*head] <= lim {
+            Self::inc(head, cap);
+        }
+    }
+
+    #[inline(always)]
+    fn max3(a: f64, b: f64, c: f64) -> f64 {
+        let m = if a > b { a } else { b };
+        if m > c { m } else { c }
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
+        let tr = if self.prev_close.is_nan() {
+            high - low
+        } else {
+            let hl = high - low;
+            let hc = (high - self.prev_close).abs();
+            let lc = (low - self.prev_close).abs();
+            Self::max3(hl, hc, lc)
+        };
+
+        if !self.filled {
+            self.minq_push(tr, self.i);
+            self.maxq_push(tr, self.i);
+
+            if self.i + 1 < self.length {
+                self.prev_close = close;
+                self.i += 1;
+                return None;
+            }
+
+            let lo = self.min_vals[self.min_head];
+            let hi = self.max_vals[self.max_head];
+            let den = hi - lo;
+            let tr_adj = if den != 0.0 { (tr - lo) / den } else { 0.0 };
+            let a0 = self.alpha * (1.0 + tr_adj * self.mult);
+
+            let src = self.prev_close;
+            self.tradjema = src.mul_add(a0, 0.0);
+
+            self.prev_close = close;
+            self.filled = true;
+            self.i += 1;
+            return Some(self.tradjema);
+        }
+
+        let cap = self.length;
+        Self::q_expire(
+            &mut self.min_head,
+            &mut self.min_tail,
+            &mut self.min_idx,
+            self.i,
+            self.length,
+            cap,
+        );
+        Self::q_expire(
+            &mut self.max_head,
+            &mut self.max_tail,
+            &mut self.max_idx,
+            self.i,
+            self.length,
+            cap,
+        );
+
+        self.minq_push(tr, self.i);
+        self.maxq_push(tr, self.i);
+
+        let lo = self.min_vals[self.min_head];
+        let hi = self.max_vals[self.max_head];
+        let den = hi - lo;
+        let tr_adj = if den != 0.0 { (tr - lo) / den } else { 0.0 };
+        let a = self.alpha * (1.0 + tr_adj * self.mult);
+
+        let src = self.prev_close;
+        self.tradjema = (src - self.tradjema).mul_add(a, self.tradjema);
+
+        self.prev_close = close;
+        self.i += 1;
+
+        Some(self.tradjema)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TradjemaBatchRange {
+    pub length: (usize, usize, usize),
+    pub mult: (f64, f64, f64),
+}
+
+impl Default for TradjemaBatchRange {
+    fn default() -> Self {
+        Self {
+            length: (40, 289, 1),
+            mult: (10.0, 10.0, 0.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TradjemaBatchBuilder {
+    range: TradjemaBatchRange,
+    kernel: Kernel,
+}
+
+impl TradjemaBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_default_candles(c: &Candles) -> Result<TradjemaBatchOutput, TradjemaError> {
+        TradjemaBatchBuilder::new()
+            .kernel(Kernel::Auto)
+            .apply_candles(c)
+    }
+
+    pub fn kernel(mut self, k: Kernel) -> Self {
+        self.kernel = k;
+        self
+    }
+
+    #[inline]
+    pub fn length_range(mut self, start: usize, end: usize, step: usize) -> Self {
+        self.range.length = (start, end, step);
+        self
+    }
+
+    #[inline]
+    pub fn mult_range(mut self, start: f64, end: f64, step: f64) -> Self {
+        self.range.mult = (start, end, step);
+        self
+    }
+
+    pub fn apply_slices(
+        self,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> Result<TradjemaBatchOutput, TradjemaError> {
+        tradjema_batch_with_kernel(high, low, close, &self.range, self.kernel)
+    }
+
+    pub fn apply_candles(self, c: &Candles) -> Result<TradjemaBatchOutput, TradjemaError> {
+        let high = c
+            .select_candle_field("high")
+            .map_err(|_| TradjemaError::EmptyInputData)?;
+        let low = c
+            .select_candle_field("low")
+            .map_err(|_| TradjemaError::EmptyInputData)?;
+        let close = c
+            .select_candle_field("close")
+            .map_err(|_| TradjemaError::EmptyInputData)?;
+        self.apply_slices(high, low, close)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TradjemaBatchOutput {
+    pub values: Vec<f64>,
+    pub combos: Vec<TradjemaParams>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl TradjemaBatchOutput {
+    pub fn row_for_params(&self, p: &TradjemaParams) -> Option<usize> {
+        self.combos.iter().position(|c| {
+            c.length.unwrap_or(40) == p.length.unwrap_or(40)
+                && (c.mult.unwrap_or(10.0) - p.mult.unwrap_or(10.0)).abs() < 1e-9
+        })
+    }
+
+    pub fn values_for(&self, p: &TradjemaParams) -> Option<&[f64]> {
+        self.row_for_params(p).map(|row| {
+            let start = row * self.cols;
+            &self.values[start..start + self.cols]
+        })
+    }
+}
+
+#[inline(always)]
+fn expand_grid(r: &TradjemaBatchRange) -> Vec<TradjemaParams> {
+    let (ls, le, lstep) = r.length;
+    let (ms, me, mstep) = r.mult;
+
+    #[inline]
+    fn axis_usize(start: usize, end: usize, step: usize) -> Vec<usize> {
+        if step == 0 {
+            return vec![start];
+        }
+        let mut vals = Vec::new();
+        if start <= end {
+            let mut v = start;
+            while v <= end {
+                vals.push(v);
+                match v.checked_add(step) {
+                    Some(n) if n > v => v = n,
+                    _ => break,
+                }
+            }
+        } else {
+            let mut v = start;
+            loop {
+                vals.push(v);
+                if v <= end {
+                    break;
+                }
+                v = v.saturating_sub(step);
+                if v < end {
+                    break;
+                }
+            }
+        }
+        vals
+    }
+
+    #[inline]
+    fn axis_f64(start: f64, end: f64, step: f64) -> Vec<f64> {
+        if step == 0.0 {
+            return vec![start];
+        }
+        let mut vals = Vec::new();
+        if start <= end {
+            let mut v = start;
+            while v <= end {
+                vals.push(v);
+                v += step;
+
+                if !v.is_finite() {
+                    break;
+                }
+                if step.is_sign_negative() {
+                    break;
+                }
+            }
+        } else {
+            let mut v = start;
+            while v >= end {
+                vals.push(v);
+                v -= step.abs();
+                if !v.is_finite() {
+                    break;
+                }
+                if step == 0.0 {
+                    break;
+                }
+            }
+        }
+        vals
+    }
+
+    let lengths = axis_usize(ls, le, lstep);
+    let mults = axis_f64(ms, me, mstep);
+    if lengths.is_empty() || mults.is_empty() {
+        return Vec::new();
+    }
+    let mut combos = Vec::with_capacity(lengths.len().saturating_mul(mults.len()));
+    for &l in &lengths {
+        for &m in &mults {
+            combos.push(TradjemaParams {
+                length: Some(l),
+                mult: Some(m),
+            });
+        }
+    }
+    combos
+}
+
+pub fn tradjema_batch_with_kernel(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    sweep: &TradjemaBatchRange,
+    k: Kernel,
+) -> Result<TradjemaBatchOutput, TradjemaError> {
+    let kernel = match k {
+        Kernel::Auto => detect_best_batch_kernel(),
+        other if other.is_batch() => other,
+        Kernel::Scalar | Kernel::Avx2 | Kernel::Avx512 => {
+            return Err(TradjemaError::InvalidKernelForBatch(k));
+        }
+        _ => detect_best_batch_kernel(),
+    };
+
+    let simd = match kernel {
+        Kernel::Avx512Batch => Kernel::Avx512,
+        Kernel::Avx2Batch => Kernel::Avx2,
+        Kernel::ScalarBatch => Kernel::Scalar,
+        _ => Kernel::Scalar,
+    };
+
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        let (ls, le, lstep) = sweep.length;
+        let (ms, me, mstep) = sweep.mult;
+
+        let length_empty =
+            (lstep == 0 && ls != le) || (lstep > 0 && ls > le && ls.saturating_sub(le) < lstep);
+        if length_empty {
+            return Err(TradjemaError::InvalidLengthRange {
+                start: ls,
+                end: le,
+                step: lstep,
+            });
+        } else {
+            return Err(TradjemaError::InvalidMultRange {
+                start: ms,
+                end: me,
+                step: mstep,
+            });
+        }
+    }
+    let rows = combos.len();
+    let cols = close.len();
+    rows.checked_mul(cols)
+        .ok_or(TradjemaError::InvalidLengthRange {
+            start: sweep.length.0,
+            end: sweep.length.1,
+            step: sweep.length.2,
+        })?;
+
+    tradjema_batch_inner(high, low, close, sweep, simd, true)
+}
+
+#[inline(always)]
+fn tradjema_batch_inner_into(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    sweep: &TradjemaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+    out: &mut [f64],
+) -> Result<Vec<TradjemaParams>, TradjemaError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        let (ls, le, lstep) = sweep.length;
+        let (ms, me, mstep) = sweep.mult;
+        let length_empty =
+            (lstep == 0 && ls != le) || (lstep > 0 && ls > le && ls.saturating_sub(le) < lstep);
+        if length_empty {
+            return Err(TradjemaError::InvalidLengthRange {
+                start: ls,
+                end: le,
+                step: lstep,
+            });
+        } else {
+            return Err(TradjemaError::InvalidMultRange {
+                start: ms,
+                end: me,
+                step: mstep,
+            });
+        }
+    }
+    if high.len() != low.len() || low.len() != close.len() {
+        return Err(TradjemaError::MissingData);
+    }
+
+    let cols = close.len();
+    let first = close
+        .iter()
+        .position(|v| !v.is_nan())
+        .ok_or(TradjemaError::AllValuesNaN)?;
+
+    #[inline(always)]
+    fn precompute_tr(high: &[f64], low: &[f64], close: &[f64], first: usize) -> Vec<f64> {
+        let n = close.len();
+        let mut tr = vec![0.0f64; n];
+        if first < n {
+            tr[first] = high[first] - low[first];
+            let mut i = first + 1;
+            while i < n {
+                let hl = high[i] - low[i];
+                let hc = (high[i] - close[i - 1]).abs();
+                let lc = (low[i] - close[i - 1]).abs();
+                tr[i] = hl.max(hc).max(lc);
+                i += 1;
+            }
+        }
+        tr
+    }
+
+    #[inline(always)]
+    fn compute_from_tr_into(
+        tr: &[f64],
+        close: &[f64],
+        length: usize,
+        mult: f64,
+        first: usize,
+        out: &mut [f64],
+    ) {
+        debug_assert_eq!(tr.len(), close.len());
+        debug_assert_eq!(close.len(), out.len());
+
+        let warm = first + length - 1;
+        if warm >= out.len() {
+            return;
+        }
+        let alpha = 2.0 / (length as f64 + 1.0);
+
+        let cap = length;
+        let mut min_vals = vec![0.0f64; cap];
+        let mut min_idx = vec![0usize; cap];
+        let mut max_vals = vec![0.0f64; cap];
+        let mut max_idx = vec![0usize; cap];
+        let (mut min_head, mut min_tail) = (0usize, 0usize);
+        let (mut max_head, mut max_tail) = (0usize, 0usize);
+        #[inline(always)]
+        fn inc(i: &mut usize, cap: usize) {
+            *i += 1;
+            if *i == cap {
+                *i = 0;
+            }
+        }
+        #[inline(always)]
+        fn dec(i: usize, cap: usize) -> usize {
+            if i == 0 { cap - 1 } else { i - 1 }
+        }
+        #[inline(always)]
+        fn minq_push(
+            v: f64,
+            idx: usize,
+            vals: &mut [f64],
+            id: &mut [usize],
+            head: &mut usize,
+            tail: &mut usize,
+            cap: usize,
+        ) {
+            let mut back = dec(*tail, cap);
+            while *tail != *head && vals[back] > v {
+                *tail = back;
+                back = dec(*tail, cap);
+            }
+            vals[*tail] = v;
+            id[*tail] = idx;
+            inc(tail, cap);
+        }
+        #[inline(always)]
+        fn maxq_push(
+            v: f64,
+            idx: usize,
+            vals: &mut [f64],
+            id: &mut [usize],
+            head: &mut usize,
+            tail: &mut usize,
+            cap: usize,
+        ) {
+            let mut back = dec(*tail, cap);
+            while *tail != *head && vals[back] < v {
+                *tail = back;
+                back = dec(*tail, cap);
+            }
+            vals[*tail] = v;
+            id[*tail] = idx;
+            inc(tail, cap);
+        }
+        #[inline(always)]
+        fn q_expire(
+            cur: usize,
+            len: usize,
+            id: &mut [usize],
+            head: &mut usize,
+            tail: &mut usize,
+            cap: usize,
+        ) {
+            let lim = cur.saturating_sub(len);
+            while *head != *tail && id[*head] <= lim {
+                inc(head, cap);
+            }
+        }
+
+        let mut i = first;
+        while i <= warm {
+            let v = tr[i];
+            minq_push(
+                v,
+                i,
+                &mut min_vals,
+                &mut min_idx,
+                &mut min_head,
+                &mut min_tail,
+                cap,
+            );
+            maxq_push(
+                v,
+                i,
+                &mut max_vals,
+                &mut max_idx,
+                &mut max_head,
+                &mut max_tail,
+                cap,
+            );
+            i += 1;
+        }
+        let lo = min_vals[min_head];
+        let hi = max_vals[max_head];
+        let den = hi - lo;
+        let v = tr[warm];
+        let tr_adj0 = if den != 0.0 { (v - lo) / den } else { 0.0 };
+        let a0 = alpha * (1.0 + tr_adj0 * mult);
+        let mut y = a0 * close[warm - 1];
+        out[warm] = y;
+
+        i = warm + 1;
+        while i < out.len() {
+            q_expire(i, length, &mut min_idx, &mut min_head, &mut min_tail, cap);
+            q_expire(i, length, &mut max_idx, &mut max_head, &mut max_tail, cap);
+
+            let v = tr[i];
+            minq_push(
+                v,
+                i,
+                &mut min_vals,
+                &mut min_idx,
+                &mut min_head,
+                &mut min_tail,
+                cap,
+            );
+            maxq_push(
+                v,
+                i,
+                &mut max_vals,
+                &mut max_idx,
+                &mut max_head,
+                &mut max_tail,
+                cap,
+            );
+
+            let lo = min_vals[min_head];
+            let hi = max_vals[max_head];
+            let den = hi - lo;
+            let tr_adj = if den != 0.0 { (v - lo) / den } else { 0.0 };
+            let a = alpha * (1.0 + tr_adj * mult);
+            let src = close[i - 1];
+            y += a * (src - y);
+            out[i] = y;
+
+            i += 1;
+        }
+    }
+
+    let pre_tr = precompute_tr(high, low, close, first);
+    let do_row = |row: usize, dst: &mut [f64]| {
+        let p = &combos[row];
+        let length = p.length.unwrap_or(40);
+        let mult = p.mult.unwrap_or(10.0);
+        if length < 2 {
+            return;
+        }
+
+        let _ = kern;
+        compute_from_tr_into(&pre_tr, close, length, mult, first, dst);
+    };
+
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        out.par_chunks_mut(cols)
+            .enumerate()
+            .for_each(|(row, slice)| do_row(row, slice));
+        #[cfg(target_arch = "wasm32")]
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    } else {
+        for (row, slice) in out.chunks_mut(cols).enumerate() {
+            do_row(row, slice);
+        }
+    }
+
+    Ok(combos)
+}
+
+fn tradjema_batch_inner(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    sweep: &TradjemaBatchRange,
+    kern: Kernel,
+    parallel: bool,
+) -> Result<TradjemaBatchOutput, TradjemaError> {
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(TradjemaError::InvalidLength {
+            length: 0,
+            data_len: 0,
+        });
+    }
+    let rows = combos.len();
+    let cols = close.len();
+
+    let mut buf_mu = make_uninit_matrix(rows, cols);
+    let first = close
+        .iter()
+        .position(|v| !v.is_nan())
+        .ok_or(TradjemaError::AllValuesNaN)?;
+    let warms: Vec<usize> = combos
+        .iter()
+        .map(|p| first + p.length.unwrap_or(40) - 1)
+        .collect();
+    init_matrix_prefixes(&mut buf_mu, cols, &warms);
+
+    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
+    let out: &mut [f64] =
+        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
+
+    let combos = tradjema_batch_inner_into(high, low, close, sweep, kern, parallel, out)?;
+
+    let values = unsafe {
+        Vec::from_raw_parts(
+            guard.as_mut_ptr() as *mut f64,
+            guard.len(),
+            guard.capacity(),
+        )
+    };
+
+    Ok(TradjemaBatchOutput {
+        values,
+        combos,
+        rows,
+        cols,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+    #[cfg(feature = "proptest")]
+    use proptest::prelude::*;
+    use std::error::Error;
+
+    fn check_tradjema_partial_params(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let default_params = TradjemaParams {
+            length: None,
+            mult: None,
+        };
+        let input = TradjemaInput::from_slices(high, low, close, default_params);
+        let output = tradjema_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_tradjema_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let input = TradjemaInput::from_slices(high, low, close, TradjemaParams::default());
+        let result = tradjema_with_kernel(&input, kernel)?;
+
+        assert_eq!(result.values.len(), candles.close.len());
+
+        let warmup = 39;
+        for i in 0..warmup {
+            assert!(
+                result.values[i].is_nan(),
+                "[{}] Expected NaN during warmup at index {}",
+                test_name,
+                i
+            );
+        }
+
+        for i in warmup..result.values.len() {
+            assert!(
+                !result.values[i].is_nan(),
+                "[{}] Expected valid value after warmup at index {}",
+                test_name,
+                i
+            );
+        }
+
+        let expected_last_five = [
+            59395.39322263,
+            59388.09683228,
+            59373.08371503,
+            59350.75110897,
+            59323.14225348,
+        ];
+
+        let start = result.values.len().saturating_sub(5);
+        for (i, &val) in result.values[start..].iter().enumerate() {
+            let diff = (val - expected_last_five[i]).abs();
+            assert!(
+                diff < 1e-8,
+                "[{}] TRADJEMA accuracy mismatch at last_5[{}]: got {:.8}, expected {:.8}, diff={:.10}",
+                test_name,
+                i,
+                val,
+                expected_last_five[i],
+                diff
+            );
+        }
+
+        Ok(())
+    }
+
+    fn check_tradjema_default_candles(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let input = TradjemaInput::with_default_candles(&candles);
+        let output = tradjema_with_kernel(&input, kernel)?;
+        assert_eq!(output.values.len(), candles.close.len());
+
+        Ok(())
+    }
+
+    fn check_tradjema_zero_length(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let input_data = vec![10.0, 20.0, 30.0];
+
+        let params = TradjemaParams {
+            length: Some(0),
+            mult: None,
+        };
+        let input = TradjemaInput::from_slices(&input_data, &input_data, &input_data, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] TRADJEMA should fail with zero length",
+            test_name
+        );
+
+        let params = TradjemaParams {
+            length: Some(1),
+            mult: None,
+        };
+        let input = TradjemaInput::from_slices(&input_data, &input_data, &input_data, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] TRADJEMA should fail with length=1 (minimum is 2)",
+            test_name
+        );
+
+        Ok(())
+    }
+
+    fn check_tradjema_length_exceeds_data(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data_small = vec![10.0, 20.0, 30.0];
+        let params = TradjemaParams {
+            length: Some(10),
+            mult: None,
+        };
+        let input = TradjemaInput::from_slices(&data_small, &data_small, &data_small, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] TRADJEMA should fail with length exceeding data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_tradjema_very_small_dataset(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let single_point = vec![42.0];
+        let params = TradjemaParams {
+            length: Some(40),
+            mult: None,
+        };
+        let input = TradjemaInput::from_slices(&single_point, &single_point, &single_point, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            res.is_err(),
+            "[{}] TRADJEMA should fail with insufficient data",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_tradjema_empty_input(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let empty: Vec<f64> = vec![];
+        let input = TradjemaInput::from_slices(&empty, &empty, &empty, TradjemaParams::default());
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(TradjemaError::EmptyInputData)),
+            "[{}] TRADJEMA should fail with empty input",
+            test_name
+        );
+        Ok(())
+    }
+
+    fn check_tradjema_invalid_mult(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        let params = TradjemaParams {
+            length: Some(2),
+            mult: Some(-10.0),
+        };
+        let input = TradjemaInput::from_slices(&data, &data, &data, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(TradjemaError::InvalidMult { .. })),
+            "[{}] TRADJEMA should fail with negative mult",
+            test_name
+        );
+
+        let params = TradjemaParams {
+            length: Some(2),
+            mult: Some(f64::NAN),
+        };
+        let input = TradjemaInput::from_slices(&data, &data, &data, params);
+        let res = tradjema_with_kernel(&input, kernel);
+        assert!(
+            matches!(res, Err(TradjemaError::InvalidMult { .. })),
+            "[{}] TRADJEMA should fail with NaN mult",
+            test_name
+        );
+
+        Ok(())
+    }
+
+    fn check_tradjema_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let first_params = TradjemaParams {
+            length: Some(20),
+            mult: Some(5.0),
+        };
+        let first_input = TradjemaInput::from_slices(high, low, close, first_params);
+        let first_result = tradjema_with_kernel(&first_input, kernel)?;
+
+        let second_params = TradjemaParams {
+            length: Some(20),
+            mult: Some(5.0),
+        };
+        let second_input = TradjemaInput::from_slices(
+            &first_result.values,
+            &first_result.values,
+            &first_result.values,
+            second_params,
+        );
+        let second_result = tradjema_with_kernel(&second_input, kernel)?;
+
+        assert_eq!(second_result.values.len(), first_result.values.len());
+        Ok(())
+    }
+
+    fn check_tradjema_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let input = TradjemaInput::from_slices(
+            high,
+            low,
+            close,
+            TradjemaParams {
+                length: Some(40),
+                mult: Some(10.0),
+            },
+        );
+        let res = tradjema_with_kernel(&input, kernel)?;
+        assert_eq!(res.values.len(), candles.close.len());
+
+        if res.values.len() > 50 {
+            for (i, &val) in res.values[50..].iter().enumerate() {
+                assert!(
+                    !val.is_nan(),
+                    "[{}] Found unexpected NaN at out-index {}",
+                    test_name,
+                    50 + i
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn check_tradjema_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let length = 40;
+        let mult = 10.0;
+
+        let input = TradjemaInput::from_slices(
+            high,
+            low,
+            close,
+            TradjemaParams {
+                length: Some(length),
+                mult: Some(mult),
+            },
+        );
+        let batch_output = tradjema_with_kernel(&input, kernel)?.values;
+
+        let mut stream = TradjemaStream::try_new(TradjemaParams {
+            length: Some(length),
+            mult: Some(mult),
+        })?;
+
+        let mut stream_values = Vec::with_capacity(candles.close.len());
+        for i in 0..candles.close.len() {
+            match stream.update(high[i], low[i], close[i]) {
+                Some(val) => stream_values.push(val),
+                None => stream_values.push(f64::NAN),
+            }
+        }
+
+        assert_eq!(batch_output.len(), stream_values.len());
+        for (i, (&b, &s)) in batch_output.iter().zip(stream_values.iter()).enumerate() {
+            if b.is_nan() && s.is_nan() {
+                continue;
+            }
+            let diff = (b - s).abs();
+            assert!(
+                diff < 1e-9,
+                "[{}] TRADJEMA streaming mismatch at idx {}: batch={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_tradjema_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
+
+        let high = candles.select_candle_field("high")?;
+        let low = candles.select_candle_field("low")?;
+        let close = candles.select_candle_field("close")?;
+
+        let test_params = vec![
+            TradjemaParams::default(),
+            TradjemaParams {
+                length: Some(10),
+                mult: Some(5.0),
+            },
+            TradjemaParams {
+                length: Some(20),
+                mult: Some(7.5),
+            },
+            TradjemaParams {
+                length: Some(50),
+                mult: Some(15.0),
+            },
+            TradjemaParams {
+                length: Some(100),
+                mult: Some(20.0),
+            },
+        ];
+
+        for (param_idx, params) in test_params.iter().enumerate() {
+            let input = TradjemaInput::from_slices(high, low, close, params.clone());
+            let output = tradjema_with_kernel(&input, kernel)?;
+
+            for (i, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+
+                if bits == 0x11111111_11111111 {
+                    panic!(
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                        with params: length={}, mult={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length.unwrap_or(40),
+                        params.mult.unwrap_or(10.0)
+                    );
+                }
+
+                if bits == 0x22222222_22222222 {
+                    panic!(
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                        with params: length={}, mult={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length.unwrap_or(40),
+                        params.mult.unwrap_or(10.0)
+                    );
+                }
+
+                if bits == 0x33333333_33333333 {
+                    panic!(
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                        with params: length={}, mult={}",
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length.unwrap_or(40),
+                        params.mult.unwrap_or(10.0)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_tradjema_no_poison(_test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    #[cfg(feature = "proptest")]
+    #[allow(clippy::float_cmp)]
+    fn check_tradjema_property(
+        test_name: &str,
+        kernel: Kernel,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use proptest::prelude::*;
+        skip_if_unsupported!(kernel, test_name);
+
+        let strat = (2usize..=100).prop_flat_map(|length| {
+            (
+                prop::collection::vec(
+                    (-1e6f64..1e6f64).prop_filter("finite", |x| x.is_finite()),
+                    length..400,
+                ),
+                Just(length),
+                0.1f64..50.0f64,
+            )
+        });
+
+        proptest::test_runner::TestRunner::default()
+            .run(&strat, |(data, length, mult)| {
+                let params = TradjemaParams {
+                    length: Some(length),
+                    mult: Some(mult),
+                };
+
+                let input = TradjemaInput::from_slices(&data, &data, &data, params);
+
+                let TradjemaOutput { values: out } = tradjema_with_kernel(&input, kernel).unwrap();
+                let TradjemaOutput { values: ref_out } =
+                    tradjema_with_kernel(&input, Kernel::Scalar).unwrap();
+
+                for i in (length - 1)..data.len() {
+                    let y = out[i];
+                    let r = ref_out[i];
+
+                    if !y.is_finite() || !r.is_finite() {
+                        prop_assert!(
+                            y.to_bits() == r.to_bits(),
+                            "finite/NaN mismatch idx {i}: {y} vs {r}"
+                        );
+                        continue;
+                    }
+
+                    let ulp_diff: u64 = y.to_bits().abs_diff(r.to_bits());
+
+                    prop_assert!(
+                        (y - r).abs() <= 1e-9 || ulp_diff <= 4,
+                        "mismatch idx {i}: {y} vs {r} (ULP={ulp_diff})"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        Ok(())
+    }
+
+    macro_rules! generate_all_tradjema_tests {
+        ($($test_fn:ident),*) => {
+            paste::paste! {
+                $(
+                    #[test]
+                    fn [<$test_fn _scalar_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    }
+                )*
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _avx2_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    }
+                    #[test]
+                    fn [<$test_fn _avx512_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    }
+                )*
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+                $(
+                    #[test]
+                    fn [<$test_fn _simd128_f64>]() {
+                        let _ = $test_fn(stringify!([<$test_fn _simd128_f64>]), Kernel::Scalar);
+                    }
+                )*
+            }
+        }
+    }
+
+    generate_all_tradjema_tests!(
+        check_tradjema_partial_params,
+        check_tradjema_accuracy,
+        check_tradjema_default_candles,
+        check_tradjema_zero_length,
+        check_tradjema_length_exceeds_data,
+        check_tradjema_very_small_dataset,
+        check_tradjema_empty_input,
+        check_tradjema_invalid_mult,
+        check_tradjema_reinput,
+        check_tradjema_nan_handling,
+        check_tradjema_streaming,
+        check_tradjema_no_poison
+    );
+
+    fn check_tradjema_into_slice(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test_name);
+        let f = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(f)?;
+        let (h, l, cl) = (
+            c.select_candle_field("high")?,
+            c.select_candle_field("low")?,
+            c.select_candle_field("close")?,
+        );
+        let input = TradjemaInput::from_slices(h, l, cl, TradjemaParams::default());
+        let mut dst = vec![0.0; cl.len()];
+        tradjema_into_slice(&mut dst, &input, kernel)?;
+        let first = cl.iter().position(|v| !v.is_nan()).unwrap();
+        let warm = first + input.get_length() - 1;
+        assert!(
+            dst[..warm].iter().all(|v| v.is_nan()),
+            "[{}] warmup prefix must be NaN",
+            test_name
+        );
+        Ok(())
+    }
+
+    generate_all_tradjema_tests!(check_tradjema_into_slice);
+
+    #[cfg(feature = "proptest")]
+    generate_all_tradjema_tests!(check_tradjema_property);
+
+    fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+
+        let output = TradjemaBatchBuilder::new()
+            .kernel(kernel)
+            .apply_candles(&c)?;
+
+        let def = TradjemaParams::default();
+        let row = output.values_for(&def).expect("default row missing");
+
+        assert_eq!(row.len(), c.close.len());
+        Ok(())
+    }
+
+    fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+
+        let output = TradjemaBatchBuilder::new()
+            .kernel(kernel)
+            .length_range(20, 50, 10)
+            .mult_range(5.0, 15.0, 5.0)
+            .apply_candles(&c)?;
+
+        let expected_combos = 4 * 3;
+        assert_eq!(output.combos.len(), expected_combos);
+        assert_eq!(output.rows, expected_combos);
+        assert_eq!(output.cols, c.close.len());
+
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        skip_if_unsupported!(kernel, test);
+
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+
+        let test_configs = vec![
+            (10, 30, 10, 5.0, 15.0, 5.0),
+            (40, 40, 0, 10.0, 10.0, 0.0),
+            (20, 60, 20, 7.5, 12.5, 2.5),
+        ];
+
+        for (cfg_idx, &(l_start, l_end, l_step, m_start, m_end, m_step)) in
+            test_configs.iter().enumerate()
+        {
+            let output = TradjemaBatchBuilder::new()
+                .kernel(kernel)
+                .length_range(l_start, l_end, l_step)
+                .mult_range(m_start, m_end, m_step)
+                .apply_candles(&c)?;
+
+            for (idx, &val) in output.values.iter().enumerate() {
+                if val.is_nan() {
+                    continue;
+                }
+
+                let bits = val.to_bits();
+                let row = idx / output.cols;
+                let col = idx % output.cols;
+                let combo = &output.combos[row];
+
+                if bits == 0x11111111_11111111
+                    || bits == 0x22222222_22222222
+                    || bits == 0x33333333_33333333
+                {
+                    panic!(
+                        "[{}] Config {}: Found poison value {} (0x{:016X}) \
+                        at row {} col {} (flat index {}) with params: length={}, mult={}",
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.length.unwrap_or(40),
+                        combo.mult.unwrap_or(10.0)
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_batch_no_poison(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    macro_rules! gen_batch_tests {
+        ($fn_name:ident) => {
+            paste::paste! {
+                #[test] fn [<$fn_name _scalar>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx2>]()        {
+                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                }
+                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+                #[test] fn [<$fn_name _avx512>]()      {
+                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                }
+                #[test] fn [<$fn_name _auto_detect>]() {
+                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]),
+                                    Kernel::Auto);
+                }
+            }
+        };
+    }
+
+    gen_batch_tests!(check_batch_default_row);
+    gen_batch_tests!(check_batch_sweep);
+    gen_batch_tests!(check_batch_no_poison);
+
+    #[test]
+    fn test_expand_grid_single_value() {
+        let range = TradjemaBatchRange {
+            length: (2, 2, 0),
+            mult: (10.0, 10.0, 0.0),
+        };
+        let combos = expand_grid(&range);
+        assert!(
+            !combos.is_empty(),
+            "expand_grid should not return empty for single value"
+        );
+        assert_eq!(combos.len(), 1, "Should have exactly one combo");
+        assert_eq!(combos[0].length, Some(2));
+        assert_eq!(combos[0].mult, Some(10.0));
+
+        let range2 = TradjemaBatchRange {
+            length: (40, 40, 0),
+            mult: (10.0, 10.0, 0.0),
+        };
+        let combos2 = expand_grid(&range2);
+        assert!(
+            !combos2.is_empty(),
+            "expand_grid should not return empty for single value (40,40,0)"
+        );
+        assert_eq!(
+            combos2.len(),
+            1,
+            "Should have exactly one combo for (40,40,0)"
+        );
+        assert_eq!(combos2[0].length, Some(40));
+        assert_eq!(combos2[0].mult, Some(10.0));
+    }
+
+    #[test]
+    fn test_tradjema_into_matches_api() -> Result<(), Box<dyn Error>> {
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
+        let (h, l, cl) = (
+            c.select_candle_field("high")?,
+            c.select_candle_field("low")?,
+            c.select_candle_field("close")?,
+        );
+
+        let input = TradjemaInput::from_slices(h, l, cl, TradjemaParams::default());
+
+        let base = tradjema(&input)?.values;
+
+        let mut out = vec![0.0; cl.len()];
+        tradjema_into(&input, &mut out)?;
+
+        assert_eq!(base.len(), out.len());
+
+        for i in 0..out.len() {
+            let a = base[i];
+            let b = out[i];
+            if a.is_nan() || b.is_nan() {
+                assert!(
+                    a.is_nan() && b.is_nan(),
+                    "NaN mismatch at index {}: {:?} vs {:?}",
+                    i,
+                    a,
+                    b
+                );
+            } else {
+                assert_eq!(a, b, "Value mismatch at index {}: {} vs {}", i, a, b);
+            }
+        }
+
+        Ok(())
+    }
+}

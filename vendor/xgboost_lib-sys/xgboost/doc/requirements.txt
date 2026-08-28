@@ -1,0 +1,17 @@
+sphinx
+mock
+sphinx_rtd_theme>=1.0.0
+breathe
+scikit-learn
+sh
+matplotlib
+graphviz
+numpy
+scipy
+myst-parser
+ray[train]
+sphinx-gallery
+dask
+pyspark
+cloudpickle
+setuptools
