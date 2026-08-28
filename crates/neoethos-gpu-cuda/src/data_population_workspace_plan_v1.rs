@@ -660,6 +660,7 @@ pub fn bind_data_population_gpu_workspace_plan_v1(
         phase_one_free_bytes_snapshot: free_memory_bytes_snapshot,
         allocator_context_reserve_bytes: plan.allocator_context_reserve_bytes,
         data_population_limits: Some(plan.limits),
+        full_discovery_trim_admission: None,
     })
     .map_err(|error| {
         DataPopulationWorkspacePlanErrorV1::new(

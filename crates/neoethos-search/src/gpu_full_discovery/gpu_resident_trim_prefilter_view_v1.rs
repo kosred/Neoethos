@@ -9,10 +9,11 @@
 
 use neoethos_gpu_cuda::resident_trim_prefilter_v1::{
     ResidentTrimPrefilterDeviceRunV1, ResidentTrimPrefilterFullDiscoveryAdmissionV1,
-    ResidentTrimPrefilterNativeMemoryFieldsV1, ResidentTrimPrefilterNativePlanFieldsV1,
-    ResidentTrimPrefilterNativePlanV1, ResidentTrimPrefilterNativeScratchBytesV1,
-    ResidentTrimPrefilterParentImportV1, ResidentTrimPrefilterSearchMemoryReceiptV1,
-    ResidentTrimPrefilterSearchPlanV1, ResidentTrimPrefilterSemanticBindingsV1,
+    ResidentTrimPrefilterImportIdentityV1, ResidentTrimPrefilterNativeMemoryFieldsV1,
+    ResidentTrimPrefilterNativePlanFieldsV1, ResidentTrimPrefilterNativePlanV1,
+    ResidentTrimPrefilterNativeScratchBytesV1, ResidentTrimPrefilterParentImportV1,
+    ResidentTrimPrefilterSearchMemoryReceiptV1, ResidentTrimPrefilterSearchPlanV1,
+    ResidentTrimPrefilterSemanticBindingsV1, ResidentTrimmedPopulationSessionV1,
     SealedResidentColumnClassificationV1, SealedResidentTrimPrefilterDeviceViewsV1,
     begin_resident_trim_prefilter_device_run_v1, enqueue_ascending_parent_column_map_v1,
     enqueue_exact_cpcv_fold_descriptors_v1, enqueue_first_passage_labels_v1,
@@ -22,6 +23,11 @@ use neoethos_gpu_cuda::resident_trim_prefilter_v1::{
     seal_resident_trim_prefilter_device_views_v1,
 };
 use sha2::{Digest, Sha256};
+
+use crate::DiscoveryConfig;
+use crate::discovery::resolve_prefilter_financial_geometry_v1;
+use crate::gpu_resident_current_config_plan_v1::SealedCurrentConfigResidentSearchPlanV1;
+use crate::prefilter_schema_v1::SealedPrefilterColumnClassificationV1;
 
 pub(crate) const RESIDENT_TRIM_CORRELATION_PREFILTER_SEMANTICS_V1: &str = concat!(
     "neoethos.resident-trim-correlation-prefilter.v1;",
@@ -203,6 +209,7 @@ pub struct ResidentTrimPrefilterResolvedPlanV1 {
     run_stream_identity_sha256: [u8; 32],
     cuda_build_manifest_sha256: [u8; 32],
     cuda_math_flags_sha256: [u8; 32],
+    current_config_plan_identity_sha256: [u8; 32],
     plan_identity_sha256: [u8; 32],
 }
 
@@ -255,6 +262,26 @@ impl SealedResidentTrimPrefilterViewsV1 {
 
     pub const fn has_zero_intermediate_host_boundary(&self) -> bool {
         self.device_views.has_zero_intermediate_host_boundary()
+    }
+
+    pub fn consume_into_population_session_v3(
+        self,
+    ) -> Result<ResidentTrimmedPopulationSessionV1, ResidentTrimPrefilterErrorV1> {
+        let expected_plan_identity = self.resolved_plan.plan_identity_sha256;
+        let expected_content_identity = self.resolved_plan.canonical_content_merkle_sha256;
+        let population = self.device_views.consume_into_population_session_v3()?;
+        if population.plan_identity_sha256() != expected_plan_identity
+            || population.canonical_content_merkle_sha256() != expected_content_identity
+            || !population.selected_compact_to_parent_columns_device()
+            || !population.selected_column_count_device()
+            || !population.same_selected_column_map_for_holdout()
+            || !population.has_zero_trim_host_boundary()
+        {
+            return Err(ResidentTrimPrefilterErrorV1::IdentityMismatch(
+                "trimmed population carrier",
+            ));
+        }
+        Ok(population)
     }
 }
 
@@ -634,6 +661,152 @@ fn consume_same_run_parent_and_schema_v1(
     Ok((parent, schema))
 }
 
+/// Bind the already preflighted current-config Search receipt to the exact
+/// trim import and the one shared schema classifier. Archive-kNN calibration
+/// is intentionally outside this constructor: callers must seal the full
+/// current-config plan before any trim allocation reaches this boundary.
+pub(crate) fn resolve_current_config_resident_trim_prefilter_plan_v1(
+    config: &DiscoveryConfig,
+    current_config_plan: &SealedCurrentConfigResidentSearchPlanV1,
+    import: &ResidentTrimPrefilterImportIdentityV1,
+    classification: &SealedPrefilterColumnClassificationV1,
+    price_hint: Option<f64>,
+) -> Result<ResidentTrimPrefilterResolvedPlanV1, ResidentTrimPrefilterErrorV1> {
+    let parent_row_range = current_config_plan.parent_row_range();
+    let prefilter_fit_row_range = current_config_plan.prefilter_fit_row_range();
+    let holdout_row_range = current_config_plan.outer_holdout_row_range();
+    let parent_rows = usize::try_from(import.parent_row_count())
+        .map_err(|_| ResidentTrimPrefilterErrorV1::ArithmeticOverflow("resident parent rows"))?;
+    let parent_columns = usize::try_from(import.parent_column_count())
+        .map_err(|_| ResidentTrimPrefilterErrorV1::ArithmeticOverflow("resident parent columns"))?;
+    if current_config_plan.plan_identity_sha256() == [0; 32]
+        || current_config_plan.selected_device_ordinal() != import.selected_cuda_ordinal()
+        || current_config_plan.parent_column_count() != parent_columns
+        || parent_row_range != (0..parent_rows)
+        || prefilter_fit_row_range.start != 0
+        || prefilter_fit_row_range.end != holdout_row_range.start
+        || holdout_row_range.end != parent_rows
+        || current_config_plan.trim_prefilter_reserved_bytes()
+            != import.trim_prefilter_reserved_bytes()
+        || current_config_plan.required_workspace_bytes() != import.required_workspace_bytes()
+        || current_config_plan.full_discovery_reserve_bytes()
+            != import.full_discovery_reserve_bytes()
+        || classification.ordered_feature_schema_sha256() != import.ordered_feature_schema_sha256()
+        || classification.column_classification_content_sha256()
+            != import.column_classification_content_sha256()
+    {
+        return Err(ResidentTrimPrefilterErrorV1::IdentityMismatch(
+            "current-config trim admission",
+        ));
+    }
+
+    let financial = resolve_prefilter_financial_geometry_v1(config, price_hint);
+    if financial.max_hold_bars == 0
+        || !financial.stop_atr_multiplier.is_finite()
+        || financial.stop_atr_multiplier <= 0.0
+        || !financial.reward_risk_ratio.is_finite()
+        || financial.reward_risk_ratio <= 0.0
+        || !financial.round_trip_cost_price.is_finite()
+        || financial.round_trip_cost_price < 0.0
+    {
+        return Err(ResidentTrimPrefilterErrorV1::InvalidResolvedPlan(
+            "prefilter financial geometry",
+        ));
+    }
+    let to_u64 = |value: usize, field: &'static str| {
+        u64::try_from(value).map_err(|_| ResidentTrimPrefilterErrorV1::ArithmeticOverflow(field))
+    };
+    let (
+        cpcv_split_count,
+        cpcv_test_group_count,
+        cpcv_embargo_fraction,
+        cpcv_purge_fraction,
+        cpcv_max_rows,
+    ) = if config.enable_cpcv {
+        (
+            to_u64(config.cpcv_n_splits, "CPCV split count")?,
+            to_u64(config.cpcv_n_test_groups, "CPCV test-group count")?,
+            config.cpcv_embargo_pct,
+            config.cpcv_purge_pct,
+            to_u64(config.cpcv_max_rows, "CPCV row cap")?,
+        )
+    } else {
+        (0, 0, 0.0, 0.0, 0)
+    };
+    let timeframe_row_cap = config
+        .max_rows_by_timeframe
+        .get(&config.timeframe_label)
+        .copied()
+        .unwrap_or_default();
+    let semantics = ResidentTrimCorrelationPrefilterSemanticsV1 {
+        parent_row_count: to_u64(parent_rows, "parent rows")?,
+        parent_column_count: to_u64(parent_columns, "parent columns")?,
+        global_row_cap: to_u64(config.max_rows, "global row cap")?,
+        timeframe_row_cap: to_u64(timeframe_row_cap, "timeframe row cap")?,
+        configured_top_k: to_u64(
+            config.runtime_overrides.prefilter_top_k,
+            "configured prefilter top-k",
+        )?,
+        resolved_top_k: to_u64(
+            current_config_plan.prefilter_top_k(),
+            "resolved prefilter top-k",
+        )?,
+        minimum_per_timeframe: to_u64(
+            current_config_plan.prefilter_min_per_timeframe(),
+            "prefilter timeframe minimum",
+        )?,
+        insample_fraction_bits: config
+            .runtime_overrides
+            .resolved_prefilter_insample_frac()
+            .to_bits(),
+        max_hold_bars: to_u64(financial.max_hold_bars, "prefilter max-hold bars")?,
+        atr_period: DEFAULT_ATR_PERIOD_V1,
+        stop_atr_multiplier_bits: financial.stop_atr_multiplier.to_bits(),
+        reward_risk_ratio_bits: financial.reward_risk_ratio.to_bits(),
+        round_trip_cost_price_bits: financial.round_trip_cost_price.to_bits(),
+        cpcv_split_count,
+        cpcv_test_group_count,
+        cpcv_embargo_fraction_bits: cpcv_embargo_fraction.to_bits(),
+        cpcv_purge_fraction_bits: cpcv_purge_fraction.to_bits(),
+        cpcv_max_rows,
+        semantics_sha256: sha256_v1(&[RESIDENT_TRIM_CORRELATION_PREFILTER_SEMANTICS_V1.as_bytes()]),
+        strict_math_flags: StrictMathFlagsV1::REQUIRED,
+    };
+    let scopes = resolve_absolute_scopes_v1(
+        semantics.parent_row_count,
+        semantics.global_row_cap,
+        semantics.timeframe_row_cap,
+    )?;
+    if scopes.selection_row_start != to_u64(prefilter_fit_row_range.start, "fit row start")?
+        || scopes.selection_row_end != to_u64(prefilter_fit_row_range.end, "fit row end")?
+        || scopes.holdout_row_start != to_u64(holdout_row_range.start, "holdout row start")?
+        || scopes.holdout_row_end != to_u64(holdout_row_range.end, "holdout row end")?
+    {
+        return Err(ResidentTrimPrefilterErrorV1::IdentityMismatch(
+            "current-config trim scopes",
+        ));
+    }
+    Ok(ResidentTrimPrefilterResolvedPlanV1 {
+        semantics,
+        scopes,
+        canonical_search_input_receipt_sha256: import.canonical_search_input_receipt_sha256(),
+        canonical_content_merkle_sha256: import.canonical_content_merkle_sha256(),
+        normalization_fit_sha256: import.normalization_fit_sha256(),
+        feature_plan_sha256: import.feature_plan_sha256(),
+        source_provenance_sha256: import.source_provenance_sha256(),
+        ordered_feature_schema_sha256: import.ordered_feature_schema_sha256(),
+        column_classification_content_sha256: import.column_classification_content_sha256(),
+        selected_cuda_ordinal: import.selected_cuda_ordinal(),
+        cuda_device_identity_sha256: import.cuda_device_identity_sha256(),
+        primary_context_identity_sha256: import.primary_context_identity_sha256(),
+        run_stream_identity_sha256: import.run_stream_identity_sha256(),
+        cuda_build_manifest_sha256: import.cuda_build_manifest_sha256(),
+        cuda_math_flags_sha256: import.cuda_math_flags_sha256(),
+        current_config_plan_identity_sha256: current_config_plan.plan_identity_sha256(),
+        plan_identity_sha256: [0; 32],
+    })
+}
+
 pub fn begin_gpu_resident_trim_prefilter_view_v1(
     parent: ResidentTrimPrefilterParentImportV1,
     sealed_schema: SealedResidentColumnClassificationV1,
@@ -677,6 +850,10 @@ pub fn begin_gpu_resident_trim_prefilter_view_v1(
             "CUDA build manifest",
         ),
         (&resolved_plan.cuda_math_flags_sha256, "CUDA math flags"),
+        (
+            &resolved_plan.current_config_plan_identity_sha256,
+            "current-config Search plan",
+        ),
     ] {
         require_nonzero_hash_v1(hash, field)?;
     }
@@ -847,5 +1024,6 @@ fn compute_resolved_plan_identity_v1(plan: &ResidentTrimPrefilterResolvedPlanV1)
         &plan.run_stream_identity_sha256,
         &plan.cuda_build_manifest_sha256,
         &plan.cuda_math_flags_sha256,
+        &plan.current_config_plan_identity_sha256,
     ])
 }

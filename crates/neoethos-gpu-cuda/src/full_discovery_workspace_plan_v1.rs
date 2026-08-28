@@ -3,7 +3,7 @@
 #[cfg(feature = "cuda")]
 use crate::resident_feature_store_v3::{
     GpuOnlyRunDeviceAdmissionRequestV3, GpuOnlyRunDeviceAdmissionV3,
-    seal_gpu_only_run_device_admission_v3,
+    SealedFullDiscoveryTrimAdmissionV1, seal_gpu_only_run_device_admission_v3,
 };
 use crate::run_device_admission_v1::{
     DiscoveryRunDeviceAdmissionErrorV1, SealedDiscoveryRunDeviceAdmissionV1,
@@ -194,6 +194,7 @@ struct PhaseArenaReuseProofV1 {
 #[derive(Debug)]
 pub struct SealedFullDiscoveryGpuWorkspacePlanV1 {
     always_resident_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
     reusable_phase_arena_bytes: u64,
     bounded_final_readback_bytes: u64,
     required_workspace_bytes: u64,
@@ -209,6 +210,10 @@ pub struct SealedFullDiscoveryGpuWorkspacePlanV1 {
 impl SealedFullDiscoveryGpuWorkspacePlanV1 {
     pub const fn always_resident_bytes(&self) -> u64 {
         self.always_resident_bytes
+    }
+
+    pub const fn trim_prefilter_reserved_bytes(&self) -> u64 {
+        self.trim_prefilter_reserved_bytes
     }
 
     pub const fn reusable_phase_arena_bytes(&self) -> u64 {
@@ -274,6 +279,7 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
     require_workspace_semantics_v1(&preflight.workspace_semantics)?;
 
     let always_resident_bytes = checked_sum_always_resident_bytes_v1(&preflight)?;
+    let trim_prefilter_reserved_bytes = preflight.population_parent_and_views.device_bytes;
     let (phase_lifetime_plan, phase_arena_reuse_proof) = seal_mutually_exclusive_phase_arena_v1(
         preflight.walk_forward_validation,
         preflight.cpcv_and_pbo,
@@ -319,6 +325,7 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
     let workspace_plan_identity_sha256 =
         hash_workspace_plan_v1(&FullDiscoveryWorkspacePlanHashInputV1 {
             always_resident_bytes,
+            trim_prefilter_reserved_bytes,
             reusable_phase_arena_bytes,
             bounded_final_readback_bytes,
             required_workspace_bytes,
@@ -329,6 +336,7 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
         });
     Ok(SealedFullDiscoveryGpuWorkspacePlanV1 {
         always_resident_bytes,
+        trim_prefilter_reserved_bytes,
         reusable_phase_arena_bytes,
         bounded_final_readback_bytes,
         required_workspace_bytes,
@@ -531,6 +539,7 @@ fn hash_phase_event_chain_v1(phases: &[FullDiscoveryWorkspacePhaseV1]) -> [u8; 3
 
 struct FullDiscoveryWorkspacePlanHashInputV1<'a> {
     always_resident_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
     reusable_phase_arena_bytes: u64,
     bounded_final_readback_bytes: u64,
     required_workspace_bytes: u64,
@@ -544,6 +553,7 @@ fn hash_workspace_plan_v1(input: &FullDiscoveryWorkspacePlanHashInputV1<'_>) -> 
     let mut hasher = Sha256::new();
     hasher.update(FULL_DISCOVERY_WORKSPACE_PLAN_SCHEMA_V1.as_bytes());
     hasher.update(input.always_resident_bytes.to_le_bytes());
+    hasher.update(input.trim_prefilter_reserved_bytes.to_le_bytes());
     hasher.update(input.reusable_phase_arena_bytes.to_le_bytes());
     hasher.update(input.bounded_final_readback_bytes.to_le_bytes());
     hasher.update(input.required_workspace_bytes.to_le_bytes());
@@ -707,6 +717,8 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
         } = cuda_build_identity;
         let SealedFullDiscoveryGpuWorkspacePlanV1 {
             allocator_context_reserve_bytes,
+            trim_prefilter_reserved_bytes,
+            required_workspace_bytes,
             vector_ta_build_sha256,
             exact_math_authority,
             ..
@@ -730,6 +742,12 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
             phase_one_free_bytes_snapshot: free_memory_bytes_snapshot,
             allocator_context_reserve_bytes,
             data_population_limits: None,
+            full_discovery_trim_admission: Some(SealedFullDiscoveryTrimAdmissionV1::new(
+                workspace_plan_identity_sha256,
+                required_workspace_bytes,
+                trim_prefilter_reserved_bytes,
+                required_workspace_bytes,
+            )),
         })
         .map_err(|error| {
             FullDiscoveryWorkspacePlanErrorV1::new(

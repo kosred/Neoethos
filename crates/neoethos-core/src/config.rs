@@ -1357,6 +1357,11 @@ pub struct ModelsConfig {
 pub struct SearchRuntimeConfig {
     pub seed: Option<u64>,
     pub novelty_weight: f64,
+    /// Explicit neighborhood size for novelty scoring. This is versioned run
+    /// input, not an implementation constant: the resident path computes the
+    /// mean Jaccard distance to the `k` nearest neighbors drawn from the
+    /// current population plus its permanent archive.
+    pub novelty_neighbors: usize,
     pub stagnation_patience: usize,
     pub tournament_size_override: Option<usize>,
     pub archive_cap_override: Option<usize>,
@@ -1406,6 +1411,7 @@ impl Default for SearchRuntimeConfig {
         Self {
             seed: None,
             novelty_weight: 0.0,
+            novelty_neighbors: 15,
             stagnation_patience: 2,
             tournament_size_override: None,
             archive_cap_override: None,
