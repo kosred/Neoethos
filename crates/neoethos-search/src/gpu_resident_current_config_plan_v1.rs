@@ -322,6 +322,127 @@ impl SealedCurrentConfigResidentSearchPlanV1 {
     }
 }
 
+/// Declaration-only marker for the separate full resident-Discovery deadline
+/// proof. Slice 2 cannot mint this type and does not use it for readiness.
+pub struct FullResidentDiscoveryDeadlineReceiptV1 {
+    _not_minted_in_slice2: core::convert::Infallible,
+}
+
+pub(crate) const CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2: &str =
+    "neoethos.current-config-resident-search-slice2-plan.v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CurrentConfigResidentSearchSlice2PlanFactsV2 {
+    population: u64,
+    maximum_generations: u64,
+    maximum_runtime_millis: u64,
+    maximum_terms_per_gene: u64,
+    gene_signature_word_count: u64,
+    novelty_weight_bits: u64,
+    novelty_neighbors: u64,
+    permanent_archive_capacity: u64,
+    calibration_active_count: u64,
+    maximum_jaccard_union: u32,
+    maximum_jaccard_cross_product: u64,
+    maximum_archive_knn_distance_count: u64,
+    maximum_archive_knn_popcount_word_count: u64,
+    required_archive_knn_distance_items_per_second: u64,
+    required_archive_knn_popcount_words_per_second: u64,
+    layout_alignment_bytes: u64,
+    archive_gene_scalars_bytes: u64,
+    archive_term_indices_bytes: u64,
+    archive_term_weights_bytes: u64,
+    archive_metric_rows_bytes: u64,
+    archive_signatures_bytes: u64,
+    archive_hashes_bytes: u64,
+    current_population_signatures_bytes: u64,
+    novelty_scores_bytes: u64,
+    exact_top_k_keys_bytes: u64,
+    admission_flags_bytes: u64,
+    admission_offsets_bytes: u64,
+    archive_control_and_seal_bytes: u64,
+    control_subtotal_bytes: u64,
+    slice2_replacement_subtotal_bytes: u64,
+    replaced_v1_scoring_bytes: u64,
+    slice2_net_additional_bytes: u64,
+    current_source_kind_wire: u8,
+    archive_source_kind_wire: u8,
+    current_ordinal_exclusive_end: u64,
+    archive_ordinal_exclusive_end: u64,
+    binary64_operation_sequence_wire: u8,
+    binary64_math_mode_wire: u8,
+    binary64_tolerance_policy_wire: u8,
+    binary64_absolute_tolerance_bits: u64,
+    binary64_relative_tolerance_bits: u64,
+    binary64_max_ulp_distance: u64,
+    novelty_semantics_identity_sha256: [u8; 32],
+    archive_capacity_identity_sha256: [u8; 32],
+    calibration_active_count_identity_sha256: [u8; 32],
+    layout_identity_sha256: [u8; 32],
+    calibration_identity_sha256: [u8; 32],
+    source_kind_encoding_identity_sha256: [u8; 32],
+    current_ordinal_domain_identity_sha256: [u8; 32],
+    archive_ordinal_domain_identity_sha256: [u8; 32],
+    tie_order_identity_sha256: [u8; 32],
+    binary64_operation_sequence_identity_sha256: [u8; 32],
+    binary64_math_mode_identity_sha256: [u8; 32],
+    binary64_tolerance_identity_sha256: [u8; 32],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
+    _identity_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentConfigResidentSearchSlice2PlanErrorV2 {
+    ImplementationPending,
+}
+
+mod slice2_plan_seal_v2 {
+    pub(super) struct Marker {
+        _private: (),
+    }
+}
+
+pub(crate) struct SealedCurrentConfigResidentSearchSlice2PlanV2 {
+    base: SealedCurrentConfigResidentSearchPlanV1,
+    facts: CurrentConfigResidentSearchSlice2PlanFactsV2,
+    identity: CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2,
+    _seal: slice2_plan_seal_v2::Marker,
+}
+
+impl SealedCurrentConfigResidentSearchSlice2PlanV2 {
+    pub(crate) fn facts_v2(&self) -> &CurrentConfigResidentSearchSlice2PlanFactsV2 {
+        let _ = &self.base;
+        &self.facts
+    }
+
+    pub(crate) fn identity_receipt_v2(
+        &self,
+    ) -> &CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
+        &self.identity
+    }
+
+    pub(crate) fn validate_identity_receipt_v2(
+        &self,
+        _receipt: &CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2,
+    ) -> Result<(), CurrentConfigResidentSearchSlice2PlanErrorV2> {
+        Err(CurrentConfigResidentSearchSlice2PlanErrorV2::ImplementationPending)
+    }
+}
+
+pub(crate) fn seal_current_config_resident_search_slice2_plan_v2(
+    base_v1: SealedCurrentConfigResidentSearchPlanV1,
+    facts_v2: CurrentConfigResidentSearchSlice2PlanFactsV2,
+) -> Result<
+    SealedCurrentConfigResidentSearchSlice2PlanV2,
+    CurrentConfigResidentSearchSlice2PlanErrorV2,
+> {
+    let _ = (base_v1, facts_v2);
+    Err(CurrentConfigResidentSearchSlice2PlanErrorV2::ImplementationPending)
+}
+
 /// Seal the current headless config into one immutable resident trim/Search
 /// receipt. This is intentionally narrower than generic Discovery: semantics
 /// not exercised by the shipped configuration fail before native allocation.
