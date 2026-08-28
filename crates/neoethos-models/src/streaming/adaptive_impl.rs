@@ -970,6 +970,7 @@ pub(super) struct PassiveAggressiveCudaPipelineEvidenceV1 {
     pub(super) artifact_d2h_bytes: u64,
 }
 
+#[cfg(feature = "statistical-gpu")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PassiveAggressiveCudaInferenceEvidenceV1 {
     pub(super) evidence_scope_schema: String,
@@ -1326,7 +1327,8 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
             #[cfg(not(feature = "statistical-gpu"))]
             {
                 bail!(
-                    "online_pa full CUDA artifact cannot infer because this binary lacks `statistical-gpu`"
+                    "online_pa full CUDA artifact schema `{}` cannot infer because this binary lacks `statistical-gpu`",
+                    full_pipeline.execution_pipeline_schema
                 );
             }
         }
