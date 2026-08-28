@@ -178,6 +178,7 @@ models:
   rl_timesteps: 100000
   search_runtime:
     novelty_weight: 0.2
+    novelty_neighbors: 15
     smc_gate_end: 0.35
     smc_gate_stagnation_step: 0.03
   transformer_dropout: 0.1

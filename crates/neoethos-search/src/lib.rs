@@ -30,6 +30,7 @@ mod cubecl_eval;
 // device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
 pub mod discovery;
 pub mod discovery_ledger;
+mod prefilter_schema_v1;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):
 // the file was a 19-LOC orphan with zero callers. The scheduler-driven
 // GPU routing it scaffolded is dispatched directly via `BackendKind`
@@ -61,6 +62,8 @@ mod exact_resident_dataset_authority_v1_contract;
 pub mod engine_identity;
 pub mod eval;
 pub mod eval_telemetry;
+#[cfg(any(test, feature = "gpu-b-adapter"))]
+pub mod gpu_resident_current_config_plan_v1;
 #[cfg(feature = "gpu-b-native")]
 #[path = "gpu_full_discovery/gpu_resident_trim_prefilter_view_v1.rs"]
 pub mod gpu_resident_trim_prefilter_view_v1;
