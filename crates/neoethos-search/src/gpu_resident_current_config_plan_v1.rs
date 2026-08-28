@@ -12,6 +12,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::DiscoveryConfig;
+use crate::canonical_discovery_config_digest_v1::canonical_discovery_config_digest_v1;
 use crate::discovery::{DiscoveryMode, resolve_prefilter_top_k};
 use crate::genetic::{
     GeneticSearchRuntimeOverrides, ParentSelectionPolicy, SurvivorSelectionPolicy,
@@ -42,6 +43,7 @@ pub enum CurrentConfigResidentSearchPlanErrorV1 {
     UnsupportedCurrentConfigSemantics,
     ArithmeticOverflow,
     ArchiveKnnBudgetExceeded,
+    CanonicalConfigEncodingFailure,
 }
 
 impl fmt::Display for CurrentConfigResidentSearchPlanErrorV1 {
@@ -68,6 +70,9 @@ impl fmt::Display for CurrentConfigResidentSearchPlanErrorV1 {
             }
             Self::ArchiveKnnBudgetExceeded => {
                 "current-config resident Search exact archive-kNN work exceeds the measured one-hour device budget"
+            }
+            Self::CanonicalConfigEncodingFailure => {
+                "current-config resident Search canonical configuration encoding failed"
             }
         })
     }
@@ -190,6 +195,7 @@ pub struct SealedCurrentConfigResidentSearchPlanV1 {
     trim_prefilter_reserved_bytes: u64,
     required_workspace_bytes: u64,
     full_discovery_reserve_bytes: u64,
+    canonical_discovery_config_digest_sha256: [u8; 32],
     plan_identity_sha256: [u8; 32],
 }
 
@@ -307,6 +313,10 @@ impl SealedCurrentConfigResidentSearchPlanV1 {
         self.full_discovery_reserve_bytes
     }
 
+    pub const fn canonical_discovery_config_digest_sha256(&self) -> [u8; 32] {
+        self.canonical_discovery_config_digest_sha256
+    }
+
     pub const fn plan_identity_sha256(&self) -> [u8; 32] {
         self.plan_identity_sha256
     }
@@ -323,6 +333,8 @@ pub fn seal_current_config_resident_search_plan_v1(
     admission: CurrentConfigResidentSearchAdmissionFactsV1,
 ) -> Result<SealedCurrentConfigResidentSearchPlanV1, CurrentConfigResidentSearchPlanErrorV1> {
     let admission = admission.validate()?;
+    let canonical_discovery_config_digest_sha256 = canonical_discovery_config_digest_v1(config)
+        .map_err(|_| CurrentConfigResidentSearchPlanErrorV1::CanonicalConfigEncodingFailure)?;
     if parent_rows == 0 || parent_columns == 0 || config.population < 2 {
         return Err(CurrentConfigResidentSearchPlanErrorV1::InvalidInputShape);
     }
@@ -456,6 +468,7 @@ pub fn seal_current_config_resident_search_plan_v1(
         required_archive_knn_popcount_words_per_second,
         maximum_runtime_millis,
         &identity_extents,
+        canonical_discovery_config_digest_sha256,
     );
 
     Ok(SealedCurrentConfigResidentSearchPlanV1 {
@@ -484,6 +497,7 @@ pub fn seal_current_config_resident_search_plan_v1(
         trim_prefilter_reserved_bytes: admission.trim_prefilter_reserved_bytes,
         required_workspace_bytes: admission.required_workspace_bytes,
         full_discovery_reserve_bytes: admission.full_discovery_reserve_bytes,
+        canonical_discovery_config_digest_sha256,
         plan_identity_sha256,
     })
 }
@@ -497,6 +511,7 @@ fn hash_plan_v1(
     required_archive_knn_popcount_words_per_second: u64,
     maximum_runtime_millis: u64,
     identity_extents: &[u64],
+    canonical_discovery_config_digest_sha256: [u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(CURRENT_CONFIG_RESIDENT_SEARCH_PLAN_SEMANTICS_V1.as_bytes());
@@ -504,6 +519,7 @@ fn hash_plan_v1(
     hash.update(CURRENT_CONFIG_ARCHIVE_GENE_IDENTITY_SEMANTICS_V1.as_bytes());
     hash.update(CURRENT_CONFIG_ARCHIVE_ADMISSION_SEMANTICS_V1.as_bytes());
     hash.update(CURRENT_CONFIG_ARCHIVE_NEIGHBOR_SEMANTICS_V1.as_bytes());
+    hash.update(canonical_discovery_config_digest_sha256);
     hash.update(admission.selected_device_ordinal.to_le_bytes());
     hash.update(admission.cuda_build_identity_sha256);
     hash.update(admission.runtime_device_identity_sha256);

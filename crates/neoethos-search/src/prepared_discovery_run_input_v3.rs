@@ -1356,7 +1356,7 @@ fn require_current_config_resident_search_admission_facts_v1(
         "resident store lacks its sealed CUDA admission identity"
     );
     bail!(
-        "current-config resident Search requires an actual run memory-pool identity and a measured exact archive-kNN popcount calibration receipt before any trim allocation; Slice 1 refuses to fabricate either admission fact"
+        "current-config resident Search requires an actual run memory-pool identity, a measured exact archive-kNN popcount calibration receipt, and the native-query/calibrated resident trim workspace preflight before any allocation; Slice 1 refuses to fabricate admission facts"
     )
 }
 

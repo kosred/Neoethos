@@ -154,4 +154,80 @@ fn cpu_and_resident_trim_share_one_schema_classification_authority() {
     assert!(discovery.contains("prefilter_schema_v1::timeframe_group_v1"));
     assert!(!discovery.contains("fn is_prefilter_state_column("));
     assert!(!discovery.contains("fn timeframe_group("));
+    let discovery_tests = read("crates/neoethos-search/src/discovery_tests.rs");
+    assert!(!discovery_tests.contains("timeframe_group(n)"));
+}
+
+#[test]
+fn current_config_plan_binds_one_exhaustive_typed_canonical_digest() {
+    let canonical = read("crates/neoethos-search/src/canonical_discovery_config_digest_v1.rs");
+    for requirement in [
+        "CANONICAL_DISCOVERY_CONFIG_DIGEST_SCHEMA_V1",
+        "let DiscoveryConfig {",
+        "let DiscoveryRuntimeOverrides {",
+        "let TargetProfile {",
+        "let FilteringConfig {",
+        "let PropFirmGateOverrides {",
+        "let PropFirmRiskRules {",
+        "let PropFirmGateConfig {",
+        "value.to_bits()",
+        "entries.sort_by",
+        "higher_timeframes",
+        "discovery_ledger_archive_top_n",
+    ] {
+        assert!(
+            canonical.contains(requirement),
+            "canonical Search-config authority is missing {requirement}"
+        );
+    }
+    assert!(!canonical.contains("serde_json"));
+    assert!(!canonical.contains("serde_yaml"));
+    assert!(!canonical.contains("HashMap::into_iter"));
+
+    let plan = read("crates/neoethos-search/src/gpu_resident_current_config_plan_v1.rs");
+    for requirement in [
+        "canonical_discovery_config_digest_v1(config)",
+        "canonical_discovery_config_digest_sha256: [u8; 32]",
+        "canonical_discovery_config_digest_sha256",
+    ] {
+        assert!(
+            plan.contains(requirement),
+            "sealed plan does not bind canonical config fact {requirement}"
+        );
+    }
+}
+
+#[test]
+fn trim_preflight_is_a_distinct_native_calibrated_workspace_extent() {
+    let source = read("crates/neoethos-gpu-cuda/src/full_discovery_workspace_plan_v1.rs");
+    assert!(source.contains("OpaqueResidentTrimPrefilterPreflightV1"));
+    for requirement in [
+        "resident_trim_prefilter: OpaqueResidentTrimPrefilterPreflightV1",
+        "peak_device_bytes",
+        "retained_view_device_bytes",
+        "cub_select_scratch_bytes",
+        "cub_radix_sort_scratch_bytes",
+        "population_overlap_device_bytes",
+        "native_query_identity_sha256",
+        "calibration_identity_sha256",
+        "preflight_identity_sha256",
+        "require_resident_trim_prefilter_preflight_v1",
+    ] {
+        assert!(
+            source.contains(requirement),
+            "trim preflight authority is missing {requirement}"
+        );
+    }
+    assert!(source.contains("Self::ResidentTrimPrefilter => \"resident-trim-prefilter\""));
+    assert!(!source.contains(
+        "let trim_prefilter_reserved_bytes = preflight.population_parent_and_views.device_bytes;"
+    ));
+    assert!(!source.contains("trim_prefilter_reserved_bytes: 1"));
+    let prepared = read("crates/neoethos-search/src/prepared_discovery_run_input_v3.rs");
+    let admission = body_after(
+        &prepared,
+        "fn require_current_config_resident_search_admission_facts_v1(",
+    );
+    assert!(admission.contains("native-query/calibrated resident trim workspace preflight"));
+    assert!(admission.contains("before any allocation"));
 }

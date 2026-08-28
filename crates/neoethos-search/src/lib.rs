@@ -39,6 +39,8 @@ mod prefilter_schema_v1;
 // lands later, reintroduce a fresh helper at that time.
 
 pub mod backend;
+#[cfg(any(test, feature = "gpu-b-adapter"))]
+mod canonical_discovery_config_digest_v1;
 mod canonical_native_discovery_request_v1;
 mod canonical_native_discovery_run_v1;
 #[cfg(all(feature = "gpu-cuda", target_os = "linux"))]
