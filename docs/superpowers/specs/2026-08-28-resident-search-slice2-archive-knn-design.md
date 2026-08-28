@@ -3,16 +3,16 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 4
+Version: 5
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
 
-Version 4 supersedes the version-3 design at commit
-`06cf3fb578333c23b1fe241ba68999789ef79151`. The version-2 and version-3
-manifests remain immutable historical receipts; the version-4 manifest alone
-binds this corrected document.
+Version 5 supersedes the version-4 design at commit
+`2f5bb09bf0d4a430577bb4bad02364b0a61f68a6`. The version-2, version-3 and
+version-4 manifests remain immutable historical receipts; the version-5
+manifest alone binds this corrected document.
 
 ## Outcome and boundary
 
@@ -59,7 +59,7 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated through version 4
+## Review corrections incorporated through version 5
 
 | Finding | Versioned decision |
 | --- | --- |
@@ -82,6 +82,10 @@ headless `DiscoveryResult` remain later gates.
 | Final novelty floating-point semantics were open | Version 4 fixes rational selection, integer-to-binary64 conversion, division and accumulation order, strict round-to-nearest-even math mode, and an absolute/relative/ULP acceptance tuple bound into every plan, calibration receipt and run identity. |
 | Calibration negatives did not independently exercise all sealed bounds | Version 4 adds `A=49_999`, `K=16`, and orthogonal distance-rate/popcount-rate failures, with exact typed refusals and zero combined-Search allocations. |
 | R7 and R8 lacked executable topology/count authority | Version 4 replaces doctest counting with compiler JSON plus tracked stderr for one positive and nine negative UI fixtures, seals the exact feature/cfg topology, and names the R8 files, tests and fixture counts. |
+| Calibration capacity and active population were conflated | Version 5 independently seals capacity `A=50_000` and `calibration_active_count=50_000`, with a one-inactive-tail `49_999` active-count control distinct from the retained `A=49_999` capacity control. |
+| The plan/deadline-marker ownership file was absent from may-touch scope | Version 5 names `gpu_resident_current_config_plan_v1.rs` and fixes the declaration-only deadline marker's exact source location without implementing a deadline receipt. |
+| The nested UI fixture package could join the parent workspace or select the wrong target | Version 5 requires an empty `[workspace]`, `autobins=false`, ten explicit `[[bin]]` mappings and one exact `--bin` selection per compiler invocation. |
+| The disabled-interposer child could be a weaker/different run | Version 5 re-spawns the exact current executable/test/fixture/hashes/argv with only the test-only interposer mode changed, and requires the exact typed handshake error and sealed non-zero exit. |
 
 ## Current source constraints
 
@@ -498,16 +502,20 @@ compares each field before the first full Search allocation.
 
 The calibration receipt is bound to the exact device UUID, context, stream,
 memory pool, CUDA build/math identity, kernel semantics, `P=200`, `A=50_000`,
-`W=4`, `K=15`, `M=16`, union/cross-product bounds, `Current=0`/`Archive=1`
-source encoding and ordinal domains, binary64 operation sequence,
-`binary64_rn_strict_v1`, the exact `(2^-50, 2^-48, 4 ULP)` policy and plan/run
-identity.
+`calibration_active_count=50_000`, `W=4`, `K=15`, `M=16`,
+union/cross-product bounds, `Current=0`/`Archive=1` source encoding and ordinal
+domains, binary64 operation sequence, `binary64_rn_strict_v1`, the exact
+`(2^-50, 2^-48, 4 ULP)` policy and plan/run identity. Capacity and active count
+are separate receipt fields and separate identity inputs.
 
 Calibration must use the production fixed-K kernel with an archive actually
-prefilled to 50,000 valid deterministic signatures. Empty-archive execution,
-inactive-tail sentinels, a smaller K, or a proxy popcount-only kernel cannot
-mint the receipt. A bounded preflight allocation may be used and released at
-this explicit pre-run boundary.
+prefilled to 50,000 valid deterministic signatures, so every slot in
+`[0, 50_000)` is active. The host-sealed calibration preflight owns and validates
+both capacity and active count before any calibration allocation or kernel.
+Only after those fields equal their exact current-config values may a bounded
+preflight allocation be used and released at this explicit pre-run boundary.
+Empty-archive execution, an inactive tail, a smaller K, or a proxy popcount-only
+kernel cannot mint the receipt.
 
 The receipt records elapsed CUDA-event time for at least one warmup and a
 versioned number of measured full-capacity iterations, complete distance items,
@@ -518,11 +526,23 @@ receipts before the first full Search allocation.
 Calibration and admission expose typed, opaque receipts. The executable
 negative matrix independently requires:
 
-- an empty active archive, inactive-tail-only work or `archive_count != 50_000`
-  cannot mint a calibration receipt;
+- an empty active archive or inactive-tail-only work fails with
+  `ResidentArchiveKnnCalibrationErrorV2::ArchiveActiveCountMismatch` during the
+  host count preflight, before a calibration allocation, kernel or receipt and
+  before every Search allocation;
+- with capacity still exactly `A=50_000`, the independent
+  `calibration_active_count=49_999` fixture marks slots `[0, 49_999)` (ordinals
+  `0..=49_998`) as valid active records and slot `49_999` as inactive. It must
+  fail with
+  `ResidentArchiveKnnCalibrationErrorV2::ArchiveActiveCountMismatch` during the
+  same host preflight, with zero calibration allocations, zero calibration
+  kernel launches, no receipt and zero Search allocations;
 - `A=49_999` is an exact capacity control and fails with
   `ResidentArchiveKnnCalibrationErrorV2::ArchiveCapacityMismatch` before any
-  calibration or Search allocation;
+  calibration or Search allocation. This control supplies
+  `calibration_active_count=49_999`, valid for its mutated capacity, and is not
+  the `A=50_000`/active-count `49_999` fixture above; capacity validation has
+  deterministic precedence over active-count validation;
 - `K != 15`, including exact `K=14` and `K=16` controls, fails with
   `ResidentArchiveKnnCalibrationErrorV2::NeighborCountMismatch` before any
   calibration or Search allocation;
@@ -540,8 +560,9 @@ negative matrix independently requires:
 
 Every rejection asserts the exact typed stage/reason and independently observes
 zero combined-admission calls and zero generation, scoring and archive Search
-allocations. Shape and K/A preflight refusals additionally observe zero
-calibration allocations. The two rate controls derive from a real completed
+allocations. Capacity, active-count, K and shape preflight refusals additionally
+observe zero calibration allocations and zero calibration kernel launches. The
+two rate controls derive from a real completed
 calibration but are independently re-sealed only by a crate-private fixture;
 their already released calibration scratch is not a Search allocation. Tests
 mutate opaque receipt fields only from that fixture module; no production caller
@@ -561,6 +582,18 @@ deadline receipt is required, and the prepared-native behavioral invariant
 passes a valid novelty receipt while omitting the full deadline receipt and
 still requires fail-before-Search-allocation. Thus a novelty benchmark cannot
 open headless execution by type confusion or by a readiness-bit shortcut.
+
+Slice 2 introduces only the public, uninhabited compile-contract marker
+`FullResidentDiscoveryDeadlineReceiptV1` in
+`crates/neoethos-search/src/gpu_resident_current_config_plan_v1.rs`, immediately
+after the `impl SealedCurrentConfigResidentSearchPlanV1` block and before
+`seal_current_config_resident_search_plan_v1`. Its sole field is private
+`_not_minted_in_slice2: core::convert::Infallible`; it has no constructor,
+sealer, trait conversion, receipt fields or production consumer. R7 obtains
+typed expressions only through divergent fixture functions. A later slice must
+replace this declaration-only marker with a separately reviewed, identity-bound
+receipt and executable deadline proof. Merely naming the marker cannot change
+readiness, headless routing or Search admission in Slice 2.
 
 ## Independent no-boundary evidence
 
@@ -615,11 +648,36 @@ known D2H and one known synchronization through each runtime/driver API family
 that the production wrapper can reach. The interceptor must record the nonce,
 process/thread identity, exact symbol, direction, byte count and successful
 return for every control call. It then seals a fresh measurement epoch; Search
-cannot reset or write that epoch. A separate child run with the interposer
-disabled, a missing symbol hook, a wrong PID/nonce or a dropped control record
-must be rejected even if its reported measured counters are all zero. Controls
-occur outside the Search timing and measured epoch. The epoch counter can be
-sealed once but cannot be reset; a second seal attempt is an exact rejection.
+cannot reset or write that epoch.
+
+The disabled-interposer negative is paired with the enabled control by a
+supervisor. Both children are spawned from `std::env::current_exe()` and require
+the same executable SHA-256, exact child test
+`resident_archive_knn_v2_interceptor_spans_admission_to_terminal_projection_child`,
+fixture seed and fixture digest, source/tree/design/plan/run/binary/wrapped-symbol
+hashes, inherited environment and byte-for-byte argv:
+
+```text
+<current_exe> resident_archive_knn_v2_interceptor_spans_admission_to_terminal_projection_child --exact --nocapture
+```
+
+The sole permitted difference is the test-only environment value
+`NEOETHOS_SLICE2_INTERPOSER_MODE_V1=enabled` versus `disabled`; it is recorded
+outside argv and included in the supervisor receipt. The enabled child must pass
+the complete control handshake and exit zero. The disabled child must stop
+before calibration/Search admission, emit the exact bounded typed discriminant
+`ResidentArchiveKnnInterceptionErrorV2::MissingInterposerControlHandshake` bound
+to the same fixture/run hashes, and exit with the sealed test-only code
+`MISSING_INTERPOSER_CONTROL_HANDSHAKE_EXIT_V1 = 86`. A CLI parse failure, absent
+test, different executable/test/fixture/hash/argv, panic/exit 101, generic
+non-zero exit or all-zero self-report is not this negative and must fail the
+supervisor.
+
+Missing-symbol, wrong PID/nonce and dropped-control-record negatives remain
+separate exact fault modes of that same current executable and fixture and must
+also be rejected before Search admission. Controls occur outside the Search
+timing and measured epoch. The epoch counter can be sealed once but cannot be
+reset; a second seal attempt is an exact rejection.
 
 The RTX oracle does not evade that boundary to inspect arrays. Before the
 measured epoch, the CPU oracle creates the deterministic fixture and its
@@ -643,11 +701,13 @@ Path: `crates/neoethos-search/src/gpu_resident_current_config_plan_v1_tests.rs`
 Assertions:
 
 - exact current dimensions, work bounds, rational bounds, memory fields,
+  distinct capacity `A=50_000`, calibration active count `50_000`,
   `Current=0`/`Archive=1` encoding and sealed ordinal domains;
 - exact binary64 operation-sequence/math-mode identities and the
   `(2^-50, 2^-48, 4 ULP)` tuple;
-- novelty/archive/layout/calibration/source-kind/ordinal/math/tolerance
-  identities independently alter the run identity and reject an old receipt;
+- novelty/archive-capacity/calibration-active-count/layout/calibration/
+  source-kind/ordinal/math/tolerance identities independently alter the run
+  identity and reject an old receipt;
 - checked overflow and any current-config extent drift fail before allocation.
 
 ### R2: exact rational kNN CPU oracle
@@ -711,9 +771,50 @@ Authority is the tracked compiler-UI harness, not rustdoc:
 - sources and normalized stderr:
   `crates/neoethos-search/tests/ui/resident_search_slice2/{pass,fail}/`.
 
-The runner performs exactly ten isolated compiler invocations with
-`--message-format=json` under
-`--no-default-features --features resident-search-slice2-device-fixtures`. It
+The nested manifest is a standalone fixture workspace. It contains the literal
+empty table `[workspace]`, sets `autobins = false`, has `default = []`, forwards
+only `resident-search-slice2-device-fixtures`, declares the two local path
+dependencies with `default-features = false`, and contains exactly ten explicit
+`[[bin]]` entries matching the target/source table below. It has no implicit
+`src/main.rs`, glob target or workspace member. Its generated `Cargo.lock` is
+tracked and bound by the R7 receipt.
+
+The non-target portion is exactly:
+
+```toml
+[package]
+name = "neoethos-resident-search-slice2-ui"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[workspace]
+
+[features]
+default = []
+resident-search-slice2-device-fixtures = [
+    "neoethos-search/resident-search-slice2-device-fixtures",
+    "neoethos-gpu-cuda/cuda-device-fixtures",
+]
+
+[dependencies]
+neoethos-search = { path = "../../..", default-features = false }
+neoethos-gpu-cuda = { path = "../../../../neoethos-gpu-cuda", default-features = false }
+```
+
+The ten `[[bin]]` tables contain only the exact `name` and `path` pair in the
+table below. Each negative source has exactly one co-located same-stem
+`.stderr`; the positive target has none.
+
+The runner performs exactly ten isolated compiler invocations. For each row it
+uses the same command shape with that row's one exact target substituted:
+
+```text
+cargo check --manifest-path crates/neoethos-search/tests/ui/resident_search_slice2/Cargo.toml --locked --offline --no-default-features --features resident-search-slice2-device-fixtures --bin <exact-target> --message-format=json
+```
+
+It never invokes `--bins`, an inferred default target or a package-wide check. It
 parses compiler JSON, requires the expected primary diagnostic code and exact
 authored source span, and compares the compiler's normalized rendered diagnostic
 against the tracked `.stderr` receipt. Any extra primary error, unresolved
@@ -724,18 +825,18 @@ claimed.
 
 The exact fixture set is one positive plus nine negatives:
 
-| Fixture | Required result |
-| --- | --- |
-| `pass/typed_surface.rs` | imports and moves every owner/receipt through the supported typed surface without creating a GPU resource |
-| `fail/clone_owner_e0599.rs` | `E0599` |
-| `fail/copy_owner_e0277.rs` | `E0277` |
-| `fail/read_trim_map_e0616.rs` | `E0616` |
-| `fail/read_trim_event_e0616.rs` | `E0616` |
-| `fail/read_archive_pointer_e0616.rs` | `E0616` |
-| `fail/read_population_field_e0616.rs` | `E0616` |
-| `fail/call_staged_constructor_e0624.rs` | `E0624` |
-| `fail/construct_ranked_receipt_e0451.rs` | `E0451` |
-| `fail/novelty_receipt_as_full_deadline_e0308.rs` | `E0308` at the argument that passes `ResidentArchiveKnnCalibrationReceiptV2` to the sink requiring `FullResidentDiscoveryDeadlineReceiptV1` |
+| Exact `--bin` target | Exact source | Required result |
+| --- | --- | --- |
+| `pass_typed_surface` | `pass/typed_surface.rs` | imports and moves every owner/receipt through the supported typed surface without creating a GPU resource |
+| `fail_clone_owner_e0599` | `fail/clone_owner_e0599.rs` | `E0599` |
+| `fail_copy_owner_e0277` | `fail/copy_owner_e0277.rs` | `E0277` |
+| `fail_read_trim_map_e0616` | `fail/read_trim_map_e0616.rs` | `E0616` |
+| `fail_read_trim_event_e0616` | `fail/read_trim_event_e0616.rs` | `E0616` |
+| `fail_read_archive_pointer_e0616` | `fail/read_archive_pointer_e0616.rs` | `E0616` |
+| `fail_read_population_field_e0616` | `fail/read_population_field_e0616.rs` | `E0616` |
+| `fail_call_staged_constructor_e0624` | `fail/call_staged_constructor_e0624.rs` | `E0624` |
+| `fail_construct_ranked_receipt_e0451` | `fail/construct_ranked_receipt_e0451.rs` | `E0451` |
+| `fail_novelty_receipt_as_full_deadline_e0308` | `fail/novelty_receipt_as_full_deadline_e0308.rs` | `E0308` at the argument that passes `ResidentArchiveKnnCalibrationReceiptV2` to the sink requiring `FullResidentDiscoveryDeadlineReceiptV1` |
 
 The positive fixture names both receipt types and calls correctly typed sinks
 through divergent value suppliers, so private constructors are not needed and
@@ -786,12 +887,19 @@ One self-authenticating sequence runs:
 
 1. `resident_archive_knn_v2_calibration_rejects_nonrepresentative_receipts_on_real_cuda`:
    exact production fixed-K calibration with a genuinely prefilled 50,000-entry
-   archive, plus executable rejection of empty/inactive-tail archive,
-   `A=49_999`, `K=14`, `K=16`, proxy/popcount kernel, a distance-under-rate
-   while popcount passes control and a popcount-under-rate while distance passes
-   control. Every case returns the exact typed refusal listed above; every
-   preflight-shape refusal has zero calibration allocations and every case has
-   zero combined-Search allocations;
+   archive and a receipt binding both capacity `A=50_000` and
+   `calibration_active_count=50_000`. Independent executable controls include
+   empty/inactive-tail archive, capacity `A=50_000` with valid active slots
+   `0..=49_998` and inactive slot `49_999`, capacity `A=49_999` with its bounded
+   active count also `49_999`, `K=14`, `K=16`, proxy/popcount kernel, a
+   distance-under-rate while popcount passes control and a popcount-under-rate
+   while distance passes control. The
+   one-inactive-tail control returns exactly
+   `ArchiveActiveCountMismatch`; the capacity control returns exactly
+   `ArchiveCapacityMismatch`. Every case returns its listed typed refusal;
+   active-count/capacity/K/shape preflight refusals have zero calibration
+   allocations and kernel launches, and every case has zero combined-Search
+   allocations;
 2. `resident_archive_knn_v2_admission_rejects_stale_foreign_or_shape_drift_receipts_before_allocation`:
    current-capacity allocation admission, including executable rejection of a
    stale CUDA build/math identity, foreign UUID/context/stream/pool receipt and
@@ -810,8 +918,11 @@ One self-authenticating sequence runs:
    asynchronously classified trim-ready stream wait, zero pre-terminal D2H and
    host synchronization, one compact terminal D2H/event/projection, and no later
    allocation. Acceptance requires the positive-control handshake to have
-   observed every wrapped runtime/driver family and an interposer-disabled child
-   to have been rejected.
+   observed every wrapped runtime/driver family. The supervisor then re-spawns
+   the exact same current executable/child test/fixture/hashes/argv with only
+   `NEOETHOS_SLICE2_INTERPOSER_MODE_V1=disabled`; acceptance requires the exact
+   `MissingInterposerControlHandshake` discriminant and exit code `86`, not a
+   generic child failure.
 
 The separately classified prepared-headless GREEN invariant below runs before
 and after this sequence. It is evidence in the final receipt, but it is never an
@@ -846,9 +957,11 @@ The implementation may use only this topology:
   as `#[cfg(all(test, feature = "resident-search-slice2-device-fixtures"))]`
   with its explicit `#[path = ...]` child module;
 - Cargo target `resident_search_slice2_compile_contract` has
-  `required-features = ["resident-search-slice2-device-fixtures"]`; its shared
-  fixture package forwards only that feature and is never a workspace/default
-  target.
+  `required-features = ["resident-search-slice2-device-fixtures"]`; its nested
+  fixture package has its own literal empty `[workspace]`, `autobins=false`, a
+  tracked lockfile, forwards only that feature and exposes only the ten explicit
+  `[[bin]]` targets selected individually by R7. It never joins the repository
+  workspace or becomes a default/package-wide target.
 
 No `cfg(test)`-only item is treated as visible to an integration test, and no
 test-only feature is allowed to unify into a production or application build.
@@ -928,13 +1041,20 @@ The first implementation may touch only the bounded archive/transaction seam:
   `resident_search_v2.rs`;
 - the crate-private whole-carrier consumer in
   `resident_trim_prefilter_v1.rs`;
+- `crates/neoethos-search/src/gpu_resident_current_config_plan_v1.rs` and its
+  focused test module, solely to bind the distinct archive capacity/calibration
+  active count and other Slice 2 identities into the plan, and to place the
+  uninhabited `FullResidentDiscoveryDeadlineReceiptV1` compile marker at the
+  exact declaration-only location specified above; no deadline sealer, proof or
+  readiness input is authorized;
 - build registration and focused contract/device test modules, including the
   test-only prepared-headless GREEN invariant module and its non-production
   fixture feature and compiler-UI target in
   `crates/neoethos-search/Cargo.toml`, plus only the exact
   `#[cfg(all(test, feature = "resident-search-slice2-device-fixtures"))]`
   child-module registration in `prepared_discovery_run_input_v3.rs`;
-- the tracked R7 fixture package/sources/stderr and the non-default
+- the tracked R7 fixture `Cargo.toml`, `Cargo.lock`, ten sources/stderr receipts
+  and the non-default
   `resident_archive_knn_v2_device_fixture` façade required by the exact topology
   above.
 
