@@ -1,0 +1,2372 @@
+{
+ "total": 323,
+ "items": [
+  {
+   "id": 1,
+   "claim": "parity.rs is 323 lines with zero non-test references",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 2,
+   "claim": "`pub mod parity;` is the module's only external mention",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 3,
+   "claim": "genetic/regime_labels.rs 522 lines, all 8 symbols reachable only from a re-export",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 4,
+   "claim": "the regime_labels re-export block is the whole consumer list",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 5,
+   "claim": "gpu_native/ranking.rs 263 lines; cmp_best_first / CANONICAL / RankKey have zero production refs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 6,
+   "claim": "regime/classifier.rs 199 lines; infer_regime_canonical is never called",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 7,
+   "claim": "regime/mod.rs is kept alive by a compile-pin test with no subject",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 8,
+   "claim": "`pub mod regime;` plus a stale Phase-B comment describing a migration that never came",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 9,
+   "claim": "archive_score / window_score / quality_score have no production caller",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 10,
+   "claim": "5 ingredient fns are used only by the three dead named scores",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 11,
+   "claim": "fn-pointer assertions plus 3 names in the `pub use` keep dead symbols compiling",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 12,
+   "claim": "the scoring module header still advertises a unification that did not occur",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 13,
+   "claim": "export_state.rs 115 lines; from_funnel referenced only by its own tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 14,
+   "claim": "DiversityKey / clamp_bin / smc_mask / diversity_key dead since 2026-05-26",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 15,
+   "claim": "KEEP — `pub type EvalMetrics = [f64;11]` must survive the diversity trim",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 16,
+   "claim": "StrategyRanker plus 3 methods, zero refs in production and test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 17,
+   "claim": "KEEP — StrategyQualityAnalyzer / score_strategy is live",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 18,
+   "claim": "gpu_native/instrumentation.rs 65 lines; gpu_stage_range! has zero expansions",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 19,
+   "claim": "Cargo feature `nvtx = []` is enabled by nothing; the NVTX extern block never compiles",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 20,
+   "claim": "RESERVED_INDEX_7 names a layout that changed under it (slot 7 = monthly_target_hit_rate)",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-search/src/eval.rs:292 (const renamed), :267-291 (doc rewritten), :1318-1323 (stale \"GPU lane disabled\" comment replaced), :2010 (PHASE1_GPU_SIZING_PORTED = true)"
+  },
+  {
+   "id": 21,
+   "claim": "portfolio.rs PortfolioOptimizer 487 lines, zero production refs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 22,
+   "claim": "strategy_db.rs 238 lines, all refs inside its own test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 23,
+   "claim": "`strategy-db` feature is named by no other manifest, so it compiles in no shipped build",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 24,
+   "claim": "duckdb optional dep with features=[\"bundled\"] — a C++ build for a dead feature",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 25,
+   "claim": "prototype_a_engine.rs 477 lines; its only invocation is a test",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 26,
+   "claim": "drag: `mod prototype_a_engine;` plus the re-export",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 27,
+   "claim": "~600-line Prototype-A resident block in cubecl_eval exists only for that engine",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 28,
+   "claim": "KEEP — prototype_a.rs upload structs are the production B wire format",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 29,
+   "claim": "A-specific parts safe to remove: status / capabilities / telemetry (used by gpu_bench)",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 30,
+   "claim": "prototype_c_engine/device.rs 1,767 lines, bench-only",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 31,
+   "claim": "prototype_c_engine/device_tests.rs 357 lines",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 32,
+   "claim": "prototype_c_engine.rs 238 lines",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 33,
+   "claim": "prototype_c_gpu.rs 257 lines, one caller and it is its own test",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 34,
+   "claim": "prototype_bc.rs 472 lines; route_strategy has zero production callers because production never had a choice",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 35,
+   "claim": "CubeCL fused lane is unreachable whenever prototype B is available",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-search/src/cubecl_eval.rs:3505 — `if prototype_b_available() { ...; return false; }` inside `resolve_fused_eval_enabled`, so the fused CubeCL lane is hard-OFF on every gpu-cuda build with a card. crates/neoethos-search/src/backend.rs:480-501 — strict mode REFUSES to substitute CubeCL when prototype B is compiled in.",
+   "operator_decision": "F64 ONLY. Every f32 measurement came out wrong; delete the f32 lanes. SEQUENCED AFTER the card's stage A, because the card is the first compiler these files have ever seen and deleting the surviving lane before f64 is proven would leave nothing.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 36,
+   "claim": "the f32 lane is 54% wrong at 200k bars — stated in the file",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-search/src/cubecl_eval.rs:4841-4851 (the 54% statement + \"The fallback below is the CPU, never the f32 lane\"), contradicted by crates/neoethos-search/src/cubecl_eval.rs:4879-4881 (\"Past this point the CubeCL lane is what evaluates the population — either because prototype B is not part of this build ... or because its runtime probe failed\"); crates/neoethos-search/src/engine_identity.rs:11, :249, :253-268; crates/neoethos-search/src/backend.rs:468",
+   "operator_decision": "F64 ONLY. Same decision, same sequencing.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 37,
+   "claim": "6 CI lines block the D8 delete",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 38,
+   "claim": "Cargo feature drag for gpu-vulkan / gpu-rocm / gpu-apple",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 39,
+   "claim": "compiled_gpu_vulkan plus the example documenting `--features gpu-vulkan` stop building if D8 lands",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 40,
+   "claim": "precondition — extract population_settings_for_dataset and SnapshotSettingsDto before touching their files",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 41,
+   "claim": "bench cluster plus Prototype C labelled DEAD",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 42,
+   "claim": "WindowEvaluation::trades fast path is inert — the only production construction hardcodes trades: None",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 43,
+   "claim": "the cost is measured in-repo: 191,800 calls, 45% of a run",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 44,
+   "claim": "trades_from_outcomes — the missing readback half — has zero non-test callers",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 45,
+   "claim": "walkforward_risk_diagnostics_from_trades called UNREACHABLE",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 46,
+   "claim": "accelerator_hint: 12 config tokens parsed into a field no device selector reads",
+   "money_path": false,
+   "effort": "hours",
+   "status": "SUPERSEDED"
+  },
+  {
+   "id": 47,
+   "claim": "its guard test asserts a round-trip and nothing about behaviour",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 48,
+   "claim": "gpu_pipeline_preflight returns Ok(()) before examining a stage",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 49,
+   "claim": "#35's escalation to GPU_PREFERRED (AllowCpu) is what pins the short-circuit on",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 50,
+   "claim": "stage1_baseline manifest is stale; at least 3 of 16 entries no longer match master",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 51,
+   "claim": "with_capability — the API that would make the preflight mean something — has zero production callers",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 52,
+   "claim": "gpu_fallback::is_availability has zero production callers",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 53,
+   "claim": "the strict-GPU lane (193 lines plus rebatch ladder) never executes on the shipped config",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 54,
+   "claim": "checkpoint.rs 508 lines, zero production callers",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 55,
+   "claim": "write_portfolio_artifact_atomic has no caller at all, not even a test",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 56,
+   "claim": "the CLI's real resume is hand-rolled and unrelated",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 57,
+   "claim": "check_trade_invariants — the correctness net on device trades — is never called",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-search/src/gpu_native/trade_invariants.rs:48 `check_trade_invariants` + :177 `check_pnl_reconciles` had ZERO callers outside their own `#[cfg(test)]` block — re-grepped repo-wide, confirmed OPEN. New entry point `audit_device_outcomes` at trade_invariants.rs:214 runs both nets in one call; it is now called from crates/neoethos-cli/src/gpu_bench_population.rs:231 over the Prototype B diagnostic readback (`engine.read_diagnostics()` at :223) and `anyhow::bail!`s the benchmark when any property fails. HONEST LIMITS, stated rather than hidden: (1) the two price-window properties do NOT fire on the device path, because `read_diagnostics` passes a NULL events pointer deliberately (crates/neoethos-gpu-cuda/src/population.rs:700, and `events: Vec::new()` at :718-720) — the arithmetic properties (mfe/mae non-negative, exit_after_entry, r_multiple sign) and the reducer reconciliation DO fire; a new test at trade_invariants.rs pins exactly that. (2) The CPU oracle cannot be used as the second caller: prototype_population_oracle.rs:487-491 initialises pnl/mfe/mae/r_multiple to 0.0 and NEVER writes them (`grep '.pnl ='` in that file returns nothing), so running the net over the oracle would report violations on every trade. (3) The PRODUCTION discovery lane cannot carry this net without a new device-to-host copy: prototype_b_engine.rs:658-663 reads metric rows only, and a full outcome readback at the ~20 000-scenario launches the sizer approves is 11.8 GB (population.rs:698). NEEDS OPERATOR: whether to pay that copy in production, and a CUDA card to exercise the wiring — it compiles only under `--features gpu-nvidia` / `gpu-b-native`. SIBLING FOUND, not mine: crates/neoethos-search/src/gpu_native/device_trades.rs:29 `trades_from_outcomes` also has zero non-test callers."
+  },
+  {
+   "id": 58,
+   "claim": "prototype_b_mirror.rs 288 lines zero refs — HOLD: confirm no rented-box `cargo test gpu_` selects its warp_first_hit tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 59,
+   "claim": "native_session has prod_refs=0 AND test_refs=0",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 60,
+   "claim": "prototype_b_engine_status declared twice across a cfg boundary, neither with a caller",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 61,
+   "claim": "BacktestEngine trait: one consumer and it is the benchmark",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 62,
+   "claim": "signal_trace_gpu.rs plus trade_trace_gpu.rs = 1,656 cfg(test)-only lines",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 63,
+   "claim": "parity_hierarchy.rs 753 lines, no external consumer, pinned by trade_trace_gpu.rs",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 64,
+   "claim": "KEEP — gpu_discovery_probe example is a live smoke test of the config boundary",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 65,
+   "claim": "payoff-floor identity gate landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-search/src/run_identity.rs:359 (assert_payoff_floor_reachable); called in production at crates/neoethos-search/src/discovery.rs:5214 (before any bar is read, after the ATR band resolves sl_min/tp_max) and in the autoresearch loop at crates/neoethos-autoresearch/src/proposal.rs:429 + contracts.rs:379"
+  },
+  {
+   "id": 66,
+   "claim": "ten named rejection counters landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-search/src/discovery.rs:4769 (`fn base_quality_breakdown(&self) -> [(&'static str, usize); 10]`); counters declared at :4619-4628, incremented from an EXHAUSTIVE match on `BaseQualityReject` at :8511-8527, drained into the funnel at :8968-8971"
+  },
+  {
+   "id": 67,
+   "claim": "ResolvedConfigStamp + config_hash landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 68,
+   "claim": "per-trial return series persistence landed",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 69,
+   "claim": "session spread wired to production",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-search/src/discovery.rs:2113 (single-point wire), crates/neoethos-core/src/config.rs:735-780 (refuses a partial curve), :699-701 (all three keys None), discovery.rs:8810-8828 (per-session census WARN when unset)",
+   "operator_decision": "PER SYMBOL, from the real measurements. One global triple cannot span EURUSD 0.16 to GBPTRY 552 pips.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 70,
+   "claim": "commission charged per side",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "BASELINE was already correct: crates/neoethos-core/src/config.rs:695 (`commission_per_lot_is_per_side: true`), :788-795 (`round_trip_commission_per_lot` doubles once), crates/neoethos-search/src/genetic/strategy_gene.rs:336, crates/neoethos-search/src/discovery.rs:916. THE LEAK I FOUND: crates/neoethos-search/src/discovery.rs:8181 assigns `config.sensitivity_commission_per_lot` straight into `settings.commission_per_trade`, which every evaluator subtracts ONCE per closed trade — and that value came from `models.prop_search_sensitivity_commission_per_lot` with NO conversion (old discovery.rs:1165-1167)."
+  },
+  {
+   "id": 71,
+   "claim": "cost band landed",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-search/src/discovery.rs:8994-8996 (was `_cost_band` bound and dropped); struct field crates/neoethos-search/src/discovery.rs:1471; accessor :1508-1517; production construction :9749; artifact field crates/neoethos-search/src/live_portfolio.rs:53-68 and constructor :78-108"
+  },
+  {
+   "id": 72,
+   "claim": "f64 two-pass prefilter statistic landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 73,
+   "claim": "triple-barrier label refit inside CPCV folds landed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 74,
+   "claim": "trailing now default OFF with ATR-scaled clamps",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-core/src/config.rs:1889 `ExitPolicyConfig::default()` ships `trailing_enabled: false`; crates/neoethos-core/src/config.rs:1953 `GeneStopBoundsConfig::default()` ships `atr_scaled: true` with `sl_min_atr: 1.0` / `sl_max_atr: 4.0` / `rr_max: 4.0` (the ATR-scaled clamps, replacing the `[6,20]`/`[12,45]` pip literals). Both reach discovery through crates/neoethos-search/src/genetic/strategy_gene.rs:905-913, which reads `models.exit_policy` rather than a literal. Neither key appears in config.yaml or the desktop seed as an override, so the shipped default IS the default. Ledger said PARTIAL; against this tree it is complete."
+  },
+  {
+   "id": 75,
+   "claim": "discovery hardcodes kill_zones_enabled: true, so the live knob can only make live LESS safe",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "was crates/neoethos-search/src/discovery.rs:2074 `kill_zones_enabled: true,` — a literal between two fields that read `config.`; now crates/neoethos-search/src/discovery.rs:2095 `kill_zones_enabled: config.kill_zones_enabled`"
+  },
+  {
+   "id": 76,
+   "claim": "cross_pair_features.rs (552 lines) is the only feature family never wired into compute_hpc_feature_frame.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 77,
+   "claim": "cross_pair_features is absent from the crate's re-export list so it does not resolve externally.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 78,
+   "claim": "DEFAULT_CROSS_PAIR_WINDOWS drags along with the dead module.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 79,
+   "claim": "resolve_path_to_vortex has 11 grep hits, all inside its own file.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 80,
+   "claim": "loader.rs's header falsely asserts resolve_path_to_vortex is 'actually called'; the live path is convert_to_vortex.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 81,
+   "claim": "cache_dir_for / cache_path_for / cache_filename_for orphan together with loader.rs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 82,
+   "claim": "detect_divergence / vortex_indicator / fisher_transform each return exactly one grep hit.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 83,
+   "claim": "indicators.rs survives dead-code lints only via the pub re-export.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 84,
+   "claim": "normalize_feature_matrix_copy has zero references including tests.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 85,
+   "claim": "normalize_feature_matrix is referenced only by its own tests.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 86,
+   "claim": "[KEEP] norm_fit_rows + normalize_feature_series_in_place are the live normaliser.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 87,
+   "claim": "max_indicator_warmup is a dead pre-flight guard while catch_unwind silently drops columns. Refuter said WIRE, not delete.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 88,
+   "claim": "Two comments assert the dead guard is live.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 89,
+   "claim": "gpu_sma_sweep_columns dead / neoethos-data/gpu-cuda enabled by no crate.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 90,
+   "claim": "IndicatorComputePolicy::{Auto,Cpu,RequireGpu} present.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 91,
+   "claim": "GPU_SWEEP_SPECS covers 10 of 18; the other 8 reported by name as CpuIndicatorNotPortable.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 92,
+   "claim": "New neoethos-data/build.rs bakes NEOETHOS_VECTOR_TA_PTX_ARCH so an arch mismatch fails named.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 93,
+   "claim": "test_fixtures.rs 253 lines ungated; a 100-bar JSON include_str!'d into every shipped binary.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 94,
+   "claim": "The always-compiled justification names three non-test callers, none of which exist.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 95,
+   "claim": "ctrader_sample_ohlcv_first has zero callers anywhere.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 96,
+   "claim": "[CORRECTED] a bare #[cfg(test)] gate would break the neoethos-search and neoethos-app suites — use #[cfg(any(test, feature=\"test-fixtures\"))].",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 97,
+   "claim": "[TODAY] indicator dispatch fixed: 66 -> 825 columns measured on real bars.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 98,
+   "claim": "[TODAY] typed drop ledger present.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 99,
+   "claim": "[TODAY] vocabulary floor test present.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 100,
+   "claim": "[TODAY] prefilter_top_k reconciled to 240 in all four places.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 101,
+   "claim": "vector-ta f64 kernel conversion in vendor/.",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "IN_FLIGHT"
+  },
+  {
+   "id": 102,
+   "claim": "ctrader_history.rs (1,164 lines) has zero callers for every public item.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 103,
+   "claim": "Only other reference to ctrader_history is a doc-link in ctrader_messages.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 104,
+   "claim": "4 uniquely-imported payload-type consts + their ctrader_account parsers likely orphan with ctrader_history.",
+   "money_path": false,
+   "effort": "decision-required — WIRE it (the 2026-05-15 full-API directive) or delete it; the audit's own D2 batch chose neither.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 105,
+   "claim": "ctrader_openapi.rs (67 lines); zero `protobuf::` references anywhere in neoethos-app/src.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 106,
+   "claim": "4 protoc generate/compile calls + proto/ dir (~100 KB) compiled on every clean build.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 107,
+   "claim": "`protobuf = \"4.31.1-release\"` + `protoc-bin-vendored = \"3.2.0\"` carried for nothing.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 108,
+   "claim": "Check the `cc` build-dep is still needed by emit_embedded_credentials before removing.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 109,
+   "claim": "`launched_by_flutter` field on HealthResponse serves a front-end deleted 2026-06-22.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 110,
+   "claim": "`install_launched_by_flutter` + its OnceLock in server/state.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 111,
+   "claim": "CLI arg `--launched-by-flutter` + its 4 branches in main.rs.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 112,
+   "claim": "`ENV_LAUNCHED_BY_FLUTTER` + its readers, cross-crate into neoethos-core.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 113,
+   "claim": "KnobEntry's kind/min/max/enumChoices/helpLong/envVar have 0 grep hits in any client.",
+   "money_path": false,
+   "effort": "hours — either delete the four unread fields, or have Advanced.tsx render editable typed controls from `kind`/`min`/`max`/`enumChoices` (that is the real prize: 53 knobs become editable for free).",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 114,
+   "claim": "Advanced.tsx hand-maintains a parallel schema duplicating the backend catalog.",
+   "money_path": false,
+   "effort": "days — the fix is to generate the form from the catalog (which requires #113 first), not to re-sync two lists by hand.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 115,
+   "claim": "53 knobs × 3 preset columns = 159 recommendation strings with no apply path.",
+   "money_path": true,
+   "effort": "decision-required — either add a POST /settings/presets apply path (hours once decided) or delete 159 strings that describe a product the app does not have.",
+   "status": "FIXED_NOW",
+   "evidence": "desktop/src/screens/Advanced.tsx:551-559 (new advisory banner) and :583-585 (column sub-labels). Backend side was already settled by a concurrent edit: crates/neoethos-app/src/server/knob_catalog.rs:1003-1033 records `GET /settings/presets` as DELETED and crates/neoethos-app/src/server/mod.rs:234-237 shows the route removed; the 159 strings survive only as `preset_conservative`/`preset_balanced`/`preset_aggressive` on `KnobEntry` (knob_catalog.rs:117-119)."
+  },
+  {
+   "id": 116,
+   "claim": "The UI deliberately abstains from /settings/presets; only writer is /risk/preset with a disjoint set.",
+   "money_path": true,
+   "effort": "decision-required — pick ONE preset vocabulary. Two is the defect.",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-app/src/server/knob_catalog.rs:1003-1029 (deletion note; handler, PresetsResponse and PresetSummary gone), crates/neoethos-app/src/server/mod.rs:234-237 (route removed), crates/neoethos-mcp/src/ops.rs:803-812"
+  },
+  {
+   "id": 117,
+   "claim": "/mesh/migration/enable, /mesh/elites, /mesh/migrants have no client anywhere.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 118,
+   "claim": "What IS missing: nothing POSTs /mesh/migration/enable when the mesh toggle flips.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 119,
+   "claim": "GET+POST /broker/credentials have no client; no credential form exists in desktop/src.",
+   "money_path": true,
+   "effort": "hours — add the form (the DTO and both handlers already exist and mask the secret correctly), or delete the two orphan routes.",
+   "status": "ALREADY_FIXED",
+   "evidence": "desktop/src/screens/Settings.tsx:165-212 (the cTrader credential state, `loadCreds`, `saveCreds` — the secret is dropped from component state the moment it is saved) and :519-610 (the rendered form). Clients exist at desktop/src/api.ts:234 (`brokerCredentials`) and :242 (`saveBrokerCredentials`). Handlers: crates/neoethos-app/src/server/broker_control.rs:29, routed at server/mod.rs:342."
+  },
+  {
+   "id": 120,
+   "claim": "POST /broker/account/select has no client — the only way to set the active cTrader account.",
+   "money_path": true,
+   "effort": "trivial — delete the orphan route, or point it at the same code the Tauri command uses.",
+   "status": "FIXED_NOW",
+   "evidence": "route deleted at crates/neoethos-app/src/server/mod.rs:357-367 (tombstone comment); handler/DTO/enum deleted at crates/neoethos-app/src/server/broker_control.rs:178-196 (tombstone); the client that does exist is desktop/src-tauri/src/broker.rs:256 `select_account`, called from desktop/src/api.ts:194 and desktop/src/screens/Settings.tsx:248"
+  },
+  {
+   "id": 121,
+   "claim": "Dashboard copy sends the operator to a Settings form that has never existed.",
+   "money_path": false,
+   "effort": "trivial — one string: point him at the Authenticate button, not at a credentials form.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 122,
+   "claim": "Two crates declare [[bin]] name = \"neoethos-mcp\"; only mcp/ is bundled.",
+   "money_path": false,
+   "effort": "trivial — rename one bin (e.g. `neoethos-mcp-client`) and update the loader's bin_name.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 123,
+   "claim": "Loader probes dir.join(bin_name) before resources/, so the wrong binary is found and the not-found branch cannot fire.",
+   "money_path": false,
+   "effort": "trivial — probe resources/ first, or fix #122 and the ambiguity disappears.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 124,
+   "claim": "GET /journal/analytics has no UI client — only the LLM can see pips/R/MFE-MAE.",
+   "money_path": false,
+   "effort": "hours — one api.ts export plus a table in the Account/Journal screen; the backend already computes everything.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 125,
+   "claim": "Desktop installs a CWD-relative config path, defeating the absolute-path safety net (UNCERTAIN — never observed misfiring).",
+   "money_path": true,
+   "effort": "hours — resolve `neoethos_core::config::user_config_path()` once at lib.rs:52 and pass that absolute path to both install_config_path and from_yaml, and make the from_yaml failure loud instead of `unwrap_or_else(default)`.",
+   "status": "ALREADY_FIXED",
+   "evidence": "desktop/src-tauri/src/lib.rs:35-49 `record_config_path` absolutises a relative path against the CWD at the moment it is still correct (deliberately not `canonicalize`); :142 hands that ABSOLUTE path to `server::state::install_config_path`; :162-168 `Settings::from_yaml` failure is `fatal_config_error` (process::exit(2) + dialog), not `unwrap_or_else(Settings::default)`. The one remaining relative literal, `record_config_path(PathBuf::from(\"config.yaml\"))` at :561, is absolutised by the same function before it is stored. `resolve_data_root` at :511-521 also reads the resolved path first. The claim's UNCERTAIN framing is now moot: the path cannot be CWD-relative."
+  },
+  {
+   "id": 126,
+   "claim": "NOT-DEAD note — all SettingsUpdateDto fields trace to real consumers; do not re-hunt.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 127,
+   "claim": "NOT-DEAD note — all 24 desktop screens mounted, all 90 api.ts exports imported; do not re-hunt.",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 128,
+   "claim": "domain/drift_monitor.rs — 345 lines, zero refs, not re-exported (delete candidate D3).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 129,
+   "claim": "domain/news_filter.rs — 338 lines, zero refs.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-core/src/domain/news_filter.rs does not exist; deleted (338 lines, matching the claim exactly) in commit 64722aa7. crates/neoethos-core/src/domain/mod.rs:4 records the removal; the two config knobs that reached it are ledgered as retired at crates/neoethos-core/src/config.rs:3320-3330 (`news.news_kill_window_min`, `news.news_lookahead_minutes`, note: \"this knob reached a NewsFilter nothing constructed\"); the `secrecy` dependency it justified is annotated at crates/neoethos-core/Cargo.toml:100-101"
+  },
+  {
+   "id": 130,
+   "claim": "domain/consistency.rs — 267 lines, zero refs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 131,
+   "claim": "domain/order_execution.rs — 216 lines, zero refs.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "`git cat-file -e HEAD:crates/neoethos-core/src/domain/order_execution.rs` → 'does not exist in HEAD'; `git ls-files | grep order_exec` → empty. Deleted in commit 64722aa7. Only surviving mention is the historical note at crates/neoethos-core/src/domain/mod.rs:4."
+  },
+  {
+   "id": 132,
+   "claim": "domain/meta_controller.rs — 206 lines, zero refs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 133,
+   "claim": "domain/events.rs — 167 lines; its one apparent consumer (storage.rs:413 RiskLedger) is itself dead.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 134,
+   "claim": "PortfolioManager cited as 'the live one' justifying deletion of the search-side PortfolioOptimizer — refuter established it has zero refs outside its own file; BOTH are dead.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 135,
+   "claim": "The PortfolioManager-vs-PortfolioOptimizer comparison table (domain/portfolio.rs:13) is the trap and must be deleted with both types.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 136,
+   "claim": "RiskLedger never constructed ⇒ its RiskEvent consumer is dead too.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 137,
+   "claim": "RiskManager 847 lines — all three ::new calls are inside its own test module.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-core/src/domain/risk.rs:369 (struct), :415 (impl), :788-789 (#[cfg(test)] mod tests), :836/:845/:866 (the only three `RiskManager::new` calls, all inside that module); file is 884 lines",
+   "operator_decision": "WIRE IT. The RiskManager gets a production constructor; challenge_phase, challenge_mode and recovery_mode_enabled resolve with it.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 138,
+   "claim": "3 news knobs orphaned with NewsFilter (config.rs:1923/1931/1934).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "`NewsFilter` no longer exists — the only three occurrences in the tree are prose (crates/neoethos-core/src/config.rs:2614, :3324, :3329). The orphaned knobs are deleted fields AND registered tombstones: config.rs:3320 `news.news_kill_window_min` and :3326 `news.news_lookahead_minutes`, both `RetiredKind::Deleted` with the note 'this knob reached a NewsFilter nothing constructed'. The blackout window is now fixed by the live gate and config.rs:2605-2615 says so."
+  },
+  {
+   "id": 139,
+   "claim": "The live news gate is a wholly separate implementation (news_calendar::entry_blackout_for, live_trading.rs:1077).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/news_calendar.rs:179 `entry_blackout_for` is the only implementation, called once at crates/neoethos-app/src/app_services/live_trading.rs:1748; the rival implementation is gone — `NewsFilter` has zero code references and its two knobs are tombstoned at crates/neoethos-core/src/config.rs:3321-3330; crates/neoethos-cli/src/main.rs:2899 names news_calendar as THE live gate"
+  },
+  {
+   "id": 140,
+   "claim": "Deleting order_execution.rs may flip config_has_recipient red for risk.min_risk_reward, which has a genuine reader (training_orchestrator.rs:2492).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "WAS_WRONG",
+   "evidence": "The feared consequence never occurred and cannot now. `order_execution.rs` no longer exists anywhere in the tree (`find . -name order_execution.rs` → nothing), and `risk.min_risk_reward` retains a genuine qualified production reader at crates/neoethos-models/src/training_orchestrator.rs:2669 (`.max(settings.risk.min_risk_reward)` inside `ResolvedLabelGeometry`, alongside a twin-disagreement log at :2660-2663). It is absent from `NO_QUALIFIED_READER` in crates/neoethos-core/tests/config_has_recipient.rs (grep for the key in that file returns only the module-doc line 42 recording the OLD false-pass), and it is in `ALWAYS_PERSIST` at config.rs:2963 and PINNED at shipped_config_matches_defaults.rs:87. Re-opening this requires deleting training_orchestrator.rs:2669, not deleting a file."
+  },
+  {
+   "id": 141,
+   "claim": "If checkpoint.rs goes, 4 core contract names become test-only (contracts/envelope.rs:56-59, primitives.rs:10, envelope.rs:156, lib.rs:37-38).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 142,
+   "claim": "4 of 8 typed env getters have zero callers (env_overrides.rs:114/:124/:133/:141).",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-core/src/env_overrides.rs now declares exactly four typed getters — :182 symbol_metadata_path_override, :190 user_data_dir_override, :198 log_dir_override, :208 broker_credentials_path_override — and every one has a production caller: symbol_metadata.rs:739, config.rs:3750 + :4172 + desktop/src-tauri/src/lib.rs:548, logging.rs:508, broker_config.rs:175 + neoethos-cli/src/main.rs:2811. The four callerless getters are gone; their names are announced as retired with their replacement at env_overrides.rs:270-315 and reported at startup by inert_overrides_present (:328) / log_active_overrides_at_startup (:343)."
+  },
+  {
+   "id": 143,
+   "claim": "NEOETHOS_PROP_FIRM_PRESET reported as an active override at startup though retired in v0.4.36.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "Code side already correct: crates/neoethos-core/src/env_overrides.rs:87 marks `ENV_PROP_FIRM_PRESET` RETIRED/INERT, :243-260 `active_overrides()` no longer lists it, :270-275 `RETIRED_ENV_VARS` names `risk.preset` as the replacement, and :367-382 `log_active_overrides_at_startup` emits one ERROR line per retired name with the value found. Doc side was still lying at docs/CONFIG-KNOBS-REFERENCE.md:156-163; fixed now at docs/CONFIG-KNOBS-REFERENCE.md:156-169."
+  },
+  {
+   "id": 144,
+   "claim": "Phase B of the single-resolution plan landed for 4 of 8; symbol_metadata.rs:725 still bypasses with raw env::var.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-core/src/symbol_metadata.rs:739 uses `crate::env_overrides::symbol_metadata_path_override()`; :725-738 records the migration. Sibling from the same finding also closed: crates/neoethos-core/src/broker_config.rs:175. Phase-A header rewritten at crates/neoethos-core/src/env_overrides.rs:29-45"
+  },
+  {
+   "id": 145,
+   "claim": "resolved_config reports two knobs as source=env from vars the engine no longer reads — misreports in both directions.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 146,
+   "claim": "evaluation_helpers.rs is 82 dead lines; each fn's only repo-wide hit is its own definition",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 147,
+   "claim": "simple_backtest is a second, wrong simulator (no spread, commission or sizing)",
+   "money_path": true,
+   "effort": "unknown",
+   "status": "ALREADY_FIXED",
+   "evidence": "`crates/neoethos-models/src/evaluation_helpers.rs` — the file that declared `simple_backtest` — was deleted whole in commit 64722aa7 (`git show 64722aa7 -- .` shows the `deleted file mode` hunk). `grep -rn simple_backtest` over the tree returns nothing, and `evaluation_helpers` / `probs_to_signals` have zero references, so the module declaration went with it. The second simulator does not exist."
+  },
+  {
+   "id": 148,
+   "claim": "DeviceBenchmark dead under both cfg arms (hardware.rs:166-227)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 149,
+   "claim": "DevicePreference / select_device / select_device_from_assignment dead (hardware.rs:234/243/282)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 150,
+   "claim": "get_available_gpus / tune_torch_backend / enable_flash_attention dead (hardware.rs:328/344/372)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 151,
+   "claim": "configure_rayon_threads / get_parallel_jobs / distribute_gpu_assignment / get_gpu_for_model dead (hardware.rs:391/407/426/435)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 152,
+   "claim": "Their test block + tests/integration_test.rs:50-58 are the only consumers",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 153,
+   "claim": "[KEEP] HardwareInfo + gpu_supports_bf16 — one live consumer",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 154,
+   "claim": "runtime/onnx.rs 186 lines behind a feature enabled by nobody",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 155,
+   "claim": "ort dep + re-export + module gate + guard test",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 156,
+   "claim": "write_onnx_status_sidecar / __export_onnx plumbing writes a JSON saying it did nothing",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 157,
+   "claim": "models.export_onnx shipped `true` for a dead feature (config.rs:718/1739, config.yaml:359)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 158,
+   "claim": "Cargo.toml:210 comment falsely lists ort(cuda) in the gpu-cuda aggregate",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 159,
+   "claim": "get_model_info / list_models_by_category / is_valid_model tests-only (registry.rs:264/308/334)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 160,
+   "claim": "register_model / ModelInfo / ModelCategory tests-only (registry.rs:416/122/92)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 161,
+   "claim": "get_recommended_device / _with_plan / get_recommended_precision_with_plan zero callers including tests",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 162,
+   "claim": "[KEEP] get_model_capability is live on every train",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 163,
+   "claim": "HOLD supports_gpu_for_model / prefers_gpu_for_model — correct table, WIRE candidate for #35",
+   "money_path": false,
+   "effort": "hours — the table is correct and reads real cfg! features; it needs one caller that emits per-model supports/prefers into the training summary, which is task #35's device self-report",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 164,
+   "claim": "Flat-average EnsemblePredictor::predict impl dead; both prod consumers use predict_with_roles",
+   "money_path": true,
+   "effort": "unknown",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-models/src/ensemble_inference/mod.rs:1178-1203 — the `EnsemblePredictor` trait no longer declares `predict` at all; crates/neoethos-models/src/ensemble_inference/soft_voting.rs:341-353 — the flat-average impl is a tombstone comment naming the two production callers (`bootstrap.rs:246` replay, `:275` live), both of which use `predict_with_roles` (soft_voting.rs:211)"
+  },
+  {
+   "id": 165,
+   "claim": "maybe_abstain + abstain_below_confidence doubly unreachable (soft_voting.rs:344-355)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 166,
+   "claim": "with_default_config / experts_unused_for_voting / voting_expert_count tests-only; the documented 'Loaded X/32 experts' banner does not exist",
+   "money_path": false,
+   "effort": "trivial — add the two values to the existing tracing::info! at live_trading.rs:677-681, which already holds the ensemble handle",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 167,
+   "claim": "[KEEP] load_outcome is used",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 168,
+   "claim": "SoftVotingEnsembleConfig's 5 knobs unsettable; expert_weights always empty => all 33 experts weighted 1.0",
+   "money_path": true,
+   "effort": "hours — the plumbing is a Settings block plus one call swap from build_ensemble_for_symbol to build_ensemble_for_symbol_with_config; choosing the weights (validation-accuracy-derived vs operator-set) is the decision",
+   "status": "FIXED_NOW",
+   "evidence": "Confirmed OPEN with one correction to the claim: FOUR knobs, not five — `abstain_below_confidence` was already deleted (soft_voting.rs:58-64). `SoftVotingEnsembleConfig` (soft_voting.rs:82-121) had no Settings recipient; the only production builder `build_ensemble_for_symbol` passed `SoftVotingEnsembleConfig::default()`, so `expert_weights` was empty and all 33 experts voted at 1.0 on every install, and the `_with_config` twin had zero non-test callers. New recipient `models.ensemble_voting` (`EnsembleVotingConfig`, crates/neoethos-core/src/config.rs:1234 field, struct + `validate()` around :1990-2060, default at :2670) is read at crates/neoethos-models/src/ensemble_inference/bootstrap.rs:199-234. REPLACE MEANT DELETE: `build_ensemble_for_symbol_with_config` is gone, together with its re-exports at ensemble_inference/mod.rs:126 and lib.rs:27 — `build_ensemble_for_symbol` is now the ONLY way to build the live ensemble and it reads the operator's file. Fail-loud on both arms (unreadable config, or inverted anomaly knees / negative weight) rather than falling back to the built-in default, which is a different combining rule. NEEDS OPERATOR (the part I refused to guess): WHICH weights. The shipped default is an EMPTY map — byte-identical to today's behaviour — because validation accuracy is measured per training run and per symbol, and baking one run's ranking into the shipped config would be an invented number. Note this interacts with #310/#299: `sac` (final_alpha 5.69e9) is refused by the numeric screen at ensemble_inference/mod.rs:971+ and would not vote even at weight 1.0."
+  },
+  {
+   "id": 169,
+   "claim": "tch feature + tch optional dep + 13 cfg sites, enabled by nothing",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 170,
+   "claim": "neat_gpu.rs + crfmnes_gpu.rs (822 lines) marked DEAD",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 171,
+   "claim": "reinforcement-learning-cuda 'enabled by nothing'",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 172,
+   "claim": "[KEEP] burn-cuda-backend exclusion is measured and documented; but the burn-cuda dep is still carried",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 173,
+   "claim": "exit_agent trained every run, loaded by nothing (~2,530 lines)",
+   "money_path": false,
+   "effort": "decision-required — either ship the exit-side decision loop that consumes ExitDecision3 (which is also the fix for #174), or stop requesting it at training_orchestrator.rs:547. Every run currently pays full training cost and disk for an artifact no code path reads.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 174,
+   "claim": "Its ExitDecision3 output is filtered out of voting (soft_voting.rs:234)",
+   "money_path": true,
+   "effort": "decision-required — this is the same decision as #173; wiring ExitDecision3 means designing an exit-side gate chain, not just removing a `continue`",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-models/src/ensemble_inference/soft_voting.rs:230-233 — `if expert.output_kind() != ExpertOutputKind::Classification3 { continue; }` still filters ExitDecision3 out of the vote; the adapter that emits it is crates/neoethos-models/src/ensemble_inference/rl_exit_adapters.rs:221/:236. The waste is already surfaced loudly and marked undecided at crates/neoethos-models/src/ensemble_inference/mod.rs:908-924 (\"exit_agent was TRAINED and has NO CONSUMER ... decision pending: ship the exit-side loop or stop training it\").",
+   "operator_decision": "CONNECT IT, with #310. ExitDecision3 needs its OWN voting chain, parallel to the direction vote - not the `continue` removed, which would feed exit opinions into a different axis.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 175,
+   "claim": "genetic model runs a second, in-sample, unread GA inside train",
+   "money_path": false,
+   "effort": "decision-required — the escape hatch exists (models.discovery_runtime.genetic_expert_holdout) but flipping it changes which genes this expert produces AND starts erroring on datasets whose in-sample half is under 64 rows, per genetic.rs:546-550. That is an operator call, not a code fix.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 176,
+   "claim": "The loader whitelists both orphans by name, hiding the problem",
+   "money_path": false,
+   "effort": "trivial to delete — but it should only go once #173 and #175 are decided, otherwise the run starts warning about a state the operator deliberately chose",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 177,
+   "claim": "rllib_num_workers / ray_tune_max_concurrency only ever asserted non-zero at load",
+   "money_path": false,
+   "effort": "trivial to delete both knobs; decision-required if the operator wants to keep them as forward-compatible labels",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 178,
+   "claim": "use_rllib_agent / auto_enable_rllib inert; no Ray runtime exists",
+   "money_path": false,
+   "effort": "trivial — delete both knobs and fold the dqn request at :549 onto use_rl_agent alone; the honesty machinery at :1890-1910 and :2761-2769 goes with them",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 179,
+   "claim": "[KEEP] rl_parallel_envs / rl_eval_episodes DO change behaviour (defaults for update_interval/update_freq)",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 180,
+   "claim": "models.tree_runtime.device inert — the default is never taken under the orchestrator",
+   "money_path": false,
+   "effort": "hours — but the real work is deciding precedence: should the hardware plan or the operator's tree_runtime.device win? Pick one and make the loser's field either read-only provenance or an explicit override that the plan respects.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 181,
+   "claim": "audit named the wrong survivor — models.tree_device_preference has TWO live readers",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 182,
+   "claim": "models.statistical_device: cpu means 539 lines of CUDA compile on every NVIDIA build and never run",
+   "money_path": false,
+   "effort": "decision-required — this is a product question (do the statistical models belong on the card at all?), not a dead-code fact. Either flip the default and measure, or drop statistical-gpu from the gpu-cuda aggregate and stop paying the compile.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 183,
+   "claim": "preferred_burn_device_policy feeds 12 ('device',…) entries that the hardware plan overwrites",
+   "money_path": false,
+   "effort": "hours — same precedence decision as #180; fixing them together is cheaper than separately",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 184,
+   "claim": "neuro_evo has no WorkloadKind => returns early and keeps the stale system.device string",
+   "money_path": false,
+   "effort": "trivial — add an Evolutionary arm (or widen the existing guard) so neuro_evo/neat map to a WorkloadKind; the risk is only in choosing WHICH kind, since it changes the device they train on",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 185,
+   "claim": "models.ddp_world_size called 'recorded only'",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 186,
+   "claim": "enable_ddp / enable_fsdp / symbol_hash_buckets genuinely recorded-only — the code states its own verdict",
+   "money_path": false,
+   "effort": "trivial to delete; decision-required to keep — they are honest provenance today, which is defensible, but three knobs the operator can toggle with no effect is the exact pattern this audit exists to remove",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 187,
+   "claim": "the six models.prop_search_* selection knobs called provenance strings",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 188,
+   "claim": "prop_search_async / prop_search_async_wait inert; both shipped ON against a `false` Default",
+   "money_path": false,
+   "effort": "trivial — either delete both knobs and the note, or set both YAMLs to false so the shipped value matches the Default. Do not implement async dispatch to justify the knob.",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 189,
+   "claim": "[KEEP] models.hpo_backend is a legitimate provenance label read back",
+   "money_path": false,
+   "effort": "unknown",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 190,
+   "claim": "POST /orders enforces no configured risk; `use neoethos_core::Settings` does not appear in the file. Operator ruled W1 out of scope except require_stop_loss.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/server/orders.rs:71-79 `require_stop_loss_setting()` calls `neoethos_core::Settings::from_yaml(&super::state::current_config_path())`; enforced on the market path at :128-143 and on the pending path at :251-267."
+  },
+  {
+   "id": 191,
+   "claim": "place_pending has the same gap and does not even require a bracket.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/server/orders.rs:249 (`pub risky: bool` on NewPendingOrderBody), :250-267 (require_stop_loss enforced, risky does not override), :278-296 (bracket rule: refuses SL-less AND TP-less pendings unless risky:true)"
+  },
+  {
+   "id": 192,
+   "claim": "No downstream clamp: broker_api has zero hits for max_lot_size / risk_per_trade / require_stop_loss.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "The literal claim is still true — `grep -c 'max_lot_size|risk_per_trade|require_stop_loss' crates/neoethos-app/src/app_services/broker_api.rs` = 0 — but the conclusion 'no downstream clamp' is now WRONG for two of the three. `require_stop_loss` IS enforced on BOTH order routes one layer up: crates/neoethos-app/src/server/orders.rs:71-83 (`require_stop_loss_setting`, fails CLOSED on an unreadable config), :128-142 (market) and :258-268 (pending), and `risky:true` does not override it. `max_lot_size` and `risk_per_trade` ARE applied on the autopilot path: crates/neoethos-app/src/app_services/live_trading.rs:706 (`max_lot_cap`) and the risk-based sizing at :2190-2216. There is no third caller to bypass them: `submit_market_order_blocking` / `submit_pending_order_blocking` have exactly two call sites, orders.rs:192/:352 and live_trading.rs:2453.",
+   "operator_decision": "RESOLVES WITH #137. Two of the three were already enforced one layer up; the third is the RiskManager clamp.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 193,
+   "claim": "risk.max_lot_size has exactly one reader in the workspace — the autopilot.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "FIXED_NOW",
+   "evidence": "the single reader: crates/neoethos-app/src/app_services/live_trading.rs:694-697 -> :2178 -> position_size clamp at :481; the sentinel it spells is `.filter(|v| *v > 0.0).unwrap_or(f64::INFINITY)`; report added at crates/neoethos-core/src/config.rs:4085-4104"
+  },
+  {
+   "id": 194,
+   "claim": "risk.require_stop_loss displayed and never enforced.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "Enforced on BOTH order paths and `risky: true` does not override it. crates/neoethos-app/src/server/orders.rs:71-83 `require_stop_loss_setting()` reads `Settings::from_yaml(current_config_path()).risk.require_stop_loss` and fails CLOSED (assumes ON) on an unreadable config; :128-150 refuses a market order with 400; :251-275 refuses a pending order with 400. The claim 'displayed and never enforced' is false against this tree. ONE residual defect found and fixed inside this item: the 400 body told the operator to 'turn it off in Settings' — a control that does not exist on the Settings screen (desktop/src/screens/Settings.tsx:436 already says so, and desktop/src/screens/Advanced.tsx:227 is where the key actually lives). Sending him to look for a non-existent switch mid-rejection is the same disguise as a silent fallback."
+  },
+  {
+   "id": 195,
+   "claim": "Manual orders do not consume an ACCOUNT_DAILY_ENTRIES slot.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "SUPERSEDED",
+   "evidence": "crates/neoethos-app/src/server/orders.rs:23-26 — \"Deliberately NOT enforced here, by operator decision: order SIZE. There is no risk.max_lot_size clamp, no risk_per_trade sizing and no daily-entry slot consumption on this path. Manual trading respects the operator; the autopilot (app_services::live_trading) is where those caps live.\" The ruling is recorded in docs/audit-status-2026-08-09.md:441-446, which marks #192/#193/#195 SUPERSEDED on it. ACCOUNT_DAILY_ENTRIES remains the autopilot's own static (live_trading.rs:54, reserved at :1974, released at :2094/:2142/:2275/:2368/:2403/:2491)."
+  },
+  {
+   "id": 196,
+   "claim": "Demo gate scopes on symbol only, no active_account_id(). LEDGER CORRECTION: the ledger's own W2 instruction was wrong — applied literally the gate becomes unsatisfiable; replaced by an environment stamp on the journal row.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_gate.rs:94-99 `scope_to_demo_environment` retains only rows whose `environment` stamp is Demo; called at :244. Writer side: crates/neoethos-app/src/app_services/journal_reconcile.rs:118 and :226 stamp `environment: Some(environment.to_string())`. Field declared at crates/neoethos-app/src/app_services/journal_store.rs:66 and :98."
+  },
+  {
+   "id": 197,
+   "claim": "The max_drawdown_pct criterion compares the whole account equity curve to one strategy's backtest DD.",
+   "money_path": true,
+   "effort": "days",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_gate.rs:257 (`max_drawdown_from_trade_pnl(&trades, b)` on the SYMBOL-SCOPED trades), :119-127 (`resolve_gate_drawdown` is fail-closed: unmeasurable ⇒ f64::MAX, which fails any finite cap), :185-208 (the residual named in code)"
+  },
+  {
+   "id": 198,
+   "claim": "The gate is evaluated once at start and never again.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "The once-only cadence is real and is now a stated, reasoned decision: crates/neoethos-app/src/app_services/live_gate.rs:29-32 ('this is an ADMISSION decision, evaluated once by live_trading::start') and crates/neoethos-app/src/app_services/live_trading.rs:1186-1193 (re-running the whole gate per bar would turn an account-level drawdown metric into a hair trigger that halts an engine holding a position). The exploit the claim implied IS closed: `start` captures the environment the admission was granted against (live_trading.rs:198, handed to the loop at :222) and the loop re-checks it before the first broker call of every iteration and BREAKS on any change (live_trading.rs:1211-1236). Ongoing protection comes from auto-cull, the risky kill switch and the margin-call watchdog, not from re-running the gate."
+  },
+  {
+   "id": 199,
+   "claim": "Meanwhile the environment is re-read from disk on every order (broker_api.rs:218, :270, :966).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "WAS_WRONG",
+   "evidence": "crates/neoethos-app/src/app_services/broker_api.rs:236-258 — `resolve_creds_expecting` documents the per-order read as THE FIX, not the defect: \"two reads of broker_credentials.toml with a gap between them, so a flip landing inside that gap was checked against the OLD file and routed with the NEW one ... It is closed here instead: the comparison happens against `settings` — the SAME read that produces `environment` on the returned ResolvedCreds\". Only three `load_broker_settings()` calls remain in the file: :258 (that function), :323 (`fetch_broker_accounts_blocking`, pre-account-selection, no order involved) and :1502 (`broker_credentials_configured`, the margin watchdog's no-network probe)."
+  },
+  {
+   "id": 200,
+   "claim": "RiskyModeManager::check_trade_allowed had zero production callers.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:2304 — `if let Err(tier) = m.check_trade_allowed(size_at_risk, sl_pips, tp_pips)` in the live auto-trade entry loop, on the production path (not a test module; the `#[cfg(test)]` block in that file starts at :2600+). The refusal is classified account-level vs order-level (`tier_halts_for_24h`, :2303-2312), logs `rule = \"risky_mode.check_trade_allowed\"` at :2351, and the account-too-small case is named separately at :2328-2347. The implementation is crates/neoethos-core/src/domain/risky_mode.rs:730. Zero production callers is no longer true."
+  },
+  {
+   "id": 201,
+   "claim": "Its only construction was a read-only projection endpoint.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:1040 — `rm::RiskyModeManager::new(cfg, bankroll).with_context(...)?` inside the production engine start, gated on `trading_mode_risky`, FAIL-CLOSED (the engine refuses to start rather than degrading to risk_per_trade with no kill switch). Its output is consulted on the order path at :2304 `m.check_trade_allowed(size_at_risk, sl_pips, tp_pips)`, and a trip is persisted at :2372 via risky_mode_persistence::record_kill_switch_trip."
+  },
+  {
+   "id": 202,
+   "claim": "record_kill_switch_trip is #[allow(dead_code)] — the attribute is the proof.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/risky_mode_persistence.rs:325 `pub fn record_kill_switch_trip()` — no `#[allow(dead_code)]` anywhere on it (:310-324 is a doc comment recording that the attribute was removed and forbidding its return). Two live callers: crates/neoethos-app/src/app_services/live_trading.rs:2371-2373 on the `halts_for_24h` branch of the risky-mode kill switch, and crates/neoethos-app/src/app_services/margin_call.rs:294."
+  },
+  {
+   "id": 203,
+   "claim": "A 5-second re-arm loop and a UI cooldown banner run off a clock no code path can start.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/risky_mode_persistence.rs:325 `record_kill_switch_trip` (no `#[allow(dead_code)]`); producer 1 = crates/neoethos-app/src/app_services/live_trading.rs:2416; producer 2 = crates/neoethos-app/src/app_services/margin_call.rs:294, reached from `arm()` at :318/:362/:378/:422 and spawned from broker_api.rs:926 on the live order path. Consumers: server/bridge.rs:233-251 (5 s auto-rearm) and server/risk.rs:90 (UI cooldown row)"
+  },
+  {
+   "id": 204,
+   "claim": "Live sizes at 30–50% of the live balance with no kill switch, no accumulator, no presend ceiling.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:1049-1084 — `RiskyModeManager` is now constructed in the live loop whenever `system.trading_mode == \"risky\"`, and FAILS CLOSED (`?` on `RiskyModeManager::new`) with a message saying it refuses to start because 30-50% sizing will not run without its caps. :1086-1098 logs the armed tiers. The three things the claim said were missing all exist: pre-send ceiling at :2248-2420 (`risky_mode.presend_sanity`, including the account-too-small refusal), the accumulators fed at :1383-1401 (`risky-mode kill switch: trade outcome recorded`), and the kill switch itself with a persisted 24h cooldown at :1964-2023 plus `risky_mode_persistence::record_kill_switch_trip`."
+  },
+  {
+   "id": 205,
+   "claim": "risky_mode.rs header binds to a TradingSession that does not exist in the workspace.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 206,
+   "claim": "Four risk.trailing_* fields have zero readers.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "FIXED_NOW",
+   "evidence": "fields deleted at crates/neoethos-core/src/config.rs:492-515 (tombstone in place of the four); Default seeds removed around :660; tombstones added to RETIRED_KEYS at crates/neoethos-core/src/config.rs:3402-3441; the precondition that blocked deletion is met — crates/neoethos-app/src/app_services/live_trading.rs:762-795 resolves and logs `models.exit_policy`, :1527-1541 applies its geometry"
+  },
+  {
+   "id": 207,
+   "claim": "Discovery hardcodes trailing instead (strategy_gene.rs:840-853).",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-search/src/genetic/strategy_gene.rs:910-913 — `trailing_enabled: exit.trailing_enabled`, `trailing_atr_multiplier: exit.trailing_stop_multiplier`, `trailing_be_trigger_r: exit.trailing_be_trigger_r`, `trailing_min_lock_pips: exit.trailing_min_lock_pips`, where `exit = overrides.exit_policy` (:904) resolves from `models.exit_policy`. The literals the claim points at are gone; :959-960 records verbatim what stood there (`trailing_enabled: true`, `trailing_be_trigger_r: 1.0`, `trailing_atr_multiplier: 1.0`). The identically-named `risk.trailing_*` keys are a documented SHADOWED DUPLICATE (:890-903) whose disagreement is logged once per run by `resolve_and_log_duplicate_knobs`, and they are deliberately not deleted yet — config.rs:490-510 records that live execution must be wired to `models.exit_policy` FIRST, or deleting them converts a visibly-wrong value into an invisible hardcode on the money path."
+  },
+  {
+   "id": 208,
+   "claim": "Live hardcodes trailing and reads the CONSTANT, not the field.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:744-793 resolves `models.exit_policy` from the loaded Settings and logs which of three states it got (ARMED / DISABLED / UNRESOLVABLE); :1479 `let trailing = exit_policy.filter(|p| p.trailing_enabled);` gates the whole block and :1491-1493 take `trailing_be_trigger_r` / `trailing_stop_multiplier` / `trailing_min_lock_pips` from the policy. FAIL-CLOSED on an unreadable config: it does not fall back to the constant. `DEFAULT_TRAILING_MIN_LOCK_PIPS` no longer has a reader in live_trading.rs (only the historical note at :751); its one remaining use is crates/neoethos-core/src/config.rs:689, seeding the shadowed-duplicate `risk.trailing_min_lock_pips` that #206 retains deliberately."
+  },
+  {
+   "id": 209,
+   "claim": "risk.risk_per_trade bypassed in risky mode by two hardcoded consts.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:815-831 resolves `risk.risky_max_risk_per_trade` (refusing non-finite/<=0 loudly rather than inventing a ceiling), :833-869 logs the config-vs-constant disagreement once at engine start with both numbers and which one binds, and :2026-2042 applies the clamp per entry. Constant unchanged at crates/neoethos-core/src/domain/risky_mode.rs:151."
+  },
+  {
+   "id": 210,
+   "claim": "risk.risky_max_risk_per_trade is read only by the search.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:844-851 (reads `risk.risky_max_risk_per_trade`), :853-889 (logs which bound wins at engine start), :2101-2116 (per-entry clamp: the LOWER of the config ceiling and the bankroll ladder rung binds)"
+  },
+  {
+   "id": 211,
+   "claim": "risk.max_portfolio_risk: 0.34 called inert / a max-1-position switch.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "CONFIG SIDE was already fixed by 7f4bba9a: crates/neoethos-core/src/config.rs:657 (default is now the preset's daily-drawdown stop, not 0.0) and :3888-3923 (a non-positive value is RE-SEEDED, not honoured, with a WARN naming both readings; 1.0 is the representable 'no ceiling'). CONSUMER SIDE was still wrong: crates/neoethos-app/src/app_services/live_trading.rs read `if portfolio_risk_cap > 0.0` before applying the budget — the exact ambiguous sentinel the operator calls a defect, kept alive at the one place that spends real money."
+  },
+  {
+   "id": 212,
+   "claim": "risk.monthly_profit_target_pct written by the preset switch, read only by the dead manager.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 213,
+   "claim": "POST /risk/preset writes raw firm ceilings while RiskConfig::default buffers them ×0.7.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/server/risk.rs:259-262 seeds `daily = PropFirmRuntimeDefaults::daily_dd_stop_trading_pct` and `total = max_overall_drawdown_pct * TOTAL_DRAWDOWN_BUFFER`, matching crates/neoethos-core/src/config.rs:662-665; the raw-ceiling writes are quoted as the defect at risk.rs:232-258"
+  },
+  {
+   "id": 214,
+   "claim": "The f32→f64 fingerprints in the shipped root file prove the raw write already happened — live total-DD sits at 20%, not 14%.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "THE CONCLUSION IS REFUTED, THE PREMISE WAS TRUE AND IS NOW FIXED AT SOURCE. Refutation: the operator's live store (%LOCALAPPDATA%\\neoethos\\config.yaml:25) carries `total_drawdown_limit: 0.07`, NOT 0.20 — 0.07 is FTMO's published 0.10 x the 0.7 internal buffer and is correct for the `preset: ftmo` that store runs (:19). The repo profile carries 0.14 (config.yaml:199), corrected 2026-08-10 from the f32 fingerprint 0.20000000298023224 and documented at config.yaml:116-121; 0.14 is NONE_OWN_MONEY 0.20 x 0.7 and is correct for that file's `preset: none`. The two files were answering for two different presets. So 'live total-DD sits at 20%' is false. Premise: the raw-write fingerprint was real AND SURVIVED — it was still being generated, because `RiskConfig::default()` computed `(constraints.max_overall_drawdown_pct as f64) * 0.7` from an f32 constant, which is why the shipped seed carried `total_drawdown_limit: 0.07000000104308128` and `monthly_profit_target_pct: 0.03999999910593033`. A limit the operator did not type, in a file he reads, chosen by a cast."
+  },
+  {
+   "id": 215,
+   "claim": "live_journal writes nothing unless NEOETHOS_BOT_LIVE_JOURNAL_PATH is set.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 216,
+   "claim": "record_live_outcome_best_effort runs on every broker execution and silently returns Ok(false).",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 217,
+   "claim": "The kill_zones_enabled knob is one-sided: it can only make live less safe than every validated backtest.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "FIXED_NOW",
+   "evidence": "one field, both sides: crates/neoethos-core/src/config.rs:461 `risk.kill_zones_enabled` (default true, :671) -> crates/neoethos-search/src/discovery.rs:1065 (from_settings) -> discovery.rs:2095 (the settings template every discovery lane uses); live reads the identical field at crates/neoethos-app/src/app_services/live_trading.rs:745"
+  },
+  {
+   "id": 218,
+   "claim": "strategy_blacklist fingerprints the artifact FILE, not the strategy.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/app_services/strategy_blacklist.rs:232 `gene_fingerprint_bytes` hashes the trading RULE with the per-run measurements stripped (deny-list at :113-125: fitness, sharpe_ratio, win_rate, max_drawdown, profit_factor, expectancy, trades_count, generation, strategy_id, slice_pass_rate, consistency) and resolves positional `indices` through `effective_feature_names` first; :277-280 `fingerprint_file` prefers the gene identity; :298-337 `is_blacklisted` matches on four arms and logs which one caught. Recording caller: crates/neoethos-app/src/app_services/live_trading.rs:1428-1431."
+  },
+  {
+   "id": 219,
+   "claim": "Discovery never consults the blacklist (zero hits in neoethos-search).",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "NEW crates/neoethos-core/src/strategy_identity.rs (canonical identity + `RetiredRules::load_from_data_dir`); crates/neoethos-search/src/live_portfolio.rs:119 (install), :162 (`drop_retired_rules`), :66-71 (applied inside `from_discovery`); crates/neoethos-search/src/lib.rs:264-273 (installed at the single startup point); crates/neoethos-app/src/app_services/strategy_blacklist.rs:107-135 (old copy DELETED, one-line delegation left)"
+  },
+  {
+   "id": 220,
+   "claim": "impl ExecutionAdapter for has exactly one hit and it is the mock.",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 221,
+   "claim": "Both RiskGate impls are non-production (permissive + test-only cap).",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 222,
+   "claim": "The Phase-5 table forward-references two types no production code constructs.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 223,
+   "claim": "EngineStats.intents_blocked is structurally always zero and the CLI prints it.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 224,
+   "claim": "EngineConfig::default() hardcodes starting_balance: 10_000 at all 5 production sites.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-app/src/server/autonomous.rs formerly passed `neoethos_trader::EngineConfig::default()` into `replay_symbol_from_dir` — `DEFAULT_REPLAY_STARTING_BALANCE` (10_000, engine.rs:36) and `ReplayCostModel::zero()` — while `Settings` was already in hand three lines above. So `POST /autonomous/replay` reported every percentage against a balance that was not the operator's, on fills that charged nothing, while data_replay's module header claimed byte-identical parity with the CLI."
+  },
+  {
+   "id": 225,
+   "claim": "Replay bracket is a 0.5%-of-price stop, not the gene's SL/TP.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "the gene path was already correct — crates/neoethos-trader/src/data_replay.rs:249 and :374 call `combine_gene_signals_with_brackets`, and the residual synthetic bracket is counted and disclosed at :281-285. The app route reached it only after a sibling shard's #229 work (crates/neoethos-app/src/server/autonomous.rs:118-127 now branches to `replay_portfolio_from_dir`). The remaining hole was the button: desktop/src/screens/Autopilot.tsx:246-251 sent no `portfolio_path`, so the operator's Replay ALWAYS ran the momentum stub behind `DEFAULT_SYNTHETIC_STOP_FRAC = 0.005` (crates/neoethos-trader/src/decision.rs:40) — a ~54-pip stop on EURUSD against the GA's 6-20."
+  },
+  {
+   "id": 226,
+   "claim": "Replay fills at the mark: zero spread, zero commission, zero slippage.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "Both replay front-ends now build the cost model from the operator's config through ONE adapter. crates/neoethos-trader/src/engine.rs:171-204 `EngineConfig::for_replay_from_settings` reads `risk.initial_balance`, `risk.backtest_spread_pips`, `risk.slippage_pips` and the per-side commission (`round_trip_commission_per_lot()/2.0`) plus the symbol's pip size, and logs them; crates/neoethos-trader/src/execution.rs:62-91 `ReplayCostModel::from_pips` halves the spread across entry/exit and REFUSES negative/non-finite inputs loudly rather than silently making a trade look better than the mark. The app route that used to pass `EngineConfig::default()` now calls the same adapter at crates/neoethos-app/src/server/autonomous.rs:106, matching the CLI at crates/neoethos-cli/src/main.rs:662/709/731/898. `ReplayCostModel::zero()` survives ONLY as an explicitly named state (execution.rs:52-58) reached when no config resolved, and that arm WARNs 'this replay fills at the mark, charging nothing' (engine.rs:176-181). The same commit also gave the replay the exit geometry it was scored under (engine.rs:206-233, reading `models.exit_policy`)."
+  },
+  {
+   "id": 227,
+   "claim": "Replay has no break-even and no trailing anywhere in the crate.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "before: the only mention of a trail in the whole crate was the fidelity warning at crates/neoethos-trader/src/data_replay.rs:79 (\"the replay has no trailing stop or break-even move at all\"). Now: crates/neoethos-trader/src/position.rs:57 TrailingPolicy, :108 Position::effective_sl, :175 Position::ratchet_trail, :260 PositionManager::set_trailing, applied in order at :405-446"
+  },
+  {
+   "id": 228,
+   "claim": "Replay closes+reopens on every non-flat bar — the exact profile live_trading documents as never validated.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-trader/src/decision.rs:63-67 makes both exits explicit knobs (`close_on_flat_signal`, `close_on_opposite_signal`); :89-99 `DecisionConfig::gene_parity(pip_size)` turns both OFF; the two REAL-gene replay paths use it at crates/neoethos-trader/src/data_replay.rs:302 and :473. The evaluator's third exit is restored at data_replay.rs:277-278 and :449-450 (`max_hold_bars` pulled from `EvaluationConfig` defaults) and its absence is announced at :287-289."
+  },
+  {
+   "id": 229,
+   "claim": "POST /autonomous/replay runs a 3-bar momentum stub while its doc claims parity.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-trader/src/engine.rs:171 `EngineConfig::for_replay_from_settings` (moved here); crates/neoethos-cli/src/main.rs:3060-3072 (old `replay_engine_config` DELETED) and :662/:709/:731/:898 (repointed); crates/neoethos-app/src/server/autonomous.rs:105 (config) and :117-127 (portfolio routing); crates/neoethos-trader/Cargo.toml:20-28 (neoethos-core dep)"
+  },
+  {
+   "id": 230,
+   "claim": "ReplayBody is {symbol, base_tf} only — the UI cannot reach the portfolio replay.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 231,
+   "claim": "replay_blend_from_dir is not compiled into the app at all (no ml-blend feature) yet its doc asserts both front-ends.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 232,
+   "claim": "BlendConfig.gate_floor 0.34 / veto_below 0.15 are literals in the live sizing path.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "crates/neoethos-app/src/app_services/live_trading.rs:520-531 — `operator_blend_gate_floor` and `operator_blend_veto_below` were functions whose entire body was `let _ = settings; None`, so `BlendConfig::from_config_values` always landed on the shipped 0.34 / 0.15. Those two numbers multiply every live entry's risk (live_trading.rs:663-667, consumed by `blend_decision` on every entry bar). The recipient fields did not exist in `ModelsConfig`; the spec was parked in docs/pending-edits-forbidden-territory.md."
+  },
+  {
+   "id": 233,
+   "claim": "TradeIntent::Amend/Cancel never constructed; the live loop amends stops directly, bypassing the type built for it.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 234,
+   "claim": "Direction::opposite, PositionManager::open_positions/has_open, AutonomousEngine::registry/positions, MockFill, combine_gene_signals_with_confidence — zero call sites.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 235,
+   "claim": "8 of 11 unused cTrader builders are safe to delete.",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 236,
+   "claim": "KEEP-and-WIRE build_amend_order_request — the UI can cancel a pending order but not modify one.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "FIXED_NOW",
+   "evidence": "was: `build_amend_order_request` at crates/neoethos-app/src/app_services/ctrader_messages.rs:634 with no variant and no caller (listed as unbuilt at :194-195, and as a gap at docs/v0.5-autonomous-trader-design.md:36). Now: variant `CTraderExecutionRequest::AmendOrder` in crates/neoethos-app/src/app_services/ctrader_execution.rs (declaration, `account_id`, `to_message`, `idempotency_fingerprint`, kind label, response-id validation — all five match sites), `broker_api::amend_order_blocking` at crates/neoethos-app/src/app_services/broker_api.rs:1310+, route `POST /orders/amend` at crates/neoethos-app/src/server/mod.rs:381-385 with handler `orders::amend_order`, client `amendOrder` at desktop/src/api.ts:554-571, and the Modify button + inline editor at desktop/src/screens/Actions.tsx:100-176 and :285-311."
+  },
+  {
+   "id": 237,
+   "claim": "KEEP-and-WIRE build_unsubscribe_spots_request — the streamer subscribes and never unsubscribes.",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 238,
+   "claim": "KEEP-and-WIRE build_margin_call_list_request — a broker margin call is a live risk signal nothing reads.",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "The reader exists and is a running watchdog. crates/neoethos-app/src/app_services/margin_call.rs is a whole module built for this; crates/neoethos-app/src/app_services/broker_api.rs:1539 calls `build_margin_call_list_request(account_id, \"margin-call-list-1\")` and :1575 calls `parse_margin_call_list_response`. It is armed at the broker boundary, not inside one engine's loop: broker_api.rs:926-927 `margin_call::ensure_spawned()` + `margin_call::active_halt()` inside `prepare_new_order`, so autopilot, manual POST /orders, POST /orders/pending and the MCP sidecar all funnel through it; closing/cancelling/amending stay permitted because they reduce exposure. margin_call.rs:505-539 spawns the poll thread and FAILS LOUD (not closed) if the thread cannot start. Fail-closed where it matters: an unparseable response halts, and MAX_CONSECUTIVE_POLL_FAILURES consecutive failures halts. The module also corrects the audit's framing honestly — the `ProtoOAMarginCallTriggerEvent` push already arrived and was recognised (live_spots_streamer.rs:617-625); it was the LIST poll that had no caller and no action."
+  },
+  {
+   "id": 239,
+   "claim": "The broker can push closed bars; the live loop polls every TF every bar instead.",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 240,
+   "claim": "models.live_ml_gate false in code default, root YAML and seed ⇒ 33 experts trained and dropped every run.",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "the claim is factually true and unchanged: crates/neoethos-core/src/config.rs:2573 `live_ml_gate: false` (code default), desktop/src-tauri/resources/config.yaml:272 `live_ml_gate: false` (shipped seed), and his own store per docs/audit-status-2026-08-10.md:217. The single live reader is crates/neoethos-app/src/app_services/live_trading.rs:653-661; with it false the ensemble is never even loaded (:897).",
+   "operator_decision": "NEVER AGAIN THROWN-AWAY MODELS. 33 experts trained and dropped every run is not acceptable.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 241,
+   "claim": "Even ON, ML may only shrink size or veto — genes keep direction.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "WAS_WRONG",
+   "evidence": "crates/neoethos-trader/src/blend_signal.rs:3-7 (module doc: 'the genes decide DIRECTION ... the ML ensemble decides BET/SIZE — it can only SHRINK conviction or VETO a trade, never flip Long<->Short and never manufacture a trade from Flat') and :186-189 (the stated post-condition on `blend_decision`: 'out direction in {gene direction, Flat}')."
+  },
+  {
+   "id": 242,
+   "claim": "KEEP — confirm the REAL gates still intact: daily entry cap, total-DD, daily-loss, spread, news, ML, auto-cull→blacklist→rediscovery.",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "All seven gates confirmed live in crates/neoethos-app/src/app_services/live_trading.rs: daily entry cap :2037 (`ACCOUNT_DAILY_ENTRIES.try_reserve`), total-DD :1927, daily-loss :1939-1959, spread :1860-1870, news :1810-1820, ML :2146 (hard veto) + :2120-2145 (size scaling), auto-cull :1459 → blacklist `retire` :1470 → `rediscovery::request` :1499"
+  },
+  {
+   "id": 243,
+   "claim": "376 pub fields across 19 structs => 371 operator-settable knobs",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 244,
+   "claim": "root 389 keys / seed 219 / 170 missing / 0 unique to the seed",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 245,
+   "claim": "seed ships account_currency: USD while the account is GBP",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "desktop/src-tauri/resources/config.yaml:25 — `account_currency: ''`. The seed is GENERATED from `Settings::default()`, whose value is `String::new()` (crates/neoethos-core/src/config.rs:260), i.e. 'resolve it from the broker', not a hardcoded currency. The operator's repo profile overrides it at config.yaml:193 `account_currency: GBP`. No 'USD' literal remains for this field anywhere."
+  },
+  {
+   "id": 246,
+   "claim": "seed ships discovery_mode: prop_firm, root risky",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "was config.yaml:138 `discovery_mode: risky` against desktop/src-tauri/resources/config.yaml:317 `discovery_mode: prop_firm`; BOTH values are no-ops — crates/neoethos-search/src/discovery.rs:6903-6907 maps only `strict|legacy`, and :6942-6954 WARNs by name that any other value \"IS NOT SET TO A RECOGNISED VALUE and decided nothing\". Each file's `system.trading_mode` (config.yaml:227 risky, seed :27 prop_firm) is what actually decided its regime, and each was already self-consistent."
+  },
+  {
+   "id": 247,
+   "claim": "seed ships prefilter_top_k: 50, root 240",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 248,
+   "claim": "seed ships prop_firm_rules: true, root false",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "The disagreement was resolved by deleting the field, which is the only fix that could not drift again. crates/neoethos-core/src/config.rs:451-460 is the tombstone: `prop_firm_rules: bool` DELETED 2026-08-10, because it was literally `preset != PropFirmPreset::None` with one write and one read into a display DTO and ZERO decisions — every discovery call passes a hardcoded `PropFirmRiskRules::default()`. The write from the preset endpoint is removed (neoethos-app/src/server/risk.rs:195-221 records the removal); the Risk card now derives the flag from `system.trading_mode`, which is what the engine reads (`derive_prop_firm_rules_active`, risk.rs:438, used at :416). The key is registered in RETIRED_KEYS at config.rs:3387-3400 so a live store still carrying it loads with the key NAMED at WARN. Verified absent from all three files: `grep prop_firm_rules` returns nothing in config.yaml, nothing in desktop/src-tauri/resources/config.yaml, and nothing in %LOCALAPPDATA%\\neoethos\\config.yaml."
+  },
+  {
+   "id": 249,
+   "claim": "daily_drawdown_limit 0.10000000149011612 vs 0.04",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "config.yaml:194 `daily_drawdown_limit: 0.08` (the f32 fingerprint 0.10000000149011612 is gone; the correction is recorded in the file header at config.yaml:98-99); desktop/src-tauri/resources/config.yaml:85 `daily_drawdown_limit: 0.04`; the divergence is registered with its derivation at crates/neoethos-core/tests/shipped_config_matches_defaults.rs:142-151 — 0.08 is NONE_OWN_MONEY.daily_dd_stop_trading_pct because the repo file runs `preset: none`, and 0.04 is FTMO's number in the store that runs `preset: ftmo`. The two files were answering for two different presets and nothing said so; now the disagreement is a dated, reasoned entry neither side can move silently."
+  },
+  {
+   "id": 250,
+   "claim": "total_drawdown_limit 0.20000000298023224 vs 0.07",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "config.yaml:199 `total_drawdown_limit: 0.14` (was 0.20000000298023224); the reason is written into the file's own registry at config.yaml:116-121. The 0.07 side is now GENERATED, not hand-edited: desktop/src-tauri/resources/config.yaml:86 is a projection of `Settings::default()`, which derives it at crates/neoethos-core/src/config.rs:665 as `max_overall_drawdown_pct * 0.7`."
+  },
+  {
+   "id": 251,
+   "claim": "models.discovery_runtime is missing from the seed",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 252,
+   "claim": "from_yaml has no deny_unknown_fields and no completeness check => keys silently take Default",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 253,
+   "claim": "AutoTuner has zero callers — 9 assignments that never execute",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 254,
+   "claim": "AutoTuner is the only code that writes those fields",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 255,
+   "claim": "system.enable_gpu / models.train_batch_size / models.hpo_trials are collateral deletions",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 256,
+   "claim": "only models.inference_batch_size and system.n_jobs are truly readerless",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 257,
+   "claim": "apply_thread_env_defaults is the ONLY workspace code setting OMP/MKL/OPENBLAS thread counts — re-home before deleting",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 258,
+   "claim": "prop_search_device beats enable_gpu_preference whenever non-empty => the UI's only compute control never decides the search",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 259,
+   "claim": "cpu_forced is unreachable from the UI (400 on anything but auto|cpu|gpu) while the screen renders 'Active: cpu'",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 260,
+   "claim": "the silent-CPU-run half is CLOSED at HEAD — resolve_with_probe escalates everything but cpu_forced",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 261,
+   "claim": "12 knobs for 6 GA-selection decisions: prop_search_* vs search_runtime.*",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 262,
+   "claim": "shipped disagreement: immigrant 0.18 (set) vs 0.25 (used)",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 263,
+   "claim": "shipped disagreement: tournament 10 (set) vs null -> derived size",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 264,
+   "claim": "the two defaults diverged independently too",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 265,
+   "claim": "three starting balances for one concept: 10 000 / 100 000 / 10 000",
+   "money_path": true,
+   "effort": "days",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "crates/neoethos-core/src/config.rs:615 `risk.initial_balance = 10_000.0`; :2079 `backtest_runtime.initial_equity = 100_000.0`; crates/neoethos-trader/src/engine.rs:36 `DEFAULT_REPLAY_STARTING_BALANCE = 10_000.0`. New report: crates/neoethos-search/src/eval.rs:615 `report_equity_denominator_disagreement`, called from :610",
+   "operator_decision": "IRRELEVANT AS A CONSTANT. The balance is read from the REAL account at demo/live time. And demo vs live must change NOTHING for models and strategies.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 266,
+   "claim": "models.backtest_runtime.initial_equity is HALF_WIRED",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "Fully wired end to end, not half. Config -> typed overrides: crates/neoethos-search/src/eval.rs:536-547 (`BacktestRuntimeOverrides::from_settings`, validating equity > 0). Installed once at startup through the single entry point: eval.rs:589, called from lib.rs:248 inside `install_search_runtime_overrides_from_settings`, which both binaries call (crates/neoethos-app/src/lib.rs:28 -> main.rs:212, and neoethos-cli/src/main.rs:33). Read on every surface: CPU eval.rs:906 and :1492, the cubecl kernels at cubecl_eval.rs:3045 / :4086 / :4564, and the native CUDA population settings at gpu_native/prototype_population_oracle.rs:368. `BacktestSettings` carries no shadow field — `initial_equity()` (eval.rs:655) is an accessor over the installed value, so there is no old-beside-new. The account-vs-search denominator disagreement is reported at eval.rs:615-641."
+  },
+  {
+   "id": 267,
+   "claim": "POST /settings {tradingMode} flips system.trading_mode only, leaving models.discovery_mode behind",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "WAS_WRONG",
+   "evidence": "crates/neoethos-app/src/server/settings.rs:556-578 — the premise is refuted in the code, by name: `resolve_discovery_mode` (crates/neoethos-search/src/discovery.rs:6920-6936) decides Risky vs PropFirm from `system.trading_mode`, the field this handler writes at settings.rs:554. `models.discovery_mode` is consulted only for the `strict`/`legacy` escape hatch (discovery.rs:6903-6907), so assigning `\"risky\"` to it is at best a no-op and at worst DESTROYS a `strict` setting on every mode click."
+  },
+  {
+   "id": 268,
+   "claim": "system.trading_mode is absent from the seed and relies on a Rust Default to agree",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 269,
+   "claim": "drawdown ceilings: buffered Default vs raw preset writer",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "FIXED_NOW",
+   "evidence": "The behavioural half was already fixed: crates/neoethos-app/src/server/risk.rs:258-260 seeds `daily` from `PropFirmRuntimeDefaults::daily_dd_stop_trading_pct` and `total` from the BUFFERED ceiling — matching config.rs:662/665 — instead of the firm's raw published number, plus a never-widen guard at :265-284 that refuses to loosen a breaker already tighter on disk and logs both values. The MECHANISM half was still open: the buffer was spelled TWICE, as a private `const TOTAL_DRAWDOWN_BUFFER: f64 = 0.7` at risk.rs:46 and as a bare `0.7` literal in config.rs, and risk.rs:41-45 itself recorded that the proper end state was one function in neoethos-core, deferred because config.rs was owned by another workflow. Two spellings of one number across two crates is precisely how the original divergence survived review."
+  },
+  {
+   "id": 270,
+   "claim": "apply_mode_overrides is multiplicative and not idempotent",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 271,
+   "claim": "call-site list wrong: orchestration.rs:127 has no such call; 5 production sites, not 6",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 272,
+   "claim": "exposure inverted: the block sits in the PropFirm arm => the fresh install is exposed, the dev tree is immune",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 273,
+   "claim": "knob_catalog advertises 49 env vars; 45 are inert",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 274,
+   "claim": "10 catalog env names have zero readers anywhere",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 275,
+   "claim": "35 catalog env names are read only inside orphaned from_env constructors",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 276,
+   "claim": "only 4 are genuinely live: RUST_LOG, LOG_DIR, NEOETHOS_USER_DATA_DIR, NEOETHOS_BOT_SYMBOL_METADATA",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 277,
+   "claim": "five install_*_from_env wrappers have zero call sites",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 278,
+   "claim": "SmcSearchConfig::from_env() is live under a misleading name — rename to current(), do not delete",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 279,
+   "claim": "collateral the audit missed: RAYON_NUM_THREADS is read only inside the orphaned from_env",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 280,
+   "claim": "NEOETHOS_BOT_CPU_BUDGET is honoured by the CLI only; the app and desktop never call apply_process_cpu_assignment",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 281,
+   "claim": "env-count discrepancy across sections: 178/138 vs 187/167 vs the stale in-repo 215/183",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 282,
+   "claim": "config_has_recipient's matcher is receiver-blind",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 283,
+   "claim": "146 of 372 knob names (39%) also exist as a pub <name>: field elsewhere",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 284,
+   "claim": "false pass: models.inference_batch_size + system.n_jobs on AutoTuneHints",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 285,
+   "claim": "false pass: risk.require_stop_loss on RiskDto",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "the false pass is impossible now — crates/neoethos-core/tests/config_has_recipient.rs:531 `strip_noncode` blanks comments and string literals before scanning (the knob catalog's own `id: \"risk.require_stop_loss\"` help text was what satisfied the old check), and the scanner is struct-typed so a same-named field on another type no longer counts. Independently, the knob now has a genuine enforcing reader: crates/neoethos-app/src/server/orders.rs:71-73 reads `s.risk.require_stop_loss` and both order routes refuse 400 without a stop-loss (:128 market, :258 pending), with `risky: true` explicitly NOT overriding it."
+  },
+  {
+   "id": 286,
+   "claim": "false passes: risk.trailing_min_lock_pips and risk.high_quality_confidence on BacktestSettings",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 287,
+   "claim": "false pass: risk.min_risk_reward on OrderExecutorConfig in a module nothing constructs",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 288,
+   "claim": "both ledgers capped at 3 and asserted to only shrink — pressure to find any token",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 289,
+   "claim": "export gates were disarmed deliberately with a dated 2026-06-06 mandate; the real defect is that ModelsConfig::default() still encodes the pre-mandate posture",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "The consequence is closed on all three routes. (1) desktop/src-tauri/src/lib.rs:162-168 — the `unwrap_or_else(|_| Settings::default())` is GONE; a config-load failure is now fatal (that was #125, the path by which the Default could reach a run). (2) desktop/src-tauri/resources/config.yaml is now generated from `Settings::default()` (crates/neoethos-core/tests/generated_seed_is_current.rs), so it cannot drift. (3) The divergence between the Default (crates/neoethos-core/src/config.rs:2532-2533, `require_walkforward_for_export: true` / `prop_firm_min_pass_rate: 0.40`) and the operator's profile (config.yaml:180 `false` / :163 `0.0`) is a REGISTERED, dated decision at crates/neoethos-core/tests/shipped_config_matches_defaults.rs:104-118, with both keys pinned at :63-64."
+  },
+  {
+   "id": 290,
+   "claim": "proposed cheapest test: pin gate-class fields to the same value in Default, root and seed",
+   "money_path": false,
+   "effort": "hours",
+   "status": "PARTIAL"
+  },
+  {
+   "id": 291,
+   "claim": "proposal: generate the seed from Settings::default() at build time",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 292,
+   "claim": "only 30 of 371 knobs are writable via POST /settings; 24 have a UI control",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 293,
+   "claim": "POST /settings/raw validates schema, not values",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-app/src/server/settings.rs:344-410 — five value checks (risk_per_trade in [0,1]; daily_drawdown_limit in (0,0.20]; total_drawdown_limit > 0; total > daily; total <= 0.30), returning 400 `risk_values_out_of_bounds` with every violation listed and NOTHING written or backed up; the stale 'shape only' comment corrected at :319-343"
+  },
+  {
+   "id": 294,
+   "claim": "six Settings fields with literally no reader (standing ledger, unshrunk)",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "The standing ledger is crates/neoethos-core/tests/config_has_recipient.rs:168 `NO_QUALIFIED_READER`. It holds EIGHT entries today, not six, and it is not stale — I re-checked each: the only non-test occurrence of any of them is `risk.challenge_mode` at crates/neoethos-search/src/discovery.rs:427-431, which is inside the gate-state logger and is therefore a REPORTER, explicitly denied credit by the `REPORTING_ONLY` list at :317. The ledger has in fact moved since the audit: the four `risk.trailing_*` shadows were deleted (#206) and `monthly_profit_target_pct` was removed after autoresearch/src/goals.rs became its real reader.",
+   "operator_decision": "Three hardware fields: DELETE. Three RiskConfig fields: resolve with #137. rl_population_size: default to 96 and wire - but model capacity should be SEARCHED, not a literal, and that goes to the loop. high_quality_confidence: CONNECT.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 295,
+   "claim": "73 root values contradict the Rust Default; 43 seed values do",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 296,
+   "claim": "regime_router_enabled, multi_resolution_enabled, export_onnx contradict Default in both files",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 297,
+   "claim": "7,730,879 trainable neural params for the whole fleet on one (symbol, TF) = 0.39% of 2B",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 298,
+   "claim": "largest artifact is xgboost_rf at 113.45 MB; store 287.46 MB / 43 instances",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 299,
+   "claim": "three shipped artifacts numerically broken (tide 1308811.5, tide_nf 51699690.0, sac final_alpha 5.69e9) and all three are in DEFAULT_BOOTSTRAP_EXPERT_NAMES",
+   "money_path": true,
+   "effort": "hours",
+   "status": "ALREADY_FIXED",
+   "evidence": "crates/neoethos-models/src/ensemble_inference/mod.rs:971-1094 `numeric_sanity_screen`, called at :943 from `load_with_partial_replica_aware` — which is the loader production uses (crates/neoethos-models/src/ensemble_inference/bootstrap.rs:248). Screen A refuses a recorded training loss above 1000x the peer median (catches `tide` 1,308,811.5 and `tide_nf` 51,699,690); Screen B refuses |final_alpha| > 1000 (catches `sac` 5.69e9). Refusals become `degraded` entries, so the existing \"no Classification3 voter loaded => refuse to start auto-trade\" contract keeps working and the trader falls back to gene-only. Unit tests at mod.rs:1440-1510 use the three real measured values."
+  },
+  {
+   "id": 300,
+   "claim": "14 symbols have data; system.watchlist lists 92; 78 have none",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 301,
+   "claim": "9,054 rows x 20 of ~3,700 features x 100-bar label => ~91 independent label events",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 302,
+   "claim": "capacity curve already measured flat-to-negative: OOS accuracy 0.6218 in every trial of every architecture",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 303,
+   "claim": "6 of 10 models hit best validation loss within 5 epochs",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 304,
+   "claim": "no time axis: 13 of 14 forward are Tensor<B,2>; transformer token_size = 20/8 = 3",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 305,
+   "claim": "models.transformer_seq_len is mapped to token_count then clamped to input_dim — it is not a sequence length",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 306,
+   "claim": "no GPU training backend for neural models; every config.json reads ndarray_cpu on the gpu-nvidia build",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 307,
+   "claim": "no distributed training — the code states it",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 308,
+   "claim": "no inference-time regime router; regime_*_models are read only to decide what to train",
+   "money_path": false,
+   "effort": "days",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 309,
+   "claim": "DQN CUDA path compiled since today; has never produced an artifact",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 310,
+   "claim": "zero RL output has ever reached a trade",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "CONFIRMED OPEN, and it is one boolean plus one artifact decision. The mechanism is fully built: `dqn` and `sac` are in DEFAULT_BOOTSTRAP_EXPERT_NAMES (crates/neoethos-models/src/ensemble_inference/bootstrap.rs:139-140) and map to `ExpertRole::DirectionalConfirm` (ensemble_inference/mod.rs:298), so they would vote in `predict_with_roles`. Nothing reaches a trade because the gate is off everywhere: `models.live_ml_gate` default `false` (config.rs:2594), seed `false` (desktop/src-tauri/resources/config.yaml:268), and ABSENT from %LOCALAPPDATA%\\neoethos\\config.yaml — so live_trading.rs:889 never builds the ensemble at all (`if live_ml_gate`). RL also never sets direction on any path: the genes pick direction and the ensemble only scales size. TWO DECISIONS THE OPERATOR MUST MAKE, and I am not guessing either. (1) Flip `models.live_ml_gate` to true? That changes live position sizing on a real account the moment it is set — it is a money decision, not tidying. It is settable today from Settings (server/settings.rs:769-770) or raw config; nothing in code should flip it. (2) The `sac` artifact in his own store records `final_alpha 5.69e9` against healthy peers around 0.48 and is REFUSED by the numeric screen at ensemble_inference/mod.rs:971+ (audit #299+#310), so at the moment the gate flips `sac` becomes a `degraded` entry and only `dqn` votes. He must decide whether to retrain `sac` (and `tide` best_loss 1,308,811.5, `tide_nf` 51,699,690) or drop them from the bootstrap list. WHAT IS NOW POSSIBLE THAT WAS NOT: with #168 landed, he can also answer these with weights instead of a binary — `models.ensemble_voting.expert_weights` lets him set `dqn`/`sac` to a fraction and measure, rather than flipping all 33 voters to full strength at once. NO CODE CHANGED FOR THIS ITEM by design.",
+   "operator_decision": "CONNECT IT, visible even in the back/forward test process.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 311,
+   "claim": "live/online learning has never executed: 13 records vs a 40-record floor; and it is forbidden from influencing trades",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 312,
+   "claim": "there is no code path anywhere that updates a model weight from a live outcome",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 313,
+   "claim": "Decision — Option A: real 256-bar x 71-feature window, +1.3% params for ~900x input",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 314,
+   "claim": "Decision — Option B: wire the regime router at inference, 0 params",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 315,
+   "claim": "Decision — Option C: set expert_weights from validation accuracy, 0 params",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 316,
+   "claim": "Decision — Option D: widen L1 selection 20 -> 256",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 317,
+   "claim": "Decision — Option E: 2B on the current 20-number single-bar input = x259 params, x1 information",
+   "money_path": false,
+   "effort": "decision-required",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 318,
+   "claim": "no capacity-sweep script exists in scripts/ — the gap is itself a finding",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 319,
+   "claim": "UNCERTAIN: whether the desktop CWD-relative config path has ever misfired",
+   "money_path": true,
+   "effort": "trivial",
+   "status": "ALREADY_FIXED",
+   "evidence": "the mechanism no longer exists, so the uncertainty is moot. desktop/src-tauri/src/lib.rs:34-49 `record_config_path` absolutises the path against the CWD at the moment that CWD is still the one that made it correct, and stores it in RESOLVED_CONFIG_PATH; :130-137 refuses to fall back to a relative path (`fatal_config_error` if none was recorded); :141 installs the ABSOLUTE path process-wide so /settings GET+POST and Settings::load cannot diverge if anything later changes directory; :161-168 makes a failed load FATAL instead of `unwrap_or_else(|_| Settings::default())`. The bare relative \"config.yaml\" branch inside core is deleted — crates/neoethos-core/src/config.rs:4159 records the deletion and :4230-4242 names what replaced it."
+  },
+  {
+   "id": 320,
+   "claim": "UNCERTAIN: whether rented-box parity scripts select prototype_b_mirror's warp_first_hit tests",
+   "money_path": false,
+   "effort": "trivial",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 321,
+   "claim": "UNCERTAIN: whether the DQN CUDA path reproduces the CPU numbers — needs one card run",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  },
+  {
+   "id": 322,
+   "claim": "UNCERTAIN: whether require_walkforward_for_export:false + prop_firm_min_pass_rate:0.0 is still the right posture",
+   "money_path": true,
+   "effort": "decision-required",
+   "status": "NEEDS_OPERATOR_DECISION",
+   "evidence": "config.yaml:180 `require_walkforward_for_export: false` and :163 `prop_firm_min_pass_rate: 0.0` against crates/neoethos-core/src/config.rs:2532-2533 (`true` / `0.40`). Readers: crates/neoethos-search/src/discovery.rs:1241-1242 binds both into `DiscoverySettings`; the pass-rate is collapsed with its twin by `.max()` at discovery.rs:9103-9105, with the disagreement now logged by name at :9106-9121.",
+   "operator_decision": "TO THE KARPATHY LOOP. Open and closed, both measured as an experiment - not chosen by a human.",
+   "decided": "2026-08-10"
+  },
+  {
+   "id": 323,
+   "claim": "UNCERTAIN: whether the 78 dataless watchlist symbols break any consumer",
+   "money_path": false,
+   "effort": "hours",
+   "status": "UNKNOWN"
+  }
+ ]
+}

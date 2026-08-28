@@ -1,0 +1,335 @@
+[package]
+name = "neoethos-app"
+version = "0.5.6"
+edition.workspace = true
+# SPDX dual-license matches the repo-root LICENSE file. Required by both
+# cargo-deb (which prefers `license` over `license-file` when generating
+# `debian/control`) and cargo-generate-rpm. Standard Rust ecosystem choice.
+license = "AGPL-3.0-or-later"
+description = "neoethos backend server for FX strategy research and risk-aware execution."
+homepage = "https://github.com/kosred/neoethos"
+repository = "https://github.com/kosred/neoethos"
+readme = "../../README.md"
+
+[features]
+# Gemma was the previous local-LLM path. Removed in the cleanup
+# that replaced it with the ChatGPT-subscription Codex OAuth flow
+# (neoethos-codex) — the AI Helper now lives entirely behind HTTP,
+# so there is no native LLM dependency to feature-gate.
+default = []
+
+# Transitional ownership flag for source files that are still path-included by
+# `neoethos-broker-history`. The app itself leaves this disabled; the history
+# crate enables it while the shared transport is moved out of the app tree.
+broker-history-service = []
+
+# #205 GPU backends — pick ONE per build.
+#
+# Pulls cubecl/burn/lightgbm/candle/ort into the appropriate GPU
+# code path. Picking the wrong vendor for the host makes the LINK
+# step fail — that's better than silently shipping a binary that
+# crashes at startup because libcuda.dll is absent.
+gpu = ["gpu-nvidia"]
+gpu-nvidia = [
+    # 2026-08-09: `neoethos-data/gpu-cuda` was declared in that crate but named
+    # by NOTHING — `grep -rn "neoethos-data/gpu-cuda"` over the repo returned
+    # zero matches, so vector-ta's 329 CUDA indicator kernels have never been in
+    # a shipped binary. Adding it here is what actually puts the indicator lane
+    # in the build. Requires nvcc and cuobjdump; the build detects every visible
+    # card, while cross-builds name exact targets through `CUDA_ARCHS`.
+    "neoethos-data/gpu-cuda",
+    "neoethos-models/gpu-cuda",
+    "neoethos-search/gpu-cuda",
+]
+# Full NVIDIA release surface. The base feature owns the native CUDA search,
+# model and indicator lanes; Burn's CUDA backend is named explicitly so the
+# shipped deep/Exit/SAC models cannot silently remain on their CPU backend.
+gpu-nvidia-full = [
+    "gpu-nvidia",
+    "neoethos-models/burn-cuda-backend",
+]
+gpu-vulkan = [
+    "neoethos-models/gpu-vulkan",
+    "neoethos-search/gpu-vulkan",
+]
+gpu-rocm = [
+    "neoethos-models/gpu-rocm",
+    "neoethos-search/gpu-rocm",
+]
+# `gpu-apple` previously light up llama-cpp(metal) for the Gemma
+# path. With Gemma gone, the AI Helper runs entirely against the
+# ChatGPT subscription API (HTTP), so there is no Metal-accelerated
+# work on Apple Silicon to wire in. Kept as an alias for parity in
+# build matrices; behaves as gpu-vulkan via MoltenVK.
+gpu-apple = ["gpu-vulkan"]
+# REMOVED 2026-08-03: `native-tree-models = ["neoethos-models/tree-models"]`.
+# It had zero `cfg` sites and, more to the point, was a NO-OP: the dependency at
+# line 175 already sets `features = ["pure-rust-ml", "tree-models"]`
+# unconditionally, so the native tree models are in every build whether this
+# feature is passed or not. Nothing in CI, no script and no doc ever passed it.
+# The packaging comment further down claimed the opposite; corrected there.
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
+tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
+anyhow = "1.0.100"
+chrono = "0.4"
+# keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
+# features the crate falls back to an in-memory MockCredential that does not
+# persist anything (verified 2026-05-20 via --api-test on Windows: tokens
+# were saved to a mock store, then "lost" on the next process start, which
+# cascaded into "No saved cTrader session" + every downstream button reading
+# "UNAVAILABLE"). The fix is target-conditional so we never pull macOS-only
+# `security-framework` or Linux-only `linux-keyutils` into the wrong build.
+open = "5.3.2"
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = true, features = ["blocking", "json", "rustls", "query", "form"] }
+# `url` is the canonical parser shared with reqwest. Kept as a direct
+# dep so any future code that inspects URL components (SSRF guards,
+# allow-list checks for redirect handlers) uses the same parser
+# reqwest does — avoids divergence between request validation and
+# actual request issuance.
+url = "2.5"
+# feed-rs parses RSS + Atom robustly (CDATA, namespaces, both RFC-822
+# and RFC-3339 dates) so the news desk ingests public no-API-key
+# financial feeds without a fragile hand-rolled XML scraper. Pure Rust;
+# reuses quick-xml / chrono / mime which are already in the dep tree.
+feed-rs = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"  # aligned with workspace.dependencies (2026-05-26)
+# F-312 (2026-05-29): POST /settings/raw needs to validate that the
+# operator's edited YAML parses as the typed `Settings` struct before
+# writing. Same `serde_yaml_ng` fork the core crate already uses —
+# `serde_yaml` itself is unmaintained per its README, the `_ng` fork
+# is the maintained drop-in.
+serde_yaml_ng = "0.10.0"
+# **2026-05-28 (Phase A audit)**: cTrader's JSON proxy encodes
+# protobuf enums as INTEGER discriminants (`"tradingMode": 0`), not
+# SCREAMING_SNAKE_CASE strings. We discovered this by capturing real
+# `ProtoOASymbolByIdRes` payloads via the `--capture-symbols` CLI
+# flag and finding that the existing string-tagged enums failed to
+# deserialize EVERY response. serde_repr round-trips u8/u16/u32
+# discriminants directly, matching the wire format.
+serde_repr = "0.1"
+dirs = "5.0.1"
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+# In-process, cancellation-aware DNS for the persistent cTrader socket. This
+# avoids std::net::ToSocketAddrs/getaddrinfo, whose blocking call cannot observe
+# an exact-run stop token or the cumulative connect deadline.
+hickory-resolver = "0.26.1"
+futures = "0.3.31"
+# **2026-05-25 — SSE push channel**: `BroadcastStream` adapter so
+# the `/live/spots/stream` SSE endpoint can wrap a
+# `tokio::sync::broadcast::Receiver` and stream ticks to the
+# Flutter UI as they arrive. Already a transitive dep through
+# `tokio`-dependent crates; making it explicit here lets us name
+# the adapter type in the SSE handler.
+tokio-stream = { version = "0.1", features = ["sync"] }
+# REMOVED 2026-08-09 (dead-code purge D2): `protobuf = "4.31.1-release"`. Its
+# only consumer was the generated `ctrader_openapi.rs`, which nothing
+# referenced. `grep 'use protobuf|protobuf::' crates/neoethos-app/src` was zero.
+rand = { workspace = true }
+base64 = "0.22"
+# zip 7.x ships with no transitive bloat (default features are deflate + bzip2;
+# we keep both for compatibility with email clients) and is already in the
+# transitive tree, so cargo's dedup keeps the build small. Used by the
+# /diagnostics/bundle route to package log + config + sysinfo into a single
+# .zip that end users attach to support emails.
+zip = "7.2"
+# rustls is already pulled in transitively by reqwest / tungstenite.
+# Keep a direct edge so cTrader code can install the process-level
+# CryptoProvider before tungstenite builds a ClientConfig; without this,
+# the mixed reqwest/object_store feature graph can enable both ring and
+# aws-lc-rs and rustls 0.23 panics at runtime.
+rustls = { version = "0.23", default-features = true, features = ["ring", "std", "tls12"] }
+
+# ── Flutter migration (Phase 1) ─────────────────────────────────────────────
+# axum is the HTTP layer the Flutter front-end talks to. Latest stable 0.8.x
+# as of 2026-05; uses the same tokio runtime the rest of the app uses, so no
+# extra reactor. `tower-http` provides ready-made middleware — we use `cors`
+# (Flutter is a separate process, same machine, but the browser preflight
+# rules still kick in when running flutter run -d chrome for debugging) and
+# `trace` (request/response logs piped through our existing tracing setup).
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+# CPU / RAM probe for the `/hardware` HTTP endpoint. MUST stay byte-identical
+# to the requirement in neoethos-core/Cargo.toml — if the two drift apart the
+# workspace resolves two sysinfo builds and `/hardware` and `HardwareProbe`
+# start reporting numbers from different code. See the long note there for why
+# 0.39 (windows 0.62 family + the Windows refresh_cpu_specifics perf fix).
+sysinfo = "0.39.6"
+
+# Our internal core engines
+neoethos-core = { path = "../neoethos-core" }
+neoethos-data = { path = "../neoethos-data" }
+neoethos-broker-truth = { path = "../neoethos-broker-truth" }
+neoethos-broker-history = { path = "../neoethos-broker-history" }
+neoethos-search = { path = "../neoethos-search" }
+# The autonomous-trader engine. The `/autonomous/replay` endpoint drives the SAME
+# engine the CLI `trader-replay` command does (parity) over real on-disk history.
+neoethos-trader = { path = "../neoethos-trader" }
+# **2026-05-25 — task #236**: enable `tree-models` in the default
+# build so the 7 gradient-boosted tree experts
+# (lightgbm / xgboost x3 / catboost x2 / sklears_tree) get the real
+# native implementations instead of falling back to the
+# `gaussian_centroid_surrogate` (LDA-like classifier). The surrogate
+# is correct but ~30-50% weaker Sharpe than real gradient-boosted
+# trees, so the production binary was leaving 21 % of the
+# ensemble's predictive power on the table.
+#
+# Build prereqs picked up automatically on Windows + macOS + Linux:
+# - CMake (already on the dev box; the LightGBM/XGBoost cc-rs build
+#   scripts call it)
+# - MSVC toolchain on Windows (Rust's stable-msvc target ALREADY
+#   depends on this; if `cargo build` works at all, the C++ compiler
+#   is reachable through cc-rs's vcvars probing)
+# - libstdc++ on Linux, libc++ on macOS — both system-default
+#
+# `pure-rust-ml` + `tree-models` are BOTH listed by neoethos-models'
+# `default` feature, so simply removing `default-features = false`
+# would also work — but spelling them out makes the intent obvious
+# at the call site (and lets a future `gpu-cuda` add-on opt-in
+# without re-discovering this comment).
+neoethos-models = { path = "../neoethos-models", default-features = true, features = ["pure-rust-ml", "tree-models"] }
+# #204: ChatGPT subscription via the Codex CLI's PKCE OAuth flow.
+# Replaces the previous local-Gemma runtime. No native deps (pure
+# HTTP + crypto); the AI Helper proxies chat requests through the
+# operator's ChatGPT Plus/Pro subscription.
+neoethos-codex = { path = "../neoethos-codex" }
+sha2.workspace = true
+clap = { version = "4.6.0", features = ["derive"] }
+num_cpus = "1.17.0"
+# Native folder-picker for the "Browse..." button on the data-bootstrap
+# page. Resolved per-target — see the `cfg()` blocks at the bottom of
+# this file (each platform gets the minimum feature set it needs, so
+# a Linux build never pulls libgtk-3-dev and a Windows build never
+# pulls the GTK glue).
+# `hex` is the minimal lowercase-hex encoder.
+hex = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+# keyring per-platform backend — see comment next to the original `keyring = ...`
+# pin removal above. Each feature is the minimum needed to bind to the OS
+# secret store: Credential Manager (Windows), Keychain (macOS), Secret
+# Service + kernel keyutils (Linux). `default-features = false` keeps the
+# mock/sample store out of the binary so a misconfigured platform fails
+# loudly instead of silently dropping tokens.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = true, features = ["windows-native"] }
+# Modern Win32 file dialog (uses the v6 common controls comctl32.dll
+# that ships with every Windows ≥ Vista — no extra runtime needed).
+rfd = { version = "0.17", default-features = true, features = ["common-controls-v6"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = true, features = ["apple-native"] }
+# macOS uses the AppKit NSOpenPanel — no extra features needed.
+rfd = { version = "0.17", default-features = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = true, features = ["linux-native-sync-persistent"] }
+# Drop GTK3 — talks to xdg-desktop-portal over D-Bus instead. Works on
+# GNOME / KDE / WSL2g without `libgtk-3-dev` installed; falls back
+# cleanly when the portal isn't available (the picker just doesn't
+# open.
+rfd = { version = "0.17", default-features = true, features = ["xdg-portal"] }
+
+# REMOVED 2026-08-09 (dead-code purge D2): the whole `[build-dependencies]`
+# block. `protoc-bin-vendored = "3.2.0"` and `cc = "1.2.14"` existed solely for
+# the protoc codegen + upb mini-table C compile that fed `ctrader_openapi.rs`.
+# `cc` was checked against `emit_embedded_credentials` first — that function is
+# pure `std::fs`/`format!` and needs no C toolchain.
+
+
+[package.metadata.packager]
+product_name = "neoethos"
+identifier = "com.neoethos.app"
+authors = ["Konstantinos Red"]
+description = "neoethos - a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+formats = ["nsis"]
+# Paths are resolved relative to this Cargo.toml.
+#
+# CORRECTED 2026-08-03. This block used to claim: "The default GUI build
+# intentionally ships without native tree-model DLLs; those are gated behind the
+# `native-tree-models` feature so a clean Windows install is not blocked by
+# Visual C++ debug/runtime DLLs at process startup."
+#
+# That was false in both halves. The dependency at line 175 sets
+# `features = ["pure-rust-ml", "tree-models"]` unconditionally, so the native
+# tree models — LightGBM, XGBoost, CatBoost — are in EVERY build, default
+# included. And `native-tree-models` gated nothing: zero cfg sites, and nothing
+# ever passed it. So the shipped installer does carry those native
+# dependencies, and anyone sizing the VC++ risk from this comment was reading
+# the opposite of the truth. The feature has been removed; see line 46.
+#
+# VC++ Redistributable note: the Rust MSVC binaries depend on
+# VCRUNTIME140.dll (Visual C++ 2015-2022 redistributable). Every
+# Windows 10/11 install that has ever run Office/Chrome/Steam/etc.
+# already has it, but a *pristine* install does not. The NSIS template
+# below adds a pre-install check that downloads + silently installs
+# the Microsoft-signed VC_redist.x64.exe from microsoft.com if the
+# DLLs aren't already on PATH. See `installer_no_paid_certs_strategy.md`
+# §4 for the bootstrapper hash + signature verification details.
+resources = [
+    "../../config.yaml",
+    "../../LICENSE",
+    "../../README.md",
+]
+# NSIS hook: vc_redist_install.nsh downloads VC++ 2015-2022 redistributable
+# from microsoft.com if HKLM\Microsoft\VC\Runtimes\x64\Installed != 1 so
+# the freshly-extracted NeoEthos.exe doesn't fail to load on pristine
+# Windows. Wrapped by installer_hooks.nsh which defines the
+# cargo-packager-recognised hook macros. Path is relative to this Cargo.toml.
+nsis.installer-hooks = "../../scripts/installer_hooks.nsh"
+
+[[package.metadata.packager.binaries]]
+path = "neoethos-app"
+main = true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-deb metadata — produces target/debian/neoethos-app_<version>_<arch>.deb
+# Spec: https://github.com/kornelski/cargo-deb
+# Strategy ref: installer_no_paid_certs_strategy.md §3 (Linux .deb path, $0).
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+maintainer = "neoethos contributors <neoethos@users.noreply.github.com>"
+# SPDX expression mirrored from `package.license` above. cargo-deb writes this
+# into the Debian `control` file's `License:` line via the license-file route.
+copyright = "2024-2026 NeoEthos contributors; licensed under AGPL-3.0-or-later"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+neoethos is an open-source quantitative trading workspace targeting \
+the cTrader Open API. It includes data ingestion, ML-driven \
+strategy search, paper / live trading orchestration, and a \
+risk-aware execution gate."""
+section = "finance"
+priority = "optional"
+assets = [
+    ["target/release/neoethos-app", "usr/bin/", "755"],
+    ["target/release/libxgboost.so", "usr/lib/neoethos-app/", "644"],
+    ["target/release/libcatboostmodel.so", "usr/lib/neoethos-app/", "644"],
+    ["../../assets/symbol_metadata/defaults.json", "usr/share/neoethos/symbol_metadata/", "644"],
+    ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
+    ["../../README.md", "usr/share/doc/neoethos/", "644"],
+]
+# Opt-in autostart only. Never enable the unit on install.
+systemd-units = { enable = false }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-generate-rpm metadata — produces target/generate-rpm/neoethos-app-*.rpm
+# Spec: https://github.com/cat-in-136/cargo-generate-rpm
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name = "neoethos"
+# Mirrors the SPDX expression in `package.license`.
+license = "AGPL-3.0-or-later"
+assets = [
+    { source = "target/release/neoethos-app", dest = "/usr/bin/neoethos-app", mode = "0755" },
+    { source = "target/release/libxgboost.so", dest = "/usr/lib/neoethos-app/libxgboost.so", mode = "0644" },
+    { source = "target/release/libcatboostmodel.so", dest = "/usr/lib/neoethos-app/libcatboostmodel.so", mode = "0644" },
+    { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },
+    { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },
+]

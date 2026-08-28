@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="230" height="28" role="img" aria-label="ΔΙΑΒΑΣΤΕ ΤΟ ΣΤΑ: ΕΛΛΗΝΙΚΑ">
+  <g shape-rendering="crispEdges">
+    <rect width="140" height="28" rx="0" fill="#555"/>
+    <rect x="140" width="90" height="28" fill="#0d5eaf"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="10" font-weight="bold" letter-spacing="1">
+    <text x="70" y="18" textLength="116" lengthAdjust="spacingAndGlyphs">ΔΙΑΒΑΣΤΕ ΤΟ ΣΤΑ</text>
+    <text x="185" y="18" textLength="66" lengthAdjust="spacingAndGlyphs">ΕΛΛΗΝΙΚΑ</text>
+  </g>
+</svg>

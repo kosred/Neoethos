@@ -1,0 +1,309 @@
+//! `/intelligence` — what the model swarm currently knows.
+//!
+//! Surfaces the contents of the `models/` directory plus the
+//! `model_targets.json` written by the last completed discovery run,
+//! in a shape the Flutter Intelligence screen can render directly.
+//! Read-only — the actual training happens via `/engines/training/*`.
+
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use neoethos_core::Settings;
+
+use super::errors::{actionable_error, internal_panic};
+use super::state::AppApiState;
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntelligenceDto {
+    /// Path of the `models/` directory (informational).
+    pub models_dir: String,
+    /// Whether the directory exists on disk.
+    pub models_dir_exists: bool,
+    /// Number of artifact files (joblib / pt / cbm / onnx / json) found.
+    pub artifact_count: usize,
+    /// Names of the discovered artifact files (sorted; no path).
+    pub artifacts: Vec<String>,
+    /// mtime of the most-recently-touched artifact, Unix-millis.
+    /// `None` when the directory is empty.
+    pub last_touched_unix_ms: Option<u64>,
+    /// Targets list from the latest discovery (`model_targets.json`).
+    /// Empty when discovery hasn't run yet, or when the file failed
+    /// to parse.
+    pub discovery_targets: Vec<DiscoveryTargetDto>,
+    /// Top-level metrics from `walkforward_metrics.json` if present.
+    pub walkforward_splits: Option<u32>,
+    pub walkforward_avg_accuracy: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryTargetDto {
+    pub symbol: String,
+    pub base_tf: String,
+    pub strategy_id: String,
+    pub sharpe: Option<f64>,
+    pub win_rate: Option<f64>,
+}
+
+pub async fn intelligence(State(_state): State<AppApiState>) -> Response {
+    let result = tokio::task::spawn_blocking(scan_intelligence).await;
+    match result {
+        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Err(err)) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read the models directory. Run Discovery and Training first, \
+             or check the app data folder is accessible.",
+            &err,
+        ),
+        Err(join_err) => internal_panic("Loading intelligence", join_err),
+    }
+}
+
+fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
+    // The backend currently scans the hardcoded "models" path so the
+    // Flutter screen surfaces the same artifacts every run.
+    // If Settings ever grows a `models_dir` we'll switch over here.
+    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
+    // install so a non-default `--config` flag still works.
+    let _settings = Settings::from_yaml(super::state::current_config_path()).ok();
+    let models_dir = std::path::PathBuf::from("models");
+    // Absolute path so out-of-process helpers (the P2P mesh sidecar) can locate
+    // the model store to transfer trained models. Falls back to the relative
+    // form if the CWD is somehow unreadable.
+    let models_dir_str = std::fs::canonicalize(&models_dir)
+        .ok()
+        .map(|p| {
+            p.display()
+                .to_string()
+                .trim_start_matches(r"\\?\")
+                .to_string()
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|c| c.join("models").display().to_string())
+        })
+        .unwrap_or_else(|| models_dir.display().to_string());
+    if !models_dir.exists() {
+        return Ok(IntelligenceDto {
+            models_dir: models_dir_str,
+            models_dir_exists: false,
+            artifact_count: 0,
+            artifacts: Vec::new(),
+            last_touched_unix_ms: None,
+            discovery_targets: Vec::new(),
+            walkforward_splits: None,
+            walkforward_avg_accuracy: None,
+        });
+    }
+
+    let (artifacts, latest_mtime) = scan_models_dir(&models_dir);
+
+    let last_touched_unix_ms = latest_mtime
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+
+    let discovery_targets = parse_model_targets(&models_dir);
+    let (wf_splits, wf_avg) = parse_walkforward(&models_dir);
+
+    Ok(IntelligenceDto {
+        models_dir: models_dir_str,
+        models_dir_exists: true,
+        artifact_count: artifacts.len(),
+        artifacts,
+        last_touched_unix_ms,
+        discovery_targets,
+        walkforward_splits: wf_splits,
+        walkforward_avg_accuracy: wf_avg,
+    })
+}
+
+/// Scan the models directory for TRAINED MODELS (2026-07-17 fix — operator:
+/// "τα βλέπει σαν αρχείο αλλά δεν τα αξιοποιεί").
+///
+/// Trained models live in NESTED directories — `models/<SYMBOL>/<TF>/<name>/`
+/// — exactly the layout the ensemble loader (`load_experts_for_symbol`)
+/// consumes. The old scan looked only at TOP-LEVEL FILES, so every trained
+/// expert was invisible to the Intelligence screen: the operator saw a full
+/// models directory on disk but "0 models" in the app. Each model dir is now
+/// reported as `SYMBOL/TF/model_name`, alongside any top-level loose artifact
+/// files (model_targets.json, walkforward.json, legacy single-file models).
+fn scan_models_dir(models_dir: &Path) -> (Vec<String>, Option<SystemTime>) {
+    let mut artifacts: Vec<String> = Vec::new();
+    let mut latest_mtime: Option<SystemTime> = None;
+    let mut touch = |meta: Option<std::fs::Metadata>| {
+        if let Some(mtime) = meta.and_then(|m| m.modified().ok()) {
+            latest_mtime = Some(match latest_mtime {
+                Some(prev) if prev > mtime => prev,
+                _ => mtime,
+            });
+        }
+    };
+
+    if let Ok(read_dir) = std::fs::read_dir(models_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if is_artifact(name) {
+                        artifacts.push(name.to_string());
+                    }
+                }
+                touch(entry.metadata().ok());
+            } else if path.is_dir() {
+                let symbol = entry.file_name().to_string_lossy().to_string();
+                let Ok(tf_dirs) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                for tf_entry in tf_dirs.flatten() {
+                    if !tf_entry.path().is_dir() {
+                        continue;
+                    }
+                    let tf = tf_entry.file_name().to_string_lossy().to_string();
+                    let Ok(model_dirs) = std::fs::read_dir(tf_entry.path()) else {
+                        continue;
+                    };
+                    for model_entry in model_dirs.flatten() {
+                        let model_path = model_entry.path();
+                        let name = model_entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('_') {
+                            continue; // sentinels, not models
+                        }
+                        if model_path.is_dir() {
+                            artifacts.push(format!("{symbol}/{tf}/{name}"));
+                            touch(model_entry.metadata().ok());
+                        } else if model_path.is_file() && is_artifact(&name) {
+                            // Flat per-TF artifact files (older layouts).
+                            artifacts.push(format!("{symbol}/{tf}/{name}"));
+                            touch(model_entry.metadata().ok());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    artifacts.sort();
+    (artifacts, latest_mtime)
+}
+
+fn is_artifact(name: &str) -> bool {
+    // Whitelist of extensions written by the training pipeline. We
+    // exclude `.txt` log files and the leading `_healthcheck` /
+    // `_workers` dot-prefixed sentinels so the UI shows only models.
+    if name.starts_with('_') {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    [".joblib", ".pkl", ".pt", ".cbm", ".onnx", ".json"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn parse_model_targets(models_dir: &Path) -> Vec<DiscoveryTargetDto> {
+    let path = models_dir.join("model_targets.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+
+    // The shape is `{ "EURUSD/M1": [{strategy_id, sharpe, win_rate, ...}, ...] }`.
+    // We flatten that to a Vec for the wire.
+    let mut out = Vec::new();
+    if let Some(obj) = value.as_object() {
+        for (key, val) in obj {
+            let (symbol, base_tf) = match key.split_once('/') {
+                Some((s, t)) => (s.to_string(), t.to_string()),
+                None => (key.clone(), String::new()),
+            };
+            if let Some(list) = val.as_array() {
+                for entry in list {
+                    let strategy_id = entry
+                        .get("strategy_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if strategy_id.is_empty() {
+                        continue;
+                    }
+                    out.push(DiscoveryTargetDto {
+                        symbol: symbol.clone(),
+                        base_tf: base_tf.clone(),
+                        strategy_id,
+                        sharpe: entry.get("sharpe").and_then(|v| v.as_f64()),
+                        win_rate: entry.get("win_rate").and_then(|v| v.as_f64()),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_walkforward(models_dir: &Path) -> (Option<u32>, Option<f64>) {
+    let path = models_dir.join("walkforward_metrics.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+    let splits = value
+        .get("walkforward_splits")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let avg = value.get("avg_accuracy").and_then(|v| v.as_f64());
+    (splits, avg)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn nested_trained_model_dirs_are_visible() {
+        // 2026-07-17: the Intelligence scan must surface trained models in
+        // the nested models/<SYMBOL>/<TF>/<name>/ layout the ensemble loader
+        // consumes — the old top-level-files-only scan showed 0 models.
+        let root = std::env::temp_dir().join(format!(
+            "neoethos_intel_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for model in ["dqn", "hmm_regime", "swarm_forecaster"] {
+            std::fs::create_dir_all(root.join("EURUSD").join("M15").join(model)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("EURUSD").join("M15").join("_healthcheck")).unwrap();
+        std::fs::write(root.join("model_targets.json"), "{}").unwrap();
+        std::fs::write(root.join("training.txt"), "log").unwrap(); // not an artifact
+
+        let (artifacts, mtime) = scan_models_dir(&root);
+        assert!(
+            artifacts.contains(&"EURUSD/M15/dqn".to_string()),
+            "nested model dirs must be listed: {artifacts:?}"
+        );
+        assert!(artifacts.contains(&"EURUSD/M15/hmm_regime".to_string()));
+        assert!(artifacts.contains(&"EURUSD/M15/swarm_forecaster".to_string()));
+        assert!(artifacts.contains(&"model_targets.json".to_string()));
+        assert!(
+            !artifacts.iter().any(|a| a.contains("_healthcheck")),
+            "sentinels must be excluded"
+        );
+        assert!(
+            !artifacts.iter().any(|a| a.contains("training.txt")),
+            "non-artifact files excluded"
+        );
+        assert_eq!(artifacts.len(), 4, "3 models + 1 json: {artifacts:?}");
+        assert!(mtime.is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

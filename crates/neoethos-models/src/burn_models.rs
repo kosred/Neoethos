@@ -1,0 +1,3816 @@
+// Production Burn Neural Network Models
+//
+// Pure-Rust deep learning models using Burn 0.21.
+// Default backend is NdArray CPU, with an optional pure-Rust WGPU lane.
+// Replaces legacy models (deep.py, mlp.py) — no legacy, no GIL.
+//
+// Production features matching legacy:
+// - Class-weighted loss for imbalanced data
+// - Index-order-aware train/val split with embargo
+//   The caller must pass rows already sorted chronologically.
+// - Early stopping with configurable patience
+// - Mini-batch training with shuffling
+// - Label protocol mapping (-1 → 2)
+
+use burn::backend::Autodiff;
+use burn::module::{Module, ModuleMapper, Param};
+use burn::nn;
+use burn::prelude::*;
+use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::backend::{Backend, BackendTypes};
+use burn::tensor::{DType, FloatDType, TensorData};
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+use burn_ndarray::NdArray;
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
+// Native CUDA takes priority over wgpu only when `burn-cuda-backend` is
+// explicitly enabled. That feature is separate from `gpu-cuda`; CUDA-enabled
+// Burn training runs on the selected card in f32 (no BF16 matmul hazard).
+#[cfg(feature = "burn-cuda-backend")]
+use burn_cuda::{Cuda, CudaDevice};
+
+use crate::hardware::HardwareInfo;
+use crate::runtime::capabilities::{
+    normalize_training_precision_policy, requested_training_precision_policy,
+};
+use anyhow::Context;
+use ndarray::Array2;
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "burn-wgpu-backend")]
+use std::collections::HashSet;
+#[cfg(feature = "burn-wgpu-backend")]
+use std::sync::{Mutex, OnceLock};
+use tracing::info;
+
+/// Backend types
+#[cfg(feature = "burn-cuda-backend")]
+pub type TrainBackend = Autodiff<Cuda<f32, i32>>;
+#[cfg(feature = "burn-cuda-backend")]
+pub type InferBackend = Cuda<f32, i32>;
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+pub type TrainBackend = Autodiff<Wgpu>;
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+pub type InferBackend = Wgpu;
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+pub type TrainBackend = Autodiff<NdArray>;
+#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+pub type InferBackend = NdArray;
+
+/// Keeps the exact Burn CUDA stream's device and pinned-host allocator pools
+/// resident for a complete model lifecycle, then releases both pools.
+///
+/// Create this scope before any Burn tensors or models so their handles drop
+/// before the final synchronize-cleanup-synchronize sequence runs.
+#[cfg(feature = "burn-cuda-backend")]
+#[must_use = "the Burn CUDA residency scope must outlive all CUDA handles"]
+pub struct BurnCudaResidencyScope {
+    cuda_ordinal: usize,
+    cubecl_residency: Option<crate::cubecl_lifecycle::CubeClResidencyScope>,
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+pub fn burn_cuda_residency_scope(cuda_ordinal: usize) -> BurnCudaResidencyScope {
+    let cubecl_residency = crate::cubecl_lifecycle::cubecl_residency_scope();
+    drop(crate::cubecl_lifecycle::cubecl_cuda_client(cuda_ordinal));
+    BurnCudaResidencyScope {
+        cuda_ordinal,
+        cubecl_residency: Some(cubecl_residency),
+    }
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+impl Drop for BurnCudaResidencyScope {
+    fn drop(&mut self) {
+        // Burn CUDA enables Fusion by default. Dropping a FusionTensor only
+        // queues a DropOp in Burn's global fusion server; a raw CubeCL sync
+        // cannot see it, so the server's handle container would keep the GPU
+        // allocation live through pool cleanup. Backend::sync drains that
+        // exact stream and then synchronizes CubeCL before the shared scope
+        // releases the device and pinned-host pools.
+        let sync_failure =
+            <InferBackend as Backend>::sync(&CudaDevice::new(self.cuda_ordinal)).err();
+        let unwinding = std::thread::panicking();
+        if unwinding && let Some(error) = sync_failure.as_ref() {
+            eprintln!("Burn CUDA fusion drain also failed during unwind: {error:?}");
+        }
+
+        drop(self.cubecl_residency.take());
+
+        if !unwinding && let Some(error) = sync_failure {
+            panic!("Burn CUDA fusion drain failed: {error:?}");
+        }
+    }
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, policy_key: &str) {
+    static INIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let initialized = INIT.get_or_init(|| Mutex::new(HashSet::new()));
+    // **2026-05-25 unwrap audit**: a poisoned mutex here means an
+    // earlier wgpu init thread panicked. Recover the inner HashSet
+    // instead of cascading the panic — at worst we re-initialise a
+    // device that was already set up (idempotent), at best we mark a
+    // device as initialised that hadn't completed. Either way the
+    // operator's process keeps running.
+    let mut initialized = initialized
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let init_key = format!("{policy_key}::{device:?}");
+    if initialized.insert(init_key) {
+        init_setup::<graphics::Vulkan>(device, Default::default());
+    }
+}
+
+pub fn active_burn_backend_name() -> &'static str {
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        "cuda"
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    {
+        "wgpu"
+    }
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+    {
+        "ndarray_cpu"
+    }
+}
+
+pub fn selection_execution_backend(selection: &BurnDeviceSelection) -> &str {
+    selection.execution_backend.as_str()
+}
+
+fn backend_name_for_type<B: Backend>() -> String {
+    let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_type.contains("wgpu") {
+        "wgpu".to_string()
+    } else if backend_type.contains("ndarray") {
+        "ndarray_cpu".to_string()
+    } else {
+        active_burn_backend_name().to_string()
+    }
+}
+
+fn external_execution_backend_for<B: Backend>() -> String {
+    format!("external:{}", backend_name_for_type::<B>())
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
+    let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_type.contains("burn_cuda")
+        || backend_type.contains("cubecl_cuda")
+        || backend_type.contains("cudaruntime")
+    {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "Burn CUDA backend requires native CUDA execution; backend type `{}` is not CUDA",
+        std::any::type_name::<B>()
+    ))
+}
+
+#[cfg(not(feature = "burn-cuda-backend"))]
+fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
+    let _ = std::marker::PhantomData::<B>;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnDeviceSelection {
+    pub requested_policy: String,
+    pub effective_policy: String,
+    pub execution_backend: String,
+}
+
+pub fn normalize_burn_device_policy(policy: &str) -> String {
+    // Burn-specific synonym: `"default"` is the burn ecosystem's term
+    // for "let the framework pick"; map it to our `"auto"` canonical
+    // token before delegating to the shared helper.
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized == "default" {
+        return "auto".to_string();
+    }
+    // Burn also accepts the `wgpu` / `wgpu:N` form because the burn-wgpu
+    // backend exists; statistical / runtime / rl callers do not, so it
+    // goes in as an `extra_prefixes` token rather than into the shared
+    // vendor list. See Batch 9 consolidation (docs/audits/research/
+    // gpu_consolidation_audit.md) for the contract.
+    crate::common::normalize_vendor_device_policy(&normalized, &["wgpu"])
+}
+
+fn is_supported_burn_device_policy(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "auto"
+            | "cpu"
+            | "gpu"
+            | "cuda"
+            | "wgpu"
+            | "default"
+            | "rocm"
+            | "metal"
+            | "vulkan"
+            | "external_device"
+    ) || normalized.starts_with("cuda:")
+        || normalized.starts_with("gpu:")
+        || normalized.starts_with("wgpu:")
+        || normalized.starts_with("rocm:")
+        || normalized.starts_with("metal:")
+        || normalized.starts_with("vulkan:")
+}
+
+fn normalize_effective_burn_device_policy(policy: &str) -> String {
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized == "external_device" {
+        normalized
+    } else {
+        normalize_burn_device_policy(&normalized)
+    }
+}
+
+pub(crate) fn validate_burn_device_selection(
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<()> {
+    let requested = normalize_burn_device_policy(&selection.requested_policy);
+    let effective = normalize_effective_burn_device_policy(&selection.effective_policy);
+    let execution_backend = selection.execution_backend.trim().to_ascii_lowercase();
+
+    if !is_supported_burn_device_policy(&requested) {
+        return Err(anyhow::anyhow!(
+            "Burn runtime requested device policy is unsupported: {}",
+            selection.requested_policy
+        ));
+    }
+
+    let effective_supported = effective == "external_device"
+        || effective == "cpu"
+        || effective == "default"
+        || effective == "gpu"
+        || effective.starts_with("gpu:");
+    if !effective_supported {
+        return Err(anyhow::anyhow!(
+            "Burn runtime effective device policy is unsupported: {}",
+            selection.effective_policy
+        ));
+    }
+
+    if execution_backend.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Burn runtime execution backend must not be empty"
+        ));
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    if !matches!(
+        execution_backend.as_str(),
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" | "external:cuda"
+    ) {
+        return Err(anyhow::anyhow!(
+            "Burn CUDA backend requires native CUDA execution, got `{execution_backend}`"
+        ));
+    }
+
+    match execution_backend.as_str() {
+        "ndarray_cpu" => {
+            if effective != "cpu" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime ndarray_cpu backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu" => {
+            if effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime generic wgpu backend requires external_device effective policy, got {effective}"
+                ));
+            }
+        }
+        "wgpu_cpu" => {
+            if effective != "cpu" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime wgpu_cpu backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu_default" => {
+            if effective != "default" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime wgpu_default backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu" => {
+            if effective != "external_device"
+                && effective != "gpu"
+                && !effective.starts_with("gpu:")
+            {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime GPU backend {execution_backend} is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" => {
+            // Native Burn CUDA backend (`burn-cuda-backend` build): the effective
+            // policy preserves the exact selected CUDA ordinal as `gpu:N`.
+            if effective != "gpu" && effective != "default" && !effective.starts_with("gpu:") {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime CUDA backend {execution_backend} is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        other if other.starts_with("external:") => {
+            if effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime external backend {other} requires external_device effective policy, got {effective}"
+                ));
+            }
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Burn runtime execution backend is unsupported: {other}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_loaded_burn_device_identity(
+    surface: &str,
+    persisted_requested_policy: Option<&str>,
+    persisted_effective_policy: Option<&str>,
+    persisted_execution_backend: Option<&str>,
+    live: &BurnDeviceSelection,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let persisted_requested_policy = persisted_requested_policy.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing requested_device_policy"
+            )
+        })?;
+        let persisted_effective_policy = persisted_effective_policy.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing effective_device_policy"
+            )
+        })?;
+        let persisted_execution_backend = persisted_execution_backend.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing execution_backend"
+            )
+        })?;
+        let persisted = BurnDeviceSelection {
+            requested_policy: normalize_burn_device_policy(persisted_requested_policy),
+            effective_policy: normalize_effective_burn_device_policy(persisted_effective_policy),
+            execution_backend: persisted_execution_backend.trim().to_ascii_lowercase(),
+        };
+        validate_burn_device_selection(&persisted).context(format!(
+            "{surface} Burn CUDA artifact runtime identity is invalid"
+        ))?;
+        if persisted != *live {
+            return Err(anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity drift: persisted {:?}, live {:?}",
+                persisted,
+                live
+            ));
+        }
+    }
+    #[cfg(not(feature = "burn-cuda-backend"))]
+    {
+        let _ = (
+            surface,
+            persisted_requested_policy,
+            persisted_effective_policy,
+            persisted_execution_backend,
+            live,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+fn resolve_cuda_device_policy(normalized: &str) -> anyhow::Result<(CudaDevice, String, String)> {
+    let device_index = match normalized {
+        "auto" | "gpu" => 0,
+        "cpu" => {
+            return Err(anyhow::anyhow!(
+                "Burn CUDA backend cannot honor explicit CPU policy; use the ndarray CPU build"
+            ));
+        }
+        "external_device" => {
+            return Err(anyhow::anyhow!(
+                "Burn CUDA external_device policy requires an explicit on-device API"
+            ));
+        }
+        value if value.starts_with("gpu:") => value[4..].parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("invalid explicit Burn CUDA device policy `{normalized}`")
+        })?,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported Burn CUDA device policy `{other}`"
+            ));
+        }
+    };
+    Ok((
+        CudaDevice::new(device_index),
+        format!("gpu:{device_index}"),
+        "cuda".to_string(),
+    ))
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+fn parse_wgpu_device_selector(normalized: &str) -> Option<(WgpuDevice, String, String)> {
+    let selector = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("gpu:"))
+        .or_else(|| normalized.strip_prefix("wgpu:"))
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))?;
+
+    if let Ok(index) = selector.parse::<usize>() {
+        return Some((
+            WgpuDevice::DiscreteGpu(index),
+            format!("gpu:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        ));
+    }
+
+    let (device_class, raw_index) = selector.split_once(':')?;
+    let index = raw_index.parse::<usize>().ok()?;
+    match device_class {
+        "discrete" | "dgpu" => Some((
+            WgpuDevice::DiscreteGpu(index),
+            format!("gpu:discrete:{index}"),
+            "wgpu_discrete_gpu".to_string(),
+        )),
+        "integrated" | "igpu" => Some((
+            WgpuDevice::IntegratedGpu(index),
+            format!("gpu:integrated:{index}"),
+            "wgpu_integrated_gpu".to_string(),
+        )),
+        "virtual" | "vgpu" => Some((
+            WgpuDevice::VirtualGpu(index),
+            format!("gpu:virtual:{index}"),
+            "wgpu_virtual_gpu".to_string(),
+        )),
+        "default" => Some((
+            WgpuDevice::DefaultDevice,
+            "default".to_string(),
+            "wgpu_default".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) {
+    match normalized {
+        "cpu" => (WgpuDevice::Cpu, "cpu".to_string(), "wgpu_cpu".to_string()),
+        "auto" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan" => (
+            WgpuDevice::DefaultDevice,
+            "default".to_string(),
+            "wgpu_default".to_string(),
+        ),
+        other => {
+            if let Some(selection) = parse_wgpu_device_selector(other) {
+                selection
+            } else {
+                (
+                    WgpuDevice::DefaultDevice,
+                    "default".to_string(),
+                    "wgpu_default".to_string(),
+                )
+            }
+        }
+    }
+}
+
+pub fn resolve_infer_device(
+    policy: &str,
+) -> anyhow::Result<(<InferBackend as BackendTypes>::Device, BurnDeviceSelection)> {
+    let requested_policy = normalize_burn_device_policy(policy);
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_cuda_device_policy(&requested_policy)?;
+        return Ok((
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        ));
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_wgpu_device_policy(&requested_policy);
+        initialize_wgpu_runtime(&device, &effective_policy);
+        return Ok((
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        ));
+    }
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+    {
+        Ok((
+            <InferBackend as BackendTypes>::Device::default(),
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy: "cpu".to_string(),
+                execution_backend: "ndarray_cpu".to_string(),
+            },
+        ))
+    }
+}
+
+pub fn resolve_train_device(
+    policy: &str,
+) -> anyhow::Result<(<TrainBackend as BackendTypes>::Device, BurnDeviceSelection)> {
+    let requested_policy = normalize_burn_device_policy(policy);
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_cuda_device_policy(&requested_policy)?;
+        return Ok((
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        ));
+    }
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    {
+        let (device, effective_policy, execution_backend) =
+            resolve_wgpu_device_policy(&requested_policy);
+        initialize_wgpu_runtime(&device, &effective_policy);
+        return Ok((
+            device,
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy,
+                execution_backend,
+            },
+        ));
+    }
+    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+    {
+        Ok((
+            <TrainBackend as BackendTypes>::Device::default(),
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy: "cpu".to_string(),
+                execution_backend: "ndarray_cpu".to_string(),
+            },
+        ))
+    }
+}
+
+pub fn default_infer_device() -> <InferBackend as BackendTypes>::Device {
+    resolve_infer_device("auto")
+        .expect("canonical Burn auto inference policy must resolve")
+        .0
+}
+
+pub fn default_train_device() -> <TrainBackend as BackendTypes>::Device {
+    resolve_train_device("auto")
+        .expect("canonical Burn auto training policy must resolve")
+        .0
+}
+
+fn parse_accelerator_index(policy: &str) -> Option<usize> {
+    policy.rsplit(':').next()?.parse::<usize>().ok()
+}
+
+pub trait ManagedBurnBackend: Backend {
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)>;
+
+    fn managed_device() -> anyhow::Result<Self::Device> {
+        Ok(Self::managed_device_and_selection()?.0)
+    }
+
+    fn managed_selection() -> anyhow::Result<BurnDeviceSelection> {
+        Ok(Self::managed_device_and_selection()?.1)
+    }
+}
+
+impl ManagedBurnBackend for TrainBackend {
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)> {
+        resolve_train_device("auto")
+    }
+}
+
+impl ManagedBurnBackend for InferBackend {
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)> {
+        resolve_infer_device("auto")
+    }
+}
+
+// ============================================================================
+// SHARED UTILITIES — matching legacy base.py
+// ============================================================================
+
+/// Map labels from {-1, 0, 1} to {2, 0, 1} matching legacy protocol.
+fn map_labels(y: &[i32]) -> anyhow::Result<Vec<i64>> {
+    y.iter()
+        .map(|&v| match v {
+            -1 => Ok(2i64),
+            0 => Ok(0i64),
+            1 => Ok(1i64),
+            other => Err(anyhow::anyhow!(
+                "Burn models only support labels in {{-1, 0, 1}}, received {other}"
+            )),
+        })
+        .collect()
+}
+
+/// Compute class weights (inverse frequency) matching legacy compute_class_weights().
+fn compute_class_weights(y: &[i64], n_classes: usize) -> Vec<f32> {
+    let mut counts = vec![0usize; n_classes];
+    for &label in y {
+        let idx = label as usize;
+        if idx < n_classes {
+            counts[idx] += 1;
+        }
+    }
+    let total = y.len() as f32;
+    counts
+        .iter()
+        .map(|&c| {
+            if c == 0 {
+                1.0
+            } else {
+                total / (n_classes as f32 * c as f32)
+            }
+        })
+        .collect()
+}
+
+fn scalar_loss_value(values: burn::tensor::TensorData, context: &str) -> anyhow::Result<f32> {
+    let values = values
+        .to_vec::<f32>()
+        .with_context(|| context.to_string())?;
+    let Some(value) = values.first().copied() else {
+        return Err(anyhow::anyhow!(
+            "{context}: Burn scalar tensor did not contain any values"
+        ));
+    };
+    if !value.is_finite() {
+        return Err(anyhow::anyhow!(
+            "{context}: Burn scalar tensor contained non-finite value {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn float_dtype(dtype: DType) -> FloatDType {
+    match dtype {
+        DType::BF16 => FloatDType::BF16,
+        DType::F16 => FloatDType::F16,
+        DType::Flex32 => FloatDType::Flex32,
+        _ => FloatDType::F32,
+    }
+}
+
+fn cast_tensor_to_dtype<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: DType,
+) -> Tensor<B, D> {
+    if tensor.dtype() == dtype {
+        tensor
+    } else {
+        tensor.cast(float_dtype(dtype))
+    }
+}
+
+pub(crate) fn cast_module_float_tensors<B: Backend, M: Module<B>>(module: M, dtype: DType) -> M {
+    struct FloatTensorDTypeMapper {
+        dtype: DType,
+    }
+
+    impl<B: Backend> ModuleMapper<B> for FloatTensorDTypeMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = cast_tensor_to_dtype(tensor, self.dtype);
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    let mut mapper = FloatTensorDTypeMapper { dtype };
+    module.map(&mut mapper)
+}
+
+/// Index-order-aware train/val split with embargo gap.
+/// The caller must provide rows in chronological order; this helper does not
+/// infer or validate timestamps.
+fn time_series_split(
+    n_samples: usize,
+    val_ratio: f32,
+    min_train: usize,
+    embargo: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let val_size = ((n_samples as f32) * val_ratio).ceil() as usize;
+    let val_size = val_size
+        .max(1)
+        .min(n_samples.saturating_sub(min_train + embargo));
+    let train_end = n_samples
+        .saturating_sub(val_size + embargo)
+        .max(min_train.min(n_samples));
+    let val_start = (train_end + embargo).min(n_samples);
+    (0..train_end, val_start..n_samples)
+}
+
+/// Early stopping tracker matching legacy EarlyStopper.
+struct EarlyStopper {
+    patience: usize,
+    min_delta: f32,
+    counter: usize,
+    best_loss: Option<f32>,
+}
+
+impl EarlyStopper {
+    fn new(patience: usize, min_delta: f32) -> Self {
+        Self {
+            patience,
+            min_delta,
+            counter: 0,
+            best_loss: None,
+        }
+    }
+    fn check(&mut self, val_loss: f32) -> bool {
+        match self.best_loss {
+            None => {
+                self.best_loss = Some(val_loss);
+                false
+            }
+            Some(best) if val_loss > best - self.min_delta => {
+                self.counter += 1;
+                self.counter >= self.patience
+            }
+            _ => {
+                self.best_loss = Some(val_loss);
+                self.counter = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Convert ndarray::Array2<f32> to Burn Tensor<B, 2> with the requested runtime dtype.
+fn array2_to_tensor_with_dtype<B: Backend>(
+    data: &Array2<f32>,
+    device: &B::Device,
+    dtype: DType,
+) -> Tensor<B, 2> {
+    let (rows, cols) = (data.nrows(), data.ncols());
+    let flat: Vec<f32> = data.iter().copied().collect();
+    // burn 0.21: from_data_dtype removed; new signature takes
+    // `impl Into<TensorCreationOptions<B>>` and the `(&device, dtype)`
+    // tuple has a From impl that builds the options. Equivalent semantics.
+    Tensor::from_data(TensorData::new(flat, [rows, cols]), (device, dtype))
+}
+
+/// Convert ndarray::Array2<f32> to Burn Tensor<B, 2>
+fn array2_to_tensor<B: Backend>(data: &Array2<f32>, device: &B::Device) -> Tensor<B, 2> {
+    array2_to_tensor_with_dtype(data, device, DType::F32)
+}
+
+/// Convert i64 labels to Burn Int Tensor<B, 1>
+fn labels_to_tensor<B: Backend>(labels: &[i64], device: &B::Device) -> Tensor<B, 1, Int> {
+    Tensor::from_data(TensorData::new(labels.to_vec(), [labels.len()]), device)
+}
+
+// ============================================================================
+// BURN MLP — matches legacy MLPExpert (mlp.py)
+// Uses LayerNorm instead of BatchNorm to avoid 3D reshape complications
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct BurnMLP<B: Backend> {
+    layers: Vec<nn::Linear<B>>,
+    norms: Vec<nn::LayerNorm<B>>,
+    dropout: nn::Dropout,
+    output: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnMLPConfig {
+    pub input_dim: usize,
+    #[config(default = 256)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_layers: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.1)]
+    pub dropout: f64,
+}
+
+impl BurnMLPConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnMLP<B> {
+        let mut layers = Vec::new();
+        let mut norms = Vec::new();
+        let mut dim = self.input_dim;
+        for _ in 0..self.n_layers.max(1) {
+            layers.push(nn::LinearConfig::new(dim, self.hidden_dim).init(device));
+            norms.push(nn::LayerNormConfig::new(self.hidden_dim).init(device));
+            dim = self.hidden_dim;
+        }
+        BurnMLP {
+            layers,
+            norms,
+            dropout: nn::DropoutConfig::new(self.dropout).init(),
+            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnMLP<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let mut h = x;
+        for (linear, norm) in self.layers.iter().zip(self.norms.iter()) {
+            h = linear.forward(h);
+            h = norm.forward(h);
+            h = burn::tensor::activation::relu(h);
+            h = self.dropout.forward(h);
+        }
+        self.output.forward(h)
+    }
+}
+
+// ============================================================================
+// BURN N-BEATS — matches legacy NBeatsExpert (deep.py)
+// ============================================================================
+
+/// FIXED N-BEATS basis matrix `[basis_dim, signal_len]` (Oreshkin et al. 2019).
+/// `is_trend`: rows are the polynomial basis t^j (t = i/len). Otherwise: row 0 =
+/// ones, then `cos(2π k t)` and `sin(2π k t)` harmonics — the Fourier seasonality
+/// basis. NOT a learnable Param — recomputed deterministically so autodiff never
+/// updates it (interpretability invariant).
+fn nbeats_basis<B: Backend>(
+    is_trend: bool,
+    basis_dim: usize,
+    len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut data = vec![0.0f32; basis_dim * len];
+    for i in 0..len {
+        let t = i as f32 / len.max(1) as f32;
+        if is_trend {
+            for j in 0..basis_dim {
+                data[j * len + i] = t.powi(j as i32);
+            }
+        } else {
+            if basis_dim > 0 {
+                data[i] = 1.0; // row 0: constant
+            }
+            let k_max = basis_dim.saturating_sub(1) / 2; // harmonics that fit
+            for k in 1..=k_max {
+                let ang = 2.0 * std::f32::consts::PI * k as f32 * t;
+                data[k * len + i] = ang.cos(); // rows 1..=k_max
+                data[(k_max + k) * len + i] = ang.sin(); // rows k_max+1..=2*k_max
+            }
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(data, [basis_dim, len]), device)
+}
+
+/// Real N-BEATS basis-expansion block: a 4-layer FC tower produces low-rank
+/// expansion coefficients θ_b, θ_f which are projected onto a FIXED basis to
+/// form the backcast/forecast over the (synthetic) window — the defining
+/// N-BEATS structure the previous generic-FC block lacked.
+#[derive(Module, Debug)]
+pub struct NBeatsBasisBlock<B: Backend> {
+    fc1: nn::Linear<B>,
+    fc2: nn::Linear<B>,
+    fc3: nn::Linear<B>,
+    fc4: nn::Linear<B>,
+    theta_b: nn::Linear<B>,
+    theta_f: nn::Linear<B>,
+    is_trend: bool,
+    basis_dim: usize,
+    signal_len: usize,
+}
+
+impl<B: Backend> NBeatsBasisBlock<B> {
+    fn forward(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let h = burn::tensor::activation::relu(self.fc1.forward(x));
+        let h = burn::tensor::activation::relu(self.fc2.forward(h));
+        let h = burn::tensor::activation::relu(self.fc3.forward(h));
+        let h = burn::tensor::activation::relu(self.fc4.forward(h));
+        let theta_b = self.theta_b.forward(h.clone()); // [batch, basis_dim]
+        let theta_f = self.theta_f.forward(h); // [batch, basis_dim]
+        let basis = nbeats_basis::<B>(
+            self.is_trend,
+            self.basis_dim,
+            self.signal_len,
+            &theta_b.device(),
+        ); // [basis_dim, signal_len]
+        let backcast = theta_b.matmul(basis.clone()); // [batch, signal_len]
+        let forecast = theta_f.matmul(basis); // [batch, signal_len]
+        (backcast, forecast)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct BurnNBeats<B: Backend> {
+    blocks: Vec<NBeatsBasisBlock<B>>,
+    output: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnNBeatsConfig {
+    pub input_dim: usize,
+    #[config(default = 64)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_blocks: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    /// Polynomial degree of the trend stack (basis_dim = degree + 1).
+    #[config(default = 3)]
+    pub trend_degree: usize,
+    /// Number of Fourier harmonics in the seasonality stack (basis_dim = 1 + 2K).
+    #[config(default = 4)]
+    pub n_harmonics: usize,
+}
+
+impl BurnNBeatsConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnNBeats<B> {
+        let len = self.input_dim.max(1);
+        // Guard the basis ranks so they never exceed the (synthetic) window.
+        let trend_dim = (self.trend_degree + 1).clamp(1, len);
+        let k = self.n_harmonics.min(len.saturating_sub(1) / 2);
+        let seasonal_dim = (1 + 2 * k).clamp(1, len);
+        let make = |is_trend: bool, basis_dim: usize| NBeatsBasisBlock {
+            fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            theta_b: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            theta_f: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            is_trend,
+            basis_dim,
+            signal_len: len,
+        };
+        // Interpretable config: a trend stack followed by a seasonality stack.
+        let mut blocks = Vec::with_capacity(self.n_blocks * 2);
+        for _ in 0..self.n_blocks {
+            blocks.push(make(true, trend_dim));
+        }
+        for _ in 0..self.n_blocks {
+            blocks.push(make(false, seasonal_dim));
+        }
+        BurnNBeats {
+            blocks,
+            output: nn::LinearConfig::new(len, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnNBeats<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        // Doubly-residual stacking over the (synthetic) input window.
+        let mut residual = x;
+        let mut forecast = Tensor::zeros(residual.dims(), &residual.device());
+        for block in &self.blocks {
+            let (backcast, fore) = block.forward(residual.clone());
+            residual = residual - backcast;
+            forecast = forecast + fore;
+        }
+        self.output.forward(forecast)
+    }
+}
+
+// ============================================================================
+// BURN N-BEATSx-NF — dedicated N-BEATS variant with exogenous gating
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct BurnNBeatsx<B: Backend> {
+    input_norm: nn::LayerNorm<B>,
+    blocks: Vec<NBeatsBasisBlock<B>>,
+    exogenous_gate: nn::Linear<B>,
+    output: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnNBeatsxConfig {
+    pub input_dim: usize,
+    #[config(default = 96)]
+    pub hidden_dim: usize,
+    #[config(default = 4)]
+    pub n_blocks: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 3)]
+    pub trend_degree: usize,
+    #[config(default = 4)]
+    pub n_harmonics: usize,
+}
+
+impl BurnNBeatsxConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnNBeatsx<B> {
+        let len = self.input_dim.max(1);
+        let trend_dim = (self.trend_degree + 1).clamp(1, len);
+        let k = self.n_harmonics.min(len.saturating_sub(1) / 2);
+        let seasonal_dim = (1 + 2 * k).clamp(1, len);
+        let make = |is_trend: bool, basis_dim: usize| NBeatsBasisBlock {
+            fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc3: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc4: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            theta_b: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            theta_f: nn::LinearConfig::new(self.hidden_dim, basis_dim)
+                .with_bias(false)
+                .init(device),
+            is_trend,
+            basis_dim,
+            signal_len: len,
+        };
+        let mut blocks = Vec::with_capacity(self.n_blocks * 2);
+        for _ in 0..self.n_blocks {
+            blocks.push(make(true, trend_dim));
+        }
+        for _ in 0..self.n_blocks {
+            blocks.push(make(false, seasonal_dim));
+        }
+        BurnNBeatsx {
+            input_norm: nn::LayerNormConfig::new(self.input_dim).init(device),
+            blocks,
+            exogenous_gate: nn::LinearConfig::new(self.input_dim, self.input_dim).init(device),
+            output: nn::LinearConfig::new(len, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnNBeatsx<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let normalized = self.input_norm.forward(x);
+        // Exogenous gate (learned from the input) modulates how much each
+        // feature's backcast is consumed at each block — the N-BEATSx routing.
+        let gate =
+            burn::tensor::activation::sigmoid(self.exogenous_gate.forward(normalized.clone()));
+        let mut residual = normalized;
+        let mut forecast = Tensor::zeros(residual.dims(), &residual.device());
+        for block in &self.blocks {
+            let (backcast, fore) = block.forward(residual.clone());
+            residual = residual - backcast * gate.clone();
+            forecast = forecast + fore;
+        }
+        self.output.forward(forecast)
+    }
+}
+
+// ============================================================================
+// BURN TiDE — faithful dense-residual MLP encoder-decoder (Das et al. 2023,
+// "Long-term Forecasting with TiDE", TMLR), applied as a per-row 3-class head
+// over FLAT features. Canonical pieces realized here: two-dense residual
+// blocks w/ LayerNorm+dropout, input feature projection, dense encoder
+// (enc1/enc2), dense decoder (dec1/dec2), and the global LINEAR residual
+// (raw_skip → head). The paper's temporal decoder + multi-horizon decode are
+// N/A: this pipeline has no lookback/horizon axis (input is [batch, features],
+// output is 3 classes), so manufacturing one would be meaningless.
+// ============================================================================
+
+/// Canonical TiDE residual block (Das, Kong, Sen, Zhou — "Long-term
+/// Forecasting with TiDE", TMLR 2023): two dense layers
+/// (`fc1 → ReLU → Dropout → fc2`) plus a **linear-projection skip**, followed
+/// by LayerNorm. The previous implementation had a single dense layer and an
+/// identity skip — a simplification of the paper's block. The second dense
+/// layer and the projected skip are the real faithfulness fix (the skip is
+/// square here since every block is `hidden → hidden`, but the projection is
+/// the canonical form and lets the block also serve as a feature projection).
+#[derive(Module, Debug)]
+pub struct ResidualBlock<B: Backend> {
+    fc1: nn::Linear<B>,
+    fc2: nn::Linear<B>,
+    skip: nn::Linear<B>,
+    norm: nn::LayerNorm<B>,
+    dropout: nn::Dropout,
+}
+
+impl<B: Backend> ResidualBlock<B> {
+    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let h = burn::tensor::activation::relu(self.fc1.forward(x.clone()));
+        let h = self.dropout.forward(self.fc2.forward(h));
+        self.norm.forward(self.skip.forward(x) + h)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct BurnTiDE<B: Backend> {
+    feature_proj: nn::Linear<B>,
+    enc1: ResidualBlock<B>,
+    enc2: ResidualBlock<B>,
+    temporal_link: nn::Linear<B>,
+    dec1: ResidualBlock<B>,
+    dec2: ResidualBlock<B>,
+    output: nn::Linear<B>,
+    raw_skip: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTiDEConfig {
+    pub input_dim: usize,
+    #[config(default = 128)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.1)]
+    pub dropout: f64,
+}
+
+impl BurnTiDEConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTiDE<B> {
+        let mk_res = || ResidualBlock {
+            fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            skip: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
+            dropout: nn::DropoutConfig::new(self.dropout).init(),
+        };
+        BurnTiDE {
+            feature_proj: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            enc1: mk_res(),
+            enc2: mk_res(),
+            temporal_link: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            dec1: mk_res(),
+            dec2: mk_res(),
+            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            raw_skip: nn::LinearConfig::new(self.input_dim, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnTiDE<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let skip = self.raw_skip.forward(x.clone());
+        let h = self.feature_proj.forward(x);
+        let h = self.enc1.forward(h);
+        let h = self.enc2.forward(h);
+        let h = self.temporal_link.forward(h);
+        let h = self.dec1.forward(h);
+        let h = self.dec2.forward(h);
+        self.output.forward(h) + skip
+    }
+}
+
+// ============================================================================
+// BURN TiDE-NF — the TiDE dense-residual backbone PLUS a learned context/
+// seasonal/horizon GATE (a neoethos variant, analogous to N-BEATSx's
+// exogenous gate). This is NOT a published "TiDE-NF" algorithm — it is
+// TiDE-flavoured + gating. It inherits the canonical two-dense ResidualBlock
+// fix for free via the shared `mk_res`.
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct BurnTiDENf<B: Backend> {
+    feature_proj: nn::Linear<B>,
+    seasonal_proj: nn::Linear<B>,
+    context_gate: nn::Linear<B>,
+    enc1: ResidualBlock<B>,
+    enc2: ResidualBlock<B>,
+    temporal_link: nn::Linear<B>,
+    horizon_gate: nn::Linear<B>,
+    dec1: ResidualBlock<B>,
+    dec2: ResidualBlock<B>,
+    output_norm: nn::LayerNorm<B>,
+    output: nn::Linear<B>,
+    raw_skip: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTiDENfConfig {
+    pub input_dim: usize,
+    #[config(default = 160)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.05)]
+    pub dropout: f64,
+}
+
+impl BurnTiDENfConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTiDENf<B> {
+        let mk_res = || ResidualBlock {
+            fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            skip: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
+            dropout: nn::DropoutConfig::new(self.dropout).init(),
+        };
+
+        BurnTiDENf {
+            feature_proj: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            seasonal_proj: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            context_gate: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            enc1: mk_res(),
+            enc2: mk_res(),
+            temporal_link: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            horizon_gate: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            dec1: mk_res(),
+            dec2: mk_res(),
+            output_norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
+            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            raw_skip: nn::LinearConfig::new(self.input_dim, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnTiDENf<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let skip = self.raw_skip.forward(x.clone());
+        let base = self.feature_proj.forward(x.clone());
+        let seasonal = burn::tensor::activation::gelu(self.seasonal_proj.forward(x.clone()));
+        let gate = burn::tensor::activation::sigmoid(self.context_gate.forward(x));
+
+        let h = self.enc1.forward(base * gate + seasonal.clone());
+        let h = self.enc2.forward(h);
+        let h = self.temporal_link.forward(h);
+        let horizon =
+            burn::tensor::activation::sigmoid(self.horizon_gate.forward(seasonal.clone()));
+        let h = self.dec1.forward(h * horizon + seasonal.clone());
+        let h = self.dec2.forward(h);
+        let h = self.output_norm.forward(h + seasonal);
+        self.output.forward(h) + skip
+    }
+}
+
+// ============================================================================
+// BURN TabNet — attentive feature selection with GLU decision steps
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct BurnTabNet<B: Backend> {
+    initial_norm: nn::LayerNorm<B>,
+    feat_fc1: nn::Linear<B>,
+    feat_fc2: nn::Linear<B>,
+    attn_fc: nn::Linear<B>,
+    attn_norm: nn::LayerNorm<B>,
+    output: nn::Linear<B>,
+    n_steps: usize,
+    hidden_dim: usize,
+    input_dim: usize,
+    relaxation_factor: f32,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTabNetConfig {
+    pub input_dim: usize,
+    #[config(default = 64)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_steps: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 1.5)]
+    pub relaxation_factor: f64,
+}
+
+impl BurnTabNetConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTabNet<B> {
+        BurnTabNet {
+            initial_norm: nn::LayerNormConfig::new(self.input_dim).init(device),
+            feat_fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim * 2).init(device),
+            feat_fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim * 2).init(device),
+            attn_fc: nn::LinearConfig::new(self.hidden_dim, self.input_dim)
+                .with_bias(false)
+                .init(device),
+            attn_norm: nn::LayerNormConfig::new(self.input_dim).init(device),
+            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            n_steps: self.n_steps,
+            hidden_dim: self.hidden_dim,
+            input_dim: self.input_dim,
+            relaxation_factor: self.relaxation_factor as f32,
+        }
+    }
+}
+
+/// GLU: split last dim in half, sigmoid-gate one half
+fn glu<B: Backend>(x: Tensor<B, 2>, half: usize) -> Tensor<B, 2> {
+    let a = x.clone().slice([0..x.dims()[0], 0..half]);
+    let b = x.clone().slice([0..x.dims()[0], half..(half * 2)]);
+    a * burn::tensor::activation::sigmoid(b)
+}
+
+/// sparsemax (Martins & Astudillo 2016) over the last dim of a `[batch, dim]`
+/// tensor: a sparse softmax alternative that yields EXACT zeros. For each row z,
+/// returns max(z - tau, 0) where tau is the threshold making the row sum to 1.
+/// This is TabNet's defining feature-selection activation — the previous code
+/// used plain softmax (never sparse).
+fn sparsemax<B: Backend>(z: Tensor<B, 2>) -> Tensor<B, 2> {
+    let d = z.dims()[1];
+    let z_sorted = z.clone().sort_descending(1);
+    let z_cumsum = z_sorted.clone().cumsum(1);
+    // k = [1, 2, ..., d], broadcast over the batch.
+    let k = Tensor::<B, 1, Int>::arange(1..(d as i64 + 1), &z.device())
+        .float()
+        .reshape([1, d]);
+    // support indicator: 1 + k*z_sorted[k] > cumsum[k] (true for the top k_z; monotone on sorted z).
+    let support = (z_sorted.clone() * k + 1.0 - z_cumsum)
+        .greater_elem(0.0)
+        .float();
+    let k_z = support.clone().sum_dim(1); // [batch, 1] — size of the support (>= 1)
+    let top_sum = (z_sorted * support).sum_dim(1); // sum of the top-k_z sorted values
+    let tau = (top_sum - 1.0) / k_z; // [batch, 1]
+    burn::tensor::activation::relu(z - tau)
+}
+
+impl<B: Backend> BurnTabNet<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let batch = x.dims()[0];
+        let x_norm = self.initial_norm.forward(x.clone());
+        let mut prior: Tensor<B, 2> = Tensor::ones([batch, self.input_dim], &x.device());
+        let mut out_accum: Tensor<B, 2> = Tensor::zeros([batch, self.hidden_dim], &x.device());
+
+        for _ in 0..self.n_steps {
+            // Feature transform with GLU
+            let feat = glu(self.feat_fc1.forward(x_norm.clone()), self.hidden_dim);
+            let feat = glu(self.feat_fc2.forward(feat), self.hidden_dim);
+
+            // Attention mask
+            let attn = self.attn_fc.forward(feat.clone());
+            let attn = self.attn_norm.forward(attn * prior.clone());
+            // sparsemax → enforces SPARSE feature selection (exact zeros), the
+            // defining TabNet property the previous softmax lacked.
+            let mask = sparsemax(attn);
+
+            // TabNet prior update P_i = P_{i-1} * (gamma - M_i). gamma>1 and the
+            // sparsemax mask is in [0,1] so the factor is always positive. The
+            // previous code clamped it to [0,1], capping the >1 growth that makes
+            // successive steps attend DIFFERENT features (cross-step diversity).
+            let prior_decay =
+                Tensor::<B, 2>::ones_like(&mask) * self.relaxation_factor - mask.clone();
+            prior = prior * prior_decay;
+
+            // Masked feature → transform → accumulate
+            let masked = x_norm.clone() * mask;
+            let step_out = glu(self.feat_fc1.forward(masked), self.hidden_dim);
+            let step_out = burn::tensor::activation::relu(glu(
+                self.feat_fc2.forward(step_out),
+                self.hidden_dim,
+            ));
+            out_accum = out_accum + step_out;
+        }
+
+        self.output.forward(out_accum)
+    }
+}
+
+// ============================================================================
+// BURN KAN — Kolmogorov-Arnold style edge functions using grid/RBF bases
+// ============================================================================
+
+const KAN_GRID_MIN: f32 = -3.0;
+const KAN_GRID_MAX: f32 = 3.0;
+
+/// B-spline basis via the Cox–de Boor recursion (PyKAN / efficient-kan) — the
+/// REAL KAN edge basis (the previous code used a FIXED, non-learnable Gaussian
+/// RBF, which is not a KAN at all). `x: [batch, in_f] -> [batch, in_f, grid_size
+/// + spline_order]`. Uniform knots over `[grid_min, grid_max]`; the per-step
+/// denominators are the constant knot spacing `p*h`, so no division guards needed.
+fn b_spline_basis<B: Backend>(
+    x: Tensor<B, 2>,
+    grid_min: f32,
+    grid_max: f32,
+    grid_size: usize,
+    spline_order: usize,
+) -> Tensor<B, 3> {
+    let [batch, in_f] = x.dims();
+    let dev = x.device();
+    let h = (grid_max - grid_min) / grid_size.max(1) as f32;
+    let n_knots = grid_size + 2 * spline_order + 1;
+    let knots: Vec<f32> = (0..n_knots)
+        .map(|t| (t as f32 - spline_order as f32) * h + grid_min)
+        .collect();
+    let m = n_knots - 1; // number of order-0 intervals
+    let g =
+        Tensor::<B, 1>::from_data(TensorData::new(knots, [n_knots]), &dev).reshape([1, 1, n_knots]);
+    let xc = x.clamp(grid_min, grid_max).unsqueeze_dim::<3>(2); // [batch, in_f, 1]
+    let left = g.clone().slice([0..1, 0..1, 0..m]);
+    let right = g.clone().slice([0..1, 0..1, 1..m + 1]);
+    // order-0 indicator: (x >= grid[t]) AND (x < grid[t+1]); product == logical-and.
+    let mut bases = xc.clone().greater_equal(left).float() * xc.clone().lower(right).float(); // [batch,in_f,m]
+    let mut width = m;
+    for p in 1..=spline_order {
+        width -= 1; // basis width shrinks by one each recursion step
+        let denom = (p as f32 * h).max(1e-6);
+        let gt = g.clone().slice([0..1, 0..1, 0..width]); // grid[t]
+        let gtp1 = g.clone().slice([0..1, 0..1, p + 1..p + 1 + width]); // grid[t+p+1]
+        let b_lo = bases.clone().slice([0..batch, 0..in_f, 0..width]); // B_{p-1}[t]
+        let b_hi = bases.clone().slice([0..batch, 0..in_f, 1..1 + width]); // B_{p-1}[t+1]
+        bases = (xc.clone() - gt) / denom * b_lo + (gtp1 - xc.clone()) / denom * b_hi;
+    }
+    bases // [batch, in_f, grid_size + spline_order]
+}
+
+/// A real KAN layer: every edge (i -> j) is a LEARNABLE univariate function
+/// `phi_ij(x_i) = sum_t spline_weight[j,i,t] * B_t(x_i)` plus a SiLU residual
+/// base path. Node `j = sum_i phi_ij(x_i) + base_j`. The learnable splines ARE
+/// the nonlinearity (no GELU/ReLU on top).
+#[derive(Module, Debug)]
+pub struct KANLayer<B: Backend> {
+    base_weight: Param<Tensor<B, 2>>, // [out_f, in_f] — SiLU residual path
+    spline_weight: Param<Tensor<B, 3>>, // [out_f, in_f, grid_size + spline_order]
+    norm: nn::LayerNorm<B>,
+    dropout: nn::Dropout,
+    in_f: usize,
+    out_f: usize,
+    grid_size: usize,
+    spline_order: usize,
+}
+
+impl<B: Backend> KANLayer<B> {
+    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let batch = x.dims()[0];
+        let coeffs = self.grid_size + self.spline_order;
+        // residual base path b(x) = silu(x), projected by the per-edge base weights.
+        let base = burn::tensor::activation::silu(x.clone())
+            .matmul(self.base_weight.val().swap_dims(0, 1)); // [batch, out_f]
+        // spline path: flatten (in_f, coeffs) and contract with the per-edge coeffs.
+        let bsp = b_spline_basis::<B>(
+            x,
+            KAN_GRID_MIN,
+            KAN_GRID_MAX,
+            self.grid_size,
+            self.spline_order,
+        )
+        .reshape([batch, self.in_f * coeffs]);
+        let w = self
+            .spline_weight
+            .val()
+            .reshape([self.out_f, self.in_f * coeffs]);
+        let spline = bsp.matmul(w.swap_dims(0, 1)); // [batch, out_f]
+        // LayerNorm + dropout for stability/regularisation only (NOT a nonlinearity).
+        self.dropout.forward(self.norm.forward(base + spline))
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct BurnKAN<B: Backend> {
+    layers: Vec<KANLayer<B>>,
+    output: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnKANConfig {
+    pub input_dim: usize,
+    #[config(default = 32)]
+    pub hidden_dim: usize,
+    #[config(default = 3)]
+    pub n_layers: usize,
+    /// Number of grid intervals G (spline coefficients per edge = G + spline_order).
+    #[config(default = 9)]
+    pub grid_size: usize,
+    /// B-spline order k (3 = cubic).
+    #[config(default = 3)]
+    pub spline_order: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.05)]
+    pub dropout: f64,
+}
+
+impl BurnKANConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnKAN<B> {
+        let hidden_dim = self.hidden_dim.max(4);
+        let n_layers = self.n_layers.max(1);
+        let grid_size = self.grid_size.clamp(3, 33);
+        let spline_order = self.spline_order.clamp(1, 5);
+        let coeffs = grid_size + spline_order;
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut dim = self.input_dim.max(1);
+        for _ in 0..n_layers {
+            // base_weight: Kaiming-style N(0, 1/sqrt(in_f)); spline_weight: small noise
+            // N(0, 0.1/coeffs) so the splines start near-flat (efficient-kan init).
+            let base_weight = Param::from_tensor(Tensor::<B, 2>::random(
+                [hidden_dim, dim],
+                burn::tensor::Distribution::Normal(0.0, (1.0 / dim as f64).sqrt()),
+                device,
+            ));
+            let spline_weight = Param::from_tensor(Tensor::<B, 3>::random(
+                [hidden_dim, dim, coeffs],
+                burn::tensor::Distribution::Normal(0.0, 0.1 / coeffs as f64),
+                device,
+            ));
+            layers.push(KANLayer {
+                base_weight,
+                spline_weight,
+                norm: nn::LayerNormConfig::new(hidden_dim).init(device),
+                dropout: nn::DropoutConfig::new(self.dropout).init(),
+                in_f: dim,
+                out_f: hidden_dim,
+                grid_size,
+                spline_order,
+            });
+            dim = hidden_dim;
+        }
+        BurnKAN {
+            layers,
+            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
+        }
+    }
+}
+
+impl<B: Backend> BurnKAN<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let mut h = x;
+        for layer in &self.layers {
+            h = layer.forward(h);
+        }
+        self.output.forward(h)
+    }
+}
+
+// ============================================================================
+// BURN TRANSFORMER — feature-token transformer for tabular time-series features
+// ============================================================================
+
+/// Sinusoidal positional encoding (Vaswani 2017), kept as a LEARNABLE `Param`
+/// initialised to the canonical sin/cos pattern. Self-attention is otherwise
+/// permutation-invariant, so without this the feature-token / patch ORDER is
+/// invisible to the model (the previous defect). `[seq, dim]`, broadcast over batch.
+fn sinusoidal_pos_encoding<B: Backend>(
+    seq: usize,
+    dim: usize,
+    device: &B::Device,
+) -> Param<Tensor<B, 2>> {
+    let mut data = vec![0.0f32; seq * dim];
+    for pos in 0..seq {
+        for i in 0..dim {
+            let denom = 10000.0f32.powf((2 * (i / 2)) as f32 / dim as f32);
+            let angle = pos as f32 / denom;
+            data[pos * dim + i] = if i % 2 == 0 { angle.sin() } else { angle.cos() };
+        }
+    }
+    Param::from_tensor(Tensor::<B, 2>::from_data(
+        TensorData::new(data, [seq, dim]),
+        device,
+    ))
+}
+
+#[derive(Module, Debug)]
+pub struct BurnTransformer<B: Backend> {
+    token_proj: nn::Linear<B>,
+    /// Learnable positional encoding `[token_count, hidden_dim]` (sinusoidal init).
+    pos_encoding: Param<Tensor<B, 2>>,
+    encoder: Vec<SequenceTransformerBlock<B>>,
+    final_norm: nn::LayerNorm<B>,
+    output: nn::Linear<B>,
+    token_size: usize,
+    token_count: usize,
+    input_dim: usize,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTransformerConfig {
+    pub input_dim: usize,
+    #[config(default = 128)]
+    pub hidden_dim: usize,
+    #[config(default = 8)]
+    pub n_heads: usize,
+    #[config(default = 4)]
+    pub n_layers: usize,
+    #[config(default = 8)]
+    pub token_count: usize,
+    #[config(default = 512)]
+    pub dim_ff: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.1)]
+    pub dropout: f64,
+}
+
+impl BurnTransformerConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTransformer<B> {
+        let hidden_dim = self.hidden_dim.max(16);
+        let token_count = self.token_count.max(1).min(self.input_dim.max(1));
+        let token_size = self.input_dim.div_ceil(token_count);
+        let requested_heads = self.n_heads.max(1);
+        let compatible_heads = (1..=requested_heads)
+            .rev()
+            .find(|candidate| hidden_dim.is_multiple_of(*candidate))
+            .unwrap_or(1);
+        let ff_dim = self.dim_ff.max(hidden_dim);
+        let encoder = (0..self.n_layers)
+            .map(|_| SequenceTransformerBlock {
+                q_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                k_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                v_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                out_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                ff1: nn::LinearConfig::new(hidden_dim, ff_dim).init(device),
+                ff2: nn::LinearConfig::new(ff_dim, hidden_dim).init(device),
+                norm1: nn::LayerNormConfig::new(hidden_dim).init(device),
+                norm2: nn::LayerNormConfig::new(hidden_dim).init(device),
+                dropout: nn::DropoutConfig::new(self.dropout).init(),
+                n_heads: compatible_heads,
+            })
+            .collect();
+        BurnTransformer {
+            token_proj: nn::LinearConfig::new(token_size, hidden_dim).init(device),
+            pos_encoding: sinusoidal_pos_encoding::<B>(token_count, hidden_dim, device),
+            encoder,
+            final_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
+            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
+            token_size,
+            token_count,
+            input_dim: self.input_dim,
+        }
+    }
+}
+
+impl<B: Backend> BurnTransformer<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let batch = x.dims()[0];
+        let mut tokens = Vec::with_capacity(self.token_count);
+        for token_idx in 0..self.token_count {
+            let start = token_idx * self.token_size;
+            let end = ((token_idx + 1) * self.token_size).min(self.input_dim);
+            let mut token = x.clone().slice([0..batch, start..end]);
+            let observed = end.saturating_sub(start);
+            if observed < self.token_size {
+                let padding =
+                    Tensor::<B, 2>::zeros([batch, self.token_size - observed], &x.device());
+                token = Tensor::cat(vec![token, padding], 1);
+            }
+            tokens.push(
+                burn::tensor::activation::gelu(self.token_proj.forward(token))
+                    .unsqueeze_dim::<3>(1),
+            );
+        }
+
+        let mut h = Tensor::cat(tokens, 1);
+        // Inject token-order info before the permutation-invariant attention stack.
+        h = h + self.pos_encoding.val().unsqueeze_dim::<3>(0);
+        for block in &self.encoder {
+            h = block.forward(h);
+        }
+        let pooled = h.mean_dim(1).squeeze_dim::<2>(1);
+        let pooled = self.final_norm.forward(pooled);
+        self.output.forward(pooled)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct SequenceTransformerBlock<B: Backend> {
+    q_proj: nn::Linear<B>,
+    k_proj: nn::Linear<B>,
+    v_proj: nn::Linear<B>,
+    out_proj: nn::Linear<B>,
+    ff1: nn::Linear<B>,
+    ff2: nn::Linear<B>,
+    norm1: nn::LayerNorm<B>,
+    norm2: nn::LayerNorm<B>,
+    dropout: nn::Dropout,
+    n_heads: usize,
+}
+
+impl<B: Backend> SequenceTransformerBlock<B> {
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq_len, d_model] = x.dims();
+        let n_heads = self.n_heads.max(1);
+        let head_dim = d_model / n_heads;
+        let flat_rows = batch * seq_len;
+        let flat = x.clone().reshape([flat_rows, d_model]);
+
+        let q = self
+            .q_proj
+            .forward(flat.clone())
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
+        let k = self
+            .k_proj
+            .forward(flat.clone())
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
+        let v = self
+            .v_proj
+            .forward(flat)
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
+
+        let scale = (head_dim as f32).sqrt();
+        let scores = q.matmul(k.swap_dims(2, 3)) / scale;
+        let attn = burn::tensor::activation::softmax(scores, 3);
+        let attn_flat = attn.matmul(v).swap_dims(1, 2).reshape([flat_rows, d_model]);
+        let attn_proj = self.dropout.forward(self.out_proj.forward(attn_flat));
+        let h = self
+            .norm1
+            .forward(
+                (x + attn_proj.reshape([batch, seq_len, d_model])).reshape([flat_rows, d_model]),
+            )
+            .reshape([batch, seq_len, d_model]);
+
+        let h_flat = h.clone().reshape([flat_rows, d_model]);
+        let ff = self.ff2.forward(
+            self.dropout
+                .forward(burn::tensor::activation::gelu(self.ff1.forward(h_flat))),
+        );
+        self.norm2
+            .forward(
+                (h + self.dropout.forward(ff).reshape([batch, seq_len, d_model]))
+                    .reshape([flat_rows, d_model]),
+            )
+            .reshape([batch, seq_len, d_model])
+    }
+}
+
+// ============================================================================
+// BURN PatchTST — dedicated patch-based transformer for tabular sequences
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct BurnPatchTST<B: Backend> {
+    patch_proj: nn::Linear<B>,
+    /// Learnable per-patch positional encoding `[patch_count, hidden_dim]` (PatchTST).
+    pos_encoding: Param<Tensor<B, 2>>,
+    patch_encoder: Vec<SequenceTransformerBlock<B>>,
+    merge_proj: nn::Linear<B>,
+    skip_proj: nn::Linear<B>,
+    head_norm: nn::LayerNorm<B>,
+    output: nn::Linear<B>,
+    patch_size: usize,
+    patch_count: usize,
+    hidden_dim: usize,
+    input_dim: usize,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnPatchTSTConfig {
+    pub input_dim: usize,
+    #[config(default = 192)]
+    pub hidden_dim: usize,
+    #[config(default = 8)]
+    pub patch_size: usize,
+    #[config(default = 6)]
+    pub n_heads: usize,
+    #[config(default = 3)]
+    pub n_layers: usize,
+    #[config(default = 384)]
+    pub dim_ff: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.1)]
+    pub dropout: f64,
+}
+
+impl BurnPatchTSTConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnPatchTST<B> {
+        let patch_size = self.patch_size.max(1);
+        let patch_count = self.input_dim.div_ceil(patch_size);
+        let hidden_dim = self.hidden_dim.max(16);
+        let requested_heads = self.n_heads.max(1);
+        let compatible_heads = (1..=requested_heads)
+            .rev()
+            .find(|candidate| hidden_dim.is_multiple_of(*candidate))
+            .unwrap_or(1);
+        let ff_dim = self.dim_ff.max(hidden_dim);
+        let patch_encoder = (0..self.n_layers.max(1))
+            .map(|_| SequenceTransformerBlock {
+                q_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                k_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                v_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                out_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                ff1: nn::LinearConfig::new(hidden_dim, ff_dim).init(device),
+                ff2: nn::LinearConfig::new(ff_dim, hidden_dim).init(device),
+                norm1: nn::LayerNormConfig::new(hidden_dim).init(device),
+                norm2: nn::LayerNormConfig::new(hidden_dim).init(device),
+                dropout: nn::DropoutConfig::new(self.dropout).init(),
+                n_heads: compatible_heads,
+            })
+            .collect();
+
+        BurnPatchTST {
+            patch_proj: nn::LinearConfig::new(patch_size, hidden_dim).init(device),
+            pos_encoding: sinusoidal_pos_encoding::<B>(patch_count, hidden_dim, device),
+            patch_encoder,
+            merge_proj: nn::LinearConfig::new(hidden_dim * patch_count, hidden_dim).init(device),
+            skip_proj: nn::LinearConfig::new(self.input_dim, hidden_dim).init(device),
+            head_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
+            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
+            patch_size,
+            patch_count,
+            hidden_dim,
+            input_dim: self.input_dim,
+        }
+    }
+}
+
+impl<B: Backend> BurnPatchTST<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let batch = x.dims()[0];
+        let mut tokens = Vec::with_capacity(self.patch_count);
+
+        for patch_idx in 0..self.patch_count {
+            let start = patch_idx * self.patch_size;
+            let end = ((patch_idx + 1) * self.patch_size).min(self.input_dim);
+            let mut patch = x.clone().slice([0..batch, start..end]);
+            let observed = end.saturating_sub(start);
+            if observed < self.patch_size {
+                let padding =
+                    Tensor::<B, 2>::zeros([batch, self.patch_size - observed], &x.device());
+                patch = Tensor::cat(vec![patch, padding], 1);
+            }
+
+            let token = burn::tensor::activation::gelu(self.patch_proj.forward(patch));
+            tokens.push(token.unsqueeze_dim::<3>(1));
+        }
+
+        let mut sequence = Tensor::cat(tokens, 1);
+        sequence = sequence + self.pos_encoding.val().unsqueeze_dim::<3>(0);
+        for block in &self.patch_encoder {
+            sequence = block.forward(sequence);
+        }
+        let merged = sequence.reshape([batch, self.patch_count * self.hidden_dim]);
+        let fused = burn::tensor::activation::gelu(
+            self.merge_proj.forward(merged) + self.skip_proj.forward(x),
+        );
+        let fused = self.head_norm.forward(fused);
+        self.output.forward(fused)
+    }
+}
+
+// ============================================================================
+// BURN TimesNet — dedicated multi-period mixer
+// ============================================================================
+
+/// Real DFT period detection (TimesNet `FFT_for_Period`). Returns the top-k
+/// dominant PERIODS (round(L/f), DC excluded) of a length-L signal plus their
+/// amplitudes (the aggregation weights). Plain O(L²) Rust — L is the small
+/// feature count and this runs OFF the autograd graph (burn 0.21 `rfft` is not
+/// autodiff-able: `todo!()`), exactly as in real TimesNet where period selection
+/// is discrete/non-differentiable.
+fn fft_top_periods(signal: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
+    let l = signal.len();
+    if l < 2 || k == 0 {
+        return (vec![l.max(1)], vec![1.0]);
+    }
+    let half = (l / 2).max(1);
+    let mut spectrum: Vec<(usize, f32)> = (1..=half)
+        .map(|f| {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (t, &v) in signal.iter().enumerate() {
+                let ang = -2.0 * std::f32::consts::PI * f as f32 * t as f32 / l as f32;
+                re += v * ang.cos();
+                im += v * ang.sin();
+            }
+            (f, (re * re + im * im).sqrt())
+        })
+        .collect();
+    spectrum.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut periods = Vec::with_capacity(k);
+    let mut amps = Vec::with_capacity(k);
+    for &(f, amp) in spectrum.iter().take(k) {
+        periods.push(((l as f32 / f as f32).round() as usize).clamp(1, l));
+        amps.push(amp);
+    }
+    if periods.is_empty() {
+        periods.push(l);
+        amps.push(1.0);
+    }
+    (periods, amps)
+}
+
+#[derive(Module, Debug)]
+pub struct BurnTimesNet<B: Backend> {
+    input_embed: nn::conv::Conv1d<B>, // lift scalar feature-series -> C channels
+    inception: Vec<nn::conv::Conv2d<B>>, // multi-kernel 2D inception (Same padding)
+    period_norm: nn::LayerNorm<B>,
+    out_head: nn::Linear<B>,
+    n_periods: usize,
+    channels: usize,
+    input_dim: usize,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTimesNetConfig {
+    pub input_dim: usize,
+    #[config(default = 192)]
+    pub hidden_dim: usize, // kept for config compat (unused by the real TimesBlock)
+    #[config(default = 4)]
+    pub n_periods: usize,
+    /// Embedding channels C for the 2D inter/intra-period convolution.
+    #[config(default = 16)]
+    pub channels: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.05)]
+    pub dropout: f64,
+}
+
+impl BurnTimesNetConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTimesNet<B> {
+        let channels = self.channels.max(4);
+        let n_periods = self.n_periods.max(2);
+        let input_embed = nn::conv::Conv1dConfig::new(1, channels, 1).init(device);
+        let inception = [1usize, 3, 5]
+            .iter()
+            .map(|&ks| {
+                nn::conv::Conv2dConfig::new([channels, channels], [ks, ks])
+                    .with_padding(nn::PaddingConfig2d::Same)
+                    .init(device)
+            })
+            .collect();
+        BurnTimesNet {
+            input_embed,
+            inception,
+            period_norm: nn::LayerNormConfig::new(channels).init(device),
+            out_head: nn::LinearConfig::new(channels, self.n_classes).init(device),
+            n_periods,
+            channels,
+            input_dim: self.input_dim,
+        }
+    }
+}
+
+impl<B: Backend> BurnTimesNet<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let [batch, l] = x.dims();
+        // Channel embedding: [B, L] -> [B, 1, L] -> Conv1d -> [B, C, L].
+        let emb = self.input_embed.forward(x.clone().reshape([batch, 1, l]));
+
+        // --- Period detection OFF the autograd graph (host DFT on the mean signal) ---
+        let mean_signal: Vec<f32> = x
+            .clone()
+            .mean_dim(0)
+            .reshape([l])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap_or_else(|_| vec![0.0; l]);
+        let (periods, amps) = fft_top_periods(&mean_signal, self.n_periods);
+        // Amplitude softmax -> aggregation weights (host constants).
+        let max_a = amps.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = amps.iter().map(|a| (a - max_a).exp()).collect();
+        let sum_e: f32 = exps.iter().sum::<f32>().max(1e-9);
+        let weights: Vec<f32> = exps.iter().map(|e| e / sum_e).collect();
+
+        // --- Per-period 1D->2D inception path (DIFFERENTIABLE) ---
+        let mut agg: Tensor<B, 3> = Tensor::zeros([batch, self.channels, l], &emb.device());
+        for (p, w) in periods.iter().zip(weights.iter()) {
+            let p = (*p).clamp(1, l);
+            let rows = l.div_ceil(p);
+            let l_pad = rows * p;
+            let padded = if l_pad > l {
+                Tensor::cat(
+                    vec![
+                        emb.clone(),
+                        Tensor::zeros([batch, self.channels, l_pad - l], &emb.device()),
+                    ],
+                    2,
+                )
+            } else {
+                emb.clone()
+            };
+            let img = padded.reshape([batch, self.channels, rows, p]); // [B,C,rows,p]
+            let mut acc = Tensor::zeros([batch, self.channels, rows, p], &img.device());
+            for conv in &self.inception {
+                acc = acc + conv.forward(img.clone());
+            }
+            let out2d = burn::tensor::activation::gelu(acc);
+            let back = out2d.reshape([batch, self.channels, l_pad]).narrow(2, 0, l);
+            agg = agg + back.mul_scalar(*w);
+        }
+        let agg = agg + emb; // residual (one TimesBlock)
+
+        // Head: global average pool over L -> [B, C] -> LayerNorm -> classes.
+        let pooled = self
+            .period_norm
+            .forward(agg.mean_dim(2).reshape([batch, self.channels]));
+        self.out_head.forward(pooled)
+    }
+}
+
+// ============================================================================
+// BURN EXPERT TRAIT — uniform interface for all models
+// ============================================================================
+
+/// Trait for all Burn models providing a consistent forward pass.
+pub trait BurnForward<B: Backend> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2>;
+}
+
+impl<B: Backend> BurnForward<B> for BurnMLP<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnNBeats<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnNBeatsx<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnTiDE<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnTiDENf<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnTabNet<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnKAN<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnTransformer<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnPatchTST<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+impl<B: Backend> BurnForward<B> for BurnTimesNet<B> {
+    fn forward_pass(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(x)
+    }
+}
+
+// ============================================================================
+// TRAINING CONFIGURATION
+// ============================================================================
+
+/// Training configuration matching legacy deep.py defaults.
+pub struct TrainConfig {
+    pub lr: f64,
+    pub batch_size: usize,
+    pub max_epochs: usize,
+    pub patience: usize,
+    pub n_classes: usize,
+    pub seed: u64,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1e-3,
+            batch_size: 64,
+            max_epochs: 100,
+            patience: 8,
+            n_classes: 3,
+            seed: 42,
+        }
+    }
+}
+
+/// Training report returned by the richer Burn runtime helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurnTrainingReport {
+    pub dataset_rows: usize,
+    pub train_rows: usize,
+    pub val_rows: usize,
+    pub embargo_rows: usize,
+    pub class_weights: Vec<f32>,
+    pub best_loss: f32,
+    pub best_epoch: Option<usize>,
+    pub epochs_ran: usize,
+    pub final_train_loss: f32,
+    pub learning_rate: f64,
+    pub batch_size: usize,
+    pub patience: usize,
+    pub seed: u64,
+    pub requested_device_policy: String,
+    pub effective_device_policy: String,
+    pub execution_backend: String,
+    pub training_precision: String,
+    pub training_precision_reason: Option<String>,
+}
+
+impl BurnTrainingReport {
+    pub fn best_observed_loss(&self) -> f32 {
+        self.best_loss
+    }
+}
+
+fn validate_train_config(config: &TrainConfig) -> anyhow::Result<()> {
+    if !config.lr.is_finite() || config.lr <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "Burn training learning rate must be finite and positive"
+        ));
+    }
+    if config.batch_size == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training batch_size must be greater than zero"
+        ));
+    }
+    if config.max_epochs == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training max_epochs must be greater than zero"
+        ));
+    }
+    if config.patience == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training patience must be greater than zero"
+        ));
+    }
+    if config.n_classes < 2 {
+        return Err(anyhow::anyhow!(
+            "Burn training requires at least two classes"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurnExecutionPrecision {
+    Fp32,
+    Bf16,
+}
+
+impl BurnExecutionPrecision {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    fn dtype(self) -> DType {
+        match self {
+            Self::Fp32 => DType::F32,
+            Self::Bf16 => DType::BF16,
+        }
+    }
+}
+
+fn requested_burn_training_precision(requested_precision: Option<&str>) -> String {
+    requested_precision
+        .map(normalize_training_precision_policy)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| requested_training_precision_policy())
+}
+
+fn resolve_burn_training_precision_for_backend<B: Backend>(
+    selection: &BurnDeviceSelection,
+    device: &B::Device,
+    requested_precision: Option<&str>,
+) -> (BurnExecutionPrecision, Option<String>) {
+    let requested = requested_burn_training_precision(requested_precision);
+
+    let gpu_requested = selection.effective_policy == "default"
+        || selection.effective_policy == "gpu"
+        || selection.effective_policy.starts_with("gpu:")
+        || matches!(
+            selection.execution_backend.as_str(),
+            "wgpu_default" | "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu"
+        );
+    let supports_bf16 = if gpu_requested {
+        let hardware = HardwareInfo::detect();
+        let accelerator_index = parse_accelerator_index(&selection.effective_policy).unwrap_or(0);
+        hardware.gpu_supports_bf16(accelerator_index) && B::supports_dtype(device, DType::BF16)
+    } else {
+        B::supports_dtype(device, DType::BF16)
+    };
+    // `FOREX_BURN_MODEL_SUPPORTS_BF16` (default true) used to AND into this.
+    // It was a capability assertion dressed as a knob: whether a model can run
+    // in bf16 is answered by `B::supports_dtype` and the card's own bf16
+    // support, both probed directly above. An env var that could only turn a
+    // supported dtype OFF, with no config field and no artifact record, is a
+    // second answer to a question the hardware already answers. Deleted
+    // 2026-08-10; reported at startup if still exported.
+    // Burn 0.21 can report BF16 tensor support on native CUDA while its full
+    // training graph is still not mixed-dtype safe.  On the production
+    // 1768-feature MLP, all forward/backward/AdamW batches complete, but
+    // releasing an older best-model snapshot after the third validation makes
+    // Burn Fusion reject a deferred BF16/F32 binary op with DTypeMismatch.
+    // Keep native CUDA training honestly on FP32 until that complete lifecycle,
+    // rather than the primitive dtype probe alone, is supported.
+    let native_cuda_training = matches!(
+        selection.execution_backend.as_str(),
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" | "external:cuda"
+    );
+    let bf16_supported = supports_bf16 && !native_cuda_training;
+
+    match requested.as_str() {
+        "bf16" if native_cuda_training => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "requested precision `bf16`; native Burn CUDA 0.21 BF16 optimizer/fusion graph is not production-safe across the complete model lifecycle; using `fp32`"
+                    .to_string(),
+            ),
+        ),
+        "auto" if native_cuda_training => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "auto precision selects `fp32` for native Burn CUDA 0.21 because its BF16 optimizer/fusion graph is not production-safe across the complete model lifecycle"
+                    .to_string(),
+            ),
+        ),
+        "bf16" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
+        "auto" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
+        "fp8" | "bf4" => {
+            let selected = if bf16_supported {
+                BurnExecutionPrecision::Bf16
+            } else {
+                BurnExecutionPrecision::Fp32
+            };
+            (
+                selected,
+                Some(format!(
+                    "requested precision `{requested}`; Burn runtime currently executes training tensors as fp32/bf16 only, using `{}`",
+                    selected.label()
+                )),
+            )
+        }
+        "bf16" => (
+            BurnExecutionPrecision::Fp32,
+            Some(format!(
+                "requested precision `{requested}` unsupported by the active Burn backend/device/model implementation; using `fp32`"
+            )),
+        ),
+        "auto" => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "auto precision fallback to fp32 for current Burn backend/device/model implementation"
+                    .to_string(),
+            ),
+        ),
+        _ => (BurnExecutionPrecision::Fp32, None),
+    }
+}
+
+// ============================================================================
+// CROSS-ENTROPY LOSS
+// ============================================================================
+
+/// Weighted cross-entropy loss matching legacy nn.CrossEntropyLoss(weight=...).
+fn cross_entropy_loss<B: Backend>(
+    logits: Tensor<B, 2>,
+    targets: Tensor<B, 1, Int>,
+    class_weights: &[f32],
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    let n_classes = class_weights.len();
+    let batch_size = logits.dims()[0];
+    let logits_dtype = logits.dtype();
+    let log_probs = burn::tensor::activation::log_softmax(logits, 1);
+    let one_hot = targets
+        .one_hot(n_classes)
+        .float()
+        .cast(float_dtype(logits_dtype));
+    // burn 0.21 migration: from_data_dtype → from_data + options tuple.
+    let weights = Tensor::<B, 1>::from_data(
+        TensorData::new(class_weights.to_vec(), [n_classes]),
+        (device, logits_dtype),
+    );
+    let weighted = log_probs * one_hot * weights.unsqueeze_dim(0);
+    weighted.sum().neg() / (batch_size as f32)
+}
+
+fn normalize_probability_rows(
+    mut probabilities: Vec<f32>,
+    rows: usize,
+    cols: usize,
+) -> Option<Vec<f32>> {
+    if rows == 0 || cols == 0 || probabilities.len() != rows.saturating_mul(cols) {
+        return None;
+    }
+
+    for row in probabilities.chunks_exact_mut(cols) {
+        let mut sum = 0.0_f32;
+        for value in row.iter_mut() {
+            if !value.is_finite() {
+                return None;
+            }
+            if *value < 0.0 {
+                return None;
+            }
+            sum += *value;
+        }
+        if sum > f32::EPSILON {
+            for value in row.iter_mut() {
+                *value /= sum;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    Some(probabilities)
+}
+
+fn validate_feature_matrix(x_data: &Array2<f32>, context: &str) -> anyhow::Result<()> {
+    if x_data.ncols() == 0 {
+        return Err(anyhow::anyhow!(
+            "{context} requires at least one feature column"
+        ));
+    }
+    if x_data.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow::anyhow!(
+            "{context} received non-finite feature values"
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// TRAINING LOOP — generic over all Burn models
+// Matches legacy deep.py: class weights, time-series split, early stopping
+// ============================================================================
+
+use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use rand::seq::SliceRandom;
+use rand::{SeedableRng, rngs::StdRng};
+
+/// Train any Burn model with production features.
+///
+/// Includes: time-series split with embargo, class-weighted loss,
+/// early stopping, mini-batch, Adam optimizer, label protocol mapping.
+pub fn train_model<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+) -> anyhow::Result<(M, f32)>
+where
+    B: AutodiffBackend + ManagedBurnBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    let (model, report) = train_model_with_report::<B, M>(model, x_data, y_raw, config)?;
+    Ok((model, report.best_observed_loss()))
+}
+
+/// Train any Burn model and return a detailed runtime report alongside the model.
+pub fn train_model_with_report<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend + ManagedBurnBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    let (device, selection) = B::managed_device_and_selection()?;
+    train_model_with_report_with_selection::<B, M>(
+        model, x_data, y_raw, config, &device, &selection,
+    )
+}
+
+pub fn train_model_with_report_on_device<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    train_model_with_report_with_selection::<B, M>(model, x_data, y_raw, config, device, selection)
+}
+
+pub fn train_model_with_report_with_selection<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    train_model_with_report_with_selection_and_precision::<B, M>(
+        model, x_data, y_raw, config, device, selection, None,
+    )
+}
+
+pub fn train_model_with_report_with_selection_and_precision<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+    requested_precision: Option<&str>,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    train_model_with_report_with_external_val::<B, M>(
+        model,
+        x_data,
+        y_raw,
+        config,
+        device,
+        selection,
+        requested_precision,
+        None,
+        None,
+    )
+}
+
+/// M5: variant that accepts an explicit external validation frame from the
+/// HPO orchestrator. When `external_val_x` and `external_val_y` are
+/// supplied, Burn skips its internal `time_series_split` 15% holdout and
+/// drives early stopping against the same val data the HPO objective uses.
+/// This keeps train/val/early-stopping consistent across the model
+/// pipeline so HPO scores reflect what the trained weights will actually
+/// generalise to.
+#[allow(clippy::too_many_arguments)]
+pub fn train_model_with_report_with_external_val<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+    requested_precision: Option<&str>,
+    external_val_x: Option<&Array2<f32>>,
+    external_val_y: Option<&[i32]>,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    ensure_burn_cuda_backend_type::<B>()?;
+    validate_train_config(config)?;
+    validate_burn_device_selection(selection)?;
+    let n_samples = x_data.nrows();
+
+    validate_feature_matrix(x_data, "Burn training")?;
+
+    if n_samples != y_raw.len() {
+        return Err(anyhow::anyhow!(
+            "Burn training feature/label mismatch: {} rows vs {} labels",
+            n_samples,
+            y_raw.len()
+        ));
+    }
+
+    let use_external_val = matches!((external_val_x, external_val_y), (Some(_), Some(_)));
+    if let (Some(vx), Some(vy)) = (external_val_x, external_val_y) {
+        validate_feature_matrix(vx, "Burn external validation")?;
+        if vx.ncols() != x_data.ncols() {
+            return Err(anyhow::anyhow!(
+                "Burn external validation column mismatch: train {}, val {}",
+                x_data.ncols(),
+                vx.ncols()
+            ));
+        }
+        if vx.nrows() != vy.len() {
+            return Err(anyhow::anyhow!(
+                "Burn external validation row/label mismatch: {} rows vs {} labels",
+                vx.nrows(),
+                vy.len()
+            ));
+        }
+    }
+
+    // 1. Label mapping: -1 → 2
+    let y_mapped = map_labels(y_raw)?;
+    let (training_precision, training_precision_reason) =
+        resolve_burn_training_precision_for_backend::<B>(selection, device, requested_precision);
+    let training_dtype = training_precision.dtype();
+
+    // 2. Resolve train/val ranges. When the caller supplied an external val
+    // frame, treat the entire `x_data` as training rows. Otherwise fall
+    // back to the legacy index-order-aware split with embargo.
+    let (train_range, val_range, embargo) = if use_external_val {
+        (0..n_samples, 0..0, 0usize)
+    } else {
+        let embargo = ((n_samples as f32 * 0.005).ceil() as usize).max(10);
+        let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo);
+        (train_range, val_range, embargo)
+    };
+    let n_train = train_range.len();
+
+    let external_val_labels_mapped = if let Some(vy) = external_val_y {
+        Some(map_labels(vy)?)
+    } else {
+        None
+    };
+
+    let val_rows_for_report = if use_external_val {
+        external_val_x.map(|vx| vx.nrows()).unwrap_or(0)
+    } else {
+        val_range.len()
+    };
+    let dataset_rows_for_report = n_train + val_rows_for_report + embargo;
+
+    if n_train == 0 || val_rows_for_report == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training requires enough rows for a validation set; rows={}, train_rows={}, val_rows={}, embargo={}",
+            n_samples,
+            n_train,
+            val_rows_for_report,
+            embargo
+        ));
+    }
+    info!(
+        "Burn training: {} train, {} val, embargo={}, external_val={}",
+        n_train, val_rows_for_report, embargo, use_external_val
+    );
+
+    // 3. Class weights
+    let train_labels: Vec<i64> = y_mapped[train_range.clone()].to_vec();
+    let class_weights = compute_class_weights(&train_labels, config.n_classes);
+
+    // 4. Keep ndarray slices as the long-lived representation and materialize Burn tensors
+    // per batch/validation pass so we do not retain large tensor graphs across the full run.
+    let x_train_array = x_data
+        .slice(ndarray::s![train_range.clone(), ..])
+        .to_owned();
+    let x_val_array = if use_external_val {
+        external_val_x.map(|vx| vx.to_owned())
+    } else if val_range.is_empty() {
+        None
+    } else {
+        Some(x_data.slice(ndarray::s![val_range.clone(), ..]).to_owned())
+    };
+    let y_val_labels = if use_external_val {
+        external_val_labels_mapped
+    } else if val_range.is_empty() {
+        None
+    } else {
+        Some(y_mapped[val_range.clone()].to_vec())
+    };
+    let val_is_empty = x_val_array.is_none();
+
+    // 5. Optimizer + early stopping
+    // Use AdamW with 5e-4 decoupled weight decay as recommended for noisy time-series
+    let mut optim = AdamWConfig::new().with_weight_decay(5e-4).init();
+    let mut early_stop = EarlyStopper::new(config.patience, 1e-4);
+    let mut best_loss = f32::INFINITY;
+    let mut best_epoch = None;
+    let mut final_train_loss = f32::INFINITY;
+    let mut model = cast_module_float_tensors(model, training_dtype);
+    let mut best_model_snapshot: Option<M> = None;
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut indices: Vec<usize> = (0..n_train).collect();
+    let mut epochs_ran = 0usize;
+
+    for epoch in 0..config.max_epochs {
+        indices.shuffle(&mut rng);
+        let mut epoch_loss = 0.0f32;
+        let mut n_batches = 0usize;
+
+        let mut start = 0;
+        while start < n_train {
+            let end = (start + config.batch_size).min(n_train);
+            let loss_val = {
+                // Tight scope keeps tensors and autograd state from lingering across batches.
+                let batch_rows = indices[start..end].to_vec();
+                let x_batch_array = x_train_array.select(ndarray::Axis(0), &batch_rows);
+                let y_batch_labels = batch_rows
+                    .iter()
+                    .map(|&idx| train_labels[idx])
+                    .collect::<Vec<_>>();
+                let x_batch =
+                    array2_to_tensor_with_dtype::<B>(&x_batch_array, device, training_dtype);
+                let y_batch = labels_to_tensor::<B>(&y_batch_labels, device);
+
+                let logits = BurnForward::forward_pass(&model, x_batch);
+                let loss = cross_entropy_loss(logits, y_batch, &class_weights, device);
+                // Normalize the scalar readback to f32. This is a no-op for the
+                // native CUDA path, whose complete training lifecycle is FP32;
+                // another backend may still select BF16 when it is safe there.
+                let loss_val = scalar_loss_value(
+                    cast_tensor_to_dtype(loss.clone(), DType::F32).into_data(),
+                    "extract Burn training loss",
+                )?;
+
+                let grads = loss.backward();
+                let grads_params = GradientsParams::from_grads(grads, &model);
+                model = optim.step(config.lr, model, grads_params);
+                Ok::<f32, anyhow::Error>(loss_val)
+            }?;
+
+            epoch_loss += loss_val;
+            n_batches += 1;
+            start = end;
+        }
+
+        let train_epoch_loss = if n_batches > 0 {
+            epoch_loss / n_batches as f32
+        } else {
+            f32::INFINITY
+        };
+        final_train_loss = train_epoch_loss;
+        if train_epoch_loss.is_finite() && val_is_empty && train_epoch_loss < best_loss {
+            best_loss = train_epoch_loss;
+            best_epoch = Some(epoch);
+            best_model_snapshot = Some(model.clone());
+        }
+
+        // Validation on holdout (sequential, no shuffle).
+        //
+        // **2026-05-25 unwrap audit**: `val_is_empty` is computed
+        // upstream from the same `val_range.is_empty()` predicate that
+        // gates `x_val_array`/`y_val_labels` initialisation — so the
+        // `Some(_)` arms are guaranteed when this branch fires. Even
+        // so, per the no-panic doctrine we pattern-match. A future
+        // regression that decouples `val_is_empty` from the array
+        // existence will now skip the validation phase silently
+        // instead of crashing mid-epoch.
+        if !val_is_empty {
+            let (Some(x_val), Some(y_val)) = (x_val_array.as_ref(), y_val_labels.as_ref()) else {
+                tracing::warn!(
+                    target: "neoethos_models::burn",
+                    "validation phase skipped: x_val_array/y_val_labels are None despite \
+                     val_is_empty=false (upstream invariant violated)"
+                );
+                continue;
+            };
+            // Burn's official validation boundary converts an autodiff module to
+            // its inner backend. Running this pass on `B` would register a graph
+            // with no subsequent backward call, leaving its Fusion bindings live
+            // after the final epoch.
+            let valid_model = model.valid();
+            let x_val =
+                array2_to_tensor_with_dtype::<B::InnerBackend>(x_val, device, training_dtype);
+            let y_val = labels_to_tensor::<B::InnerBackend>(y_val, device);
+            let val_logits = BurnForward::forward_pass(&valid_model, x_val);
+            let val_loss =
+                cross_entropy_loss::<B::InnerBackend>(val_logits, y_val, &class_weights, device);
+            let vl = scalar_loss_value(
+                cast_tensor_to_dtype(val_loss, DType::F32).into_data(),
+                "extract Burn validation loss",
+            )?;
+
+            if vl < best_loss {
+                best_loss = vl;
+                best_epoch = Some(epoch);
+                best_model_snapshot = Some(model.clone());
+            }
+            if early_stop.check(vl) {
+                info!("Early stop at epoch {} (val_loss={:.6})", epoch, vl);
+                epochs_ran = epoch + 1;
+                break;
+            }
+            if epoch % 10 == 0 {
+                info!(
+                    "Epoch {}: train={:.6} val={:.6}",
+                    epoch, train_epoch_loss, vl
+                );
+            }
+        } else if epoch % 10 == 0 {
+            info!("Epoch {}: train={:.6}", epoch, train_epoch_loss);
+        }
+
+        epochs_ran = epoch + 1;
+    }
+
+    if !best_loss.is_finite() {
+        best_loss = final_train_loss;
+        if best_loss.is_finite() && best_epoch.is_none() {
+            best_epoch = Some(epochs_ran.saturating_sub(1));
+        }
+    }
+    if let Some(best_model) = best_model_snapshot {
+        model = best_model;
+    }
+
+    Ok((
+        model,
+        BurnTrainingReport {
+            dataset_rows: dataset_rows_for_report,
+            train_rows: n_train,
+            val_rows: val_rows_for_report,
+            embargo_rows: embargo,
+            class_weights,
+            best_loss,
+            best_epoch,
+            epochs_ran,
+            final_train_loss,
+            learning_rate: config.lr,
+            batch_size: config.batch_size,
+            patience: config.patience,
+            seed: config.seed,
+            requested_device_policy: selection.requested_policy.clone(),
+            effective_device_policy: selection.effective_policy.clone(),
+            execution_backend: selection.execution_backend.clone(),
+            training_precision: training_precision.label().to_string(),
+            training_precision_reason,
+        },
+    ))
+}
+
+// ============================================================================
+// PREDICTION HELPER
+// ============================================================================
+
+/// Run inference and return probabilities as (n_samples, 3) array.
+pub fn predict_proba<B: ManagedBurnBackend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+) -> anyhow::Result<Array2<f32>> {
+    predict_proba_checked::<B, M>(model, x_data, batch_size)
+}
+
+pub fn predict_proba_on_device<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+) -> anyhow::Result<Array2<f32>> {
+    Ok(predict_proba_checked_on_device::<B, M>(model, x_data, batch_size, device)?.0)
+}
+
+pub fn predict_proba_on_device_with_selection<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, device, selection,
+    )
+}
+
+/// Run inference and return validated probabilities as (n_samples, 3) array.
+pub fn predict_proba_checked<B: ManagedBurnBackend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+) -> anyhow::Result<Array2<f32>> {
+    Ok(predict_proba_checked_with_selection::<B, M>(model, x_data, batch_size)?.0)
+}
+
+pub fn predict_proba_checked_with_selection<B: ManagedBurnBackend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    let (device, selection) = B::managed_device_and_selection()?;
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, &device, &selection,
+    )
+}
+
+pub fn predict_proba_checked_on_device<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    let selection = BurnDeviceSelection {
+        requested_policy: "external_device".to_string(),
+        effective_policy: "external_device".to_string(),
+        execution_backend: external_execution_backend_for::<B>(),
+    };
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, device, &selection,
+    )
+}
+
+pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    ensure_burn_cuda_backend_type::<B>()?;
+    validate_burn_device_selection(selection)?;
+    if batch_size == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn prediction batch_size must be greater than zero"
+        ));
+    }
+    let n_samples = x_data.nrows();
+    if n_samples == 0 {
+        return Ok((Array2::zeros((0, 3)), selection.clone()));
+    }
+    validate_feature_matrix(x_data, "Burn prediction")?;
+
+    let mut all_probs: Vec<f32> = Vec::with_capacity(n_samples * 3);
+
+    let mut start = 0;
+    while start < n_samples {
+        let end = (start + batch_size).min(n_samples);
+        let data: Vec<f32> = {
+            let batch = array2_to_tensor::<B>(
+                &x_data.slice(ndarray::s![start..end, ..]).to_owned(),
+                device,
+            );
+            let logits = model.forward_pass(batch);
+            let probs = burn::tensor::activation::softmax(logits, 1);
+            probs
+                .into_data()
+                .to_vec()
+                .context("extract Burn prediction probabilities")?
+        };
+        all_probs.extend(data);
+        start = end;
+    }
+
+    let normalized = normalize_probability_rows(all_probs, n_samples, 3)
+        .ok_or_else(|| anyhow::anyhow!("Burn prediction probabilities failed validation"))?;
+    let probabilities = Array2::from_shape_vec((n_samples, 3), normalized)
+        .map_err(|_| anyhow::anyhow!("Burn prediction probabilities failed to reshape"))?;
+    Ok((probabilities, selection.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_auto_precision_runs_three_epoch_real_kernels_in_fp32() -> anyhow::Result<()> {
+        use burn_fusion::{inspect::FusionInspector, stream::StreamId};
+
+        const ROWS: usize = 128;
+
+        let _cuda_residency = burn_cuda_residency_scope(0);
+
+        let fusion_inspector = FusionInspector::install(StreamId::current());
+        <InferBackend as Backend>::sync(&CudaDevice::new(0))
+            .context("synchronize Burn Fusion before the low-level CUDA handle baseline")?;
+        fusion_inspector.set_baseline();
+
+        let kernel_result = (|| -> anyhow::Result<()> {
+            let (train_device, train_selection) = resolve_train_device("gpu:0")?;
+            assert_eq!(train_device.index, 0);
+            assert_eq!(train_selection.effective_policy, "gpu:0");
+            assert_eq!(train_selection.execution_backend, "cuda");
+
+            let model = BurnMLPConfig::new(2).init::<TrainBackend>(&train_device);
+            let features = Array2::from_shape_vec(
+                (ROWS, 2),
+                (0..ROWS * 2).map(|index| index as f32 * 0.005).collect(),
+            )?;
+            let labels = (0..ROWS)
+                .map(|index| match index % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
+            let config = TrainConfig {
+                batch_size: 16,
+                max_epochs: 3,
+                patience: 3,
+                ..TrainConfig::default()
+            };
+            let (_trained, report) = train_model_with_report_on_device::<TrainBackend, _>(
+                model,
+                &features,
+                &labels,
+                &config,
+                &train_device,
+                &train_selection,
+            )?;
+            assert_eq!(report.execution_backend, "cuda");
+            assert_eq!(report.dataset_rows, ROWS);
+            assert!(report.train_rows > 0);
+            assert!(report.val_rows > 0);
+            assert_eq!(report.epochs_ran, 3);
+            assert_eq!(report.training_precision, "fp32");
+            assert!(
+                report
+                    .training_precision_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("BF16 optimizer/fusion graph")
+            );
+
+            let (infer_device, infer_selection) = resolve_infer_device("gpu:0")?;
+            let infer_model = BurnMLPConfig::new(2).init::<InferBackend>(&infer_device);
+            let (probabilities, returned_selection) =
+                predict_proba_checked_on_device_with_selection::<InferBackend, _>(
+                    &infer_model,
+                    &features.slice(ndarray::s![..4, ..]).to_owned(),
+                    4,
+                    &infer_device,
+                    &infer_selection,
+                )?;
+            assert_eq!(returned_selection, infer_selection);
+            assert_eq!(probabilities.dim(), (4, 3));
+            assert!(probabilities.iter().all(|value| value.is_finite()));
+            Ok(())
+        })();
+
+        <InferBackend as Backend>::sync(&CudaDevice::new(0))
+            .context("drain Burn Fusion after the low-level CUDA work scope")?;
+        let leaked_handles = fusion_inspector.new_handles_since_baseline();
+        assert!(
+            leaked_handles.is_empty(),
+            "Burn Fusion retained CUDA handles after lexical scope teardown: {leaked_handles:?}"
+        );
+        kernel_result?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "deliberate production-shape CPU/GPU performance benchmark"]
+    fn burn_production_shape_cpu_gpu_benchmark() -> anyhow::Result<()> {
+        const BASE_ROWS: usize = 4_692;
+        const BASE_HPO_ROWS: usize = 3_734;
+        const FEATURES: usize = 1_768;
+        const HIDDEN_DIM: usize = 256;
+        const LAYERS: usize = 3;
+        const DEFAULT_BATCH_SIZE: usize = 1_024;
+        const EPOCHS: usize = 3;
+        const MAX_ROW_MULTIPLIER: usize = 16;
+        const MAX_PARALLEL_JOBS: usize = 16;
+
+        let positive_env = |name: &str, default: usize| -> anyhow::Result<usize> {
+            let Some(raw) = std::env::var_os(name) else {
+                return Ok(default);
+            };
+            let raw = raw
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{name} must be valid UTF-8"))?;
+            let value = raw
+                .parse::<usize>()
+                .with_context(|| format!("parse positive integer from {name}={raw:?}"))?;
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+            Ok(value)
+        };
+        let row_multiplier = positive_env("NEOETHOS_BURN_BENCH_ROW_MULTIPLIER", 1)?;
+        if row_multiplier > MAX_ROW_MULTIPLIER {
+            anyhow::bail!("NEOETHOS_BURN_BENCH_ROW_MULTIPLIER must be <= {MAX_ROW_MULTIPLIER}");
+        }
+        let rows = BASE_ROWS
+            .checked_mul(row_multiplier)
+            .context("scale benchmark rows without overflow")?;
+        let hpo_rows = BASE_HPO_ROWS
+            .checked_mul(row_multiplier)
+            .context("scale benchmark HPO rows without overflow")?;
+        let batch_size = positive_env("NEOETHOS_BURN_BENCH_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
+        let parallel_jobs = positive_env("NEOETHOS_BURN_BENCH_PARALLEL_JOBS", 1)?;
+        if parallel_jobs > MAX_PARALLEL_JOBS {
+            anyhow::bail!("NEOETHOS_BURN_BENCH_PARALLEL_JOBS must be <= {MAX_PARALLEL_JOBS}");
+        }
+
+        #[cfg(feature = "burn-cuda-backend")]
+        let _cuda_residency = burn_cuda_residency_scope(0);
+
+        let run_job = |job_index: usize| -> anyhow::Result<serde_json::Value> {
+            let requested_device = if cfg!(feature = "burn-cuda-backend") {
+                "gpu:0"
+            } else {
+                "cpu"
+            };
+            let (train_device, train_selection) = resolve_train_device(requested_device)?;
+            let features = Array2::from_shape_fn((rows, FEATURES), |(row, column)| {
+                let mixed = (row.wrapping_mul(131) + column.wrapping_mul(17)) % 2_048;
+                let centered = mixed as f32 / 1_024.0 - 1.0;
+                let trend = (row % 97) as f32 / 512.0 - 0.09375;
+                centered + trend
+            });
+            let labels = (0..rows)
+                .map(|row| match row % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
+            let hpo_features = features.slice(ndarray::s![..hpo_rows, ..]).to_owned();
+            let train_config = TrainConfig {
+                batch_size,
+                max_epochs: EPOCHS,
+                patience: 8,
+                seed: 42 + job_index as u64,
+                ..TrainConfig::default()
+            };
+
+            let run_phase = |phase: &str,
+                             frame: &Array2<f32>,
+                             phase_labels: &[i32]|
+             -> anyhow::Result<(f64, BurnTrainingReport)> {
+                <TrainBackend as Backend>::sync(&train_device)
+                    .with_context(|| format!("synchronize Burn backend before {phase}"))?;
+                let started = std::time::Instant::now();
+                let model = BurnMLPConfig::new(FEATURES)
+                    .with_hidden_dim(HIDDEN_DIM)
+                    .with_n_layers(LAYERS)
+                    .with_n_classes(3)
+                    .with_dropout(0.1)
+                    .init::<TrainBackend>(&train_device);
+                let (trained, report) =
+                    train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                        model,
+                        frame,
+                        phase_labels,
+                        &train_config,
+                        &train_device,
+                        &train_selection,
+                        Some("fp32"),
+                    )?;
+                drop(trained);
+                <TrainBackend as Backend>::sync(&train_device)
+                    .with_context(|| format!("synchronize Burn backend after {phase}"))?;
+                Ok((started.elapsed().as_secs_f64(), report))
+            };
+
+            let (hpo_seconds, hpo_report) = run_phase("hpo", &hpo_features, &labels[..hpo_rows])?;
+            let (refit_seconds, refit_report) = run_phase("full_refit", &features, &labels)?;
+            let total_seconds = hpo_seconds + refit_seconds;
+
+            assert_eq!(hpo_report.dataset_rows, hpo_rows);
+            assert_eq!(refit_report.dataset_rows, rows);
+            assert_eq!(hpo_report.epochs_ran, EPOCHS);
+            assert_eq!(refit_report.epochs_ran, EPOCHS);
+            assert_eq!(hpo_report.batch_size, batch_size);
+            assert_eq!(refit_report.batch_size, batch_size);
+            assert_eq!(hpo_report.training_precision, "fp32");
+            assert_eq!(refit_report.training_precision, "fp32");
+            Ok(serde_json::json!({
+                "job_index": job_index,
+                "execution_backend": train_selection.execution_backend,
+                "effective_device_policy": train_selection.effective_policy,
+                "hpo_seconds": hpo_seconds,
+                "full_refit_seconds": refit_seconds,
+                "total_training_seconds": total_seconds,
+                "hpo_best_loss": hpo_report.best_loss,
+                "refit_best_loss": refit_report.best_loss,
+            }))
+        };
+
+        let wall_started = std::time::Instant::now();
+        let job_results = std::thread::scope(|scope| -> anyhow::Result<Vec<serde_json::Value>> {
+            let mut handles = Vec::with_capacity(parallel_jobs);
+            for job_index in 0..parallel_jobs {
+                let run_job = &run_job;
+                handles.push(scope.spawn(move || run_job(job_index)));
+            }
+            let mut results = Vec::with_capacity(parallel_jobs);
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("parallel Burn benchmark job panicked"))??,
+                );
+            }
+            Ok(results)
+        })?;
+        let wall_seconds = wall_started.elapsed().as_secs_f64();
+        let mut job_seconds = job_results
+            .iter()
+            .map(|result| {
+                result["total_training_seconds"]
+                    .as_f64()
+                    .context("benchmark job must report total_training_seconds")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let total_training_seconds_sum = job_seconds.iter().sum::<f64>();
+        job_seconds.sort_by(f64::total_cmp);
+        let median_job_seconds = if job_seconds.len() % 2 == 0 {
+            let upper = job_seconds.len() / 2;
+            (job_seconds[upper - 1] + job_seconds[upper]) * 0.5
+        } else {
+            job_seconds[job_seconds.len() / 2]
+        };
+        for result in &job_results {
+            println!("NEOETHOS_CPU_GPU_BENCHMARK_JOB={result}");
+        }
+        println!(
+            "NEOETHOS_CPU_GPU_BENCHMARK={}",
+            serde_json::json!({
+                "schema": "neoethos.burn-cpu-gpu-production-shape-benchmark.v3",
+                "compiled_backend": active_burn_backend_name(),
+                "rows": rows,
+                "hpo_rows": hpo_rows,
+                "row_multiplier": row_multiplier,
+                "features": FEATURES,
+                "hidden_dim": HIDDEN_DIM,
+                "layers": LAYERS,
+                "batch_size": batch_size,
+                "epochs_per_phase": EPOCHS,
+                "parallel_jobs": parallel_jobs,
+                "feature_matrix_bytes_per_job": rows * FEATURES * std::mem::size_of::<f32>(),
+                "wall_seconds": wall_seconds,
+                "total_training_seconds_sum": total_training_seconds_sum,
+                "median_job_seconds": median_job_seconds,
+                "concurrency_overlap_factor": total_training_seconds_sum / wall_seconds,
+                "jobs_per_second": parallel_jobs as f64 / wall_seconds,
+                "job_results": job_results,
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_rejects_cpu_and_malformed_device_policies() {
+        assert!(resolve_train_device("cpu").is_err());
+        assert!(resolve_infer_device("gpu:not-an-index").is_err());
+        let (device, selection) =
+            resolve_train_device("gpu:7").expect("syntactically valid exact CUDA ordinal");
+        assert_eq!(device.index, 7);
+        assert_eq!(selection.effective_policy, "gpu:7");
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_rejects_non_cuda_backend_types_and_runtime_selections() {
+        let backend_error = ensure_burn_cuda_backend_type::<burn_ndarray::NdArray>()
+            .expect_err("Burn CUDA build must reject an NdArray backend type");
+        assert!(backend_error.to_string().contains("requires native CUDA"));
+
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "ndarray_cpu".to_string(),
+        };
+        let selection_error = validate_burn_device_selection(&selection)
+            .expect_err("Burn CUDA build must reject a CPU runtime selection");
+        assert!(selection_error.to_string().contains("requires native CUDA"));
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_loaded_artifact_identity_is_complete_and_exact() {
+        let live = BurnDeviceSelection {
+            requested_policy: "gpu:0".to_string(),
+            effective_policy: "gpu:0".to_string(),
+            execution_backend: "cuda".to_string(),
+        };
+        validate_loaded_burn_device_identity(
+            "test",
+            Some("gpu:0"),
+            Some("gpu:0"),
+            Some("cuda"),
+            &live,
+        )
+        .expect("exact CUDA artifact identity must pass");
+        assert!(
+            validate_loaded_burn_device_identity(
+                "test",
+                Some("gpu:0"),
+                Some("cpu"),
+                Some("ndarray_cpu"),
+                &live,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_loaded_burn_device_identity("test", Some("gpu:0"), None, Some("cuda"), &live,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sparsemax_is_normalized_and_sparse() {
+        // sparsemax must (a) sum to 1 per row and (b) produce EXACT zeros for the
+        // dominated entries — unlike softmax which is always fully dense.
+        let device = Default::default();
+        let z = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(vec![3.0f32, 0.1, 0.1, 0.1, 0.1], [1, 5]),
+            &device,
+        );
+        let p = sparsemax(z).into_data().to_vec::<f32>().expect("to_vec");
+        let sum: f32 = p.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "sparsemax must sum to 1, got {sum}"
+        );
+        let zeros = p.iter().filter(|&&x| x.abs() < 1e-6).count();
+        assert!(zeros >= 1, "sparsemax must produce exact zeros, got {p:?}");
+    }
+
+    #[test]
+    fn nbeats_trend_basis_is_polynomial_and_forward_shapes() {
+        let device = Default::default();
+        // trend basis [3, 8] row-major: row0 = ones, row1 = t, row2 = t^2.
+        let b = nbeats_basis::<InferBackend>(true, 3, 8, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec");
+        for i in 0..8 {
+            let t = i as f32 / 8.0;
+            assert!((b[i] - 1.0).abs() < 1e-6, "trend row0 must be ones");
+            assert!((b[8 + i] - t).abs() < 1e-6, "trend row1 must be t");
+            assert!((b[16 + i] - t * t).abs() < 1e-6, "trend row2 must be t^2");
+        }
+        // forward: real interpretable N-BEATS produces finite [batch, n_classes].
+        let model = BurnNBeatsConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..64).map(|v| (v % 16) as f32 * 0.1).collect::<Vec<f32>>(),
+                [4, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
+        let finite = y
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec")
+            .iter()
+            .all(|v| v.is_finite());
+        assert!(finite, "N-BEATS output must be finite");
+    }
+
+    #[test]
+    fn b_spline_basis_is_partition_of_unity() {
+        // Correct Cox-de Boor B-splines form a partition of unity: the basis sums
+        // to 1 over the coefficient axis for any interior input. This validates
+        // the recurrence (a wrong recurrence breaks this).
+        let device = Default::default();
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(vec![-1.0f32, 0.0, 0.7, 2.0], [1, 4]),
+            &device,
+        );
+        let sums = b_spline_basis::<InferBackend>(x, -3.0, 3.0, 9, 3)
+            .sum_dim(2) // [1, 4, 1]
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec");
+        for s in sums {
+            assert!(
+                (s - 1.0).abs() < 1e-3,
+                "B-spline basis must sum to 1, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn kan_forward_is_finite_and_input_sensitive() {
+        let device = Default::default();
+        let model = BurnKANConfig::new(8).init::<InferBackend>(&device);
+        let x1 =
+            Tensor::<InferBackend, 2>::from_data(TensorData::new(vec![0.5f32; 8], [1, 8]), &device);
+        let x2 = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..8).map(|v| v as f32 * 0.3 - 1.0).collect::<Vec<f32>>(),
+                [1, 8],
+            ),
+            &device,
+        );
+        let y1 = model.forward(x1);
+        assert_eq!(y1.dims(), [1, 3]);
+        let v1 = y1.into_data().to_vec::<f32>().expect("v");
+        assert!(
+            v1.iter().all(|v| v.is_finite()),
+            "KAN output must be finite"
+        );
+        let v2 = model.forward(x2).into_data().to_vec::<f32>().expect("v");
+        let diff: f32 = v1.iter().zip(&v2).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            diff > 1e-5,
+            "KAN must be input-sensitive (learnable edges), diff={diff}"
+        );
+    }
+
+    #[test]
+    fn nbeatsx_basis_forward_is_finite() {
+        let device = Default::default();
+        let model = BurnNBeatsxConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32)
+                    .map(|v| (v % 16) as f32 * 0.1 - 0.8)
+                    .collect::<Vec<f32>>(),
+                [2, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [2, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn fft_detects_dominant_period() {
+        // A length-16 signal with period 4 (freq f=L/p=4) — the DFT must pick it.
+        let sig: Vec<f32> = (0..16)
+            .map(|t| (2.0 * std::f32::consts::PI * t as f32 / 4.0).sin())
+            .collect();
+        let (periods, _amps) = fft_top_periods(&sig, 2);
+        assert!(
+            periods.iter().any(|&p| p == 4),
+            "DFT must detect period 4, got {periods:?}"
+        );
+    }
+
+    #[test]
+    fn timesnet_forward_is_finite() {
+        let device = Default::default();
+        let model = BurnTimesNetConfig::new(16).init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32)
+                    .map(|t| (2.0 * std::f32::consts::PI * (t % 16) as f32 / 4.0).sin())
+                    .collect::<Vec<f32>>(),
+                [2, 16],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [2, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn tide_two_dense_block_forward_shape_and_finite() {
+        // The upgraded two-dense ResidualBlock (fc1→ReLU→Dropout→fc2 + linear
+        // skip → LayerNorm) must run end-to-end and emit a 3-class row.
+        let device = Default::default();
+        let model = BurnTiDEConfig::new(8)
+            .with_hidden_dim(16)
+            .with_dropout(0.0)
+            .init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32)
+                    .map(|v| (v % 8) as f32 * 0.15 - 0.6)
+                    .collect::<Vec<f32>>(),
+                [4, 8],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn tide_nf_forward_shape_and_finite() {
+        // TiDE-NF (two-dense backbone + seasonal/context/horizon gates).
+        let device = Default::default();
+        let model = BurnTiDENfConfig::new(8)
+            .with_hidden_dim(16)
+            .with_dropout(0.0)
+            .init::<InferBackend>(&device);
+        let x = Tensor::<InferBackend, 2>::from_data(
+            TensorData::new(
+                (0..32)
+                    .map(|v| (v % 8) as f32 * 0.1 - 0.4)
+                    .collect::<Vec<f32>>(),
+                [4, 8],
+            ),
+            &device,
+        );
+        let y = model.forward(x);
+        assert_eq!(y.dims(), [4, 3]);
+        assert!(
+            y.into_data()
+                .to_vec::<f32>()
+                .expect("v")
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn transformer_positional_encoding_makes_token_order_matter() {
+        // Self-attention is permutation-invariant; the sinusoidal positional
+        // encoding must make two inputs that differ ONLY in token order produce
+        // different logits. (This would fail on the pre-fix code.)
+        let device = Default::default();
+        let model = BurnTransformerConfig::new(16)
+            .with_token_count(8)
+            .with_hidden_dim(32)
+            .init::<InferBackend>(&device);
+        let base: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let mut swapped = base.clone();
+        swapped.swap(0, 14); // token 0 <-> token 7 (each token = 2 features); multiset preserved
+        swapped.swap(1, 15);
+        let x1 = Tensor::<InferBackend, 2>::from_data(TensorData::new(base, [1, 16]), &device);
+        let x2 = Tensor::<InferBackend, 2>::from_data(TensorData::new(swapped, [1, 16]), &device);
+        let diff: f32 = (model.forward(x1) - model.forward(x2))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(
+            diff > 1e-5,
+            "positional encoding must make token order matter (diff={diff})"
+        );
+    }
+
+    #[test]
+    fn predict_proba_checked_returns_empty_array_for_empty_input() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((0, 2));
+
+        let probabilities = predict_proba_checked::<InferBackend, _>(&model, &x, 16)?;
+        assert_eq!(probabilities.shape(), &[0, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_rejects_zero_batch_size() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((1, 2));
+
+        let err =
+            predict_proba::<InferBackend, _>(&model, &x, 0).expect_err("batch_size=0 must fail");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn predict_proba_rejects_zero_feature_columns() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((1, 0));
+
+        let err = predict_proba::<InferBackend, _>(&model, &x, 16)
+            .expect_err("zero feature columns must fail early");
+        assert!(err.to_string().contains("at least one feature column"));
+    }
+
+    #[test]
+    fn predict_proba_rejects_non_finite_inputs() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::from_shape_vec((1, 2), vec![0.0_f32, f32::NAN]).expect("shape input");
+
+        let err = predict_proba::<InferBackend, _>(&model, &x, 16)
+            .expect_err("non-finite inputs must fail early");
+        assert!(err.to_string().contains("non-finite feature values"));
+    }
+
+    #[test]
+    fn train_model_rejects_non_finite_inputs_before_tensorization() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec(
+            (128, 2),
+            (0..256)
+                .map(|idx| {
+                    if idx == 17 {
+                        f32::INFINITY
+                    } else {
+                        idx as f32 * 0.01
+                    }
+                })
+                .collect(),
+        )
+        .expect("shape input");
+        let labels = (0..128)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+
+        let err = train_model::<TrainBackend, _>(model, &x, &labels, &TrainConfig::default())
+            .expect_err("non-finite training inputs must fail early");
+        assert!(err.to_string().contains("non-finite feature values"));
+    }
+
+    #[test]
+    fn normalize_burn_device_policy_defaults_to_auto() {
+        assert_eq!(normalize_burn_device_policy(""), "auto");
+        assert_eq!(normalize_burn_device_policy("  CUDA:2 "), "gpu:2");
+        assert_eq!(normalize_burn_device_policy("rocm:3"), "gpu:3");
+        assert_eq!(normalize_burn_device_policy("metal"), "gpu");
+        assert_eq!(normalize_burn_device_policy("vulkan:1"), "gpu:1");
+        assert_eq!(normalize_burn_device_policy("cuda"), "gpu");
+        assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
+    }
+
+    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[test]
+    fn wgpu_policy_preserves_integrated_adapter_class() {
+        let normalized = normalize_burn_device_policy("vulkan:integrated:0");
+        let (device, effective_policy, execution_backend) = resolve_wgpu_device_policy(&normalized);
+
+        assert_eq!(device, WgpuDevice::IntegratedGpu(0));
+        assert_eq!(effective_policy, "gpu:integrated:0");
+        assert_eq!(execution_backend, "wgpu_integrated_gpu");
+    }
+
+    #[test]
+    fn supported_burn_device_policy_recognizes_expected_aliases() {
+        assert!(is_supported_burn_device_policy("auto"));
+        assert!(is_supported_burn_device_policy("cpu"));
+        assert!(is_supported_burn_device_policy("cuda:2"));
+        assert!(is_supported_burn_device_policy("gpu:1"));
+        assert!(is_supported_burn_device_policy("metal"));
+        assert!(is_supported_burn_device_policy("rocm:2"));
+        assert!(is_supported_burn_device_policy("external_device"));
+    }
+
+    #[test]
+    fn burn_training_precision_fp8_request_degrades_truthfully() {
+        let selection = BurnDeviceSelection {
+            requested_policy: "gpu".to_string(),
+            effective_policy: "gpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+        let device = <TrainBackend as BackendTypes>::Device::default();
+        let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
+            &selection,
+            &device,
+            Some("fp8"),
+        );
+        assert!(matches!(
+            precision,
+            BurnExecutionPrecision::Bf16 | BurnExecutionPrecision::Fp32
+        ));
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requested precision `fp8`")
+        );
+    }
+
+    #[test]
+    fn burn_training_precision_cpu_bf16_request_reflects_backend_support() {
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "ndarray_cpu".to_string(),
+        };
+        let device = <TrainBackend as BackendTypes>::Device::default();
+        let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
+            &selection,
+            &device,
+            Some("bf16"),
+        );
+        if <TrainBackend as Backend>::supports_dtype(&device, DType::BF16) {
+            assert_eq!(precision, BurnExecutionPrecision::Bf16);
+            assert!(reason.is_none());
+        } else {
+            assert_eq!(precision, BurnExecutionPrecision::Fp32);
+            assert!(
+                reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unsupported by the active Burn backend/device/model")
+            );
+        }
+    }
+
+    #[test]
+    fn train_model_rejects_invalid_train_config_before_tensor_work() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec((128, 2), (0..256).map(|idx| idx as f32 * 0.01).collect())
+            .expect("shape input");
+        let labels = (0..128)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let config = TrainConfig {
+            batch_size: 0,
+            ..TrainConfig::default()
+        };
+
+        let err = train_model::<TrainBackend, _>(model, &x, &labels, &config)
+            .expect_err("invalid train config must fail early");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn train_model_with_report_on_device_requires_explicit_selection() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec((160, 2), (0..320).map(|idx| idx as f32 * 0.01).collect())
+            .expect("shape input");
+        let labels = (0..160)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let selection = resolve_train_device("auto")?.1;
+
+        let (_trained, report) = train_model_with_report_on_device::<TrainBackend, _>(
+            model,
+            &x,
+            &labels,
+            &TrainConfig::default(),
+            &device,
+            &selection,
+        )?;
+
+        assert_eq!(report.requested_device_policy, selection.requested_policy);
+        assert_eq!(report.effective_device_policy, selection.effective_policy);
+        assert_eq!(report.execution_backend, selection.execution_backend);
+        assert!(!report.training_precision.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_train_device_cpu_policy_reports_consistent_backend() {
+        #[cfg(feature = "burn-cuda-backend")]
+        {
+            let err = resolve_train_device("cpu")
+                .expect_err("CUDA-only Burn build must reject explicit CPU policy");
+            assert!(err.to_string().contains("cannot honor explicit CPU policy"));
+            return;
+        }
+
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        let (_device, selection) =
+            resolve_train_device("cpu").expect("CPU-capable Burn backend must resolve CPU");
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        assert_eq!(selection.requested_policy, "cpu");
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        assert_eq!(selection.effective_policy, "cpu");
+        #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+        assert_eq!(selection.execution_backend, "wgpu_cpu");
+        #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+        assert_eq!(selection.execution_backend, "ndarray_cpu");
+    }
+
+    #[cfg(feature = "burn-wgpu-backend")]
+    #[test]
+    fn resolve_train_device_cuda_alias_reports_wgpu_runtime_truthfully() {
+        let (_device, selection) =
+            resolve_train_device("cuda:2").expect("wgpu CUDA alias must resolve");
+        assert_eq!(selection.requested_policy, "gpu:2");
+        assert_eq!(selection.effective_policy, "gpu:2");
+        assert_eq!(selection.execution_backend, "wgpu_discrete_gpu");
+    }
+
+    #[cfg(feature = "burn-wgpu-backend")]
+    #[test]
+    fn resolve_infer_device_default_gpu_reports_wgpu_default_backend() {
+        let (_device, selection) =
+            resolve_infer_device("gpu").expect("wgpu default GPU must resolve");
+        assert_eq!(selection.requested_policy, "gpu");
+        assert_eq!(selection.effective_policy, "default");
+        assert_eq!(selection.execution_backend, "wgpu_default");
+    }
+
+    #[test]
+    fn predict_proba_checked_with_selection_returns_runtime_provenance() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+
+        let (_probabilities, selection) =
+            predict_proba_checked_with_selection::<InferBackend, _>(&model, &x, 16)?;
+        assert!(!selection.requested_policy.trim().is_empty());
+        assert!(!selection.effective_policy.trim().is_empty());
+        assert!(!selection.execution_backend.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_on_device_with_selection_preserves_supplied_provenance() -> anyhow::Result<()>
+    {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+        let selection = BurnDeviceSelection {
+            requested_policy: "external_device".to_string(),
+            effective_policy: "external_device".to_string(),
+            execution_backend: external_execution_backend_for::<InferBackend>(),
+        };
+
+        let (_probabilities, returned_selection) = predict_proba_on_device_with_selection::<
+            InferBackend,
+            _,
+        >(&model, &x, 16, &device, &selection)?;
+        assert_eq!(returned_selection, selection);
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_checked_on_device_reports_typed_external_provenance() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+
+        let (_probabilities, selection) =
+            predict_proba_checked_on_device::<InferBackend, _>(&model, &x, 16, &device)?;
+        assert_eq!(selection.requested_policy, "external_device");
+        assert_eq!(selection.effective_policy, "external_device");
+        assert!(selection.execution_backend.starts_with("external:"));
+        Ok(())
+    }
+
+    #[test]
+    fn train_model_with_report_rejects_incoherent_runtime_selection() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::<f32>::zeros((12, 2));
+        let labels = (0..12)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+
+        let err = train_model_with_report_on_device::<TrainBackend, _>(
+            model,
+            &x,
+            &labels,
+            &TrainConfig::default(),
+            &device,
+            &selection,
+        )
+        .expect_err("incoherent runtime provenance must fail");
+        #[cfg(feature = "burn-cuda-backend")]
+        assert!(
+            err.to_string().contains("requires native CUDA"),
+            "unexpected error: {err}"
+        );
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        assert!(
+            err.to_string()
+                .contains("incompatible with effective policy cpu"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predict_proba_on_device_with_selection_rejects_incoherent_runtime_selection() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+
+        let err = predict_proba_on_device_with_selection::<InferBackend, _>(
+            &model, &x, 16, &device, &selection,
+        )
+        .expect_err("incoherent runtime provenance must fail");
+        #[cfg(feature = "burn-cuda-backend")]
+        assert!(
+            err.to_string().contains("requires native CUDA"),
+            "unexpected error: {err}"
+        );
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        assert!(
+            err.to_string()
+                .contains("incompatible with effective policy cpu"),
+            "unexpected error: {err}"
+        );
+    }
+}

@@ -1,0 +1,64 @@
+# NeoEthos MCP control plane — the Model Context Protocol *server* that gives
+# OpenAI Codex CLI (and any MCP-speaking agent runtime) full operational
+# control of the running NeoEthos backend over stdio, wrapped in a hard,
+# server-side, fail-closed DEMO-ONLY guard.
+#
+# Design: docs/codex-control-plane.md. This crate is a thin HTTP client of
+# the backend at http://127.0.0.1:7423 — it deliberately does NOT link the
+# engine crates (the backend process is the single owner of all state; see
+# the design doc §1.2 for why linking core would recreate the "two Settings
+# resolutions" defect class across two processes).
+#
+# Name collision note: the top-level `mcp/` directory is the unrelated MCP
+# *client* aggregator sidecar (its own excluded workspace). This crate is the
+# inbound control-plane *server*.
+#
+# W10 (2026-08-10): the path used to be the ONLY thing disambiguating them —
+# both crates declared `[[bin]] name = "neoethos-mcp"`, so the two produced
+# identically-named executables. The installer bundles the `mcp/` one next to
+# the desktop app (tauri.windows.conf.json), and `desktop/src-tauri/src/lib.rs`
+# spawns `neoethos-mcp.exe` by name from that directory — so whichever binary
+# landed there won, and nothing checked which. This crate's binary is now
+# `neoethos-control-plane`, matching what it actually is — not `neoethos-codex`,
+# because a crate by that exact name already exists (the ChatGPT OAuth
+# fallback), and reusing it would recreate the same confusion one level over.
+# The library name is
+# unchanged; libs never collide across the two workspaces' target dirs.
+[package]
+name = "neoethos-mcp"
+version = "0.1.0"
+description = "NeoEthos Codex control plane — MCP server (stdio) over the localhost backend API, demo-guarded"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neoethos-control-plane"
+path = "src/main.rs"
+
+[lib]
+name = "neoethos_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+neoethos-execution-budget.workspace = true
+# Official Model Context Protocol SDK, server role, stdio transport.
+# Pinned EXACTLY: rmcp 3.x moved 3.0.0 -> 3.1.2 in ten days; upgrades are
+# deliberate, not drive-by (design §1.1). MCP spec 2026-07-28 — the same
+# protocol family Codex CLI ships.
+rmcp = { version = "=3.1.2", features = ["server", "transport-io", "macros"] }
+# JSON schema generation for tool parameter structs. Same major rmcp itself
+# uses (rmcp depends on schemars 1.x), so the derive and the SDK agree.
+schemars = "1"
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Logs go to STDERR ONLY — stdout is the JSON-RPC channel (design §1.2).
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Mock backend for the demo-guard behavior tests (design §6.1.3). Same axum
+# major the real backend uses, so the mock speaks identical HTTP.
+axum = "0.8"

@@ -1,0 +1,115 @@
+[package]
+name = "neoethos-search"
+version = "0.5.6"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = "0.4.44"
+# cubecl 0.10 — pure defaults; runtime selection happens downstream.
+# See neoethos-models/Cargo.toml for the full reasoning (AMD Vulkan
+# SPIR-V driver crash avoidance).
+cubecl = { version = "0.10.0", optional = true }
+# AREA 1 (2026-06-09): direct handle on the cubecl memory-management types
+# (`MemoryConfiguration::Custom` / `MemoryPoolOptions` / `PoolType`) used to inject
+# a BOUNDED wgpu pool in `create_gpu_client`. cubecl/cubecl-wgpu only re-export
+# `MemoryConfiguration` (cubecl-wgpu runtime.rs:15) — the pool-option structs are
+# NOT re-exported, so we name `cubecl_runtime` directly. Version pinned to the same
+# 0.10.0 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the graph.
+# Optional + gated to `gpu` so the non-GPU build never pulls it.
+cubecl-runtime = { version = "0.10.0", optional = true }
+cubecl-common = { version = "0.10.0", optional = true }
+ndarray = { version = "0.17.2", features = ["rayon"] }
+itertools = "0.14.0"
+rand = "0.9.2"
+# AREA 2 / Stage A (2026-06-09): deterministic ChaCha8 RNG for the GPU-batched
+# Monte-Carlo perturbation screen. Seeded per (combo, candidate, run) so the
+# batched population run reproduces the old serial MC bit-for-bit AND is
+# reproducible across CPU/GPU. rand_chacha 0.9 is the companion of rand 0.9
+# (already in Cargo.lock transitively).
+rand_chacha = "0.9.0"
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+sha2.workspace = true
+statrs = "0.18.0"
+# Filesystem free-space probe for `trial_returns.rs`. The per-trial return
+# matrix is capped by a SHARE OF ACTUAL DISK HEADROOM rather than by a constant,
+# so the cap means the same thing on a laptop and on a rented box. Pinned to the
+# same 0.39.6 neoethos-core and neoethos-app already resolve, so this adds a
+# dependency EDGE and not a second copy in the graph.
+sysinfo = "0.39.6"
+tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
+neoethos-data = { path = "../neoethos-data" }
+neoethos-dataset-contracts.workspace = true
+neoethos-broker-truth = { path = "../neoethos-broker-truth" }
+neoethos-core = { path = "../neoethos-core" }
+neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
+neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
+duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
+# REMOVED 2026-08-02: `tch = { version = "0.22.0", optional = true }`.
+# No feature in this crate ever listed `dep:tch`, and no file under src/
+# mentions `tch::` — it was already unreachable. Its stated purpose (CUDA
+# device enumeration) is served by neoethos-gpu-cuda / cudarc, which query
+# the driver directly.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+
+[features]
+default = []
+# Profiler builds link NVIDIA's NVTX C API. Ordinary builds retain a no-op
+# instrumentation API and never require the NVIDIA toolkit/library.
+nvtx = []
+# `gpu`: pulls in the GPU dep chain — cubecl for the SL/TP-faithful
+# eval/backtest kernel (`cubecl_eval.rs`). After audit 2026-05-24 the legacy
+# `discovery_gpu` + `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC
+# of orphan code targeting Hyperstack-N3 specifically). The concrete runtime is
+# selected by the vendor aliases below; `gpu` itself binds NO runtime, so a
+# Vulkan build never compiles cubecl-cuda.
+#
+# CORRECTED 2026-08-02. This comment used to claim that "generic multi-GPU
+# support now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
+# `tch::Cuda::device_count()`". No shipped build did anything of the kind:
+# `tch` was an optional dependency that no feature enabled, `tch::` appears
+# nowhere under src/, and `cubecl_eval.rs` binds one client. Every run has
+# been single-device. Multi-GPU is unbuilt work, not a feature to be
+# rediscovered — the claim is deleted rather than softened so nobody plans
+# against it again.
+gpu = ["dep:cubecl", "dep:cubecl-runtime", "dep:cubecl-common"]
+# #205: vendor-aware aliases so the top-level binary can pick a backend
+# without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
+# over `R: Runtime`, so each alias just selects the cubecl runtime:
+# - gpu-cuda   → CUDA (NVIDIA), plus the native `neoethos-gpu-cuda` engine.
+# - gpu-vulkan → cubecl-wgpu via the naga→SPIR-V path (`wgpu`, NOT `wgpu-spirv`:
+#   the direct-SPIR-V passthrough crashes AMD's Vulkan driver). Runs on the
+#   integrated AMD GPU here and on any wgpu adapter (Vulkan/DX12/Metal).
+# - gpu-rocm   → cubecl HIP (AMD discrete, Linux).
+gpu-cuda = [
+    "gpu",
+    "gpu-b-native",
+    "cubecl/cuda",
+    "neoethos-core/gpu-cuda",
+    "neoethos-data/gpu-cuda",
+]
+# Prototype B is a native-CUDA engine: it links the `neoethos-gpu-cuda` C ABI
+# and needs neither CubeCL nor libtorch. This feature exists on its own so a
+# rented GPU box can prove the B kernel with nothing but rustc, a C++ compiler
+# and nvcc, instead of provisioning the entire GPU dependency chain first.
+# `gpu-cuda` implies it, so a full build is unchanged.
+# The B adapter's types and control flow, without requiring nvcc. The native
+# crate has an honest no-CUDA stub, so this lets the discovery-side adapter be
+# type-checked on a developer machine and in CI, where the full `gpu-b-native`
+# build cannot even start. It reports no devices at runtime, so nothing routes
+# to the GPU under this feature alone.
+gpu-b-adapter = ["dep:neoethos-gpu-cuda"]
+gpu-b-native = ["gpu-b-adapter", "neoethos-gpu-cuda/cuda"]
+gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
+gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
+strategy-db = ["dep:duckdb"]
+
+[dev-dependencies]
+# The probe example needs a subscriber to surface the engine's own diagnostics.
+tracing-subscriber = { workspace = true }
+tempfile = "3.27"

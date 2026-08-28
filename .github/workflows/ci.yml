@@ -1,0 +1,273 @@
+name: CI
+
+# Manual-only by design.
+#
+# The repository is in an active strategy-search/refactor phase. Running CI on
+# every small push creates noisy failed notifications before related changes are
+# complete. Start this workflow manually from the Actions tab when you want a
+# full repository health check.
+on:
+  workflow_dispatch:
+    inputs:
+      run_default_features:
+        description: "Also run workspace checks with default features"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      enable_gpu:
+        description: "Enable GPU testing (NVIDIA/AMD)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+
+jobs:
+  workspace-linux:
+    name: Workspace check/test (Linux)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against Python/PyO3 reintroduction
+        shell: bash
+        run: |
+          # scripts/check_no_python_legacy.sh was deleted; inline equivalent.
+          if git grep -nEi '(^|[^[:alnum:]_])(pyo3|pythonize)([^[:alnum:]_]|$)' --             Cargo.toml Cargo.lock 'crates/**/Cargo.toml'             desktop/src-tauri/Cargo.toml mcp/Cargo.toml mesh/Cargo.toml; then
+            echo 'Python/PyO3 dependency found in a Rust manifest or lockfile.' >&2
+            exit 1
+          fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake mold pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-workspace-ci-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features
+
+      - name: Run workspace tests without default features
+        run: cargo test --workspace --no-default-features
+
+      - name: Run neoethos-codex tests
+        run: cargo test -p neoethos-codex
+
+      - name: Cargo check workspace with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo check --workspace --all-targets
+
+      - name: Run workspace tests with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo test --workspace
+
+  # GPU-accelerated Linux job with NVIDIA CUDA support
+  workspace-linux-gpu-nvidia:
+    name: Workspace check/test (Linux + NVIDIA GPU)
+    runs-on: [self-hosted, linux, gpu, nvidia]
+    if: ${{ inputs.enable_gpu == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check NVIDIA GPU availability
+        run: |
+          nvidia-smi
+          echo "CUDA version:"
+          nvcc --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake mold pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-gpu-nvidia-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-gpu-nvidia-ci-
+
+      # The workspace has NO feature named `cuda` — the per-crate GPU
+      # features are gpu-cuda (models/search) aggregated as gpu-nvidia in
+      # the binaries. Build the CLI the way the GPU releases always were.
+      - name: Build CLI with NVIDIA GPU support
+        run: cargo build -p neoethos-cli --release --features gpu-nvidia
+        env:
+          CUDA_PATH: /usr/local/cuda
+
+      # One shared inventory pins every expected passing/ignored count and
+      # rejects skip/fallback/substitution diagnostics. CubeCL tests need their
+      # explicit real-device switch in addition to the generic strict policy.
+      - name: Strict NVIDIA real-device validation
+        run: |
+          bash scripts/gpu-bench/check_cuda_hardware.sh
+          bash scripts/gpu-bench/run_cuda_validation.sh all
+          bash scripts/gpu-bench/run_cuda_memcheck_validation.sh all
+        env:
+          CUDA_PATH: /usr/local/cuda
+          NEOETHOS_REQUIRE_GPU: "1"
+          NEOETHOS_RUN_CUDA_SEARCH_TESTS: "1"
+
+  # GPU-accelerated Linux job with AMD ROCm support
+  workspace-linux-gpu-amd:
+    name: Workspace check/test (Linux + AMD GPU)
+    runs-on: [self-hosted, linux, gpu, amd]
+    if: ${{ inputs.enable_gpu == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check AMD GPU availability
+        run: |
+          rocm-smi
+          echo "ROCm version:"
+          hipcc --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake mold pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
+          # and dtolnay's action overrides rust-toolchain.toml.
+          toolchain: nightly-2026-04-07
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-gpu-amd-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-gpu-amd-ci-
+
+      # No workspace `rocm` feature exists — the aggregate is gpu-rocm.
+      - name: Build CLI with AMD GPU support
+        run: cargo build -p neoethos-cli --release --features gpu-rocm
+        env:
+          ROCM_PATH: /opt/rocm
+
+      - name: GPU parity tests (CPU == GPU, ROCm)
+        run: cargo test -p neoethos-search --release --features gpu-rocm gpu_ -- --nocapture
+        env:
+          ROCM_PATH: /opt/rocm
+          NEOETHOS_REQUIRE_GPU: "1"
+
+  # V0.4 audit Task #46 — extend CI beyond Linux so the cfg(windows) /
+  # cfg(macos) paths get exercised on every dispatch. The codebase has
+  # Windows-specific autostart code, file-system path quirks, and a
+  # `packaging_smoke` test gated `cfg(not(windows))` for Git Bash path
+  # translation issues; running `cargo check --workspace` (NOT the full
+  # test matrix, to keep CI cost bounded) on each target catches the
+  # most common cross-platform regressions before they reach the
+  # release pipeline.
+  workspace-windows:
+    name: Workspace check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-workspace-ci-
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features
+      # Compile the WGPU path on every Windows dispatch even when the runner has
+      # no physical GPU. This catches WinRT/D3D12 dependency-family drift before
+      # it reaches a release or an optional self-hosted GPU parity job.
+      - name: Cargo check Windows WGPU path
+        run: cargo check -p neoethos-search --features gpu-vulkan --locked
+
+  workspace-macos:
+    name: Workspace check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-workspace-ci-
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features

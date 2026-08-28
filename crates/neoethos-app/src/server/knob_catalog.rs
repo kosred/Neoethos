@@ -1,0 +1,1253 @@
+//! `/settings/knob-catalog` — machine-readable catalog of every runtime
+//! knob the bot honours.
+//!
+//! This is the JSON counterpart to `docs/CONFIG-KNOBS-REFERENCE.md` —
+//! the operator-facing markdown reference. The Flutter "Advanced
+//! Settings" screen calls `GET /settings/knob-catalog`, gets back a
+//! flat list of `KnobEntry` records, and renders each with a tooltip
+//! (description), a numeric / dropdown / toggle widget (driven by
+//! `kind`), and a "current value" badge (live from the typed runtime
+//! overrides).
+//!
+//! ## Why this exists
+//!
+//! Operator directive 2026-05-25: "βάζουμε στο UI όλες τις πιθανές
+//! επιλογές που υπάρχουν μαζί με ένα help section που να εξηγεί τι
+//! είναι το κάθε τι και πως επιρεαζει το bot και τις λειτουργίες
+//! του. Φυσικά θα υπάρχουν κάποια presets για ευκολία και ασφάλεια."
+//!
+//! Translation: "we put in the UI every possible option that exists
+//! plus a help section that explains what each one is and how it
+//! affects the bot and its functions. Of course there will be some
+//! presets for convenience and safety."
+//!
+//! ## Layering
+//!
+//! - **Catalog** (this module): the schema + help text + defaults +
+//!   ranges + preset values. Compiled into the binary so the
+//!   Flutter UI never has to bundle a copy of the help text.
+//! - **Current values**: read at request time from the installed
+//!   `*RuntimeOverrides` structs via the existing
+//!   `current_*_runtime_overrides()` accessors. This is the
+//!   "what is the bot using right now" badge in the UI.
+//! - **Write path** (future): `POST /settings/knobs` will write the
+//!   operator's changes to `config.yaml` and tell them to restart.
+//!   Hot-reloading typed overrides is out of scope for Phase 1 (it
+//!   would require converting OnceLock → RwLock across every
+//!   override struct, which is a bigger refactor).
+
+use axum::Json;
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+
+use super::state::AppApiState;
+
+/// One knob in the catalog. Serializes as JSON for the Flutter UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnobEntry {
+    /// Stable machine-readable id (e.g. `"ctrader.max_attempts"`).
+    /// The Flutter UI keys on this; renaming a knob requires
+    /// updating the front-end too.
+    pub id: &'static str,
+
+    /// Section the knob belongs to (matches the headings in
+    /// `docs/CONFIG-KNOBS-REFERENCE.md`).
+    pub section: &'static str,
+
+    /// Human-readable display name for the Settings card.
+    pub label: &'static str,
+
+    // ── `env_var` — DELETED 2026-08-10 (W2-7 / D-F1) ────────────────────
+    //
+    // The field carried a "historical env-var name" for 51 of these entries,
+    // under its own doc comment admitting it had NOT been audited per entry
+    // and was "PROVENANCE, not behaviour". That distinction does not survive
+    // the wire: this catalog is served verbatim to the LLM control plane
+    // (`crates/neoethos-mcp/src/ops.rs:803` → `server.rs:718`, described to
+    // the model as the authoritative list of every runtime knob) and rendered
+    // in Settings → Advanced. Both audiences read a variable name next to a
+    // knob as a way to set the knob.
+    //
+    // Every one of those names is now inert. The search-side readers
+    // (`install_search_runtime_overrides_from_env` and the `*_from_env`
+    // constructors behind the ~35 `NEOETHOS_BOT_PROP_*` entries) were deleted
+    // on 2026-08-03; the app-side ones moved to `AppRuntimeConfig` and were
+    // deleted here on 2026-08-10. Telling an agent to export
+    // `NEOETHOS_BOT_PROP_TOURNAMENT_SIZE` and then reporting the change as
+    // applied is the exact failure this wave exists to end.
+    //
+    // The field is REMOVED rather than set to `None` everywhere: 51 `None`s
+    // are a slot waiting for someone to fill it back in. Nothing in
+    // `desktop/src/**` reads `envVar` (only a prose comment in
+    // `Advanced.tsx:441` mentions it), so dropping the JSON key breaks no UI.
+    //
+    // Deliberately NOT replaced with a `config_key` field. Populating one
+    // correctly for 51 entries is an audit — `id` here is a display path
+    // (`"backtest.max_month_buckets"`), not a config path
+    // (`models.backtest_runtime.month_capacity`) — and a `config_key` guessed
+    // from the id would be the same lie in a new field. The retired NAMES are
+    // not lost: `app_services::retired_env` holds them with their replacement
+    // keys and prints them when one is still exported.
+    /// What kind of widget the UI should render. **2026-05-26**: this
+    /// field is `#[serde(flatten)]` so the `KnobKind` variant's tag
+    /// (`kind`) and constraint fields (`min`, `max`, `enumChoices`)
+    /// surface as top-level JSON keys instead of a nested object —
+    /// matching what Flutter's `KnobDescriptor.fromJson` expects.
+    #[serde(flatten)]
+    pub kind: KnobKind,
+
+    /// Default value (as a string — the front-end parses by `kind`).
+    pub default: &'static str,
+
+    /// Current value (as a string — read at request time from the
+    /// installed runtime overrides; falls back to the default when
+    /// no install has happened).
+    pub current: String,
+
+    /// Short help text (1-2 sentences) — shown as a tooltip.
+    pub help_short: &'static str,
+
+    /// Long help text — shown in an expanded info box. Includes the
+    /// "effect on the bot" explanation from the markdown reference.
+    pub help_long: &'static str,
+
+    /// Recommended value for each safety preset. Empty values mean
+    /// "use the default" or "this knob isn't preset-driven".
+    pub preset_conservative: &'static str,
+    pub preset_balanced: &'static str,
+    pub preset_aggressive: &'static str,
+}
+
+/// **2026-05-26 fix (Κωνσταντίνος)**: was previously serialized via the
+/// default externally-tagged + kebab-case representation, producing
+/// JSON like `{"int": {"min": 0, "max": 3600}}` for struct variants
+/// and `"bool"` for unit variants. The Flutter Advanced Settings
+/// screen (`advanced_settings_screen.dart:646-674`) parses with:
+///   ```dart
+///   kind: j['kind'] as String? ?? 'Text',
+///   minValue: (j['min'] as num?)?.toDouble(),
+///   enumChoices: (j['enumChoices'] as List?)?.cast<String>(),
+///   ```
+/// — i.e. expects a **flat** shape with `kind` as a String and
+/// `min`/`max`/`enumChoices` as siblings of `kind`. Under the old
+/// serde, `j['kind']` for any Int/Float/Enum knob was a `Map`, so the
+/// `as String?` cast fell through to `'Text'`, every numeric input
+/// rendered as a plain TextField with no clamping, every enum lost
+/// its dropdown, and the Save button silently dropped most edits.
+///
+/// Switching to `#[serde(tag = "kind")]` + `#[serde(flatten)]` on the
+/// containing `KnobEntry.kind` field gives us exactly the shape the
+/// UI wants: `{"id": "...", "kind": "Int", "min": 0, "max": 3600,
+/// ...}`. Unit variants serialize as `{"kind": "Bool"}` with no
+/// extras. The `variants` field renames to `enumChoices` to match
+/// the camelCase wire convention used by the rest of the DTOs.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum KnobKind {
+    /// Integer with optional min/max clamp.
+    Int {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
+    /// Floating-point with optional min/max clamp.
+    Float {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+    },
+    /// Boolean checkbox.
+    Bool,
+    /// Free-text string.
+    Text,
+    /// One of a fixed enum set. Flutter side reads this as
+    /// `enumChoices`, not `variants`.
+    Enum {
+        #[serde(rename = "enumChoices")]
+        variants: &'static [&'static str],
+    },
+    /// Filesystem path.
+    Path,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnobCatalogResponse {
+    pub schema_version: u32,
+    pub generated_at_unix_ms: i64,
+    pub knobs: Vec<KnobEntry>,
+}
+
+/// Wire schema of `GET /settings/knob-catalog`.
+///
+/// **2 (2026-08-10)** — the `envVar` key was REMOVED from every entry (W2-7).
+/// A consumer pinned to v1 that expects the key must treat its absence as
+/// "this knob has no environment variable", which is now true of all of them.
+/// Bumped rather than dropped silently because the LLM control plane reads
+/// this payload as authoritative.
+///
+/// 1 — original shape, with `envVar`.
+const SCHEMA_VERSION: u32 = 2;
+
+/// Build the catalog. Each entry reads its `current` value from the
+/// installed runtime overrides; the static parts come from the
+/// catalog array.
+pub fn build_catalog() -> Vec<KnobEntry> {
+    use neoethos_search::current_genetic_search_runtime_overrides as ga;
+    use neoethos_search::current_quality_runtime_overrides as quality;
+    use neoethos_search::current_strategy_evaluation_runtime_overrides as strat;
+
+    let ga_overrides = ga();
+    let quality_overrides = quality();
+    let strat_overrides = strat();
+
+    let cost = &strat_overrides.cost_profile;
+    let smc = &ga_overrides.smc_gate;
+
+    // The live-blend multipliers have no runtime-override cache to read from —
+    // they are plain `Settings` fields consulted at engine start
+    // (`live_trading::operator_blend_gate_floor` / `_veto_below`). Read the
+    // operator's store once; an unreadable config falls back to the compiled
+    // defaults, which is exactly what the engine would use, so the catalog
+    // cannot show a number the run would not use.
+    let settings = neoethos_core::Settings::from_yaml(super::state::current_config_path())
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                target: "neoethos_app::knob_catalog",
+                error = %err,
+                "could not read the config for the knob catalog — showing the compiled \
+                 defaults, which is what a run with an unreadable config would also use"
+            );
+            neoethos_core::Settings::default()
+        });
+    let models = &settings.models;
+    let resolved_cpu_budget = neoethos_core::execution_budget::installed_process_budget()
+        .map(|installed| installed.resolved().clone())
+        .unwrap_or_else(|| {
+            neoethos_core::ExecutionBudgetInputs::from_settings_and_parent(
+                &settings,
+                None,
+                neoethos_core::execution_budget::CoordinationScope::ProcessLocal,
+            )
+            .unwrap_or_else(|error| panic!("invalid CPU execution budget input: {error}"))
+            .resolve()
+            .unwrap_or_else(|error| panic!("invalid CPU execution budget request: {error}"))
+        });
+
+    vec![
+        // ── Section 1 — System hardware ──────────────────────────────────
+        KnobEntry {
+            id: "system.hardware.cpu_budget",
+            section: "System hardware",
+            label: "Maximum CPU workers",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: None,
+            },
+            default: "auto: effective logical threads - 2",
+            current: resolved_cpu_budget.effective_worker_limit.get().to_string(),
+            help_short: "Auto uses effective logical threads minus two reserved threads; a value can only narrow that process ceiling.",
+            help_long: "The effective logical-thread count comes from the OS/cgroup/affinity-aware process view. Auto keeps a fixed two-thread stability reserve when at least three threads are available. This is the only persistent CPU-width knob; every Rayon, native-library, parser, model, and child-process worker count is admitted beneath the same ceiling.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        // ── Section 2 — Broker connectivity ──────────────────────────────
+        KnobEntry {
+            id: "ctrader.read_timeout_secs",
+            section: "Broker connectivity (cTrader)",
+            label: "Read timeout (seconds)",
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(3600),
+            },
+            default: "30",
+            current: "30".to_string(), // Read inline in execute_via_session; no typed cache yet.
+            help_short: "Caps the TCP read for cTrader execution; 0 disables.",
+            help_long: "Without this cap, a broker stall could wedge the trading loop indefinitely. With it, the I/O error bubbles up, the session is dropped, and the next attempt re-authenticates. Lower (15s) for low-latency colo; raise for slow consumer networks.",
+            preset_conservative: "30",
+            preset_balanced: "30",
+            preset_aggressive: "15",
+        },
+        KnobEntry {
+            id: "ctrader.max_attempts",
+            section: "Broker connectivity (cTrader)",
+            label: "Max execution attempts",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(5),
+            },
+            default: "3",
+            current: "3".to_string(),
+            help_short: "Initial + retries per cTrader order. Retry safety relies on the broker deduping by clientOrderId.",
+            help_long: "Lower (2) is safer for the prop-firm gate; higher (5) gives more retry resilience at the cost of duplicate-order risk if the broker's dedup misbehaves.",
+            preset_conservative: "2",
+            preset_balanced: "3",
+            preset_aggressive: "5",
+        },
+        KnobEntry {
+            id: "ctrader.backoff_base_ms",
+            section: "Broker connectivity (cTrader)",
+            label: "Retry backoff base (ms)",
+            kind: KnobKind::Int {
+                min: Some(10),
+                max: Some(2000),
+            },
+            default: "200",
+            current: "200".to_string(),
+            help_short: "Base backoff in ms; doubles per attempt with 0-99ms jitter, capped at 5s total.",
+            help_long: "Slower retries (500ms) are gentler on the broker; faster (100ms) recovers quicker from transient errors but risks rate-limiting.",
+            preset_conservative: "500",
+            preset_balanced: "200",
+            preset_aggressive: "100",
+        },
+        KnobEntry {
+            id: "ctrader.allow_partial_fill",
+            section: "Broker connectivity (cTrader)",
+            label: "Accept partial fills",
+            kind: KnobKind::Bool,
+            default: "false",
+            current: "false".to_string(),
+            help_short: "When off, partial fills error out; when on, they're accepted as final.",
+            help_long: "Conservative trading rejects partial fills so the risk-per-trade math stays consistent. Aggressive mode accepts whatever the broker can fill — useful on illiquid pairs where partial is better than nothing.",
+            preset_conservative: "false",
+            preset_balanced: "false",
+            preset_aggressive: "true",
+        },
+        KnobEntry {
+            id: "ctrader.chart_merge_side",
+            section: "Broker connectivity (cTrader)",
+            label: "Chart merge side",
+            kind: KnobKind::Enum {
+                variants: &["mid", "bid", "ask"],
+            },
+            default: "mid",
+            current: "mid".to_string(),
+            help_short: "Which side of the spread the chart layer uses when one price is needed.",
+            help_long: "Mid is the broker-standard convention. Bid/Ask let you model worst-case slippage explicitly for backtests.",
+            preset_conservative: "mid",
+            preset_balanced: "mid",
+            preset_aggressive: "mid",
+        },
+        // ── Section 2 — Risk & PnL ─────────────────────────────────────
+        KnobEntry {
+            id: "risk.account_currency",
+            section: "Risk & PnL safety",
+            label: "Account currency (ISO-4217)",
+            kind: KnobKind::Text,
+            default: "(unset → hard-fail at risk gate)",
+            current: cost
+                .account_currency
+                .clone()
+                .unwrap_or_else(|| "(unset)".to_string()),
+            help_short: "ISO-4217 code (USD/EUR/GBP/JPY/CHF/CAD/AUD/NZD…) for the funded account. Required.",
+            help_long: "Drives the pip-value math in the risk gate. With a wrong account currency, position sizing is wrong (e.g. treating GBP as USD overstates risk by ~20%). Operator-supplied via Settings → Broker Setup once; never auto-defaulted.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "paths.symbol_metadata_override",
+            section: "Logging / persistence",
+            label: "Symbol-metadata path override",
+            kind: KnobKind::Path,
+            default: "data/symbol_metadata.json",
+            current: "data/symbol_metadata.json".to_string(),
+            help_short: "Overrides the on-disk symbol-metadata JSON file.",
+            help_long: "By default the bot reads `data/symbol_metadata.json` (auto-populated from the cTrader ProtoOASymbol records). Override to point at a frozen snapshot for reproducible offline backtests.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "paths.user_data_dir_override",
+            section: "Logging / persistence",
+            label: "User data dir override",
+            kind: KnobKind::Path,
+            default: "(platform default — %LOCALAPPDATA% on Windows)",
+            current: "(platform default)".to_string(),
+            help_short: "Where logs and persistent state live. Override to redirect to a portable drive or RAM disk.",
+            // ⚠ One of exactly three catalog entries whose environment
+            // variable is STILL LIVE after the 2026-08-10 consolidation, and
+            // the only one that can change WHICH CONFIG FILE the process
+            // reads. `neoethos_core::config::user_config_path()` consults
+            // `crate::env_overrides::user_data_dir_override()` (config.rs:3872)
+            // and already logs "NEOETHOS_USER_DATA_DIR IS REDIRECTING THE
+            // CONFIG FILE" (config.rs:3883) when it fires. It lives in
+            // `neoethos-core`, which this wave could not edit; recorded as A9
+            // in the handoff. Said out loud in the help text rather than left
+            // for an operator to discover.
+            help_long: "By default `dirs::data_local_dir()` resolves to `%LOCALAPPDATA%/NeoEthos` on Windows. Override only if you have a specific reason (portable installation, faster disk, segregated backup target). ⚠ This one is still driven by the `NEOETHOS_USER_DATA_DIR` environment variable, not by this file — and it decides which config file the process reads, so setting it changes the answer to every other question on this screen. The startup log names it explicitly when it is in force.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "risk.prop_firm_preset",
+            section: "Risk & PnL safety",
+            label: "Prop-firm preset",
+            kind: KnobKind::Enum {
+                variants: &["ftmo", "myforexfunds", "fundednext", "the5ers", "none"],
+            },
+            default: "ftmo",
+            current: "ftmo".to_string(),
+            help_short: "Seeds RiskConfig defaults from the chosen prop-firm's published rules.",
+            help_long: "Sets daily-loss / max-drawdown / profit-target / min-trading-days defaults. Operator can override individual fields. Pick the preset that matches your funded account.",
+            preset_conservative: "ftmo",
+            preset_balanced: "ftmo",
+            preset_aggressive: "none",
+        },
+        KnobEntry {
+            id: "risk.require_stop_loss",
+            section: "Risk & PnL safety",
+            label: "Require Stop-Loss on every order",
+            kind: KnobKind::Bool,
+            default: "true",
+            current: "true".to_string(),
+            help_short: "When on, the risk gate REJECTS any order without a stop_loss.",
+            help_long: "**F-249/F-271 closure (2026-05-25 — operator-approved configurable preset)**: Conservative preset turns this ON so prop-firm validation never trades without SL. Balanced/Aggressive turn it OFF for scalp strategies that fill first and place SL second. NOTE: Risky Mode ALWAYS requires SL+TP regardless of this flag (kill-switch math depends on it). **2026-08-09 (W1) — this control now ENFORCES.** Until today it was displayed here and in GET /risk and read by no code path at all. It is enforced in `server::orders::place` and `place_pending`: with it ON, `stopLossPips` is mandatory on a manual order and `risky:true` does NOT override it. It does not touch order SIZE — the manual path deliberately applies no lot cap.",
+            preset_conservative: "true",
+            preset_balanced: "false",
+            preset_aggressive: "false",
+        },
+        KnobEntry {
+            id: "models.blend_gate_floor",
+            section: "Risk & PnL safety",
+            label: "Live blend floor (how small ML may shrink a gene entry)",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.34",
+            current: format!("{}", models.blend_gate_floor),
+            help_short: "Smallest fraction of its size a validated gene entry may be shrunk to by a lukewarm ensemble.",
+            help_long: "Only applies while `models.live_ml_gate` is ON. The genes ALWAYS pick the direction; ML can only shrink size. This floor is what stops a lukewarm model from gating a validated gene edge to nothing — at 0.34 a bar the ensemble is unsure about still trades at a third of its size. Raise it to give ML less authority over sizing, lower it to give ML more. **2026-08-10 (#232): this was a hardcoded literal in the live sizing path with no config recipient — the value shown here is now the one the engine reads.** An out-of-range, non-finite, or inverted pair (floor below the veto) is REFUSED back to these defaults by `BlendConfig::from_config_values` and logged with both numbers, so a bad value cannot silently change a live position size.",
+            preset_conservative: "0.50",
+            preset_balanced: "0.34",
+            preset_aggressive: "0.20",
+        },
+        KnobEntry {
+            id: "models.blend_veto_below",
+            section: "Risk & PnL safety",
+            label: "Live blend veto (skip the bar below this multiplier)",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.15",
+            current: format!("{}", models.blend_veto_below),
+            help_short: "Effective multiplier below which the live blend SKIPS the bar instead of sizing it to the floor.",
+            help_long: "Without this, a bar the ensemble almost fully rejects would still open at the minimum lot the sizing floor allows. Must be <= the blend floor, or every floored bar would be vetoed — that pair is refused back to the shipped defaults, loudly. Raise it to skip more marginal bars; lower it to take them small. Only applies while `models.live_ml_gate` is ON.",
+            preset_conservative: "0.25",
+            preset_balanced: "0.15",
+            preset_aggressive: "0.05",
+        },
+        KnobEntry {
+            id: "risk.reject_pip_fallback",
+            section: "Risk & PnL safety",
+            label: "Reject cross-pair pip-value fallback",
+            kind: KnobKind::Bool,
+            default: "false",
+            current: format!("{}", cost.reject_pip_fallback),
+            help_short: "When on, cross-pair pip-value fallback bails out instead of using a possibly-wrong quote-currency value.",
+            help_long: "Recommended on prop-firm runs: fail loudly if a cross pair lacks an FX rate. Off keeps the historical tolerant behaviour.",
+            preset_conservative: "true",
+            preset_balanced: "false",
+            preset_aggressive: "false",
+        },
+        // ── Section 3 — Discovery / GA ─────────────────────────────────
+        KnobEntry {
+            id: "ga.seed",
+            section: "Discovery / GA search",
+            label: "RNG seed (deterministic)",
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: None,
+            },
+            default: "(unset — non-deterministic)",
+            current: ga_overrides
+                .seed
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
+            help_short: "Setting any value makes the GA run deterministic. Unset → OS-RNG seed.",
+            help_long: "Set during validation runs to compare changes apples-to-apples. Leave unset for production search so the GA gets fresh randomness.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "ga.novelty_weight",
+            section: "Discovery / GA search",
+            label: "Novelty bonus weight",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.0",
+            current: format!("{}", ga_overrides.novelty_weight),
+            help_short: "Favours diverse genes during selection; 0 = pure fitness ranking.",
+            help_long: "Useful when the GA gets stuck in a local optimum. 0.05 = mild diversity nudge; 0.15 = strong novelty push.",
+            preset_conservative: "0.0",
+            preset_balanced: "0.05",
+            preset_aggressive: "0.15",
+        },
+        KnobEntry {
+            id: "ga.stagnation_patience",
+            section: "Discovery / GA search",
+            label: "Stagnation patience (generations)",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(50),
+            },
+            default: "2",
+            current: format!("{}", ga_overrides.stagnation_patience),
+            help_short: "Generations of no-progress before the SOFT diversity kick / gate relaxation triggers.",
+            help_long: "Low (1-2) reacts to stagnation quickly: relaxes the SMC gate, raises random immigrants and hypermutation to explore new indicator subsets. This is NOT the hard stop — see Convergence patience.",
+            preset_conservative: "1",
+            preset_balanced: "2",
+            preset_aggressive: "5",
+        },
+        KnobEntry {
+            id: "ga.convergence_patience",
+            section: "Discovery / GA search",
+            label: "Convergence patience (generations)",
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(5000),
+            },
+            default: "250",
+            current: format!("{}", ga_overrides.convergence_patience),
+            help_short: "Flat generations before the combo HARD early-stops — but ONLY after the wall-clock floor (see below). 0 = never (run to the time cap).",
+            help_long: "After the soft diversity kick fails to break stagnation for this many generations AND at least the 'Convergence min-elapsed fraction' of the time budget has passed, the search stops and the run advances to the next pair/timeframe — coverage beats depth on a converged combo. The wall-clock floor is essential: generation rate varies ~300x across timeframes, so without it a fast TF would hit 250 gens (~1s) and stop before finding any strategy. 0 disables (grind until prop_search_max_hours).",
+            preset_conservative: "120",
+            preset_balanced: "250",
+            preset_aggressive: "600",
+        },
+        KnobEntry {
+            id: "ga.min_improvement",
+            section: "Discovery / GA search",
+            label: "Min improvement epsilon",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.000000000001",
+            current: format!("{}", ga_overrides.min_improvement),
+            help_short: "Minimum top-fitness gain counted as real progress when measuring stagnation.",
+            help_long: "A generation whose best fitness rises by less than this counts as stagnant. The tiny default (1e-12) means any numeric gain resets stagnation; raise it (e.g. 0.001) to ignore micro-improvements so the convergence early-stop fires on plateaus that only tick up imperceptibly.",
+            preset_conservative: "0.0",
+            preset_balanced: "0.000000000001",
+            preset_aggressive: "0.001",
+        },
+        KnobEntry {
+            id: "ga.convergence_min_elapsed_fraction",
+            section: "Discovery / GA search",
+            label: "Convergence min-elapsed fraction",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.5",
+            current: format!("{}", ga_overrides.convergence_min_elapsed_fraction),
+            help_short: "Fraction of the per-combo time budget that MUST elapse before the convergence early-stop may fire.",
+            help_long: "The throughput-safety floor for the early-stop. 0.5 = every combo gets at least half its time budget to search before it can be early-stopped, so fast timeframes are never killed in seconds. Lower (0.25) = more aggressive savings but higher risk of cutting a combo that was still finding strategies. 1.0 = effectively disables the early-stop (only the time cap stops the combo). 0 = no floor (pure generation count — NOT recommended).",
+            preset_conservative: "0.66",
+            preset_balanced: "0.5",
+            preset_aggressive: "0.25",
+        },
+        KnobEntry {
+            id: "ga.tournament_size",
+            section: "Discovery / GA search",
+            label: "Tournament size override",
+            kind: KnobKind::Int {
+                min: Some(2),
+                max: Some(64),
+            },
+            default: "(derived: max(pop/12, 3))",
+            current: ga_overrides
+                .tournament_size_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "(derived)".to_string()),
+            help_short: "Larger tournaments → stronger selection → faster convergence, less diversity.",
+            help_long: "Default is population-derived. Manually pin only if your search is converging too slowly (raise) or losing diversity (lower).",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "ga.smc_gate_start",
+            section: "Discovery / GA search",
+            label: "SMC gate start threshold",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.75",
+            current: format!("{}", smc.start),
+            help_short: "Where the SMC confluence gate begins each run.",
+            help_long: "Higher (0.85) = only strong SMC confluence passes. Lower (0.65) = permissive. Gate decays toward `end` over the run.",
+            preset_conservative: "0.85",
+            preset_balanced: "0.75",
+            preset_aggressive: "0.65",
+        },
+        KnobEntry {
+            id: "ga.smc_gate_end",
+            section: "Discovery / GA search",
+            label: "SMC gate end threshold",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
+            default: "0.35",
+            current: format!("{}", smc.end),
+            help_short: "Floor for the SMC confluence gate.",
+            help_long: "The gate decays from `start` to `end` along a power curve. Higher (0.45) = strict floor; lower (0.25) = permissive.",
+            preset_conservative: "0.45",
+            preset_balanced: "0.35",
+            preset_aggressive: "0.25",
+        },
+        KnobEntry {
+            id: "ga.disable_smc_gate",
+            section: "Discovery / GA search",
+            label: "Disable SMC gate (diagnostic)",
+            kind: KnobKind::Bool,
+            default: "false",
+            current: format!("{}", smc.disable_gate),
+            help_short: "DIAGNOSTIC ONLY: forces the SMC gate to bypass (active sum = 0).",
+            help_long: "Useful for isolating 'SMC indicators don't trigger on this symbol' from 'signal generation is broken'. Should NEVER be enabled in production — your strategies become unfiltered.",
+            preset_conservative: "false",
+            preset_balanced: "false",
+            preset_aggressive: "false",
+        },
+        // ── Section 5 — Quality / acceptance ───────────────────────────
+        KnobEntry {
+            id: "quality.min_trades_per_month",
+            section: "Quality / acceptance filtering",
+            label: "Min trades per month",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(200),
+            },
+            default: "4",
+            current: format!("{}", quality_overrides.min_trades_per_month),
+            help_short: "Strategies with fewer trades/month than this are rejected as undersampled.",
+            help_long: "Conservative (8) keeps only well-sampled strategies. Aggressive (2) tolerates rare-but-edge-rich strategies.",
+            preset_conservative: "8",
+            preset_balanced: "4",
+            preset_aggressive: "2",
+        },
+        KnobEntry {
+            id: "quality.trading_days_per_month",
+            section: "Quality / acceptance filtering",
+            label: "Trading days per month",
+            kind: KnobKind::Float {
+                min: Some(1.0),
+                max: Some(31.0),
+            },
+            default: "21.0",
+            current: format!("{}", quality_overrides.trading_days_per_month),
+            help_short: "Used to normalize trade frequency across calendars.",
+            help_long: "Forex trades ~22 days/month; 21 is the conservative round. Only matters for cross-strategy comparison.",
+            preset_conservative: "21.0",
+            preset_balanced: "21.0",
+            preset_aggressive: "21.0",
+        },
+        // ── Section 1 cont. — Broker streaming + transport ────────────
+        KnobEntry {
+            id: "ctrader.stream_max_attempts",
+            section: "Broker connectivity (cTrader)",
+            label: "Streaming max attempts",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(5),
+            },
+            default: "3",
+            current: "3".to_string(),
+            help_short: "Max attempts for `load_live_chart_update` poll (stateless, safe to retry).",
+            help_long: "Streaming polls are idempotent, so retries are safe. Default 3 is sensible for typical WiFi/VPS latencies; raise (5) on unstable links.",
+            preset_conservative: "3",
+            preset_balanced: "3",
+            preset_aggressive: "5",
+        },
+        KnobEntry {
+            id: "ctrader.stream_backoff_base_ms",
+            section: "Broker connectivity (cTrader)",
+            label: "Streaming backoff base (ms)",
+            kind: KnobKind::Int {
+                min: Some(10),
+                max: Some(2000),
+            },
+            default: "200",
+            current: "200".to_string(),
+            help_short: "Streaming-layer retry backoff base; doubles per attempt, capped at 5s total.",
+            help_long: "Mirror of the execution backoff. Slower (500ms) on unstable networks; faster (100ms) on colo / low-latency.",
+            preset_conservative: "500",
+            preset_balanced: "200",
+            preset_aggressive: "100",
+        },
+        // ── Section 2 cont. — Risk knobs ─────────────────────────────
+        KnobEntry {
+            id: "risk.quote_to_account_rate",
+            section: "Risk & PnL safety",
+            label: "Quote→account FX rate override",
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
+            default: "(unset — broker-derived)",
+            current: cost
+                .quote_to_account_rate
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "(unset)".to_string()),
+            help_short: "Live quote→account FX rate for cross-pair pip math. Only used during initial session before broker feeds it.",
+            help_long: "Cross pairs (e.g. EURGBP on a USD account) need a quote→account rate to convert pip value. The broker feeds this once the session is up; this override is mainly for offline backtests / paper trading when no live broker is connected.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "risk.pip_value",
+            section: "Cost model / pip-value",
+            label: "Per-pip account-currency value (override)",
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
+            default: "(broker symbol metadata)",
+            current: cost
+                .pip_value
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "(broker)".to_string()),
+            help_short: "Manual pip-value override. Leave unset; let broker symbol_metadata.json drive.",
+            help_long: "Only set when you're stress-testing a specific pip assumption (e.g. simulating a JPY pair with non-standard pip semantics). Production runs leave this empty and read from the broker's ProtoOASymbol records.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "risk.pip_value_per_lot",
+            section: "Cost model / pip-value",
+            label: "Per-lot pip value (override)",
+            kind: KnobKind::Float {
+                min: Some(0.000_001),
+                max: None,
+            },
+            default: "(broker symbol metadata)",
+            current: cost
+                .pip_value_per_lot
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "(broker)".to_string()),
+            help_short: "Pip value per standard lot, in account currency. Override only for stress-testing.",
+            help_long: "Companion to `risk.pip_value`. Same recommendation: leave unset for production.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "cost.spread_pips",
+            section: "Cost model / pip-value",
+            label: "Spread override (pips)",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(100.0),
+            },
+            default: "(broker-quoted)",
+            current: cost
+                .spread_pips
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "(broker)".to_string()),
+            help_short: "Stress-test override for the spread used in backtest cost math.",
+            help_long: "Conservative: +0.5 over broker-quoted (buffer for worst-case). Balanced: leave unset (use broker quote). Aggressive: 0.0 (zero-friction theoretical baseline). For prop-firm validation, stress-test with the widest spread your broker has quoted in the last 30 days.",
+            preset_conservative: "0.5",
+            preset_balanced: "",
+            preset_aggressive: "0.0",
+        },
+        KnobEntry {
+            id: "cost.commission_per_trade",
+            section: "Cost model / pip-value",
+            label: "Commission per trade (override)",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(50.0),
+            },
+            default: "(broker-quoted)",
+            current: cost
+                .commission_per_trade
+                .map(|v| format!("{v}"))
+                .unwrap_or_else(|| "(broker)".to_string()),
+            help_short: "Override commission per round-trip per standard lot.",
+            help_long: "Stress-test with the worst-case commission your broker quotes for your account class. cTrader typically charges $3-7 per round-trip per standard lot for raw-spread accounts.",
+            preset_conservative: "7.0",
+            preset_balanced: "",
+            preset_aggressive: "0.0",
+        },
+        // ── Section 3 cont. — GA archive / selection / SMC gate curve ─
+        KnobEntry {
+            id: "ga.archive_cap",
+            section: "Discovery / GA search",
+            label: "Archive capacity override",
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(200_000),
+            },
+            default: "(derived: min(pop × gens, 50000))",
+            current: ga_overrides
+                .archive_cap_override
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(derived)".to_string()),
+            help_short: "Maximum genes kept in the archive. Override only if RAM-constrained or deep-tuning.",
+            help_long: "Larger archive = more candidates for the final picker, more RAM. Capped at 200_000 to prevent blowups on very-long HPC runs.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "ga.smc_gate_curve",
+            section: "Discovery / GA search",
+            label: "SMC gate curve exponent",
+            kind: KnobKind::Float {
+                min: Some(0.1),
+                max: Some(5.0),
+            },
+            default: "1.0",
+            current: format!("{}", smc.curve),
+            help_short: "Power-curve exponent for the SMC gate decay between start and end.",
+            help_long: "1.0 = linear decay. Higher (1.5-2.0) keeps the gate strict longer (more concave). Lower (0.5-0.7) relaxes faster (more convex).",
+            preset_conservative: "1.5",
+            preset_balanced: "1.0",
+            preset_aggressive: "0.7",
+        },
+        KnobEntry {
+            id: "ga.smc_gate_stagnation_step",
+            section: "Discovery / GA search",
+            label: "SMC gate stagnation-relax step",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.5),
+            },
+            default: "0.03",
+            current: format!("{}", smc.stagnation_step),
+            help_short: "How much the SMC gate relaxes per stagnant generation (after patience exceeded).",
+            help_long: "Lower = gate stays strict during stagnation (good for selective searches). Higher = gate opens up faster to escape local optima.",
+            preset_conservative: "0.01",
+            preset_balanced: "0.03",
+            preset_aggressive: "0.05",
+        },
+        KnobEntry {
+            id: "ga.archive_mode",
+            section: "Discovery / GA search",
+            label: "Archive scoring mode",
+            kind: KnobKind::Enum {
+                variants: &["net", "pf", "sharpe"],
+            },
+            default: "net",
+            current: ga_overrides.archive_scoring.mode.clone(),
+            help_short: "Which metric gates archive admission: net P&L, profit factor, or Sharpe.",
+            help_long: "`net` is the default-stable choice. `pf` is more tolerant of low-trade strategies. `sharpe` rewards consistency over total return.",
+            preset_conservative: "net",
+            preset_balanced: "net",
+            preset_aggressive: "pf",
+        },
+        KnobEntry {
+            id: "ga.archive_min_net",
+            section: "Discovery / GA search",
+            label: "Archive min net P&L",
+            kind: KnobKind::Float {
+                min: None,
+                max: None,
+            },
+            default: "0.0",
+            current: format!("{}", ga_overrides.archive_scoring.min_net),
+            help_short: "Floor for net P&L below which strategies are NOT archived.",
+            help_long: "Conservative (500): keeps only strategies that won at least $500 over the in-sample window. Balanced (0): admits any net-positive. Aggressive (negative): includes near-break-even strategies for further inspection.",
+            preset_conservative: "500.0",
+            preset_balanced: "0.0",
+            preset_aggressive: "-100.0",
+        },
+        KnobEntry {
+            id: "ga.archive_min_pf",
+            section: "Discovery / GA search",
+            label: "Archive min profit factor",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(10.0),
+            },
+            default: "1.0",
+            current: format!("{}", ga_overrides.archive_scoring.min_pf),
+            help_short: "Floor for profit factor (gross_win / gross_loss) below which strategies are NOT archived.",
+            help_long: "1.0 = break-even. Conservative (1.5) keeps only solid edges. Aggressive (1.1) admits more candidates.",
+            preset_conservative: "1.5",
+            preset_balanced: "1.0",
+            preset_aggressive: "1.1",
+        },
+        KnobEntry {
+            id: "ga.archive_min_sharpe",
+            section: "Discovery / GA search",
+            label: "Archive min Sharpe ratio",
+            kind: KnobKind::Float {
+                min: None,
+                max: None,
+            },
+            default: "0.0",
+            current: format!("{}", ga_overrides.archive_scoring.min_sharpe),
+            help_short: "Floor for Sharpe (only enforced when `archive_mode = sharpe`).",
+            help_long: "Conservative (0.5) is institutional-quality consistency. Balanced (0.0) is no floor. Aggressive (-0.5) admits noisy strategies for diagnostic inspection.",
+            preset_conservative: "0.5",
+            preset_balanced: "0.0",
+            preset_aggressive: "-0.5",
+        },
+        KnobEntry {
+            id: "ga.parent_selection",
+            section: "Discovery / GA search",
+            label: "Parent selection policy",
+            kind: KnobKind::Enum {
+                variants: &["rank_weighted", "tournament", "truncation"],
+            },
+            default: "rank_weighted",
+            current: format!("{:?}", ga_overrides.selection.parent).to_lowercase(),
+            help_short: "How the GA picks parents for crossover.",
+            help_long: "`rank_weighted` (default) is stable + diverse. `tournament` is faster on large populations. `truncation` is deterministic top-K (most aggressive).",
+            preset_conservative: "rank_weighted",
+            preset_balanced: "rank_weighted",
+            preset_aggressive: "tournament",
+        },
+        KnobEntry {
+            id: "ga.survivor_selection",
+            section: "Discovery / GA search",
+            label: "Survivor selection policy",
+            kind: KnobKind::Enum {
+                variants: &["rank_weighted", "tournament", "truncation"],
+            },
+            default: "rank_weighted",
+            current: format!("{:?}", ga_overrides.selection.survivor).to_lowercase(),
+            help_short: "How the GA picks survivors for the next generation.",
+            help_long: "Mirror of `parent_selection`. Mixing policies (e.g. tournament parents + truncation survivors) is permitted but rarely useful.",
+            preset_conservative: "rank_weighted",
+            preset_balanced: "rank_weighted",
+            preset_aggressive: "truncation",
+        },
+        KnobEntry {
+            id: "ga.random_immigrants",
+            section: "Discovery / GA search",
+            label: "Random immigrants ratio",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.95),
+            },
+            default: "0.25",
+            current: format!("{}", ga_overrides.selection.immigrant_ratio),
+            help_short: "Fraction of each generation replaced with fresh random genes (diversity injection).",
+            help_long: "Higher (0.4) = more exploration. Lower (0.1) = more exploitation of existing genes. 0.25 is the audit baseline.",
+            preset_conservative: "0.10",
+            preset_balanced: "0.25",
+            preset_aggressive: "0.40",
+        },
+        KnobEntry {
+            id: "ga.survivor_fraction",
+            section: "Discovery / GA search",
+            label: "Survivor fraction (elite carry-over)",
+            kind: KnobKind::Float {
+                min: Some(0.0),
+                max: Some(0.95),
+            },
+            default: "0.10",
+            current: format!("{}", ga_overrides.selection.survivor_fraction),
+            help_short: "Fraction of top genes carried unchanged to the next generation.",
+            help_long: "Conservative (0.20) preserves more elites = slower convergence but safer. Aggressive (0.05) recycles more = faster turnover but riskier.",
+            preset_conservative: "0.20",
+            preset_balanced: "0.10",
+            preset_aggressive: "0.05",
+        },
+        KnobEntry {
+            id: "ga.selection_temperature",
+            section: "Discovery / GA search",
+            label: "Selection temperature",
+            kind: KnobKind::Float {
+                min: Some(0.001),
+                max: Some(10.0),
+            },
+            default: "0.75",
+            current: format!("{}", ga_overrides.selection.temperature),
+            help_short: "Softness of the selection probability distribution.",
+            help_long: "Lower (<0.5) = more random (every gene has a similar chance). Higher (>1.0) = more deterministic (top genes dominate).",
+            preset_conservative: "0.5",
+            preset_balanced: "0.75",
+            preset_aggressive: "1.5",
+        },
+        // ── Section 6 — Backtest runtime ───────────────────────────────
+        KnobEntry {
+            id: "backtest.initial_equity",
+            section: "Backtest runtime",
+            label: "Initial equity",
+            kind: KnobKind::Float {
+                min: Some(100.0),
+                max: Some(10_000_000.0),
+            },
+            default: "100000.0",
+            current: format!(
+                "{}",
+                neoethos_search::current_backtest_runtime_overrides().initial_equity
+            ),
+            help_short: "Starting equity for the backtest simulation, independent of any live account.",
+            help_long: "100k USD is the prop-firm baseline (most challenges fund at $100k). Use 10k for a smaller-account stress test, or 1M to see how compounding scales.",
+            preset_conservative: "100000.0",
+            preset_balanced: "100000.0",
+            preset_aggressive: "100000.0",
+        },
+        KnobEntry {
+            id: "backtest.max_month_buckets",
+            section: "Backtest runtime",
+            label: "Max month buckets (TRUNCATES the record scored — not just RAM)",
+            // ── W2-6 / E-4 (2026-08-10): the advertised minimum is GONE. ────
+            // This said `min: Some(12)` while the help text called the knob a
+            // RAM cap. Those two statements cannot both be acted on: 12 is not
+            // a memory choice, it is "score every gene on its first twelve
+            // months". `month_capacity` sizes `monthly_pnls`, which feeds
+            // metric slot 7, which `named.rs:161` weights at 0.45 — the
+            // DOMINANT term of the prop-firm objective. An operator who took
+            // the UI's own endorsed minimum would have every gene in a ten-year
+            // record ranked on its first year, and would get back a perfectly
+            // plausible number with nothing wrong-looking about it.
+            //
+            // The floor is now 240, the shipped default and a full 20-year
+            // sweep. Nothing legitimate wants less: this is not a knob for
+            // shortening the evaluation window (that is `stage1_window` and the
+            // funnel percentages), it is a ceiling on how many months of
+            // history the buckets can hold. Raising the floor can only make the
+            // scored record LONGER, never shorter — the safer direction, per
+            // non-negotiable #2.
+            kind: KnobKind::Int {
+                min: Some(240),
+                max: Some(1200),
+            },
+            default: "240",
+            current: format!(
+                "{}",
+                neoethos_search::current_backtest_runtime_overrides().month_capacity
+            ),
+            help_short: "How many months of per-month statistics are kept. Truncating this TRUNCATES THE RECORD every gene is scored on.",
+            help_long: "Not merely a RAM cap, despite what this text used to say. `month_capacity` sizes the `monthly_pnls` series, which becomes metric slot 7, which carries a weight of 0.45 in the prop-firm objective (`named.rs:161`) — the largest single term. Set it below the length of your history and every gene is ranked on the first N months of that history, and the resulting score looks entirely normal. 240 = 20 years and is the default and the minimum; raise to 600 for 50-year MT5 historical imports. There is no reason to lower it.",
+            preset_conservative: "240",
+            preset_balanced: "240",
+            preset_aggressive: "600",
+        },
+        KnobEntry {
+            id: "stop_target.tail_max_bars",
+            section: "Backtest runtime",
+            label: "Adaptive-stop tail cap (bars)",
+            // History, kept because it explains the 0 default: this knob had
+            // no recipient at all — the value was hardcoded at
+            // `stop_target.rs:78` and the config key was deleted in 48abfc90
+            // for being dead. (It never carried an env var either; the
+            // `env_var` field that used to say so was removed from every entry
+            // on 2026-08-10 — see the tombstone on `KnobEntry`.)
+            kind: KnobKind::Int {
+                min: Some(0),
+                max: Some(100_000_000),
+            },
+            default: "0",
+            current: format!(
+                "{}",
+                neoethos_search::current_stop_target_runtime_overrides().tail_max_bars
+            ),
+            help_short: "0 = no cap. Bars the adaptive stop's tail (expected-shortfall) term is computed over.",
+            help_long: "The adaptive stop is max(1.0 x volatility, 1.25 x tail). Until 2026-08-04 this was hardcoded at 300 000 and a longer series silently dropped the tail term: on EURUSD M5, 300 000 bars gave a median base stop of 18.09 pips and 300 001 gave 5.81 pips. The lanes that crossed that cap were the MONTE-CARLO and SENSITIVITY quality screens (843k-bar in-sample slice, ~6.6 pips); GA scoring (210k stage-1 window), walk-forward and live were all under it (~13-23 pips). So every candidate was quality-screened against a stop one third of the one it was scored and traded on. 0 (no cap) makes every lane agree — it moves ONLY the two screen lanes. A non-zero cap now FAILS the run by name instead of quietly changing the stop.",
+            preset_conservative: "0",
+            preset_balanced: "0",
+            preset_aggressive: "0",
+        },
+        KnobEntry {
+            id: "stop_target.tail_step",
+            section: "Backtest runtime",
+            label: "Adaptive-stop tail sampling stride",
+            kind: KnobKind::Int {
+                min: Some(1),
+                max: Some(1_000),
+            },
+            default: "1",
+            current: format!(
+                "{}",
+                neoethos_search::current_stop_target_runtime_overrides().tail_step
+            ),
+            help_short: "1 = recompute the stop's tail term on every bar. Higher values make the stop depend on where the series starts.",
+            help_long: "The tail sampling grid is anchored at the START of whatever slice it is given, so a stride above 1 makes the same bar get a different stop depending on which caller asked. At the old default of 5, the base over the trailing 300 001 EURUSD M5 bars differed from the same bars of the full-series base by up to 86% PER BAR while the medians agreed to 0.006%. The live loop's rolling buffer moves its start every bar, so that fired constantly. 1 costs 574 ms instead of 206 ms per combo and moves every median by under 0.02%.",
+            preset_conservative: "1",
+            preset_balanced: "1",
+            preset_aggressive: "1",
+        },
+        // ── Section 7 — Logging / server ─────────────────────────────
+        KnobEntry {
+            id: "log.rust_log",
+            section: "Logging / persistence",
+            label: "RUST_LOG filter",
+            kind: KnobKind::Text,
+            default: "(production default from Settings)",
+            current: "(see startup banner)".to_string(),
+            help_short: "tracing-subscriber filter (e.g. `info,sqlx=warn`).",
+            // Still live, and legitimately so: `RUST_LOG` is parsed by
+            // `tracing_subscriber::EnvFilter` itself, an ecosystem convention
+            // that predates and outranks our config file. It changes what is
+            // PRINTED, never what is decided. `neoethos-core/src/env_overrides.rs`
+            // classifies it the same way.
+            help_long: "Lower to `error,neoethos=info` for quieter logs; raise to `debug` for diagnostics. The production default ships in `Settings.system.log_filter`. The `RUST_LOG` environment variable still overrides it — that one is parsed by the tracing subscriber itself, it is an ecosystem convention rather than a NeoEthos setting, and it changes only what is printed.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "log.log_dir",
+            section: "Logging / persistence",
+            label: "Log directory override",
+            kind: KnobKind::Path,
+            default: "(platform default — %APPDATA%/neoethos/logs on Windows)",
+            current: "(platform default)".to_string(),
+            help_short: "Override the on-disk log directory.",
+            // Still live in `neoethos-core/src/logging.rs` via `ENV_LOG_DIR`.
+            // Destination of log FILES only — no decision depends on it.
+            help_long: "By default logs go under the platform user-data-dir. Override to redirect to a fast SSD, a network share, or a tmpfs for ephemeral runs. Still driven by the `LOG_DIR` environment variable, read in `neoethos-core`; it moves where log files are written and nothing else.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+        KnobEntry {
+            id: "server.bind_addr",
+            section: "Server / network",
+            label: "HTTP server bind address",
+            kind: KnobKind::Text,
+            default: "127.0.0.1:7423",
+            current: "127.0.0.1:7423".to_string(),
+            help_short: "host:port for the backend HTTP server.",
+            help_long: "Default binds to localhost only (the Flutter front-end on the same machine). Override to `0.0.0.0:7423` to expose to LAN, or change the port if 7423 conflicts with another app. Both sides (backend + Flutter `backend_client.dart`) must agree.",
+            preset_conservative: "",
+            preset_balanced: "",
+            preset_aggressive: "",
+        },
+    ]
+}
+
+/// `GET /settings/knob-catalog`
+pub async fn get_knob_catalog(State(_state): State<AppApiState>) -> Response {
+    let response = KnobCatalogResponse {
+        schema_version: SCHEMA_VERSION,
+        generated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+        knobs: build_catalog(),
+    };
+    Json(response).into_response()
+}
+
+// GET /settings/presets — DELETED 2026-08-10 (#115 / #116).
+//
+// It served three safety-posture presets (Conservative / Balanced /
+// Aggressive), each with a description promising a bundle of knobs — "0.5%
+// risk/trade, strict SMC gate, tight PnL circuit breaker, fewer cTrader
+// retries ... Risky Mode disabled". NOTHING in the product could apply any of
+// them: no POST counterpart, no apply function, no client, in `crates/`,
+// `desktop/src`, `desktop/src-tauri/src`, `mesh/` or `mcp/`.
+//
+// THE DECISION (#116): there is ONE preset vocabulary and it is the prop-firm
+// one — `POST /risk/preset` (ftmo | myforexfunds | fundednext | the5ers |
+// none), `server::risk::update_preset`. Two disjoint vocabularies, one of them
+// inert, is how #213/#214 happened: the operator believed a posture existed
+// that would set his risk knobs, so nobody checked what the ONE working preset
+// path actually wrote into the drawdown breakers.
+//
+// The 2026-08-09 pass left the route registered returning 501 with an empty
+// list. That was worse than either option: `neoethos-mcp`'s `op_knob_catalog`
+// fetched it unconditionally, and a 501 is an Err in `Backend::read_response`,
+// so the whole `knob_catalog` MCP tool failed. Route, handler, `PresetsResponse`
+// and `PresetSummary` are now gone, along with that fetch.
+//
+// The per-knob `presetConservative` / `presetBalanced` / `presetAggressive`
+// strings on [`KnobEntry`] survive as ADVISORY values a UI may render as
+// "recommended". They are never a control that sets anything. Restoring an
+// apply path means writing EVERY knob a description promises — three of five is
+// a new lie in place of the old one.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_is_non_empty_and_ids_unique() {
+        let catalog = build_catalog();
+        assert!(!catalog.is_empty(), "knob catalog should not be empty");
+        let mut ids: Vec<&str> = catalog.iter().map(|k| k.id).collect();
+        ids.sort();
+        let len_before = ids.len();
+        ids.dedup();
+        assert_eq!(
+            len_before,
+            ids.len(),
+            "knob catalog ids must be unique — a duplicate would clobber \
+             the Flutter UI's per-id state."
+        );
+    }
+
+    #[test]
+    fn catalog_serializes_to_json_cleanly() {
+        let catalog = build_catalog();
+        let response = KnobCatalogResponse {
+            schema_version: SCHEMA_VERSION,
+            generated_at_unix_ms: 0,
+            knobs: catalog,
+        };
+        let json = serde_json::to_string(&response).expect("catalog must serialize without error");
+        assert!(json.contains("\"schemaVersion\":2"));
+        assert!(json.contains("\"id\":\"ctrader.max_attempts\""));
+    }
+
+    /// W2-7: the catalog must not advertise an environment variable for ANY
+    /// knob. It is served to the LLM control plane as the authoritative knob
+    /// list, and every retired name is inert — an agent told to export one
+    /// would report a change it did not make.
+    ///
+    /// This is the pinning test that makes re-adding the field a deliberate
+    /// act rather than an accident.
+    #[test]
+    fn catalog_advertises_no_environment_variables() {
+        let catalog = build_catalog();
+        let json = serde_json::to_string(&KnobCatalogResponse {
+            schema_version: SCHEMA_VERSION,
+            generated_at_unix_ms: 0,
+            knobs: catalog,
+        })
+        .expect("catalog must serialize without error");
+        assert!(
+            !json.contains("envVar"),
+            "the knob catalog must not carry an `envVar` key — no environment \
+             variable is honoured, and the control plane reads this as \
+             authoritative"
+        );
+        assert!(
+            !json.contains("NEOETHOS_BOT_"),
+            "a retired NEOETHOS_BOT_* name leaked into the catalog payload"
+        );
+    }
+
+    /// W2-6 💰: `month_capacity` truncates the record every gene is SCORED on
+    /// (metric slot 7, weight 0.45 of the prop-firm objective). The UI once
+    /// endorsed a minimum of 12, i.e. "rank a ten-year record on its first
+    /// year and return a plausible number". The advertised floor must never
+    /// again be below the shipped default.
+    #[test]
+    fn month_bucket_minimum_cannot_truncate_the_scored_record() {
+        let catalog = build_catalog();
+        let entry = catalog
+            .iter()
+            .find(|k| k.id == "backtest.max_month_buckets")
+            .expect("backtest.max_month_buckets must exist in the catalog");
+        match entry.kind {
+            KnobKind::Int { min, .. } => assert_eq!(
+                min,
+                Some(240),
+                "the advertised minimum must be the shipped 240 (20 years); \
+                 anything lower is a UI-endorsed way to score genes on a \
+                 truncated history"
+            ),
+            other => panic!("expected an Int knob, got {other:?}"),
+        }
+    }
+}

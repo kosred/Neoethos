@@ -1,0 +1,109 @@
+[package]
+name = "neoethos-data"
+version = "0.5.6"
+edition.workspace = true
+license.workspace = true
+# Refuses exactly one build configuration — `gpu-cuda` together with
+# CUDA_FAST_MATH — and records nothing. vector-ta is the sole authority for
+# exact native architectures through `module_loader::{COMPILED_ARCHS,
+# COMPILED_ARCH_SOURCE}`; this crate never derives a second answer.
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+parquet.workspace = true
+thrift.workspace = true
+flatbuffers.workspace = true
+vortex-flatbuffers.workspace = true
+chrono = "0.4"
+neoethos-core = { path = "../neoethos-core" }
+neoethos-dataset-contracts.workspace = true
+neoethos-feature-contracts.workspace = true
+neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts", optional = true }
+neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
+csv = "1.3"
+ndarray = { version = "0.17.2", features = ["rayon"] }
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tracing = "0.1"
+# Pin aligned 2026-05-26 with workspace `[patch.crates-io]` which redirects
+# this dep to `vendor/vector-ta-0.2.9-patched/`. The previous `0.2.4` pin was
+# silently overridden by the patch entry (verified via `cargo tree -i vector-ta`
+# which has always shown 0.2.9). Bumping the literal makes the intent obvious
+# to anyone reading this file and prevents a future patch removal from silently
+# downgrading the binary.
+# `nightly-avx`: vector-ta's runtime-selected AVX2/AVX512 TA kernels (the repo
+# pins a NIGHTLY toolchain in rust-toolchain.toml, so this is always available).
+# Without it `Kernel::Auto` falls back to the SCALAR baseline — i.e. the whole
+# feature build runs on SSE2-class scalar code instead of AVX2/AVX512. This is
+# the single biggest CPU win for `hpc_ta::compute_classic_ta_columns` and needs
+# no GPU. The separate native CUDA path is enabled only by `gpu-cuda` below.
+vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
+# STAY ON 0.2.9 — decided 2026-08-09 against the 0.3.1 API diff, not by habit.
+#   * A mechanical diff of every `pub fn|struct|enum|trait` across
+#     `src/indicators`, `src/cuda` and `src/utilities` between 0.2.9 and 0.3.1
+#     yields an EMPTY removed-set AND an EMPTY added-set for NeoEthos's Rust
+#     API. The upgrade therefore buys no Rust production capability.
+#   * The GPU lane is a reviewed vendored replacement with exact native cubin
+#     generation and loading. An upstream crate comparison is not authority for
+#     its artifact or runtime semantics.
+#   * And it does not carry the fix we vendored for: the `warm prefix exceeds
+#     row width` assert is still at `src/utilities/helpers.rs:159` in 0.3.1
+#     (verified against the extracted 0.3.1 crate source). Upgrading means
+#     re-vendoring and re-applying our clamp patch for no benefit, while adding
+#     a variable to the parity experiment that is about to run on the card.
+# Revisit when upstream ships the helpers.rs fix, or when a release adds an f64
+# device lane — that, not a version number, is what would make the GPU
+# indicator path parity-capable.
+memmap2 = "0.9.5"
+libc = "0.2.189"
+# Rust CUDA Driver-API bindings — SAME 0.3.2 vector-ta itself depends on, so
+# the graph unifies on one copy and `cust::Context::new` retains the DEVICE
+# PRIMARY context, i.e. our handle and every vector-ta wrapper share one
+# address space. Used for exactly one thing: reading
+# `ComputeCapabilityMajor/Minor` off the present device so the arch-mismatch
+# refusal can name the real device arch instead of guessing. Optional and
+# reachable only through `gpu-cuda`, so a card-less build never sees it (its
+# build script hard-requires a CUDA toolkit).
+cust = { version = "0.3.2", optional = true }
+# Recursive filesystem walk used by core::discover. Latest stable
+# (verified on crates.io 2026-05-14): 2.5.0.
+walkdir = "2.5"
+vortex-array = "0.67.0"
+vortex-buffer = { version = "0.67.0", features = ["memmap2"] }
+vortex-file = "0.67.0"
+vortex-io = "0.67.0"
+vortex-layout = "0.67.0"
+vortex-session = "0.67.0"
+
+[dev-dependencies]
+ctor = "0.4.3"
+tempfile = "3.27"
+
+# `gpu-cuda` enables vector-ta's reviewed native CUDA build and Rust CUDA API.
+# The build emits one exact `.cubin` per kernel and requested/visible `sm_X`,
+# validates every artifact with `cuobjdump`, and generates the exact runtime
+# registry. No alternate artifact, driver compilation, approximate
+# architecture selection, or CPU substitution path exists.
+#
+# `CUDA_ARCHS` may name one or more explicit exact targets; otherwise vector-ta
+# derives every visible GPU architecture. nvcc and cuobjdump are required.
+# `CUDA_FAST_MATH` must remain unset or `0` for parity.
+# The default feature set remains CPU-only and never resolves `cust`.
+[features]
+gpu-cuda = [
+    "dep:cust",
+    "dep:neoethos-gpu-contracts",
+    "dep:neoethos-gpu-cuda",
+    "neoethos-gpu-cuda/cuda",
+    "vector-ta/cuda-build-native",
+]
+gpu-cuda-device-fixtures = [
+    "gpu-cuda",
+    "neoethos-gpu-cuda/cuda-device-fixtures",
+]

@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "resources": {
+      "../../mcp/target/release/neoethos-mcp": "",
+      "../../mesh/target/release/neoethos-mesh": "",
+      "../../target/release/libcatboostmodel.so": "",
+      "../../target/release/libxgboost.so": ""
+    }
+  }
+}

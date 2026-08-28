@@ -1,0 +1,1256 @@
+use anyhow::{Context, Result, bail};
+use nalgebra::DMatrix;
+use ndarray::{Array1, Array2, Axis};
+use neoethos_core::storage::json::{DirBackupWriteConfig, write_dir_with_backup};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+use crate::base::{
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
+};
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
+use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::RuntimePrediction;
+
+use super::common::{
+    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, cpu_backend_for_policy,
+    ensure_feature_columns_match, feature_matrix_from_frame, read_json, remap_three_class_labels,
+    softmax_rows, statistical_device_policy, write_json,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BayesianClassPosterior {
+    weights: Array1<f64>,
+    bias: f64,
+    /// FULL Laplace posterior covariance over the augmented parameter vector
+    /// `[w_0..w_{d-1}, bias]`, shape `(d+1, d+1)`. Bishop PRML §4.5:
+    /// `Σ = (XᵀSX + αI)⁻¹`. The off-diagonal terms capture feature
+    /// correlation (TA features are highly collinear), unlike the previous
+    /// diagonal-only `variance_diag`/`bias_variance` approximation that
+    /// assumed feature independence.
+    covariance: Array2<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BayesianOneVsRestArtifact {
+    precision_schema: String,
+    model_name: String,
+    feature_columns: Vec<String>,
+    dataset_rows: usize,
+    scaler: FeatureScaler,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
+    runtime_backend: String,
+    prior_precision: f64,
+    learning_rate: f64,
+    epochs: usize,
+    classes: Vec<BayesianClassPosterior>,
+}
+
+const BAYESIAN_F64_SCHEMA: &str = "neoethos.bayesian_logit.f64.v2";
+const BAYESIAN_CPU_BACKEND: &str = "bayes_logit_bayesian_ovr_cpu";
+
+fn sigmoid(value: f64) -> f64 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp_value = value.exp();
+        exp_value / (1.0 + exp_value)
+    }
+}
+
+fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
+    if rows <= 6 {
+        return ((0..rows).collect(), Vec::new());
+    }
+
+    let val_rows = ((rows as f64) * 0.2).round() as usize;
+    let val_rows = val_rows.clamp(1, rows.saturating_sub(2));
+    let embargo_rows = if rows >= 20 {
+        ((rows as f64) * 0.02).round() as usize
+    } else {
+        0
+    };
+    let embargo_rows = embargo_rows.clamp(0, rows.saturating_sub(val_rows + 1));
+    let train_rows = rows.saturating_sub(val_rows + embargo_rows);
+
+    if train_rows == 0 {
+        return ((0..rows).collect(), Vec::new());
+    }
+
+    let train = (0..train_rows).collect::<Vec<_>>();
+    let val = (train_rows + embargo_rows..rows).collect::<Vec<_>>();
+    (train, val)
+}
+
+/// GROUP E remediation 2026-05-25: 5 hand-rolled functions replaced
+/// with a single delegation to the canonical `write_dir_with_backup`
+/// helper in `neoethos-core::storage::json`. Saves ~60 LOC of duplicate
+/// staged-tmp+backup logic (this file is one of 4).
+fn with_staged_bayesian_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    write_dir_with_backup(
+        path,
+        DirBackupWriteConfig {
+            artifact_label: "bayesian artifact",
+            temp_extension: "tmp_bayesian_artifact",
+            backup_extension: "bak_bayesian_artifact",
+        },
+        writer,
+    )
+}
+
+fn runtime_metadata(
+    model_name: &str,
+    feature_columns: Vec<String>,
+    dataset_rows: usize,
+    train_rows: usize,
+    val_rows: usize,
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
+        model_name,
+        ModelFamily::Meta,
+        CapabilityState::Implemented,
+        feature_columns,
+        canonical_three_class_label_mapping(),
+        TrainingSummaryMetadata::new_unchecked(dataset_rows, train_rows, val_rows),
+    )
+}
+
+fn normalize_bayesian_params(
+    prior_precision: f64,
+    learning_rate: f64,
+    epochs: usize,
+) -> Result<(f64, f64, usize)> {
+    if !prior_precision.is_finite() {
+        bail!("bayesian prior_precision must be finite");
+    }
+    if !learning_rate.is_finite() {
+        bail!("bayesian learning_rate must be finite");
+    }
+    Ok((
+        prior_precision.max(1e-6),
+        learning_rate.max(1e-4),
+        epochs.max(1),
+    ))
+}
+
+fn fit_binary_posterior(
+    train_features: &Array2<f64>,
+    train_labels: &[f64],
+    val_features: Option<&Array2<f64>>,
+    val_labels: Option<&[f64]>,
+    prior_precision: f64,
+    learning_rate: f64,
+    epochs: usize,
+) -> Result<BayesianClassPosterior> {
+    let rows = train_features.nrows();
+    let cols = train_features.ncols();
+    if rows == 0 || cols == 0 {
+        bail!("bayesian logistic regression requires a non-empty feature matrix");
+    }
+    if train_labels.len() != rows {
+        bail!(
+            "bayesian logistic regression label mismatch: {} rows vs {} labels",
+            rows,
+            train_labels.len()
+        );
+    }
+    if let Some(val_features) = val_features
+        && let Some(val_labels) = val_labels
+        && val_features.nrows() != val_labels.len()
+    {
+        bail!(
+            "bayesian validation mismatch: {} rows vs {} labels",
+            val_features.nrows(),
+            val_labels.len()
+        );
+    }
+
+    let prior = prior_precision.max(1e-6);
+    let lr = learning_rate.max(1e-4);
+    let mut weights = Array1::<f64>::zeros(cols);
+    let mut bias = 0.0_f64;
+    let mut best_weights = weights.clone();
+    let mut best_bias = bias;
+    let mut best_val_loss = f64::INFINITY;
+    let mut stale_epochs = 0usize;
+    let patience = 25usize;
+
+    for _ in 0..epochs.max(1) {
+        let mut grad_w = Array1::<f64>::zeros(cols);
+        let mut grad_b = 0.0_f64;
+
+        for (row, label) in train_labels.iter().enumerate().take(rows) {
+            let x_row = train_features.row(row);
+            let logit = weights
+                .iter()
+                .zip(x_row.iter())
+                .map(|(weight, value)| weight * value)
+                .sum::<f64>()
+                + bias;
+            let probability = sigmoid(logit);
+            let error = probability - *label;
+
+            for col in 0..cols {
+                grad_w[col] += error * x_row[col];
+            }
+            grad_b += error;
+        }
+
+        for col in 0..cols {
+            grad_w[col] = grad_w[col] / rows as f64 + prior * weights[col];
+            weights[col] -= lr * grad_w[col];
+        }
+        grad_b /= rows as f64;
+        bias -= lr * grad_b;
+
+        if let (Some(val_features), Some(val_labels)) = (val_features, val_labels)
+            && val_features.nrows() > 0
+        {
+            let mut val_loss = 0.0_f64;
+            for (row, target) in val_labels.iter().enumerate().take(val_features.nrows()) {
+                let x_row = val_features.row(row);
+                let logit = weights
+                    .iter()
+                    .zip(x_row.iter())
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f64>()
+                    + bias;
+                let probability = sigmoid(logit).clamp(1e-6, 1.0 - 1e-6);
+                val_loss -= *target * probability.ln() + (1.0 - *target) * (1.0 - probability).ln();
+            }
+            val_loss /= val_features.nrows() as f64;
+
+            if val_loss + 1e-6 < best_val_loss {
+                best_val_loss = val_loss;
+                best_weights = weights.clone();
+                best_bias = bias;
+                stale_epochs = 0;
+            } else {
+                stale_epochs += 1;
+                if stale_epochs >= patience {
+                    break;
+                }
+            }
+        }
+    }
+
+    if best_val_loss.is_finite() {
+        weights = best_weights;
+        bias = best_bias;
+    }
+
+    // FULL Laplace posterior covariance (Bishop PRML §4.5.1). Build the
+    // augmented Hessian over Z = [X | 1] (bias = last column):
+    //     H = ZᵀSZ + αI ,  S = diag(p_i(1-p_i)) ,  α = N · prior_precision
+    // We use the UN-averaged data term `ZᵀSZ` with the prior scaled by N
+    // (`α = N·prior`). This yields the SAME w_MAP the (1/N)-averaged fit
+    // gradient minimised (its stationarity ⇔ ΣᵢXᵀ(p−y) + N·prior·w = 0),
+    // while giving a genuinely Bayesian posterior precision that GROWS with N
+    // — so Σ = H⁻¹ contracts as ~1/N (the defining posterior-contraction
+    // property). The previous (1/N)-scaled diagonal Hessian neither
+    // contracted with N nor carried off-diagonal feature covariance.
+    // The complete fit, Hessian, covariance, and persisted posterior remain
+    // f64. Narrowing the posterior after the correct linear algebra would
+    // silently destroy the precision this model is meant to expose.
+    let aug = cols + 1;
+    let mut hessian = DMatrix::<f64>::zeros(aug, aug);
+    for row in 0..rows {
+        let x_row = train_features.row(row);
+        let logit = weights
+            .iter()
+            .zip(x_row.iter())
+            .map(|(weight, value)| weight * value)
+            .sum::<f64>()
+            + bias;
+        let probability = sigmoid(logit);
+        let curvature = (probability * (1.0 - probability)).max(1e-6);
+        for a in 0..aug {
+            let za = if a < cols { x_row[a] } else { 1.0 };
+            if za == 0.0 {
+                continue;
+            }
+            for b in 0..aug {
+                let zb = if b < cols { x_row[b] } else { 1.0 };
+                hessian[(a, b)] += curvature * za * zb;
+            }
+        }
+    }
+    // Gaussian prior precision α = N·prior on the weight diagonal only (the
+    // intercept is left unpenalised, matching the fit objective); a tiny
+    // jitter on the bias diagonal keeps the unpenalised bias strictly SPD.
+    let prior_alpha = prior * rows as f64;
+    for d in 0..cols {
+        hessian[(d, d)] += prior_alpha;
+    }
+    hessian[(cols, cols)] += 1e-6;
+
+    // Σ = H⁻¹ via Cholesky (SPD by construction). Escalate a ridge jitter on
+    // numerical non-positive-definiteness; bail loud if it never resolves.
+    let mut jitter = 0.0_f64;
+    let sigma = loop {
+        let mut candidate = hessian.clone();
+        for d in 0..aug {
+            candidate[(d, d)] += jitter;
+        }
+        match candidate.cholesky() {
+            Some(chol) => break chol.inverse(),
+            None => {
+                jitter = if jitter == 0.0 { 1e-8 } else { jitter * 10.0 };
+                if jitter > 1.0 {
+                    bail!(
+                        "bayesian Laplace Hessian is not positive-definite (jitter escalation exhausted)"
+                    );
+                }
+            }
+        }
+    };
+    let covariance = Array2::from_shape_fn((aug, aug), |(a, b)| sigma[(a, b)]);
+
+    Ok(BayesianClassPosterior {
+        weights,
+        bias,
+        covariance,
+    })
+}
+
+fn predictive_logit(class_model: &BayesianClassPosterior, features: &[f64]) -> Result<f64> {
+    let mean = class_model
+        .weights
+        .iter()
+        .zip(features.iter())
+        .map(|(weight, value)| weight * value)
+        .sum::<f64>()
+        + class_model.bias;
+    // Predictive logit variance σ_a² = zᵀ Σ z with z = [x | 1] (augmented
+    // bias slot). The FULL quadratic form picks up off-diagonal posterior
+    // covariance (Bishop PRML eq. 4.151), unlike the old diagonal sum.
+    let aug = class_model.covariance.nrows();
+    if aug != features.len() + 1 {
+        bail!(
+            "bayesian predictive covariance dimension mismatch: covariance {} vs features+bias {}",
+            aug,
+            features.len() + 1
+        );
+    }
+    let z: Vec<f64> = features
+        .iter()
+        .copied()
+        .chain(std::iter::once(1.0))
+        .collect();
+    let mut variance = 0.0_f64;
+    for a in 0..aug {
+        let mut row_acc = 0.0_f64;
+        for b in 0..aug {
+            row_acc += class_model.covariance[(a, b)] * z[b];
+        }
+        variance += z[a] * row_acc;
+    }
+    if !mean.is_finite() || !variance.is_finite() {
+        bail!("bayesian logistic regression produced non-finite posterior moments");
+    }
+    // Probit/κ correction (Bishop eq. 4.153, MacKay 1992) — UNCHANGED; only
+    // its variance input now comes from the full quadratic form.
+    let correction = (1.0 + std::f64::consts::PI * variance.max(0.0) / 8.0).sqrt();
+    Ok(mean / correction.max(1e-6))
+}
+
+fn runtime_predictions(
+    model_name: &str,
+    probabilities: &Array2<f64>,
+    execution_backend: &str,
+) -> Result<Vec<RuntimePrediction>> {
+    let mut predictions = Vec::with_capacity(probabilities.nrows());
+    for row in probabilities.outer_iter() {
+        let row_values = [row[0], row[1], row[2]];
+        let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
+        let reason = abstain_recommended
+            .then(|| "shared three-class confidence gate recommended abstain".to_string());
+        predictions.push(build_runtime_prediction_with_details(
+            model_name,
+            ModelFamily::Meta,
+            CapabilityState::Implemented,
+            row_values,
+            Some(confidence),
+            Some(abstain_recommended),
+            Some(execution_backend.to_string()),
+            reason,
+        )?);
+    }
+
+    Ok(predictions)
+}
+
+fn validate_runtime_metadata(
+    metadata: &RuntimeArtifactMetadata,
+    expected_model_name: &str,
+    expected_feature_columns: &[String],
+    expected_dataset_rows: usize,
+) -> Result<()> {
+    if expected_feature_columns.is_empty() {
+        bail!("persisted {expected_model_name} artifact is missing feature columns");
+    }
+    if metadata.model_name != expected_model_name {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected model name {expected_model_name}, got {}",
+            metadata.model_name
+        );
+    }
+    if metadata.family != ModelFamily::Meta {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected family {:?}, got {:?}",
+            ModelFamily::Meta,
+            metadata.family
+        );
+    }
+    if metadata.state != CapabilityState::Implemented {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected state {:?}, got {:?}",
+            CapabilityState::Implemented,
+            metadata.state
+        );
+    }
+    if metadata.label_mapping != canonical_three_class_label_mapping() {
+        bail!("runtime metadata mismatch for {expected_model_name}: unexpected label mapping");
+    }
+    if metadata.feature_columns != expected_feature_columns {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected feature columns {:?}, got {:?}",
+            expected_feature_columns,
+            metadata.feature_columns
+        );
+    }
+    if metadata.training_summary.dataset_rows != expected_dataset_rows {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected {} dataset rows, got {}",
+            expected_dataset_rows,
+            metadata.training_summary.dataset_rows
+        );
+    }
+    if metadata.training_summary.train_rows == 0 {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: training rows must be non-zero"
+        );
+    }
+    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
+        != metadata.training_summary.dataset_rows
+    {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: training rows {} + validation rows {} must equal dataset rows {}",
+            metadata.training_summary.train_rows,
+            metadata.training_summary.val_rows,
+            metadata.training_summary.dataset_rows
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_runtime_metadata_from_artifact(
+    path: &Path,
+    artifact: &BayesianOneVsRestArtifact,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_runtime_metadata(
+                &metadata,
+                "bayes_logit",
+                &artifact.feature_columns,
+                artifact.dataset_rows,
+            )
+            .with_context(|| {
+                format!(
+                    "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
+                    metadata_path.display()
+                )
+            })?;
+            if let Some(embedded) = artifact.runtime_metadata.as_ref()
+                && (embedded.model_name != metadata.model_name
+                    || embedded.family != metadata.family
+                    || embedded.state != metadata.state
+                    || embedded.feature_columns != metadata.feature_columns
+                    || embedded.label_mapping != metadata.label_mapping
+                    || embedded.training_summary.dataset_rows
+                        != metadata.training_summary.dataset_rows
+                    || embedded.training_summary.train_rows != metadata.training_summary.train_rows
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+            {
+                bail!(
+                    "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
+                    metadata_path.display()
+                );
+            }
+            Ok(metadata)
+        }
+        Err(file_err) => {
+            let fallback = artifact
+                .runtime_metadata
+                .clone()
+                .with_context(|| format!("missing runtime metadata file {} and artifact has no embedded metadata: {file_err}", metadata_path.display()))?;
+            validate_runtime_metadata(
+                &fallback,
+                "bayes_logit",
+                &artifact.feature_columns,
+                artifact.dataset_rows,
+            )?;
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %file_err,
+                model = "bayes_logit",
+                "bayesian metadata sidecar missing/unreadable; using embedded runtime metadata"
+            );
+            Ok(fallback)
+        }
+    }
+}
+
+fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()> {
+    if artifact.precision_schema != BAYESIAN_F64_SCHEMA {
+        bail!(
+            "unsupported Bayesian precision schema `{}`; expected `{BAYESIAN_F64_SCHEMA}`",
+            artifact.precision_schema
+        );
+    }
+    if artifact.model_name != "bayes_logit" {
+        bail!(
+            "unexpected bayesian artifact model name {}",
+            artifact.model_name
+        );
+    }
+    if artifact.feature_columns.is_empty() {
+        bail!("bayesian artifact must contain at least one feature column");
+    }
+    if artifact.dataset_rows == 0 {
+        bail!("bayesian artifact must persist a non-zero dataset row count");
+    }
+    if artifact.classes.len() != 3 {
+        bail!(
+            "bayesian artifact must persist exactly three class models, found {}",
+            artifact.classes.len()
+        );
+    }
+    if artifact.scaler.means.len() != artifact.feature_columns.len()
+        || artifact.scaler.stds.len() != artifact.feature_columns.len()
+    {
+        bail!(
+            "bayesian artifact scaler dimension mismatch: means {}, stds {}, features {}",
+            artifact.scaler.means.len(),
+            artifact.scaler.stds.len(),
+            artifact.feature_columns.len()
+        );
+    }
+    // **2026-05-25 unwrap audit**: collapse the is_none check + the
+    // `.expect("checked runtime metadata presence")` extraction into a
+    // single `let-else` so no panic-shaped expression remains. Same
+    // bail message preserved.
+    let Some(runtime_meta) = artifact.runtime_metadata.as_ref() else {
+        bail!("bayesian artifact must persist runtime metadata");
+    };
+    validate_runtime_metadata(
+        runtime_meta,
+        "bayes_logit",
+        &artifact.feature_columns,
+        artifact.dataset_rows,
+    )?;
+    if !artifact.prior_precision.is_finite() || artifact.prior_precision <= 0.0 {
+        bail!("bayesian artifact prior_precision must be finite and positive");
+    }
+    if !artifact.learning_rate.is_finite() || artifact.learning_rate <= 0.0 {
+        bail!("bayesian artifact learning_rate must be finite and positive");
+    }
+    if artifact.epochs == 0 {
+        bail!("bayesian artifact epochs must be positive");
+    }
+    if artifact.runtime_backend != BAYESIAN_CPU_BACKEND {
+        bail!(
+            "unsupported Bayesian runtime backend `{}` for the CpuOnly f64 artifact",
+            artifact.runtime_backend
+        );
+    }
+    if artifact.scaler.means.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| *value <= 0.0)
+        || artifact.classes.iter().any(|class_model| {
+            let aug = artifact.feature_columns.len() + 1;
+            class_model.weights.len() != artifact.feature_columns.len()
+                || class_model.covariance.dim() != (aug, aug)
+                || class_model.weights.iter().any(|value| !value.is_finite())
+                || !class_model.bias.is_finite()
+                || class_model.covariance.iter().any(|value| !value.is_finite())
+                // a covariance must have strictly positive variances on the diagonal
+                || (0..aug).any(|d| class_model.covariance[(d, d)] <= 0.0)
+                // and must be (numerically) symmetric
+                || (0..aug).any(|a| {
+                    (a + 1..aug).any(|b| {
+                        (class_model.covariance[(a, b)] - class_model.covariance[(b, a)]).abs()
+                            > 1e-3
+                    })
+                })
+        })
+    {
+        bail!("bayesian artifact contains invalid posterior parameters");
+    }
+
+    Ok(())
+}
+
+pub struct BayesianLogitExpert {
+    model: Option<BayesianOneVsRestArtifact>,
+    pub prior_precision: f64,
+    pub learning_rate: f64,
+    pub epochs: usize,
+}
+
+impl BayesianLogitExpert {
+    pub fn new() -> Self {
+        Self {
+            model: None,
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 250,
+        }
+    }
+
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        match &self.model {
+            Some(m) => &m.feature_columns,
+            None => &[],
+        }
+    }
+}
+
+impl Default for BayesianLogitExpert {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BayesianLogitExpert {
+    fn fit_cpu(&mut self, x: &FeatureFrame, y: &[i32], runtime_backend: String) -> Result<()> {
+        let (prior_precision, learning_rate, epochs) =
+            normalize_bayesian_params(self.prior_precision, self.learning_rate, self.epochs)?;
+        let (features, feature_columns) = feature_matrix_from_frame(x)?;
+        let rows = features.nrows();
+        if y.len() != rows {
+            bail!(
+                "bayes_logit requires matching feature and label rows: {} features vs {} labels",
+                rows,
+                y.len()
+            );
+        }
+        let labels = remap_three_class_labels(y)?;
+        let (train_indices, val_indices) = split_train_val_indices(rows);
+        let train_labels = train_indices
+            .iter()
+            .map(|idx| labels[*idx])
+            .collect::<Vec<_>>();
+        let val_labels = val_indices
+            .iter()
+            .map(|idx| labels[*idx])
+            .collect::<Vec<_>>();
+        let train_features = features.select(Axis(0), &train_indices);
+        let val_features = if val_indices.is_empty() {
+            None
+        } else {
+            Some(features.select(Axis(0), &val_indices))
+        };
+        let scaler = FeatureScaler::fit(&train_features)?;
+        let train_features = scaler.transform(&train_features)?;
+        let val_features = if let Some(val_features) = val_features {
+            Some(scaler.transform(&val_features)?)
+        } else {
+            None
+        };
+
+        let mut classes = Vec::with_capacity(3);
+        for class_idx in 0..3usize {
+            let binary = train_labels
+                .iter()
+                .map(|label| if *label == class_idx { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>();
+            let val_binary = if val_labels.is_empty() {
+                None
+            } else {
+                Some(
+                    val_labels
+                        .iter()
+                        .map(|label| {
+                            if *label as usize == class_idx {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            classes.push(fit_binary_posterior(
+                &train_features,
+                &binary,
+                val_features.as_ref(),
+                val_binary.as_deref(),
+                prior_precision,
+                learning_rate,
+                epochs,
+            )?);
+        }
+
+        let runtime_metadata = runtime_metadata(
+            "bayes_logit",
+            feature_columns.clone(),
+            rows,
+            train_labels.len(),
+            val_indices.len(),
+        )?;
+        self.model = Some(BayesianOneVsRestArtifact {
+            precision_schema: BAYESIAN_F64_SCHEMA.to_string(),
+            model_name: "bayes_logit".to_string(),
+            feature_columns,
+            dataset_rows: rows,
+            scaler,
+            runtime_metadata: Some(runtime_metadata),
+            runtime_backend,
+            prior_precision,
+            learning_rate,
+            epochs,
+            classes,
+        });
+        self.prior_precision = prior_precision;
+        self.learning_rate = learning_rate;
+        self.epochs = epochs;
+        Ok(())
+    }
+
+    fn predict_proba_cpu(&self, x: &FeatureFrame) -> Result<Array2<f64>> {
+        let artifact = self
+            .model
+            .as_ref()
+            .context("BayesianLogitExpert not trained")?;
+        validate_bayesian_artifact(artifact)?;
+        ensure_feature_columns_match(&artifact.feature_columns, x)?;
+        let (features, _) = feature_matrix_from_frame(x)?;
+        let features = artifact.scaler.transform(&features)?;
+        let mut logits = Vec::with_capacity(features.nrows() * 3);
+
+        for row in 0..features.nrows() {
+            let row_values = features.row(row).to_vec();
+            for class_model in &artifact.classes {
+                logits.push(predictive_logit(class_model, &row_values)?);
+            }
+        }
+
+        softmax_rows(
+            &Array2::from_shape_vec((features.nrows(), 3), logits)
+                .context("shape bayesian probabilities")?,
+        )
+    }
+}
+
+impl ExpertModel for BayesianLogitExpert {
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        let runtime_backend = cpu_backend_for_policy(
+            &statistical_device_policy("bayes_logit"),
+            BAYESIAN_CPU_BACKEND,
+        )?;
+        lease.scope(|| self.fit_cpu(x, y, runtime_backend))
+    }
+
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        cpu_backend_for_policy(
+            &statistical_device_policy("bayes_logit"),
+            BAYESIAN_CPU_BACKEND,
+        )?;
+        lease.scope(|| self.predict_proba_cpu(x))
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        let artifact = self
+            .model
+            .as_ref()
+            .context("BayesianLogitExpert not trained")?;
+        validate_bayesian_artifact(artifact)?;
+        let runtime_metadata = artifact
+            .runtime_metadata
+            .as_ref()
+            .context("BayesianLogitExpert artifact missing runtime metadata")?;
+        validate_runtime_metadata(
+            runtime_metadata,
+            "bayes_logit",
+            &artifact.feature_columns,
+            artifact.dataset_rows,
+        )?;
+        with_staged_bayesian_artifact_dir(path, |staged_path| {
+            write_json(&staged_path.join(MODEL_FILE_NAME), artifact)?;
+            write_json(&staged_path.join(METADATA_FILE_NAME), &runtime_metadata)
+        })
+    }
+
+    fn load(&mut self, path: &Path) -> Result<()> {
+        let mut artifact: BayesianOneVsRestArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
+        validate_bayesian_artifact(&artifact)?;
+        let runtime_metadata = resolve_runtime_metadata_from_artifact(path, &artifact)?;
+        artifact.runtime_metadata = Some(runtime_metadata);
+        self.prior_precision = artifact.prior_precision;
+        self.learning_rate = artifact.learning_rate;
+        self.epochs = artifact.epochs;
+        self.model = Some(artifact);
+        Ok(())
+    }
+}
+
+impl BayesianLogitExpert {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let runtime_backend = cpu_backend_for_policy(
+            &statistical_device_policy("bayes_logit"),
+            BAYESIAN_CPU_BACKEND,
+        )?;
+        lease.scope(|| {
+            let artifact = self
+                .model
+                .as_ref()
+                .context("BayesianLogitExpert not trained")?;
+            validate_bayesian_artifact(artifact)?;
+            let runtime_metadata = artifact
+                .runtime_metadata
+                .as_ref()
+                .context("BayesianLogitExpert runtime metadata missing")?;
+            validate_runtime_metadata(
+                runtime_metadata,
+                &artifact.model_name,
+                &artifact.feature_columns,
+                artifact.dataset_rows,
+            )?;
+            if artifact.runtime_backend != runtime_backend {
+                bail!(
+                    "Bayesian runtime backend mismatch: artifact `{}` vs selected `{runtime_backend}`",
+                    artifact.runtime_backend
+                );
+            }
+            let probabilities = self.predict_proba_cpu(x)?;
+            runtime_predictions(
+                &artifact.model_name,
+                &probabilities,
+                &artifact.runtime_backend,
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::three_class_runtime_confidence;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+
+    // Deterministic, rule-derived fixture (NOT random noise): two spread-out
+    // features and a fixed linear decision boundary. Used to verify the
+    // defining Bayesian properties of the full-covariance Laplace posterior.
+    fn laplace_feature(i: usize, j: usize) -> f64 {
+        if j == 0 {
+            ((i % 11) as f64 - 5.0) * 0.3
+        } else {
+            ((i * 7 % 13) as f64 - 6.0) * 0.25
+        }
+    }
+    fn make_features(n: usize) -> Array2<f64> {
+        Array2::from_shape_fn((n, 2), |(i, j)| laplace_feature(i, j))
+    }
+    fn make_labels(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let x0 = laplace_feature(i, 0);
+                let x1 = laplace_feature(i, 1);
+                if 1.5 * x0 - x1 > 0.0 { 1.0 } else { 0.0 }
+            })
+            .collect()
+    }
+    fn predictive_variance(cm: &BayesianClassPosterior, x: &[f64]) -> f64 {
+        let aug = cm.covariance.nrows();
+        let z: Vec<f64> = x.iter().copied().chain(std::iter::once(1.0)).collect();
+        let mut v = 0.0_f64;
+        for a in 0..aug {
+            let mut acc = 0.0_f64;
+            for b in 0..aug {
+                acc += cm.covariance[(a, b)] * z[b];
+            }
+            v += z[a] * acc;
+        }
+        v
+    }
+
+    #[test]
+    fn full_laplace_predictive_variance_contracts_with_data() -> Result<()> {
+        // The defining Bayesian property: more data ⇒ tighter posterior ⇒
+        // smaller predictive logit variance zᵀΣz for a fixed probe point.
+        let probe = [0.6_f64, -0.4];
+        let cm_small = fit_binary_posterior(
+            &make_features(24),
+            &make_labels(24),
+            None,
+            None,
+            0.05,
+            0.1,
+            400,
+        )?;
+        let cm_large = fit_binary_posterior(
+            &make_features(400),
+            &make_labels(400),
+            None,
+            None,
+            0.05,
+            0.1,
+            400,
+        )?;
+        let v_small = predictive_variance(&cm_small, &probe);
+        let v_large = predictive_variance(&cm_large, &probe);
+        assert!(v_small.is_finite() && v_large.is_finite() && v_small > 0.0 && v_large > 0.0);
+        assert!(
+            v_large < v_small,
+            "posterior predictive variance must contract with more data: N=24 -> {v_small}, N=400 -> {v_large}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sigmoid_preserves_a_signal_below_f32_resolution() {
+        let positive = sigmoid(1.0e-12_f64);
+        let negative = sigmoid(-1.0e-12_f64);
+        assert!(
+            positive > 0.5,
+            "positive f64 logit must remain distinguishable"
+        );
+        assert!(
+            negative < 0.5,
+            "negative f64 logit must remain distinguishable"
+        );
+    }
+
+    #[test]
+    fn probit_correction_shrinks_logit_toward_half() -> Result<()> {
+        // With a positive predictive variance the κ/probit correction
+        // (Bishop 4.153) must shrink |logit| below the plug-in mean, pulling
+        // σ strictly closer to 0.5.
+        let cm = BayesianClassPosterior {
+            weights: Array1::from(vec![0.8_f64, -0.5]),
+            bias: 0.2,
+            covariance: Array2::<f64>::eye(3) * 0.5_f64,
+        };
+        let x = [1.0_f64, 1.0];
+        let raw_mean = 0.8 * 1.0 - 0.5 * 1.0 + 0.2_f64; // 0.5
+        let corrected = predictive_logit(&cm, &x)?;
+        assert!(
+            corrected.abs() < raw_mean.abs(),
+            "probit correction must shrink the logit toward 0: raw={raw_mean}, corrected={corrected}"
+        );
+        assert!(
+            (sigmoid(corrected) - 0.5).abs() < (sigmoid(raw_mean) - 0.5).abs(),
+            "probit-corrected probability must be closer to 0.5 than the plug-in"
+        );
+        Ok(())
+    }
+
+    fn sample_frame() -> FeatureFrame {
+        let columns = [
+            ("open", vec![1.0, 1.1, 1.2, 1.3, 1.4, 1.5]),
+            ("high", vec![1.2, 1.3, 1.4, 1.5, 1.6, 1.7]),
+            ("low", vec![0.9, 1.0, 1.1, 1.2, 1.3, 1.4]),
+            ("close", vec![1.05, 1.15, 1.25, 1.35, 1.45, 1.55]),
+        ]
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; 6])
+                .expect("valid Bayesian feature column")
+        })
+        .collect();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(6),
+            columns,
+        )
+        .expect("sample Bayesian feature frame")
+    }
+
+    fn sample_labels() -> Vec<i32> {
+        vec![-1_i32, 0, 1, -1, 0, 1]
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated Bayesian test lease")
+    }
+
+    #[test]
+    fn bayesian_logit_rejects_label_row_mismatch() {
+        let frame = sample_frame();
+        let y = vec![-1_i32, 0, 1];
+        let lease = one_worker_lease();
+        let mut model = BayesianLogitExpert::new();
+
+        let err = model
+            .fit(&frame, &y, &lease)
+            .expect_err("mismatched labels should fail");
+        assert!(err.to_string().contains("matching feature and label rows"));
+    }
+
+    #[test]
+    fn runtime_predictions_use_shared_three_class_confidence_gate() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f64, 0.20, 0.22])?;
+        let predictions = runtime_predictions(
+            "bayes_logit",
+            &probabilities,
+            "bayes_logit_bayesian_ovr_cpu",
+        )?;
+        let prediction = predictions
+            .first()
+            .expect("one runtime prediction should be produced");
+        let (expected_confidence, expected_abstain) =
+            three_class_runtime_confidence([0.58, 0.20, 0.22])?;
+
+        assert!((prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6);
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_predictions_persist_bayesian_backend_details() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f64, 0.20, 0.22])?;
+        let prediction = runtime_predictions(
+            "bayes_logit",
+            &probabilities,
+            "bayes_logit_bayesian_ovr_cpu",
+        )?
+        .into_iter()
+        .next()
+        .expect("one runtime prediction");
+
+        assert_eq!(
+            prediction.metadata().execution_backend.as_deref(),
+            Some("bayes_logit_bayesian_ovr_cpu")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_train_val_indices_leaves_temporal_embargo_gap() {
+        let (train, val) = split_train_val_indices(50);
+        assert!(!val.is_empty(), "validation split should be present");
+        let last_train = *train.last().expect("train rows");
+        let first_val = *val.first().expect("val rows");
+        assert!(
+            first_val > last_train + 1,
+            "expected embargo gap between train and val"
+        );
+    }
+
+    #[test]
+    fn validate_bayesian_artifact_rejects_missing_runtime_metadata() {
+        let artifact = BayesianOneVsRestArtifact {
+            precision_schema: BAYESIAN_F64_SCHEMA.to_string(),
+            model_name: "bayes_logit".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            runtime_metadata: None,
+            runtime_backend: "bayes_logit_bayesian_ovr_cpu".to_string(),
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 32,
+            classes: vec![
+                BayesianClassPosterior {
+                    weights: Array1::zeros(2),
+                    bias: 0.0,
+                    covariance: Array2::eye(3),
+                };
+                3
+            ],
+        };
+
+        let err = validate_bayesian_artifact(&artifact)
+            .expect_err("artifact without runtime metadata should fail");
+        assert!(err.to_string().contains("runtime metadata"));
+    }
+
+    #[test]
+    fn validate_bayesian_artifact_rejects_non_positive_scaler_stds() {
+        let artifact = BayesianOneVsRestArtifact {
+            precision_schema: BAYESIAN_F64_SCHEMA.to_string(),
+            model_name: "bayes_logit".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 0.0],
+            },
+            runtime_metadata: Some(
+                runtime_metadata(
+                    "bayes_logit",
+                    vec!["f1".to_string(), "f2".to_string()],
+                    8,
+                    6,
+                    2,
+                )
+                .expect("build metadata"),
+            ),
+            runtime_backend: "bayes_logit_bayesian_ovr_cpu".to_string(),
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 32,
+            classes: vec![
+                BayesianClassPosterior {
+                    weights: Array1::zeros(2),
+                    bias: 0.0,
+                    covariance: Array2::eye(3),
+                };
+                3
+            ],
+        };
+
+        let err = validate_bayesian_artifact(&artifact)
+            .expect_err("artifact with non-positive scaler std should fail");
+        assert!(err.to_string().contains("invalid posterior parameters"));
+    }
+
+    #[test]
+    fn validate_bayesian_artifact_rejects_old_precision_schema() {
+        let artifact = BayesianOneVsRestArtifact {
+            precision_schema: "neoethos.bayesian_logit.f32.v1".to_string(),
+            model_name: "bayes_logit".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            runtime_metadata: Some(
+                runtime_metadata(
+                    "bayes_logit",
+                    vec!["f1".to_string(), "f2".to_string()],
+                    8,
+                    6,
+                    2,
+                )
+                .expect("build metadata"),
+            ),
+            runtime_backend: "bayes_logit_bayesian_ovr_cpu".to_string(),
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 32,
+            classes: vec![
+                BayesianClassPosterior {
+                    weights: Array1::zeros(2),
+                    bias: 0.0,
+                    covariance: Array2::eye(3),
+                };
+                3
+            ],
+        };
+
+        let err = validate_bayesian_artifact(&artifact)
+            .expect_err("old f32 Bayesian artifacts must fail closed");
+        assert!(err.to_string().contains("precision schema"));
+    }
+
+    #[test]
+    fn validate_runtime_metadata_rejects_zero_train_rows() {
+        let metadata = RuntimeArtifactMetadata {
+            schema_version: crate::runtime::artifacts::RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION,
+            model_name: "bayes_logit".to_string(),
+            family: ModelFamily::Meta,
+            state: CapabilityState::Implemented,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            label_mapping: canonical_three_class_label_mapping(),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 0, 8),
+        };
+
+        let err = validate_runtime_metadata(
+            &metadata,
+            "bayes_logit",
+            &["f1".to_string(), "f2".to_string()],
+            8,
+        )
+        .expect_err("zero train rows must fail");
+        assert!(err.to_string().contains("training rows must be non-zero"));
+    }
+
+    #[test]
+    fn bayesian_load_uses_embedded_runtime_metadata_when_metadata_file_missing() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let frame = sample_frame();
+        let y = sample_labels();
+        let lease = one_worker_lease();
+        let mut model = BayesianLogitExpert::new();
+        model.fit(&frame, &y, &lease)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir =
+            std::env::temp_dir().join(format!("neoethos-models-bayes-embed-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        std::fs::remove_file(artifact_dir.join(METADATA_FILE_NAME)).expect("remove metadata file");
+
+        let mut reloaded = BayesianLogitExpert::new();
+        reloaded.load(&artifact_dir)?;
+        assert!(reloaded.model.is_some());
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
+    }
+
+    #[test]
+    fn bayesian_load_rejects_sidecar_drift_against_embedded_metadata() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let frame = sample_frame();
+        let y = sample_labels();
+        let lease = one_worker_lease();
+        let mut model = BayesianLogitExpert::new();
+        model.fit(&frame, &y, &lease)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir =
+            std::env::temp_dir().join(format!("neoethos-models-bayes-drift-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        let metadata_path = artifact_dir.join(METADATA_FILE_NAME);
+        let mut drifted: RuntimeArtifactMetadata =
+            read_json(&metadata_path).expect("read saved metadata");
+        drifted.training_summary.dataset_rows += 1;
+        write_json(&metadata_path, &drifted).expect("write drifted metadata");
+
+        let mut reloaded = BayesianLogitExpert::new();
+        let err = reloaded
+            .load(&artifact_dir)
+            .expect_err("drifted sidecar metadata should fail load");
+        assert!(err.to_string().contains("sidecar mismatch"));
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
+    }
+}

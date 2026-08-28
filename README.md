@@ -1,0 +1,110 @@
+<div align="center">
+
+[![Διαβάστε το στα Ελληνικά](assets/badge-lang-el.svg)](README.el.md)
+
+# NeoEthos
+
+### *A new ethos for trading — institutional-grade discipline, in the hands of one person.*
+
+**Pure-Rust trading intelligence: it discovers its own strategies, sizes every trade by the math of survival, and answers to a single, honest goal you set.**
+
+`100% Rust on the hot path` · `cTrader native` · `no Python at runtime` · `your machine, your data, your keys`
+
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) · [**The story ✦**](https://kosred.github.io/Neoethos/) · [Latest release](../../releases/latest) · [Build from source](BUILDING.md) · [Principles](PRINCIPLES.md) · [Privacy](PRIVACY.md)
+
+</div>
+
+---
+
+## Why this exists
+
+The serious tools — walk-forward validation, genetic strategy search, Kelly-aware sizing, prop-firm risk gates, a real model ensemble — have always lived behind institutional walls and five-figure subscriptions. The small trader gets a chart and a prayer.
+
+NeoEthos is the refusal of that. It puts the *whole pipeline* — research, discovery, risk, execution — on one person's laptop, in software that is auditable line by line and lies to no one: every number comes from the engine; nothing is invented for the UI.
+
+## What it does
+
+- **Discovers strategies, doesn't ship guesses.** A genetic search breeds and tests strategies across timeframes, then survives them through **five mandatory anti-overfitting gates** — walk-forward, CPCV, PBO/CSCV (López de Prado), a permutation test and a parameter-plateau test — so what reaches you has held up on data it never trained on. See [PRINCIPLES.md](PRINCIPLES.md).
+- **Shares compute, not secrets.** **Federation** (SETI@home-style): people who trust each other pool their machines for discovery — no server needed, and every imported result still passes every local gate before any real money. See the [Federation guide](docs/FEDERATION.md); the serverless P2P mesh is the isolated [`mesh/`](mesh/README.md) sidecar.
+- **Two honest modes, one master switch.** You pick the goal; *the search, the models, and the risk all re-orient around it.*
+- **Sizes for survival.** Position size is a fraction of your *live* balance (it compounds as you grow), derived from each strategy's measured edge and the broker's real per-lot costs — not a fixed, account-blowing percentage.
+- **A real model ensemble.** XGBoost, CatBoost, LightGBM, neural nets (Burn), KAN, N-BEATS, TabNet, TiDE and more — native Rust, no GIL, no embedded Python on the hot path.
+- **Live, broker-native.** cTrader Open API over OAuth/WebSocket. Market **and** conditional (limit/stop) orders, live P/L, a MyFxbook-style trade journal. Your account, your keys, on your machine.
+- **A desktop app *and* a terminal.** A single-process **Tauri + React** desktop app (Greek / English) and a full ratatui TUI with live candlesticks — the same Rust engine underneath.
+
+## The two modes
+
+| | **Risky Mode** | **Prop-Firm Mode** |
+|---|---|---|
+| **Goal** | Multiply a small balance to a large target, as fast as the edge allows | Pass prop-firm challenges comfortably and bank a steady monthly return |
+| **You set** | start → target → horizon (e.g. €100 → €50,000 in 6 months) | the firm preset (FTMO, FundedNext, …) + drawdown caps |
+| **The search** | is *pressured* to find strategies that can hit your target in time | optimises for the firm's window-pass rules |
+| **The truth** | high risk, deep drawdown — and the odds are computed, not promised | safety and stability first |
+
+You set the goal. The math tells you the truth about it. The bot tries.
+
+> **Risk warning.** Trading leveraged FX carries a substantial risk of loss and is not suitable for everyone. NeoEthos is research/educational software and **not financial advice**. Nothing here is a promise of profit. Use a demo account until *you* have verified an edge; you alone are responsible for any live trading.
+
+## Architecture
+
+Fully pure-Rust — migrated off a Python/Rust hybrid to kill the GIL and earn memory safety end to end. A single Tauri process links the engine crates **in-process** and serves the React UI; there is no separate backend to run.
+
+- **`neoethos-core`** — risk management, portfolio optimisation, the single config the UI/TUI edit
+- **`neoethos-data`** — high-speed OHLCV + feature engine, zero look-ahead bias
+- **`neoethos-models`** — the native ML ensemble
+- **`neoethos-search`** — genetic discovery + target-aware ranking + the OOS validation gates
+- **`neoethos-trader`** — live signal generation + the autonomous engine
+- **`neoethos-app`** — in-process HTTP API, headless jobs, cTrader transports
+- **`neoethos-cli`** — the TUI + batch operator tasks
+- **`desktop/`** — the Tauri v2 shell + React/TypeScript UI (`crate neoethos-desktop`)
+
+## Getting started
+
+**Just want to run it?** Grab the Windows installer (`.exe` or `.msi`) from the [latest release](../../releases/latest). Launch it, connect your cTrader account (OAuth, one time), and you're in. Use a **Demo** account first.
+
+**Want to build it yourself?** See **[BUILDING.md](BUILDING.md)** for the full, OS-by-OS guide (toolchains, the desktop build, the TUI, optional GPU acceleration, and cTrader setup). The short version:
+
+```bash
+# Prerequisites: Rust (stable, 2024 edition) + Node 20+ + Tauri OS deps.
+# Desktop app installer (bundles the frontend + engine into one binary):
+cd desktop
+npm install
+npx tauri build          # → target/release/bundle/{nsis,msi}/...
+
+# Or run it live during development:
+npx tauri dev
+
+# Terminal UI (live candlesticks, discovery, logs) — no Node needed:
+cargo run --release -p neoethos-cli
+```
+
+## Status
+
+**v0.5.6.** Everything from v0.5.2 — "the honesty release" (the five-gate validation stack: walk-forward, CPCV, PBO, permutation, plateau; risk-constrained Kelly sizing on the empirical trade distribution; the prop-firm challenge simulator; auto-cull with a permanent blacklist + automatic re-discovery; Federation Phase 0) — plus, since then: the **serverless P2P mesh sidecar is real** ([`mesh/`](mesh/README.md) — automatic relay connectivity, peer discovery over gossip, cross-machine discovery work distribution, swarm capacity aggregation), an isolated **MCP tool sidecar** for the AI supervisor, **hold-to-bracket live-execution parity** with the validated discovery kernel, never-OOM holdout views, and a **line-by-line audit of the entire first-party codebase** (July 2026). The road ahead: island-model distributed discovery (in testing on two machines) → broker-agnostic adapters → a mobile monitor.
+
+## Privacy
+
+**No telemetry. No tracking. No server. Nothing leaves your machine** except the connections *you* configure (your broker, optional news calendar, optional AI assistant with your own account). Every outbound connection is enumerated and auditable in [PRIVACY.md](PRIVACY.md) — and because this is AGPL, you can verify every claim in the source.
+
+## Support the project
+
+NeoEthos is built by one person on a 6-core mini PC, with no company behind it. If it's useful to you, you can help it survive:
+
+- ⭐ **Star the repo** — discoverability is oxygen for a project with no marketing budget
+- 🐛 **Run it on demo and report issues** — real-world reports are gold
+- 🖥 **Lend compute** to a federation group, or **contribute** ([CONTRIBUTING.md](CONTRIBUTING.md))
+- 💚 **Donate** — via [GitHub Sponsors](https://github.com/sponsors/kosred) (one-time or monthly). Donations fund the electricity, the hardware, and the AI-assisted development that built this. No donation buys signals, promises, or influence over the math — the math is not for sale.
+
+## License
+
+NeoEthos is licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later) — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+In plain terms: you are free to use, study, modify and self-host it. If you run a **modified** version as a network service, the AGPL requires you to offer that service's users the corresponding source. Third-party components keep their own licenses (see `vendor/` and the dependency manifests).
+
+Copyright © 2024–2026 Konstantinos Kokkinos ("kosred").
+
+<div align="center">
+
+*Built with discipline, in the open, by one person who believes the small trader deserves better tools.*
+
+</div>

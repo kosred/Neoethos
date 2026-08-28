@@ -1,0 +1,28 @@
+[package]
+name = "neoethos-gpu-cuda"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+cuda = ["dep:cust", "dep:vector-ta"]
+cuda-device-fixtures = ["cuda"]
+
+[dependencies]
+cust = { version = "0.3.2", optional = true }
+neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
+pci-info = { version = "=0.3.4", default-features = false }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+vector-ta = { version = "0.2.9", optional = true, default-features = false, features = ["cuda-build-native"] }
+
+[build-dependencies]
+cc = "1.2"
+sha2.workspace = true
+
+[dev-dependencies]
+cc = "1.2"
+sha2.workspace = true

@@ -1,0 +1,278 @@
+//! `/account/snapshot` — current account balance + open positions.
+//!
+//! Wire shape mirrors the `AccountSnapshot` class in
+//! `experiments/forex-flutter-ui/lib/api/backend_client.dart`. Field
+//! names use serde-rename-style camelCase so the Flutter side can
+//! deserialize without a custom mapper — see
+//! `serde(rename_all = "camelCase")` on each struct.
+//!
+//! ## Behaviour when broker is offline
+//!
+//! Phase 1 server fills the cache with a deterministic seed at boot
+//! (see `state::AppApiState::with_seed_account`). Once the live
+//! broker session lands, the seed gets overwritten the moment the
+//! first cTrader account-info message arrives. Either way the route
+//! returns 200 — Flutter doesn't need to special-case "no data yet".
+//!
+//! If the cache is truly empty (no seed AND no live data — only
+//! happens if the bootstrap code is wrong) we return `503 Service
+//! Unavailable` so the Flutter side can render a meaningful error
+//! state instead of an empty json blob.
+
+use std::convert::Infallible;
+use std::time::Duration;
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use futures::stream::{Stream, StreamExt};
+use tokio_stream::wrappers::BroadcastStream;
+
+#[cfg(test)]
+use super::state::PositionPayload;
+use super::state::{AccountSnapshotPayload, AppApiState};
+
+/// Wire DTO. `serde(rename_all = "camelCase")` keeps the JSON keys
+/// matching the Dart field names without us having to maintain two
+/// independent naming conventions.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSnapshotDto {
+    pub balance: f64,
+    pub equity: f64,
+    pub free_margin: f64,
+    pub used_margin: f64,
+    pub currency: String,
+    /// Server-side wall-clock (Unix milliseconds, UTC) for when
+    /// this snapshot was assembled. The Flutter Dashboard renders
+    /// "as of HH:MM:SS" in the user's local timezone next to the
+    /// balance number so the operator can tell at a glance whether
+    /// the displayed equity is fresh or carried over from a stale
+    /// poll. Optional only because the DTO predates this field — a
+    /// missing value renders as "—" and triggers the staleness
+    /// banner.
+    pub fetched_at_unix_ms: Option<i64>,
+    pub positions: Vec<PositionDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionDto {
+    /// cTrader position id — needed by the Close button to call
+    /// `POST /positions/close`.
+    pub position_id: i64,
+    /// Broker volume in centi-lot units (what the close endpoint
+    /// wants). The `volume` field below is the human-readable lot
+    /// count.
+    pub volume_units: i64,
+    pub symbol: String,
+    pub side: String,
+    pub volume: f64,
+    /// Unix-ms timestamp of the position open fill (UTC). Flutter
+    /// converts to local time for the "since HH:MM" badge in the
+    /// position row. None when cTrader didn't include a stamp in
+    /// the reconcile payload (rare race window).
+    pub open_timestamp_ms: Option<i64>,
+    pub pnl_pips: Option<f64>,
+    pub pnl_usd: f64,
+    /// Entry price / SL / TP straight from the broker — no client merge.
+    pub entry_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    /// Volume in lots (cTrader parity); `None` if symbol not in metadata.
+    pub volume_lots: Option<f64>,
+}
+
+impl From<crate::server::state::PositionPayload> for PositionDto {
+    fn from(p: crate::server::state::PositionPayload) -> Self {
+        PositionDto {
+            position_id: p.position_id,
+            volume_units: p.volume_units,
+            symbol: p.symbol,
+            side: p.side,
+            volume: p.volume,
+            open_timestamp_ms: p.open_timestamp_ms,
+            pnl_pips: p.pnl_pips,
+            pnl_usd: p.pnl_usd,
+            entry_price: p.entry_price,
+            stop_loss: p.stop_loss,
+            take_profit: p.take_profit,
+            volume_lots: p.volume_lots,
+        }
+    }
+}
+
+impl From<AccountSnapshotPayload> for AccountSnapshotDto {
+    fn from(p: AccountSnapshotPayload) -> Self {
+        Self {
+            balance: p.balance,
+            equity: p.equity,
+            free_margin: p.free_margin,
+            used_margin: p.used_margin,
+            currency: p.currency,
+            fetched_at_unix_ms: Some(p.fetched_at_unix_ms),
+            positions: p.positions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// **2026-05-25 — operator directive "uniform push everywhere"**:
+/// `GET /account/snapshot/stream` — Server-Sent Events that pushes
+/// every account update (balance, equity, free margin, positions,
+/// PnL) the moment the bridge writes a fresh snapshot to the cache.
+///
+/// Replaces the Flutter 1Hz polling of `/account/snapshot` with a
+/// real-time push channel. Latency = network RTT (~1-5 ms) instead
+/// of poll interval (~1000 ms).
+///
+/// Mirror of `live_spots::stream` for ticks. Same SSE wire shape:
+/// `event: account` + JSON payload per snapshot, plus a 15 s
+/// keep-alive so HTTP proxies don't idle-close the connection.
+///
+/// The polling `/account/snapshot` route is kept as a fallback for
+/// cold-start (Flutter calls it once on mount before switching to
+/// the SSE stream) and for HTTP clients without SSE support.
+///
+/// **Architectural note**: positions are part of the
+/// `AccountSnapshotPayload` shape so the same stream covers
+/// balance + equity + open positions. A separate `/positions/stream`
+/// would be redundant; one channel serves the Dashboard's full view.
+pub async fn stream(
+    State(state): State<AppApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.subscribe_account();
+    let stream = BroadcastStream::new(receiver).filter_map(|res| async move {
+        let payload = res.ok()?;
+        let dto = AccountSnapshotDto::from(payload);
+        let json = serde_json::to_string(&dto).ok()?;
+        Some(Ok(Event::default().event("account").data(json)))
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// `POST /account/snapshot/refresh` — operator-triggered immediate
+/// account refresh. Pings the bridge's `account_refresh_rx` channel
+/// so the next polling iteration fires NOW instead of waiting up to
+/// 5 s for the timer. Returns the freshly-cached snapshot (or 503
+/// if the cache is still empty after the refresh, e.g. broker
+/// session not yet established).
+///
+/// **2026-05-25 — operator directive "uniform push everywhere"**:
+/// same trigger channel that the future `OAExecutionEvent` handler
+/// will use; exposing it as an HTTP endpoint gives the operator a
+/// "force refresh" button in the UI without any extra plumbing.
+pub async fn refresh(State(state): State<AppApiState>) -> Response {
+    state.trigger_account_refresh();
+    // Give the bridge a couple of polling iterations to react before
+    // returning the (likely refreshed) snapshot. This is generous
+    // enough that the bridge's refresh-once round trip + cache write
+    // typically completes within the wait.
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    match state.account().await {
+        Some(payload) => Json(AccountSnapshotDto::from(payload)).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "broker session not ready",
+                "code": "broker_not_ready",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn snapshot(State(state): State<AppApiState>) -> Response {
+    match state.account().await {
+        Some(payload) => Json(AccountSnapshotDto::from(payload)).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "broker session not ready",
+                "code": "broker_not_ready",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn seeded_state() -> AppApiState {
+        AppApiState::new().with_seed_account(AccountSnapshotPayload {
+            balance: 10_000.0,
+            equity: 10_125.5,
+            free_margin: 9_750.0,
+            used_margin: 250.0,
+            currency: "EUR".to_string(),
+            fetched_at_unix_ms: 0,
+            positions: vec![PositionPayload {
+                position_id: 0,
+                volume_units: 0,
+                symbol: "EURUSD".to_string(),
+                side: "LONG".to_string(),
+                volume: 0.10,
+                open_timestamp_ms: None,
+                pnl_pips: Some(12.5),
+                pnl_usd: 11.30,
+                entry_price: Some(1.0850),
+                stop_loss: None,
+                take_profit: None,
+                volume_lots: Some(0.10),
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_seeded_account_as_camel_case_json() {
+        let app = super::super::router(seeded_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/account/snapshot")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body collects");
+        let text = std::str::from_utf8(&body).expect("utf-8 body");
+        // CamelCase keys — important for Flutter side to deserialize.
+        assert!(
+            text.contains("\"freeMargin\""),
+            "expected camelCase, got: {text}"
+        );
+        assert!(text.contains("\"usedMargin\""));
+        assert!(text.contains("\"pnlPips\""));
+        assert!(text.contains("\"pnlUsd\""));
+        assert!(text.contains("EURUSD"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_503_when_no_account_seeded() {
+        let app = super::super::router(AppApiState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/account/snapshot")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

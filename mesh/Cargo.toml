@@ -1,0 +1,49 @@
+# NeoEthos Mesh — the P2P sidecar (Federation, fully automatic).
+#
+# DELIBERATELY ISOLATED: its OWN workspace + Cargo.lock. Shares NOTHING with
+# the main NeoEthos workspace's pinned GPU/ML dependency tree. A bug or version
+# conflict here crashes THIS binary and nothing else — the trading engine is
+# untouched. The sidecar talks to the running app ONLY over its localhost HTTP
+# API (`/federation/*`). See mesh/README.md and docs/p2p-mesh-design-2026-07-03.md.
+[workspace]
+
+[package]
+name = "neoethos-mesh"
+version = "0.1.0"
+description = "NeoEthos P2P mesh sidecar — fully-automatic serverless shared discovery (iroh 1.0)"
+authors = ["NeoEthos"]
+license = "AGPL-3.0-or-later"
+edition = "2024"
+rust-version = "1.91"
+
+[[bin]]
+name = "neoethos-mesh"
+path = "src/main.rs"
+
+[dependencies]
+neoethos-execution-budget = { path = "../crates/neoethos-execution-budget" }
+# Current iroh 1.0 (edition 2024): QUIC + TLS 1.3 + relay/hole-punch + FULLY
+# AUTOMATIC peer discovery. No port-forwarding, no Tailscale, no human in the
+# loop — a node just starts and joins the swarm.
+iroh = "1.0"
+iroh-gossip = "0.101"
+n0-future = "0.3"
+futures-lite = "2"
+bytes = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# In-memory tar of the model directory for training-result transfer.
+tar = "0.4"
+base64 = "0.22"
+anyhow = "1"
+rand = "0.8"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# HTTP bridge to the LOCAL NeoEthos app (/federation/*). rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

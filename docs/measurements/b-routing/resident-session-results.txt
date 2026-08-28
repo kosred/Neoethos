@@ -1,0 +1,6 @@
+RESULT a-4k     parity=True  gpu=0.0292s 36.0 M cand-bars/s 
+RESULT b-4k     parity=True  gpu=0.0208s 50.4 M cand-bars/s 
+RESULT a-20k    parity=True  gpu=0.1016s 50.4 M cand-bars/s 
+RESULT b-20k    parity=True  gpu=0.1012s 50.6 M cand-bars/s 
+RESULT a-200k   parity=True  gpu=1.1009s 46.5 M cand-bars/s 
+RESULT b-200k   parity=True  gpu=1.0681s 47.9 M cand-bars/s 

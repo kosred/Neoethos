@@ -1,0 +1,145 @@
+[package]
+name = "neoethos-cli"
+version = "0.5.6"
+edition.workspace = true
+# SPDX dual-license matches the repo-root LICENSE file. Required by both
+# cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
+license = "AGPL-3.0-or-later"
+description = "NeoEthos headless CLI + TUI — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+homepage = "https://github.com/kosred/neoethos"
+repository = "https://github.com/kosred/neoethos"
+readme = "../../README.md"
+
+[features]
+default = []
+# GPU features MIRROR neoethos-app EXACTLY. Discovery/training/eval MUST run
+# identically whether invoked from the UI/backend or the CLI — no capability may
+# differ between front-ends. So `--features gpu-vulkan` (or gpu-nvidia/gpu-rocm)
+# builds the CLI with the SAME cubecl-wgpu / CUDA GPU eval the app uses; the
+# headless/VPS path is no longer silently CPU-only.
+gpu = ["gpu-nvidia"]
+# `neoethos-data/gpu-cuda` added 2026-08-09 — it had been declared and named by
+# nothing, so vector-ta's CUDA indicator kernels were never in a binary. MIRRORS
+# neoethos-app exactly, per the parity rule above.
+gpu-nvidia = [
+    "neoethos-data/gpu-cuda",
+    "neoethos-models/gpu-cuda",
+    "neoethos-search/gpu-cuda",
+    "neoethos-autoresearch/gpu-cuda",
+]
+# Exact full research/training build for NVIDIA hosts. `gpu-nvidia` covers the
+# search, indicator, tree, RL, evolution and statistical CUDA surfaces; Burn's
+# deep/Exit/SAC backend is intentionally independent in neoethos-models and is
+# included here explicitly so the full-run command cannot leave those models on
+# CPU while a card is present.
+gpu-nvidia-full = [
+    "gpu-nvidia",
+    "neoethos-models/burn-cuda-backend",
+]
+# Minimal native-CUDA build: Prototype B only, no CubeCL and no libtorch. Used
+# by the rented-GPU kit to prove the B kernel before provisioning anything else.
+gpu-b-native = ["neoethos-search/gpu-b-native"]
+# Benchmark-only CUDA: the search GPU lane (CubeCL CUDA + the native B engine)
+# without the model stack, so a rented box can run the whole A/B/C matrix with
+# rustc and nvcc alone — no libtorch download, no LIBTORCH env, no CUDA-version
+# matching against a prebuilt tensor library.
+gpu-bench-cuda = ["neoethos-search/gpu-cuda", "gpu-b-native"]
+gpu-vulkan = ["neoethos-models/gpu-vulkan", "neoethos-search/gpu-vulkan"]
+gpu-rocm = ["neoethos-models/gpu-rocm", "neoethos-search/gpu-rocm"]
+gpu-apple = ["gpu-vulkan"]
+
+[dependencies]
+neoethos-core = { path = "../neoethos-core" }
+neoethos-broker-history = { path = "../neoethos-broker-history" }
+neoethos-data = { path = "../neoethos-data" }
+neoethos-models = { path = "../neoethos-models", features = ["tree-models", "pure-rust-ml"] }
+neoethos-search = { path = "../neoethos-search" }
+# The autonomous-trader engine. The CLI `trader-replay` command drives the SAME
+# engine the app does (parity) over real on-disk history for an offline dry-run.
+# `ml-blend` enables the genes×ensemble blend path (`trader-replay --blend`); the
+# cli already builds neoethos-models so this is only a feature flag, no new cost.
+neoethos-trader = { path = "../neoethos-trader", features = ["ml-blend"] }
+# The goal-driven research loop. `neoethos-cli autoresearch` is its ONLY operator
+# entry point: `runner::run` was invoked from nowhere in the workspace — no CLI
+# subcommand, no UI route, no caller outside its own crate — so the loop could
+# not be started by a human at all.
+#
+# This edge is one-directional and stays that way. `neoethos-autoresearch`
+# depends on NEITHER `neoethos-app` NOR `neoethos-trader` (its own manifest says
+# so, and `tests/no_broker_dependency.rs` fails if that ever stops being true),
+# so adding it here gives the CLI a way to START the loop and gives the loop no
+# way to reach a broker.
+neoethos-autoresearch = { path = "../neoethos-autoresearch" }
+anyhow = "1.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { workspace = true, features = ["blocking"] }
+# Deterministic attribution hashes for the Rust-only benchmark preparation
+# commands (snapshot SHA-256, config/dataset hashes). Same version the app and
+# codex crates already resolve, so no new graph entry.
+sha2 = "0.10"
+# `tracing` is consumed at every error-path in main.rs / tui/* for
+# structured logging (warn!/debug!). Pre-existing usage; the dep
+# line was inadvertently dropped during an earlier refactor and
+# v0.4.5 needs it for `cargo check` to pass.
+tracing = "0.1"
+# Interactive TUI — used by `neoethos-cli` when invoked with no args.
+# `crossterm` is the cross-platform terminal backend; `ratatui` is the
+# rendering library. Together they give us Bloomberg-style fixed
+# layouts with live progress + keyboard nav.
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+# Task #61 — `setup` subcommand needs the canonical user-config
+# directory (`%APPDATA%\Roaming\neoethos\` on Windows,
+# `~/.config/neoethos/` on Linux, `~/Library/Application Support/neoethos/`
+# on macOS) so it prints the SAME path
+# `neoethos-app::broker_persistence::credentials_file_path` reads from.
+# Pinned to the same `dirs` version neoethos-app uses so both crates
+# resolve to byte-identical paths (no `directories`-vs-`dirs` drift).
+dirs = "5.0.1"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-deb metadata — produces target/debian/neoethos-cli_<version>_<arch>.deb
+# Spec: https://github.com/kornelski/cargo-deb
+# Strategy ref: installer_no_paid_certs_strategy.md §3 (Linux .deb path, $0).
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+maintainer = "neoethos contributors <neoethos@users.noreply.github.com>"
+copyright = "2024-2026 NeoEthos contributors; licensed under AGPL-3.0-or-later"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+neoethos is an open-source quantitative trading workspace targeting \
+the cTrader Open API. It includes data ingestion, ML-driven \
+strategy search, paper / live trading orchestration, and a \
+risk-aware execution gate. This package ships the headless CLI / TUI \
+front-end."""
+section = "finance"
+priority = "optional"
+assets = [
+    ["target/release/neoethos-cli", "usr/bin/", "755"],
+    ["target/release/libxgboost.so", "usr/lib/neoethos-cli/", "644"],
+    ["target/release/libcatboostmodel.so", "usr/lib/neoethos-cli/", "644"],
+    ["../../assets/symbol_metadata/defaults.json", "usr/share/neoethos/symbol_metadata/", "644"],
+    ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
+    ["../../README.md", "usr/share/doc/neoethos/", "644"],
+]
+# Opt-in autostart only via the in-app wizard — never enable the unit on
+# install. (Wizard §9: user controls autonomous-watchdog autostart.)
+systemd-units = { enable = false }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-generate-rpm metadata — produces target/generate-rpm/neoethos-cli-*.rpm
+# Spec: https://github.com/cat-in-136/cargo-generate-rpm
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name = "neoethos-cli"
+license = "AGPL-3.0-or-later"
+assets = [
+    { source = "target/release/neoethos-cli", dest = "/usr/bin/neoethos-cli", mode = "0755" },
+    { source = "target/release/libxgboost.so", dest = "/usr/lib/neoethos-cli/libxgboost.so", mode = "0644" },
+    { source = "target/release/libcatboostmodel.so", dest = "/usr/lib/neoethos-cli/libcatboostmodel.so", mode = "0644" },
+    { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },
+    { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },
+]

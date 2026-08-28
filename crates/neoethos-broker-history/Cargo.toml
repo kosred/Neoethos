@@ -1,0 +1,46 @@
+[package]
+name = "neoethos-broker-history"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["broker-history-service"]
+broker-history-service = []
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+chrono.workspace = true
+clap = { version = "4.6.0", features = ["derive"] }
+ctrlc = "3.5.1"
+hickory-resolver = "0.26.1"
+neoethos-core = { path = "../neoethos-core" }
+neoethos-data = { path = "../neoethos-data" }
+neoethos-broker-truth.workspace = true
+neoethos-execution-budget.workspace = true
+open = "5.3.2"
+rand.workspace = true
+reqwest = { version = "0.13.3", default-features = true, features = ["blocking", "json", "rustls", "query", "form"] }
+rustls = { version = "0.23", default-features = true, features = ["ring", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_repr = "0.1"
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+url = "2.5"
+vortex-array = "0.67.0"
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native", "sync-secret-service"] }

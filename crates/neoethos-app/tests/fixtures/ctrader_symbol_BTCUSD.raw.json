@@ -1,0 +1,79 @@
+{
+  "clientMsgId": "capture-symbol-by-id",
+  "payload": {
+    "ctidTraderAccountId": 47367144,
+    "symbol": [
+      {
+        "chargeSwapAtWeekends": false,
+        "commission": 0,
+        "commissionType": 1,
+        "digits": 3,
+        "distanceSetIn": 1,
+        "enableShortSelling": true,
+        "gslCharge": 0,
+        "gslDistance": 0,
+        "gslScheduleId": 1,
+        "guaranteedStopLoss": false,
+        "leverageId": 1052,
+        "lotSize": 100,
+        "maxExposure": 10000000000000,
+        "maxVolume": 5000,
+        "measurementUnits": "BTC",
+        "minCommission": 0,
+        "minCommissionAsset": "INR",
+        "minCommissionType": 1,
+        "minVolume": 1,
+        "pipPosition": 1,
+        "pnlConversionFeeRate": 0,
+        "preciseMinCommission": 0,
+        "preciseTradingCommissionRate": 0,
+        "rolloverCommission": 0,
+        "rolloverCommission3Days": 0,
+        "schedule": [
+          {
+            "endSecond": 86395,
+            "startSecond": 0
+          },
+          {
+            "endSecond": 172795,
+            "startSecond": 86400
+          },
+          {
+            "endSecond": 259195,
+            "startSecond": 172800
+          },
+          {
+            "endSecond": 345595,
+            "startSecond": 259200
+          },
+          {
+            "endSecond": 431995,
+            "startSecond": 345600
+          },
+          {
+            "endSecond": 518395,
+            "startSecond": 432000
+          },
+          {
+            "endSecond": 604795,
+            "startSecond": 518400
+          }
+        ],
+        "scheduleTimeZone": "Europe/Bucharest",
+        "skipRolloverDays": 3,
+        "skipSWAPPeriods": 0,
+        "slDistance": 0,
+        "stepVolume": 1,
+        "swapLong": 0.0,
+        "swapPeriod": 24,
+        "swapRollover3Days": 0,
+        "swapShort": 0.0,
+        "swapTime": 1259,
+        "symbolId": 22395,
+        "tpDistance": 0,
+        "tradingMode": 0
+      }
+    ]
+  },
+  "payloadType": 2117
+}

@@ -1,0 +1,53 @@
+# cubecl runtime configuration — discovered by cubecl's
+# `RuntimeConfig::from_current_dir()`, which walks UP from the process CWD,
+# so any CLI/engine run from (or under) the repo root picks this up.
+#
+# WHY THIS EXISTS (burn #4792 / cubecl-cuda stream pools):
+# cubecl-cuda assigns ONE CUDA stream per touching thread and, by default,
+# allows up to `max_streams = 128`. Discovery drives the GPU from ~N rayon
+# worker threads, so with the default each thread gets its OWN grow-only
+# VRAM pool → total VRAM ≈ N × per-pool-budget, which is exactly what filled
+# a 48 GB A6000 on M1. Collapsing to a SINGLE stream means the per-pool VRAM
+# budget bounds the WHOLE process, not each thread.
+#
+# SCOPE — CORRECTED 2026-08-04. This block used to read:
+#
+#   "SCOPE: this only affects gpu-cuda builds (NVIDIA). The Vulkan/wgpu path
+#    already bounds its pool in-code (`create_gpu_client` in cubecl_eval.rs
+#    installs a graduated pool with a finite `dealloc_period`), and CPU builds
+#    never read this file."
+#
+# Both halves of that were false, checked against the vendored sources of the
+# cubecl version this workspace pins (0.11.0-pre.1):
+#
+#   cubecl-wgpu/src/compute/server.rs:114   let max_streams = config.streaming.max_streams;
+#   cubecl-cpu/src/compute/server.rs:57     let max_streams = config.streaming.max_streams;
+#   cubecl-cpu/src/lib.rs:212               ... .streaming.max_streams as u64;
+#
+# `max_streams` lives on the RUNTIME-WIDE `StreamingConfig`
+# (cubecl-runtime/src/config/streaming.rs:11, default 128), not on anything
+# CUDA-specific, so `max_streams = 1` applies to EVERY cubecl runtime in the
+# process. On the wgpu path it feeds both `SchedulerMultiStreamOptions.max_streams`
+# and `shared_bindings_pool: LeasePool::with_capacity(tasks_max * max_streams)`
+# — i.e. it serialises the Vulkan scheduler and shrinks that lease pool 128x.
+# That matters more than it sounds: the CUDA lane is the one that is usually
+# absent (no NVIDIA card on the operator's machine), so in practice this file
+# has mostly been throttling wgpu and CPU, the two lanes it claimed not to touch.
+#
+# The in-code wgpu pool bound the old comment cited is real and still there
+# (`create_gpu_client` in cubecl_eval.rs) — it just is not a reason this
+# setting skips wgpu. Keeping `max_streams = 1`: the VRAM argument above is
+# unchanged, and single-stream is the conservative setting for all three
+# backends. Revisit only with a measurement, not with a scope assumption.
+#
+# Keep the file VALID TOML — cubecl PANICS at startup on a malformed config
+# rather than ignoring it.
+[compilation]
+# Persistent PTX caching is temporarily disabled. The vendored CubeCL 0.10
+# cache key does not bind generated source or the active CUDA/NVRTC toolchain,
+# so a source edit can otherwise reuse stale device code. Restore `cache =
+# "target"` only after the source- and toolchain-bound cache-key patch has
+# passed the two-process real-device regression.
+
+[streaming]
+max_streams = 1

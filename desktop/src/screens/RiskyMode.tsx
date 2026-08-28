@@ -1,0 +1,116 @@
+import { riskyScenarios, settings, strategyList } from "../api";
+import { usePoll } from "../hooks";
+import { HelpPanel } from "../components/Help";
+
+const days = (n: number | null) =>
+  n == null || Number.isNaN(n) ? "never" : n >= 365 ? `${(n / 365).toFixed(1)}y` : n >= 30 ? `${(n / 30).toFixed(1)}mo` : `${Math.round(n)}d`;
+const eur = (v: number) => `€${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+
+function ProjBlock({ label, proj }: { label: string; proj: any }) {
+  return (
+    <div className="ticket" style={{ margin: 0 }}>
+      <h2 style={{ marginTop: 0, fontSize: 14 }}>{label}</h2>
+      {proj ? (
+        <div className="cards" style={{ gridTemplateColumns: "1fr 1fr" }}>
+          <div className="card"><div className="card-label">EXPECTED</div><div className="card-value">{days(proj.expectedDays)}</div></div>
+          <div className="card"><div className="card-label">BEST CASE</div><div className="card-value">{days(proj.bestCaseDays)}</div></div>
+          <div className="card"><div className="card-label">RISK / TRADE</div><div className="card-value">{(proj.riskFraction * 100).toFixed(0)}%</div></div>
+          <div className="card"><div className="card-label">RUIN PROB.</div><div className="card-value" style={{ color: "#ef4444" }}>{(proj.ruinProbability * 100).toFixed(1)}%</div></div>
+        </div>
+      ) : (
+        <p className="muted">Computing…</p>
+      )}
+    </div>
+  );
+}
+
+export default function RiskyMode() {
+  const { data: cfg } = usePoll(settings, 0);
+  const { data: list } = usePoll(strategyList, 0);
+
+  const start = cfg?.riskyStartBalance ?? 100;
+  const target = cfg?.riskyTargetBalance ?? 50000;
+  const horizon = cfg?.riskyHorizonDays ?? 180;
+  // Engine-decided projections for BOTH headline goals (sourced from the engine,
+  // NOT user input) — 50k is the default target, 100k shown for comparison.
+  const { data: proj50 } = usePoll(() => riskyScenarios({ startingUsd: start, targetUsd: 50000 }), 0, [start]);
+  const { data: proj100 } = usePoll(() => riskyScenarios({ startingUsd: start, targetUsd: 100000 }), 0, [start]);
+
+  const mult = target / start;
+  const riskyStrats = (list?.strategies ?? []).filter((s) => s.mode === "risky");
+  // Which rule set governs comes from `system.trading_mode`, the field the
+  // engine reads. This used to come from `risk.prop_firm_rules` — one write,
+  // one display read, zero decisions — so this banner could say "Prop-firm"
+  // while trading_mode was risky and the account was being sized accordingly.
+  const propActive = cfg?.tradingMode === "prop_firm";
+
+  return (
+    <div className="screen">
+      <h1>Risky Mode <span className="badge live">AUTOMATIC · AGGRESSIVE</span></h1>
+      <p className="sub">The bot hunts for strategies to reach the goal — sizing, win-rate, R:R and costs are all engine-decided</p>
+
+      <HelpPanel id="riskymode">
+        <p>A separate, aggressive mode whose job is to <b>multiply a small account</b> toward a target (e.g. €100 → €100k). It is deliberately <b>read-only</b>: you cannot tune it, because over-tuning is how accounts blow up.</p>
+        <p>Everything you see — position sizing (half-Kelly of the measured edge), required win-rate, reward:risk and the time-to-target projection — is computed by the engine from your goal and real broker costs. The list shows the strategies discovered specifically for this mode.</p>
+        <p className="muted small">Aggressive = high risk of ruin. The projection is a best-case compounding model, not a promise. Prove strategies on Demo (Autopilot) before any real money.</p>
+      </HelpPanel>
+
+      <div className="banner warn">
+        Fully automatic — you don't set any parameters. The engine searches for strategies that can hit the goal,
+        sizes them itself, and computes real costs per-lot from the broker. High risk: ruin is a real outcome.
+      </div>
+
+      <h2>The goal (from config)</h2>
+      <div className="cards">
+        <div className="card"><div className="card-label">START</div><div className="card-value">{eur(start)}</div></div>
+        <div className="card accent"><div className="card-label">TARGET</div><div className="card-value">{eur(target)}</div></div>
+        <div className="card"><div className="card-label">MULTIPLIER</div><div className="card-value">{mult.toFixed(0)}×</div></div>
+        <div className="card"><div className="card-label">HORIZON</div><div className="card-value">{days(horizon)}</div></div>
+      </div>
+
+      <h2>Engine estimate <span className="muted small">(not user-tunable · two goals)</span></h2>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <ProjBlock label={`€${eur(start).slice(1)} → €50,000`} proj={proj50} />
+        <ProjBlock label={`€${eur(start).slice(1)} → €100,000`} proj={proj100} />
+      </div>
+      <p className="muted small">Costs (spread/commission/swap) are taken per-lot from the broker and folded into every estimate automatically. The active discovery goal is set in Settings → Discovery mode.</p>
+
+      <h2>Strategies found for this dream</h2>
+      {riskyStrats.length === 0 ? (
+        <p className="muted">No risky-mode strategies discovered yet — run Discovery in risky mode. Validated ones appear in Strategy Report.</p>
+      ) : (
+        <table className="tbl">
+          <thead><tr><th>Symbol</th><th>TF</th><th>Win%</th><th>Trades</th><th>CAGR%</th><th>OOS</th><th>Flags</th></tr></thead>
+          <tbody>
+            {riskyStrats.slice(0, 12).map((s) => (
+              <tr key={s.base}>
+                <td><b>{s.symbol}</b></td>
+                <td>{s.timeframe}</td>
+                <td>{s.winRate != null ? (s.winRate * 100).toFixed(1) : "—"}</td>
+                <td>{s.trades}</td>
+                <td>{Math.abs(s.cagrPct) > 1000 ? "🚩" : s.cagrPct.toFixed(1)}</td>
+                <td><span className={`badge ${s.walkforwardPassed ? "demo" : "live"}`}>{s.walkforwardPassed ? "✓" : "✗"}</span></td>
+                <td>{s.flags.length > 0 ? <span className="sell small">🚩 {s.flags.length}</span> : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <h2>Mode exclusivity</h2>
+      <div className="banner info">
+        Risky and Prop-firm are two separate configs — only ONE runs at a time. The other is dormant until you pause
+        or the account is blown. Currently active rules:{" "}
+        <b>{cfg ? (propActive ? "Prop-firm" : "Risky") : "—"}</b>{" "}
+        <span className="muted small">(from system.trading_mode — change it in Settings → Discovery mode)</span>.
+        {propActive && (
+          <>
+            {" "}
+            <b>Trading mode is Prop-firm, so nothing on this screen is in force</b> — the sizing
+            ladder and projections below describe what Risky mode WOULD do.
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

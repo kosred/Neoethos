@@ -1,0 +1,288 @@
+{
+  "schema": "neoethos.regime-semantic-v3.red-fixtures.v1",
+  "semantic_version": 3,
+  "operation_schedule": "neoethos.regime.semantic-v3.f64-rn-fixed-order-log49-neumaier-v1",
+  "canonical_nan_bits": "0x7ff8000000000000",
+  "validity_codes": {
+    "valid": 0,
+    "warmup": 1,
+    "zero_denominator": 5,
+    "non_finite": 7,
+    "compute_failure": 8
+  },
+  "columns": [
+    {
+      "slot": 0,
+      "retired_v2_name": "regime_vol_state",
+      "semantic_v3_name": "neoethos_custom_gk_vol_ratio_state_10_50_v3",
+      "formula_identity": "neoethos.custom.garman-klass-volatility-ratio-state.10-50.v3",
+      "first_theoretical_row": 49,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 1,
+      "retired_v2_name": "regime_vol_zscore",
+      "semantic_v3_name": "neoethos_custom_gk_vol_ratio_offset_10_50_v3",
+      "formula_identity": "neoethos.custom.garman-klass-volatility-ratio-offset.10-50.v3",
+      "first_theoretical_row": 49,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 2,
+      "retired_v2_name": "regime_trend_strength",
+      "semantic_v3_name": "regime_wilder_adx_14_v3",
+      "formula_identity": "wilder.directional-movement.adx.14.v3",
+      "first_theoretical_row": 27,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 3,
+      "retired_v2_name": "regime_trend_direction",
+      "semantic_v3_name": "neoethos_custom_wilder_di_dominance_direction_14_v3",
+      "formula_identity": "neoethos.custom.wilder-di-dominance-direction.14.v3",
+      "first_theoretical_row": 14,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 4,
+      "retired_v2_name": "regime_trend_state",
+      "semantic_v3_name": "neoethos_custom_wilder_adx_direction_state_14_25_v3",
+      "formula_identity": "neoethos.custom.wilder-adx-direction-state.14-threshold-25.v3",
+      "first_theoretical_row": 27,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 5,
+      "retired_v2_name": "regime_squeeze",
+      "semantic_v3_name": "neoethos_custom_bollinger_keltner_squeeze_state_20_2_1p5_v3",
+      "formula_identity": "neoethos.custom.bollinger-population-keltner-squeeze-state.20-2-1p5.v3",
+      "first_theoretical_row": 20,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 6,
+      "retired_v2_name": "regime_squeeze_momentum",
+      "semantic_v3_name": "neoethos_custom_bollinger_midline_atr_deviation_20_v3",
+      "formula_identity": "neoethos.custom.bollinger-midline-atr-deviation.20.v3",
+      "first_theoretical_row": 20,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 7,
+      "retired_v2_name": "regime_mr_vs_momentum",
+      "semantic_v3_name": "neoethos_custom_directional_persistence_balance_20_v3",
+      "formula_identity": "neoethos.custom.directional-persistence-sign-balance.20.v3",
+      "first_theoretical_row": 21,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 8,
+      "retired_v2_name": "regime_rei",
+      "semantic_v3_name": "neoethos_custom_candle_body_range_balance_8_v3",
+      "formula_identity": "neoethos.custom.candle-body-range-balance.8.v3",
+      "first_theoretical_row": 7,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 9,
+      "retired_v2_name": "regime_choppiness",
+      "semantic_v3_name": "regime_dreiss_choppiness_index_14_v3",
+      "formula_identity": "dreiss.choppiness-index.true-range.14.v3",
+      "first_theoretical_row": 14,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 10,
+      "retired_v2_name": "regime_cusum_up",
+      "semantic_v3_name": "neoethos_custom_standardized_cusum_up_50_0p5_3_v3",
+      "formula_identity": "neoethos.custom.standardized-cusum-upper.50-k0p5-h3.v3",
+      "first_theoretical_row": 50,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 11,
+      "retired_v2_name": "regime_cusum_down",
+      "semantic_v3_name": "neoethos_custom_standardized_cusum_down_50_0p5_3_v3",
+      "formula_identity": "neoethos.custom.standardized-cusum-lower.50-k0p5-h3.v3",
+      "first_theoretical_row": 50,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 12,
+      "retired_v2_name": "regime_change_signal",
+      "semantic_v3_name": "neoethos_custom_standardized_cusum_signal_50_0p5_3_v3",
+      "formula_identity": "neoethos.custom.standardized-cusum-signal.50-k0p5-h3.v3",
+      "first_theoretical_row": 50,
+      "constant_at_first": { "validity": "zero_denominator", "value_bits": "0x7ff8000000000000" }
+    },
+    {
+      "slot": 13,
+      "retired_v2_name": "regime_entropy",
+      "semantic_v3_name": "neoethos_custom_equal_width_log_return_entropy_30_10_v3",
+      "formula_identity": "neoethos.custom.equal-width-log-return-shannon-entropy.30x10.v3",
+      "first_theoretical_row": 30,
+      "constant_at_first": { "validity": "valid", "value_bits": "0x0000000000000000" }
+    }
+  ],
+  "cases": [
+    {
+      "id": "empty_input_refuses_before_allocation",
+      "kind": "input_refusal",
+      "input": { "rows": 0 },
+      "expected_error": "RegimeInputRefusalV3::EmptyInput"
+    },
+    {
+      "id": "nonfinite_close_refuses_before_allocation",
+      "kind": "input_refusal",
+      "input": {
+        "generator": "constant_ohlc",
+        "rows": 1,
+        "price_bits": "0x4059000000000000",
+        "mutation": { "field": "close", "row": 0, "value_bits": "0x7ff8000000000000" }
+      },
+      "expected_error": "RegimeInputRefusalV3::NonFiniteOhlc{row:0,field:close}"
+    },
+    {
+      "id": "monotone_fifteen_rows_exposes_v2_validity_defect",
+      "kind": "ohlc",
+      "input": {
+        "generator": "ascending_integer_candles",
+        "rows": 15,
+        "open_i": "100+i",
+        "high_i": "open_i+2",
+        "low_i": "open_i-1",
+        "close_i": "open_i+1"
+      },
+      "expect": [
+        { "slot": 2, "row": 13, "validity": "warmup", "value_bits": "0x7ff8000000000000" },
+        { "slot": 3, "row": 13, "validity": "warmup", "value_bits": "0x7ff8000000000000" },
+        { "slot": 4, "row": 13, "validity": "warmup", "value_bits": "0x7ff8000000000000" },
+        { "slot": 2, "row": 14, "validity": "warmup", "value_bits": "0x7ff8000000000000" },
+        { "slot": 3, "row": 14, "validity": "valid", "value_bits": "0x3ff0000000000000" },
+        { "slot": 4, "row": 14, "validity": "warmup", "value_bits": "0x7ff8000000000000" }
+      ]
+    },
+    {
+      "id": "constant_sixty_rows_freezes_denominators",
+      "kind": "ohlc",
+      "input": {
+        "generator": "constant_ohlc",
+        "rows": 60,
+        "price_bits": "0x4059000000000000"
+      },
+      "expect_from_column_constant_at_first": true,
+      "expect_preceding_row": { "validity": "warmup", "value_bits": "0x7ff8000000000000" },
+      "cusum_hidden_state_after_zero_denominator": {
+        "up_bits": "0x0000000000000000",
+        "down_bits": "0x0000000000000000"
+      }
+    },
+    {
+      "id": "garman_klass_primary_component_exact_schedule",
+      "kind": "unit_formula",
+      "input": {
+        "open_bits": "0x4059000000000000",
+        "high_bits": "0x405b800000000000",
+        "low_bits": "0x4056800000000000",
+        "close_bits": "0x405a400000000000"
+      },
+      "expected_component_bits": "0x3f93ad0b4360c3a2",
+      "forbidden_negative_policy": "abs"
+    },
+    {
+      "id": "bollinger_population_not_sample_variance",
+      "kind": "unit_formula",
+      "input": { "close_integers_inclusive": [1, 20] },
+      "expected_mean_bits": "0x4025000000000000",
+      "expected_population_variance_bits": "0x4040a00000000000",
+      "expected_population_std_bits": "0x401710ac0b5e5e32",
+      "rejected_sample_variance_bits": "0x4041800000000000",
+      "rejected_sample_std_bits": "0x4017aa10d193c22d"
+    },
+    {
+      "id": "dreiss_gap_uses_true_high_and_true_low",
+      "kind": "ohlc",
+      "input": {
+        "row_0": { "open": 100, "high": 101, "low": 99, "close": 100 },
+        "rows_1_through_14": { "open": 110, "high": 111, "low": 109, "close": 110 }
+      },
+      "row": 14,
+      "sum_true_range_bits": "0x4042800000000000",
+      "true_high_minus_true_low_bits": "0x4026000000000000",
+      "expected_validity": "valid",
+      "expected_value_bits": "0x4046fb6c35d3f6e6",
+      "rejected_raw_high_low_denominator_bits": "0x4000000000000000",
+      "rejected_raw_formula_value_bits": "0x405ba3e90312f59e"
+    },
+    {
+      "id": "cusum_strict_threshold_equality_does_not_hit",
+      "kind": "unit_recurrence",
+      "input": {
+        "previous_up_bits": "0x4004000000000000",
+        "previous_down_bits": "0x0000000000000000",
+        "z_bits": "0x3ff0000000000000"
+      },
+      "expected": {
+        "up_bits": "0x4008000000000000",
+        "down_bits": "0x0000000000000000",
+        "signal_bits": "0x0000000000000000"
+      }
+    },
+    {
+      "id": "cusum_up_hit_emits_post_reset_state",
+      "kind": "unit_recurrence",
+      "input": {
+        "previous_up_bits": "0x4008000000000000",
+        "previous_down_bits": "0x3ff0000000000000",
+        "z_bits": "0x3ff0000000000000"
+      },
+      "candidate_up_bits": "0x400c000000000000",
+      "expected": {
+        "up_bits": "0x0000000000000000",
+        "down_bits": "0x0000000000000000",
+        "signal_bits": "0x3ff0000000000000"
+      }
+    },
+    {
+      "id": "cusum_down_hit_emits_post_reset_state",
+      "kind": "unit_recurrence",
+      "input": {
+        "previous_up_bits": "0x3ff0000000000000",
+        "previous_down_bits": "0x4008000000000000",
+        "z_bits": "0xbff0000000000000"
+      },
+      "candidate_down_bits": "0x400c000000000000",
+      "expected": {
+        "up_bits": "0x0000000000000000",
+        "down_bits": "0x0000000000000000",
+        "signal_bits": "0xbff0000000000000"
+      }
+    },
+    {
+      "id": "constant_log_returns_have_valid_zero_entropy",
+      "kind": "ohlc",
+      "input": {
+        "generator": "constant_ohlc",
+        "rows": 31,
+        "price_bits": "0x4059000000000000"
+      },
+      "expect": {
+        "slot": 13,
+        "row": 30,
+        "validity": "valid",
+        "value_bits": "0x0000000000000000"
+      }
+    }
+  ],
+  "red_production_paths": [
+    "crates/neoethos-data/src/core/regime_detection.rs",
+    "crates/neoethos-data/src/core/gpu_resident_regime_v3.rs",
+    "crates/neoethos-gpu-cuda/src/resident_regime_v3.rs",
+    "crates/neoethos-gpu-cuda/native/resident_regime_v3.cu",
+    "crates/neoethos-data/src/core/feature_registry.rs",
+    "crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs",
+    "crates/neoethos-data/src/core/gpu_only_feature_workspace_preflight_v3.rs",
+    "crates/neoethos-gpu-cuda/build.rs",
+    "crates/neoethos-gpu-cuda/src/lib.rs"
+  ]
+}

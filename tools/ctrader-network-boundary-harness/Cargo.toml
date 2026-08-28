@@ -1,0 +1,19 @@
+[package]
+name = "ctrader-network-boundary-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep this leaf harness outside the repository workspace graph. Its purpose is
+# to compile the real cTrader transport modules without pulling neoethos-models.
+[workspace]
+
+[dependencies]
+anyhow = "1.0"
+hickory-resolver = "0.26.1"
+neoethos-core = { path = "../../crates/neoethos-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.49.0", features = ["net", "rt", "time"] }
+tracing = "0.1"
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }

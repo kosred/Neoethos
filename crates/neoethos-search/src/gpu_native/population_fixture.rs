@@ -1,0 +1,533 @@
+//! Deterministic engine-only population fixture for executable GPU benchmarks.
+
+use crate::backend::{EvaluationBackend, evaluate_population_core_with_backend_and_audit};
+use crate::eval::{BacktestSettings, PopulationEvalInputs, SmcRow};
+use crate::gpu_native::cpu_strategy::CpuStrategyAuditContext;
+use crate::gpu_native::parity_hierarchy::{
+    FloatTolerance, ParityPolicy, ParityTrace, TraceComparisonReport, compare_traces,
+};
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
+use crate::gpu_native::prototype_population::{
+    PrototypeBcRequirements, PrototypePopulationError, PrototypePopulationWorkload,
+};
+use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
+use ndarray::Array2;
+use std::collections::HashSet;
+
+/// Host-owned outputs for parity levels 11-12.
+///
+/// Stage 1 keeps validation and canonical ranking on the host.  The integration
+/// harness therefore accepts their real outputs explicitly; it must never infer
+/// a verdict or survivor identity from a metric row or its position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIntegrationArtifacts {
+    pub candidate_ids: Vec<u64>,
+    pub validation_verdicts: Vec<bool>,
+    pub survivor_order: Vec<u64>,
+}
+
+impl HostIntegrationArtifacts {
+    fn validate(&self, metric_rows: usize) -> Result<(), String> {
+        if self.candidate_ids.len() != metric_rows {
+            return Err(format!(
+                "integration candidate ID count {} does not match metric row count {metric_rows}",
+                self.candidate_ids.len()
+            ));
+        }
+        if self.validation_verdicts.len() != metric_rows {
+            return Err(format!(
+                "integration validation verdict count {} does not match metric row count {metric_rows}",
+                self.validation_verdicts.len()
+            ));
+        }
+        let candidate_ids = self.candidate_ids.iter().copied().collect::<HashSet<_>>();
+        if candidate_ids.len() != self.candidate_ids.len() {
+            return Err("integration candidate IDs must be unique".into());
+        }
+        let survivor_ids = self.survivor_order.iter().copied().collect::<HashSet<_>>();
+        if survivor_ids.len() != self.survivor_order.len() {
+            return Err("integration survivor IDs must be unique".into());
+        }
+        if let Some(unknown) = self
+            .survivor_order
+            .iter()
+            .find(|candidate_id| !candidate_ids.contains(candidate_id))
+        {
+            return Err(format!(
+                "integration survivor ID {unknown} is not present in candidate IDs"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TinyPopulationFixture {
+    close: Vec<f64>,
+    high: Vec<f64>,
+    low: Vec<f64>,
+    indicators: Array2<f64>,
+    gene_offsets: Vec<i32>,
+    gene_indices: Vec<i32>,
+    gene_weights: Vec<f64>,
+    long_thresholds: Vec<f64>,
+    short_thresholds: Vec<f64>,
+    months: Vec<i64>,
+    days: Vec<i64>,
+    timestamps: Vec<i64>,
+    stop_pips: Vec<f64>,
+    target_pips: Vec<f64>,
+    stop_vol_multipliers: Vec<f64>,
+    smc_data: Vec<SmcRow>,
+    gene_smc_flags: Vec<SmcRow>,
+    smc_weights: [f64; 11],
+    settings: BacktestSettings,
+}
+
+impl TinyPopulationFixture {
+    pub fn new(population: usize, bars: usize, features: usize) -> Self {
+        let population = population.max(1);
+        let bars = bars.max(64);
+        let features = features.max(2);
+        let close: Vec<f64> = (0..bars)
+            .map(|bar| {
+                let x = bar as f64;
+                1.10 + (x * 0.031).sin() * 0.003 + (x * 0.007).cos() * 0.001
+            })
+            .collect();
+        let high = close.iter().map(|price| price + 0.0007).collect();
+        let low = close.iter().map(|price| price - 0.0007).collect();
+        let indicators = Array2::from_shape_fn((features, bars), |(feature, bar)| {
+            let phase = feature as f64 * 0.37;
+            let x = bar as f64 * (0.017 + feature as f64 * 0.0003);
+            (x + phase).sin() * 0.75 + (x * 0.31 - phase).cos() * 0.20
+        });
+
+        let terms_per_gene = features.min(4).max(2);
+        let mut gene_offsets = Vec::with_capacity(population + 1);
+        let mut gene_indices = Vec::with_capacity(population * terms_per_gene);
+        let mut gene_weights = Vec::with_capacity(population * terms_per_gene);
+        gene_offsets.push(0);
+        for candidate in 0..population {
+            for term in 0..terms_per_gene {
+                gene_indices.push(((candidate + term * 3) % features) as i32);
+                let magnitude = 0.35 + ((candidate + term) % 5) as f64 * 0.11;
+                gene_weights.push(if (candidate + term) % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                });
+            }
+            gene_offsets.push(gene_indices.len() as i32);
+        }
+
+        let timestamps: Vec<i64> = (0..bars)
+            .map(|bar| 1_700_000_000_000_i64 + bar as i64 * 60_000)
+            .collect();
+        let months = (0..bars).map(|bar| (bar / 43_200) as i64).collect();
+        let days = (0..bars).map(|bar| (bar / 1_440) as i64).collect();
+        let long_thresholds = (0..population)
+            .map(|candidate| 0.20 + (candidate % 3) as f64 * 0.03)
+            .collect();
+        let short_thresholds = (0..population)
+            .map(|candidate| -0.20 - (candidate % 3) as f64 * 0.03)
+            .collect();
+        let stop_pips = vec![18.0; population];
+        let target_pips = vec![36.0; population];
+        let stop_vol_multipliers = vec![0.0; population];
+        let smc_data = vec![[0_i8; 11]; bars];
+        let gene_smc_flags = vec![[0_i8; 11]; population];
+
+        let mut settings = BacktestSettings::default();
+        settings.max_hold_bars = 12;
+        settings.trailing_enabled = false;
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.swap_long_pips_per_day = 0.0;
+        settings.swap_short_pips_per_day = 0.0;
+        settings.pnl_conversion_fee_rate = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.01;
+        settings.high_quality_confidence = 0.65;
+
+        Self {
+            close,
+            high,
+            low,
+            indicators,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thresholds,
+            short_thresholds,
+            months,
+            days,
+            timestamps,
+            stop_pips,
+            target_pips,
+            stop_vol_multipliers,
+            smc_data,
+            gene_smc_flags,
+            smc_weights: [0.0; 11],
+            settings,
+        }
+    }
+
+    pub fn population(&self) -> usize {
+        self.long_thresholds.len()
+    }
+
+    pub fn bars(&self) -> usize {
+        self.close.len()
+    }
+
+    pub fn features(&self) -> usize {
+        self.indicators.nrows()
+    }
+
+    pub fn candidate_bars(&self) -> u64 {
+        (self.population() as u64).saturating_mul(self.bars() as u64)
+    }
+
+    pub fn prototype_a_uploads(
+        &self,
+    ) -> (
+        PrototypeADatasetUpload,
+        PrototypeAGeneUpload,
+        PrototypeAScenarioUpload,
+    ) {
+        let candidate_ids = (0..self.population())
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        let scenarios = candidate_ids
+            .iter()
+            .copied()
+            // Through the ONE builder — see `snapshot_fixture` for why
+            // `..ScenarioDescriptor::default()` was a free-trading backtest.
+            .map(|candidate_id| {
+                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id, self.bars())
+            })
+            .collect();
+        (
+            PrototypeADatasetUpload {
+                close: self.close.clone(),
+                high: self.high.clone(),
+                low: self.low.clone(),
+                indicators: self.indicators.iter().copied().collect(),
+                feature_count: self.features(),
+                months: self.months.clone(),
+                days: self.days.clone(),
+                timestamps: self.timestamps.clone(),
+                smc_data: self.smc_data.clone(),
+                settings: SnapshotSettingsDto::from_settings(&self.settings),
+            },
+            PrototypeAGeneUpload {
+                candidate_ids,
+                offsets: self.gene_offsets.clone(),
+                indices: self.gene_indices.clone(),
+                weights: self.gene_weights.clone(),
+                long_thresholds: self.long_thresholds.clone(),
+                short_thresholds: self.short_thresholds.clone(),
+                stop_pips: self.stop_pips.clone(),
+                target_pips: self.target_pips.clone(),
+                stop_vol_multipliers: self.stop_vol_multipliers.clone(),
+                smc_flags: self.gene_smc_flags.clone(),
+                smc_weights: self.smc_weights,
+                gate_threshold: 0.0,
+            },
+            PrototypeAScenarioUpload { scenarios },
+        )
+    }
+
+    pub fn population_workload(
+        &self,
+        requirements: PrototypeBcRequirements,
+    ) -> Result<PrototypePopulationWorkload, PrototypePopulationError> {
+        let (dataset, genes, scenarios) = self.prototype_a_uploads();
+        PrototypePopulationWorkload::from_uploads(dataset, genes, scenarios, requirements)
+    }
+
+    pub fn evaluate(
+        &self,
+        backend: EvaluationBackend,
+        audit: &CpuStrategyAuditContext,
+    ) -> Result<Vec<[f64; 11]>, String> {
+        evaluate_population_core_with_backend_and_audit(self.inputs(), backend, audit)
+    }
+
+    fn inputs(&self) -> PopulationEvalInputs<'_> {
+        PopulationEvalInputs {
+            close: &self.close,
+            high: &self.high,
+            low: &self.low,
+            indicators: self.indicators.view(),
+            gene_offsets: &self.gene_offsets,
+            gene_indices: &self.gene_indices,
+            gene_weights: &self.gene_weights,
+            long_thr: &self.long_thresholds,
+            short_thr: &self.short_thresholds,
+            month_idx: &self.months,
+            day_idx: &self.days,
+            timestamps: &self.timestamps,
+            sl_pips: &self.stop_pips,
+            tp_pips: &self.target_pips,
+            stop_vol_mult: &self.stop_vol_multipliers,
+            smc_data: &self.smc_data,
+            gene_smc_flags: &self.gene_smc_flags,
+            gate_threshold: 0.0,
+            weights: &self.smc_weights,
+            settings: &self.settings,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_test_oracle(
+        &self,
+        backend: EvaluationBackend,
+        audit: &CpuStrategyAuditContext,
+    ) -> Result<Vec<[f64; 11]>, String> {
+        crate::backend::evaluate_population_core_with_backend_test_oracle(
+            self.inputs(),
+            backend,
+            audit,
+        )
+    }
+
+    pub fn compare_final_metrics(
+        reference: &[[f64; 11]],
+        candidate: &[[f64; 11]],
+    ) -> TraceComparisonReport {
+        // Prototype A owns level 10 only. Validation and canonical ranking stay
+        // in their host-owned stages and are exercised by
+        // `compare_integration_artifacts`; do not fabricate levels 11-12 from
+        // metric positions here.
+        let reference = ParityTrace {
+            final_metrics: reference.to_vec(),
+            ..ParityTrace::default()
+        };
+        let candidate = ParityTrace {
+            final_metrics: candidate.to_vec(),
+            ..ParityTrace::default()
+        };
+        compare_traces(
+            "cpu_reference",
+            "gpu_candidate",
+            &reference,
+            &candidate,
+            prototype_a_parity_policy(),
+        )
+    }
+
+    /// Build the levels 10-12 integration trace from outputs supplied by the
+    /// stages that own them. Candidate IDs are shape-checked here even though
+    /// [`ParityTrace`] stores the verdict vector positionally.
+    pub fn integration_trace(
+        metrics: &[[f64; 11]],
+        artifacts: &HostIntegrationArtifacts,
+    ) -> Result<ParityTrace, String> {
+        artifacts.validate(metrics.len())?;
+        Ok(ParityTrace {
+            final_metrics: metrics.to_vec(),
+            validation_verdicts: artifacts.validation_verdicts.clone(),
+            survivor_order: artifacts.survivor_order.clone(),
+            ..ParityTrace::default()
+        })
+    }
+
+    pub fn compare_integration_artifacts(
+        reference_metrics: &[[f64; 11]],
+        reference_artifacts: &HostIntegrationArtifacts,
+        candidate_metrics: &[[f64; 11]],
+        candidate_artifacts: &HostIntegrationArtifacts,
+    ) -> Result<TraceComparisonReport, String> {
+        if reference_artifacts.candidate_ids != candidate_artifacts.candidate_ids {
+            return Err(format!(
+                "integration candidate IDs differ: reference={:?}, candidate={:?}",
+                reference_artifacts.candidate_ids, candidate_artifacts.candidate_ids
+            ));
+        }
+        let reference = Self::integration_trace(reference_metrics, reference_artifacts)?;
+        let candidate = Self::integration_trace(candidate_metrics, candidate_artifacts)?;
+        Ok(compare_traces(
+            "cpu_reference",
+            "gpu_candidate",
+            &reference,
+            &candidate,
+            prototype_a_parity_policy(),
+        ))
+    }
+}
+
+fn prototype_a_parity_policy() -> ParityPolicy {
+    ParityPolicy {
+        metrics: FloatTolerance {
+            absolute: 1.0e-3,
+            relative: 1.0e-3,
+            max_ulps: 64,
+        },
+        ..ParityPolicy::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_reference_fixture_is_deterministic_and_shape_stable() {
+        let fixture = TinyPopulationFixture::new(8, 256, 6);
+        let first_audit = CpuStrategyAuditContext::validation_reference(1);
+        let second_audit = CpuStrategyAuditContext::validation_reference(2);
+        let first = fixture
+            .evaluate_test_oracle(EvaluationBackend::CPU_CANONICAL, &first_audit)
+            .unwrap();
+        let second = fixture
+            .evaluate_test_oracle(EvaluationBackend::CPU_CANONICAL, &second_audit)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 8);
+        assert_eq!(fixture.candidate_bars(), 8 * 256);
+    }
+
+    #[test]
+    fn deterministic_integration_trace_carries_explicit_levels_ten_through_twelve() {
+        let metrics = vec![
+            [1.0, 0.0, 100_001.0, 0.0, 0.5, 1.2, 1.0, 0.0, 2.0, 0.0, 0.0],
+            [3.0, 0.0, 100_003.0, 0.0, 0.5, 1.2, 1.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let artifacts = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![41],
+        };
+        let trace = TinyPopulationFixture::integration_trace(&metrics, &artifacts).unwrap();
+
+        assert_eq!(trace.final_metrics, metrics);
+        assert_eq!(trace.validation_verdicts, vec![true, false]);
+        assert_eq!(trace.survivor_order, vec![41]);
+    }
+
+    #[test]
+    fn integration_artifacts_report_level_eleven_before_level_twelve() {
+        let metrics = vec![
+            [1.0, 0.0, 100_001.0, 0.0, 0.5, 1.2, 1.0, 0.0, 2.0, 0.0, 0.0],
+            [3.0, 0.0, 100_003.0, 0.0, 0.5, 1.2, 1.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let reference = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![41],
+        };
+        let mut candidate = reference.clone();
+        candidate.validation_verdicts[1] = true;
+        candidate.survivor_order = vec![7];
+        let mut candidate_metrics = metrics.clone();
+        candidate_metrics[0][0] += 5.0e-4;
+
+        let report = TinyPopulationFixture::compare_integration_artifacts(
+            &metrics,
+            &reference,
+            &candidate_metrics,
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            report.first_divergence.unwrap().level,
+            crate::gpu_native::parity_hierarchy::ParityLevel::ValidationVerdict
+        );
+
+        candidate.validation_verdicts = reference.validation_verdicts.clone();
+        let report = TinyPopulationFixture::compare_integration_artifacts(
+            &metrics,
+            &reference,
+            &candidate_metrics,
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            report.first_divergence.unwrap().level,
+            crate::gpu_native::parity_hierarchy::ParityLevel::SurvivorOrdering
+        );
+    }
+
+    #[test]
+    fn integration_artifacts_reject_positional_or_unknown_id_claims() {
+        let metrics = vec![[0.0; 11], [0.0; 11]];
+        let mismatched = HostIntegrationArtifacts {
+            candidate_ids: vec![41],
+            validation_verdicts: vec![true],
+            survivor_order: vec![41],
+        };
+        assert!(TinyPopulationFixture::integration_trace(&metrics, &mismatched).is_err());
+
+        let unknown_survivor = HostIntegrationArtifacts {
+            candidate_ids: vec![41, 7],
+            validation_verdicts: vec![true, false],
+            survivor_order: vec![99],
+        };
+        assert!(TinyPopulationFixture::integration_trace(&metrics, &unknown_survivor).is_err());
+    }
+
+    /// `ForbidCpu` is the promise, not `device == Gpu`.
+    ///
+    /// The dispatch matched on `(Gpu, ForbidCpu)`, so `{ device: Auto, fallback:
+    /// ForbidCpu }` — a value `EvaluationBackend::validate()` accepts, and which
+    /// `install_evaluation_backend` therefore installs without complaint — fell
+    /// into the catch-all arm and ran `evaluate_population_core`, which is free
+    /// to evaluate the entire population on the CPU. A backend whose
+    /// `cpu_fallback_allowed()` is false must never reach a CPU lane.
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn a_forbid_cpu_backend_is_strict_even_when_its_device_is_auto() {
+        let fixture = TinyPopulationFixture::new(4, 128, 4);
+        let audit = CpuStrategyAuditContext::production(5);
+        let backend = EvaluationBackend {
+            device: crate::backend::DevicePreference::Auto,
+            fallback: crate::backend::FallbackPolicy::ForbidCpu,
+            accelerator_hint: crate::backend::AcceleratorHint::Any,
+        };
+        assert!(!backend.cpu_fallback_allowed());
+        let error = fixture.evaluate_test_oracle(backend, &audit).unwrap_err();
+        assert!(
+            error.contains("compiled without a GPU backend"),
+            "a ForbidCpu backend must fail closed, not run on the CPU: {error}"
+        );
+        audit.snapshot().assert_zero_executed().unwrap();
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn strict_fixture_fails_without_executing_cpu_when_gpu_is_not_compiled() {
+        let fixture = TinyPopulationFixture::new(4, 128, 4);
+        let audit = CpuStrategyAuditContext::production(3);
+        let error = fixture
+            .evaluate_test_oracle(EvaluationBackend::GPU_REQUIRED, &audit)
+            .unwrap_err();
+        assert!(error.contains("compiled without a GPU backend"));
+        audit.snapshot().assert_zero_executed().unwrap();
+    }
+
+    #[test]
+    fn tiny_fixture_exports_an_explicit_bc_population_workload() {
+        let fixture = TinyPopulationFixture::new(2, 64, 4);
+        let workload = fixture
+            .population_workload(
+                crate::gpu_native::prototype_population::PrototypeBcRequirements {
+                    prop_firm_state:
+                        crate::gpu_native::prototype_population::PropFirmRequirement::NotRequested,
+                },
+            )
+            .unwrap();
+        let (dataset, genes, scenarios) = fixture.prototype_a_uploads();
+
+        assert_eq!(workload.dataset, dataset);
+        assert_eq!(workload.genes, genes);
+        assert_eq!(workload.scenarios, scenarios);
+    }
+}

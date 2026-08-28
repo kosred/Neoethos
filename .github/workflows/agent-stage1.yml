@@ -1,0 +1,145 @@
+name: GPU-native Stage 1 verification
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: gpu-native-stage1-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install mold when missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v mold >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends mold
+          fi
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+
+      - name: Check formatting of changed Rust files
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/stage1-diagnostics
+          mapfile -d '' rust_files < <(git diff --name-only -z origin/master...HEAD -- '*.rs')
+          if (( ${#rust_files[@]} == 0 )); then
+            echo "No changed Rust files" | tee /tmp/stage1-diagnostics/format.log
+          else
+            printf 'Checking %s\n' "${rust_files[@]}" | tee /tmp/stage1-diagnostics/format.log
+            rustfmt --check --edition 2024 --config skip_children=true "${rust_files[@]}" \
+              2>&1 | tee -a /tmp/stage1-diagnostics/format.log
+          fi
+
+      - name: Test GPU contracts crate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-gpu-contracts 2>&1 | tee /tmp/stage1-diagnostics/contracts-test.log
+
+      - name: Test CUDA ABI scaffold
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-gpu-cuda 2>&1 | tee /tmp/stage1-diagnostics/cuda-scaffold-test.log
+
+      - name: Lint and smoke-test rented-GPU kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n \
+            scripts/gpu-bench/preflight.sh \
+            scripts/gpu-bench/remote_bootstrap.sh \
+            scripts/gpu-bench/prepare_worktrees.sh \
+            scripts/gpu-bench/run_rented.sh \
+            scripts/gpu-bench/check_cuda_hardware.sh \
+            scripts/gpu-bench/run_cuda_test_gate.sh \
+            scripts/gpu-bench/run_compute_sanitizer_gate.sh \
+            scripts/gpu-bench/run_cuda_validation.sh \
+            scripts/gpu-bench/run_cuda_memcheck_validation.sh
+          python3 -m py_compile \
+            scripts/gpu-bench/test_prepare_worktrees.py \
+            scripts/gpu-bench/test_cuda_gate_behavior.py \
+            scripts/gpu-bench/test_preflight_contract.py \
+            scripts/gpu-bench/test_remote_bootstrap_contract.py \
+            scripts/gpu-bench/test_stage1_ci_contract.py
+          python3 scripts/gpu-bench/test_prepare_worktrees.py
+          python3 scripts/gpu-bench/test_cuda_gate_behavior.py
+          python3 scripts/gpu-bench/test_preflight_contract.py
+          python3 scripts/gpu-bench/test_remote_bootstrap_contract.py
+          python3 scripts/gpu-bench/test_stage1_ci_contract.py
+          rustc --edition 2024 --test \
+            crates/neoethos-cli/tests/canonical_runtime_source_contract.rs \
+            -D warnings -o /tmp/canonical-runtime-source-contract
+          /tmp/canonical-runtime-source-contract \
+            paid_gpu_preparation_reopens_shared_imported_vortex_only --exact --nocapture
+
+      - name: Test search crate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search 2>&1 | tee /tmp/stage1-diagnostics/search-test.log
+
+      - name: Check CLI crate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-check.log
+
+      - name: Check search GPU feature
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-search --features gpu-vulkan \
+            2>&1 | tee /tmp/stage1-diagnostics/search-gpu-check.log
+
+      - name: Check CLI GPU feature
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-cli --features gpu-vulkan \
+            2>&1 | tee /tmp/stage1-diagnostics/cli-gpu-check.log
+
+      - name: Direct WGPU correctness probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p neoethos-search --features gpu-vulkan \
+            gpu_native:: -- --nocapture \
+            2>&1 | tee /tmp/stage1-diagnostics/gpu-native-direct.log
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-diagnostics-${{ github.run_id }}
+          path: /tmp/stage1-diagnostics
+          if-no-files-found: error
+          retention-days: 3

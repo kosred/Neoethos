@@ -1,0 +1,290 @@
+use anyhow::{Context, Result, bail};
+use cubecl::cuda::CudaRuntime;
+use cubecl::prelude::*;
+use ndarray::Array2;
+
+use crate::cubecl_lifecycle::{cubecl_cuda_client, cubecl_residency_scope};
+
+const CLASS_COUNT: usize = 3;
+const L2_WEIGHT: f32 = 1.0e-4;
+
+#[cube(launch)]
+fn candidate_loss_kernel(
+    candidates: &Array<f32>,
+    features: &Array<f32>,
+    labels: &Array<i32>,
+    losses: &mut Array<f32>,
+    n_rows: u32,
+    input_dim: u32,
+    hidden_dim: u32,
+    param_dim: u32,
+) {
+    if ABSOLUTE_POS < losses.len() {
+        let candidate = ABSOLUTE_POS;
+        let n_rows_us = n_rows as usize;
+        let input_dim_us = input_dim as usize;
+        let hidden_dim_us = hidden_dim as usize;
+        let param_dim_us = param_dim as usize;
+        let param_base = candidate * param_dim_us;
+        let w1_offset = param_base;
+        let b1_offset = w1_offset + input_dim_us * hidden_dim_us;
+        let w2_offset = b1_offset + hidden_dim_us;
+        let b2_offset = w2_offset + hidden_dim_us * CLASS_COUNT;
+
+        let l2 = RuntimeCell::<f32>::new(0.0);
+        for p in 0..param_dim_us {
+            let value = candidates[param_base + p];
+            l2.store(l2.read() + value * value);
+        }
+        let l2_final = l2.read() / param_dim as f32;
+
+        if n_rows == 0 {
+            losses[candidate] = L2_WEIGHT * l2_final;
+            terminate!();
+        }
+
+        let total_loss = RuntimeCell::<f32>::new(0.0);
+        for row in 0..n_rows_us {
+            let logit0 = RuntimeCell::<f32>::new(candidates[b2_offset]);
+            let logit1 = RuntimeCell::<f32>::new(candidates[b2_offset + 1]);
+            let logit2 = RuntimeCell::<f32>::new(candidates[b2_offset + 2]);
+
+            for hidden in 0..hidden_dim_us {
+                let activation = RuntimeCell::<f32>::new(candidates[b1_offset + hidden]);
+                for feature in 0..input_dim_us {
+                    activation.store(
+                        activation.read()
+                            + features[row * input_dim_us + feature]
+                                * candidates[w1_offset + feature * hidden_dim_us + hidden],
+                    );
+                }
+                let act = activation.read().tanh();
+                logit0.store(logit0.read() + act * candidates[w2_offset + hidden * CLASS_COUNT]);
+                logit1
+                    .store(logit1.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 1]);
+                logit2
+                    .store(logit2.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 2]);
+            }
+
+            let l0 = logit0.read();
+            let l1 = logit1.read();
+            let l2v = logit2.read();
+            let max_logit = RuntimeCell::<f32>::new(l0);
+            if l1 > max_logit.read() {
+                max_logit.store(l1);
+            }
+            if l2v > max_logit.read() {
+                max_logit.store(l2v);
+            }
+            let m = max_logit.read();
+            let e0 = (l0 - m).exp();
+            let e1 = (l1 - m).exp();
+            let e2 = (l2v - m).exp();
+            let denom = e0 + e1 + e2;
+            let label = labels[row];
+            let probability = RuntimeCell::<f32>::new(e2 / denom);
+            if label == 0 {
+                probability.store(e0 / denom);
+            } else if label == 1 {
+                probability.store(e1 / denom);
+            }
+            if probability.read() < 1.0e-6 {
+                probability.store(1.0e-6);
+            }
+            if probability.read() > 0.999999 {
+                probability.store(0.999999);
+            }
+            total_loss.store(total_loss.read() - probability.read().ln());
+        }
+
+        losses[candidate] = total_loss.read() / n_rows as f32 + L2_WEIGHT * l2_final;
+    }
+}
+
+fn cuda_device_id(policy: &str) -> Result<usize> {
+    crate::common::cuda_device_id_from_policy(policy)
+}
+
+fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
+    crate::common::cuda_kernel_units(client.properties().hardware.max_units_per_cube)
+}
+
+fn flatten_candidates(candidates: &[Vec<f64>], param_dim: usize) -> Result<Vec<f32>> {
+    let mut flat = Vec::with_capacity(candidates.len().saturating_mul(param_dim));
+    for candidate in candidates {
+        if candidate.len() != param_dim {
+            bail!(
+                "neuro-evo cuda candidate dimension mismatch: expected {}, received {}",
+                param_dim,
+                candidate.len()
+            );
+        }
+        flat.extend(candidate.iter().map(|value| *value as f32));
+    }
+    Ok(flat)
+}
+
+fn flatten_features(features: &Array2<f32>, input_dim: usize) -> Result<Vec<f32>> {
+    crate::common::cuda_flatten_features(features, input_dim, "neuro-evo")
+}
+
+fn launch_loss_kernel(
+    client: &ComputeClient<CudaRuntime>,
+    candidates_flat: &[f32],
+    features: &Array2<f32>,
+    labels: &[usize],
+    candidate_count: usize,
+    input_dim: usize,
+    hidden_dim: usize,
+    param_dim: usize,
+) -> Result<Vec<f32>> {
+    if candidate_count == 0 {
+        return Ok(Vec::new());
+    }
+    if features.nrows() != labels.len() {
+        bail!(
+            "neuro-evo cuda labels mismatch: {} labels for {} feature rows",
+            labels.len(),
+            features.nrows()
+        );
+    }
+    if labels.iter().any(|label| *label >= CLASS_COUNT) {
+        bail!("neuro-evo cuda labels must be in 0..3");
+    }
+
+    let features_flat = flatten_features(features, input_dim)?;
+    let labels = labels.iter().map(|label| *label as i32).collect::<Vec<_>>();
+    let candidates_handle = client.create_from_slice(f32::as_bytes(candidates_flat));
+    let features_handle = client.create_from_slice(f32::as_bytes(&features_flat));
+    let labels_handle = client.create_from_slice(i32::as_bytes(&labels));
+    let losses_handle = client.empty(candidate_count.saturating_mul(std::mem::size_of::<f32>()));
+
+    let units = kernel_units(client);
+    let cubes = (candidate_count as u32).div_ceil(units);
+    candidate_loss_kernel::launch::<CudaRuntime>(
+        client,
+        CubeCount::Static(cubes, 1, 1),
+        CubeDim::new_1d(units),
+        unsafe { ArrayArg::from_raw_parts(candidates_handle.clone(), candidates_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
+        unsafe { ArrayArg::from_raw_parts(labels_handle.clone(), labels.len()) },
+        unsafe { ArrayArg::from_raw_parts(losses_handle.clone(), candidate_count) },
+        features.nrows() as u32,
+        input_dim as u32,
+        hidden_dim as u32,
+        param_dim as u32,
+    );
+
+    // See `neat_gpu.rs`: `kernel::launch::<R>` is `()` in cubecl 0.10, and the
+    // `Result` moved to the readback.
+    let bytes = client
+        .read_one(losses_handle)
+        .context("read back neuro-evo cuda candidate losses")?;
+    Ok(f32::from_bytes(&bytes).to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_selection_losses_cuda(
+    candidates: &[Vec<f64>],
+    train_features: &Array2<f32>,
+    train_labels: &[usize],
+    val_features: &Array2<f32>,
+    val_labels: &[usize],
+    input_dim: usize,
+    hidden_dim: usize,
+    param_dim: usize,
+    policy: &str,
+) -> Result<Vec<(f64, f64, f64)>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let candidates_flat = flatten_candidates(candidates, param_dim)?;
+    let _cubecl_call_residency = cubecl_residency_scope();
+    let client = cubecl_cuda_client(cuda_device_id(policy)?);
+    let train_losses = launch_loss_kernel(
+        &client,
+        &candidates_flat,
+        train_features,
+        train_labels,
+        candidates.len(),
+        input_dim,
+        hidden_dim,
+        param_dim,
+    )?;
+    let val_losses = if val_labels.is_empty() {
+        train_losses.clone()
+    } else {
+        launch_loss_kernel(
+            &client,
+            &candidates_flat,
+            val_features,
+            val_labels,
+            candidates.len(),
+            input_dim,
+            hidden_dim,
+            param_dim,
+        )?
+    };
+
+    Ok(train_losses
+        .into_iter()
+        .zip(val_losses)
+        .map(|(train_loss, val_loss)| {
+            let train_loss = train_loss as f64;
+            let val_loss = val_loss as f64;
+            let selection_loss = if val_labels.is_empty() {
+                train_loss
+            } else {
+                0.65 * train_loss + 0.35 * val_loss
+            };
+            (selection_loss, train_loss, val_loss)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::array;
+
+    use super::try_selection_losses_cuda;
+
+    #[test]
+    fn crfmnes_cuda_selection_losses_launch_real_kernel() {
+        let input_dim = 2;
+        let hidden_dim = 3;
+        let param_dim = input_dim * hidden_dim + hidden_dim + hidden_dim * 3 + 3;
+        let candidates = vec![
+            vec![0.0_f64; param_dim],
+            (0..param_dim)
+                .map(|index| (index as f64 - 5.0) * 0.01)
+                .collect(),
+        ];
+        let train_features = array![
+            [0.25_f32, -0.5_f32],
+            [0.75_f32, 0.125_f32],
+            [-0.4_f32, 0.9_f32],
+            [0.6_f32, -0.2_f32],
+        ];
+        let train_labels = [0_usize, 1, 2, 1];
+        let val_features = array![[0.1_f32, 0.2_f32], [-0.3_f32, 0.8_f32]];
+        let val_labels = [0_usize, 2];
+
+        let losses = try_selection_losses_cuda(
+            &candidates,
+            &train_features,
+            &train_labels,
+            &val_features,
+            &val_labels,
+            input_dim,
+            hidden_dim,
+            param_dim,
+            "gpu:0",
+        )
+        .expect("mandatory CR-FM-NES CUDA kernel launch");
+
+        assert_eq!(losses.len(), candidates.len());
+        assert!(losses.iter().all(|losses| {
+            losses.0.is_finite() && losses.1.is_finite() && losses.2.is_finite()
+        }));
+    }
+}

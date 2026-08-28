@@ -1,0 +1,21 @@
+# Rented NVIDIA benchmark kit
+
+This directory prepares attributed, fail-fast benchmark runs. It does not claim speedups or select an engine.
+
+The paid-run path is **Rust only**. Snapshot preparation, matrix generation, collation and the preflight report are subcommands of `neoethos-cli`. Superseded Python conversion/matrix/collation implementations were removed after the Rust path replaced them.
+
+1. Run `bash preflight.sh`. By default it accepts an RTX 3090 or RTX A6000 with NVIDIA compute capability at least 8.6 and at least 24,000 reported MiB of physical VRAM, plus CUDA/Nsight/CUPTI. It then runs the count-pinned real-device inventory: f64 native ABI (1), native-B parity (3), CubeCL population parity (7), CubeCL trailing (1), fused (1), direct Prototype A (1), Prototype C (7), the active resident-f64 data suite (67 with 2 explicit ignores), and the HPC indicator sweep (1). Compute Sanitizer separately re-runs native ABI 1/1, native-B 3/3, CubeCL population 7/7, direct Prototype A 1/1, and the full resident Prototype C device group 7/7. Every binary must keep its pinned Cargo count, exit successfully, and report zero memory errors and zero leaked bytes. Any skip, fallback, substitution, zero-test result, count drift, sanitizer error, or leaked byte fails the preflight. Remote runs also capture `nvidia-smi` telemetry; the real-device switches are exported in the test shell before telemetry is backgrounded, so starting telemetry cannot scope those switches away from Cargo. Unknown/lower cards require the explicit `NEOETHOS_ALLOW_OTHER_GPU=1` override. A benchmark that genuinely requires A6000 capacity can narrow the policy with `NEOETHOS_EXPECT_GPU_SUBSTRING='RTX A6000' NEOETHOS_MIN_VRAM_MIB=45000`. The report itself is written by `neoethos-cli bench-preflight-report`.
+2. Create detached, clean historical and candidate worktrees with `bash prepare_worktrees.sh <root> <candidate-sha> [legacy-sha]`.
+3. Build the candidate release binary inside its pinned worktree before paid benchmark execution. Prototype B additionally requires `--features gpu-nvidia`; a binary without it refuses the job rather than measuring something else.
+4. Import each explicitly bar-open source file with the shared `neoethos-cli import` boundary. CSV, TSV, JSON/JSONL, Parquet, Arrow IPC and Vortex source formats may enter there; the importer validates, publishes and reopens an immutable canonical Vortex generation. Then prepare from the exact returned identity, for example:
+   `neoethos-cli bench-prepare --data-root cache/import --symbol EURUSD --dataset-identity d1-... --out snapshots/M1.json --timeframe M1 --population 4096`.
+   Repeat for each independently sourced direct timeframe. The benchmark command never parses a source format and never manufactures a larger timeframe from M1.
+5. Generate the matrix with `neoethos-cli bench-matrix --candidate-sha ... --fixture snapshot --snapshot-dir snapshots` for Prototype B and C only. Prototype A CLI timing is blocked because the current aggregate dispatcher can execute B while attributing the receipt to A; `run_cuda_validation.sh cubecl` uses the direct A engine and is the accepted A hardware proof. The historical legacy adapter remains explicitly blocked until it exists.
+6. Execute the printed commands after inspecting `matrix.json`. Clean timing, diagnostics, Nsight Systems and Nsight Compute remain separate processes and separate reports.
+7. Collate completed JSON reports with `neoethos-cli bench-collate --reports cache/gpu-bench/runs --out cache/gpu-bench/summary.json`. Missing fields stay null and parity failures are counted, never averaged away.
+
+`run_rented.sh <candidate-sha> [source-dir]` chains steps 1, 4, 5 and 7 for one session. Its directory convention uses one explicitly bar-open CSV per direct timeframe, but those files still pass through the same admitted importer before benchmark preparation.
+
+For fast infrastructure checks, omit `--fixture snapshot`; the deterministic tiny path is available for B and C. Do not add A to a benchmark matrix until its CLI entrypoint directly invokes the A engine.
+
+The historical reference is pinned to `2be1408ee3986026fdbb2a5a74aaaf6ac67e5209`. Candidate and legacy worktree SHAs are checked before command generation. Missing or unsupported measurements remain blocked or empty; the scripts never fabricate values.

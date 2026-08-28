@@ -1,0 +1,35 @@
+The Inter font family is licensed under the SIL Open Font License, Version 1.1.
+
+Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)
+
+The self-hosted .woff2 subset files in this directory are redistributed
+under the OFL so that the NeoEthos site can display beautiful, readable text
+with ZERO external network requests (no Google Fonts, no CDN) — consistent
+with the project's privacy promise (see PRIVACY.md).
+
+Full license text: https://openfontlicense.org/
+Font source: https://github.com/rsms/inter
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 — 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The fonts,
+including any derivative works, can be bundled, embedded, redistributed
+and/or sold with any software provided that any reserved names are not used
+by derivative works. The fonts and derivatives, however, cannot be released
+under any other type of license. The requirement for fonts to remain under
+this license does not apply to any document created using the fonts or their
+derivatives.
+
+(The complete terms — Permission & Conditions, and the disclaimer — are
+available at https://openfontlicense.org/ ; the fonts are provided "as is",
+without warranty of any kind.)

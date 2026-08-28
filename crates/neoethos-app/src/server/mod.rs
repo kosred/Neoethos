@@ -1,0 +1,583 @@
+//! HTTP API surface that the Flutter front-end talks to.
+//!
+//! Backend HTTP surface for the Flutter migration. The goal of this module
+//! is to expose TradingSession state and broker actions over stable JSON so
+//! a thin Flutter client can render the UI.
+//!
+//! ## Layering
+//!
+//! - `mod.rs` — router + `serve()` entry point. Owns the axum app.
+//! - `state.rs` — `AppApiState`, the `Arc<Mutex<...>>`-wrapped handle
+//!   to the long-lived `TradingSession`. All routes pull through this.
+//! - `account.rs` — `/account/snapshot` route + DTO.
+//! - `health.rs` — `/healthz` route, no app state needed.
+//!
+//! ## Port
+//!
+//! The Flutter client (`experiments/forex-flutter-ui/lib/api/
+//! backend_client.dart`) hard-codes `http://127.0.0.1:7423`. We bind there
+//! by default. Override with the `NEOETHOS_SERVER_BIND` env var
+//! (`host:port` form) when running multiple instances on the same machine.
+//!
+//! ## CORS
+//!
+//! Flutter desktop binaries open a native window and don't need CORS, but
+//! `flutter run -d chrome` (used for hot-reload dev) does. We allow any
+//! origin for now — the server is loopback-only so the surface is small.
+//! Tighten before exposing on non-loopback interfaces.
+
+pub mod account;
+pub mod auth;
+pub mod autonomous;
+pub mod bridge;
+pub mod broker_control;
+pub mod chart;
+// **2026-05-25 — operator directive "live tick + chart switch
+// must be immediate"**: in-memory LRU cache for `ChartDto` so
+// repeat timeframe switches don't re-read the 30 MB Vortex file.
+// Mirrors the in-RAM series cache that TradingView / cTrader /
+// MT5 all use server-side or client-side.
+pub mod chart_cache;
+pub mod codex;
+pub mod data_control;
+pub mod diagnostics;
+pub mod engines_control;
+pub mod errors;
+mod feature_store_disk;
+pub mod federation;
+pub mod hardware;
+pub mod health;
+pub mod indicators;
+pub mod intelligence;
+pub mod journal;
+pub mod knob_catalog;
+pub mod live_spots;
+pub mod mcp;
+pub mod news;
+pub mod orders;
+pub mod pending_actions;
+pub mod portfolios;
+pub mod risk;
+pub mod risky;
+pub mod settings;
+pub mod state;
+pub mod storage;
+pub mod strategy_lab;
+pub mod strategy_report;
+pub mod supervisor;
+pub mod system_status;
+pub mod watchlist;
+
+use anyhow::Context;
+use axum::Router;
+use axum::routing::{get, post};
+use std::net::SocketAddr;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+
+use self::state::AppApiState;
+
+/// CORS policy for the API (audit S01, 2026-07-13).
+///
+/// The old layer was `allow_origin(Any)`, which defeated the loopback-only
+/// security model through the operator's own BROWSER as confused deputy:
+/// any public webpage could `fetch("http://127.0.0.1:<port>/orders", …)`,
+/// the permissive preflight would pass, and the page could place/close
+/// REAL trades or rewrite broker credentials — no auth in front (the CLI
+/// port is a fixed default, trivially targetable).
+///
+/// Only the app's own UI surfaces are cross-origin against this server and
+/// therefore need CORS at all: the Tauri webview (`http(s)://tauri.localhost`
+/// on Windows, `tauri://localhost` on Linux/macOS) and the Vite dev server
+/// (`http://localhost:5173`). Server-side callers (MCP sidecar, mesh, curl)
+/// never send Origin preflights, so they are unaffected. Everything else —
+/// i.e. every real website — is denied.
+///
+/// ## The escape hatch is GONE (2026-08-10, config consolidation)
+///
+/// `NEOETHOS_CORS_ALLOW_ANY=1` used to restore `allow_origin(Any)` with a
+/// warning. It is deleted, and it did NOT become a config key.
+///
+/// Reasoning, stated here because "we removed an operator's option" deserves
+/// a reason on the line that removed it:
+///
+/// * It was an environment variable that silently and totally disabled a
+///   security control on a **trade-capable, unauthenticated** API. That is the
+///   exact shape non-negotiable #2 forbids — a lever that raises a limit, off
+///   the config surface, invisible in the run artifact.
+/// * Its stated purpose (reach the API from a phone on the LAN) is already
+///   served, and served safely, by binding a non-loopback address: that path
+///   goes through [`configure_api_auth`], which **refuses to bind at all**
+///   without an operator-supplied API token. The env var bypassed that gate
+///   entirely — allow-any CORS on a loopback bind needs no token.
+/// * So the two mechanisms were not equivalent. One demands a credential, the
+///   other demanded nothing.
+///
+/// If the variable is still exported, `app_services::retired_env` prints an
+/// ERROR at startup naming it and saying the value was ignored. Nothing here
+/// reads it.
+fn cors_layer() -> CorsLayer {
+    let allowed =
+        AllowOrigin::predicate(|origin, _| origin.to_str().map(origin_is_allowed).unwrap_or(false));
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// The origin-allowlist behind [`cors_layer`]: the app's own UI surfaces
+/// only. scheme://host[:port] — scheme+host are compared, the port is
+/// ignored (the vite dev port and the tauri webview port can vary).
+fn origin_is_allowed(origin: &str) -> bool {
+    let rest = match origin.split_once("://") {
+        Some(("http" | "https", rest)) => rest,
+        // Tauri's custom protocol origin on Linux/macOS.
+        Some(("tauri", rest)) => rest,
+        _ => return false,
+    };
+    let host = rest.split([':', '/']).next().unwrap_or("");
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost"
+    )
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::origin_is_allowed;
+
+    #[test]
+    fn app_ui_origins_are_allowed() {
+        for origin in [
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "tauri://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost",
+        ] {
+            assert!(origin_is_allowed(origin), "{origin} must be allowed");
+        }
+    }
+
+    #[test]
+    fn public_websites_are_denied() {
+        // Audit S01: with allow_origin(Any), any of these could drive the
+        // unauthenticated trading endpoints through the operator's browser.
+        for origin in [
+            "https://evil.example.com",
+            "http://attacker.io",
+            "https://localhost.evil.com", // suffix trick
+            "http://127.0.0.1.evil.com",  // prefix trick
+            "file://localhost",           // wrong scheme
+            "null",                       // sandboxed iframe origin
+            "",
+        ] {
+            assert!(!origin_is_allowed(origin), "{origin} must be denied");
+        }
+    }
+}
+
+/// Build the axum router. Kept as a free function so tests can mount
+/// individual routes against a mock `AppApiState` without going through
+/// the actual TCP bind.
+pub fn router(state: AppApiState) -> Router {
+    let cors = cors_layer();
+
+    Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/account/snapshot", get(account::snapshot))
+        // **2026-05-25 — operator directive "uniform push everywhere"**:
+        // SSE push channel mirror of `/live/spots/stream` for account
+        // updates. Bridge writes a fresh snapshot every 5 s (and in
+        // future on every `OAExecutionEvent` push); subscribers receive
+        // each update with ~5 ms latency vs. the previous 1000 ms poll
+        // of `/account/snapshot`.
+        .route("/account/snapshot/stream", get(account::stream))
+        // **2026-05-25 — uniform-push doctrine**: force-refresh
+        // trigger that bridges the 5 s safety poll. Operator clicks
+        // a "refresh" button → POST here → bridge skips the timer
+        // and runs `refresh_once` immediately → fresh snapshot
+        // broadcast within ~750 ms. Same channel the future
+        // `OAExecutionEvent` handler will use.
+        .route("/account/snapshot/refresh", post(account::refresh))
+        .route("/hardware", get(hardware::hardware))
+        // The AI news desk: public no-API-key RSS headlines fetched
+        // server-side + a Codex (ChatGPT subscription) market briefing.
+        // `?force=true` bypasses the fetch-coalescing cache.
+        .route("/news/feed", get(news::feed))
+        .route("/risk", get(risk::risk))
+        .route("/risk/preset", post(risk::update_preset))
+        // Risky/Growth Mode time-to-target projection, computed by the
+        // live engine's own math (no hardcoded growth rates in the UI).
+        .route("/risky/scenarios", get(risky::scenarios))
+        .route(
+            "/settings",
+            get(settings::settings).post(settings::update_settings),
+        )
+        // #193: raw config.yaml for the Flutter Settings "Advanced"
+        // panel that surfaces knobs the typed /settings DTO can't list.
+        //
+        // F-312 (2026-05-29): POST handler on the same route writes the
+        // whole YAML verbatim, closing the silent-drop hole where the
+        // typed `POST /settings` DTO dropped edits to any of the 200+
+        // fields outside its 5-field allowlist.
+        .route(
+            "/settings/raw",
+            get(settings::settings_raw_yaml).post(settings::update_settings_raw_yaml),
+        )
+        // **2026-05-25 — operator-approved**: the Flutter "Advanced
+        // Settings" screen consumes this catalog to render every
+        // runtime knob with help text + presets. Catalog is the
+        // machine-readable counterpart of `docs/CONFIG-KNOBS-REFERENCE.md`.
+        .route(
+            "/settings/knob-catalog",
+            get(knob_catalog::get_knob_catalog),
+        )
+        // `/settings/presets` is GONE (#115/#116, 2026-08-10): the
+        // safety-posture vocabulary it served had no apply path anywhere in the
+        // product. The ONE preset vocabulary is the prop-firm one, written by
+        // `POST /risk/preset`. See the note in `knob_catalog.rs`.
+        .route("/engines/status", get(system_status::engines))
+        // Storage transparency + autopilot artifact picker.
+        .route("/storage/paths", get(storage::paths))
+        .route("/portfolios/list", get(portfolios::list))
+        // Per-strategy monthly journal + validation verdict + honest flags.
+        .route("/strategy/list", get(strategy_report::list))
+        .route("/strategy/report", get(strategy_report::report))
+        .route(
+            "/engines/discovery/start",
+            post(engines_control::discovery_start),
+        )
+        .route(
+            "/engines/discovery/stop",
+            post(engines_control::discovery_stop),
+        )
+        .route(
+            "/engines/training/start",
+            post(engines_control::training_start),
+        )
+        .route(
+            "/engines/training/stop",
+            post(engines_control::training_stop),
+        )
+        .route(
+            "/engines/native-research/start",
+            post(engines_control::canonical_native_research_start),
+        )
+        .route(
+            "/engines/native-research/cancel",
+            post(engines_control::canonical_native_research_cancel),
+        )
+        // F-330 Strategy Lab — Promotion Gate status + promote-to-live.
+        .route(
+            "/strategy_lab/promotion",
+            get(strategy_lab::promotion_status),
+        )
+        .route("/strategy_lab/promote", post(strategy_lab::promote))
+        // Autonomous trader (Phase 1.5): offline dry-run over on-disk history,
+        // the SAME engine + helper the CLI `trader-replay` drives → identical
+        // EngineStats from both front-ends.
+        .route("/autonomous/replay", post(autonomous::replay))
+        // Phase A live trading: start/stop/status for the bar-poll → gene
+        // signal → cTrader execution loop.
+        .route("/autonomous/start", post(autonomous::start_live))
+        .route("/autonomous/stop", post(autonomous::stop_live))
+        .route("/autonomous/status", get(autonomous::live_status))
+        .route("/autonomous/gate", get(autonomous::gate))
+        // Permanent auto-cull blacklist of retired (never-tradable-again) strategies.
+        .route("/strategy/blacklist", get(autonomous::blacklist))
+        // Live↔backtest parity harness (window-invariance of live signals).
+        .route("/autonomous/parity", get(autonomous::parity))
+        // Monte-Carlo tail risk of a portfolio's trade sequence (p95 DD, ruin).
+        .route("/autonomous/tailrisk", get(autonomous::tail_risk))
+        // First-passage prop-firm challenge simulation (pass% per sizing).
+        .route("/autonomous/challenge", get(autonomous::challenge))
+        // Federation Phase 0 — any instance can coordinate; workers point at it.
+        .route("/federation/status", get(federation::fed_status))
+        .route("/federation/jobs", post(federation::fed_set_jobs))
+        .route("/federation/job", get(federation::fed_next_job))
+        .route("/federation/submit", post(federation::fed_submit))
+        .route(
+            "/federation/worker/start",
+            post(federation::fed_worker_start),
+        )
+        .route("/federation/worker/stop", post(federation::fed_worker_stop))
+        // Aggregated swarm capacity (the network as one machine) from the mesh.
+        .route("/mesh/swarm", get(federation::swarm_capacity))
+        // Distributed island-model GA migration (mesh-driven; OFF until enabled).
+        .route("/mesh/migration/enable", post(federation::migration_enable))
+        .route("/mesh/elites", get(federation::migration_elites))
+        .route("/mesh/migrants", post(federation::migration_migrants))
+        // MCP sidecar management (config file + sidecar status/tools proxy).
+        // Tool CALLS stay behind the Supervisor's approval-gated actions.
+        // POST accepted alongside PUT (the web client only speaks GET/POST).
+        .route(
+            "/mcp/config",
+            get(mcp::config_get)
+                .put(mcp::config_put)
+                .post(mcp::config_put),
+        )
+        .route("/mcp/status", get(mcp::status))
+        // Offline learning report from live experience (never touches live).
+        .route(
+            "/experience/train",
+            post(|| async {
+                use axum::response::IntoResponse;
+                match tokio::task::spawn_blocking(
+                    crate::app_services::experience_train::train_from_experience,
+                )
+                .await
+                {
+                    Ok(Ok(report)) => axum::Json(serde_json::json!(report)).into_response(),
+                    Ok(Err(e)) => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response(),
+                    Err(e) => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
+        // Session-aware spread stats recorded from the broker's own ticks.
+        .route(
+            "/data/spread-stats",
+            get(|| async { axum::Json(crate::app_services::spread_stats::snapshot()) }),
+        )
+        // Autonomous LLM supervisor (observe/diagnose + tiered actions).
+        .route("/supervisor/status", get(supervisor::status))
+        .route("/supervisor/config", post(supervisor::update_config))
+        .route("/supervisor/tick", post(supervisor::tick))
+        .route("/supervisor/chat", post(supervisor::chat))
+        .route("/broker/status", get(system_status::broker_status))
+        .route("/broker/reauth", post(broker_control::reauth))
+        .route(
+            "/broker/credentials",
+            get(broker_control::credentials_get).post(broker_control::credentials_post),
+        )
+        .route("/broker/symbols", get(data_control::symbols))
+        .route("/broker/timeframes", get(data_control::timeframes))
+        .route("/broker/accounts", get(data_control::accounts))
+        // 2026-06-10 cTrader Open API history / margin / profile consumers.
+        .route("/broker/orders/history", get(data_control::order_history))
+        .route("/broker/cashflow", get(data_control::cash_flow_history))
+        .route(
+            "/broker/margin/expected",
+            get(data_control::expected_margin),
+        )
+        .route("/broker/profile", get(data_control::ctid_profile))
+        .route("/broker/version", get(data_control::server_version))
+        // `POST /broker/account/select` DELETED 2026-08-10 (audit #120). It was
+        // the only route that could change WHICH ACCOUNT TRADES, it had no
+        // client, and it disagreed with the path that does have one: the Tauri
+        // command `select_account` (`desktop/src-tauri/src/broker.rs:256`) also
+        // sets `enabled_for_execution` and the Demo/Live environment, neither of
+        // which this route touched — so the two answers to "which account is
+        // active" were different. `docs/codex-control-plane.md` additionally
+        // requires the HTTP control plane to be structurally incapable of
+        // switching accounts or environments; deleting the route is what makes
+        // that true rather than merely intended.
+        .route("/data/bootstrap", get(system_status::data_bootstrap))
+        .route("/data/fetch", post(data_control::fetch))
+        .route("/data/fetch/status", get(data_control::fetch_status))
+        .route("/data/fetch/stop", post(data_control::stop_fetch))
+        // Explicit user source -> sealed immutable snapshot -> verified
+        // canonical Vortex generation. No runtime format auto-conversion.
+        .route("/data/import", post(data_control::import_file))
+        .route("/orders", post(orders::place))
+        // Conditional (limit/stop) orders: GET lists resting broker orders,
+        // POST places a new one that fills when price reaches the trigger.
+        .route(
+            "/orders/pending",
+            get(orders::list_pending).post(orders::place_pending),
+        )
+        .route("/orders/cancel", post(orders::cancel_order))
+        // #236: modify a RESTING order in place. Until 2026-08-10 the UI could
+        // place a pending order and cancel it but not change it, so correcting a
+        // trigger price meant cancel + re-place — two broker round trips and a
+        // window with no order behind the level.
+        .route("/orders/amend", post(orders::amend_order))
+        .route("/positions/close", post(orders::close_position))
+        .route(
+            "/positions/protection",
+            post(orders::amend_position_protection),
+        )
+        // #204 ChatGPT subscription via Codex CLI OAuth flow.
+        // Replaces the previous local-Gemma path. Status renders the
+        // UI badge, start kicks off PKCE, logout wipes the token,
+        // chat proxies requests through the subscription bearer.
+        .route("/auth/codex/status", get(codex::status))
+        .route("/auth/codex/start", post(codex::start))
+        .route("/auth/codex/logout", post(codex::logout))
+        .route("/codex/chat", post(codex::chat))
+        .route("/intelligence", get(intelligence::intelligence))
+        // Live tick stream (#137). Reads from the cache that the
+        // long-running spot streamer populates; sub-2s freshness
+        // for active majors.
+        .route("/live/spots", get(live_spots::list))
+        // **2026-05-25 — operator directive "push, not poll"**:
+        // SSE endpoint that streams ticks to Flutter as they arrive
+        // (target latency ~5 ms vs. 1000 ms for the polling route
+        // above). The polling route is kept as a fallback for HTTP
+        // clients without SSE support + for the cold-start snapshot.
+        .route("/live/spots/stream", get(live_spots::stream))
+        // F-338 (Feature #12): editable Market Watch watchlist. GET
+        // returns the saved `system.watchlist`; POST replaces it and
+        // re-subscribes the live spot stream within ~5 s (no restart).
+        .route("/watchlist", get(watchlist::get).post(watchlist::post))
+        .route("/chart", get(chart::chart))
+        // Scroll-back pagination: older bars on demand, broker-only, never
+        // persisted (TradingView model — panning back costs zero disk).
+        .route("/chart/history", get(chart::chart_history))
+        .route("/indicators", get(indicators::indicators))
+        // Trade journal (#flagship): closed-trade log + computed stats
+        // (myfxbook-style). Reads the JSONL store under <data_dir>/journal/.
+        .route("/journal/trades", get(journal::trades))
+        .route("/journal/stats", get(journal::stats))
+        .route("/journal/analytics", get(journal::analytics))
+        .route("/diagnostics/report", post(diagnostics::report))
+        // ── Trade-management confirmation flow (#136) ──────────
+        .route("/actions/pending", get(pending_actions::list))
+        .route("/actions/{id}/confirm", post(pending_actions::confirm))
+        .route("/actions/{id}/reject", post(pending_actions::reject))
+        // Audit S01: bearer-token gate. Permissive when no token is installed
+        // (the loopback default — CORS already blocks browsers); enforced when
+        // serve() installs a token (mandatory for a non-loopback bind, or when
+        // the operator sets NEOETHOS_API_TOKEN). Inner to CORS so preflight
+        // still works; `/healthz` stays open (handled inside the middleware).
+        .layer(axum::middleware::from_fn(auth::require_token))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Resolve + install the API auth token for this launch (audit S01), and
+/// FAIL CLOSED on the dangerous case: a non-loopback bind with no operator
+/// token. Returns `Err` to refuse binding; `Ok(())` means the router's
+/// bearer gate is configured (enforcing iff a token was installed).
+fn configure_api_auth(addr: &SocketAddr) -> anyhow::Result<()> {
+    match auth::configured_token() {
+        Some(token) => {
+            auth::set_api_token(token);
+            tracing::info!(
+                target: "neoethos_app::server",
+                "API bearer-token authentication ACTIVE (NEOETHOS_API_TOKEN). \
+                 Requests must send `Authorization: Bearer <token>` (except /healthz)."
+            );
+        }
+        None if !addr.ip().is_loopback() => {
+            anyhow::bail!(
+                "refusing to bind the API to non-loopback {addr} with NO authentication: \
+                 the trading endpoints (place/close orders, broker credentials) would be \
+                 reachable and trade-capable from the network. Set NEOETHOS_API_TOKEN to a \
+                 secret and send `Authorization: Bearer <token>`, or bind to 127.0.0.1."
+            );
+        }
+        None => {
+            // Loopback with no operator token: permissive (unchanged behavior).
+            // The CORS allowlist blocks cross-origin browser access.
+        }
+    }
+    Ok(())
+}
+
+/// **F-527/F-CORE3 closure (2026-05-25)**: the hard-coded fallback bind
+/// address + the env-var resolution now live in the canonical
+/// `app_services::env_overrides` registry so the operator can grep one
+/// file to find every NeoEthos env knob. This shim keeps the
+/// `default_bind_addr()` callsite stable.
+///
+/// The port is mirrored in `lib/api/backend_client.dart`; if either
+/// side changes, both must change in the same commit.
+fn default_bind_addr() -> SocketAddr {
+    crate::app_services::env_overrides::server_bind_addr()
+}
+
+/// Bind the HTTP listener and serve until the process is killed. The
+/// returned future runs forever in the happy path; an error means the
+/// bind failed (port already in use, EACCES, etc.).
+pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
+    let addr = default_bind_addr();
+    // Audit S01: install auth + fail closed on a non-loopback bind with no
+    // token BEFORE binding the socket.
+    configure_api_auth(&addr)?;
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind axum HTTP server on {addr}"))?;
+
+    tracing::info!(
+        target: "neoethos_app::server",
+        bind_addr = %addr,
+        "NeoEthos HTTP server listening — Flutter client should connect here"
+    );
+
+    // 2026-06-10: the trading endpoints (/orders, /positions/close,
+    // /broker/credentials, …) carry NO authentication — the security model
+    // is "loopback-only", enforced solely by the bind address. Make that
+    // assumption explicit in the logs, and SHOUT if the operator ever points
+    // the bind at a non-loopback interface, where those endpoints would become
+    // reachable (and trade-capable) from the network with no auth in front.
+    if addr.ip().is_loopback() {
+        tracing::info!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "server is loopback-only (no endpoint authentication by design — \
+             do not expose this port on a public interface)"
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_app::server",
+            bind_addr = %addr,
+            "SECURITY: HTTP server bound to a NON-loopback address — the trading \
+             endpoints have NO authentication and are now reachable from the \
+             network. Anyone who can reach this port can place/close live trades \
+             and change broker credentials. Bind to 127.0.0.1 unless you have put \
+             your own auth/firewall in front."
+        );
+    }
+
+    axum::serve(listener, app)
+        .await
+        .context("axum::serve returned with an unrecoverable error")
+}
+
+/// Serve the full API on a caller-supplied, already-bound listener. Used by
+/// the in-process desktop shell (Tauri), which binds an ephemeral loopback
+/// port itself — so it knows the port *before* the window loads — and hands
+/// the listener here. Same router, same handlers, same loopback-only security
+/// model as [`serve`]; the only difference is who owns the socket.
+pub async fn serve_on(listener: std::net::TcpListener, state: AppApiState) -> anyhow::Result<()> {
+    let addr = listener.local_addr().ok();
+    // Audit S01: the desktop shell always binds an ephemeral loopback port, so
+    // there is no non-loopback case to fail closed on here; honor an operator
+    // NEOETHOS_API_TOKEN if set (enforcement then applies to this listener too).
+    if let Some(token) = auth::configured_token() {
+        auth::set_api_token(token);
+        tracing::info!(
+            target: "neoethos_app::server",
+            "in-process API bearer-token authentication ACTIVE (NEOETHOS_API_TOKEN)"
+        );
+    }
+    listener
+        .set_nonblocking(true)
+        .context("failed to set the backend listener non-blocking")?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .context("failed to adopt the pre-bound backend listener into tokio")?;
+    let app = router(state);
+
+    tracing::info!(
+        target: "neoethos_app::server",
+        ?addr,
+        "NeoEthos in-process API listening (Tauri shell) — loopback-only"
+    );
+
+    axum::serve(listener, app)
+        .await
+        .context("in-process axum::serve returned with an unrecoverable error")
+}

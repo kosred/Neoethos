@@ -1,0 +1,144 @@
+[package]
+name = "neoethos-core"
+version = "0.5.6"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Compile-time runtime inventory. Hardware discovery must advertise only
+# backends that the current binary can actually execute.
+gpu-cuda = []
+gpu-rocm = []
+gpu-wgpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+neoethos-execution-budget.workspace = true
+neoethos-broker-truth.workspace = true
+neoethos-dataset-contracts.workspace = true
+rayon.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+config = "0.15.19"
+tracing = "0.1.42"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+# tracing-appender: daily-rotating file logger. Wired into `logging::setup_logging`
+# alongside the console layer so each session writes to
+# `<user-data-dir>/neoethos/logs/neoethos.YYYY-MM-DD.log`. Old files (> 7 days)
+# are deleted at startup to keep the directory clean — the user explicitly
+# requested "logs of today, not garbage from days/months ago".
+tracing-appender = "0.2.4"
+# Platform-correct user-data dir for log storage. Same version as neoethos-app.
+dirs = "5.0.1"
+# F-102 fix (2026-05-25): `tokio` removed from neoethos-core dependencies.
+# Verified via `grep "use tokio|tokio::|#[tokio::"` — ZERO call sites in
+# the entire crate. The previous `features = ["full"]` pulled the
+# complete tokio runtime (~50 transitive crates) into a foundation
+# layer that does nothing async. Crates that DO need tokio (e.g.
+# neoethos-app, neoethos-cli) depend on it directly with minimal
+# features instead.
+# 0.39.6 (2026-07-09). Moved off 0.37.2 on 2026-08-02. Two reasons, both
+# checked against the LIVE crates.io API, not the local registry index:
+#   1. 0.37.2's Windows backend takes `windows >=0.59, <0.62`, which is the
+#      ONLY reason this crate dragged a second `windows` major (0.61.3) into
+#      the tree. 0.38+ takes `windows >=0.62, <0.63` — the same family
+#      `wgpu-hal` and our own `[target.'cfg(windows)']` block already use.
+#   2. 0.39.0 fixed a soundness bug in user retrieval and 0.39.2 fixed a real
+#      Windows perf bug: `System::refresh_cpu_specifics` was doing CPU-usage
+#      work even when usage was not requested. `HardwareProbe::probe` calls
+#      `refresh_all()` on every hardware snapshot, so we were paying it.
+# API surface we use (System::{new,new_all,refresh_all,refresh_memory,
+# refresh_cpu_usage,refresh_processes,cpus,total_memory,available_memory,
+# used_memory,physical_core_count,name,os_version}, Cpu::{brand,cpu_usage},
+# Pid::from_u32, ProcessesToUpdate, Process::start_time,
+# MINIMUM_CPU_UPDATE_INTERVAL) is untouched across 0.37→0.39: the whole
+# 0.38.0/0.39.0 breaking sections are NetBSD support, MacAddr/file_system
+# serde shapes and two additive APIs we do not call.
+# MSRV: 0.39 requires rustc 1.95; rust-toolchain.toml pins 1.96.0-nightly.
+#
+# ONE KNOWN COST, measured, so nobody has to re-derive it: cubecl-cpu 0.10.0
+# takes `sysinfo ^0.38.0` (non-optional) and burn-train 0.21.0 takes the same
+# optionally, so 0.38.4 stays in the lockfile whatever we do. Being on 0.39.6
+# therefore costs exactly ONE extra lock entry vs. matching them at 0.38.4
+# (measured: 187 duplicate entries at 0.39.6, 186 at 0.38.4). We took latest;
+# flip both this line and neoethos-app/Cargo.toml to "0.38.4" to buy the entry
+# back. It collapses on its own when cubecl 0.11 bumps its sysinfo floor.
+#
+# What it does NOT fix, contrary to an earlier note: the `windows` duplicate.
+# Tauri 2.11.3, tao, wry and webview2-com all declare `windows ^0.61`, so
+# windows 0.61.3 stays regardless. Moving sysinfo off 0.37 only removed the
+# last NON-Tauri consumer of the 0.61 family.
+sysinfo = "0.39.6"
+anyhow = "1.0.100"
+thiserror = "2.0.16"
+# HELD AT 0.37 — and this is NOT our choice to make. Re-proved 2026-08-02 by
+# actually setting 0.40.1 and running the resolver; cargo refuses:
+#
+#   package `libsqlite3-sys` links to the native library `sqlite3`, but it
+#   conflicts with a previous package which links to `sqlite3` as well
+#     libsqlite3-sys v0.38.1  <- rusqlite v0.40.1  <- neoethos-core
+#     libsqlite3-sys v0.35.0  <- rusqlite v0.37.0  <- burn-dataset v0.21.0
+#                                <- burn-core <- burn <- neoethos-models
+#
+# Three things worth knowing before anyone tries again:
+#  * burn-dataset is never COMPILED — `burn-core`'s default set is
+#    ["std", "burn-std/default", "burn-dataset?/default", "burn-tensor/default"]
+#    and the `?` means burn-dataset stays off unless something enables it.
+#    But `links` uniqueness is enforced on the RESOLVE graph, which contains
+#    every declared optional dependency. So we pay a version pin for a crate
+#    that never produces a single object file, and `default-features = false`
+#    on burn cannot buy it back.
+#  * 0.37.0 is the LAST rusqlite on libsqlite3-sys ^0.35. 0.38.0 already moved
+#    to ^0.36.0 and 0.40.1 is on ^0.38.1 — there is no intermediate hop.
+#  * Upgrading burn does NOT unblock this. burn-dataset 0.22.0-pre.1 still
+#    declares `rusqlite ^0.37.0` (checked live). This is chained to a
+#    burn-dataset release that has not happened yet, not to burn 0.22.
+#
+# Cost of being stuck: near zero. Our whole surface is Connection::open +
+# params! + query/execute (storage.rs), unchanged from 0.37 through 0.40.
+rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+# NB (2026-08-09, D3 purge): `uuid`, `ndarray` and `secrecy` were removed
+# here because their last consumers in this crate were the orphaned
+# `domain::{events, portfolio, news_filter}` modules. `secrecy` in
+# particular guarded an LLM API key on a `NewsFilter` nothing constructed;
+# if a real secret-holding type lands in core, bring the dep back WITH it.
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = true, features = ["rustls", "json", "blocking", "query", "form"] }
+# TOML serializer for the broker credentials file. Owns the
+# canonical on-disk shape so both neoethos-app and neoethos-cli can
+# read + write `broker_credentials.toml` without a workspace cycle.
+toml = "0.8.20"
+wgpu = { version = "29.0.3", optional = true }
+pollster = { version = "0.4.0", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# F-101 follow-up (2026-05-25 — corrected after verbose build):
+# pruned from the previous 4-feature set down to the 3 actually
+# used after `utils/window_control.rs` was deleted:
+#   - `Win32_System_Console` — CLI console-mode detection
+#   - `Win32_UI_WindowsAndMessaging` — the startup MessageBox dialog
+#     in `logging.rs:140` (no-tty fallback)
+#   - `Win32_Foundation` — required by the WindowsAndMessaging types
+# `Win32_UI_Input_KeyboardAndMouse` was the only feature truly orphaned
+# by the F-101 deletion.
+# 2026-08-02: the `=0.62.0` exact pin was removed. Its stated reason was wrong.
+# Checked live against crates.io: gpu-allocator 0.28.0 declares
+# `windows >=0.58, <=0.62` (and `>=0.53, <=0.62` for its optional d3d12 dep).
+# In Cargo's semver grammar a `<=` comparator with the patch omitted means
+# `<= 0.62.∞`, so 0.62.1 and 0.62.2 were ALWAYS admissible — the pin was not
+# holding gpu-allocator together, it was holding us one patch release behind.
+# wgpu-hal 29.0.3 itself asks for `windows ^0.62` / `windows-core ^0.62`, and
+# the lockfile already resolved windows-core to 0.62.2, so the exact pin was
+# actually producing the odd pairing of windows 0.62.0 with windows-core 0.62.2.
+# `^0.62` keeps us inside the one family everything in the D3D12 path agrees on.
+# NOTE: this does NOT collapse the windows duplicate. Tauri 2.11.3 (and tao,
+# wry, webview2-com) declare `windows ^0.61`, so 0.61.3 stays in the graph
+# until Tauri moves. Nothing we own can delete it.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }

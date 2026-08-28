@@ -1,0 +1,42 @@
+// Shared resident_feature_store_v3.rs import hunk (do not register capability yet):
+use crate::resident_higher_timeframe_alignment_v3::{
+    ResidentHigherTimeframeDirectParentV3, ResidentHigherTimeframeExecutorV3,
+    ResidentHigherTimeframeLaunchAuthorityV3, ResidentHigherTimeframeRuntimeReceiptV3,
+};
+
+// Shared ResidentFeatureStoreAssemblerV3 impl hunk. Invoke only in schema-v4
+// order after Footprint and before post-column transforms. Data must construct
+// the moved parent carriers/authorities from the resolved live HTF span.
+pub fn append_resident_higher_timeframe_alignment_v3(
+    &mut self,
+    parents: Vec<ResidentHigherTimeframeDirectParentV3>,
+    admitted_global_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    launch_authority: ResidentHigherTimeframeLaunchAuthorityV3,
+) -> Result<ResidentHigherTimeframeRuntimeReceiptV3, ResidentFeatureStoreCudaErrorV3> {
+    let mut executor = {
+        let run_device = self.run_device.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "run-device admission was moved before HTF-v3 execution".into(),
+            )
+        })?;
+        let base_parent = self.parent_source.as_deref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident base parent was moved before HTF-v3 execution".into(),
+            )
+        })?;
+        ResidentHigherTimeframeExecutorV3::new(
+            run_device,
+            base_parent,
+            parents,
+            admitted_global_bindings,
+            launch_authority,
+        )?
+    };
+    while let Some(batch) = executor.next_pending_batch_v3()? {
+        self.append_batch(Box::new(batch))?;
+        while !self.try_retire_completed_batch()? {
+            std::thread::yield_now();
+        }
+    }
+    executor.finish_v3()
+}

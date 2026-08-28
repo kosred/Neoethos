@@ -1,0 +1,1 @@
+{"started":false,"kind":"canonical_native_research","errorCode":"process_execution_busy","detail":"process execution is busy: requested NativeResearch while NativeResearch is active","requestedKind":"canonical_native_research","activeKind":"canonical_native_research"}

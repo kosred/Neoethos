@@ -1,0 +1,1344 @@
+use super::super::Ohlcv;
+use super::features::{FeatureCellValidity, FeatureColumnF64};
+use super::smc_log1p_exact_v1::smc_log1p_exact_v1;
+use super::timestamps::validate_canonical_millisecond_timestamps;
+use anyhow::{Result, ensure};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
+use std::collections::HashMap;
+
+/// Semantic v3 replaces the platform-dependent FVG-age `ln_1p` call with the
+/// shared fixed-order CPU/CUDA authority. Semantic-v2 feature/search artifacts
+/// are migration inputs only and must be refused until regenerated under v3.
+pub const SMC_SEMANTIC_VERSION: u32 = 3;
+pub const SMC_V2_ARTIFACT_MIGRATION_POLICY: &str =
+    "refuse semantic-v2 SMC artifacts; require a new content-addressed v3 generation";
+
+pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
+    let n = ohlcv.len();
+    // Matrix initialization - Deep Institutional IPDA Variables
+    let mut ob = vec![0.0_f64; n];
+    let mut fvg = vec![0.0_f64; n];
+    let mut ifvg = vec![0.0_f64; n];
+    let mut liq_sweep = vec![0.0_f64; n];
+    let mut pd_array = vec![0.0_f64; n];
+    let mut macro_active = vec![0.0_f64; n];
+    let mut displacement = vec![0.0_f64; n];
+
+    // Advanced SMC features
+    let mut breaker_block = vec![0.0_f64; n];
+    let mut mitigation_block = vec![0.0_f64; n];
+    let mut mss = vec![0.0_f64; n]; // Market Structure Shift / CHOCH
+    let mut volume_imbalance = vec![0.0_f64; n];
+
+    // Deep ICT Concepts
+    let mut bos = vec![0.0_f64; n]; // Break of Structure
+    let mut eqh = vec![0.0_f64; n]; // Equal Highs (liquidity trap)
+    let mut eql = vec![0.0_f64; n]; // Equal Lows (liquidity trap)
+    let mut inducement = vec![0.0_f64; n]; // Minor swing bait before real move
+    let mut asian_range = vec![0.0_f64; n]; // Asian session range position
+    let mut silver_bullet = vec![0.0_f64; n]; // ICT Silver Bullet windows
+    let mut judas_swing = vec![0.0_f64; n]; // Fake move at session open
+    let mut nwog = vec![0.0_f64; n]; // New Week Opening Gap
+    let mut ndog = vec![0.0_f64; n]; // New Day Opening Gap
+    let mut ict_macro = vec![0.0_f64; n]; // ICT Macro time windows
+    let mut fvg_strength = vec![0.0_f64; n]; // FVG gap size normalized by ATR
+    let mut dealing_range_width = vec![0.0_f64; n]; // Dealing range as % of price
+    let mut swing_range_pct = vec![0.0_f64; n]; // Current swing point range %
+    let mut ob_strength = vec![0.0_f64; n]; // OB candle body vs range ratio
+    let mut trend_bias = vec![0.0_f64; n]; // Multi-TF trend alignment
+    let mut unicorn_model = vec![0.0_f64; n]; // Breaker + FVG + OB confluence
+    let mut rejection_block = vec![0.0_f64; n]; // Long wick rejection zones
+    let mut propulsion_block = vec![0.0_f64; n]; // Strong displacement after consolidation
+    let mut fib_time_ratio = vec![0.0_f64; n]; // Fibonacci time-based clustering
+
+    // Extended Fibonacci Matrix
+    // Internal ranges (retracements)
+    let mut fib_236 = vec![0.0_f64; n];
+    let mut fib_382 = vec![0.0_f64; n];
+    let mut fib_500 = vec![0.0_f64; n]; // Equilibrium exactly
+    let mut fib_618 = vec![0.0_f64; n];
+    let mut fib_705 = vec![0.0_f64; n];
+    let mut fib_786 = vec![0.0_f64; n];
+    let mut fib_886 = vec![0.0_f64; n];
+
+    // External ranges (extensions / standard deviations)
+    let mut fib_1272 = vec![0.0_f64; n];
+    let mut fib_1414 = vec![0.0_f64; n];
+    let mut fib_1618 = vec![0.0_f64; n];
+    let mut fib_2000 = vec![0.0_f64; n];
+    let mut fib_2618 = vec![0.0_f64; n];
+
+    // FVG magnet features (operator 2026-07-02: "the market almost always
+    // returns to OLD FVGs — we don't look back far enough"). The registries
+    // below now REMEMBER unfilled gaps for much longer (cap 64/side, was 10)
+    // and these columns make the magnet VISIBLE to the GA per bar:
+    let mut fvg_magnet_dist = vec![0.0_f64; n]; // signed ATRs to nearest unfilled gap (+above/−below)
+    let mut fvg_magnet_age = vec![0.0_f64; n]; // log-scaled age (bars) of that gap
+    let mut fvg_inside = vec![0.0_f64; n]; // +1 inside a buy gap, −1 inside a sell gap
+    let mut fvg_open_count = vec![0.0_f64; n]; // unfilled gaps (both sides) / 20
+
+    if n == 0 {
+        return build_smc_return_vec(
+            ob,
+            fvg,
+            ifvg,
+            liq_sweep,
+            pd_array,
+            macro_active,
+            displacement,
+            breaker_block,
+            mitigation_block,
+            mss,
+            volume_imbalance,
+            bos,
+            eqh,
+            eql,
+            inducement,
+            asian_range,
+            silver_bullet,
+            judas_swing,
+            nwog,
+            ndog,
+            ict_macro,
+            fvg_strength,
+            dealing_range_width,
+            swing_range_pct,
+            ob_strength,
+            trend_bias,
+            unicorn_model,
+            rejection_block,
+            propulsion_block,
+            fib_time_ratio,
+            fib_236,
+            fib_382,
+            fib_500,
+            fib_618,
+            fib_705,
+            fib_786,
+            fib_886,
+            fib_1272,
+            fib_1414,
+            fib_1618,
+            fib_2000,
+            fib_2618,
+            fvg_magnet_dist,
+            fvg_magnet_age,
+            fvg_inside,
+            fvg_open_count,
+        );
+    }
+
+    // IPDA Configuration
+    const IPDA_LOOKBACK: usize = 40; // 40 period dealing range
+    const SWING_FRACTAL: usize = 5; // 5-bar swing high/low required for old highs
+    const DISPLACEMENT_LOOKBACK: usize = 20;
+    const DISPLACEMENT_MULT: f64 = 1.8;
+
+    // Active IPDA memory for IFVG computations
+    let mut active_buy_fvgs: Vec<(f64, f64, usize)> = Vec::new(); // (top, bottom, birth bar)
+    let mut active_sell_fvgs: Vec<(f64, f64, usize)> = Vec::new(); // (top, bottom, birth bar)
+    let mut swing_highs: Vec<f64> = Vec::new();
+    let mut swing_lows: Vec<f64> = Vec::new();
+
+    // For MSS tracking
+    let mut latest_bull_sweep_idx = 0;
+    let mut latest_bear_sweep_idx = 0;
+    let mut active_sell_ob: Vec<(usize, f64, f64)> = Vec::new(); // idx, top, bot
+    let mut active_buy_ob: Vec<(usize, f64, f64)> = Vec::new(); // idx, top, bot
+
+    // For BOS tracking
+    let mut last_confirmed_high = f64::NEG_INFINITY;
+    let mut last_confirmed_low = f64::INFINITY;
+
+    // For Asian Range
+    let mut asian_high = f64::NEG_INFINITY;
+    let mut asian_low = f64::INFINITY;
+    let mut asian_range_set = false;
+
+    // For NWOG/NDOG
+    let mut prev_day_close = f64::NAN;
+    let mut prev_week_close = f64::NAN;
+    let mut last_day: i64 = -1;
+    let mut last_week: i64 = -1;
+
+    // Running ATR for normalization
+    let mut atr_sum = 0.0_f64;
+    let mut atr_count = 0_usize;
+
+    // Consolidation tracking for propulsion blocks
+    let mut consol_count = 0_usize;
+    let mut _consol_range_avg = 0.0_f64;
+
+    for i in 0..n {
+        let open = ohlcv.open[i];
+        let high = ohlcv.high[i];
+        let low = ohlcv.low[i];
+        let close = ohlcv.close[i];
+        let ts = ohlcv.timestamp.as_ref().map(|t| t[i]);
+
+        // Running ATR
+        if i > 0 {
+            let tr = (high - low)
+                .max((high - ohlcv.close[i - 1]).abs())
+                .max((low - ohlcv.close[i - 1]).abs());
+            atr_sum += tr;
+            atr_count += 1;
+        }
+        let running_atr = if atr_count > 0 {
+            atr_sum / atr_count as f64
+        } else {
+            (high - low).max(1e-10)
+        };
+
+        // 1. Killzones (Macro Time Delivery Algorithm)
+        // London Killzone 07:00-11:00 UTC, NY Killzone 13:00-17:00 UTC
+        macro_active[i] = 1.0;
+        if let Some(t_ms) = ts
+            && let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(t_ms)
+        {
+            let hour = dt.hour();
+            let minute = dt.minute();
+            if (7..11).contains(&hour) || (13..17).contains(&hour) {
+                macro_active[i] = 1.0;
+            } else {
+                macro_active[i] = 0.0;
+            }
+
+            // ICT Macro Time Windows (precise 15-90min windows of institutional activity)
+            // 9:50-10:10 UTC, 10:50-11:10, 13:10-13:40, 14:50-15:10, 15:15-15:45
+            let hm = hour * 60 + minute;
+            if (590..=610).contains(&hm)
+                || (650..=670).contains(&hm)
+                || (790..=820).contains(&hm)
+                || (890..=910).contains(&hm)
+                || (915..=945).contains(&hm)
+            {
+                ict_macro[i] = 1.0;
+            }
+
+            // Silver Bullet Windows: 10:00-11:00 UTC (London), 14:00-15:00 UTC (NY AM), 18:00-19:00 UTC (NY PM)
+            if (hour == 10) || (hour == 14) || (hour == 18) {
+                silver_bullet[i] = 1.0;
+            }
+
+            // Asian Range: 00:00-08:00 UTC (track high/low for the session)
+            if hour < 8 {
+                if high > asian_high {
+                    asian_high = high;
+                }
+                if low < asian_low {
+                    asian_low = low;
+                }
+                asian_range_set = true;
+            } else if hour == 8 && minute == 0 {
+                // Reset at end of Asian session
+                asian_range_set = true;
+            }
+
+            // Asian Range Position (where is price relative to the Asian range?)
+            if asian_range_set && asian_high > asian_low {
+                let ar = asian_high - asian_low;
+                asian_range[i] = (close - asian_low) / ar; // 0=at low, 1=at high, <0 or >1 = outside
+            }
+
+            // Reset Asian range at midnight UTC
+            if hour == 0 && minute == 0 {
+                asian_high = f64::NEG_INFINITY;
+                asian_low = f64::INFINITY;
+                asian_range_set = false;
+            }
+
+            // NWOG/NDOG: New Day/Week Opening Gaps
+            let day_key = dt.ordinal() as i64 + dt.year() as i64 * 400;
+            let week_key = dt.iso_week().week() as i64 + dt.year() as i64 * 60;
+
+            if day_key != last_day {
+                if prev_day_close.is_finite() {
+                    // Gap between previous day close and current open
+                    let gap = open - prev_day_close;
+                    ndog[i] = gap / running_atr.max(1e-10);
+                }
+                prev_day_close = if i > 0 { ohlcv.close[i - 1] } else { close };
+                last_day = day_key;
+            }
+
+            if week_key != last_week {
+                if prev_week_close.is_finite() {
+                    let gap = open - prev_week_close;
+                    nwog[i] = gap / running_atr.max(1e-10);
+                }
+                prev_week_close = if i > 0 { ohlcv.close[i - 1] } else { close };
+                last_week = week_key;
+            }
+
+            // Judas Swing: Fake move in first 30 minutes of London/NY session
+            if (hour == 7 || hour == 13) && minute < 30 && i >= 1 {
+                let prev_c = ohlcv.close[i - 1];
+                // If price moves strongly one way then reverses
+                if (high - prev_c).abs() > running_atr * 0.5 && close < prev_c {
+                    judas_swing[i] = -1.0; // Bearish Judas (faked up)
+                } else if (prev_c - low).abs() > running_atr * 0.5 && close > prev_c {
+                    judas_swing[i] = 1.0; // Bullish Judas (faked down)
+                }
+            }
+        }
+
+        // Volume Imbalance (Gap between bodies but wicks overlap)
+        if i >= 1 {
+            let prev_open = ohlcv.open[i - 1];
+            let prev_close = ohlcv.close[i - 1];
+            let prev_body_top = prev_open.max(prev_close);
+            let prev_body_bot = prev_open.min(prev_close);
+            let curr_body_top = open.max(close);
+            let curr_body_bot = open.min(close);
+
+            // Bullish Volume Imbalance
+            if curr_body_bot > prev_body_top && low <= ohlcv.high[i - 1] {
+                volume_imbalance[i] = 1.0;
+            }
+            // Bearish Volume Imbalance
+            else if curr_body_top < prev_body_bot && high >= ohlcv.low[i - 1] {
+                volume_imbalance[i] = -1.0;
+            }
+        }
+
+        // Deep SMC Range Evaluation and Fibonacci Profiling
+        if i >= IPDA_LOOKBACK {
+            let mut highest = f64::NEG_INFINITY;
+            let mut lowest = f64::INFINITY;
+            for j in (i - IPDA_LOOKBACK)..i {
+                if ohlcv.high[j] > highest {
+                    highest = ohlcv.high[j];
+                }
+                if ohlcv.low[j] < lowest {
+                    lowest = ohlcv.low[j];
+                }
+            }
+
+            let equilibrium = (highest + lowest) / 2.0;
+            pd_array[i] = if close > equilibrium { 1.0 } else { -1.0 };
+
+            // Fibonacci Optimal Trade Entry (OTE) Distances + Extensions
+            let range = highest - lowest;
+            if range > 1e-9 {
+                let dist_236 = ((close - (lowest + range * 0.236)).abs() / range).min(1.0);
+                let dist_382 = ((close - (lowest + range * 0.382)).abs() / range).min(1.0);
+                let dist_500 = ((close - equilibrium).abs() / range).min(1.0);
+                let dist_618 = ((close - (lowest + range * 0.618)).abs() / range).min(1.0);
+                let dist_705 = ((close - (lowest + range * 0.705)).abs() / range).min(1.0);
+                let dist_786 = ((close - (lowest + range * 0.786)).abs() / range).min(1.0);
+                let dist_886 = ((close - (lowest + range * 0.886)).abs() / range).min(1.0);
+
+                // Extensions
+                let dist_1272 = ((close - (lowest + range * 1.272)).abs() / range).min(1.0);
+                let dist_1414 = ((close - (lowest + range * 1.414)).abs() / range).min(1.0);
+                let dist_1618 = ((close - (lowest + range * 1.618)).abs() / range).min(1.0);
+                let dist_2000 = ((close - (lowest + range * 2.0)).abs() / range).min(1.0);
+                let dist_2618 = ((close - (lowest + range * 2.618)).abs() / range).min(1.0);
+
+                // Convert to proximity score (peaks directly on the line)
+                fib_236[i] = (1.0 - (15.0 * dist_236)).max(0.0);
+                fib_382[i] = (1.0 - (15.0 * dist_382)).max(0.0);
+                fib_500[i] = (1.0 - (15.0 * dist_500)).max(0.0);
+                fib_618[i] = (1.0 - (15.0 * dist_618)).max(0.0);
+                fib_705[i] = (1.0 - (15.0 * dist_705)).max(0.0);
+                fib_786[i] = (1.0 - (15.0 * dist_786)).max(0.0);
+                fib_886[i] = (1.0 - (15.0 * dist_886)).max(0.0);
+                fib_1272[i] = (1.0 - (10.0 * dist_1272)).max(0.0);
+                fib_1414[i] = (1.0 - (10.0 * dist_1414)).max(0.0);
+                fib_1618[i] = (1.0 - (10.0 * dist_1618)).max(0.0);
+                fib_2000[i] = (1.0 - (5.0 * dist_2000)).max(0.0);
+                fib_2618[i] = (1.0 - (5.0 * dist_2618)).max(0.0);
+            }
+        }
+
+        // Displacement Detection (Body size relative to historical moving average)
+        if i >= DISPLACEMENT_LOOKBACK {
+            let body = (close - open).abs();
+            let mut avg_body = 0.0;
+            for j in (i - DISPLACEMENT_LOOKBACK)..i {
+                avg_body += (ohlcv.close[j] - ohlcv.open[j]).abs();
+            }
+            avg_body /= DISPLACEMENT_LOOKBACK as f64;
+            if avg_body > 1e-12 && body >= (DISPLACEMENT_MULT * avg_body) {
+                displacement[i] = if close > open { 1.0 } else { -1.0 };
+            }
+        }
+
+        // Fractal Swing High/Low Tracking (For Engineered Liquidity pools)
+        if i >= SWING_FRACTAL * 2 {
+            let center = i - SWING_FRACTAL;
+            let center_h = ohlcv.high[center];
+            let center_l = ohlcv.low[center];
+            let mut is_swing_high = true;
+            let mut is_swing_low = true;
+
+            for j in (center - SWING_FRACTAL)..=(center + SWING_FRACTAL) {
+                if j == center {
+                    continue;
+                }
+                if ohlcv.high[j] >= center_h {
+                    is_swing_high = false;
+                }
+                if ohlcv.low[j] <= center_l {
+                    is_swing_low = false;
+                }
+            }
+            if is_swing_high {
+                swing_highs.push(center_h);
+            }
+            if is_swing_low {
+                swing_lows.push(center_l);
+            }
+
+            // Keep memory vector bounded to avoid bloat (Track last 15 pools)
+            if swing_highs.len() > 15 {
+                swing_highs.remove(0);
+            }
+            if swing_lows.len() > 15 {
+                swing_lows.remove(0);
+            }
+        }
+
+        // Purge and Revert (True Liquidity Sweeps - BISI/SIBI Mitigation)
+        for &sh in &swing_highs {
+            if high > sh && close < sh {
+                liq_sweep[i] = -1.0;
+                latest_bear_sweep_idx = i;
+            }
+        }
+        for &sl in &swing_lows {
+            if low < sl && close > sl {
+                liq_sweep[i] = 1.0;
+                latest_bull_sweep_idx = i;
+            }
+        }
+
+        // Market Structure Shift (MSS) logic
+        // Displacement past opposite swing high/low AFTER a sweep
+        if displacement[i] == 1.0 && latest_bull_sweep_idx > 0 && i - latest_bull_sweep_idx <= 15 {
+            // Swept lows, now displaced up past a recent swing high?
+            if let Some(&recent_sh) = swing_highs.last()
+                && close > recent_sh
+                && ohlcv.close[i - 1] <= recent_sh
+            {
+                mss[i] = 1.0; // Bullish CHOCH
+            }
+        }
+        if displacement[i] == -1.0 && latest_bear_sweep_idx > 0 && i - latest_bear_sweep_idx <= 15 {
+            // Swept highs, now displaced down past a recent swing low?
+            if let Some(&recent_sl) = swing_lows.last()
+                && close < recent_sl
+                && ohlcv.close[i - 1] >= recent_sl
+            {
+                mss[i] = -1.0; // Bearish CHOCH
+            } // Bearish CHOCH
+        }
+
+        // Order Block / Mitigation / Breaker Block Validation
+        if i >= 3 {
+            let was_bull_sweep =
+                liq_sweep[i - 1] == 1.0 || liq_sweep[i - 2] == 1.0 || liq_sweep[i - 3] == 1.0;
+            let was_bear_sweep =
+                liq_sweep[i - 1] == -1.0 || liq_sweep[i - 2] == -1.0 || liq_sweep[i - 3] == -1.0;
+
+            let prev_open = ohlcv.open[i - 1];
+            let prev_close = ohlcv.close[i - 1];
+            let prev_high = ohlcv.high[i - 1];
+            let prev_low = ohlcv.low[i - 1];
+
+            // Institutional Bullish OB: Swept sell-side lows, displacing up past the down candle high
+            if was_bull_sweep && close > open && prev_close < prev_open && close >= prev_high {
+                ob[i] = 1.0;
+                active_buy_ob.push((i, prev_high, prev_low));
+            }
+            // Institutional Bearish OB: Swept buy-side highs, displacing down past the up candle low
+            if was_bear_sweep && close < open && prev_close > prev_open && close <= prev_low {
+                ob[i] = -1.0;
+                active_sell_ob.push((i, prev_high, prev_low));
+            }
+
+            // Mitigation block: Same profile as OB but failed to sweep liquidity first
+            if !was_bull_sweep
+                && close > open
+                && prev_close < prev_open
+                && close >= prev_high
+                && displacement[i] == 1.0
+            {
+                mitigation_block[i] = 1.0;
+            }
+            if !was_bear_sweep
+                && close < open
+                && prev_close > prev_open
+                && close <= prev_low
+                && displacement[i] == -1.0
+            {
+                mitigation_block[i] = -1.0;
+            }
+        }
+
+        // Breaker Block: Failed Order Block
+        // Active Sell OB gets broken strongly up -> Becomes Bullish Breaker
+        active_sell_ob.retain(|&(idx, top, _bot)| {
+            if i - idx < 50 && displacement[i] == 1.0 && close > top {
+                breaker_block[i] = 1.0; // Bullish Breaker Signal
+                false // Re-evaluated
+            } else {
+                i - idx < 50
+            }
+        });
+
+        // Active Buy OB gets broken strongly down -> Becomes Bearish Breaker
+        active_buy_ob.retain(|&(idx, _top, bot)| {
+            if i - idx < 50 && displacement[i] == -1.0 && close < bot {
+                breaker_block[i] = -1.0; // Bearish Breaker Signal
+                false // Re-evaluated
+            } else {
+                i - idx < 50
+            }
+        });
+
+        // Standard FVG Generation
+        if i >= 2 {
+            let bot_fvg_sell = ohlcv.high[i];
+            let top_fvg_sell = ohlcv.low[i - 2];
+            // Bearish FVG: Low of candle 1 is higher than High of candle 3
+            if bot_fvg_sell < top_fvg_sell {
+                fvg[i] = -1.0;
+                active_sell_fvgs.push((top_fvg_sell, bot_fvg_sell, i));
+            }
+
+            let top_fvg_buy = ohlcv.low[i];
+            let bot_fvg_buy = ohlcv.high[i - 2];
+            // Bullish FVG: High of candle 1 is lower than Low of candle 3
+            if top_fvg_buy > bot_fvg_buy {
+                fvg[i] = 1.0;
+                active_buy_fvgs.push((top_fvg_buy, bot_fvg_buy, i));
+            }
+        }
+
+        // Inversion FVG (IFVG) Detection
+        // Retain active selling gaps; if price CLOSES above gap top, it's an IFVG flip to bullish
+        active_sell_fvgs.retain(|&(top, _bot, _born)| {
+            if close > top {
+                ifvg[i] = 1.0;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Retain active buying gaps; if price CLOSES below gap bottom, it's an IFVG flip to bearish
+        active_buy_fvgs.retain(|&(_top, bot, _born)| {
+            if close < bot {
+                ifvg[i] = -1.0;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Long-memory registries (operator 2026-07-02): old UNFILLED gaps are
+        // the ones price returns to days later — the previous cap of 10 evicted
+        // exactly those magnets on dense TFs (M5: 10 gaps ≈ hours of memory).
+        if active_buy_fvgs.len() > 64 {
+            active_buy_fvgs.remove(0);
+        }
+        if active_sell_fvgs.len() > 64 {
+            active_sell_fvgs.remove(0);
+        }
+
+        // FVG MAGNET columns — make the pull of the nearest unfilled gap
+        // visible to the GA: signed distance in ATRs (+ = gap above price),
+        // log-scaled age of that gap, inside-a-gap flag, and open-gap count.
+        {
+            let mut best_dist_atr = f64::INFINITY;
+            let mut best_signed = 0.0_f64;
+            let mut best_age = 0.0_f64;
+            let atr = running_atr.max(1e-10);
+            for &(top, bot, born) in active_buy_fvgs.iter().chain(active_sell_fvgs.iter()) {
+                let mid = (top + bot) / 2.0;
+                let signed = (mid - close) / atr;
+                let dist = signed.abs();
+                if dist < best_dist_atr {
+                    best_dist_atr = dist;
+                    best_signed = signed.clamp(-10.0, 10.0);
+                    best_age = smc_log1p_exact_v1((i - born) as u64) / 9.21; // ~ln(10k) → [0,1]
+                }
+            }
+            // Inside-gap flags, signed by gap side.
+            if active_buy_fvgs
+                .iter()
+                .any(|&(top, bot, _)| close <= top && close >= bot)
+            {
+                fvg_inside[i] = 1.0;
+            } else if active_sell_fvgs
+                .iter()
+                .any(|&(top, bot, _)| close <= top && close >= bot)
+            {
+                fvg_inside[i] = -1.0;
+            }
+            if best_dist_atr.is_finite() {
+                fvg_magnet_dist[i] = best_signed;
+                fvg_magnet_age[i] = best_age.clamp(0.0, 1.0);
+            }
+            fvg_open_count[i] = (active_buy_fvgs.len() + active_sell_fvgs.len()) as f64 / 20.0;
+        }
+
+        // FVG Strength: Gap size as a fraction of ATR (normalized significance)
+        if fvg[i] != 0.0 && i >= 2 {
+            let gap_size = if fvg[i] > 0.0 {
+                ohlcv.low[i] - ohlcv.high[i - 2]
+            } else {
+                ohlcv.low[i - 2] - ohlcv.high[i]
+            }
+            .abs();
+            fvg_strength[i] = gap_size / running_atr.max(1e-10);
+        }
+
+        // BOS: Break of Structure (simpler than MSS, no sweep required)
+        //
+        // **2026-05-25 unwrap audit**: the `!is_empty()` guard makes
+        // `last().unwrap()` logically safe, but per the no-panic
+        // doctrine we pattern-match instead. Same downstream behaviour.
+        if let Some(&recent_high) = swing_highs.last() {
+            if close > recent_high && recent_high > last_confirmed_high {
+                bos[i] = 1.0;
+                last_confirmed_high = recent_high;
+            }
+        }
+        if let Some(&recent_low) = swing_lows.last() {
+            if close < recent_low && recent_low < last_confirmed_low {
+                bos[i] = -1.0;
+                last_confirmed_low = recent_low;
+            }
+        }
+
+        // EQH/EQL: Equal Highs/Lows (engineered liquidity pools)
+        // Two swing highs within 0.05% of each other = liquidity magnet
+        if swing_highs.len() >= 2 {
+            let h1 = swing_highs[swing_highs.len() - 1];
+            let h2 = swing_highs[swing_highs.len() - 2];
+            if h1 > 0.0 && ((h1 - h2).abs() / h1) < 0.0005 {
+                eqh[i] = 1.0;
+            }
+        }
+        if swing_lows.len() >= 2 {
+            let l1 = swing_lows[swing_lows.len() - 1];
+            let l2 = swing_lows[swing_lows.len() - 2];
+            if l1 > 0.0 && ((l1 - l2).abs() / l1) < 0.0005 {
+                eql[i] = 1.0;
+            }
+        }
+
+        // Inducement: Minor swing broken without displacement (bait before real move)
+        if i >= 3 {
+            if swing_highs.len() >= 2 {
+                let minor_high = swing_highs[swing_highs.len() - 1];
+                if high > minor_high && displacement[i] == 0.0 {
+                    inducement[i] = 1.0;
+                }
+            }
+            if swing_lows.len() >= 2 {
+                let minor_low = swing_lows[swing_lows.len() - 1];
+                if low < minor_low && displacement[i] == 0.0 {
+                    inducement[i] = -1.0;
+                }
+            }
+        }
+
+        // OB Strength: Body-to-range ratio of the OB candle
+        if ob[i] != 0.0 && i >= 1 {
+            let prev_range = ohlcv.high[i - 1] - ohlcv.low[i - 1];
+            let prev_body = (ohlcv.close[i - 1] - ohlcv.open[i - 1]).abs();
+            ob_strength[i] = if prev_range > 1e-10 {
+                prev_body / prev_range
+            } else {
+                0.0
+            };
+        }
+
+        // Rejection Block: Long wick with small body (> 60% wick of total range)
+        let total_range = high - low;
+        if total_range > 1e-10 {
+            let body = (close - open).abs();
+            let wick_ratio = 1.0 - (body / total_range);
+            if wick_ratio > 0.6 {
+                let upper_wick = high - close.max(open);
+                let lower_wick = close.min(open) - low;
+                if upper_wick > lower_wick {
+                    rejection_block[i] = -1.0; // Bearish rejection (long upper wick)
+                } else {
+                    rejection_block[i] = 1.0; // Bullish rejection (long lower wick)
+                }
+            }
+        }
+
+        // Dealing Range Width (as % of price for cross-pair normalization)
+        if i >= IPDA_LOOKBACK {
+            let mut highest = f64::NEG_INFINITY;
+            let mut lowest = f64::INFINITY;
+            for j in (i - IPDA_LOOKBACK)..i {
+                if ohlcv.high[j] > highest {
+                    highest = ohlcv.high[j];
+                }
+                if ohlcv.low[j] < lowest {
+                    lowest = ohlcv.low[j];
+                }
+            }
+            dealing_range_width[i] = if close > 1e-10 {
+                (highest - lowest) / close
+            } else {
+                0.0
+            };
+        }
+
+        // Swing Range %
+        //
+        // **2026-05-25 unwrap audit**: pattern-match instead of guarded
+        // `.last().unwrap()`. The `if let Some(...) = a.zip(b)` idiom
+        // collapses the two `last()` calls into one pattern so we don't
+        // duplicate the emptiness check.
+        if let (Some(&sh), Some(&sl)) = (swing_highs.last(), swing_lows.last()) {
+            swing_range_pct[i] = if close > 1e-10 {
+                (sh - sl).abs() / close
+            } else {
+                0.0
+            };
+        }
+
+        // Propulsion Block: Strong displacement following consolidation (4+ bars narrow range)
+        let bar_range = (high - low) / running_atr.max(1e-10);
+        if bar_range < 0.5 {
+            consol_count += 1;
+            _consol_range_avg += bar_range;
+        } else {
+            if consol_count >= 4 && displacement[i] != 0.0 {
+                propulsion_block[i] = displacement[i]; // Same direction as displacement
+            }
+            consol_count = 0;
+            _consol_range_avg = 0.0;
+        }
+
+        // Trend Bias: Simple multi-period EMA alignment proxy (using closing price only)
+        // Fast vs slow moving average via exponential smoothing
+        if i >= 50 {
+            let fast_period = 8;
+            let slow_period = 50;
+            let mut fast_sum = 0.0;
+            let mut slow_sum = 0.0;
+            for j in (i - fast_period)..=i {
+                fast_sum += ohlcv.close[j];
+            }
+            for j in (i - slow_period)..=i {
+                slow_sum += ohlcv.close[j];
+            }
+            let fast_ma = fast_sum / (fast_period + 1) as f64;
+            let slow_ma = slow_sum / (slow_period + 1) as f64;
+            trend_bias[i] = (fast_ma - slow_ma) / running_atr.max(1e-10);
+        }
+
+        // Unicorn Model: Confluence of Breaker + FVG + OB within last 5 bars
+        if i >= 5 {
+            let has_breaker = (i.saturating_sub(5)..=i).any(|j| breaker_block[j] != 0.0);
+            let has_fvg = (i.saturating_sub(5)..=i).any(|j| fvg[j] != 0.0);
+            let has_ob = (i.saturating_sub(5)..=i).any(|j| ob[j] != 0.0);
+            if has_breaker && has_fvg && has_ob {
+                unicorn_model[i] = if close > open { 1.0 } else { -1.0 };
+            }
+        }
+
+        // Fibonacci Time Ratio: Distance from swing points in bars as Fib ratios
+        // How many bars since last swing high/low, normalized by Fib numbers
+        if i >= SWING_FRACTAL * 2 {
+            // Use distance to pattern Fibonacci time clusters (8, 13, 21, 34, 55)
+            let fib_times = [8, 13, 21, 34, 55];
+            let bars_since_event = if liq_sweep[i] != 0.0 || mss[i] != 0.0 || displacement[i] != 0.0
+            {
+                0
+            } else {
+                // Look back to find last significant event
+                let mut dist = 0_usize;
+                for j in (0..i).rev() {
+                    dist += 1;
+                    if liq_sweep[j] != 0.0 || mss[j] != 0.0 || displacement[j] != 0.0 {
+                        break;
+                    }
+                    if dist > 60 {
+                        break;
+                    }
+                }
+                dist
+            };
+            // Score peaks when bars_since_event matches a Fibonacci time number
+            for &ft in &fib_times {
+                if bars_since_event == ft {
+                    fib_time_ratio[i] = 1.0;
+                    break;
+                } else if (bars_since_event as i64 - ft as i64).unsigned_abs() <= 1 {
+                    fib_time_ratio[i] = 0.5;
+                }
+            }
+        }
+    }
+
+    build_smc_return_vec(
+        ob,
+        fvg,
+        ifvg,
+        liq_sweep,
+        pd_array,
+        macro_active,
+        displacement,
+        breaker_block,
+        mitigation_block,
+        mss,
+        volume_imbalance,
+        bos,
+        eqh,
+        eql,
+        inducement,
+        asian_range,
+        silver_bullet,
+        judas_swing,
+        nwog,
+        ndog,
+        ict_macro,
+        fvg_strength,
+        dealing_range_width,
+        swing_range_pct,
+        ob_strength,
+        trend_bias,
+        unicorn_model,
+        rejection_block,
+        propulsion_block,
+        fib_time_ratio,
+        fib_236,
+        fib_382,
+        fib_500,
+        fib_618,
+        fib_705,
+        fib_786,
+        fib_886,
+        fib_1272,
+        fib_1414,
+        fib_1618,
+        fib_2000,
+        fib_2618,
+        fvg_magnet_dist,
+        fvg_magnet_age,
+        fvg_inside,
+        fvg_open_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_smc_return_vec(
+    ob: Vec<f64>,
+    fvg: Vec<f64>,
+    ifvg: Vec<f64>,
+    liq_sweep: Vec<f64>,
+    pd_array: Vec<f64>,
+    macro_active: Vec<f64>,
+    displacement: Vec<f64>,
+    breaker_block: Vec<f64>,
+    mitigation_block: Vec<f64>,
+    mss: Vec<f64>,
+    volume_imbalance: Vec<f64>,
+    bos: Vec<f64>,
+    eqh: Vec<f64>,
+    eql: Vec<f64>,
+    inducement: Vec<f64>,
+    asian_range: Vec<f64>,
+    silver_bullet: Vec<f64>,
+    judas_swing: Vec<f64>,
+    nwog: Vec<f64>,
+    ndog: Vec<f64>,
+    ict_macro: Vec<f64>,
+    fvg_strength: Vec<f64>,
+    dealing_range_width: Vec<f64>,
+    swing_range_pct: Vec<f64>,
+    ob_strength: Vec<f64>,
+    trend_bias: Vec<f64>,
+    unicorn_model: Vec<f64>,
+    rejection_block: Vec<f64>,
+    propulsion_block: Vec<f64>,
+    fib_time_ratio: Vec<f64>,
+    fib_236: Vec<f64>,
+    fib_382: Vec<f64>,
+    fib_500: Vec<f64>,
+    fib_618: Vec<f64>,
+    fib_705: Vec<f64>,
+    fib_786: Vec<f64>,
+    fib_886: Vec<f64>,
+    fib_1272: Vec<f64>,
+    fib_1414: Vec<f64>,
+    fib_1618: Vec<f64>,
+    fib_2000: Vec<f64>,
+    fib_2618: Vec<f64>,
+    fvg_magnet_dist: Vec<f64>,
+    fvg_magnet_age: Vec<f64>,
+    fvg_inside: Vec<f64>,
+    fvg_open_count: Vec<f64>,
+) -> Vec<(String, Vec<f64>)> {
+    vec![
+        ("smc_ob".to_string(), ob),
+        ("smc_fvg".to_string(), fvg),
+        ("smc_ifvg".to_string(), ifvg),
+        ("smc_liq_sweep".to_string(), liq_sweep),
+        ("smc_pd_array".to_string(), pd_array),
+        ("smc_killzone".to_string(), macro_active),
+        ("smc_displacement".to_string(), displacement),
+        ("smc_breaker_block".to_string(), breaker_block),
+        ("smc_mitigation_block".to_string(), mitigation_block),
+        ("smc_mss".to_string(), mss),
+        ("smc_volume_imbalance".to_string(), volume_imbalance),
+        ("smc_bos".to_string(), bos),
+        ("smc_eqh".to_string(), eqh),
+        ("smc_eql".to_string(), eql),
+        ("smc_inducement".to_string(), inducement),
+        ("smc_asian_range".to_string(), asian_range),
+        ("smc_silver_bullet".to_string(), silver_bullet),
+        ("smc_judas_swing".to_string(), judas_swing),
+        ("smc_nwog".to_string(), nwog),
+        ("smc_ndog".to_string(), ndog),
+        ("smc_ict_macro".to_string(), ict_macro),
+        ("smc_fvg_strength".to_string(), fvg_strength),
+        ("smc_dealing_range_width".to_string(), dealing_range_width),
+        ("smc_swing_range_pct".to_string(), swing_range_pct),
+        ("smc_ob_strength".to_string(), ob_strength),
+        ("smc_trend_bias".to_string(), trend_bias),
+        ("smc_unicorn_model".to_string(), unicorn_model),
+        ("smc_rejection_block".to_string(), rejection_block),
+        ("smc_propulsion_block".to_string(), propulsion_block),
+        ("smc_fib_time_ratio".to_string(), fib_time_ratio),
+        ("smc_fib_236".to_string(), fib_236),
+        ("smc_fib_382".to_string(), fib_382),
+        ("smc_fib_500".to_string(), fib_500),
+        ("smc_fib_618".to_string(), fib_618),
+        ("smc_fib_705".to_string(), fib_705),
+        ("smc_fib_786".to_string(), fib_786),
+        ("smc_fib_886".to_string(), fib_886),
+        ("smc_fib_1272".to_string(), fib_1272),
+        ("smc_fib_1414".to_string(), fib_1414),
+        ("smc_fib_1618".to_string(), fib_1618),
+        ("smc_fib_2000".to_string(), fib_2000),
+        ("smc_fib_2618".to_string(), fib_2618),
+        // FVG magnet columns (2026-07-02) — appended at the END of the family
+        // so every pre-existing name keeps its relative position.
+        ("smc_fvg_magnet_dist".to_string(), fvg_magnet_dist),
+        ("smc_fvg_magnet_age".to_string(), fvg_magnet_age),
+        ("smc_fvg_inside".to_string(), fvg_inside),
+        ("smc_fvg_open_count".to_string(), fvg_open_count),
+    ]
+}
+
+fn smc_validity_mut<'a>(
+    validity_by_name: &'a mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+) -> Result<&'a mut Vec<FeatureCellValidity>> {
+    validity_by_name
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("missing SMC validity plan for `{name}`"))
+}
+
+fn smc_mark_after_warmup(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    warmup: usize,
+) -> Result<()> {
+    let validity = smc_validity_mut(validity_by_name, name)?;
+    validity.fill(FeatureCellValidity::Valid);
+    let warmup = warmup.min(validity.len());
+    validity[..warmup].fill(FeatureCellValidity::Warmup);
+    Ok(())
+}
+
+fn smc_mark_all(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    reason: FeatureCellValidity,
+) -> Result<()> {
+    smc_validity_mut(validity_by_name, name)?.fill(reason);
+    Ok(())
+}
+
+fn smc_values<'a>(legacy: &'a [(String, Vec<f64>)], name: &str) -> Result<&'a [f64]> {
+    legacy
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, values)| values.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("missing SMC values for `{name}`"))
+}
+
+/// Explicit-validity f64 SMC lane used by the atomic Tasks 5B-9 migration.
+///
+/// Sparse event flags keep a valid numeric zero once their required history
+/// exists. Calendar/session outputs require canonical millisecond timestamps;
+/// magnitudes such as FVG distance/age and OB strength remain invalid until
+/// the referenced structure actually exists. This prevents `0.0` from
+/// simultaneously meaning false, warmup, absent structure, and division by
+/// zero.
+pub fn compute_smc_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    const EPS: f64 = 1e-12;
+    const IPDA_LOOKBACK: usize = 40;
+    const SWING_FRACTAL: usize = 5;
+    const DISPLACEMENT_LOOKBACK: usize = 20;
+
+    let n = ohlcv.len();
+    ensure!(n > 0, "SMC features require at least one OHLC row");
+    ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "SMC OHLC lengths do not match close length {n}"
+    );
+    for row in 0..n {
+        let open = ohlcv.open[row];
+        let high = ohlcv.high[row];
+        let low = ohlcv.low[row];
+        let close = ohlcv.close[row];
+        ensure!(
+            open.is_finite() && high.is_finite() && low.is_finite() && close.is_finite(),
+            "SMC OHLC row {row} contains a non-finite price"
+        );
+        ensure!(
+            open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0,
+            "SMC OHLC row {row} contains a non-positive price"
+        );
+        ensure!(
+            low <= open.min(close) && high >= open.max(close),
+            "SMC OHLC row {row} violates low <= open/close <= high"
+        );
+    }
+    if let Some(volume) = ohlcv.volume.as_deref() {
+        ensure!(
+            volume.len() == n,
+            "SMC volume length {} does not match OHLC length {n}",
+            volume.len()
+        );
+        if let Some((row, value)) = volume
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("SMC volume row {row} is invalid: {value}");
+        }
+    }
+
+    let timestamps = if let Some(timestamps) = ohlcv.timestamp.as_deref() {
+        ensure!(
+            timestamps.len() == n,
+            "SMC timestamp length {} does not match OHLC length {n}",
+            timestamps.len()
+        );
+        validate_canonical_millisecond_timestamps(timestamps)?;
+        Some(timestamps)
+    } else {
+        None
+    };
+
+    let legacy = compute_smc_feature_columns(ohlcv);
+    let mut validity_by_name: HashMap<String, Vec<FeatureCellValidity>> = legacy
+        .iter()
+        .map(|(name, _)| (name.clone(), vec![FeatureCellValidity::ComputeFailure; n]))
+        .collect();
+
+    let mut running_atr = vec![0.0; n];
+    let mut atr_sum = 0.0;
+    let mut atr_count = 0_usize;
+    for row in 0..n {
+        if row > 0 {
+            let true_range = (ohlcv.high[row] - ohlcv.low[row])
+                .max((ohlcv.high[row] - ohlcv.close[row - 1]).abs())
+                .max((ohlcv.low[row] - ohlcv.close[row - 1]).abs());
+            atr_sum += true_range;
+            atr_count += 1;
+        }
+        running_atr[row] = if atr_count > 0 {
+            atr_sum / atr_count as f64
+        } else {
+            ohlcv.high[row] - ohlcv.low[row]
+        };
+    }
+
+    for (name, warmup) in [
+        ("smc_ob", DISPLACEMENT_LOOKBACK),
+        ("smc_fvg", 2),
+        ("smc_ifvg", 2),
+        ("smc_liq_sweep", SWING_FRACTAL * 2),
+        ("smc_breaker_block", DISPLACEMENT_LOOKBACK),
+        ("smc_mitigation_block", DISPLACEMENT_LOOKBACK),
+        ("smc_mss", DISPLACEMENT_LOOKBACK),
+        ("smc_volume_imbalance", 1),
+        ("smc_bos", SWING_FRACTAL * 2),
+        ("smc_eqh", SWING_FRACTAL * 2),
+        ("smc_eql", SWING_FRACTAL * 2),
+        ("smc_inducement", SWING_FRACTAL * 2),
+        ("smc_unicorn_model", 5),
+        ("smc_fib_time_ratio", SWING_FRACTAL * 2),
+        ("smc_fvg_inside", 2),
+        ("smc_fvg_open_count", 0),
+    ] {
+        smc_mark_after_warmup(&mut validity_by_name, name, warmup)?;
+    }
+
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_displacement",
+        DISPLACEMENT_LOOKBACK,
+    )?;
+    for row in DISPLACEMENT_LOOKBACK..n {
+        let average_body: f64 = ((row - DISPLACEMENT_LOOKBACK)..row)
+            .map(|index| (ohlcv.close[index] - ohlcv.open[index]).abs())
+            .sum::<f64>()
+            / DISPLACEMENT_LOOKBACK as f64;
+        if average_body <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_displacement")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_pd_array", IPDA_LOOKBACK)?;
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_dealing_range_width",
+        IPDA_LOOKBACK,
+    )?;
+    let fibonacci_names = [
+        "smc_fib_236",
+        "smc_fib_382",
+        "smc_fib_500",
+        "smc_fib_618",
+        "smc_fib_705",
+        "smc_fib_786",
+        "smc_fib_886",
+        "smc_fib_1272",
+        "smc_fib_1414",
+        "smc_fib_1618",
+        "smc_fib_2000",
+        "smc_fib_2618",
+    ];
+    for name in fibonacci_names {
+        smc_mark_after_warmup(&mut validity_by_name, name, IPDA_LOOKBACK)?;
+    }
+    for row in IPDA_LOOKBACK..n {
+        let highest = ohlcv.high[(row - IPDA_LOOKBACK)..row]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lowest = ohlcv.low[(row - IPDA_LOOKBACK)..row]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        if highest - lowest <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_pd_array")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+            for name in fibonacci_names {
+                smc_validity_mut(&mut validity_by_name, name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_fvg_strength", 2)?;
+    let fvg_values = smc_values(&legacy, "smc_fvg")?;
+    for row in 2..n {
+        if fvg_values[row] != 0.0 && running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_strength")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_rejection_block", 0)?;
+    for row in 0..n {
+        if ohlcv.high[row] - ohlcv.low[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_rejection_block")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_trend_bias", 50)?;
+    for row in 50..n {
+        if running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_trend_bias")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_propulsion_block",
+        DISPLACEMENT_LOOKBACK,
+    )?;
+    for row in DISPLACEMENT_LOOKBACK..n {
+        if running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_propulsion_block")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_ob_strength",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let ob_values = smc_values(&legacy, "smc_ob")?;
+    for row in 1..n {
+        if ob_values[row] != 0.0 {
+            smc_validity_mut(&mut validity_by_name, "smc_ob_strength")?[row] =
+                if ohlcv.high[row - 1] - ohlcv.low[row - 1] > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                };
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_swing_range_pct",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let swing_validity = smc_validity_mut(&mut validity_by_name, "smc_swing_range_pct")?;
+    swing_validity[..(SWING_FRACTAL * 2).min(n)].fill(FeatureCellValidity::Warmup);
+    let mut has_swing_high = false;
+    let mut has_swing_low = false;
+    for row in (SWING_FRACTAL * 2)..n {
+        let center = row - SWING_FRACTAL;
+        let center_high = ohlcv.high[center];
+        let center_low = ohlcv.low[center];
+        let mut is_high = true;
+        let mut is_low = true;
+        for index in (center - SWING_FRACTAL)..=(center + SWING_FRACTAL) {
+            if index == center {
+                continue;
+            }
+            if ohlcv.high[index] >= center_high {
+                is_high = false;
+            }
+            if ohlcv.low[index] <= center_low {
+                is_low = false;
+            }
+        }
+        has_swing_high |= is_high;
+        has_swing_low |= is_low;
+        if has_swing_high && has_swing_low {
+            swing_validity[row] = FeatureCellValidity::Valid;
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_fvg_magnet_dist",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_fvg_magnet_age",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let open_count = smc_values(&legacy, "smc_fvg_open_count")?;
+    for row in 0..n {
+        if open_count[row] > 0.0 {
+            let reason = if running_atr[row] > EPS {
+                FeatureCellValidity::Valid
+            } else {
+                FeatureCellValidity::ZeroDenominator
+            };
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_magnet_dist")?[row] = reason;
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_magnet_age")?[row] = reason;
+        }
+    }
+
+    let calendar_names = [
+        "smc_killzone",
+        "smc_asian_range",
+        "smc_silver_bullet",
+        "smc_judas_swing",
+        "smc_nwog",
+        "smc_ndog",
+        "smc_ict_macro",
+    ];
+    if let Some(timestamps) = timestamps {
+        for name in calendar_names {
+            smc_mark_after_warmup(&mut validity_by_name, name, 0)?;
+        }
+        smc_validity_mut(&mut validity_by_name, "smc_judas_swing")?[0] =
+            FeatureCellValidity::Warmup;
+        smc_validity_mut(&mut validity_by_name, "smc_nwog")?[0] = FeatureCellValidity::Warmup;
+        smc_validity_mut(&mut validity_by_name, "smc_ndog")?[0] = FeatureCellValidity::Warmup;
+
+        let mut asian_high = f64::NEG_INFINITY;
+        let mut asian_low = f64::INFINITY;
+        let mut asian_set = false;
+        let mut last_day = None;
+        let mut last_week = None;
+        for row in 0..n {
+            let date = Utc
+                .timestamp_millis_opt(timestamps[row])
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("SMC timestamp row {row} is not a UTC instant"))?;
+            let hour = date.hour();
+            let minute = date.minute();
+            if hour < 8 {
+                asian_high = asian_high.max(ohlcv.high[row]);
+                asian_low = asian_low.min(ohlcv.low[row]);
+                asian_set = true;
+            } else if hour == 8 && minute == 0 {
+                asian_set = true;
+            }
+            smc_validity_mut(&mut validity_by_name, "smc_asian_range")?[row] = if !asian_set {
+                FeatureCellValidity::Warmup
+            } else if asian_high - asian_low > EPS {
+                FeatureCellValidity::Valid
+            } else {
+                FeatureCellValidity::ZeroDenominator
+            };
+            if hour == 0 && minute == 0 {
+                asian_high = f64::NEG_INFINITY;
+                asian_low = f64::INFINITY;
+                asian_set = false;
+            }
+
+            let day = (date.year(), date.ordinal());
+            let week = (date.year(), date.iso_week().week());
+            if last_day.is_some_and(|previous| previous != day) && running_atr[row] <= EPS {
+                smc_validity_mut(&mut validity_by_name, "smc_ndog")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+            if last_week.is_some_and(|previous| previous != week) && running_atr[row] <= EPS {
+                smc_validity_mut(&mut validity_by_name, "smc_nwog")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+            last_day = Some(day);
+            last_week = Some(week);
+        }
+    } else {
+        for name in calendar_names {
+            smc_mark_all(
+                &mut validity_by_name,
+                name,
+                FeatureCellValidity::MissingInput,
+            )?;
+        }
+    }
+
+    if let Some((name, row)) = validity_by_name.iter().find_map(|(name, validity)| {
+        validity
+            .iter()
+            .position(|reason| *reason == FeatureCellValidity::ComputeFailure)
+            .map(|row| (name.clone(), row))
+    }) {
+        anyhow::bail!("unclassified SMC validity for `{name}` row {row}");
+    }
+
+    legacy
+        .into_iter()
+        .map(|(name, values)| {
+            let validity = validity_by_name
+                .remove(&name)
+                .ok_or_else(|| anyhow::anyhow!("missing SMC validity for `{name}`"))?;
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
+}

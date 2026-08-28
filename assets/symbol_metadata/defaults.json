@@ -1,0 +1,30 @@
+{
+  "entries": {
+    "EURUSD": {"symbol":"EURUSD","base":"EUR","quote":"USD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.10},
+    "GBPUSD": {"symbol":"GBPUSD","base":"GBP","quote":"USD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.27},
+    "AUDUSD": {"symbol":"AUDUSD","base":"AUD","quote":"USD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":0.66},
+    "NZDUSD": {"symbol":"NZDUSD","base":"NZD","quote":"USD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":0.60},
+    "USDCAD": {"symbol":"USDCAD","base":"USD","quote":"CAD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.36},
+    "USDCHF": {"symbol":"USDCHF","base":"USD","quote":"CHF","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":0.90},
+    "USDJPY": {"symbol":"USDJPY","base":"USD","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":150.0},
+    "EURJPY": {"symbol":"EURJPY","base":"EUR","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":165.0},
+    "GBPJPY": {"symbol":"GBPJPY","base":"GBP","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":190.0},
+    "AUDJPY": {"symbol":"AUDJPY","base":"AUD","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":99.0},
+    "NZDJPY": {"symbol":"NZDJPY","base":"NZD","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":90.0},
+    "CADJPY": {"symbol":"CADJPY","base":"CAD","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":110.0},
+    "CHFJPY": {"symbol":"CHFJPY","base":"CHF","quote":"JPY","pip_size":0.01,"contract_size":100000.0,"pip_value_quote":1000.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":167.0},
+    "EURGBP": {"symbol":"EURGBP","base":"EUR","quote":"GBP","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":0.86},
+    "EURAUD": {"symbol":"EURAUD","base":"EUR","quote":"AUD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.66},
+    "EURNZD": {"symbol":"EURNZD","base":"EUR","quote":"NZD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.83},
+    "EURCHF": {"symbol":"EURCHF","base":"EUR","quote":"CHF","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":0.99},
+    "EURCAD": {"symbol":"EURCAD","base":"EUR","quote":"CAD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.50},
+    "GBPAUD": {"symbol":"GBPAUD","base":"GBP","quote":"AUD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.93},
+    "GBPNZD": {"symbol":"GBPNZD","base":"GBP","quote":"NZD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":2.12},
+    "GBPCHF": {"symbol":"GBPCHF","base":"GBP","quote":"CHF","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.15},
+    "GBPCAD": {"symbol":"GBPCAD","base":"GBP","quote":"CAD","pip_size":0.0001,"contract_size":100000.0,"pip_value_quote":10.0,"digits":5,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":1.74},
+    "XAUUSD": {"symbol":"XAUUSD","base":"XAU","quote":"USD","pip_size":0.01,"contract_size":100.0,"pip_value_quote":1.0,"digits":2,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":2400.0},
+    "XAGUSD": {"symbol":"XAGUSD","base":"XAG","quote":"USD","pip_size":0.001,"contract_size":5000.0,"pip_value_quote":5.0,"digits":3,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":28.0},
+    "BTCUSD": {"symbol":"BTCUSD","base":"BTC","quote":"USD","pip_size":1.0,"contract_size":1.0,"pip_value_quote":1.0,"digits":1,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":70000.0},
+    "ETHUSD": {"symbol":"ETHUSD","base":"ETH","quote":"USD","pip_size":0.1,"contract_size":1.0,"pip_value_quote":0.1,"digits":2,"min_lot":0.01,"max_lot":100.0,"lot_step":0.01,"typical_price":3500.0}
+  }
+}

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chocolatey package manifest for neoethos.
+  Spec: https://docs.chocolatey.org/en-us/create/create-packages
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>neoethos</id>
+    <version>0.4.20</version>
+    <packageSourceUrl>https://github.com/kosred/neoethos/tree/main/packaging/chocolatey/neoethos</packageSourceUrl>
+    <owners>kosred</owners>
+    <title>neoethos</title>
+    <authors>neoethos contributors</authors>
+    <projectUrl>https://github.com/kosred/neoethos</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/kosred/neoethos/main/packaging/appimage/neoethos-app.AppDir/neoethos-app.png</iconUrl>
+    <copyright>Copyright 2024-2026 neoethos contributors</copyright>
+    <licenseUrl>https://github.com/kosred/neoethos/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/kosred/neoethos</projectSourceUrl>
+    <docsUrl>https://github.com/kosred/neoethos#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/kosred/neoethos/issues</bugTrackerUrl>
+    <tags>forex trading quant ctrader rust neoethos</tags>
+    <summary>Quantitative trading workspace for the cTrader Open API.</summary>
+    <description>
+neoethos is a quantitative trading workspace targeting the cTrader Open API.
+It includes data ingestion, ML-driven strategy search, paper / live trading
+orchestration, and a risk-aware execution gate.
+    </description>
+    <releaseNotes>https://github.com/kosred/neoethos/releases/tag/v0.4.20</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

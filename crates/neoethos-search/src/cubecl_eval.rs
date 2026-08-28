@@ -1,0 +1,5201 @@
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
+use anyhow::{Context, Result, bail};
+#[cfg(feature = "gpu-cuda")]
+use cubecl::cuda::{CudaDevice, CudaRuntime};
+use cubecl::prelude::*;
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl_common::stream_id::StreamId;
+use ndarray::ArrayView2;
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
+
+use crate::eval::{BacktestSettings, SmcRow, completed_month_return_sharpe_v1};
+use crate::gpu_native::prototype_a::{
+    PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeAScenarioUpload,
+};
+
+const SMC_WIDTH: usize = 11;
+const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
+// FTMO prop-firm observables emitted per gene by `backtest_population_kernel`
+// into the `ftmo_out` array, so the host can apply FTMO rules on the GPU result
+// instead of re-running a CPU `simulate_trades_core` + `compute_prop_firm_risk_summary`.
+// Layout per gene (matches validation.rs::compute_prop_firm_risk_summary):
+//   [0] net_return_pct          = net_profit / initial_equity
+//   [1] max_daily_loss_pct      = max_day(|day_pnl| if day_pnl<0) / initial_equity
+//   [2] max_overall_drawdown_pct = peak-to-trough DD of the END-OF-DAY equity curve
+//   [3] largest_profit_share    = largest_positive_day / sum_of_positive_days (0 if none)
+//   [4] max_trades_per_day      = max day trade count (as f64)
+//   [5] trading_days            = count of days with >=1 trade (as f64)
+const FTMO_WIDTH: usize = 6;
+
+#[cfg(feature = "gpu-cuda")]
+type ActiveCubeClRuntime = CudaRuntime;
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+type ActiveCubeClRuntime = WgpuRuntime;
+
+struct CubeClResidencyState {
+    active: usize,
+    clients: HashMap<(StreamId, usize), ComputeClient<ActiveCubeClRuntime>>,
+}
+
+fn active_residency_scopes() -> &'static Mutex<CubeClResidencyState> {
+    static STATE: OnceLock<Mutex<CubeClResidencyState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(CubeClResidencyState {
+            active: 0,
+            clients: HashMap::new(),
+        })
+    })
+}
+
+/// Keeps immutable CubeCL inputs resident for one complete discovery run.
+///
+/// Direct population entrypoints also take a nested scope, so standalone calls
+/// synchronously release their device and pinned-host pools on every return.
+/// An outer discovery scope keeps the cache hot across GA, validation and
+/// quality-screen calls, then the final [`Drop`] performs the release even on
+/// error or unwind.
+pub(crate) struct CubeClResidencyScope {
+    _private: (),
+}
+
+pub(crate) fn cubecl_residency_scope() -> CubeClResidencyScope {
+    let mut state = active_residency_scopes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.active = state
+        .active
+        .checked_add(1)
+        .expect("CubeCL residency scope count overflowed");
+    CubeClResidencyScope { _private: () }
+}
+
+fn record_cubecl_device(device_key: usize, client: &ComputeClient<ActiveCubeClRuntime>) {
+    let stream = StreamId::current();
+    let mut cleanup_client = client.clone();
+    // SAFETY: this clone is retained exclusively for final cleanup of the exact
+    // stream that created the allocations. No kernel work is submitted through
+    // it before the last residency scope has exited.
+    unsafe { cleanup_client.set_stream(stream) };
+
+    let mut state = active_residency_scopes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.active > 0 {
+        state
+            .clients
+            .entry((stream, device_key))
+            .or_insert(cleanup_client);
+    }
+}
+
+fn release_cubecl_devices(
+    clients: impl IntoIterator<Item = ComputeClient<ActiveCubeClRuntime>>,
+) -> Result<()> {
+    for client in clients {
+        cubecl::future::block_on(client.sync()).map_err(|error| {
+            anyhow::anyhow!("CubeCL pre-cleanup synchronization failed: {error:?}")
+        })?;
+        client.memory_cleanup();
+        cubecl::future::block_on(client.sync()).map_err(|error| {
+            anyhow::anyhow!("CubeCL pool cleanup synchronization failed: {error:?}")
+        })?;
+    }
+    Ok(())
+}
+
+impl Drop for CubeClResidencyScope {
+    fn drop(&mut self) {
+        let clients = {
+            let mut state = active_residency_scopes()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(state.active > 0, "CubeCL residency scope underflow");
+            state.active -= 1;
+            if state.active != 0 {
+                return;
+            }
+            state
+                .clients
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>()
+        };
+
+        resident_device_cache::clear();
+        if let Err(error) = release_cubecl_devices(clients) {
+            if std::thread::panicking() {
+                eprintln!("CubeCL cleanup also failed during unwind: {error:#}");
+            } else {
+                panic!("CubeCL cleanup failed: {error:#}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn cubecl_daily_drawdown_from_extrema(day_peak: f64, day_low: f64) -> f64 {
+    if day_peak > 0.0 {
+        (day_peak - day_low) / day_peak
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+fn cubecl_daily_drawdown_after_peak_transition(
+    max_daily_dd: f64,
+    day_peak: f64,
+    day_low: f64,
+    new_peak: f64,
+    new_low: f64,
+) -> f64 {
+    max_daily_dd
+        .max(cubecl_daily_drawdown_from_extrema(day_peak, day_low))
+        .max(cubecl_daily_drawdown_from_extrema(new_peak, new_low))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CubeClTransferTelemetry {
+    pub gpu_calls: u64,
+    pub resident_cache_hits: u64,
+    pub resident_cache_misses: u64,
+    pub resident_upload_bytes: u64,
+    pub streamed_dataset_upload_bytes: u64,
+    pub gene_uploads: u64,
+    pub gene_upload_bytes: u64,
+    pub full_readbacks: u64,
+    pub full_readback_bytes: u64,
+    pub compact_readbacks: u64,
+    pub compact_readback_bytes: u64,
+    pub chained_reuploads: u64,
+    pub synchronization_events: u64,
+}
+
+mod transfer_telemetry {
+    use super::CubeClTransferTelemetry;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static GPU_CALLS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static RESIDENT_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static STREAMED_DATASET_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+    static GENE_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static FULL_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACKS: AtomicU64 = AtomicU64::new(0);
+    static COMPACT_READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CHAINED_REUPLOADS: AtomicU64 = AtomicU64::new(0);
+    static SYNCHRONIZATION_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn reset() {
+        ENABLED.store(true, Ordering::Relaxed);
+        clear();
+    }
+
+    pub(super) fn disable() {
+        ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    fn clear() {
+        for counter in [
+            &GPU_CALLS,
+            &RESIDENT_CACHE_HITS,
+            &RESIDENT_CACHE_MISSES,
+            &RESIDENT_UPLOAD_BYTES,
+            &STREAMED_DATASET_UPLOAD_BYTES,
+            &GENE_UPLOADS,
+            &GENE_UPLOAD_BYTES,
+            &FULL_READBACKS,
+            &FULL_READBACK_BYTES,
+            &COMPACT_READBACKS,
+            &COMPACT_READBACK_BYTES,
+            &CHAINED_REUPLOADS,
+            &SYNCHRONIZATION_EVENTS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn snapshot() -> CubeClTransferTelemetry {
+        CubeClTransferTelemetry {
+            gpu_calls: GPU_CALLS.load(Ordering::Relaxed),
+            resident_cache_hits: RESIDENT_CACHE_HITS.load(Ordering::Relaxed),
+            resident_cache_misses: RESIDENT_CACHE_MISSES.load(Ordering::Relaxed),
+            resident_upload_bytes: RESIDENT_UPLOAD_BYTES.load(Ordering::Relaxed),
+            streamed_dataset_upload_bytes: STREAMED_DATASET_UPLOAD_BYTES.load(Ordering::Relaxed),
+            gene_uploads: GENE_UPLOADS.load(Ordering::Relaxed),
+            gene_upload_bytes: GENE_UPLOAD_BYTES.load(Ordering::Relaxed),
+            full_readbacks: FULL_READBACKS.load(Ordering::Relaxed),
+            full_readback_bytes: FULL_READBACK_BYTES.load(Ordering::Relaxed),
+            compact_readbacks: COMPACT_READBACKS.load(Ordering::Relaxed),
+            compact_readback_bytes: COMPACT_READBACK_BYTES.load(Ordering::Relaxed),
+            chained_reuploads: CHAINED_REUPLOADS.load(Ordering::Relaxed),
+            synchronization_events: SYNCHRONIZATION_EVENTS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn record_call() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        GPU_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_streamed_dataset_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        STREAMED_DATASET_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_gene_upload(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        GENE_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        GENE_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_hit() {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        RESIDENT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_resident_miss(bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        RESIDENT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        RESIDENT_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_readback(use_fused: bool, compact_bytes: usize, dense_bytes: usize) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        COMPACT_READBACKS.fetch_add(1, Ordering::Relaxed);
+        COMPACT_READBACK_BYTES.fetch_add(compact_bytes as u64, Ordering::Relaxed);
+        SYNCHRONIZATION_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if !use_fused && dense_bytes > 0 {
+            FULL_READBACKS.fetch_add(1, Ordering::Relaxed);
+            FULL_READBACK_BYTES.fetch_add(dense_bytes as u64, Ordering::Relaxed);
+            CHAINED_REUPLOADS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn reset_cubecl_transfer_telemetry() {
+    transfer_telemetry::reset();
+}
+
+pub(crate) fn disable_cubecl_transfer_telemetry() {
+    transfer_telemetry::disable();
+}
+
+pub(crate) fn cubecl_transfer_telemetry_snapshot() -> CubeClTransferTelemetry {
+    transfer_telemetry::snapshot()
+}
+
+// ─── CUDA lane knobs — RETIRED 2026-08-10 ───────────────────────────
+//
+// This registry no longer reads the environment at all: `CudaEnvKnobs
+// ::typed_defaults()` returns the values the lane always had with nothing
+// exported. The struct and its name are kept because `execution_profile.rs`
+// records them into the run profile, and because the profile must go on
+// reporting what the lane used.
+//
+// The history below is left because it names the six variables, which is what
+// a reader looking for a deleted knob will search for.
+//
+// **2026-05-25**: the 7 inline `std::env::var(...)` reads previously
+// scattered across `cuda_eval_signal_kernel_enabled`,
+// `cuda_eval_backtest_kernel_enabled`, `signal_kernel_units`,
+// `backtest_kernel_units`, and `cuda_device_id` now route through this
+// typed registry. Same canonical pattern as
+// `crates/neoethos-app/src/app_services/env_overrides.rs` and
+// `crates/neoethos-search/src/genetic/runtime_overrides.rs`.
+//
+// The `CudaEnvKnobs` struct is built once on first access via
+// `cuda_env_knobs()` (lazy OnceLock) so the env-var reads happen at
+// most once per process. Mirrors the audit-baseline `HardwareRuntimeOverrides`
+// shape.
+//
+// Knobs covered (env-var name → typed field):
+// - `NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL` → `eval_kernel_enabled: bool`
+// - `NEOETHOS_BOT_SEARCH_BACKTEST_CUDA_KERNEL` → `backtest_kernel_enabled: bool`
+// - `NEOETHOS_BOT_SEARCH_EVAL_KERNEL_UNITS` → `eval_kernel_units_override: Option<u32>`
+// - `NEOETHOS_BOT_SEARCH_BACKTEST_KERNEL_UNITS` → `backtest_kernel_units_override: Option<u32>`
+// - `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE` → `cuda_device_id: usize`
+//
+// Vulkan note: the wgpu-vulkan backend is wired via feature
+// aggregation (`vulkan` cargo feature). It doesn't read any of these
+// env vars — the cubecl runtime selects Vulkan at compile time when
+// the `vulkan` feature is on. No env-knob registry needed for Vulkan
+// today; if one becomes necessary it'd live in a sibling
+// `wgpu_eval.rs` file with the same typed-registry pattern.
+
+#[derive(Debug, Clone, Copy)]
+struct CudaEnvKnobs {
+    eval_kernel_enabled: bool,
+    backtest_kernel_enabled: bool,
+    eval_kernel_units_override: Option<u32>,
+    backtest_kernel_units_override: Option<u32>,
+    // Read only by the `gpu-cuda` device selector; unused on the wgpu/Vulkan
+    // path (which uses `WgpuDevice::DefaultDevice`).
+    #[allow(dead_code)]
+    cuda_device_id: usize,
+}
+
+impl CudaEnvKnobs {
+    /// The typed lane settings. 2026-08-10: every field used to come from an
+    /// env var; each is now the value the lane always had when nothing was
+    /// exported, so an unset shell and a set shell finally produce the same
+    /// run.
+    ///
+    /// WHAT THIS REFUSES that it previously permitted: turning a kernel off,
+    /// hand-picking launch units, pinning a CUDA ordinal, and changing the
+    /// precision of the CubeCL lane — all by exporting a variable nothing recorded. The
+    /// device ordinal survives as the explicit `device_override` argument the
+    /// multi-GPU scheduler passes per lane, which is the supported path. Search
+    /// arithmetic is now unconditionally f64, so there is no precision selector.
+    const fn typed_defaults() -> Self {
+        Self {
+            eval_kernel_enabled: true,
+            backtest_kernel_enabled: true,
+            eval_kernel_units_override: None,
+            backtest_kernel_units_override: None,
+            cuda_device_id: 0,
+        }
+    }
+}
+
+static CUDA_ENV_KNOBS: OnceLock<CudaEnvKnobs> = OnceLock::new();
+
+fn cuda_env_knobs() -> CudaEnvKnobs {
+    *CUDA_ENV_KNOBS.get_or_init(CudaEnvKnobs::typed_defaults)
+}
+
+// ─── GPU per-call timing instrumentation (NEOETHOS_GPU_TIMING) ───────
+//
+// 2026-06-10: the hybrid splitter measured the A6000 at ~74 genes/s vs the CPU
+// lane's ~77 000 genes/s — a ~1000× gap that is per-LAUNCH overhead, NOT inherent
+// GPU slowness (the kernel itself is correct + parity-proven). To SEE where the
+// milliseconds go inside one `try_evaluate_population_cuda` call, set
+// `NEOETHOS_GPU_TIMING=1` and this module emits a `tracing::info!` breakdown:
+// n_genes, n_samples, total elapsed, and the split between client-get, host
+// data-prep, device UPLOAD (`create_from_slice` / `empty`), KERNEL launch, and
+// READBACK (`read_one_unchecked`).
+//
+// PARITY: this module is a pure side-effect. It only accumulates `Duration`s into
+// a thread-local; it never touches a kernel input, an output buffer, or a launch
+// dimension. When `NEOETHOS_GPU_TIMING` is unset, the cached `enabled()` flag is
+// `false` and every phase closure runs the wrapped work WITHOUT even reading the
+// clock, so the production path is byte-identical and ~free.
+mod gpu_timing {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    /// Cached once: is the per-call GPU timing breakdown wanted?
+    ///
+    /// 2026-08-10: was `env::var("NEOETHOS_GPU_TIMING").is_ok()`. A diagnostic
+    /// that only prints is not a knob that deserves its own environment
+    /// variable — it is a log level. It now follows the process log filter,
+    /// which IS config (`log.level`), so turning it on is the same gesture as
+    /// turning any other diagnostic on and nothing has to be remembered.
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(
+            || tracing::enabled!(target: "neoethos_search::gpu_timing", tracing::Level::DEBUG),
+        )
+    }
+
+    /// The phases a population eval splits into. `upload` / `kernel` / `readback`
+    /// accumulate across EVERY gene-chunk + gene-batch inside the call (the inner
+    /// `launch_signal_kernel` / `launch_backtest_kernel` add into the live frame).
+    #[derive(Default, Clone, Copy)]
+    pub struct Phases {
+        pub client_get: Duration,
+        pub host_prep: Duration,
+        pub upload: Duration,
+        pub kernel: Duration,
+        pub readback: Duration,
+    }
+
+    thread_local! {
+        /// The live accumulation frame for the current `try_evaluate_population_cuda`
+        /// call on this thread. `None` outside a measured call (also the always-state
+        /// when timing is disabled, so the inner adders are no-ops).
+        static FRAME: RefCell<Option<Phases>> = const { RefCell::new(None) };
+    }
+
+    /// Begin a measurement frame for the current call. No-op when timing is off.
+    pub fn begin() {
+        if !enabled() {
+            return;
+        }
+        FRAME.with(|f| *f.borrow_mut() = Some(Phases::default()));
+    }
+
+    /// End the frame and return the accumulated phases (the residual top-level time
+    /// the caller can attribute to "other"). `None` when timing is off.
+    pub fn end() -> Option<Phases> {
+        if !enabled() {
+            return None;
+        }
+        FRAME.with(|f| f.borrow_mut().take())
+    }
+
+    /// Add `d` to one phase of the live frame. Cheap no-op when no frame is active.
+    fn add(select: impl Fn(&mut Phases) -> &mut Duration, d: Duration) {
+        FRAME.with(|f| {
+            if let Some(frame) = f.borrow_mut().as_mut() {
+                *select(frame) += d;
+            }
+        });
+    }
+
+    /// Run `body`, attributing its elapsed time to the UPLOAD phase. When timing is
+    /// off, runs `body` WITHOUT reading the clock (the closure is fully inlined and
+    /// the result is byte-identical).
+    pub fn upload<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.upload, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the KERNEL phase.
+    pub fn kernel<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.kernel, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the READBACK phase.
+    pub fn readback<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.readback, body)
+    }
+
+    /// Run `body`, attributing its elapsed time to the CLIENT-GET phase.
+    pub fn client_get<T>(body: impl FnOnce() -> T) -> T {
+        time(|p| &mut p.client_get, body)
+    }
+
+    /// Directly fold an already-measured `Duration` into the HOST-PREP phase. Used
+    /// for the constant per-sample conversions, which are measured with a plain
+    /// `Instant` window at the call site rather than a closure. No-op when off.
+    pub fn add_host_prep(d: Duration) {
+        if !enabled() {
+            return;
+        }
+        add(|p| &mut p.host_prep, d);
+    }
+
+    /// Common timing core. The `enabled()` branch is the only check on the hot path
+    /// when timing is off — no `Instant::now()`, no thread-local borrow.
+    fn time<T>(select: impl Fn(&mut Phases) -> &mut Duration, body: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return body();
+        }
+        let start = Instant::now();
+        let out = body();
+        add(select, start.elapsed());
+        out
+    }
+}
+
+// ─── Device-resident buffer cache (the per-launch-overhead fix) ─────────────
+//
+// 2026-07-02 (operator: "why does the GPU keep losing to the CPU?"): the
+// hybrid splitter measured an A6000 at ~74 genes/s vs ~77k genes/s on CPU —
+// a ~1000× gap that is per-LAUNCH overhead, dominated by re-UPLOADING the
+// same per-unit-CONSTANT arrays (the indicator matrix, SMC rows, price/time
+// series) over PCIe on EVERY generation. Those arrays never change within a
+// discovery unit.
+//
+// This cache keeps such buffers RESIDENT on the device across launches, keyed
+// by (runtime, device, slot, full-content SHA-256, len). A hit clones the
+// Arc-backed `Handle` (no copy); a miss uploads and replaces. Correctness
+// does not depend on pointer identity or sampled bytes: every input byte is
+// covered by the digest, so changes between the retired sampling probes cannot
+// alias a stale buffer. NEVER-OOM: total resident bytes are capped at half the
+// installed VRAM budget; oldest entries evict first (dropping a Handle releases
+// the allocation back to cubecl's pool).
+mod resident_device_cache {
+    use sha2::{Digest, Sha256};
+    use std::any::TypeId;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+
+    type Key = (TypeId, usize, u8, [u8; 32], usize);
+
+    struct State {
+        map: HashMap<Key, (usize, cubecl::server::Handle)>,
+        order: VecDeque<Key>,
+        total_bytes: usize,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static S: OnceLock<Mutex<State>> = OnceLock::new();
+        S.get_or_init(|| {
+            Mutex::new(State {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                total_bytes: 0,
+            })
+        })
+    }
+
+    pub(super) fn clear() {
+        let mut state = state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.map.clear();
+        state.order.clear();
+        state.total_bytes = 0;
+    }
+
+    /// Stable full-content identity. Hashing is O(n), like an upload, while a
+    /// cache hit still avoids the much costlier host-to-device transfer.
+    fn content_digest(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn budget_bytes() -> usize {
+        let mb = super::installed_memory_budgets()
+            .map(|b| b.vram_budget_mb / 2)
+            .unwrap_or(1024);
+        (mb as usize).saturating_mul(1024 * 1024)
+    }
+
+    /// Return a device handle for `bytes`, reusing a resident upload when the
+    /// content matches. Slots are namespaces (indicators, smc, close, …) so
+    /// unrelated arrays never contend on one entry.
+    pub(super) fn get_or_upload<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        device: usize,
+        slot: u8,
+        bytes: &[u8],
+    ) -> cubecl::server::Handle {
+        let key: Key = (
+            TypeId::of::<R>(),
+            device,
+            slot,
+            content_digest(bytes),
+            bytes.len(),
+        );
+        {
+            let Ok(mut st) = state().lock() else {
+                super::transfer_telemetry::record_resident_miss(bytes.len());
+                return client.create_from_slice(bytes);
+            };
+            if let Some((_, handle)) = st.map.get(&key) {
+                super::transfer_telemetry::record_resident_hit();
+                return handle.clone();
+            }
+            // Evict oldest until the NEW entry fits the budget.
+            let budget = budget_bytes();
+            while st.total_bytes.saturating_add(bytes.len()) > budget {
+                let Some(old) = st.order.pop_front() else {
+                    break;
+                };
+                if let Some((sz, _)) = st.map.remove(&old) {
+                    st.total_bytes = st.total_bytes.saturating_sub(sz);
+                }
+            }
+        }
+        // Upload OUTSIDE the lock (can take milliseconds for GB-scale buffers).
+        let handle = client.create_from_slice(bytes);
+        super::transfer_telemetry::record_resident_miss(bytes.len());
+        if let Ok(mut st) = state().lock() {
+            st.map.insert(key, (bytes.len(), handle.clone()));
+            st.order.push_back(key);
+            st.total_bytes = st.total_bytes.saturating_add(bytes.len());
+        }
+        handle
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::content_digest;
+
+        #[test]
+        fn resident_cache_identity_covers_every_input_byte() {
+            let baseline = vec![0_u8; 32 * 1024];
+            let mut changed_between_legacy_probes = baseline.clone();
+            changed_between_legacy_probes[12_345] = 1;
+
+            assert_ne!(
+                content_digest(&baseline),
+                content_digest(&changed_between_legacy_probes),
+                "a same-length buffer change outside the retired sampling probes must miss the cache"
+            );
+        }
+    }
+
+    pub(super) const SLOT_INDICATORS: u8 = 0;
+    pub(super) const SLOT_SMC_DATA: u8 = 1;
+    pub(super) const SLOT_CLOSE: u8 = 2;
+    pub(super) const SLOT_HIGH: u8 = 3;
+    pub(super) const SLOT_LOW: u8 = 4;
+    pub(super) const SLOT_TS_DELTAS: u8 = 5;
+    pub(super) const SLOT_MONTH_IDX: u8 = 6;
+    pub(super) const SLOT_DAY_IDX: u8 = 7;
+}
+
+// The six `read_*_from_env` helpers that used to live here were DELETED
+// 2026-08-10 with the rest of the env layer. What each of them decided, and
+// what decides it now, is the `RETIRED_ENV_VARS` table in `execution_profile
+// .rs` — including the loud startup report when one is still exported.
+
+/// Create a `ComputeClient` for the active GPU runtime. The concrete runtime is
+/// chosen at COMPILE time by the GPU feature flag — CUDA under `gpu-cuda`,
+/// wgpu/Vulkan under `gpu-vulkan` — so every downstream kernel launch stays
+/// generic over `R: Runtime` and runs unchanged on whichever backend was built.
+/// (When both features are on, CUDA wins.)
+///
+/// 🔴 `gpu-rocm` DOES NOT COMPILE, and this function is why.
+///
+/// There are exactly two definitions below: `#[cfg(feature = "gpu-cuda")]` and
+/// `#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]`. The string
+/// `feature = "gpu-rocm"` appears NOWHERE in neoethos-search/src. But
+/// Cargo.toml defines `gpu-rocm = ["gpu", "cubecl/hip", ...]`, which enables
+/// neither of those two, so every call site here fails to resolve:
+///
+///     error[E0432]: unresolved import `crate::cubecl_eval::create_gpu_client`
+///     error[E0425]: cannot find function `create_gpu_client` in this scope   (×4)
+///     error[E0425]: cannot find type `PrototypeAActiveRuntime` in this scope
+///     error[E0425]: cannot find function `active_backend_id` in this scope
+///
+/// 8 errors, measured 2026-08-03 with `cargo check -p neoethos-search
+/// --features gpu-rocm`. CI runs this lane at ci.yml:205 and :210, so it has
+/// been red. Bare `gpu` fails the same way with 7 — that one is by design, as
+/// `gpu` binds no runtime.
+///
+/// CORRECTION TO THE RECORD: commit 4e6f0aad is titled "the Vulkan and ROCm
+/// builds did not compile" and fixed only Vulkan. Its own verification never
+/// ran gpu-rocm — the claim outran the evidence, which is the failure mode this
+/// branch has spent two days correcting in other people's work.
+///
+/// THE FIX, when someone has an AMD card to test on: add a third arm returning
+/// `ComputeClient<HipRuntime>` (cubecl-hip), mirroring the Vulkan arm, plus
+/// `PrototypeAActiveRuntime` and `active_backend_id` for it. Deliberately not
+/// written blind here: an untested HIP arm would turn a loud compile error into
+/// a runtime one on hardware nobody in this project owns, which is strictly
+/// worse than a build that refuses.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<CudaRuntime>> {
+    let device_id = device_override.unwrap_or_else(cuda_device_id);
+    // Device enumeration goes through our own C ABI rather than `tch`: the only
+    // thing that was ever needed from libtorch here is a device count, and
+    // dragging a multi-gigabyte install onto every CUDA machine to obtain it is
+    // not a trade worth making.
+    let device_count = neoethos_gpu_cuda::device_count();
+    if device_count <= device_id {
+        bail!(
+            "GPU evaluator requested CUDA device {} but only {} CUDA devices are available",
+            device_id,
+            device_count
+        );
+    }
+    let device = CudaDevice::new(device_id);
+    let client = CudaRuntime::client(&device);
+    record_cubecl_device(device_id, &client);
+    // AREA 1 (2026-06-09): probe the device's REAL per-buffer cap (VRAM/4 on CUDA)
+    // and install it ONCE. CUDA canNOT inject a `MemoryConfiguration` (CudaServer
+    // hardcodes its pool), so unlike the wgpu branch we do NOT call `init_setup`;
+    // the existing reactive `trim_gpu_pool_if_over_budget` bounds the pool. We only
+    // raise the per-buffer cap so heavy TFs stop being windowed to 120MB.
+    install_gpu_buffer_cap(probe_gpu_buffer_cap_bytes(&client));
+    Ok(client)
+}
+
+/// wgpu/Vulkan twin of the `gpu-cuda` client factory above. Uses cubecl's
+/// `wgpu` (naga → SPIR-V) path, NOT `wgpu-spirv`: the direct SPIR-V passthrough
+/// crashes AMD's Vulkan driver, so naga emits validated SPIR-V.
+///
+/// Device selection comes from the `device_override` the multi-GPU scheduler
+/// passes per lane. `None` ⇒ `DefaultDevice`.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE=<kind>:<n>` used to pin
+/// the adapter class here, and `parse_wgpu_device_selector` went with it. It
+/// was a second, invisible device decision sitting beside the argument the
+/// scheduler already passes — the shape that let a run use a different card
+/// from the one the log named.
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+pub(crate) fn create_gpu_client(
+    device_override: Option<usize>,
+) -> Result<ComputeClient<WgpuRuntime>> {
+    // `WgpuDevice`/`WgpuRuntime` come from the module-level import (line ~7).
+    // The pool-option structs (`MemoryPoolOptions`/`PoolType`) are used inside
+    // `bounded_wgpu_pools` below, which imports them itself.
+    use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, Vulkan, init_setup};
+
+    // Experimental multi-GPU sharding passes a discrete `device_override` per
+    // lane. The supported scheduler path uses the typed singular selector so
+    // integrated and virtual adapters are pinned to the right CubeCL variant.
+    let base_device = device_override
+        .map(WgpuDevice::DiscreteGpu)
+        .unwrap_or(WgpuDevice::DefaultDevice);
+
+    // AREA 1 (2026-06-09): initialize the wgpu server for this device EXACTLY ONCE,
+    // with the adapter's REAL limits + a BOUNDED memory pool, then reuse it.
+    //
+    // `init_setup::<Vulkan>(&base_device, opts)` builds the wgpu adapter/device with
+    // the adapter's NATIVE limits (cubecl requests `adapter.limits()` on the wgsl
+    // path, NOT the 128MB defaults) AND registers a `ComputeClient` server under
+    // `base_device` using our `opts` — see cubecl-wgpu runtime.rs:264-273. After one
+    // `init_setup`, `WgpuRuntime::client(&base_device)` (which calls
+    // `ComputeClient::load`) just looks the bounded server back up.
+    //
+    // CRITICAL — it must run AT MOST ONCE per device key: `ComputeClient::init`
+    // PANICS ("already registered server") on a duplicate, and `init_setup` reads
+    // the limits ONLY as a side effect of registering, so we cannot pre-read them to
+    // size the pool. We therefore build the bounded pool from the SAME first
+    // principles cubecl's default `SubSlices` uses (a graduated set sized off
+    // `max_page` + alignment), passing the device's real `max_storage_buffer_binding_size`
+    // as `max_page`. A single giant page would be WRONG — `SlicedPool::accept`
+    // requires a slice to fill >=80% of its page, so small buffers would be rejected
+    // → `BufferTooBig`. The graduated pools handle every buffer size; the only
+    // difference from the default is a finite `dealloc_period` so freed pages RETURN
+    // to the driver (cubecl's default is `None` = grow-only, the documented
+    // 60k-row-H1 → 15GB peak). The reactive `trim_gpu_pool_if_over_budget` stays as
+    // the backstop. The registry below guarantees the once-per-key invariant.
+    static INITIALIZED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<WgpuDevice>>,
+    > = std::sync::OnceLock::new();
+    // Key the cache on the complete class-aware selector. IntegratedGpu(0) and
+    // DiscreteGpu(0) are different CubeCL servers and must not alias.
+    let key = base_device.clone();
+
+    let initialized =
+        INITIALIZED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = initialized
+        .lock()
+        .map_err(|_| anyhow::anyhow!("wgpu device-init registry mutex poisoned"))?;
+    if seen.insert(key.clone()) {
+        // We can't read the device limits without registering, so the bounded pool
+        // is built from a CONSERVATIVE `max_page` = the cap ceiling (2GiB), which is
+        // >= the largest single buffer the windowing machinery ever builds
+        // (`gpu_buffer_elem_cap` is clamped to <=2GiB). The graduated pools cover
+        // every smaller size. wgpu's `min_uniform_buffer_offset_alignment` is 256 on
+        // every desktop adapter; use it as the alignment unit (over-aligning is
+        // harmless — it only rounds page sizes up).
+        const POOL_MAX_PAGE: u64 = GPU_BUFFER_CAP_CEIL; // 2 GiB
+        const POOL_ALIGNMENT: u64 = 256;
+        let runtime_options = RuntimeOptions {
+            tasks_max: 32,
+            memory_config: MemoryConfiguration::Custom {
+                pool_options: bounded_wgpu_pools(POOL_MAX_PAGE, POOL_ALIGNMENT),
+            },
+        };
+        // CubeCL reports missing/default or class-pinned adapters by panicking.
+        // Catch that panic while this registry guard is still live so the
+        // once-per-device key can be removed and the mutex is not poisoned for
+        // every later GPU test in the same process. Unknown panics still fail
+        // after the guard is released.
+        let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            init_setup::<Vulkan>(&base_device, runtime_options)
+        })) {
+            Ok(setup) => setup,
+            Err(payload) => {
+                seen.remove(&key);
+                let message = panic_payload_message(payload.as_ref());
+                drop(seen);
+                if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+                    bail!("wgpu adapter unavailable: {message}");
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
+        let binding_limit = setup.device.limits().max_storage_buffer_binding_size as u64;
+        let buffer_limit = setup.adapter.limits().max_buffer_size;
+        let real_cap = binding_limit.min(buffer_limit);
+        install_gpu_buffer_cap(
+            ((real_cap as f64 * 0.8) as u64).clamp(GPU_BUFFER_CAP_FLOOR, GPU_BUFFER_CAP_CEIL),
+        );
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            max_storage_buffer_binding_size = binding_limit,
+            max_buffer_size = buffer_limit,
+            "wgpu adapter limits probed at init_setup (bounded pool installed)"
+        );
+    }
+    drop(seen); // release the registry lock before building the (cheap) client
+
+    let client = WgpuRuntime::client(&base_device);
+    let device_key = device_override.map_or(0, |device| device.saturating_add(1));
+    record_cubecl_device(device_key, &client);
+    Ok(client)
+}
+
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic during wgpu adapter initialization".to_string()
+    }
+}
+
+/// Build a GRADUATED set of sliced memory pools (mirroring cubecl's default
+/// `SubSlices` construction: cubecl-runtime memory_manage.rs:202-258) but with a
+/// finite `dealloc_period` so freed pages RETURN to the driver instead of growing
+/// forever. `max_page` is the largest single buffer to accommodate; `alignment`
+/// rounds page sizes. The structure: a tiny exclusive pool for sub-alignment
+/// allocations, a descending ladder of `max_page/4, /16, /64, …` sliced pools
+/// (each `max_slice_size = page/2^i` to curb fragmentation), and a final full
+/// `max_page` pool. Every buffer size therefore lands in a right-sized pool — a
+/// single giant page would reject small allocations (`SlicedPool::accept` needs a
+/// slice to fill >=80% of its page).
+#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
+fn bounded_wgpu_pools(
+    max_page: u64,
+    alignment: u64,
+) -> Vec<cubecl_runtime::memory_management::MemoryPoolOptions> {
+    use cubecl_runtime::memory_management::{MemoryPoolOptions, PoolType};
+    const MB: u64 = 1024 * 1024;
+    // Reclaim a page after it has gone unused across ~64 parent allocations. Bounds
+    // the otherwise grow-only high-water mark while keeping enough reuse that the
+    // hot window/gene-batch loop doesn't thrash the driver allocator.
+    const DEALLOC_PERIOD: u64 = 64;
+    let alignment = alignment.max(1);
+
+    let mut pools: Vec<MemoryPoolOptions> = Vec::new();
+    // Sub-alignment allocations can't use offsets (wgpu) — give them an exclusive
+    // pool. (dealloc_period None: these are tiny + reused constantly.)
+    pools.push(MemoryPoolOptions {
+        pool_type: PoolType::ExclusivePages { max_alloc_size: 0 },
+        dealloc_period: None,
+    });
+
+    let mut current = max_page;
+    let mut max_sizes: Vec<u64> = Vec::new();
+    let mut page_sizes: Vec<u64> = Vec::new();
+    let mut base: u32 = pools.len() as u32;
+    while current >= 32 * MB {
+        current /= 4;
+        current = current.next_multiple_of(alignment);
+        max_sizes.push(current / 2u64.pow(base));
+        page_sizes.push(current);
+        base += 1;
+    }
+    max_sizes.reverse();
+    page_sizes.reverse();
+    for i in 0..max_sizes.len() {
+        pools.push(MemoryPoolOptions {
+            pool_type: PoolType::SlicedPages {
+                page_size: page_sizes[i],
+                max_slice_size: max_sizes[i].max(alignment),
+            },
+            dealloc_period: Some(DEALLOC_PERIOD),
+        });
+    }
+    // Final big pool for the largest buffers.
+    let big = (max_page / alignment) * alignment;
+    pools.push(MemoryPoolOptions {
+        pool_type: PoolType::SlicedPages {
+            page_size: big.max(alignment),
+            max_slice_size: big.max(alignment),
+        },
+        dealloc_period: Some(DEALLOC_PERIOD),
+    });
+    pools
+}
+
+#[cube(launch)]
+fn synthesize_signals_kernel<F: Float + CubeElement>(
+    indicators: &Array<F>,
+    gene_offsets: &Array<i32>,
+    gene_indices: &Array<i32>,
+    gene_weights: &Array<F>,
+    long_thr: &Array<F>,
+    short_thr: &Array<F>,
+    smc_data: &Array<i32>,
+    gene_smc_flags: &Array<i32>,
+    smc_weights: &Array<F>,
+    output: &mut Array<i32>,
+    // Phase 2 (2026-06-06): per-bar confidence of the raw threshold crossing,
+    // mirrors `synthesize_signals_and_confidence_cpu` (eval.rs:1543-1544).
+    // Confidence uses the same element type as the signal math and backtest so
+    // the canonical f64 lane never crosses a narrower storage boundary.
+    confidences_out: &mut Array<F>,
+    n_samples: u32,
+    gene_start: u32,
+    gate_threshold: F,
+) {
+    // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
+    // indexing also expects `usize`. Coerce all u32 kernel parameters
+    // to usize at the top of the kernel so the rest reads naturally.
+    //
+    // For mutable scalar accumulators (`combined`, `active_sum`,
+    // `score`, `sig`) we must use RuntimeCell because cubecl 0.9's
+    // `assign` and `assign_op` paths both reject const-initialized
+    // `let mut` bindings.
+    let pos = ABSOLUTE_POS;
+    if pos < output.len() {
+        let n_samples = n_samples as usize;
+        let gene = (pos / n_samples) + gene_start as usize;
+        let sample = pos % n_samples;
+
+        let start = gene_offsets[gene] as usize;
+        let end = gene_offsets[gene + 1] as usize;
+        let combined = RuntimeCell::<F>::new(F::new(0.0));
+        for i in start..end {
+            let idx = gene_indices[i] as usize;
+            let weight = gene_weights[i];
+            let indicator = indicators[idx * n_samples + sample];
+            combined.store(combined.read() + weight * indicator);
+        }
+
+        let lt = long_thr[gene];
+        let st = short_thr[gene];
+        let combined_val = combined.read();
+        let sig = RuntimeCell::<i32>::new(0);
+        if combined_val >= lt {
+            sig.store(1);
+        } else if combined_val <= st {
+            sig.store(-1);
+        }
+
+        let sig_val = sig.read();
+        if sig_val == 0 {
+            output[pos] = 0;
+            confidences_out[pos] = F::new(0.0);
+            terminate!();
+        }
+
+        // Confidence of the raw threshold crossing (pre-gate); computed and
+        // stored in `F` to match the CPU
+        // `synthesize_signals_and_confidence_cpu` (eval.rs:1507/1543-1544):
+        // gap = |lt - st| guarded >= 1e-6; margin = (combined-lt) long / (st-combined) short;
+        // conf = (margin/gap).clamp(0,1). Written only where the final signal survives.
+        let gap_raw = lt - st;
+        // #1375 WORKAROUND (tracel-ai/cubecl#1375): an expression-position
+        // `let x = if <runtime cond> { a } else { b }` returns the ELSE branch
+        // UNCONDITIONALLY on the wgpu/Vulkan backend (CPU & CUDA are correct).
+        //
+        // STILL OPEN as of 2026-08-02, checked live against the issue, and it is
+        // open at the version this workspace pins (Cargo.lock: cubecl 0.10.0).
+        // Do NOT delete these workarounds on the strength of the issue thread:
+        // wingertge believes PR tracel-ai/cubecl#1355 fixed it, but that PR
+        // merged 2026-05-26 and 0.10.0 shipped 2026-05-07, so the earliest
+        // release that could contain the fix is 0.11.0 (0.11.0-pre.1 is the only
+        // 0.11 on crates.io as of this writing) — and the maintainer's own words
+        // were "I'll try to reproduce", not "fixed". Remove the workarounds only
+        // after the bump to 0.11 AND a device parity run that stays green.
+        // Statement-if + RuntimeCell is correct on ALL backends, so this both
+        // preserves CPU/CUDA behaviour and FIXES the Vulkan eval — and matches the
+        // RuntimeCell idiom used throughout this kernel. gap = |lt - st|, floored 1e-6.
+        let gap_abs = RuntimeCell::<F>::new(gap_raw);
+        if gap_raw < F::new(0.0) {
+            gap_abs.store(F::new(0.0) - gap_raw);
+        }
+        let gap = RuntimeCell::<F>::new(gap_abs.read());
+        if gap_abs.read() < F::new(1e-6) {
+            gap.store(F::new(1e-6));
+        }
+        // margin: long = combined - lt, short = st - combined.
+        let margin = RuntimeCell::<F>::new(st - combined_val);
+        if sig_val == 1 {
+            margin.store(combined_val - lt);
+        }
+        let conf_f = margin.read() / gap.read();
+        // conf = conf_f.clamp(0, 1)  (statement-if else-if chain — #1375-safe).
+        let conf = RuntimeCell::<F>::new(conf_f);
+        if conf_f < F::new(0.0) {
+            conf.store(F::new(0.0));
+        } else if conf_f > F::new(1.0) {
+            conf.store(F::new(1.0));
+        }
+
+        let flag_base = gene * SMC_WIDTH;
+        let smc_base = sample * SMC_WIDTH;
+        let active_sum = RuntimeCell::<F>::new(F::new(0.0));
+        for j in 0..SMC_WIDTH {
+            if gene_smc_flags[flag_base + j] != 0 {
+                active_sum.store(active_sum.read() + smc_weights[j]);
+            }
+        }
+
+        let active_sum_val = active_sum.read();
+        if active_sum_val <= F::new(0.0) {
+            output[pos] = sig_val;
+            confidences_out[pos] = conf.read();
+            terminate!();
+        }
+
+        // #1375 workaround: gate = min(active_sum_val, gate_threshold). On Vulkan the
+        // expression form returned gate_threshold unconditionally, making the SMC
+        // gate at `score >= gate` HARDER for low-SMC-weight genes → signals wrongly
+        // suppressed vs CPU/CUDA. Statement-if restores parity.
+        let gate = RuntimeCell::<F>::new(gate_threshold);
+        if active_sum_val < gate_threshold {
+            gate.store(active_sum_val);
+        }
+        let score = RuntimeCell::<F>::new(F::new(0.0));
+        for k in 0..SMC_WIDTH {
+            if gene_smc_flags[flag_base + k] != 0 {
+                let smc_value = smc_data[smc_base + k];
+                if k == 5 {
+                    if smc_value == 1 {
+                        score.store(score.read() + smc_weights[k]);
+                    }
+                } else if smc_value == sig_val {
+                    score.store(score.read() + smc_weights[k]);
+                }
+            }
+        }
+
+        if score.read() >= gate.read() {
+            output[pos] = sig_val;
+            confidences_out[pos] = conf.read();
+        } else {
+            output[pos] = 0;
+            confidences_out[pos] = F::new(0.0);
+        }
+    }
+}
+
+// The canonical f64 backtest kernel.
+//
+// The accumulation in this kernel is where precision actually decides the
+// result: a 2026-07-27 measurement on an RTX A6000 had the old narrow lane report a
+// net profit of +3 940 against the canonical +8 506 over 200 000 real EURUSD M5
+// bars — 54 % wrong — while an f64 engine reproduced the CPU exactly. The error
+// is not drift alone; the narrow lane took 129-430 more trades, so rounding was
+// flipping stop/target comparisons and changing which trades happen at all.
+//
+// The body remains a macro over its concrete element type so its untyped
+// literals adopt f64 without rewriting every arithmetic site as `F::new(...)`.
+// It is instantiated exactly once below; there is no alternate precision lane.
+macro_rules! define_backtest_population_kernel {
+    ($name:ident, $f:ty) => {
+        #[cube(launch)]
+        fn $name(
+            close_pips: &Array<$f>,
+            high_pips: &Array<$f>,
+            low_pips: &Array<$f>,
+            signals_flat: &Array<i32>,
+            timestamp_deltas_ms: &Array<i32>,
+            month_idx: &Array<i32>,
+            day_idx: &Array<i32>,
+            sl_pips: &Array<$f>,
+            tp_pips: &Array<$f>,
+            metrics_out: &mut Array<$f>,
+            trade_counts_out: &mut Array<i32>,
+            monthly_pnls_out: &mut Array<$f>,
+            month_counts_out: &mut Array<i32>,
+            n_samples: u32,
+            gene_start: u32,
+            gene_count: u32,
+            month_capacity: u32,
+            initial_equity: $f,
+            max_hold_bars: u32,
+            min_hold_bars: u32,
+            max_trades_per_day: u32,
+            gap_threshold_ms: i32,
+            use_timestamps: i32,
+            trailing_enabled: i32,
+            trailing_atr_multiplier: $f,
+            trailing_be_trigger_r: $f,
+            trailing_min_lock_pips: $f,
+            spread_pips: $f,
+            commission_per_trade: $f,
+            pip_value_per_lot: $f,
+            // Phase C.3 (2026-05-28) — broker-supplied carry costs mirrored
+            // from the CPU `apply_carry_and_fee` helper. Sign convention
+            // matches the broker: positive = credit, negative = charge per
+            // overnight day. `pnl_conversion_fee_rate` is a fraction (0.005
+            // = 0.5%); skipped if non-finite / out-of-range so a missing-
+            // broker-data run still produces a backtest, matching the CPU
+            // kernel's fail-safe default behaviour.
+            swap_long_pips_per_day: $f,
+            swap_short_pips_per_day: $f,
+            pnl_conversion_fee_rate: $f,
+            // Phase 2 (2026-06-06): risk-based, confidence-scaled position sizing —
+            // mirrors `risk_based_pos_lots` + the pos_lots multiply sites on the CPU
+            // (eval.rs:657-685, 1049-1054, 809/865-880/979/627). `confidences_flat` is
+            // per-gene-per-bar (same layout as `signals_flat`). When `risk_based_sizing`
+            // is 0 the kernel forces pos_lots = 1.0 (legacy fixed-1-lot parity).
+            confidences_flat: &Array<$f>,
+            risk_based_sizing: i32,
+            risk_per_trade_min: $f,
+            risk_per_trade_max: $f,
+            high_quality_confidence: $f,
+            // Adaptive stops (2026-07-24): per-BAR base stop distance in pips
+            // (`base_pips`, shared across genes), per-GENE volatility multiplier
+            // (`stop_vol_mult`), and the reward:risk. When `stop_vol_mult[gene] > 0` an
+            // entry captures `sl = mult × base_pips[signal_bar]`, `tp = adaptive_rr × sl`
+            // (see the entry block) — otherwise the scalar `sl_pips`/`tp_pips` path, so a
+            // fixed-stop population is byte-identical. `base_pips` has `n_samples`
+            // elements; a fixed-only launch passes a 1-element dummy (never read).
+            base_pips: &Array<$f>,
+            stop_vol_mult: &Array<$f>,
+            adaptive_rr: $f,
+            // Per-month STARTING equity (sibling of monthly_pnls_out); the host divides
+            // monthly_pnls_out / month_start_equities_out to get monthly_target_hit_rate
+            // (metric slot 7), matching eval.rs:1110-1131.
+            month_start_equities_out: &mut Array<$f>,
+            // FTMO prop-firm observables, `n_genes * FTMO_WIDTH` laid out per gene
+            // (see `FTMO_WIDTH`). MUST be the LAST kernel parameter so `launch_backtest_kernel`
+            // appends its `ArrayArg` after all the existing args.
+            ftmo_out: &mut Array<$f>,
+        ) {
+            // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
+            // Every scalar accumulator that gets reassigned must use RuntimeCell —
+            // `let mut x = literal;` and `let mut x = param;` both produce
+            // immutable bindings in cubecl 0.9, and any later `=`/`+=` panics.
+            if ABSOLUTE_POS < gene_count as usize {
+                let local_gene = ABSOLUTE_POS;
+                let gene = local_gene + gene_start as usize;
+                let n_samples = n_samples as usize;
+                let month_capacity = month_capacity as usize;
+                let max_hold_bars = max_hold_bars as usize;
+                let min_hold_bars = min_hold_bars as usize;
+                let max_trades_per_day = max_trades_per_day as usize;
+                let signal_base = local_gene * n_samples;
+                let month_base = gene * month_capacity;
+                let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
+                let ftmo_base = gene * FTMO_WIDTH;
+
+                for zero_idx in 0..month_capacity {
+                    monthly_pnls_out[month_base + zero_idx] = 0.0;
+                    month_start_equities_out[month_base + zero_idx] = initial_equity;
+                }
+                month_counts_out[gene] = 0;
+                trade_counts_out[gene] = 0;
+                for fj in 0..FTMO_WIDTH {
+                    ftmo_out[ftmo_base + fj] = 0.0;
+                }
+
+                if n_samples == 0 {
+                    for j in 0..BACKTEST_CORE_METRIC_WIDTH {
+                        metrics_out[metric_base + j] = 0.0;
+                    }
+                    terminate!();
+                }
+
+                // Per-entry SL/TP distance in pips. For a fixed-stop gene these stay at
+                // the scalar sl_pips[gene]/tp_pips[gene] (byte-identical); for an adaptive
+                // gene (stop_vol_mult[gene] > 0) they are RE-CAPTURED at each entry from
+                // the signal-bar volatility (below), mirroring the CPU `entry_sl_tp_pips`.
+                // RuntimeCell because cubecl 0.9 forbids reassigning a `let` binding.
+                let sl_distance = RuntimeCell::<$f>::new(sl_pips[gene]);
+                let tp_distance = RuntimeCell::<$f>::new(tp_pips[gene]);
+
+                let equity = RuntimeCell::<$f>::new(initial_equity);
+                let peak_equity = RuntimeCell::<$f>::new(initial_equity);
+                let max_dd = RuntimeCell::<$f>::new(0.0);
+                let trade_count = RuntimeCell::<i32>::new(0);
+                let wins = RuntimeCell::<i32>::new(0);
+                let gross_profit = RuntimeCell::<$f>::new(0.0);
+                let gross_loss = RuntimeCell::<$f>::new(0.0);
+
+                let last_month = RuntimeCell::<i32>::new(-1);
+                let current_month_pnl = RuntimeCell::<$f>::new(0.0);
+                let month_ptr = RuntimeCell::<i32>::new(-1);
+                // Per-month starting equity (slot-7 monthly_target_hit_rate). Mirrors the
+                // CPU `current_month_start_equity` carried at each month boundary (eval.rs:732/778).
+                let current_month_start_equity = RuntimeCell::<$f>::new(initial_equity);
+                // Confidence-scaled lot size, captured ONCE at entry, held for the trade
+                // (eval.rs:1049-1054). 1.0 = legacy fixed-1-lot.
+                let pos_lots = RuntimeCell::<$f>::new(1.0);
+
+                let last_day = RuntimeCell::<i32>::new(-1);
+                let day_peak = RuntimeCell::<$f>::new(initial_equity);
+                let day_low = RuntimeCell::<$f>::new(initial_equity);
+                let max_daily_dd = RuntimeCell::<$f>::new(0.0);
+                let day_trade_count = RuntimeCell::<u32>::new(0);
+
+                // ── FTMO prop-firm observables (mirror validation.rs::compute_prop_firm_risk_summary) ──
+                // Trades bucket by integer DAY == day_idx[i] (same key the CPU derives from
+                // trade.exit_time / 86_400_000). `current_day_pnl` accumulates realized pnl of
+                // the day in progress; finalized at each day boundary and once more after the loop.
+                let current_day_pnl = RuntimeCell::<$f>::new(0.0);
+                let max_daily_loss = RuntimeCell::<$f>::new(0.0);
+                // END-OF-DAY equity curve drawdown: equity at a day boundary already equals
+                // initial + sum(all prior days' realized pnl), i.e. exactly the CPU's per-day
+                // equity point (equity += day_pnl iterated in day order). No-trade boundary days
+                // repeat the prior point → never create a new peak or a larger DD → harmless.
+                let eod_peak = RuntimeCell::<$f>::new(initial_equity);
+                let max_eod_dd = RuntimeCell::<$f>::new(0.0);
+                let positive_day_sum = RuntimeCell::<$f>::new(0.0);
+                let largest_positive_day = RuntimeCell::<$f>::new(0.0);
+                let max_trades_day = RuntimeCell::<u32>::new(0);
+                let trading_days = RuntimeCell::<i32>::new(0);
+                // FTMO trade-DAY counting must bucket by the CLOSE day (= trade.exit_time/day),
+                // because the CPU `compute_prop_firm_risk_summary` keys `day_trade_count` on
+                // `trade.exit_time/86_400_000`. The existing `day_trade_count` increments at
+                // ENTRY (it gates `max_trades_per_day` on the entry side) and would diverge for
+                // overnight holds, so we keep a SEPARATE close-bucketed counter here.
+                let current_day_closes = RuntimeCell::<u32>::new(0);
+
+                let in_pos = RuntimeCell::<i32>::new(0);
+                let entry_px = RuntimeCell::<$f>::new(0.0);
+                let entry_idx = RuntimeCell::<i32>::new(-1);
+                let trail_px = RuntimeCell::<$f>::new(0.0);
+                // Phase C.3: accumulated days in position. Resets to 0 at entry,
+                // each in-position bar adds `timestamp_deltas_ms[i] / 86_400_000`.
+                // $f precision loss on the cast is bounded by ~5 ms per bar
+                // (cast of values up to 86.4M ms into 24-bit mantissa); over
+                // a year of D1 bars this accumulates to <$0.001 of swap error
+                // at typical EURUSD pip values — negligible vs the $122/year
+                // swap charge being modelled.
+                let position_days = RuntimeCell::<$f>::new(0.0);
+
+                for i in 1..n_samples {
+                    // Phase C.3: accumulate carry duration while in position.
+                    // Runs BEFORE any exit logic so the close branches use the
+                    // total time held, INCLUDING the delta into the current bar.
+                    if in_pos.read() != 0 && use_timestamps != 0 && timestamp_deltas_ms[i] > 0 {
+                        let delta_days = timestamp_deltas_ms[i] as $f / 86_400_000.0;
+                        position_days.store(position_days.read() + delta_days);
+                    }
+
+                    let m_val = month_idx[i];
+                    let last_month_v = last_month.read();
+                    if m_val != last_month_v {
+                        if last_month_v != -1 {
+                            let next_ptr = month_ptr.read() + 1;
+                            month_ptr.store(next_ptr);
+                            if next_ptr >= 0 && next_ptr < month_capacity as i32 {
+                                monthly_pnls_out[month_base + next_ptr as usize] =
+                                    current_month_pnl.read();
+                                month_start_equities_out[month_base + next_ptr as usize] =
+                                    current_month_start_equity.read();
+                            }
+                        }
+                        current_month_pnl.store(0.0);
+                        // New month starts at the equity carried in (eval.rs:778). Runs
+                        // BEFORE this bar's exits mutate equity — preserve the ordering.
+                        current_month_start_equity.store(equity.read());
+                        last_month.store(m_val);
+                    }
+
+                    let d_val = day_idx[i];
+                    let last_day_v = last_day.read();
+                    if d_val != last_day_v {
+                        if last_day_v != -1 && day_peak.read() > 0.0 {
+                            let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                            if dd > max_daily_dd.read() {
+                                max_daily_dd.store(dd);
+                            }
+                        }
+                        // ── FTMO: finalize the PREVIOUS day before resetting day state ──
+                        // Runs AFTER the prior day's exits have already mutated `equity`
+                        // (the entry for THIS bar happens later in the loop), so `equity`
+                        // and `current_day_pnl` here hold the just-finished day's totals.
+                        if last_day_v != -1 {
+                            let dp = current_day_pnl.read();
+                            // max_daily_loss = max over days of |negative day pnl|.
+                            if dp < 0.0 {
+                                let neg = -dp;
+                                if neg > max_daily_loss.read() {
+                                    max_daily_loss.store(neg);
+                                }
+                            }
+                            // largest_profit_share inputs: sum + max of POSITIVE day pnls.
+                            if dp > 0.0 {
+                                positive_day_sum.store(positive_day_sum.read() + dp);
+                                if dp > largest_positive_day.read() {
+                                    largest_positive_day.store(dp);
+                                }
+                            }
+                            // END-OF-DAY equity drawdown: `equity` == initial + sum(all prior
+                            // days' pnl) == the CPU's per-day equity point.
+                            let eod_eq = equity.read();
+                            if eod_eq > eod_peak.read() {
+                                eod_peak.store(eod_eq);
+                            }
+                            let ep = eod_peak.read();
+                            let eod_dd = RuntimeCell::<$f>::new(0.0);
+                            if ep > 0.0 {
+                                eod_dd.store((ep - eod_eq) / ep);
+                            }
+                            if eod_dd.read() > max_eod_dd.read() {
+                                max_eod_dd.store(eod_dd.read());
+                            }
+                            // trading_days + max_trades_per_day from the finished day —
+                            // counted by CLOSES (exit-day bucketed) to match the CPU.
+                            let dtc = current_day_closes.read();
+                            if dtc > 0 {
+                                trading_days.store(trading_days.read() + 1);
+                            }
+                            if dtc > max_trades_day.read() {
+                                max_trades_day.store(dtc);
+                            }
+                            current_day_pnl.store(0.0);
+                            current_day_closes.store(0);
+                        }
+                        last_day.store(d_val);
+                        day_peak.store(equity.read());
+                        day_low.store(equity.read());
+                        day_trade_count.store(0);
+                    }
+
+                    let in_pos_v = in_pos.read();
+                    if in_pos_v != 0
+                        && use_timestamps != 0
+                        && gap_threshold_ms > 0
+                        && timestamp_deltas_ms[i] >= gap_threshold_ms
+                    {
+                        let entry_px_v = entry_px.read();
+                        let pnl_cell = RuntimeCell::<$f>::new(0.0);
+                        if in_pos_v == 1 {
+                            pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
+                        } else {
+                            pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
+                        }
+                        pnl_cell.store(
+                            pnl_cell.read()
+                                - commission_per_trade
+                                - (spread_pips * 0.5 * pip_value_per_lot),
+                        );
+                        // Phase 2: scale (gross - commission - half_spread) by pos_lots
+                        // BEFORE swap (swap scaled in its own term). Matches eval.rs:809.
+                        pnl_cell.store(pnl_cell.read() * pos_lots.read());
+                        // Phase C.3: broker swap (signed: + = credit, − = charge).
+                        // #1375 workaround: long => swap_long, short => swap_short.
+                        let swap_per_day_gap = RuntimeCell::<$f>::new(swap_short_pips_per_day);
+                        if in_pos_v == 1 {
+                            swap_per_day_gap.store(swap_long_pips_per_day);
+                        }
+                        let swap_credit_gap = swap_per_day_gap.read()
+                            * position_days.read()
+                            * pip_value_per_lot
+                            * pos_lots.read();
+                        pnl_cell.store(pnl_cell.read() + swap_credit_gap);
+                        // PnL conversion fee applied last; skip if out-of-range.
+                        if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
+                            pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                        }
+                        let pnl = pnl_cell.read();
+                        equity.store(equity.read() + pnl);
+                        current_month_pnl.store(current_month_pnl.read() + pnl);
+                        // FTMO: attribute this realized pnl + closed-trade to the CURRENT
+                        // (close) day's bucket — matches the CPU's exit-day bucketing.
+                        current_day_pnl.store(current_day_pnl.read() + pnl);
+                        current_day_closes.store(current_day_closes.read() + 1);
+                        trade_count.store(trade_count.read() + 1);
+                        if pnl > 0.0 {
+                            wins.store(wins.read() + 1);
+                            gross_profit.store(gross_profit.read() + pnl);
+                        } else {
+                            gross_loss.store(gross_loss.read() - pnl);
+                        }
+                        in_pos.store(0);
+                        let eq = equity.read();
+                        if eq > peak_equity.read() {
+                            peak_equity.store(eq);
+                        }
+                        if eq > day_peak.read() {
+                            let previous_day_peak = day_peak.read();
+                            if previous_day_peak > 0.0 {
+                                let previous_dd =
+                                    (previous_day_peak - day_low.read()) / previous_day_peak;
+                                if previous_dd > max_daily_dd.read() {
+                                    max_daily_dd.store(previous_dd);
+                                }
+                            }
+                            day_peak.store(eq);
+                            day_low.store(eq);
+                        } else if eq < day_low.read() {
+                            day_low.store(eq);
+                        }
+                        let pe = peak_equity.read();
+                        let current_dd = RuntimeCell::<$f>::new(0.0);
+                        if pe > 0.0 {
+                            current_dd.store((pe - eq) / pe);
+                        }
+                        if current_dd.read() > max_dd.read() {
+                            max_dd.store(current_dd.read());
+                        }
+                    }
+
+                    let in_pos_v2 = in_pos.read();
+                    if in_pos_v2 != 0 {
+                        let lo = low_pips[i];
+                        let hi = high_pips[i];
+                        let entry_px_v = entry_px.read();
+
+                        // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
+                        // equity-based DD tracks the sized position.
+                        // #1375 workaround: long worst-case intrabar = low-entry, short = entry-high.
+                        // The expr form gave longs the SHORT formula on Vulkan → wrong max_dd.
+                        let worst_base =
+                            RuntimeCell::<$f>::new((entry_px_v - hi) * pip_value_per_lot);
+                        if in_pos_v2 == 1 {
+                            worst_base.store((lo - entry_px_v) * pip_value_per_lot);
+                        }
+                        let worst_float_pnl = worst_base.read() * pos_lots.read();
+                        let eq = equity.read();
+
+                        // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
+                        let best_base =
+                            RuntimeCell::<$f>::new((entry_px_v - lo) * pip_value_per_lot);
+                        if in_pos_v2 == 1 {
+                            best_base.store((hi - entry_px_v) * pip_value_per_lot);
+                        }
+                        let best_float_pnl = best_base.read() * pos_lots.read();
+                        if (eq + best_float_pnl) > peak_equity.read() {
+                            peak_equity.store(eq + best_float_pnl);
+                        }
+                        if (eq + best_float_pnl) > day_peak.read() {
+                            let previous_day_peak = day_peak.read();
+                            if previous_day_peak > 0.0 {
+                                let previous_dd =
+                                    (previous_day_peak - day_low.read()) / previous_day_peak;
+                                if previous_dd > max_daily_dd.read() {
+                                    max_daily_dd.store(previous_dd);
+                                }
+                            }
+                            day_peak.store(eq + best_float_pnl);
+                            // Start a new causal same-day drawdown segment at the new
+                            // peak, retaining this bar's worst excursion.
+                            day_low.store(eq + worst_float_pnl);
+                        } else if (eq + worst_float_pnl) < day_low.read() {
+                            day_low.store(eq + worst_float_pnl);
+                        }
+
+                        let pe = peak_equity.read();
+                        let current_dd = RuntimeCell::<$f>::new(0.0);
+                        if pe > 0.0 {
+                            current_dd.store((pe - (eq + worst_float_pnl)) / pe);
+                        }
+                        if current_dd.read() > max_dd.read() {
+                            max_dd.store(current_dd.read());
+                        }
+
+                        let pnl_cell = RuntimeCell::<$f>::new(0.0);
+                        let exit_cell = RuntimeCell::<u32>::new(0);
+                        let bars_held = i as i32 - entry_idx.read();
+                        let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
+
+                        if past_min_hold && in_pos_v2 == 1 {
+                            let sl_cell = RuntimeCell::<$f>::new(entry_px_v - sl_distance.read());
+                            let tp = entry_px_v + tp_distance.read();
+                            // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
+                            // match the CPU eval: this bar's high can't move the stop its own low is
+                            // checked against). `trail_px == 0.0` is the unset sentinel.
+                            if trailing_enabled != 0
+                                && trail_px.read() > 0.0
+                                && trail_px.read() > sl_cell.read()
+                            {
+                                sl_cell.store(trail_px.read());
+                            }
+                            let sl_v = sl_cell.read();
+                            if lo <= sl_v {
+                                pnl_cell.store((sl_v - entry_px_v) * pip_value_per_lot);
+                                exit_cell.store(1);
+                            } else if hi >= tp {
+                                pnl_cell.store((tp - entry_px_v) * pip_value_per_lot);
+                                exit_cell.store(1);
+                            }
+                            // AFTER the exit check: ratchet the trail up from THIS bar's high.
+                            if exit_cell.read() == 0 && trailing_enabled != 0 {
+                                let mv = hi - entry_px_v;
+                                if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                                    // Mirrors eval.rs: the trail never sits closer to
+                                    // entry than the locked profit, which the R-based
+                                    // multiplier alone cannot guarantee across genes.
+                                    let locked = entry_px.read() + trailing_min_lock_pips;
+                                    let raw = hi - (trailing_atr_multiplier * sl_distance.read());
+                                    // #1375 workaround: candidate = max(raw, locked). The
+                                    // expression form returned `locked` unconditionally on
+                                    // the wgpu backend, so the ATR trail never ratcheted past
+                                    // the min-lock floor and every long exited at a stop the
+                                    // CPU had already moved. The CPU reference is literally
+                                    // `.max(locked)` (eval.rs:1505-1507), so the two engines
+                                    // disagreed on the exit price of every trailing trade.
+                                    // Statement-if + RuntimeCell is correct
+                                    // on all backends — same idiom as the `gap_abs` and
+                                    // `gate` workarounds in the signal kernel above.
+                                    let candidate = RuntimeCell::<$f>::new(locked);
+                                    if raw > locked {
+                                        candidate.store(raw);
+                                    }
+                                    let candidate_v = candidate.read();
+                                    if trail_px.read() == 0.0 || candidate_v > trail_px.read() {
+                                        trail_px.store(candidate_v);
+                                    }
+                                }
+                            }
+                        } else if past_min_hold {
+                            let sl_cell = RuntimeCell::<$f>::new(entry_px_v + sl_distance.read());
+                            let tp = entry_px_v - tp_distance.read();
+                            if trailing_enabled != 0
+                                && trail_px.read() > 0.0
+                                && trail_px.read() < sl_cell.read()
+                            {
+                                sl_cell.store(trail_px.read());
+                            }
+                            let sl_v = sl_cell.read();
+                            if hi >= sl_v {
+                                pnl_cell.store((entry_px_v - sl_v) * pip_value_per_lot);
+                                exit_cell.store(1);
+                            } else if lo <= tp {
+                                pnl_cell.store((entry_px_v - tp) * pip_value_per_lot);
+                                exit_cell.store(1);
+                            }
+                            // AFTER the exit check: ratchet the trail down from THIS bar's low.
+                            if exit_cell.read() == 0 && trailing_enabled != 0 {
+                                let mv = entry_px_v - lo;
+                                if mv >= (trailing_be_trigger_r * sl_distance.read()) {
+                                    let locked = entry_px.read() - trailing_min_lock_pips;
+                                    let raw = lo + (trailing_atr_multiplier * sl_distance.read());
+                                    // #1375 workaround: candidate = min(raw, locked) — the
+                                    // short mirror of the long branch above.
+                                    let candidate = RuntimeCell::<$f>::new(locked);
+                                    if raw < locked {
+                                        candidate.store(raw);
+                                    }
+                                    let candidate_v = candidate.read();
+                                    if trail_px.read() == 0.0 || candidate_v < trail_px.read() {
+                                        trail_px.store(candidate_v);
+                                    }
+                                }
+                            }
+                        }
+
+                        if exit_cell.read() == 0
+                            && past_min_hold
+                            && max_hold_bars > 0
+                            && bars_held >= max_hold_bars as i32
+                        {
+                            if in_pos_v2 == 1 {
+                                pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
+                            } else {
+                                pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
+                            }
+                            exit_cell.store(1);
+                        }
+
+                        if exit_cell.read() != 0 {
+                            pnl_cell.store(
+                                pnl_cell.read()
+                                    - commission_per_trade
+                                    - (spread_pips * 0.5 * pip_value_per_lot),
+                            );
+                            // Phase 2: scale (gross - commission - half_spread) by pos_lots
+                            // BEFORE swap. Matches eval.rs:979.
+                            pnl_cell.store(pnl_cell.read() * pos_lots.read());
+                            // Phase C.3: broker swap (signed: + = credit, − = charge).
+                            // #1375 workaround: long => swap_long, short => swap_short.
+                            let swap_per_day = RuntimeCell::<$f>::new(swap_short_pips_per_day);
+                            if in_pos_v2 == 1 {
+                                swap_per_day.store(swap_long_pips_per_day);
+                            }
+                            let swap_credit = swap_per_day.read()
+                                * position_days.read()
+                                * pip_value_per_lot
+                                * pos_lots.read();
+                            pnl_cell.store(pnl_cell.read() + swap_credit);
+                            if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
+                                pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                            }
+                            let pnl = pnl_cell.read();
+                            equity.store(equity.read() + pnl);
+                            current_month_pnl.store(current_month_pnl.read() + pnl);
+                            // FTMO: attribute this realized pnl + closed-trade to the CURRENT
+                            // (close) day's bucket — matches the CPU's exit-day bucketing.
+                            current_day_pnl.store(current_day_pnl.read() + pnl);
+                            current_day_closes.store(current_day_closes.read() + 1);
+                            trade_count.store(trade_count.read() + 1);
+                            if pnl > 0.0 {
+                                wins.store(wins.read() + 1);
+                                gross_profit.store(gross_profit.read() + pnl);
+                            } else {
+                                gross_loss.store(gross_loss.read() - pnl);
+                            }
+                            in_pos.store(0);
+                            let eq2 = equity.read();
+                            if eq2 > peak_equity.read() {
+                                peak_equity.store(eq2);
+                            }
+                            if eq2 > day_peak.read() {
+                                let previous_day_peak = day_peak.read();
+                                if previous_day_peak > 0.0 {
+                                    let previous_dd =
+                                        (previous_day_peak - day_low.read()) / previous_day_peak;
+                                    if previous_dd > max_daily_dd.read() {
+                                        max_daily_dd.store(previous_dd);
+                                    }
+                                }
+                                day_peak.store(eq2);
+                                day_low.store(eq2);
+                            } else if eq2 < day_low.read() {
+                                day_low.store(eq2);
+                            }
+                            let pe2 = peak_equity.read();
+                            let current_dd = RuntimeCell::<$f>::new(0.0);
+                            if pe2 > 0.0 {
+                                current_dd.store((pe2 - eq2) / pe2);
+                            }
+                            if current_dd.read() > max_dd.read() {
+                                max_dd.store(current_dd.read());
+                            }
+                        }
+                    } else {
+                        // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar close.
+                        let s = signals_flat[signal_base + i - 1];
+                        if s != 0 {
+                            if !(max_trades_per_day > 0
+                                && (day_trade_count.read() as usize) >= max_trades_per_day)
+                            {
+                                in_pos.store(s);
+                                entry_px.store(close_pips[i] + (s as $f) * spread_pips * 0.5);
+                                entry_idx.store(i as i32);
+                                trail_px.store(0.0);
+                                // Phase C.3: reset carry accumulator at new entry.
+                                position_days.store(0.0);
+                                // Adaptive stops: re-capture the per-entry SL/TP. An
+                                // adaptive gene (stop_vol_mult>0) scales the SIGNAL-bar
+                                // (i-1) base vol distance — the same causally-available bar
+                                // the signal/confidence use — and sets TP = rr × SL,
+                                // mirroring the CPU `entry_sl_tp_pips`. A fixed gene leaves
+                                // sl_distance/tp_distance at the scalar sl_pips/tp_pips.
+                                // Captured BEFORE the sizing below so eff_sl uses it.
+                                if stop_vol_mult[gene] > 0.0 {
+                                    let sl_a = stop_vol_mult[gene] * base_pips[i - 1];
+                                    sl_distance.store(sl_a);
+                                    tp_distance.store(adaptive_rr * sl_a);
+                                }
+                                // Phase 2: risk-based, confidence-scaled lot size, captured
+                                // at entry from running equity + the prior-bar confidence
+                                // (causal i-1, same shift as the signal read). Mirrors
+                                // risk_based_pos_lots (eval.rs:657-685) term-for-term.
+                                if risk_based_sizing != 0 {
+                                    // RuntimeCell idiom (cubecl rejects if-as-value that mixes
+                                    // array-read cube values with bare literals).
+                                    let conf_c = RuntimeCell::<$f>::new(
+                                        confidences_flat[signal_base + i - 1],
+                                    );
+                                    if conf_c.read() < 0.0 {
+                                        conf_c.store(0.0);
+                                    }
+                                    if conf_c.read() > 1.0 {
+                                        conf_c.store(1.0);
+                                    }
+                                    // conf_scale = (conf/hq).min(1.0), guarded for hq<=0 (=> 1.0).
+                                    let conf_scale = RuntimeCell::<$f>::new(1.0);
+                                    if high_quality_confidence > 0.0 {
+                                        let r = conf_c.read() / high_quality_confidence;
+                                        if r < 1.0 {
+                                            conf_scale.store(r);
+                                        }
+                                    }
+                                    let risk_pct = risk_per_trade_min
+                                        + (risk_per_trade_max - risk_per_trade_min)
+                                            * conf_scale.read();
+                                    // eff_sl = sl_distance.max(1.0)
+                                    let eff_sl = RuntimeCell::<$f>::new(1.0);
+                                    if sl_distance.read() > 1.0 {
+                                        eff_sl.store(sl_distance.read());
+                                    }
+                                    let denom = eff_sl.read() * pip_value_per_lot;
+                                    let eq_now = equity.read();
+                                    // lots = (risk_pct*equity)/denom if valid, else 0; clamp [0,100].
+                                    let lots = RuntimeCell::<$f>::new(0.0);
+                                    if eq_now > 0.0 && denom > 1e-12 {
+                                        lots.store((risk_pct * eq_now) / denom);
+                                    }
+                                    if lots.read() > 100.0 {
+                                        lots.store(100.0);
+                                    }
+                                    if lots.read() < 0.0 {
+                                        lots.store(0.0);
+                                    }
+                                    pos_lots.store(lots.read());
+                                } else {
+                                    pos_lots.store(1.0);
+                                }
+                                day_trade_count.store(day_trade_count.read() + 1);
+                            }
+                        }
+                    }
+                }
+
+                // ── FTMO: FLUSH THE FINAL DAY ──────────────────────────────────────
+                // The boundary block only fires on a CHANGE of day_idx, so the LAST day
+                // in the series is never finalized there. Repeat the same finalize using
+                // the final `current_day_pnl` / `equity` / `day_trade_count`, but only if
+                // at least one bar was processed (last_day != -1). This exactly mirrors
+                // the CPU iterating its last BTreeMap day.
+                if last_day.read() != -1 {
+                    if day_peak.read() > 0.0 {
+                        let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                        if dd > max_daily_dd.read() {
+                            max_daily_dd.store(dd);
+                        }
+                    }
+                    let dp = current_day_pnl.read();
+                    if dp < 0.0 {
+                        let neg = -dp;
+                        if neg > max_daily_loss.read() {
+                            max_daily_loss.store(neg);
+                        }
+                    }
+                    if dp > 0.0 {
+                        positive_day_sum.store(positive_day_sum.read() + dp);
+                        if dp > largest_positive_day.read() {
+                            largest_positive_day.store(dp);
+                        }
+                    }
+                    let eod_eq = equity.read();
+                    if eod_eq > eod_peak.read() {
+                        eod_peak.store(eod_eq);
+                    }
+                    let ep = eod_peak.read();
+                    let eod_dd = RuntimeCell::<$f>::new(0.0);
+                    if ep > 0.0 {
+                        eod_dd.store((ep - eod_eq) / ep);
+                    }
+                    if eod_dd.read() > max_eod_dd.read() {
+                        max_eod_dd.store(eod_dd.read());
+                    }
+                    // Count by CLOSES (exit-day bucketed) to match the CPU.
+                    let dtc = current_day_closes.read();
+                    if dtc > 0 {
+                        trading_days.store(trading_days.read() + 1);
+                    }
+                    if dtc > max_trades_day.read() {
+                        max_trades_day.store(dtc);
+                    }
+                }
+
+                let final_equity = equity.read();
+                let final_peak = peak_equity.read();
+                let final_max_dd = max_dd.read();
+                let final_trade_count = trade_count.read();
+                let final_wins = wins.read();
+                let final_gp = gross_profit.read();
+                let final_gl = gross_loss.read();
+                let final_max_daily_dd = max_daily_dd.read();
+                let final_month_ptr = month_ptr.read();
+
+                let net_profit = final_equity - initial_equity;
+                let win_rate_cell = RuntimeCell::<$f>::new(0.0);
+                if final_trade_count > 0 {
+                    win_rate_cell.store(final_wins as $f / final_trade_count as $f);
+                }
+                let pf_cell = RuntimeCell::<$f>::new(0.0);
+                if final_gl > 0.0 {
+                    pf_cell.store((final_gp / final_gl).min(10.0));
+                } else if final_gp > 0.0 {
+                    pf_cell.store(10.0);
+                }
+                let expectancy_cell = RuntimeCell::<$f>::new(0.0);
+                if final_trade_count > 0 {
+                    expectancy_cell.store(net_profit / final_trade_count as $f);
+                }
+                let filled_months_cell = RuntimeCell::<i32>::new(0);
+                if final_month_ptr >= 0 {
+                    let raw = final_month_ptr + 1;
+                    if raw < month_capacity as i32 {
+                        filled_months_cell.store(raw);
+                    } else {
+                        filled_months_cell.store(month_capacity as i32);
+                    }
+                }
+
+                metrics_out[metric_base] = net_profit;
+                metrics_out[metric_base + 1] = final_peak;
+                metrics_out[metric_base + 2] = final_max_dd;
+                metrics_out[metric_base + 3] = win_rate_cell.read();
+                metrics_out[metric_base + 4] = pf_cell.read();
+                metrics_out[metric_base + 5] = expectancy_cell.read();
+                metrics_out[metric_base + 6] = final_max_daily_dd;
+                trade_counts_out[gene] = final_trade_count;
+                month_counts_out[gene] = filled_months_cell.read();
+
+                // ── FTMO observables emit (mirrors validation.rs::compute_prop_firm_risk_summary) ──
+                // net_return_pct = net_profit / initial_equity (guard initial_equity>0).
+                let net_return_pct = RuntimeCell::<$f>::new(0.0);
+                if initial_equity > 0.0 {
+                    net_return_pct.store(net_profit / initial_equity);
+                }
+                // max_daily_loss_pct = max|neg day pnl| / initial_equity.
+                let max_daily_loss_pct = RuntimeCell::<$f>::new(0.0);
+                if initial_equity > 0.0 {
+                    max_daily_loss_pct.store(max_daily_loss.read() / initial_equity);
+                }
+                // largest_profit_share = largest_positive_day / sum_positive_days (0 if none).
+                // Statement-if guard (cubecl#1375: NEVER expression-if mixing runtime values).
+                let largest_profit_share = RuntimeCell::<$f>::new(0.0);
+                if positive_day_sum.read() > 1e-9 {
+                    largest_profit_share
+                        .store(largest_positive_day.read() / positive_day_sum.read());
+                }
+
+                ftmo_out[ftmo_base] = net_return_pct.read();
+                ftmo_out[ftmo_base + 1] = max_daily_loss_pct.read();
+                ftmo_out[ftmo_base + 2] = max_eod_dd.read();
+                ftmo_out[ftmo_base + 3] = largest_profit_share.read();
+                ftmo_out[ftmo_base + 4] = max_trades_day.read() as $f;
+                ftmo_out[ftmo_base + 5] = trading_days.read() as $f;
+            }
+        }
+    };
+}
+
+define_backtest_population_kernel!(backtest_population_kernel, f64);
+
+fn mean_std(values: &[f64]) -> (f64, f64) {
+    // Phase 64 — both CPU and GPU paths now share the canonical
+    // `neoethos_core::utils::mean_std` so CPU/GPU rank parity cannot drift
+    // due to a math-helper divergence.
+    let (mean, std) = neoethos_core::utils::mean_std(values);
+    if !mean.is_finite() || !std.is_finite() {
+        return (0.0, 0.0);
+    }
+    (mean, std)
+}
+
+pub(crate) fn cuda_eval_signal_kernel_enabled() -> bool {
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
+    cuda_env_knobs().eval_kernel_enabled
+}
+
+pub(crate) fn cuda_eval_backtest_kernel_enabled() -> bool {
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`.
+    cuda_env_knobs().backtest_kernel_enabled
+}
+
+/// Whether the discovery eval should SKIP the GPU lane because the only GPU is
+/// an integrated / shared-memory adapter.
+///
+/// Real-data verdict (2026-07-24, release CLI on real M5 EURUSD, AMD Ryzen 5
+/// 5675U iGPU): an integrated GPU is a NET LOSS for the fine-grained population
+/// eval. The backtest kernel itself is ~0.09 ms, but the per-call host↔device
+/// upload + readback over the SHARED-memory bus is ~1 s, so the GPU lane runs
+/// 10-20× slower than the 6-core CPU and only drags each generation; the fused
+/// (readback-free) path can't rescue it because its VRAM-resident signal matrix
+/// OOMs the iGPU's tiny device-local heap. The hybrid splitter already demotes a
+/// slow GPU toward the CPU, but on an integrated adapter that costs several
+/// wasted probe generations (and a possible transient OOM) before it converges —
+/// so we skip the GPU lane outright and run pure-CPU from the first generation.
+///
+/// The auto-tuner marks an integrated GPU by installing a non-zero
+/// `gpu_buffer_mb` (the discrete-card branch leaves it 0). This is idempotent —
+/// it ensures the budget is installed even on the lighter `search` path. Opt
+/// back in with `NEOETHOS_BOT_SEARCH_USE_IGPU=1` (e.g. to re-measure a strong
+/// APU, or after a driver/kernel change) — that forces the normal hybrid path,
+/// which still measures and demotes as usual.
+pub(crate) fn integrated_gpu_eval_disabled() -> bool {
+    // 2026-08-10: `NEOETHOS_BOT_SEARCH_USE_IGPU=1` used to force the hybrid
+    // path back on. It is gone. An integrated GPU is something the probe
+    // DETECTS, not something a shell declares, and the measurement that closed
+    // this (2026-07-24, real M5 EURUSD on a Ryzen 5 5675U APU) was a net loss
+    // plus OOM every generation. Re-measuring a strong APU is a code change
+    // with a number attached, not an export.
+    auto_tune_memory_budgets();
+    let disabled = installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0);
+    if disabled {
+        // Log the skip ONCE (not every generation) so the run makes clear why the
+        // GPU isn't engaged — fail-loud transparency, not a silent fallback.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                "discovery GPU lane SKIPPED — only an integrated/shared-memory GPU is present, which is a net loss for this eval (kernel ~0.09 ms but ~1 s per-call upload/readback over the shared bus, 10-20x slower than the CPU, and the fused path OOMs its tiny device-local heap). Running discovery fully on the CPU. Override with NEOETHOS_BOT_SEARCH_USE_IGPU=1."
+            );
+        });
+    }
+    disabled
+}
+
+// **2026-05-25 — task #261**: switched from concrete `CudaRuntime` to a
+// generic `R: Runtime` parameter so these helpers (and the kernel-launch
+// fns below) compile against any cubecl runtime — CUDA (NVIDIA), Vulkan
+// (cross-vendor via cubecl-wgpu/spirv), and ROCm/HIP. The CUDA-specific
+// env knobs stay because they're plain numbers (kernel unit count,
+// device id) — semantically valid for any backend; the `cuda_` prefix
+// just reflects the env-var name and is a follow-up cosmetic rename.
+fn signal_kernel_units<R: Runtime>(client: &ComputeClient<R>) -> u32 {
+    let max_units = client.properties().hardware.max_units_per_cube.max(1);
+    cuda_env_knobs()
+        .eval_kernel_units_override
+        .unwrap_or(max_units)
+        .min(max_units)
+        .max(1)
+}
+
+fn backtest_kernel_units<R: Runtime>(client: &ComputeClient<R>) -> u32 {
+    let max_units = client.properties().hardware.max_units_per_cube.max(1);
+    cuda_env_knobs()
+        .backtest_kernel_units_override
+        .unwrap_or(max_units)
+        .min(max_units)
+        .max(1)
+}
+
+#[allow(dead_code)] // gpu-cuda device selection only; wgpu uses DefaultDevice
+fn cuda_device_id() -> usize {
+    // F-CORE3 closure: typed boundary via `cuda_env_knobs()`. The
+    // tracing::warn for unparseable values fires once at first read
+    // (inside `read_cuda_device_id_from_env`) rather than on every
+    // kernel launch.
+    cuda_env_knobs().cuda_device_id
+}
+
+fn flatten_i32_rows(rows: &[SmcRow]) -> Vec<i32> {
+    let mut out = Vec::with_capacity(rows.len().saturating_mul(SMC_WIDTH));
+    for row in rows {
+        for value in row {
+            out.push(*value as i32);
+        }
+    }
+    out
+}
+
+fn flatten_i32_flags(rows: &[SmcRow]) -> Vec<i32> {
+    flatten_i32_rows(rows)
+}
+
+/// Host-side validation that every index the kernel will compute stays
+/// within its array. This is the contract `synthesize_signals_kernel`
+/// implicitly assumes; without these checks a single bad GA gene
+/// silently reads garbage memory in the CUDA kernel, which produces
+/// **wrong trading signals** with no error (panics in CUDA kernels
+/// surface as CUDA driver errors or simply corrupt data — both far
+/// worse than a clean `Err` for a real-money trading system).
+///
+/// Invariants (mirroring `synthesize_signals_kernel`):
+///   1. `gene_offsets.len() == n_genes + 1` (CSR layout, last entry is total)
+///   2. `gene_offsets` is monotonically non-decreasing
+///   3. `gene_offsets[n_genes] as usize <= gene_indices.len()` and ≤ gene_weights.len()
+///   4. every `gene_indices[i]` is in `[0, indicators_flat.len() / n_samples)`
+///   5. `long_thr.len() == n_genes` and `short_thr.len() == n_genes`
+///   6. `gene_smc_flags.len() == n_genes * SMC_WIDTH`
+///   7. `smc_data.len() == n_samples * SMC_WIDTH`
+///   8. `smc_weights.len() == SMC_WIDTH`
+///   9. `indicators_flat.len() % n_samples == 0`
+fn validate_signal_kernel_inputs<F>(
+    indicators_flat: &[F],
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[F],
+    long_thr: &[F],
+    short_thr: &[F],
+    smc_data: &[i32],
+    gene_smc_flags: &[i32],
+    smc_weights: &[F],
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<()> {
+    if gene_offsets.len() != n_genes + 1 {
+        bail!(
+            "gene_offsets length {} must equal n_genes + 1 = {}",
+            gene_offsets.len(),
+            n_genes + 1
+        );
+    }
+    if long_thr.len() != n_genes {
+        bail!(
+            "long_thr length {} must equal n_genes {}",
+            long_thr.len(),
+            n_genes
+        );
+    }
+    if short_thr.len() != n_genes {
+        bail!(
+            "short_thr length {} must equal n_genes {}",
+            short_thr.len(),
+            n_genes
+        );
+    }
+    if gene_smc_flags.len() != n_genes * SMC_WIDTH {
+        bail!(
+            "gene_smc_flags length {} must equal n_genes * SMC_WIDTH = {}",
+            gene_smc_flags.len(),
+            n_genes * SMC_WIDTH
+        );
+    }
+    if smc_weights.len() != SMC_WIDTH {
+        bail!(
+            "smc_weights length {} must equal SMC_WIDTH = {}",
+            smc_weights.len(),
+            SMC_WIDTH
+        );
+    }
+    if smc_data.len() != n_samples * SMC_WIDTH {
+        bail!(
+            "smc_data length {} must equal n_samples * SMC_WIDTH = {}",
+            smc_data.len(),
+            n_samples * SMC_WIDTH
+        );
+    }
+    if n_samples == 0 {
+        bail!("n_samples must be > 0");
+    }
+    if indicators_flat.len() % n_samples != 0 {
+        bail!(
+            "indicators_flat length {} must be a multiple of n_samples {}",
+            indicators_flat.len(),
+            n_samples
+        );
+    }
+    let n_indicators = indicators_flat.len() / n_samples;
+    let total_entries = gene_offsets[n_genes];
+    if total_entries < 0 {
+        bail!(
+            "gene_offsets[n_genes] = {} must be non-negative",
+            total_entries
+        );
+    }
+    if (total_entries as usize) > gene_indices.len() {
+        bail!(
+            "gene_offsets[n_genes] = {} exceeds gene_indices length {}",
+            total_entries,
+            gene_indices.len()
+        );
+    }
+    if (total_entries as usize) > gene_weights.len() {
+        bail!(
+            "gene_offsets[n_genes] = {} exceeds gene_weights length {}",
+            total_entries,
+            gene_weights.len()
+        );
+    }
+    // Monotonicity: gene_offsets[g] <= gene_offsets[g+1] for every g.
+    for g in 0..n_genes {
+        if gene_offsets[g] > gene_offsets[g + 1] {
+            bail!(
+                "gene_offsets must be non-decreasing: gene_offsets[{}]={} > gene_offsets[{}]={}",
+                g,
+                gene_offsets[g],
+                g + 1,
+                gene_offsets[g + 1]
+            );
+        }
+        if gene_offsets[g] < 0 {
+            bail!("gene_offsets[{}] = {} is negative", g, gene_offsets[g]);
+        }
+    }
+    // Every gene_indices entry must reference a valid indicator row.
+    // Checking up to `total_entries` because anything past that isn't read.
+    let used_entries = total_entries as usize;
+    for (i, &idx) in gene_indices.iter().take(used_entries).enumerate() {
+        if idx < 0 {
+            bail!("gene_indices[{}] = {} is negative", i, idx);
+        }
+        if (idx as usize) >= n_indicators {
+            bail!(
+                "gene_indices[{}] = {} exceeds n_indicators = {} (indicators_flat.len()/n_samples)",
+                i,
+                idx,
+                n_indicators
+            );
+        }
+    }
+    Ok(())
+}
+
+// The canonical signal helper fixes its element type to f64 and leaves only the
+// runtime generic for backend selection.
+/// Conservative max ELEMENTS per single GPU storage buffer. wgpu caps a storage
+/// buffer at `max_storage_buffer_binding_size` (WebGPU default 128MB); exceeding
+/// it raises "wgpu error: Out of Memory". We stay under it and window/batch the
+/// GA's big buffers (the indicators matrix and the per-gene signal series) so
+/// even huge-row timeframes (M1: ~5.3M rows) run on the GPU instead of falling
+/// back to CPU. Overridable per box via `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`
+/// (raise it where the device's real limit is higher than the 128MB default).
+/// Hardware-derived memory budgets installed once at discovery start by
+/// [`auto_tune_memory_budgets`]. They make the engine fit whatever card + RAM it
+/// finds with ZERO user config: the cap helpers below resolve their value as
+/// `explicit env override > auto-tuned budget > conservative default`. A user
+/// can therefore (a) do nothing and get a hardware-fit config, (b) set an env
+/// var to force a specific value. Either way the engine never OOMs regardless of
+/// requested population/generations (the budgets bound the windowing, the pool
+/// trim, and the host gene-chunk).
+#[derive(Clone, Copy, Debug)]
+struct MemoryBudgets {
+    /// Host budget (MB) for the per-gene signal+confidence assembly → gene chunk.
+    host_budget_mb: u64,
+    /// VRAM pool reserved budget (MB) above which the pool is trimmed.
+    vram_budget_mb: u64,
+    /// Per-storage-buffer cap (MB) for the windowing/batching.
+    gpu_buffer_mb: usize,
+}
+
+static MEMORY_BUDGETS: std::sync::OnceLock<MemoryBudgets> = std::sync::OnceLock::new();
+
+fn installed_memory_budgets() -> Option<MemoryBudgets> {
+    MEMORY_BUDGETS.get().copied()
+}
+
+/// The device's REAL per-storage-buffer cap (bytes), probed ONCE from the active
+/// GPU client the first time one is built (in `create_gpu_client`). Replaces the
+/// historical hardcoded 120MB literal that was a workaround for cubecl using the
+/// DEFAULT (128MB) wgpu limits instead of the adapter's true
+/// `max_storage_buffer_binding_size` — on Vulkan that real limit is far higher
+/// (often `u64::MAX`), and on CUDA it is VRAM/4 (cubecl-cuda runtime.rs). With the
+/// real cap the windowing/batching machinery (still the safety net) produces a few
+/// big launches instead of many tiny ones, so heavy TFs (M1/M3/M5) actually run on
+/// the GPU. Populated on BOTH backends; `gpu_buffer_elem_cap` reads it.
+static GPU_BUFFER_CAP_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Floor for the probed per-buffer cap: never drop below the historical 120MB so a
+/// bogus tiny `max_page_size` report can't starve the GPU lane into many micro
+/// launches.
+const GPU_BUFFER_CAP_FLOOR: u64 = 120 * 1024 * 1024;
+/// Ceiling for the probed per-buffer cap: keep a single window at <=2GiB so its
+/// host element count (fed into u32 cube math) stays addressable and a single
+/// allocation can't blow a small card before the pool-trim/catch_unwind safety
+/// nets engage.
+const GPU_BUFFER_CAP_CEIL: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Probe the active client for the device's REAL per-storage-buffer byte limit.
+/// `client.properties().memory.max_page_size` is populated on BOTH backends:
+/// cubecl-wgpu sets it to `device.limits().max_storage_buffer_binding_size`
+/// (runtime.rs:291), cubecl-cuda to VRAM/4. We keep 0.8 headroom and clamp to
+/// `[120MB, 2GiB]`. Generic over `R: Runtime` exactly like `signal_kernel_units`.
+///
+/// Used by the CUDA `create_gpu_client` (which has only a `ComputeClient`, never a
+/// raw `WgpuSetup`). The wgpu branch reads the equivalent value directly from
+/// `setup.device.limits()`/`setup.adapter.limits()` at `init_setup` time, so this
+/// helper is dead on a vulkan-only build — hence the `#[cfg]` gate.
+#[cfg(feature = "gpu-cuda")]
+fn probe_gpu_buffer_cap_bytes<R: Runtime>(client: &ComputeClient<R>) -> u64 {
+    let max_page = client.properties().memory.max_page_size;
+    ((max_page as f64 * 0.8) as u64).clamp(GPU_BUFFER_CAP_FLOOR, GPU_BUFFER_CAP_CEIL)
+}
+
+/// Install the probed per-buffer cap (first install wins) and log it ONCE. Called
+/// from `create_gpu_client` on first client build (both backends). On the wgpu
+/// path the cap may already have been installed from the raw adapter/device limits
+/// at `init_setup` time; this is then a no-op (the `OnceLock` keeps the first
+/// value), so we only log when WE are the installer.
+fn install_gpu_buffer_cap(probed: u64) {
+    let mut newly_installed = false;
+    let cap = *GPU_BUFFER_CAP_BYTES.get_or_init(|| {
+        newly_installed = true;
+        probed
+    });
+    if newly_installed {
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            probed_cap_mb = cap / (1024 * 1024),
+            "probed GPU per-buffer cap (replaces the old hardcoded 120MB)"
+        );
+    }
+}
+
+/// VRAM budget (MB) for the resident-upload cache + pool trim, from the smallest
+/// card's capacity.
+///
+/// 60% of the card, with the CEILING derived from the card instead of a flat
+/// literal. It used to be `clamp(384, 24576)`: a hard 24 GB cap that only ever
+/// bound BIG cards — a 48 GB A6000 was held to 24 GB (and the resident cache,
+/// which gets half, to 12 GB) while 24 GB of the card sat unused. The ceiling is
+/// now "card minus a driver/working reserve", so a big card actually uses its
+/// capacity and a small card gets slightly MORE headroom than the old formula.
+///
+/// The reserve covers the driver context, cubecl's own allocations and the
+/// transient per-launch buffers — everything that is NOT the resident data.
+///
+/// Unknown VRAM (wgpu/ROCm report 0) keeps the conservative 2 GB so the pool
+/// trim still bounds usage.
+fn vram_budget_mb_for(min_vram_gb: f64) -> u64 {
+    if !min_vram_gb.is_finite() || min_vram_gb <= 0.0 {
+        return 2048;
+    }
+    let reserve_gb = (min_vram_gb * 0.15).clamp(1.0, 6.0);
+    let ceiling_mb = (((min_vram_gb - reserve_gb) * 1024.0).max(384.0)) as u64;
+    let target_mb = (min_vram_gb * 1024.0 * 0.60) as u64;
+    target_mb.clamp(384, ceiling_mb.max(384))
+}
+
+/// Probe the host RAM + GPU VRAM and install memory budgets sized to fit, so the
+/// average user needs no manual tuning. Idempotent (first install wins) and
+/// safe: explicit `NEOETHOS_BOT_SEARCH_*` env vars still override per-knob. On a
+/// box where VRAM can't be read (wgpu/ROCm report 0), a conservative VRAM budget
+/// is used so the pool trim still bounds usage. Called once at discovery start.
+pub fn auto_tune_memory_budgets() {
+    if MEMORY_BUDGETS.get().is_some() {
+        return;
+    }
+    let profile = neoethos_core::system::HardwareProbe::new().detect();
+    let avail_ram_gb = if profile.available_ram_gb.is_finite() && profile.available_ram_gb > 0.0 {
+        profile.available_ram_gb
+    } else {
+        4.0 // conservative fallback
+    };
+    let min_vram_gb = profile
+        .gpu_mem_gb
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(f64::INFINITY, f64::min);
+
+    // Host: cap the RESIDENT RAM for signal handling at ~25% of available RAM
+    // (the gene_chunk_size 5× overhead factor already accounts for the transient
+    // GPU upload/readback copies, so this budget is real RSS). Clamped [256MB,
+    // 4GB]: a 1GB box still runs (tiny chunks, slow but never OOM); a big box is
+    // capped at 4GB of signal handling — fixed data costs (the indicator matrix,
+    // ~rows×cols×4B) live on top, so leaving 4GB headroom keeps even M1 (6M rows)
+    // inside a 16GB box.
+    let host_budget_mb = ((avail_ram_gb * 1024.0 * 0.25) as u64).clamp(256, 4096);
+    // VRAM: trim the pool above ~60% of the smallest card; if VRAM is unknown,
+    // use a conservative 2GB so the trim still keeps the footprint modest.
+    // AREA 1 (2026-06-09): the per-storage-buffer cap is NO LONGER guessed here.
+    // It used to be hardcoded to 120MB because cubecl built clients with the
+    // DEFAULT (128MB) wgpu limits instead of the adapter's real
+    // `max_storage_buffer_binding_size`, so a single >128MB buffer → `wgpu error:
+    // Out of Memory` → GPU-lane panic → silent CPU fallback for every heavy-TF
+    // generation (M1/M3/M5 never actually ran on the GPU). `create_gpu_client` now
+    // (a) on wgpu builds the device via `init_setup` reading the adapter's TRUE
+    // limits, and (b) on BOTH backends probes `client.properties().memory
+    // .max_page_size` to install `GPU_BUFFER_CAP_BYTES`. So we set `gpu_buffer_mb`
+    // to 0 here = "probe at client build"; `gpu_buffer_elem_cap` ignores a 0 budget
+    // and reads the probed cap. The pool-trim budget (`v`) still scales with VRAM.
+    let (vram_budget_mb, gpu_buffer_mb) = if min_vram_gb.is_finite() {
+        // Discrete card with real dedicated VRAM: pool-trim from the card, and
+        // leave the per-buffer cap at 0 so it's probed from the device at client
+        // build (the true `max_storage_buffer_binding_size`).
+        //
+        let budget = vram_budget_mb_for(min_vram_gb);
+        (budget, 0usize)
+    } else {
+        // Shared-memory GPU (integrated graphics — the probe reports no dedicated
+        // VRAM). Its buffers come out of SYSTEM RAM, so the usable budget is
+        // available RAM minus what the OS and the CPU lane (host signal buffers,
+        // rayon) already need — NOT the device's advertised max-buffer limit,
+        // which is the whole of RAM and makes the fused path OOM. `avail_ram_gb`
+        // is already post-OS "available" RAM; take a conservative slice of it so
+        // the GPU chunking coexists with the CPU lane inside shared memory. Pool
+        // trim ~30%, per-buffer cap ~15% (bounds the fused resident buffer =
+        // gene-batch × n_samples). Clamped so a tiny box still runs.
+        let pool_mb = ((avail_ram_gb * 1024.0 * 0.30) as u64).clamp(512, 8192);
+        let buf_mb = ((avail_ram_gb * 1024.0 * 0.15) as u64).clamp(256, 4096) as usize;
+        (pool_mb, buf_mb)
+    };
+
+    let budgets = MemoryBudgets {
+        host_budget_mb,
+        vram_budget_mb,
+        gpu_buffer_mb,
+    };
+    let _ = MEMORY_BUDGETS.set(budgets);
+    tracing::info!(
+        target: "neoethos_search::cubecl_eval",
+        avail_ram_gb = format!("{avail_ram_gb:.1}"),
+        min_vram_gb = if min_vram_gb.is_finite() { format!("{min_vram_gb:.1}") } else { "unknown".to_string() },
+        host_budget_mb,
+        vram_budget_mb,
+        gpu_buffer_mb,
+        "auto-tuned memory budgets (memory tracks hardware, not user params)"
+    );
+}
+
+/// Maximum f64 elements a single storage buffer may hold so it stays
+/// under the device's real per-buffer limit.
+///
+/// Resolution order (bytes) — 2026-08-10, after the env override was deleted:
+///   1. The device-probed cap installed at first client build
+///      (`GPU_BUFFER_CAP_BYTES`, set by `create_gpu_client`), bounded by a
+///      non-zero startup budget (the integrated-GPU case; on a discrete card
+///      the budget is left 0 and the probe wins).
+///   2. A startup-budget value when no client exists yet.
+///   3. The 120MB floor — used only before any client exists (e.g. unit code
+///      that computes a window size without a GPU).
+///
+/// `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB` is GONE. It was already the best-behaved
+/// of the three memory env vars — it `min`'d against the probe — but peak
+/// memory is a function of the hardware and never of a user parameter, and the
+/// only thing lowering it by hand could do that the probe cannot is make the
+/// run slower.
+/// Test-only seam replacing the deleted `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`.
+///
+/// The split-invariance parity test (`eval.rs`, heavy-row) has to force MANY
+/// windows/gene-batches at two DIFFERENT granularities and prove the two are
+/// bit-identical — that assertion is what stands between a gather bug and a
+/// silently corrupted metric. It used to force the split with the env var; the
+/// var is gone from production, so the seam is now explicitly test-only and
+/// cannot be reached by an export. `0` = inactive.
+#[cfg(test)]
+pub(crate) static TEST_GPU_BUFFER_CAP_MB: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn gpu_buffer_elem_cap() -> usize {
+    #[cfg(test)]
+    {
+        let mb = TEST_GPU_BUFFER_CAP_MB.load(std::sync::atomic::Ordering::Relaxed);
+        if mb > 0 {
+            let bytes = mb.saturating_mul(1024 * 1024);
+            return (bytes.saturating_div(8)).max(1) as usize;
+        }
+    }
+    let probed = GPU_BUFFER_CAP_BYTES.get().copied();
+    let budget_bytes = installed_memory_budgets()
+        .map(|b| b.gpu_buffer_mb)
+        .filter(|mb| *mb > 0)
+        .map(|mb| (mb as u64).saturating_mul(1024 * 1024));
+
+    let bytes = match probed {
+        // Use the probed cap, but let a (non-zero) budget CAP it. On a
+        // shared-memory GPU (integrated graphics) the probed device limit is
+        // the whole system RAM — far more than the fused/windowed path can fill
+        // without OOM — so the RAM-derived budget must bound it. On a discrete
+        // card the budget is left 0 (probe wins), unchanged.
+        Some(p) => match budget_bytes {
+            Some(b) => p.min(b),
+            None => p,
+        },
+        None => budget_bytes.unwrap_or(GPU_BUFFER_CAP_FLOOR),
+    };
+    (bytes.saturating_div(8)).max(1) as usize // 8 bytes/element (canonical f64 lane)
+}
+
+/// SAMPLE columns the signal-synth kernel can process in one launch so no buffer
+/// exceeds the cap. Per-window buffers: indicators window (`n_indicators × W`),
+/// signal/confidence outputs (`n_genes × W`), SMC window (`W × SMC_WIDTH`).
+fn signal_window_size(n_indicators: usize, n_genes: usize, n_samples: usize) -> usize {
+    let per_sample = n_indicators.max(n_genes).max(SMC_WIDTH).max(1);
+    (gpu_buffer_elem_cap() / per_sample).clamp(1, n_samples.max(1))
+}
+
+/// GENES the backtest kernel can process in one launch — its signal buffer is
+/// `B × n_samples`, and its confidence buffer is f64, so
+/// `B = cap / n_samples` uses the f64 element cap above.
+fn backtest_gene_batch(n_genes: usize, n_samples: usize) -> usize {
+    (gpu_buffer_elem_cap() / n_samples.max(1)).clamp(1, n_genes.max(1))
+}
+
+/// Conservative cap (bytes) on the cubecl GPU memory pool's RESERVED footprint.
+/// cubecl's wgpu pool is grow-only: it recycles freed buffers for reuse and does
+/// NOT return them to the driver, so across thousands of kernel launches (many
+/// windows × batches × generations) the reserved high-water mark climbs until it
+/// fills the card — this is why a 60k-row H1 run peaked at ~15GB on a 16GB card
+/// even though the live working set is only ~250MB. We probe the pool with
+/// `ComputeClient::memory_usage()` and, when `bytes_reserved` exceeds this cap,
+/// ask cubecl to release what it can via `memory_cleanup()`. The default is
+/// deliberately small so the engine NEVER OOMs on a modest discrete GPU
+/// regardless of how large a population/generations the user requests; the
+/// startup auto-tuner raises it on cards with more headroom.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB` DELETED. It was tried
+/// FIRST and never clamped, so an exported number could exceed the card and
+/// disable the pool trim this function exists to perform. The probe-derived
+/// budget (`auto_tune_memory_budgets`) is now the only input — memory tracks
+/// hardware, not user params.
+fn gpu_pool_budget_bytes() -> u64 {
+    const DEFAULT_MB: u64 = 3072;
+    installed_memory_budgets()
+        .map(|b| b.vram_budget_mb)
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// How many genes to evaluate per chunk so the host-side signal + confidence
+/// assembly (`chunk × n_samples × 12B`: i32 signal + f64 confidence) stays
+/// within a budget. This buffer is
+/// the ONLY population-dependent host allocation in the GPU path (the indicator
+/// matrix is data-sized, not population-sized), so chunking it makes peak host
+/// RAM a function of (budget, rows) and NOT of the requested population: a user
+/// can ask for an enormous population and it streams through in chunks instead
+/// of OOMing. Genes are evaluated independently, so a chunk split is numerically
+/// identical to one pass (CPU↔GPU parity preserved). The startup auto-tuner
+/// sizes the budget from available RAM.
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB` DELETED. This is the one
+/// with a measured body count: it was tried FIRST and never clamped against
+/// the probe, and the comment below records what an unclamped budget cost — a
+/// 200-gene M1 pass at 38 GB RSS, SIGSEGV. A user parameter that can raise a
+/// memory ceiling above the machine is the never-OOM invariant inverted.
+fn gene_chunk_size(n_genes: usize, n_samples: usize) -> usize {
+    const DEFAULT_MB: u64 = 1024;
+    // The signal+confidence assembly is 12 B/gene/sample, but during GPU
+    // upload+readback cubecl/wgpu transiently holds several COPIES of that data
+    // (host staging on the way to the device, plus the device→host readback),
+    // so the resident peak is empirically ~4-5× the logical buffer. Measured on
+    // an A4000: a full-population (200-gene) M1 pass with no copy margin hit 38GB
+    // RSS (~4.5× the 8.4GB buffer) and SIGSEGV'd, while a 12-gene chunk ran
+    // clean. We bake a 5× factor in so the budget means real RESIDENT RAM, not
+    // just the logical buffer — the user/auto-tuner can reason in true GB.
+    const HOST_OVERHEAD_FACTOR: u64 = 5;
+    let budget = installed_memory_budgets()
+        .map(|b| b.host_budget_mb)
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1024 * 1024);
+    let per_gene = (n_samples as u64)
+        .saturating_mul(12)
+        .saturating_mul(HOST_OVERHEAD_FACTOR)
+        .max(1);
+    ((budget / per_gene) as usize).clamp(1, n_genes.max(1))
+}
+
+/// Probe the cubecl memory pool and, if its RESERVED footprint exceeds the
+/// budget, ask cubecl to trim it (`memory_cleanup()` →
+/// `pool.cleanup(explicit=true)` + `storage.flush()`). This bounds the otherwise
+/// grow-only wgpu pool high-water mark so peak VRAM tracks the live working set,
+/// not the run length. Cheap when under budget (just a usage probe) and never
+/// fails the run — a probe error is ignored (CPU/GPU correctness is unaffected).
+///
+/// 2026-08-10: `NEOETHOS_BOT_SEARCH_VRAM_LOG=1` DELETED. Like the timing
+/// breakdown, this only ever printed, so it is a log level rather than a knob:
+/// raise `neoethos_search::cubecl_eval` to DEBUG.
+fn trim_gpu_pool_if_over_budget<R: Runtime>(client: &ComputeClient<R>) {
+    let usage = match client.memory_usage() {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let budget = gpu_pool_budget_bytes();
+    tracing::debug!(
+        target: "neoethos_search::cubecl_eval",
+        reserved_mb = usage.bytes_reserved / (1024 * 1024),
+        in_use_mb = usage.bytes_in_use / (1024 * 1024),
+        budget_mb = budget / (1024 * 1024),
+        "gpu pool footprint"
+    );
+    if usage.bytes_reserved > budget {
+        client.memory_cleanup();
+    }
+}
+
+/// Gather indicator columns `[s0, s1)` out of the indicator-major flat matrix
+/// (`[n_indicators × n_samples]`, indexed `idx*n_samples+s`) into a contiguous
+/// `[n_indicators × (s1-s0)]` window the kernel indexes as `idx*W + (s-s0)`.
+fn gather_indicator_window<F: Copy>(
+    indicators_flat: &[F],
+    n_indicators: usize,
+    n_samples: usize,
+    s0: usize,
+    s1: usize,
+) -> Vec<F> {
+    let wlen = s1 - s0;
+    let mut out = Vec::with_capacity(n_indicators.saturating_mul(wlen));
+    for idx in 0..n_indicators {
+        let base = idx * n_samples;
+        out.extend_from_slice(&indicators_flat[base + s0..base + s1]);
+    }
+    out
+}
+
+/// Run the (stateless, per-sample) signal-synth kernel over SAMPLE-windows so the
+/// indicators/signal buffers stay under the wgpu cap, assembling the full
+/// `[n_genes × n_samples]` signal + confidence series on the host. Windowing is
+/// exact (each sample is independent of the others) so the result is identical
+/// to a single whole-series launch — CPU↔GPU parity is preserved.
+fn windowed_signal_synth<R: Runtime>(
+    client: &ComputeClient<R>,
+    device_key: usize,
+    indicators_flat: &[f64],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    gate_threshold: f64,
+) -> Result<(Vec<i32>, Vec<f64>)> {
+    let w = signal_window_size(n_indicators, n_genes, n_samples);
+    let mut signals = vec![0i32; n_genes.saturating_mul(n_samples)];
+    let mut conf = vec![0.0f64; n_genes.saturating_mul(n_samples)];
+    let mut s0 = 0;
+    while s0 < n_samples {
+        let s1 = (s0 + w).min(n_samples);
+        let wlen = s1 - s0;
+        let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
+        let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<f64>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
+        let (sig_w, conf_w) = launch_signal_kernel::<R>(
+            client,
+            device_key,
+            &ind_window,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            smc_window,
+            gene_smc_flags_flat,
+            smc_weights,
+            n_genes,
+            wlen,
+            gate_threshold,
+        )?;
+        for gene in 0..n_genes {
+            let dst = gene * n_samples + s0;
+            let src = gene * wlen;
+            signals[dst..dst + wlen].copy_from_slice(&sig_w[src..src + wlen]);
+            conf[dst..dst + wlen].copy_from_slice(&conf_w[src..src + wlen]);
+        }
+        s0 = s1;
+        // Bound the pool across the (potentially thousands of) sample-windows a
+        // huge-row TF sweeps — without this the reserved high-water climbs
+        // through the whole signal-synth before the backtest even starts.
+        trim_gpu_pool_if_over_budget(client);
+    }
+    Ok((signals, conf))
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::{
+        backtest_gene_batch, cubecl_daily_drawdown_after_peak_transition,
+        cubecl_daily_drawdown_from_extrema, gather_indicator_window, gene_chunk_size,
+        signal_window_size,
+    };
+
+    #[test]
+    fn cubecl_daily_drawdown_arithmetic_uses_same_day_peak_and_low() {
+        let observed = cubecl_daily_drawdown_from_extrema(110_000.0, 105_000.0);
+        let expected = 5_000.0 / 110_000.0;
+        assert!((observed - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn cubecl_daily_drawdown_finalizes_the_previous_segment_before_a_new_peak() {
+        let observed = cubecl_daily_drawdown_after_peak_transition(
+            0.0, 100_000.0, 90_000.0, 110_000.0, 110_000.0,
+        );
+        assert!(
+            (observed - 0.10).abs() < 1.0e-12,
+            "the device arithmetic must retain the 100k -> 90k segment before resetting at 110k, got {observed}"
+        );
+    }
+
+    #[test]
+    fn gene_chunk_size_bounds_host_buffer_and_never_zero() {
+        // Default budget (1024MB, no env override in the test environment).
+        // Tiny rows -> whole population fits one chunk.
+        assert_eq!(gene_chunk_size(200, 1), 200);
+        // M1-like 6M rows: 12B/gene/sample × 5× copy-overhead factor -> a few
+        // genes/chunk, so the resident signal RAM (incl. transient GPU copies)
+        // stays inside the budget regardless of how big the population is.
+        let c = gene_chunk_size(200, 6_000_000);
+        assert!((2..=10).contains(&c), "M1 chunk = {c}");
+        // Absurd rows -> clamps to >=1 (never 0 -> no div-by-zero and the
+        // caller's `while c0 < n_genes` always advances). The never-OOM floor.
+        assert_eq!(gene_chunk_size(1_000_000, 2_000_000_000), 1);
+        // Chunk never exceeds the population.
+        assert_eq!(gene_chunk_size(50, 1), 50);
+    }
+
+    #[test]
+    fn gather_indicator_window_extracts_strided_columns() {
+        // 3 indicators × 5 samples, indicator-major flat: idx*5 + s.
+        let flat: Vec<i32> = (0..15).collect(); // ind0=[0..5] ind1=[5..10] ind2=[10..15]
+        // Window samples [1, 4) -> each indicator's [1,2,3] offset.
+        let w = gather_indicator_window(&flat, 3, 5, 1, 4);
+        assert_eq!(w, vec![1, 2, 3, 6, 7, 8, 11, 12, 13]);
+        // Full window == original.
+        assert_eq!(gather_indicator_window(&flat, 3, 5, 0, 5), flat);
+    }
+
+    #[test]
+    fn small_combo_is_one_window_and_one_batch() {
+        // n_samples small => the whole series fits one window / one batch.
+        assert_eq!(signal_window_size(64, 50, 10), 10);
+        assert_eq!(backtest_gene_batch(200, 100), 200);
+    }
+
+    #[test]
+    fn huge_combo_splits_into_multiple_windows_and_batches() {
+        // M1-like: 5.27M samples => sub-series windows + small gene batches.
+        let w = signal_window_size(64, 50, 5_270_000);
+        assert!(w >= 1 && w < 5_270_000, "got {w}");
+        let b = backtest_gene_batch(200, 5_270_000);
+        assert!(b >= 1 && b < 200, "got {b}");
+        // The full series is covered by an integer number of windows.
+        let windows = 5_270_000usize.div_ceil(w);
+        assert!(windows >= 2);
+    }
+}
+
+// `wgpu_device_selector_tests` DELETED 2026-08-10 with
+// `parse_wgpu_device_selector`. It tested the parser for
+// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE`; the device now comes from the
+// `device_override` argument the multi-GPU scheduler passes, which needs no
+// string parsing and therefore no parser test.
+
+fn launch_signal_kernel<R: Runtime>(
+    client: &ComputeClient<R>,
+    device_key: usize,
+    indicators_flat: &[f64],
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    smc_data: &[i32],
+    gene_smc_flags: &[i32],
+    smc_weights: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    gate_threshold: f64,
+) -> Result<(Vec<i32>, Vec<f64>)> {
+    let total = n_genes.saturating_mul(n_samples);
+    if total == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // **CRITICAL for real-money trading**: validate every kernel input
+    // BEFORE handing buffers to the GPU. Bad GA-evolved indices silently
+    // read garbage memory in CUDA, producing wrong trading signals with
+    // no error path. The check is O(n_genes + total_entries) — negligible
+    // next to the kernel's own work.
+    validate_signal_kernel_inputs(
+        indicators_flat,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data,
+        gene_smc_flags,
+        smc_weights,
+        n_genes,
+        n_samples,
+    )
+    .context("signal kernel input validation failed")?;
+
+    // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; unchanged otherwise).
+    // The two per-unit-CONSTANT arrays (the indicator matrix + SMC rows) come
+    // from the resident cache — uploaded ONCE per unit, reused across every
+    // generation. This is the per-launch-overhead fix: PCIe re-uploads of the
+    // (potentially GB-scale) indicator matrix dominated the ~1000× GPU-lane
+    // slowdown the hybrid splitter measured. Per-generation arrays (gene
+    // weights/thresholds — a few KB) still upload fresh each call.
+    let (
+        indicators_handle,
+        gene_offsets_handle,
+        gene_indices_handle,
+        gene_weights_handle,
+        long_thr_handle,
+        short_thr_handle,
+        smc_data_handle,
+        gene_smc_flags_handle,
+        smc_weights_handle,
+        output_handle,
+        conf_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            resident_device_cache::get_or_upload(
+                client,
+                device_key,
+                resident_device_cache::SLOT_INDICATORS,
+                f64::as_bytes(indicators_flat),
+            ),
+            client.create_from_slice(i32::as_bytes(gene_offsets)),
+            client.create_from_slice(i32::as_bytes(gene_indices)),
+            client.create_from_slice(f64::as_bytes(gene_weights)),
+            client.create_from_slice(f64::as_bytes(long_thr)),
+            client.create_from_slice(f64::as_bytes(short_thr)),
+            resident_device_cache::get_or_upload(
+                client,
+                device_key,
+                resident_device_cache::SLOT_SMC_DATA,
+                i32::as_bytes(smc_data),
+            ),
+            client.create_from_slice(i32::as_bytes(gene_smc_flags)),
+            client.create_from_slice(f64::as_bytes(smc_weights)),
+            client.empty(total.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(total.saturating_mul(std::mem::size_of::<f64>())),
+        )
+    });
+
+    let units = signal_kernel_units(client);
+    let cubes = (total as u32).div_ceil(units);
+    // cubecl 0.10: `from_raw_parts(handle, len)` takes the Handle BY VALUE (no
+    // generic, no vectorization arg), so clone each (cheap, Arc-backed) to keep
+    // the originals alive for the read-back. Scalars are passed as raw values
+    // (the 0.10 `LaunchArg for T` impl, replacing 0.9's `ScalarArg::new`). The
+    // generated `launch` is infallible (returns `()`), so no `.context()?`.
+    // KERNEL phase (timed).
+    gpu_timing::kernel(|| {
+        synthesize_signals_kernel::launch::<f64, R>(
+            client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(units),
+            unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), indicators_flat.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len()) },
+            unsafe { ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+            unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_data.len()) },
+            unsafe {
+                ArrayArg::from_raw_parts(gene_smc_flags_handle.clone(), gene_smc_flags.len())
+            },
+            unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+            unsafe { ArrayArg::from_raw_parts(output_handle.clone(), total) },
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            n_samples as u32,
+            0,
+            gate_threshold,
+        );
+    }); // end gpu_timing::kernel
+
+    // READBACK phase (timed): blocking VRAM→host copy that syncs the kernel.
+    let (bytes, conf_bytes) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(output_handle),
+            client.read_one_unchecked(conf_handle),
+        )
+    });
+    Ok((
+        i32::from_bytes(&bytes).to_vec(),
+        f64::from_bytes(&conf_bytes).to_vec(),
+    ))
+}
+
+fn try_generate_signal_flat_cuda(
+    indicators: ArrayView2<'_, f64>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f64,
+    smc_weights: &[f64; SMC_WIDTH],
+    device_override: Option<usize>,
+) -> Result<(Vec<i32>, Vec<f64>)> {
+    let n_genes = long_thr.len();
+    let n_samples = indicators.ncols();
+    if n_genes == 0 || n_samples == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if gene_offsets.len() != n_genes + 1 {
+        bail!(
+            "cuda evaluator signal kernel gene_offsets mismatch: expected {}, received {}",
+            n_genes + 1,
+            gene_offsets.len()
+        );
+    }
+    if short_thr.len() != n_genes
+        || gene_smc_flags.len() != n_genes
+        || smc_data.len() != n_samples
+        || indicators.nrows() == 0
+    {
+        bail!("cuda evaluator signal kernel received inconsistent dimensions");
+    }
+
+    let client = create_gpu_client(device_override)?;
+
+    let indicators_flat = indicators.iter().copied().collect::<Vec<_>>();
+    let smc_data_flat = flatten_i32_rows(smc_data);
+    let gene_smc_flags_flat = flatten_i32_flags(gene_smc_flags);
+    let n_indicators = indicators.nrows();
+    windowed_signal_synth::<_>(
+        &client,
+        device_override.unwrap_or(0),
+        &indicators_flat,
+        n_indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        &smc_data_flat,
+        &gene_smc_flags_flat,
+        smc_weights,
+        n_genes,
+        n_samples,
+        gate_threshold,
+    )
+    .context("launch f64 cuda evaluator signal kernel")
+}
+
+fn saturating_i32(value: i64) -> i32 {
+    // Note — emit a one-line WARN when we actually saturate
+    // so the operator can detect it (was previously silent). The four
+    // callsites (timestamp deltas, gap-threshold config, month/day idx)
+    // all expect values that comfortably fit in i32 for normal trading
+    // data; if we ever DO saturate, the kernel result is wrong and we
+    // want it in the log. The cost (one branch per element on the rare
+    // path) is negligible vs. the cost of debugging a silent wrong-
+    // result later.
+    if value > i32::MAX as i64 || value < i32::MIN as i64 {
+        tracing::warn!(
+            target: "neoethos_search::cubecl_eval",
+            value = value,
+            "i64 → i32 saturation in cubecl_eval kernel input: value clamped — \
+             check upstream data magnitudes (timestamp delta > 24.8 days? \
+             gap_threshold_ms > i32::MAX? month/day idx out of range?)"
+        );
+    }
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+fn timestamp_delta_ms(timestamps: &[i64], n_samples: usize) -> (Vec<i32>, bool) {
+    let mut deltas = vec![0i32; n_samples];
+    if timestamps.len() != n_samples {
+        return (deltas, false);
+    }
+    for i in 1..n_samples {
+        let delta = timestamps[i].saturating_sub(timestamps[i - 1]).max(0);
+        deltas[i] = saturating_i32(delta);
+    }
+    (deltas, true)
+}
+
+fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f64> {
+    let safe_pip = if pip_value.abs() < 1e-12 {
+        1e-12
+    } else {
+        pip_value
+    };
+    prices.iter().map(|price| *price / safe_pip).collect()
+}
+
+// Host side of the canonical f64 backtest kernel.
+macro_rules! define_launch_backtest_kernel {
+    ($name:ident, $kernel:ident, $f:ty) => {
+        fn $name<R: Runtime>(
+            client: &ComputeClient<R>,
+            device_key: usize,
+            close_pips: &[f64],
+            high_pips: &[f64],
+            low_pips: &[f64],
+            signals_flat: &[i32],
+            confidences_flat: &[f64],
+            timestamp_deltas_ms: &[i32],
+            use_timestamps: bool,
+            month_idx: &[i32],
+            day_idx: &[i32],
+            sl_pips: &[f64],
+            tp_pips: &[f64],
+            // Per-gene adaptive volatility multiplier (empty / all-zero ⇒ fixed-stop
+            // path). Pairs with `settings.adaptive_base_pips` + `settings.adaptive_rr`.
+            stop_vol_mult: &[f64],
+            settings: &BacktestSettings,
+            month_capacity: usize,
+        ) -> Result<(Vec<$f>, Vec<i32>, Vec<$f>, Vec<i32>, Vec<$f>, Vec<$f>)> {
+            // The macro remains shared with the device kernel body, but it is
+            // instantiated only for f64. These copies preserve the canonical
+            // host precision exactly; there is no narrowing bridge.
+            let close_pips: Vec<$f> = close_pips.iter().map(|&v| v as $f).collect();
+            let high_pips: Vec<$f> = high_pips.iter().map(|&v| v as $f).collect();
+            let low_pips: Vec<$f> = low_pips.iter().map(|&v| v as $f).collect();
+            let sl_pips: Vec<$f> = sl_pips.iter().map(|&v| v as $f).collect();
+            let tp_pips: Vec<$f> = tp_pips.iter().map(|&v| v as $f).collect();
+            let confidences_flat: Vec<$f> = confidences_flat.iter().map(|&v| v as $f).collect();
+            let n_samples = close_pips.len();
+            let n_genes = sl_pips.len();
+            if n_samples == 0 || n_genes == 0 {
+                return Ok((
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            if high_pips.len() != n_samples
+                || low_pips.len() != n_samples
+                || timestamp_deltas_ms.len() != n_samples
+                || month_idx.len() != n_samples
+                || day_idx.len() != n_samples
+                || tp_pips.len() != n_genes
+                || signals_flat.len() != n_genes.saturating_mul(n_samples)
+                || confidences_flat.len() != n_genes.saturating_mul(n_samples)
+            {
+                bail!("cuda evaluator backtest kernel received inconsistent dimensions");
+            }
+
+            // Device UPLOAD phase (timed under NEOETHOS_GPU_TIMING; runs unchanged
+            // otherwise). All `create_from_slice` (host→VRAM copies) + `empty` (output
+            // allocations) are the per-launch device-buffer setup the breakdown isolates.
+            let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+            let monthly_len = n_genes.saturating_mul(month_capacity);
+            let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+            let (
+                close_handle,
+                high_handle,
+                low_handle,
+                signals_handle,
+                conf_handle,
+                timestamp_delta_handle,
+                month_handle,
+                day_handle,
+                sl_handle,
+                tp_handle,
+                metrics_handle,
+                trade_counts_handle,
+                monthly_handle,
+                month_start_eq_handle,
+                month_counts_handle,
+                ftmo_handle,
+            ) = gpu_timing::upload(|| {
+                use resident_device_cache as rc;
+                (
+                    // Per-unit-CONSTANT series (prices/time indices): resident across
+                    // launches — uploaded once, reused every generation/batch. The
+                    // per-generation payloads (signals/confidences — they change each
+                    // call) still upload fresh.
+                    rc::get_or_upload(
+                        client,
+                        device_key,
+                        rc::SLOT_CLOSE,
+                        <$f>::as_bytes(&close_pips),
+                    ),
+                    rc::get_or_upload(
+                        client,
+                        device_key,
+                        rc::SLOT_HIGH,
+                        <$f>::as_bytes(&high_pips),
+                    ),
+                    rc::get_or_upload(client, device_key, rc::SLOT_LOW, <$f>::as_bytes(&low_pips)),
+                    client.create_from_slice(i32::as_bytes(signals_flat)),
+                    client.create_from_slice(<$f>::as_bytes(&confidences_flat)),
+                    rc::get_or_upload(
+                        client,
+                        device_key,
+                        rc::SLOT_TS_DELTAS,
+                        i32::as_bytes(timestamp_deltas_ms),
+                    ),
+                    rc::get_or_upload(
+                        client,
+                        device_key,
+                        rc::SLOT_MONTH_IDX,
+                        i32::as_bytes(month_idx),
+                    ),
+                    rc::get_or_upload(client, device_key, rc::SLOT_DAY_IDX, i32::as_bytes(day_idx)),
+                    client.create_from_slice(<$f>::as_bytes(&sl_pips)),
+                    client.create_from_slice(<$f>::as_bytes(&tp_pips)),
+                    client.empty(metrics_len.saturating_mul(std::mem::size_of::<$f>())),
+                    client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+                    client.empty(monthly_len.saturating_mul(std::mem::size_of::<$f>())),
+                    client.empty(monthly_len.saturating_mul(std::mem::size_of::<$f>())),
+                    client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+                    client.empty(ftmo_len.saturating_mul(std::mem::size_of::<$f>())),
+                )
+            });
+
+            let units = backtest_kernel_units(client);
+            let cubes = (n_genes as u32).div_ceil(units);
+            // Adaptive-stop kernel args. When the settings carry a per-bar base vol
+            // series aligned to n_samples AND some gene has a positive multiplier, upload
+            // the REAL base ($f) + per-gene multiplier and use settings.adaptive_rr;
+            // otherwise inert dummies (all-zero multiplier ⇒ the kernel's
+            // `stop_vol_mult[gene] > 0` check is always false ⇒ the scalar sl/tp path,
+            // byte-identical). base + rr ride on `settings` (already threaded); the length
+            // guard keeps a windowed slice from mis-indexing the full-series base.
+            let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
+                && settings
+                    .adaptive_base_pips
+                    .as_ref()
+                    .map(|b| b.len() == n_samples)
+                    .unwrap_or(false);
+            let (base_vals, mult_vals): (Vec<$f>, Vec<$f>) = if adaptive_on {
+                let base = settings.adaptive_base_pips.as_ref().unwrap();
+                (
+                    base.iter().map(|&d| d as $f).collect(),
+                    stop_vol_mult.iter().map(|&m| m as $f).collect(),
+                )
+            } else {
+                (vec![0.0], vec![0.0; n_genes])
+            };
+            let base_len = base_vals.len();
+            let adaptive_rr_val = if adaptive_on {
+                settings.adaptive_rr as $f
+            } else {
+                2.0
+            };
+            let base_pips_dummy = client.create_from_slice(<$f>::as_bytes(&base_vals));
+            let stop_vol_mult_dummy = client.create_from_slice(<$f>::as_bytes(&mult_vals));
+            // cubecl 0.10 migration: Handle-by-value `from_raw_parts(handle, len)`
+            // (clone to keep originals for read-back), raw-value scalars (no
+            // `ScalarArg::new`), infallible `launch` (no `.context()?`).
+            // KERNEL phase (timed). Note: cubecl launches are ASYNC enqueues, so most of
+            // the real GPU time is realized at the readback sync below — the split still
+            // tells the operator whether launch-enqueue itself is a bottleneck.
+            gpu_timing::kernel(|| {
+                $kernel::launch::<R>(
+                    client,
+                    CubeCount::Static(cubes, 1, 1),
+                    CubeDim::new_1d(units),
+                    unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+                    unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+                    unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+                    unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), signals_flat.len()) },
+                    unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+                    unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+                    unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+                    unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+                    unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+                    unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+                    unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+                    unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+                    unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+                    n_samples as u32,
+                    0,
+                    n_genes as u32,
+                    month_capacity as u32,
+                    settings.initial_equity() as $f,
+                    settings.max_hold_bars as u32,
+                    settings.min_hold_bars as u32,
+                    settings.max_trades_per_day as u32,
+                    saturating_i32(settings.gap_threshold_ms),
+                    if use_timestamps { 1i32 } else { 0i32 },
+                    if settings.trailing_enabled {
+                        1i32
+                    } else {
+                        0i32
+                    },
+                    settings.trailing_atr_multiplier as $f,
+                    settings.trailing_be_trigger_r as $f,
+                    settings.trailing_min_lock_pips as $f,
+                    settings.spread_pips as $f,
+                    settings.commission_per_trade as $f,
+                    settings.pip_value_per_lot as $f,
+                    // Phase C.3 (2026-05-28) — broker-supplied carry costs.
+                    settings.swap_long_pips_per_day as $f,
+                    settings.swap_short_pips_per_day as $f,
+                    settings.pnl_conversion_fee_rate as $f,
+                    // Phase 2 (2026-06-06) — confidence-scaled risk-based sizing knobs +
+                    // per-month start-equity output for slot-7. ORDER MUST MATCH the kernel
+                    // signature appended after pnl_conversion_fee_rate.
+                    unsafe {
+                        ArrayArg::from_raw_parts(conf_handle.clone(), confidences_flat.len())
+                    },
+                    if settings.risk_based_sizing {
+                        1i32
+                    } else {
+                        0i32
+                    },
+                    settings.risk_per_trade_min as $f,
+                    settings.risk_per_trade_max as $f,
+                    settings.high_quality_confidence as $f,
+                    unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
+                    unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+                    adaptive_rr_val,
+                    unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+                    // FTMO prop-firm observables — LAST kernel argument (matches the kernel
+                    // signature). `n_genes * FTMO_WIDTH` values laid out per gene.
+                    unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+                );
+            }); // end gpu_timing::kernel
+
+            // READBACK phase (timed). `read_one_unchecked` is the blocking VRAM→host copy
+            // that also SYNCS the queued kernel, so this is where async GPU time is realized.
+            let (
+                metrics_bytes,
+                trade_counts_bytes,
+                monthly_bytes,
+                month_counts_bytes,
+                month_start_eq_bytes,
+                ftmo_bytes,
+            ) = gpu_timing::readback(|| {
+                (
+                    client.read_one_unchecked(metrics_handle),
+                    client.read_one_unchecked(trade_counts_handle),
+                    client.read_one_unchecked(monthly_handle),
+                    client.read_one_unchecked(month_counts_handle),
+                    client.read_one_unchecked(month_start_eq_handle),
+                    client.read_one_unchecked(ftmo_handle),
+                )
+            });
+
+            Ok((
+                <$f>::from_bytes(&metrics_bytes).to_vec(),
+                i32::from_bytes(&trade_counts_bytes).to_vec(),
+                <$f>::from_bytes(&monthly_bytes).to_vec(),
+                i32::from_bytes(&month_counts_bytes).to_vec(),
+                <$f>::from_bytes(&month_start_eq_bytes).to_vec(),
+                <$f>::from_bytes(&ftmo_bytes).to_vec(),
+            ))
+        }
+    };
+}
+
+define_launch_backtest_kernel!(launch_backtest_kernel, backtest_population_kernel, f64);
+
+/// Device-side copy of one sample-WINDOW of synthesized signals/conf into the
+/// correct slice of the full-series PERSISTENT VRAM buffer — the mechanism that
+/// lets the fused path keep signals VRAM-resident even when the signal synth
+/// must window the sample axis (heavy TFs like M1, 6M rows). `src` is the
+/// window buffer (genes×wlen, gene-contiguous); `dst` is the persistent buffer
+/// (genes×full_samples). Generic over T so the SAME kernel copies i32 signals
+/// and f64 confidences. **2026-06-10 — M1/general fused path.**
+#[cube(launch)]
+fn copy_window_into_persistent<T: CubePrimitive>(
+    src: &Array<T>,
+    dst: &mut Array<T>,
+    wlen: u32,
+    full_samples: u32,
+    s0: u32,
+    valid_len: u32,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos < valid_len as usize {
+        let wlen = wlen as usize;
+        let gene = pos / wlen;
+        let sample = pos % wlen;
+        let dpos = gene * (full_samples as usize) + (s0 as usize) + sample;
+        dst[dpos] = src[pos];
+    }
+}
+
+/// Build a tiny deterministic combo and run BOTH the windowed host path and the
+/// fused VRAM-resident path on `client`, returning `true` iff every per-gene
+/// output buffer is bit-for-bit identical AND the combo produced real
+/// (non-trivial) signals. This is the EXACT check the
+/// [`fused_parity_tests::fused_path_is_byte_identical_to_windowed_path`] test
+/// asserts, factored out so the discovery startup gate can self-verify the fast
+/// path on the actual card before enabling it — the fast path never turns on
+/// where it is not provably safe. A trivial combo (no signals) can't prove
+/// parity and returns `false`. Every bit mismatch is logged (which buffer) so a
+/// future divergence is diagnosable from the discovery log alone.
+///
+/// `FUSED_TEST_NSAMPLES` forces the MULTI-window accumulator path (e.g. 200000 +
+/// a tiny `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB=1` cap → many signal windows); the
+/// default 300 is a single window that runs in well under a second.
+///
+/// Why the fast (default) single-window probe is a COMPLETE card/driver gate:
+/// windowing partitions a *map* (per-sample signal synth, each sample
+/// independent), not a *reduce* — it re-runs the SAME synth kernel on sub-ranges
+/// and stitches the results with bit-exact integer memcpys, adding no new
+/// floating-point op. So a card that is byte-identical single-window is
+/// byte-identical multi-window; the probe only needs to catch a card/driver
+/// where the fused KERNELS themselves diverge (precision/rounding), which shows
+/// up in one window. The multi-window accumulator keeps its own coverage via the
+/// `FUSED_TEST_NSAMPLES` knob and the `gpu_population_eval_matches_cpu_heavy_rows`
+/// parity test.
+#[cfg(feature = "gpu")]
+fn fused_path_parity_holds<R: Runtime>(client: &ComputeClient<R>) -> Result<bool> {
+    // 2026-08-10: `FUSED_TEST_NSAMPLES` DELETED. It was catalogued as a test
+    // knob; it is not — this function is `#[cfg(feature = "gpu")]`, not
+    // `#[cfg(test)]`, and runs on every production GPU startup. What it did was
+    // make the self-check probe slower on purpose. The doc above already argues
+    // that the single-window probe is a COMPLETE card/driver gate, and the
+    // multi-window accumulator's coverage lives in
+    // `gpu_population_eval_matches_cpu_heavy_rows`, which forces its windows
+    // through the `#[cfg(test)]` buffer-cap seam rather than an export.
+    // 300 = a single signal window that runs in well under a second.
+    let n_samples: usize = 300;
+    let n_genes = 3usize;
+    let n_indicators = 2usize;
+
+    let close: Vec<f64> = (0..n_samples)
+        .map(|i| 1.10 + 0.005 * (i as f64 * 0.1).sin())
+        .collect();
+    // WIDE intrabar range (±60 pips) so a fixed SL/TP is hit intrabar and the
+    // position actually CLOSES (trade_count increments on close).
+    let high: Vec<f64> = close.iter().map(|c| c + 0.006).collect();
+    let low: Vec<f64> = close.iter().map(|c| c - 0.006).collect();
+
+    // STRONG ±5 square-wave indicators (indicator-major flat) → clean alternating
+    // signal with transitions every 30/45 bars so the backtest opens/closes real
+    // trades (the meaningfulness guard below).
+    let mut ind_flat = Vec::with_capacity(n_indicators * n_samples);
+    ind_flat.extend((0..n_samples).map(|i| if (i / 30) % 2 == 0 { 5.0f64 } else { -5.0 }));
+    ind_flat.extend((0..n_samples).map(|i| if (i / 45) % 2 == 0 { 5.0f64 } else { -5.0 }));
+    let indicators = ndarray::Array2::from_shape_vec((n_indicators, n_samples), ind_flat)
+        .map_err(|e| anyhow::anyhow!("fused parity probe: indicator shape error: {e}"))?;
+
+    // CSR genes: g0→ind0, g1→ind1, g2→0.5·ind0+0.5·ind1.
+    let gene_offsets: Vec<i32> = vec![0, 1, 2, 4];
+    let gene_indices: Vec<i32> = vec![0, 1, 0, 1];
+    let gene_weights: Vec<f64> = vec![1.0, 1.0, 0.5, 0.5];
+    let long_thr: Vec<f64> = vec![0.5, 0.5, 0.5];
+    let short_thr: Vec<f64> = vec![-0.5, -0.5, -0.5];
+
+    let timestamps: Vec<i64> = (0..n_samples)
+        .map(|i| 1_600_000_000_000 + i as i64 * 3_600_000)
+        .collect();
+    let month_div = (n_samples / 4).max(1) as i64;
+    let day_div = (n_samples / 60).max(1) as i64;
+    let month_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / month_div).collect();
+    let day_idx: Vec<i64> = (0..n_samples).map(|i| i as i64 / day_div).collect();
+    let sl_pips: Vec<f64> = vec![20.0, 15.0, 30.0];
+    let tp_pips: Vec<f64> = vec![40.0, 30.0, 60.0];
+    let smc_data: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_samples];
+    let gene_smc_flags: Vec<SmcRow> = vec![[0i8; SMC_WIDTH]; n_genes];
+    let gate_threshold = 0.0f64;
+    let smc_weights = [0.0f64; SMC_WIDTH];
+    // Fixed 1-lot sizing — matches the production gate (the backtest core gets no
+    // confidences) so the synthetic combo actually opens trades.
+    let mut settings = BacktestSettings::default();
+    settings.risk_based_sizing = false;
+    settings.min_hold_bars = 0;
+    settings.max_hold_bars = 3;
+    let month_capacity = settings.month_capacity();
+
+    // ── WINDOWED path: synth signals to host, then backtest (re-upload). ──
+    let (sig, conf) = try_generate_signal_flat_cuda(
+        indicators.view(),
+        &gene_offsets,
+        &gene_indices,
+        &gene_weights,
+        &long_thr,
+        &short_thr,
+        &smc_data,
+        &gene_smc_flags,
+        gate_threshold,
+        &smc_weights,
+        None,
+    )?;
+
+    let close_pips = normalize_prices_to_pips(&close, settings.pip_value);
+    let high_pips = normalize_prices_to_pips(&high, settings.pip_value);
+    let low_pips = normalize_prices_to_pips(&low, settings.pip_value);
+    let (ts_deltas, use_ts) = timestamp_delta_ms(&timestamps, n_samples);
+    let month_i32: Vec<i32> = month_idx.iter().map(|v| saturating_i32(*v)).collect();
+    let day_i32: Vec<i32> = day_idx.iter().map(|v| saturating_i32(*v)).collect();
+    let sl_f32: Vec<f64> = sl_pips.to_vec();
+    let tp_f32: Vec<f64> = tp_pips.to_vec();
+
+    let (mw, tcw, mow, mcw, msew, _ftmo_w) = launch_backtest_kernel(
+        client,
+        0,
+        &close_pips,
+        &high_pips,
+        &low_pips,
+        &sig,
+        &conf,
+        &ts_deltas,
+        use_ts,
+        &month_i32,
+        &day_i32,
+        &sl_f32,
+        &tp_f32,
+        &[], // fixed-stop parity fixture: no adaptive multiplier
+        &settings,
+        month_capacity,
+    )?;
+
+    // ── FUSED path: signals stay in VRAM, fed straight to the backtest. ──
+    let indicators_f64: Vec<f64> = indicators.iter().copied().collect();
+    let smc_flat = flatten_i32_rows(&smc_data);
+    let flags_flat = flatten_i32_flags(&gene_smc_flags);
+    let (mf, tcf, mof, mcf, msef, _ftmo_f) = fused_signal_backtest_batch(
+        client,
+        &indicators_f64,
+        n_indicators,
+        &gene_offsets,
+        &gene_indices,
+        &gene_weights,
+        &long_thr,
+        &short_thr,
+        &smc_flat,
+        &flags_flat,
+        &smc_weights,
+        gate_threshold,
+        &close_pips,
+        &high_pips,
+        &low_pips,
+        &ts_deltas,
+        use_ts,
+        &month_i32,
+        &day_i32,
+        &sl_f32,
+        &tp_f32,
+        &[], // fixed-stop parity fixture
+        &settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )?;
+
+    // BIT-for-bit equality: compare raw bit patterns (not `==`) so a legitimately
+    // equal NaN (same bits, produced identically by both paths) counts as equal.
+    fn bits_eq(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+    let sig_nonzero = sig.iter().filter(|s| **s != 0).count();
+    let mut ok = true;
+    if !bits_eq(&mw, &mf) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: metrics_flat mismatch");
+        ok = false;
+    }
+    if tcw != tcf {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: trade_counts mismatch");
+        ok = false;
+    }
+    if !bits_eq(&mow, &mof) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: monthly_flat mismatch");
+        ok = false;
+    }
+    if mcw != mcf {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: month_counts mismatch");
+        ok = false;
+    }
+    if !bits_eq(&msew, &msef) {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: month_start_eq_flat mismatch");
+        ok = false;
+    }
+    // Meaningfulness guard: a combo that produced no signals can't prove parity.
+    if sig_nonzero == 0 {
+        tracing::warn!(target: "neoethos_search::cubecl_eval", "fused parity probe: synthetic combo produced no signals — parity not established");
+        ok = false;
+    }
+    tracing::info!(
+        target: "neoethos_search::cubecl_eval",
+        signals_nonzero = sig_nonzero,
+        n_samples,
+        byte_identical = ok,
+        "fused VRAM-resident parity probe complete"
+    );
+    Ok(ok)
+}
+
+/// Whether the fused VRAM-resident eval is active for this process. The fast
+/// path keeps the genes×samples signal matrix on the GPU — eliminating the
+/// signal readback (measured 688ms on the A6000, vs a 0.09ms kernel) and the
+/// matching re-upload — so the win is largest on DENSE timeframes (M1/M5, the
+/// most bars) and discrete cards. Resolution order (there is NO operator
+/// override: the `NEOETHOS_GPU_FUSED_EVAL` env knob was DELETED 2026-08-10 —
+/// see `resolve_fused_eval_enabled`):
+///   1. integrated / shared-memory GPU → OFF (the fused path OOMs there);
+///   2. otherwise AUTO — run the byte-parity self-check on THIS machine's GPU and
+///      enable iff the fused path is bit-for-bit identical to the proven windowed
+///      path. Any mismatch / error / panic keeps the windowed path (fail-safe;
+///      parity is sacred on the real-money path).
+///
+/// Was default-OFF behind a hidden env var (task #39, 2026-06-10). Made
+/// self-enabling 2026-07-22 per the operator directive "anything that can give
+/// acceleration must happen automatically" — the probe reuses the same check the
+/// parity test asserts, so the fast path turns itself on wherever it is proven
+/// safe (e.g. the A6000) with zero tuning. Memoised: the probe runs once.
+/// The memoised fused-eval decision. Module-scope (not function-local) so the
+/// run profile can PEEK the decision that was actually made without forcing
+/// the probe — see [`fused_eval_decision_peek`].
+static FUSED_EVAL_DECISION: OnceLock<bool> = OnceLock::new();
+
+fn fused_eval_enabled() -> bool {
+    *FUSED_EVAL_DECISION.get_or_init(resolve_fused_eval_enabled)
+}
+
+/// Non-forcing read of the fused-eval decision for the discovery run profile.
+/// `Some(x)` = the decision this process made (env override or auto-probe);
+/// `None` = the fused-eval path was never consulted, so it cannot have
+/// influenced the run. Deliberately does NOT call the resolver: profile
+/// capture must never launch GPU work as a side effect.
+pub(crate) fn fused_eval_decision_peek() -> Option<bool> {
+    FUSED_EVAL_DECISION.get().copied()
+}
+
+/// Serializable snapshot of the CUDA env-knob registry for the discovery run
+/// profile. Values come from the SAME memoised [`cuda_env_knobs`] the kernels
+/// read — the profile can therefore not disagree with the engine.
+#[derive(Debug, Clone)]
+pub(crate) struct CudaKnobsForProfile {
+    pub precision: String,
+    pub eval_kernel_enabled: bool,
+    pub backtest_kernel_enabled: bool,
+    pub eval_kernel_units: Option<u32>,
+    pub backtest_kernel_units: Option<u32>,
+    pub cuda_device_id: usize,
+}
+
+pub(crate) fn cuda_knobs_for_profile() -> CudaKnobsForProfile {
+    let knobs = cuda_env_knobs();
+    CudaKnobsForProfile {
+        precision: "Fp64".to_string(),
+        eval_kernel_enabled: knobs.eval_kernel_enabled,
+        backtest_kernel_enabled: knobs.backtest_kernel_enabled,
+        eval_kernel_units: knobs.eval_kernel_units_override,
+        backtest_kernel_units: knobs.backtest_kernel_units_override,
+        cuda_device_id: knobs.cuda_device_id,
+    }
+}
+
+/// Non-forcing read of the installed hardware memory budgets for the run
+/// profile: `(host_budget_mb, vram_budget_mb, gpu_buffer_mb)`. `None` = the
+/// auto-tuner never ran in this process (budgets could not have shaped any
+/// windowing decision). Peek only — capturing a profile must not trigger the
+/// hardware probe.
+pub(crate) fn memory_budgets_for_profile() -> Option<(u64, u64, usize)> {
+    installed_memory_budgets().map(|b| (b.host_budget_mb, b.vram_budget_mb, b.gpu_buffer_mb))
+}
+
+fn resolve_fused_eval_enabled() -> bool {
+    // 2026-08-10: the `NEOETHOS_GPU_FUSED_EVAL` override that used to sit here
+    // is DELETED. Auto-detection decides whether fusion fits the active CubeCL
+    // device; an ambient override is not part of the engine contract.
+    //
+    // Make sure the hardware-sized budgets are installed before we read the
+    // integrated-GPU marker below — the app's discovery path calls this first, but
+    // the lighter `search` CLI path does not. `auto_tune_memory_budgets` is
+    // idempotent (first install wins), so this is a no-op when it already ran.
+    auto_tune_memory_budgets();
+    // INTEGRATED-GPU GATE (2026-07-24, real-data verdict): on a shared-memory GPU
+    // the fused path is a NET LOSS and it OOMs. The auto-tuner marks such a device
+    // by installing a non-zero `gpu_buffer_mb` (the discrete-card branch leaves it
+    // 0 — see `auto_tune_memory_budgets`). Measured on the AMD iGPU (Ryzen 5
+    // 5675U, real M5 EURUSD): the fused path keeps the whole genes×samples signal
+    // matrix VRAM-resident, whose peak exceeds the iGPU's tiny Vulkan device-local
+    // heap (far below its advertised 2 GB per-buffer limit) → `wgpu error: Out of
+    // Memory` EVERY generation, then a CPU recompute. The proven WINDOWED path,
+    // by contrast, reads each window back to host so its peak is one window — it
+    // runs there without OOM and the hybrid splitter measures it fairly (and, since
+    // the kernel is 0.09 ms but per-call upload/readback is ~1 s on the shared bus,
+    // correctly demotes it toward the CPU). So on an integrated GPU we skip the
+    // fused probe entirely and stay windowed. The explicit env override above still
+    // wins, so a user who wants to test fusion on their iGPU can force it.
+    if installed_memory_budgets().is_some_and(|b| b.gpu_buffer_mb > 0) {
+        tracing::info!(
+            target: "neoethos_search::cubecl_eval",
+            "fused VRAM-resident eval left OFF — integrated/shared-memory GPU detected (its device-local heap is too small for the VRAM-resident signal matrix; the fused path OOMs there). Using the proven windowed path, which the hybrid splitter demotes to the CPU if the GPU is slower. There is no override — this is auto-detected from the device probe."
+        );
+        return false;
+    }
+    // AUTO: `create_gpu_client` + the kernels can panic on a cubecl pool edge
+    // (#243) — catch it so a probe failure is fail-safe (stay windowed), never a
+    // crashed discovery. `AssertUnwindSafe` because the client/kernels aren't
+    // `UnwindSafe` but nothing observable is left half-mutated on a panic here.
+    let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        let client = create_gpu_client(None)?;
+        fused_path_parity_holds(&client)
+    }));
+    match probed {
+        Ok(Ok(true)) => {
+            tracing::info!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval AUTO-ENABLED — startup parity check is byte-identical to the windowed path on this GPU; dense timeframes now run fully on the card (no host round-trip)"
+            );
+            true
+        }
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval left OFF — startup parity check did not match the windowed path bit-for-bit on this GPU; staying on the proven windowed path (fail-safe). There is no override: a card whose fused path is not bit-identical must be fixed, not forced."
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                error = %e,
+                "fused VRAM-resident eval left OFF — startup parity check could not run; staying on the proven windowed path"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "neoethos_search::cubecl_eval",
+                "fused VRAM-resident eval left OFF — startup parity check panicked; staying on the proven windowed path"
+            );
+            false
+        }
+    }
+}
+
+/// Force the fused-eval decision (probe + log) up-front at discovery start so it
+/// happens before the GA loop rather than lazily mid-generation. Idempotent
+/// (memoised).
+pub fn ensure_fused_eval_decided() {
+    let _ = fused_eval_enabled();
+}
+
+pub(crate) struct PrototypeADatasetWindow {
+    sample_start: usize,
+    sample_len: usize,
+    indicators: cubecl::server::Handle,
+    smc_data: cubecl::server::Handle,
+}
+
+pub(crate) struct PrototypeADatasetResident {
+    windows: Vec<PrototypeADatasetWindow>,
+    close: cubecl::server::Handle,
+    high: cubecl::server::Handle,
+    low: cubecl::server::Handle,
+    timestamp_deltas: cubecl::server::Handle,
+    months: cubecl::server::Handle,
+    days: cubecl::server::Handle,
+    adaptive_base: cubecl::server::Handle,
+    adaptive_base_len: usize,
+    signals_workspace: cubecl::server::Handle,
+    confidences_workspace: cubecl::server::Handle,
+    window_signals_workspace: cubecl::server::Handle,
+    window_confidences_workspace: cubecl::server::Handle,
+    workspace_gene_capacity: usize,
+    pub(crate) n_samples: usize,
+    pub(crate) n_indicators: usize,
+    use_timestamps: bool,
+    pub(crate) month_capacity: usize,
+    settings: BacktestSettings,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAGenesResident {
+    _candidate_ids: cubecl::server::Handle,
+    offsets: cubecl::server::Handle,
+    indices: cubecl::server::Handle,
+    weights: cubecl::server::Handle,
+    long_thresholds: cubecl::server::Handle,
+    short_thresholds: cubecl::server::Handle,
+    stop_pips: cubecl::server::Handle,
+    target_pips: cubecl::server::Handle,
+    stop_vol_multipliers: cubecl::server::Handle,
+    smc_flags: cubecl::server::Handle,
+    smc_weights: cubecl::server::Handle,
+    metrics_workspace: cubecl::server::Handle,
+    trade_counts_workspace: cubecl::server::Handle,
+    monthly_workspace: cubecl::server::Handle,
+    month_counts_workspace: cubecl::server::Handle,
+    month_start_eq_workspace: cubecl::server::Handle,
+    ftmo_workspace: cubecl::server::Handle,
+    month_capacity: usize,
+    gate_threshold: f64,
+    any_adaptive: bool,
+    pub(crate) canonical_candidate_ids: Vec<u64>,
+    pub(crate) n_genes: usize,
+    pub(crate) upload_bytes: usize,
+    pub(crate) workspace_allocations: u64,
+}
+
+pub(crate) struct PrototypeAScenariosResident {
+    #[allow(dead_code)]
+    descriptors: cubecl::server::Handle,
+    pub(crate) canonical_descriptors: Vec<ScenarioDescriptor>,
+    pub(crate) upload_bytes: usize,
+}
+
+pub(crate) fn upload_prototype_a_dataset<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeADatasetUpload,
+    max_gene_batch: usize,
+) -> Result<PrototypeADatasetResident> {
+    let n_samples = upload.close.len();
+    let n_indicators = upload.feature_count;
+    if n_samples == 0
+        || n_indicators == 0
+        || upload.indicators.len() != n_samples.saturating_mul(n_indicators)
+    {
+        bail!("Prototype A dataset upload has inconsistent dimensions");
+    }
+    let settings = upload.settings.to_settings();
+    let close = normalize_prices_to_pips(&upload.close, settings.pip_value);
+    let high = normalize_prices_to_pips(&upload.high, settings.pip_value);
+    let low = normalize_prices_to_pips(&upload.low, settings.pip_value);
+    let (timestamp_deltas, use_timestamps) = timestamp_delta_ms(&upload.timestamps, n_samples);
+    let months = upload
+        .months
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let days = upload
+        .days
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let smc_data = flatten_i32_rows(&upload.smc_data);
+    let adaptive_base = settings
+        .adaptive_base_pips
+        .as_ref()
+        .filter(|values| values.len() == n_samples)
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![0.0]);
+    let adaptive_base_len = adaptive_base.len();
+
+    let workspace_gene_capacity =
+        backtest_gene_batch(max_gene_batch.max(1), n_samples).min(max_gene_batch.max(1));
+    let window_size = signal_window_size(n_indicators, workspace_gene_capacity, n_samples);
+    let mut windows = Vec::new();
+    let mut sample_start = 0usize;
+    while sample_start < n_samples {
+        let sample_end = (sample_start + window_size).min(n_samples);
+        let indicators = gather_indicator_window(
+            &upload.indicators,
+            n_indicators,
+            n_samples,
+            sample_start,
+            sample_end,
+        );
+        let smc_start = sample_start.saturating_mul(SMC_WIDTH);
+        let smc_end = sample_end.saturating_mul(SMC_WIDTH);
+        windows.push(PrototypeADatasetWindow {
+            sample_start,
+            sample_len: sample_end - sample_start,
+            indicators: client.create_from_slice(f64::as_bytes(&indicators)),
+            smc_data: client.create_from_slice(i32::as_bytes(&smc_data[smc_start..smc_end])),
+        });
+        sample_start = sample_end;
+    }
+
+    let upload_bytes = upload
+        .indicators
+        .len()
+        .saturating_mul(std::mem::size_of::<f64>())
+        .saturating_add(smc_data.len().saturating_mul(std::mem::size_of::<i32>()))
+        .saturating_add(
+            (close.len() + high.len() + low.len() + adaptive_base.len())
+                .saturating_mul(std::mem::size_of::<f64>()),
+        )
+        .saturating_add(
+            (timestamp_deltas.len() + months.len() + days.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        );
+    let signal_workspace_len = workspace_gene_capacity.saturating_mul(n_samples);
+    let window_workspace_len = workspace_gene_capacity.saturating_mul(window_size);
+    Ok(PrototypeADatasetResident {
+        windows,
+        close: client.create_from_slice(f64::as_bytes(&close)),
+        high: client.create_from_slice(f64::as_bytes(&high)),
+        low: client.create_from_slice(f64::as_bytes(&low)),
+        timestamp_deltas: client.create_from_slice(i32::as_bytes(&timestamp_deltas)),
+        months: client.create_from_slice(i32::as_bytes(&months)),
+        days: client.create_from_slice(i32::as_bytes(&days)),
+        adaptive_base: client.create_from_slice(f64::as_bytes(&adaptive_base)),
+        adaptive_base_len,
+        signals_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        confidences_workspace: client
+            .empty(signal_workspace_len.saturating_mul(std::mem::size_of::<f64>())),
+        window_signals_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<i32>())),
+        window_confidences_workspace: client
+            .empty(window_workspace_len.saturating_mul(std::mem::size_of::<f64>())),
+        workspace_gene_capacity,
+        n_samples,
+        n_indicators,
+        use_timestamps,
+        month_capacity: settings.month_capacity(),
+        settings,
+        upload_bytes,
+        workspace_allocations: 4,
+    })
+}
+
+pub(crate) fn upload_prototype_a_genes<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAGeneUpload,
+    month_capacity: usize,
+) -> Result<PrototypeAGenesResident> {
+    let n_genes = upload.candidate_ids.len();
+    if n_genes == 0 || upload.offsets.len() != n_genes + 1 {
+        bail!("Prototype A gene upload has inconsistent dimensions");
+    }
+    let smc_flags = flatten_i32_flags(&upload.smc_flags);
+    let stop_pips = &upload.stop_pips;
+    let target_pips = &upload.target_pips;
+    let stop_vol_multipliers = &upload.stop_vol_multipliers;
+    let upload_bytes = upload
+        .candidate_ids
+        .len()
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(
+            (upload.offsets.len() + upload.indices.len() + smc_flags.len())
+                .saturating_mul(std::mem::size_of::<i32>()),
+        )
+        .saturating_add(
+            (upload.weights.len()
+                + upload.long_thresholds.len()
+                + upload.short_thresholds.len()
+                + stop_pips.len()
+                + target_pips.len()
+                + stop_vol_multipliers.len()
+                + upload.smc_weights.len())
+            .saturating_mul(std::mem::size_of::<f64>()),
+        );
+    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+    let monthly_len = n_genes.saturating_mul(month_capacity);
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    Ok(PrototypeAGenesResident {
+        _candidate_ids: client.create_from_slice(u64::as_bytes(&upload.candidate_ids)),
+        offsets: client.create_from_slice(i32::as_bytes(&upload.offsets)),
+        indices: client.create_from_slice(i32::as_bytes(&upload.indices)),
+        weights: client.create_from_slice(f64::as_bytes(&upload.weights)),
+        long_thresholds: client.create_from_slice(f64::as_bytes(&upload.long_thresholds)),
+        short_thresholds: client.create_from_slice(f64::as_bytes(&upload.short_thresholds)),
+        stop_pips: client.create_from_slice(f64::as_bytes(stop_pips)),
+        target_pips: client.create_from_slice(f64::as_bytes(target_pips)),
+        stop_vol_multipliers: client.create_from_slice(f64::as_bytes(stop_vol_multipliers)),
+        smc_flags: client.create_from_slice(i32::as_bytes(&smc_flags)),
+        smc_weights: client.create_from_slice(f64::as_bytes(&upload.smc_weights)),
+        metrics_workspace: client.empty(metrics_len.saturating_mul(std::mem::size_of::<f64>())),
+        trade_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        monthly_workspace: client.empty(monthly_len.saturating_mul(std::mem::size_of::<f64>())),
+        month_counts_workspace: client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+        month_start_eq_workspace: client
+            .empty(monthly_len.saturating_mul(std::mem::size_of::<f64>())),
+        ftmo_workspace: client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f64>())),
+        month_capacity,
+        gate_threshold: upload.gate_threshold,
+        any_adaptive: upload.stop_vol_multipliers.iter().any(|value| *value > 0.0),
+        canonical_candidate_ids: upload.candidate_ids.clone(),
+        n_genes,
+        upload_bytes,
+        workspace_allocations: 6,
+    })
+}
+
+pub(crate) fn upload_prototype_a_scenarios<R: Runtime>(
+    client: &ComputeClient<R>,
+    upload: &PrototypeAScenarioUpload,
+) -> Result<PrototypeAScenariosResident> {
+    if upload.scenarios.is_empty() {
+        bail!("Prototype A scenario upload is empty");
+    }
+    let bytes = encode_scenario_descriptors(&upload.scenarios);
+    Ok(PrototypeAScenariosResident {
+        descriptors: client.create_from_slice(&bytes),
+        canonical_descriptors: upload.scenarios.clone(),
+        upload_bytes: bytes.len(),
+    })
+}
+
+fn encode_scenario_descriptors(scenarios: &[ScenarioDescriptor]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        scenarios
+            .len()
+            .saturating_mul(std::mem::size_of::<ScenarioDescriptor>()),
+    );
+    for scenario in scenarios {
+        bytes.extend_from_slice(&scenario.base_candidate_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_id.to_le_bytes());
+        bytes.extend_from_slice(&scenario.rng_counter.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.window_len.to_le_bytes());
+        bytes.extend_from_slice(&scenario.scenario_type.to_le_bytes());
+        bytes.extend_from_slice(&scenario.spread_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.slippage_ticks.to_le_bytes());
+        bytes.extend_from_slice(&scenario.commission_micros.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_offset.to_le_bytes());
+        bytes.extend_from_slice(&scenario.perturbation_count.to_le_bytes());
+        bytes.extend_from_slice(&scenario.reserved.to_le_bytes());
+    }
+    bytes
+}
+
+/// Device-resident output of a fused gene-batch backtest: the six per-gene metric
+/// buffers stay ON THE GPU (a cheap Arc-backed `ComputeClient` clone keeps the
+/// server alive) and are read to host exactly ONCE, later, by
+/// [`read_fused_resident_metrics`]. This is the honest device-residency boundary
+/// the `BacktestEngine` contract needs — nothing dense is read back and the compact
+/// metrics are not materialised on the host until that single explicit readback.
+/// `n_genes`/`month_capacity` carry the layout the reader/engine slices by.
+pub(crate) struct FusedResidentMetrics<R: Runtime> {
+    client: ComputeClient<R>,
+    metrics: cubecl::server::Handle,
+    trade_counts: cubecl::server::Handle,
+    monthly: cubecl::server::Handle,
+    month_counts: cubecl::server::Handle,
+    month_start_eq: cubecl::server::Handle,
+    ftmo: cubecl::server::Handle,
+    pub(crate) n_genes: usize,
+    pub(crate) month_capacity: usize,
+}
+
+/// Read the retained device metrics of a fused gene-batch to host — the single
+/// intended compact readback boundary. Consumes the handles. Byte-identical to
+/// the readback that `fused_signal_backtest_batch` used to do inline.
+pub(crate) fn read_fused_resident_metrics<R: Runtime>(
+    resident: FusedResidentMetrics<R>,
+) -> (Vec<f64>, Vec<i32>, Vec<f64>, Vec<i32>, Vec<f64>, Vec<f64>) {
+    let FusedResidentMetrics {
+        client,
+        metrics,
+        trade_counts,
+        monthly,
+        month_counts,
+        month_start_eq,
+        ftmo,
+        ..
+    } = resident;
+    let (
+        metrics_bytes,
+        trade_counts_bytes,
+        monthly_bytes,
+        month_counts_bytes,
+        month_start_eq_bytes,
+        ftmo_bytes,
+    ) = gpu_timing::readback(|| {
+        (
+            client.read_one_unchecked(metrics),
+            client.read_one_unchecked(trade_counts),
+            client.read_one_unchecked(monthly),
+            client.read_one_unchecked(month_counts),
+            client.read_one_unchecked(month_start_eq),
+            client.read_one_unchecked(ftmo),
+        )
+    });
+    (
+        f64::from_bytes(&metrics_bytes).to_vec(),
+        i32::from_bytes(&trade_counts_bytes).to_vec(),
+        f64::from_bytes(&monthly_bytes).to_vec(),
+        i32::from_bytes(&month_counts_bytes).to_vec(),
+        f64::from_bytes(&month_start_eq_bytes).to_vec(),
+        f64::from_bytes(&ftmo_bytes).to_vec(),
+    )
+}
+
+pub(crate) fn evaluate_prototype_a_resident<R: Runtime>(
+    client: &ComputeClient<R>,
+    dataset: &PrototypeADatasetResident,
+    genes: &PrototypeAGenesResident,
+    max_gene_batch: usize,
+) -> Result<(Vec<FusedResidentMetrics<R>>, u64)> {
+    if dataset.n_samples == 0 || genes.n_genes == 0 || max_gene_batch == 0 {
+        bail!("Prototype A resident evaluation requires non-empty bounded inputs");
+    }
+    let batch_size = dataset
+        .workspace_gene_capacity
+        .min(max_gene_batch)
+        .min(genes.n_genes)
+        .max(1);
+    let mut synchronization_events = 0u64;
+    let signal_units = signal_kernel_units(client);
+
+    let mut gene_start = 0usize;
+    while gene_start < genes.n_genes {
+        let gene_end = (gene_start + batch_size).min(genes.n_genes);
+        let batch_genes = gene_end - gene_start;
+        let total = batch_genes.saturating_mul(dataset.n_samples);
+        let signals = dataset.signals_workspace.clone();
+        let confidences = dataset.confidences_workspace.clone();
+
+        for window in &dataset.windows {
+            let window_total = batch_genes.saturating_mul(window.sample_len);
+            let window_signals = dataset.window_signals_workspace.clone();
+            let window_confidences = dataset.window_confidences_workspace.clone();
+            let signal_cubes = (window_total as u32).div_ceil(signal_units);
+            synthesize_signals_kernel::launch::<f64, R>(
+                client,
+                CubeCount::Static(signal_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.indicators.clone(),
+                        dataset.n_indicators.saturating_mul(window.sample_len),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.offsets.clone(), genes.n_genes + 1) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.indices.clone(),
+                        genes.indices.size_in_used() as usize / std::mem::size_of::<i32>(),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.weights.clone(),
+                        genes.weights.size_in_used() as usize / std::mem::size_of::<f64>(),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.long_thresholds.clone(), genes.n_genes) },
+                unsafe { ArrayArg::from_raw_parts(genes.short_thresholds.clone(), genes.n_genes) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        window.smc_data.clone(),
+                        window.sample_len.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        genes.smc_flags.clone(),
+                        genes.n_genes.saturating_mul(SMC_WIDTH),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(genes.smc_weights.clone(), SMC_WIDTH) },
+                unsafe { ArrayArg::from_raw_parts(window_signals.clone(), window_total) },
+                unsafe { ArrayArg::from_raw_parts(window_confidences.clone(), window_total) },
+                window.sample_len as u32,
+                gene_start as u32,
+                genes.gate_threshold,
+            );
+            cubecl::future::block_on(client.sync())
+                .map_err(|error| anyhow::anyhow!("Prototype A signal event failed: {error:?}"))?;
+            synchronization_events = synchronization_events.saturating_add(1);
+
+            let copy_cubes = (window_total as u32).div_ceil(signal_units);
+            copy_window_into_persistent::launch::<i32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_signals, window_total) },
+                unsafe { ArrayArg::from_raw_parts(signals.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+            copy_window_into_persistent::launch::<f64, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(signal_units),
+                unsafe { ArrayArg::from_raw_parts(window_confidences, window_total) },
+                unsafe { ArrayArg::from_raw_parts(confidences.clone(), total) },
+                window.sample_len as u32,
+                dataset.n_samples as u32,
+                window.sample_start as u32,
+                window_total as u32,
+            );
+        }
+
+        cubecl::future::block_on(client.sync())
+            .map_err(|error| anyhow::anyhow!("Prototype A signal-copy event failed: {error:?}"))?;
+        synchronization_events = synchronization_events.saturating_add(1);
+
+        let metrics_len = genes.n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let monthly_len = genes.n_genes.saturating_mul(dataset.month_capacity);
+        let ftmo_len = genes.n_genes.saturating_mul(FTMO_WIDTH);
+        let adaptive_on = genes.any_adaptive && dataset.adaptive_base_len == dataset.n_samples;
+        let backtest_units = backtest_kernel_units(client);
+        let backtest_cubes = (batch_genes as u32).div_ceil(backtest_units);
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(backtest_cubes, 1, 1),
+            CubeDim::new_1d(backtest_units),
+            unsafe { ArrayArg::from_raw_parts(dataset.close.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.high.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.low.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals, total) },
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.timestamp_deltas.clone(), dataset.n_samples)
+            },
+            unsafe { ArrayArg::from_raw_parts(dataset.months.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(dataset.days.clone(), dataset.n_samples) },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.target_pips.clone(), genes.n_genes) },
+            unsafe { ArrayArg::from_raw_parts(genes.metrics_workspace.clone(), metrics_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.trade_counts_workspace.clone(), genes.n_genes)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.monthly_workspace.clone(), monthly_len) },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_counts_workspace.clone(), genes.n_genes)
+            },
+            dataset.n_samples as u32,
+            gene_start as u32,
+            batch_genes as u32,
+            dataset.month_capacity as u32,
+            dataset.settings.initial_equity(),
+            dataset.settings.max_hold_bars as u32,
+            dataset.settings.min_hold_bars as u32,
+            dataset.settings.max_trades_per_day as u32,
+            saturating_i32(dataset.settings.gap_threshold_ms),
+            if dataset.use_timestamps { 1 } else { 0 },
+            if dataset.settings.trailing_enabled {
+                1
+            } else {
+                0
+            },
+            dataset.settings.trailing_atr_multiplier,
+            dataset.settings.trailing_be_trigger_r,
+            dataset.settings.trailing_min_lock_pips,
+            dataset.settings.spread_pips,
+            dataset.settings.commission_per_trade,
+            dataset.settings.pip_value_per_lot,
+            dataset.settings.swap_long_pips_per_day,
+            dataset.settings.swap_short_pips_per_day,
+            dataset.settings.pnl_conversion_fee_rate,
+            unsafe { ArrayArg::from_raw_parts(confidences, total) },
+            if dataset.settings.risk_based_sizing {
+                1
+            } else {
+                0
+            },
+            dataset.settings.risk_per_trade_min,
+            dataset.settings.risk_per_trade_max,
+            dataset.settings.high_quality_confidence,
+            unsafe {
+                ArrayArg::from_raw_parts(dataset.adaptive_base.clone(), dataset.adaptive_base_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.stop_vol_multipliers.clone(), genes.n_genes) },
+            if adaptive_on {
+                dataset.settings.adaptive_rr
+            } else {
+                2.0
+            },
+            unsafe {
+                ArrayArg::from_raw_parts(genes.month_start_eq_workspace.clone(), monthly_len)
+            },
+            unsafe { ArrayArg::from_raw_parts(genes.ftmo_workspace.clone(), ftmo_len) },
+        );
+        gene_start = gene_end;
+    }
+    Ok((
+        vec![FusedResidentMetrics {
+            client: client.clone(),
+            metrics: genes.metrics_workspace.clone(),
+            trade_counts: genes.trade_counts_workspace.clone(),
+            monthly: genes.monthly_workspace.clone(),
+            month_counts: genes.month_counts_workspace.clone(),
+            month_start_eq: genes.month_start_eq_workspace.clone(),
+            ftmo: genes.ftmo_workspace.clone(),
+            n_genes: genes.n_genes,
+            month_capacity: genes.month_capacity,
+        }],
+        synchronization_events,
+    ))
+}
+
+pub(crate) fn read_prototype_a_resident_metrics<R: Runtime>(
+    outputs: Vec<FusedResidentMetrics<R>>,
+) -> Result<(Vec<[f64; 11]>, usize)> {
+    let mut rows = Vec::new();
+    let mut readback_bytes = 0usize;
+    for output in outputs {
+        let n_genes = output.n_genes;
+        let month_capacity = output.month_capacity;
+        readback_bytes = readback_bytes.saturating_add(
+            n_genes
+                .saturating_mul(
+                    BACKTEST_CORE_METRIC_WIDTH
+                        .saturating_add(FTMO_WIDTH)
+                        .saturating_mul(std::mem::size_of::<f64>())
+                        .saturating_add(2usize.saturating_mul(std::mem::size_of::<i32>())),
+                )
+                .saturating_add(
+                    n_genes
+                        .saturating_mul(month_capacity)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f64>()),
+                ),
+        );
+        let (metrics, trade_counts, monthly, month_counts, month_start_eq, _ftmo) =
+            read_fused_resident_metrics(output);
+        rows.extend(assemble_metric_rows(
+            &metrics,
+            &trade_counts,
+            &monthly,
+            &month_counts,
+            &month_start_eq,
+            month_capacity,
+            n_genes,
+        )?);
+    }
+    Ok((rows, readback_bytes))
+}
+
+fn assemble_metric_rows(
+    metrics_flat: &[f64],
+    trade_counts: &[i32],
+    monthly_flat: &[f64],
+    month_counts: &[i32],
+    month_start_eq_flat: &[f64],
+    month_capacity: usize,
+    n_genes: usize,
+) -> Result<Vec<[f64; 11]>> {
+    if metrics_flat.len() != n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH)
+        || trade_counts.len() != n_genes
+        || monthly_flat.len() != n_genes.saturating_mul(month_capacity)
+        || month_counts.len() != n_genes
+        || month_start_eq_flat.len() != n_genes.saturating_mul(month_capacity)
+    {
+        bail!("Prototype A compact metric readback returned an invalid shape");
+    }
+    let mut rows = Vec::with_capacity(n_genes);
+    for gene in 0..n_genes {
+        let metric_base = gene.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+        let month_base = gene.saturating_mul(month_capacity);
+        let month_count = month_counts[gene].max(0) as usize;
+        let month_limit = month_count.min(month_capacity);
+        let monthly_pnls = &monthly_flat[month_base..month_base + month_limit];
+        let month_start_equities = &month_start_eq_flat[month_base..month_base + month_limit];
+        let sharpe = completed_month_return_sharpe_v1(monthly_pnls, month_start_equities);
+        let (average_month_pnl, month_pnl_stddev) = mean_std(monthly_pnls);
+        let consistency = if month_pnl_stddev > 0.0 {
+            (average_month_pnl / month_pnl_stddev).clamp(0.0, 1.0)
+        } else if average_month_pnl > 0.0 && monthly_pnls.len() < 2 {
+            1.0
+        } else {
+            0.0
+        };
+        const MONTHLY_RETURN_TARGET: f64 = 0.04;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for month in 0..month_limit {
+            let base = month_start_eq_flat[month_base + month];
+            if base > 0.0 {
+                counted += 1;
+                if monthly_flat[month_base + month] / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        let monthly_hit = if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        };
+        rows.push([
+            metrics_flat[metric_base],
+            sharpe,
+            metrics_flat[metric_base + 1],
+            metrics_flat[metric_base + 2],
+            metrics_flat[metric_base + 3],
+            metrics_flat[metric_base + 4],
+            metrics_flat[metric_base + 5],
+            monthly_hit,
+            trade_counts[gene] as f64,
+            consistency,
+            metrics_flat[metric_base + 6],
+        ]);
+    }
+    Ok(rows)
+}
+
+/// FUSED windowed signal-synth + backtest for ONE gene-batch, leaving the per-gene
+/// metric scalars DEVICE-RESIDENT (see [`FusedResidentMetrics`]). The signal kernel
+/// writes each sample-window's signals(i32)/conf(f64) into a PERSISTENT VRAM
+/// buffer (via a GPU-side copy — no host roundtrip) that the backtest kernel
+/// then reads DIRECTLY — no readback of the genes×samples matrix, no re-upload.
+/// Handles all timeframes (1 window for light TFs, many for M1). Numerically
+/// identical to the windowed host path: same kernels, same inputs, same f64
+/// precision — the bytes are simply not round-tripped through host RAM. The thin
+/// [`fused_signal_backtest_batch`] wrapper adds the compact readback for the
+/// existing host-returning callers (byte-identical). Callers guarantee `total > 0`.
+#[allow(clippy::too_many_arguments)]
+fn fused_signal_backtest_batch_resident<R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[f64],
+    // The signal kernel derives the indicator count from `indicators_flat.len() /
+    // n_samples` internally; kept in the signature for call-site symmetry.
+    _n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[f64],
+    gate_threshold: f64,
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<FusedResidentMetrics<R>> {
+    let total = n_genes.saturating_mul(n_samples);
+    if total == 0 {
+        bail!("fused resident backtest requires at least one gene and one sample");
+    }
+    // Same input validation the non-fused signal kernel runs — a bad GA gene
+    // index must fail LOUD, not read garbage VRAM (real-money path).
+    validate_signal_kernel_inputs(
+        indicators_flat,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        n_genes,
+        n_samples,
+    )
+    .context("fused signal kernel input validation failed")?;
+
+    // ── WINDOWED signal synthesis into PERSISTENT VRAM (general / M1-capable). ──
+    // The signal synth windows the SAMPLE axis to bound the per-window INDICATOR
+    // upload — the heaviest TFs (M1, 6M rows × ~76 indicators ≈ 1.8GB) can't
+    // upload all indicators in one buffer. But instead of reading each window
+    // back to host (the windowed host path's 688ms-and-up readback), each
+    // window's signals/conf are copied ON THE GPU into the full-series persistent
+    // buffers below, which the backtest then reads directly. So the signals stay
+    // VRAM-resident for ANY timeframe — solve M1 ⇒ solved everywhere.
+    let n_indicators = indicators_flat.len() / n_samples;
+    let signals_handle = client.empty(total.saturating_mul(std::mem::size_of::<i32>()));
+    let conf_handle = client.empty(total.saturating_mul(std::mem::size_of::<f64>()));
+    // Gene-independent inputs are identical every window — upload ONCE.
+    let gene_upload_bytes = gene_offsets
+        .len()
+        .saturating_mul(std::mem::size_of::<i32>())
+        + gene_indices
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + gene_weights
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>())
+        + long_thr.len().saturating_mul(std::mem::size_of::<f64>())
+        + short_thr.len().saturating_mul(std::mem::size_of::<f64>())
+        + gene_smc_flags_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + smc_weights.len().saturating_mul(std::mem::size_of::<f64>())
+        + sl_pips.len().saturating_mul(std::mem::size_of::<f64>())
+        + tp_pips.len().saturating_mul(std::mem::size_of::<f64>())
+        + stop_vol_mult
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>());
+    transfer_telemetry::record_gene_upload(gene_upload_bytes);
+    let (
+        gene_offsets_handle,
+        gene_indices_handle,
+        gene_weights_handle,
+        long_thr_handle,
+        short_thr_handle,
+        gene_smc_flags_handle,
+        smc_weights_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(i32::as_bytes(gene_offsets)),
+            client.create_from_slice(i32::as_bytes(gene_indices)),
+            client.create_from_slice(f64::as_bytes(gene_weights)),
+            client.create_from_slice(f64::as_bytes(long_thr)),
+            client.create_from_slice(f64::as_bytes(short_thr)),
+            client.create_from_slice(i32::as_bytes(gene_smc_flags_flat)),
+            client.create_from_slice(f64::as_bytes(smc_weights)),
+        )
+    });
+    let sig_units = signal_kernel_units(client);
+    let w = signal_window_size(n_indicators, n_genes, n_samples);
+    let mut s0 = 0usize;
+    while s0 < n_samples {
+        let s1 = (s0 + w).min(n_samples);
+        let wlen = s1 - s0;
+        let win_total = n_genes.saturating_mul(wlen);
+        let ind_window = gather_indicator_window(indicators_flat, n_indicators, n_samples, s0, s1);
+        let smc_window = &smc_data_flat[s0 * SMC_WIDTH..s1 * SMC_WIDTH];
+        transfer_telemetry::record_streamed_dataset_upload(
+            ind_window.len().saturating_mul(std::mem::size_of::<f64>())
+                + smc_window.len().saturating_mul(std::mem::size_of::<i32>()),
+        );
+        // Per-window inputs + transient window output buffers (freed each pass).
+        let (indicators_handle, smc_data_handle, sig_w, conf_w) = gpu_timing::upload(|| {
+            (
+                client.create_from_slice(f64::as_bytes(&ind_window)),
+                client.create_from_slice(i32::as_bytes(smc_window)),
+                client.empty(win_total.saturating_mul(std::mem::size_of::<i32>())),
+                client.empty(win_total.saturating_mul(std::mem::size_of::<f64>())),
+            )
+        });
+        let sig_cubes = (win_total as u32).div_ceil(sig_units);
+        gpu_timing::kernel(|| {
+            synthesize_signals_kernel::launch::<f64, R>(
+                client,
+                CubeCount::Static(sig_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(indicators_handle.clone(), ind_window.len()) },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_offsets_handle.clone(), gene_offsets.len())
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_indices_handle.clone(), gene_indices.len())
+                },
+                unsafe {
+                    ArrayArg::from_raw_parts(gene_weights_handle.clone(), gene_weights.len())
+                },
+                unsafe { ArrayArg::from_raw_parts(long_thr_handle.clone(), long_thr.len()) },
+                unsafe { ArrayArg::from_raw_parts(short_thr_handle.clone(), short_thr.len()) },
+                unsafe { ArrayArg::from_raw_parts(smc_data_handle.clone(), smc_window.len()) },
+                unsafe {
+                    ArrayArg::from_raw_parts(
+                        gene_smc_flags_handle.clone(),
+                        gene_smc_flags_flat.len(),
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts(smc_weights_handle.clone(), smc_weights.len()) },
+                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
+                wlen as u32,
+                0,
+                gate_threshold,
+            );
+        });
+        // BARRIER: the copy below reads what the signal kernel just wrote; on a
+        // multi-stream backend that is a cross-kernel dependency, so sync first.
+        cubecl::future::block_on(client.sync())
+            .map_err(|e| anyhow::anyhow!("fused signal-window sync failed: {e:?}"))?;
+        // GPU-side copy of this window into the persistent full-series buffers
+        // (no host roundtrip). i32 signals + f64 conf share the generic kernel.
+        let copy_cubes = (win_total as u32).div_ceil(sig_units);
+        gpu_timing::kernel(|| {
+            copy_window_into_persistent::launch::<i32, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(sig_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+                wlen as u32,
+                n_samples as u32,
+                s0 as u32,
+                win_total as u32,
+            );
+            copy_window_into_persistent::launch::<f64, R>(
+                client,
+                CubeCount::Static(copy_cubes, 1, 1),
+                CubeDim::new_1d(sig_units),
+                unsafe { ArrayArg::from_raw_parts(conf_w.clone(), win_total) },
+                unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+                wlen as u32,
+                n_samples as u32,
+                s0 as u32,
+                win_total as u32,
+            );
+        });
+        s0 = s1;
+        // Free this window's transient buffers before the next pass so peak VRAM
+        // stays ~one window, not the whole series (never-OOM on heavy TFs).
+        trim_gpu_pool_if_over_budget(client);
+    }
+
+    // BARRIER (parity-critical): wait for every window's copy to FINISH writing
+    // the persistent signals/conf before the backtest reads them. Without it the
+    // backtest races partially-written signals (the cubecl-cuda backend may use
+    // multiple streams) and the metrics diverge from the windowed path. A sync is
+    // a stream barrier — it copies NOTHING, so the readback-elimination win stands.
+    cubecl::future::block_on(client.sync())
+        .map_err(|e| anyhow::anyhow!("fused signal-kernel sync failed: {e:?}"))?;
+
+    // ── Backtest kernel: upload the per-sample arrays + allocate metric
+    //    outputs, but READ the signal/conf handles above directly (no
+    //    re-upload). The barrier above guarantees the signal writes are visible;
+    //    the metrics readback below syncs the backtest. ──
+    let metrics_len = n_genes.saturating_mul(BACKTEST_CORE_METRIC_WIDTH);
+    let monthly_len = n_genes.saturating_mul(month_capacity);
+    let ftmo_len = n_genes.saturating_mul(FTMO_WIDTH);
+    let (
+        close_handle,
+        high_handle,
+        low_handle,
+        timestamp_delta_handle,
+        month_handle,
+        day_handle,
+        sl_handle,
+        tp_handle,
+        metrics_handle,
+        trade_counts_handle,
+        monthly_handle,
+        month_start_eq_handle,
+        month_counts_handle,
+        ftmo_handle,
+    ) = gpu_timing::upload(|| {
+        (
+            client.create_from_slice(f64::as_bytes(close_pips)),
+            client.create_from_slice(f64::as_bytes(high_pips)),
+            client.create_from_slice(f64::as_bytes(low_pips)),
+            client.create_from_slice(i32::as_bytes(timestamp_deltas_ms)),
+            client.create_from_slice(i32::as_bytes(month_idx)),
+            client.create_from_slice(i32::as_bytes(day_idx)),
+            client.create_from_slice(f64::as_bytes(sl_pips)),
+            client.create_from_slice(f64::as_bytes(tp_pips)),
+            client.empty(metrics_len.saturating_mul(std::mem::size_of::<f64>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f64>())),
+            client.empty(monthly_len.saturating_mul(std::mem::size_of::<f64>())),
+            client.empty(n_genes.saturating_mul(std::mem::size_of::<i32>())),
+            client.empty(ftmo_len.saturating_mul(std::mem::size_of::<f64>())),
+        )
+    });
+    // Adaptive-stop kernel args (fused path). Real base+mult when adaptive is on
+    // and the base aligns with n_samples, else inert dummies (fixed → scalar sl/tp
+    // path, byte-identical). Mirrors `launch_backtest_kernel`.
+    let adaptive_on = stop_vol_mult.iter().any(|&m| m > 0.0)
+        && settings
+            .adaptive_base_pips
+            .as_ref()
+            .map(|b| b.len() == n_samples)
+            .unwrap_or(false);
+    let (base_f64, mult_f64): (Vec<f64>, Vec<f64>) = if adaptive_on {
+        let base = settings.adaptive_base_pips.as_ref().unwrap();
+        (base.to_vec(), stop_vol_mult.to_vec())
+    } else {
+        (vec![0.0f64], vec![0.0f64; n_genes])
+    };
+    let base_len = base_f64.len();
+    let adaptive_rr_f64 = if adaptive_on {
+        settings.adaptive_rr
+    } else {
+        2.0
+    };
+    let base_pips_dummy = client.create_from_slice(f64::as_bytes(&base_f64));
+    let stop_vol_mult_dummy = client.create_from_slice(f64::as_bytes(&mult_f64));
+    let bt_units = backtest_kernel_units(client);
+    let bt_cubes = (n_genes as u32).div_ceil(bt_units);
+    gpu_timing::kernel(|| {
+        backtest_population_kernel::launch::<R>(
+            client,
+            CubeCount::Static(bt_cubes, 1, 1),
+            CubeDim::new_1d(bt_units),
+            unsafe { ArrayArg::from_raw_parts(close_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(high_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(low_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(signals_handle.clone(), total) },
+            unsafe { ArrayArg::from_raw_parts(timestamp_delta_handle.clone(), n_samples) },
+            unsafe { ArrayArg::from_raw_parts(month_handle.clone(), month_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(day_handle.clone(), day_idx.len()) },
+            unsafe { ArrayArg::from_raw_parts(sl_handle.clone(), sl_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(tp_handle.clone(), tp_pips.len()) },
+            unsafe { ArrayArg::from_raw_parts(metrics_handle.clone(), metrics_len) },
+            unsafe { ArrayArg::from_raw_parts(trade_counts_handle.clone(), n_genes) },
+            unsafe { ArrayArg::from_raw_parts(monthly_handle.clone(), monthly_len) },
+            unsafe { ArrayArg::from_raw_parts(month_counts_handle.clone(), n_genes) },
+            n_samples as u32,
+            0,
+            n_genes as u32,
+            month_capacity as u32,
+            settings.initial_equity(),
+            settings.max_hold_bars as u32,
+            settings.min_hold_bars as u32,
+            settings.max_trades_per_day as u32,
+            saturating_i32(settings.gap_threshold_ms),
+            if use_timestamps { 1i32 } else { 0i32 },
+            if settings.trailing_enabled {
+                1i32
+            } else {
+                0i32
+            },
+            settings.trailing_atr_multiplier,
+            settings.trailing_be_trigger_r,
+            settings.trailing_min_lock_pips,
+            settings.spread_pips,
+            settings.commission_per_trade,
+            settings.pip_value_per_lot,
+            settings.swap_long_pips_per_day,
+            settings.swap_short_pips_per_day,
+            settings.pnl_conversion_fee_rate,
+            unsafe { ArrayArg::from_raw_parts(conf_handle.clone(), total) },
+            if settings.risk_based_sizing {
+                1i32
+            } else {
+                0i32
+            },
+            settings.risk_per_trade_min,
+            settings.risk_per_trade_max,
+            settings.high_quality_confidence,
+            unsafe { ArrayArg::from_raw_parts(base_pips_dummy.clone(), base_len) },
+            unsafe { ArrayArg::from_raw_parts(stop_vol_mult_dummy.clone(), n_genes) },
+            adaptive_rr_f64,
+            unsafe { ArrayArg::from_raw_parts(month_start_eq_handle.clone(), monthly_len) },
+            unsafe { ArrayArg::from_raw_parts(ftmo_handle.clone(), ftmo_len) },
+        );
+    });
+
+    Ok(FusedResidentMetrics {
+        client: client.clone(),
+        metrics: metrics_handle,
+        trade_counts: trade_counts_handle,
+        monthly: monthly_handle,
+        month_counts: month_counts_handle,
+        month_start_eq: month_start_eq_handle,
+        ftmo: ftmo_handle,
+        n_genes,
+        month_capacity,
+    })
+}
+
+/// Compatibility boundary for the existing population evaluator. New
+/// device-chained callers retain the result of
+/// [`fused_signal_backtest_batch_resident`] and defer this compact readback until
+/// `BacktestEngine::readback_compact`.
+#[allow(clippy::too_many_arguments)]
+fn fused_signal_backtest_batch<R: Runtime>(
+    client: &ComputeClient<R>,
+    indicators_flat: &[f64],
+    n_indicators: usize,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    smc_data_flat: &[i32],
+    gene_smc_flags_flat: &[i32],
+    smc_weights: &[f64],
+    gate_threshold: f64,
+    close_pips: &[f64],
+    high_pips: &[f64],
+    low_pips: &[f64],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
+    month_idx: &[i32],
+    day_idx: &[i32],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    settings: &BacktestSettings,
+    month_capacity: usize,
+    n_genes: usize,
+    n_samples: usize,
+) -> Result<(Vec<f64>, Vec<i32>, Vec<f64>, Vec<i32>, Vec<f64>, Vec<f64>)> {
+    let resident = fused_signal_backtest_batch_resident(
+        client,
+        indicators_flat,
+        n_indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        smc_data_flat,
+        gene_smc_flags_flat,
+        smc_weights,
+        gate_threshold,
+        close_pips,
+        high_pips,
+        low_pips,
+        timestamp_deltas_ms,
+        use_timestamps,
+        month_idx,
+        day_idx,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        settings,
+        month_capacity,
+        n_genes,
+        n_samples,
+    )?;
+    Ok(read_fused_resident_metrics(resident))
+}
+
+pub(crate) fn try_evaluate_population_cuda(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: ArrayView2<'_, f64>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f64,
+    smc_weights: &[f64; SMC_WIDTH],
+    settings: &BacktestSettings,
+    device_override: Option<usize>,
+) -> Result<Vec<[f64; 11]>> {
+    let _evaluation_residency = cubecl_residency_scope();
+    let n_genes = long_thr.len();
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
+    let n_samples = close.len();
+    if n_genes == 0 || n_samples == 0 {
+        return Ok(vec![ZERO_METRICS; n_genes]);
+    }
+    if high.len() != n_samples
+        || low.len() != n_samples
+        || month_idx.len() != n_samples
+        || day_idx.len() != n_samples
+        || indicators.ncols() != n_samples
+        || sl_pips.len() != n_genes
+        || tp_pips.len() != n_genes
+    {
+        bail!("cuda population evaluate path received inconsistent dimensions");
+    }
+
+    transfer_telemetry::record_call();
+
+    // NEOETHOS_GPU_TIMING: open a per-call measurement frame (no-op when unset).
+    // The total is timed from here; the inner phases (client-get/host-prep/upload/
+    // kernel/readback) are attributed below. PARITY: pure side-effect — `begin()`
+    // only touches a thread-local Duration accumulator, never a kernel byte.
+    gpu_timing::begin();
+    let call_start = std::time::Instant::now();
+
+    // `create_gpu_client` is CHEAP: cubecl 0.10 memoizes one ComputeClient/server
+    // per device id in a global registry (cubecl-common channel.rs `CHANNELS`), so
+    // this is a HashMap lookup + Arc-handle clone, NOT a fresh CUDA context. We
+    // still time it so the operator can CONFIRM it is not the overhead.
+    let client = gpu_timing::client_get(|| create_gpu_client(device_override))?;
+    // Per-SAMPLE host vecs — shared across every gene, so compute once outside
+    // the gene-chunk loop (they are data-sized, not population-sized). These are
+    // the constant per-sample conversions (normalize_prices_to_pips ×3 +
+    // timestamp/month/day) the timing breakdown attributes to "host-prep".
+    let prep_start = std::time::Instant::now();
+    let close_pips = normalize_prices_to_pips(close, settings.pip_value);
+    let high_pips = normalize_prices_to_pips(high, settings.pip_value);
+    let low_pips = normalize_prices_to_pips(low, settings.pip_value);
+    let (timestamp_deltas_ms, use_timestamps) = timestamp_delta_ms(timestamps, n_samples);
+    let month_idx = month_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let day_idx = day_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
+    let month_capacity = settings.month_capacity();
+    // Attribute the constant per-sample conversions above to the host-prep phase
+    // (no-op when timing is off).
+    gpu_timing::add_host_prep(prep_start.elapsed());
+
+    let mut metrics_flat: Vec<f64> = Vec::with_capacity(n_genes * BACKTEST_CORE_METRIC_WIDTH);
+    let mut trade_counts: Vec<i32> = Vec::with_capacity(n_genes);
+    let mut monthly_flat: Vec<f64> = Vec::with_capacity(n_genes * month_capacity);
+    let mut month_counts: Vec<i32> = Vec::with_capacity(n_genes);
+    let mut month_start_eq_flat: Vec<f64> = Vec::with_capacity(n_genes * month_capacity);
+
+    // Outer GENE-CHUNK loop: the per-gene signal + confidence host buffers
+    // (`chunk × n_samples × 12B`) are the only POPULATION-dependent host
+    // allocation, so synthesising signals one gene-chunk at a time bounds peak
+    // host RAM to ~`gene_chunk_size × n_samples × 12B` regardless of how large a
+    // population the user requested (never-OOM invariant: memory = f(hardware),
+    // not f(params)). Inside each chunk the backtest gene-batches so each device
+    // signal buffer (`B × n_samples`) stays under the wgpu storage-buffer cap.
+    // Genes are independent + concatenated in gene order, so this is numerically
+    // identical to a single pass — CPU↔GPU parity holds.
+    let n_indicators = indicators.nrows();
+    // **task #39 (2026-06-10):** when fusion is enabled, run the VRAM-resident
+    // fused path for EVERY timeframe — the signal matrix never leaves the GPU
+    // (no 688ms+ readback, no re-upload). The fused batch windows the signal
+    // synth internally (persistent-VRAM accumulator), so it handles the heaviest
+    // TFs (M1, 6M rows) too; the gene-batch already bounds genes×samples to fit
+    // VRAM (never-OOM). It fills the SAME metric vecs as the windowed path, so
+    // the assembly below — and the result — is byte-identical (A6000-proven).
+    let use_fused = fused_eval_enabled();
+    if use_fused {
+        let indicators_f64: Vec<f64> = indicators.iter().copied().collect();
+        let smc_data_flat = flatten_i32_rows(smc_data);
+        let gene_smc_flags_flat_all = flatten_i32_flags(gene_smc_flags);
+        let batch = backtest_gene_batch(n_genes, n_samples);
+        let mut b0 = 0usize;
+        while b0 < n_genes {
+            let b1 = (b0 + batch).min(n_genes);
+            let bn = b1 - b0;
+            // Same catch_unwind guard as the windowed path: a cubecl pool/#243
+            // panic becomes a fail-loud Err → eval.rs recomputes on CPU.
+            let res: Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let idx0 = gene_offsets[b0] as usize;
+                    let idx1 = gene_offsets[b1] as usize;
+                    let base = gene_offsets[b0];
+                    let chunk_offsets: Vec<i32> =
+                        gene_offsets[b0..=b1].iter().map(|o| *o - base).collect();
+                    let (m, tc, mo, mc, mse, _ftmo) = fused_signal_backtest_batch(
+                        &client,
+                        &indicators_f64,
+                        n_indicators,
+                        &chunk_offsets,
+                        &gene_indices[idx0..idx1],
+                        &gene_weights[idx0..idx1],
+                        &long_thr[b0..b1],
+                        &short_thr[b0..b1],
+                        &smc_data_flat,
+                        &gene_smc_flags_flat_all[b0 * SMC_WIDTH..b1 * SMC_WIDTH],
+                        smc_weights,
+                        gate_threshold,
+                        &close_pips,
+                        &high_pips,
+                        &low_pips,
+                        &timestamp_deltas_ms,
+                        use_timestamps,
+                        &month_idx,
+                        &day_idx,
+                        &sl_pips_all[b0..b1],
+                        &tp_pips_all[b0..b1],
+                        &stop_vol_mult[b0..b1],
+                        settings,
+                        month_capacity,
+                        bn,
+                        n_samples,
+                    )?;
+                    metrics_flat.extend_from_slice(&m);
+                    trade_counts.extend_from_slice(&tc);
+                    monthly_flat.extend_from_slice(&mo);
+                    month_counts.extend_from_slice(&mc);
+                    month_start_eq_flat.extend_from_slice(&mse);
+                    Ok(())
+                }))
+                .map_err(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic>".to_string());
+                    anyhow::anyhow!(
+                        "GPU fused batch [{b0},{b1}) panicked (cubecl pool/#243): {msg}"
+                    )
+                })
+                .and_then(|inner| inner);
+            res?;
+            trim_gpu_pool_if_over_budget(&client);
+            b0 = b1;
+        }
+    } else {
+        let g_chunk = gene_chunk_size(n_genes, n_samples);
+        let mut c0 = 0usize;
+        while c0 < n_genes {
+            let c1 = (c0 + g_chunk).min(n_genes);
+
+            // AREA 1 (2026-06-09): wrap the per-chunk GPU work in `catch_unwind`.
+            // cubecl 0.10 has NO Result-returning launch — a pool exhaustion or the
+            // cubecl#243 class of failure surfaces as a PANIC, not an `Err`. Without
+            // this the panic would unwind across `try_evaluate_population_cuda`,
+            // poison the worker thread, and only reach the eval.rs hybrid match as an
+            // opaque thread-join error. Catching it HERE lets a single bad chunk fail
+            // LOUD (a tracing::warn upstream carries the message) and convert to an
+            // `Err` → the existing eval.rs:1896-1917 fallback recomputes on CPU. The
+            // build is `panic = "unwind"` (workspace Cargo.toml) so this is sound; the
+            // SUCCESS path is byte-identical (the closure just runs the same launches).
+            let chunk_res: Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    // Slice + rebase the CSR gene arrays for the chunk [c0, c1).
+                    let idx0 = gene_offsets[c0] as usize;
+                    let idx1 = gene_offsets[c1] as usize;
+                    let base = gene_offsets[c0];
+                    let chunk_offsets: Vec<i32> =
+                        gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+                    let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+                        indicators,
+                        &chunk_offsets,
+                        &gene_indices[idx0..idx1],
+                        &gene_weights[idx0..idx1],
+                        &long_thr[c0..c1],
+                        &short_thr[c0..c1],
+                        smc_data,
+                        &gene_smc_flags[c0..c1],
+                        gate_threshold,
+                        smc_weights,
+                        device_override,
+                    )?;
+                    // Release the signal-synth device buffers before the backtest allocates.
+                    trim_gpu_pool_if_over_budget(&client);
+
+                    let chunk_n = c1 - c0;
+                    let batch = backtest_gene_batch(chunk_n, n_samples);
+                    let mut g0 = 0usize;
+                    while g0 < chunk_n {
+                        let g1 = (g0 + batch).min(chunk_n);
+                        // The production metrics path intentionally ignores the FTMO
+                        // observables (last tuple slot). The test-only direct-device oracle
+                        // below validates those observables without creating a second
+                        // production authority.
+                        let (m, tc, mo, mc, mse, _ftmo) = launch_backtest_kernel(
+                            &client,
+                            device_override.unwrap_or(0),
+                            &close_pips,
+                            &high_pips,
+                            &low_pips,
+                            &signals_flat[g0 * n_samples..g1 * n_samples],
+                            &confidences_flat[g0 * n_samples..g1 * n_samples],
+                            &timestamp_deltas_ms,
+                            use_timestamps,
+                            &month_idx,
+                            &day_idx,
+                            &sl_pips_all[c0 + g0..c0 + g1],
+                            &tp_pips_all[c0 + g0..c0 + g1],
+                            &stop_vol_mult[c0 + g0..c0 + g1],
+                            settings,
+                            month_capacity,
+                        )?;
+                        metrics_flat.extend_from_slice(&m);
+                        trade_counts.extend_from_slice(&tc);
+                        monthly_flat.extend_from_slice(&mo);
+                        month_counts.extend_from_slice(&mc);
+                        month_start_eq_flat.extend_from_slice(&mse);
+                        g0 = g1;
+                        // Trim the pool between gene-batches so a huge-row TF (many
+                        // batches per chunk) can't let the reserved high-water mark
+                        // climb mid-eval.
+                        trim_gpu_pool_if_over_budget(&client);
+                    }
+                    Ok(())
+                }))
+                .map_err(|payload| {
+                    // Best-effort extraction of the panic message for a fail-loud Err.
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic>".to_string());
+                    anyhow::anyhow!("GPU gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}")
+                })
+                .and_then(|inner| inner);
+            chunk_res?; // → propagates to the eval.rs hybrid match → CPU recompute
+
+            c0 = c1;
+        }
+    } // end `else` (windowed host path); the `if use_fused` branch filled the
+    // same metric vecs above.
+
+    let compact_readback_bytes = metrics_flat
+        .len()
+        .saturating_mul(std::mem::size_of::<f64>())
+        + trade_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + monthly_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>())
+        + month_counts
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+        + month_start_eq_flat
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>());
+    let dense_readback_bytes = n_genes
+        .saturating_mul(n_samples)
+        .saturating_mul(std::mem::size_of::<i32>() + std::mem::size_of::<f64>());
+    transfer_telemetry::record_readback(use_fused, compact_readback_bytes, dense_readback_bytes);
+
+    let mut results = Vec::with_capacity(n_genes);
+    for g in 0..n_genes {
+        let metric_base = g * BACKTEST_CORE_METRIC_WIDTH;
+        let month_base = g.saturating_mul(month_capacity);
+        let month_count = month_counts.get(g).copied().unwrap_or_default().max(0) as usize;
+        let month_limit = month_count.min(month_capacity);
+        let monthly_pnls = &monthly_flat[month_base..month_base + month_limit];
+        let month_start_equities = &month_start_eq_flat[month_base..month_base + month_limit];
+        let sharpe = completed_month_return_sharpe_v1(monthly_pnls, month_start_equities);
+        let (avg_month_pnl, std_month_pnl) = mean_std(monthly_pnls);
+        let consistency = if std_month_pnl > 0.0 {
+            (avg_month_pnl / std_month_pnl).clamp(0.0, 1.0)
+        } else if avg_month_pnl > 0.0 && monthly_pnls.len() < 2 {
+            1.0
+        } else {
+            0.0
+        };
+
+        // Slot 7: monthly_target_hit_rate — fraction of COMPLETE months whose
+        // return >= 4% of that month's STARTING equity. Computed host-side in f64
+        // from the kernel's per-month PnL + start-equity buffers, byte-for-byte
+        // matching the CPU (eval.rs:1110-1131): base>0 counts, no-trade months miss.
+        const MONTHLY_RETURN_TARGET: f64 = 0.04;
+        let mut hit = 0usize;
+        let mut counted = 0usize;
+        for idx in 0..month_limit {
+            let base = month_start_eq_flat[month_base + idx];
+            if base > 0.0 {
+                counted += 1;
+                if monthly_flat[month_base + idx] / base >= MONTHLY_RETURN_TARGET {
+                    hit += 1;
+                }
+            }
+        }
+        let monthly_hit = if counted > 0 {
+            hit as f64 / counted as f64
+        } else {
+            0.0
+        };
+
+        results.push([
+            metrics_flat[metric_base],
+            sharpe,
+            metrics_flat[metric_base + 1],
+            metrics_flat[metric_base + 2],
+            metrics_flat[metric_base + 3],
+            metrics_flat[metric_base + 4],
+            metrics_flat[metric_base + 5],
+            monthly_hit,
+            trade_counts.get(g).copied().unwrap_or_default() as f64,
+            consistency,
+            metrics_flat[metric_base + 6],
+        ]);
+    }
+
+    // NEOETHOS_GPU_TIMING breakdown. `end()` returns None (and skips the whole log)
+    // when the env var is unset, so production pays nothing here.
+    if let Some(phases) = gpu_timing::end() {
+        let total = call_start.elapsed();
+        // "other" = total minus the attributed phases (host result-assembly above,
+        // pool trims, the catch_unwind plumbing). A large `kernel` or `upload`
+        // share at a SMALL n_genes is the per-launch-overhead signature.
+        let attributed =
+            phases.client_get + phases.host_prep + phases.upload + phases.kernel + phases.readback;
+        let other = total.saturating_sub(attributed);
+        tracing::info!(
+            target: "neoethos_search::gpu",
+            n_genes,
+            n_samples,
+            total_ms = total.as_secs_f64() * 1e3,
+            client_get_ms = phases.client_get.as_secs_f64() * 1e3,
+            host_prep_ms = phases.host_prep.as_secs_f64() * 1e3,
+            upload_ms = phases.upload.as_secs_f64() * 1e3,
+            kernel_ms = phases.kernel.as_secs_f64() * 1e3,
+            readback_ms = phases.readback.as_secs_f64() * 1e3,
+            other_ms = other.as_secs_f64() * 1e3,
+            "NEOETHOS_GPU_TIMING: population eval per-call breakdown"
+        );
+    }
+
+    Ok(results)
+}
+
+/// GPU FTMO prop-firm observables path — sibling of [`try_evaluate_population_cuda`]
+/// that returns the per-gene `[f64; FTMO_WIDTH]` FTMO observables instead of the
+/// `[f64; 11]` ranking metrics. Reuses the EXACT same signal-synth
+/// (`try_generate_signal_flat_cuda`) + backtest (`launch_backtest_kernel`) path, so
+/// the trades the kernel realizes are identical to the metrics path — only the slot
+/// of the launch tuple that we keep differs. Layout per gene matches `FTMO_WIDTH`
+/// (see the const doc) and `validation.rs::compute_prop_firm_risk_summary`:
+///   [0] net_return_pct  [1] max_daily_loss_pct  [2] max_overall_drawdown_pct
+///   [3] largest_profit_share  [4] max_trades_per_day  [5] trading_days
+///
+/// Test-only direct-device oracle for the FTMO observables emitted by the canonical
+/// backtest kernel. Production consumes the proven `[f64; 11]` metrics path above;
+/// this helper exists only to compare the extra device outputs with the CPU oracle.
+#[cfg(test)]
+pub(crate) fn try_evaluate_ftmo_population_cuda(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    indicators: ArrayView2<'_, f64>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f64,
+    smc_weights: &[f64; SMC_WIDTH],
+    settings: &BacktestSettings,
+    device_override: Option<usize>,
+) -> Result<Vec<[f64; FTMO_WIDTH]>> {
+    let _evaluation_residency = cubecl_residency_scope();
+    let n_genes = long_thr.len();
+    // Last line of defence for the optional `stop_vol_mult` contract: an empty
+    // slice means "no adaptive stops", and every batch slice below would panic
+    // on it. That panic is caught upstream and retried on the CPU, which turns
+    // a contract violation into a silent CPU fallback — exactly what a
+    // GPU-required run must never do.
+    let stop_vol_mult_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
+    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
+    let n_samples = close.len();
+    if n_genes == 0 || n_samples == 0 {
+        return Ok(vec![[0.0f64; FTMO_WIDTH]; n_genes]);
+    }
+    if high.len() != n_samples
+        || low.len() != n_samples
+        || month_idx.len() != n_samples
+        || day_idx.len() != n_samples
+        || indicators.ncols() != n_samples
+        || sl_pips.len() != n_genes
+        || tp_pips.len() != n_genes
+    {
+        bail!("cuda ftmo population evaluate path received inconsistent dimensions");
+    }
+
+    let client = create_gpu_client(device_override)?;
+    // Per-SAMPLE host vecs — shared across every gene (data-sized, not population-sized).
+    let close_pips = normalize_prices_to_pips(close, settings.pip_value);
+    let high_pips = normalize_prices_to_pips(high, settings.pip_value);
+    let low_pips = normalize_prices_to_pips(low, settings.pip_value);
+    let (timestamp_deltas_ms, use_timestamps) = timestamp_delta_ms(timestamps, n_samples);
+    let month_idx = month_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let day_idx = day_idx
+        .iter()
+        .map(|value| saturating_i32(*value))
+        .collect::<Vec<_>>();
+    let sl_pips_all = sl_pips.to_vec();
+    let tp_pips_all = tp_pips.to_vec();
+    let month_capacity = settings.month_capacity();
+
+    let mut ftmo_flat: Vec<f64> = Vec::with_capacity(n_genes * FTMO_WIDTH);
+
+    // Same bounded GENE-CHUNK + gene-BATCH loop as the metrics path (never-OOM
+    // invariant); genes are independent + concatenated in order so this is
+    // numerically identical to a single pass.
+    let g_chunk = gene_chunk_size(n_genes, n_samples);
+    let mut c0 = 0usize;
+    while c0 < n_genes {
+        let c1 = (c0 + g_chunk).min(n_genes);
+
+        let chunk_res: Result<()> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                let idx0 = gene_offsets[c0] as usize;
+                let idx1 = gene_offsets[c1] as usize;
+                let base = gene_offsets[c0];
+                let chunk_offsets: Vec<i32> =
+                    gene_offsets[c0..=c1].iter().map(|o| *o - base).collect();
+                let (signals_flat, confidences_flat) = try_generate_signal_flat_cuda(
+                    indicators,
+                    &chunk_offsets,
+                    &gene_indices[idx0..idx1],
+                    &gene_weights[idx0..idx1],
+                    &long_thr[c0..c1],
+                    &short_thr[c0..c1],
+                    smc_data,
+                    &gene_smc_flags[c0..c1],
+                    gate_threshold,
+                    smc_weights,
+                    device_override,
+                )?;
+                trim_gpu_pool_if_over_budget(&client);
+
+                let chunk_n = c1 - c0;
+                let batch = backtest_gene_batch(chunk_n, n_samples);
+                let mut g0 = 0usize;
+                while g0 < chunk_n {
+                    let g1 = (g0 + batch).min(chunk_n);
+                    // We keep ONLY the FTMO vec (last tuple slot); the metrics
+                    // outputs are recomputed identically but discarded here.
+                    let (_m, _tc, _mo, _mc, _mse, ftmo) = launch_backtest_kernel(
+                        &client,
+                        device_override.unwrap_or(0),
+                        &close_pips,
+                        &high_pips,
+                        &low_pips,
+                        &signals_flat[g0 * n_samples..g1 * n_samples],
+                        &confidences_flat[g0 * n_samples..g1 * n_samples],
+                        &timestamp_deltas_ms,
+                        use_timestamps,
+                        &month_idx,
+                        &day_idx,
+                        &sl_pips_all[c0 + g0..c0 + g1],
+                        &tp_pips_all[c0 + g0..c0 + g1],
+                        &stop_vol_mult[c0 + g0..c0 + g1],
+                        settings,
+                        month_capacity,
+                    )?;
+                    ftmo_flat.extend_from_slice(&ftmo);
+                    g0 = g1;
+                    trim_gpu_pool_if_over_budget(&client);
+                }
+                Ok(())
+            }))
+            .map_err(|payload| {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                anyhow::anyhow!(
+                    "GPU ftmo gene-chunk [{c0},{c1}) panicked (cubecl pool/#243): {msg}"
+                )
+            })
+            .and_then(|inner| inner);
+        chunk_res?;
+
+        c0 = c1;
+    }
+
+    if ftmo_flat.len() != n_genes * FTMO_WIDTH {
+        bail!(
+            "cuda ftmo evaluate produced {} values, expected {}",
+            ftmo_flat.len(),
+            n_genes * FTMO_WIDTH
+        );
+    }
+
+    let mut results = Vec::with_capacity(n_genes);
+    for g in 0..n_genes {
+        let base = g * FTMO_WIDTH;
+        let mut row = [0.0f64; FTMO_WIDTH];
+        row.copy_from_slice(&ftmo_flat[base..base + FTMO_WIDTH]);
+        results.push(row);
+    }
+
+    Ok(results)
+}
+
+const ZERO_METRICS: [f64; 11] = [0.0; 11];
+
+// ── task #39 parity: the fused VRAM-resident path MUST be byte-identical to the
+//    proven windowed host path. The explicit real-card switch keeps ordinary
+//    GPU-less CI out; once requested, client creation and every launch fail loud. ──
+#[cfg(test)]
+mod fused_parity_tests {
+    use super::*;
+
+    // The fused VRAM-resident path MUST be byte-identical to the proven windowed
+    // host path. This asserts the EXACT `fused_path_parity_holds` probe the
+    // discovery startup gate uses to auto-enable the fast path — so passing here
+    // means the production auto-enable decision is trustworthy. The explicit
+    // real-card switch prevents ordinary GPU-less CI from selecting it; after
+    // selection, missing adapters and launch errors are fatal.
+    #[test]
+    fn fused_path_is_byte_identical_to_windowed_path() {
+        if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED fused_path_is_byte_identical_to_windowed_path — set \
+                 NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on a real GPU host"
+            );
+            return;
+        }
+        let client = create_gpu_client(None)
+            .expect("requested fused-path hardware proof could not create a GPU client");
+        assert!(
+            fused_path_parity_holds(&client)
+                .expect("fused parity probe should run once a GPU client exists"),
+            "fused VRAM-resident path diverged from the windowed path on this GPU \
+             (see the warn logs for which buffer mismatched)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vram_budget_tests {
+    use super::vram_budget_mb_for;
+
+    /// The budget must SCALE with the card. The old formula clamped at a flat
+    /// 24 GB, so every card above 40 GB got the same budget as a 40 GB one and
+    /// left the rest idle — the reason a rented A6000 could not hold a large
+    /// feature cube resident even though it had the room.
+    #[test]
+    fn budget_scales_with_the_card_instead_of_a_flat_ceiling() {
+        // 48 GB A6000: 60% = 28.8 GB, ceiling = 48 - 6 = 42 GB → 28.8 GB.
+        let a6000 = vram_budget_mb_for(48.0);
+        assert!(
+            (29_000..=29_800).contains(&a6000),
+            "A6000 budget should be ~28.8 GB, got {a6000} MB"
+        );
+        assert!(a6000 > 24576, "must exceed the old flat 24 GB clamp");
+
+        // 80 GB card keeps scaling.
+        assert!(vram_budget_mb_for(80.0) > a6000);
+    }
+
+    #[test]
+    fn mid_and_small_cards_are_unchanged_or_safer() {
+        // 24 GB (A5000-class): 60% = 14.4 GB, well under both ceilings — the
+        // old formula gave the same number.
+        let mid = vram_budget_mb_for(24.0);
+        assert!((14_000..=14_800).contains(&mid), "got {mid} MB");
+
+        // 8 GB: 60% = 4.8 GB, ceiling = 8 - 1.2 = 6.8 GB → 4.8 GB (unchanged).
+        let small = vram_budget_mb_for(8.0);
+        assert!((4_800..=5_000).contains(&small), "got {small} MB");
+
+        // 2 GB: 60% = 1.2 GB but the ceiling (2 - 1 = 1 GB) now binds, so a
+        // tiny card reserves MORE than the old formula allowed.
+        let tiny = vram_budget_mb_for(2.0);
+        assert_eq!(tiny, 1024, "tiny card must respect the driver reserve");
+        assert!(tiny < 1229, "must be below the old 60%-of-2GB value");
+    }
+
+    #[test]
+    fn unknown_or_absent_vram_falls_back_conservatively() {
+        assert_eq!(vram_budget_mb_for(f64::INFINITY), 2048);
+        assert_eq!(vram_budget_mb_for(0.0), 2048);
+        assert_eq!(vram_budget_mb_for(-1.0), 2048);
+        assert_eq!(vram_budget_mb_for(f64::NAN), 2048);
+        // Never below the floor, whatever the card reports.
+        assert!(vram_budget_mb_for(0.25) >= 384);
+    }
+}

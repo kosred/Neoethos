@@ -1,0 +1,72 @@
+{
+  "clientMsgId": "capture-symbol-by-id",
+  "payload": {
+    "ctidTraderAccountId": 47367144,
+    "symbol": [
+      {
+        "chargeSwapAtWeekends": false,
+        "commission": 4500,
+        "commissionType": 1,
+        "digits": 3,
+        "distanceSetIn": 1,
+        "enableShortSelling": true,
+        "gslCharge": 0,
+        "gslDistance": 0,
+        "gslScheduleId": 1,
+        "guaranteedStopLoss": false,
+        "leverageId": 1053,
+        "lotSize": 10000000,
+        "maxExposure": 10000000000000,
+        "maxVolume": 1000000000,
+        "measurementUnits": "GBP",
+        "minCommission": 0,
+        "minCommissionAsset": "USD",
+        "minCommissionType": 2,
+        "minVolume": 100000,
+        "pipPosition": 2,
+        "pnlConversionFeeRate": 0,
+        "preciseMinCommission": 0,
+        "preciseTradingCommissionRate": 4500000000,
+        "rolloverCommission": 0,
+        "rolloverCommission3Days": 3,
+        "schedule": [
+          {
+            "endSecond": 145795,
+            "startSecond": 61205
+          },
+          {
+            "endSecond": 232195,
+            "startSecond": 147605
+          },
+          {
+            "endSecond": 318595,
+            "startSecond": 234005
+          },
+          {
+            "endSecond": 404995,
+            "startSecond": 320405
+          },
+          {
+            "endSecond": 491395,
+            "startSecond": 406805
+          }
+        ],
+        "scheduleTimeZone": "America/New_York",
+        "skipRolloverDays": 3,
+        "skipSWAPPeriods": 0,
+        "slDistance": 0,
+        "stepVolume": 100000,
+        "swapCalculationType": 0,
+        "swapLong": -0.585,
+        "swapPeriod": 24,
+        "swapRollover3Days": 3,
+        "swapShort": -2.97,
+        "swapTime": 1259,
+        "symbolId": 7,
+        "tpDistance": 0,
+        "tradingMode": 0
+      }
+    ]
+  },
+  "payloadType": 2117
+}

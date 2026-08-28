@@ -1,0 +1,6 @@
+# case_id	counter0	counter1	counter2	counter3	key0	key1	expected0	expected1	expected2	expected3
+counter_low_one	00000001	00000000	00000000	00000000	00000000	00000000	f8e4cca4	5cb200db	b1a574eb	097eff67
+counter_and_key_high_bits	80000000	00000000	80000000	ffffffff	00000000	80000000	ede64302	f449fdcb	e9e6ce10	d7b716c6
+key_edges	00000000	ffffffff	00000001	80000000	ffffffff	00000000	80ab057e	c91070bf	00d81fba	0745e36e
+alternating_and_nonzero	aaaaaaaa	55555555	deadbeef	01020304	13579bdf	2468ace0	239671e8	07bfa674	015b2528	fda6518f
+carry_edges	ffffffff	00000000	ffffffff	00000000	00000001	ffffffff	557fdc23	d4420d79	85eeffce	41f1eec7

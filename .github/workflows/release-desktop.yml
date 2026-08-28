@@ -1,0 +1,192 @@
+name: Release desktop GUI (Windows + Linux)
+
+# Builds the NeoEthos Tauri DESKTOP app (the GUI, NOT the CLI) for Windows and
+# Linux and attaches the installers to the GitHub Release for the tag. This is
+# how dual-platform GUI installers are produced without owning both machines —
+# GitHub's runners build each target in the cloud.
+#
+# Distinct from release.yml (GPU bundle) and release-installers.yml (CLI .deb/
+# .rpm/.AppImage). Artifact names here carry a `-desktop` suffix so nothing
+# collides on the shared Release.
+#
+# Trigger: push a tag like `v0.5.3`, or run manually (workflow_dispatch).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux
+          - os: windows-latest
+            target: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # EXPLICIT pin: dtolnay's action exports RUSTUP_TOOLCHAIN, which
+      # OVERRIDES rust-toolchain.toml — @nightly would build with the
+      # latest nightly instead of the repo's pinned one. Pass the pin.
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-04-07
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Linux needs the Tauri/WebKit + build toolchain (mirrors BUILDING.md §2).
+      # Windows runners already ship MSVC + CMake.
+      - name: Linux system deps
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file pkg-config mold libfuse2 cpio rpm2cpio python3-pip \
+            libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev \
+            libxdo-dev libayatana-appindicator3-dev
+          pip3 install --user 'cmake>=3.28'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "desktop/src-tauri -> target"
+
+      - name: Frontend deps
+        working-directory: desktop
+        run: npm ci || npm install
+
+      # Tauri resolves and copies bundle.resources from the desktop build
+      # script, before normal Rust dependencies are guaranteed to have built.
+      # Build the exact CPU desktop dependency graph first so its two native
+      # tree-model runtimes exist before the release-only resource overlay is
+      # applied. Ordinary cargo test/check never loads that overlay.
+      - name: Build desktop native runtime prerequisites
+        run: cargo build --release -p neoethos-app --lib --no-default-features
+
+      - name: Stage and verify Windows native runtimes
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $xgboostTarget = "target\release\xgboost.dll"
+          $catboostTarget = "target\release\catboostmodel.dll"
+          if (-not (Test-Path -LiteralPath $xgboostTarget -PathType Leaf) -or (Get-Item -LiteralPath $xgboostTarget).Length -le 0) {
+            throw "Required XGBoost runtime is missing or empty: $xgboostTarget"
+          }
+          if (-not (Test-Path -LiteralPath $catboostTarget -PathType Leaf) -or (Get-Item -LiteralPath $catboostTarget).Length -le 0) {
+            throw "Required CatBoost runtime is missing or empty: $catboostTarget"
+          }
+
+      - name: Stage and verify Linux native runtimes
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s target/release/libxgboost.so
+          test -s target/release/libcatboostmodel.so
+
+      # The MCP sidecar ships inside the installer (bundle.resources in the
+      # per-platform tauri conf files) — build it BEFORE bundling or the
+      # resource is missing and the bundle step fails. It lives in its OWN
+      # isolated workspace (mcp/), so this never touches the engine's deps.
+      - name: Build MCP sidecar
+        run: cargo build --release --manifest-path mcp/Cargo.toml
+
+      # The P2P mesh sidecar ships inside the installer too (same per-platform
+      # bundle.resources mechanism). Its OWN isolated workspace (mesh/) — never
+      # touches the engine's pinned deps. The desktop auto-launches it when the
+      # operator opts in (Federation → Turn mesh ON).
+      - name: Build mesh sidecar
+        run: cargo build --release --manifest-path mesh/Cargo.toml
+
+      # tauri-action runs the frontend build then compiles the desktop binary
+      # with the web assets embedded, producing the platform installer, and —
+      # on a tag — uploads the bundle to the matching Release (as a draft).
+      - name: Build + upload the desktop GUI
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Enables the package-only ELF RUNPATH to Tauri's Linux resource
+          # directory. Ordinary local cargo builds must never search a stale
+          # installed NeoEthos runtime before their build-tree artifacts.
+          NEOETHOS_TAURI_RELEASE_BUNDLE: "1"
+          # linuxdeploy's binary stripping breaks on the runner (classic
+          # tauri-on-CI failure: "failed to run linuxdeploy").
+          # NOTE: even with NO_STRIP, linuxdeploy still dies instantly on
+          # this runner (exits with no output ~1s after launch), so the GUI
+          # AppImage target is disabled in tauri.linux.conf.json (JSON can't
+          # carry comments — the rationale lives here). Linux GUI ships as
+          # .deb + .rpm; the CLI AppImage from release-installers.yml covers
+          # AppImage users.
+          NO_STRIP: true
+        with:
+          projectPath: desktop
+          args: >-
+            --config src-tauri/tauri.release.${{ matrix.target }}.conf.json
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: "NeoEthos ${{ github.ref_name }} — desktop GUI"
+          releaseDraft: true
+          prerelease: false
+
+      - name: Verify installed Linux runtime layout
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          rpm="$(find target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' -print -quit)"
+          test -n "$deb"
+          test -n "$rpm"
+          rpm="$(realpath "$rpm")"
+          extracted="$(mktemp -d)"
+          trap 'rm -rf -- "$extracted"' EXIT
+          mkdir -p "$extracted/deb" "$extracted/rpm"
+          dpkg-deb -x "$deb" "$extracted/deb"
+          (cd "$extracted/rpm" && rpm2cpio "$rpm" | cpio -id --quiet)
+
+          verify_installed_tree() {
+            local root="$1"
+            local resources="$root/usr/lib/NeoEthos"
+            test -x "$resources/neoethos-mcp"
+            test -x "$resources/neoethos-mesh"
+            test -f "$resources/libcatboostmodel.so"
+            test -f "$resources/libxgboost.so"
+            local desktop_bin
+            desktop_bin="$(find "$root/usr/bin" -maxdepth 1 -type f -perm -u+x -print -quit)"
+            test -n "$desktop_bin"
+            if ! readelf -d "$desktop_bin" > "$root/readelf.log" 2>&1; then
+              cat "$root/readelf.log"
+              return 1
+            fi
+            grep -Fq '(RUNPATH)' "$root/readelf.log"
+            grep -Fq '$ORIGIN/../lib/NeoEthos' "$root/readelf.log"
+            if ! env -u LD_LIBRARY_PATH ldd "$desktop_bin" > "$root/ldd.log" 2>&1; then
+              cat "$root/ldd.log"
+              return 1
+            fi
+            cat "$root/ldd.log"
+            if grep -q 'not found' "$root/ldd.log"; then
+              return 1
+            fi
+            for library in libcatboostmodel.so libxgboost.so; do
+              local resolved
+              resolved="$(awk -v library="$library" '$1 == library && $2 == "=>" { print $3; exit }' "$root/ldd.log")"
+              test -n "$resolved"
+              test "$(realpath "$resolved")" = "$(realpath "$resources/$library")"
+            done
+          }
+
+          verify_installed_tree "$extracted/deb"
+          verify_installed_tree "$extracted/rpm"

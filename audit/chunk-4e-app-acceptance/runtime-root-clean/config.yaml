@@ -1,0 +1,29 @@
+system:
+  data_dir: /workspace/forex-ai/audit/chunk-4e-app-acceptance/runtime-root-clean
+  symbol: EURUSD
+  account_currency: USD
+  base_timeframe: M15
+  higher_timeframes:
+  - M30
+  multi_resolution_enabled: true
+models:
+  prop_search_population: 10
+  prop_search_population_auto: false
+  prop_search_generations: 0
+  prop_search_max_indicators: 5
+  prop_search_max_rows: 0
+  prop_search_max_rows_by_tf: {}
+  prop_search_device: auto
+  prop_search_min_payoff_ratio: 0.0
+  discovery_runtime:
+    prefilter_top_k: 0
+    min_history_years: 0
+    adaptive_thresholds: false
+  discovery_ledger:
+    enabled: false
+  gene_stop_bounds:
+    atr_scaled: false
+  search_runtime:
+    seed: 684015249448
+  data_runtime:
+    normalize_features: false
