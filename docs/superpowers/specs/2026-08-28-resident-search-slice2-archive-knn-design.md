@@ -3,11 +3,16 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 2
+Version: 3
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
+
+Version 3 supersedes the review candidate at commit
+`def68c428b625126e48302f1443d210e64846e84`. Its version-2 manifest remains an
+immutable historical receipt; the version-3 manifest binds this corrected
+document.
 
 ## Outcome and boundary
 
@@ -54,9 +59,9 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated in version 2
+## Review corrections incorporated through version 3
 
-| Finding | Version 2 decision |
+| Finding | Versioned decision |
 | --- | --- |
 | Chat-only freeze was not reviewable | This tracked document and its tracked SHA-256 manifest are the sole design authority. |
 | Ownership omitted trim lifetimes | The Search owner consumes and retains the whole `ResidentTrimmedPopulationSessionV1`, including its native map, ready event, parent import, schema and full-admission owners. |
@@ -69,6 +74,9 @@ headless `DiscoveryResult` remain later gates.
 | Calibration could benchmark an easy case | The exact production fixed-K kernel is benchmarked with `P=200`, a prefilled `A=50_000` archive, `W=4`, and `K=15`. |
 | Production counters were self-reported | RTX acceptance independently intercepts every D2H and synchronization API in addition to checking production counters. |
 | One-hour claim was too broad | Slice 2 proves a necessary novelty-stage lower bound only; a later combined deadline gate must cover every Search stage. |
+| GREEN readiness/headless assertions named no executable authority | Version 3 binds the existing behavioral readiness function in `resident_search_generation_v2_production_contract` and adds a prepared-native behavioral refusal test with an independent post-trim allocation scope. |
+| Calibration rejection covered only exact and under-rate receipts | Version 3 executes empty-archive, smaller-K, proxy-kernel, stale-build, foreign-device and shape-drift rejections and proves a valid novelty-only receipt cannot satisfy the separate headless deadline/readiness gate. |
+| Opacity/interception tests could pass vacuously | Version 3 requires exact rustc diagnostic codes plus compile-pass controls for R7, and live positive-control calls plus an interposer-disabled rejection for the independent CUDA interception layer. |
 
 ## Current source constraints
 
@@ -426,11 +434,39 @@ popcount words, fixed-K comparisons and output digest. Admission requires both
 minimum rates above and rejects missing, zero, stale, foreign or under-rate
 receipts before the first full Search allocation.
 
+Calibration and admission expose typed, opaque receipts. The executable
+negative matrix independently requires:
+
+- an empty active archive, inactive-tail-only work or `archive_count != 50_000`
+  cannot mint a calibration receipt;
+- `K != 15`, including the exact `K=14` smaller-neighbor control, cannot mint
+  the current-config receipt;
+- a popcount-only/proxy kernel or a foreign kernel-semantics identity cannot
+  mint it even if its measured rate is high;
+- a receipt from a stale CUDA build/math identity, another device UUID,
+  context, stream or memory pool is rejected by admission;
+- independent `P`, `A`, `W` and `M` shape mutations are rejected; and
+- a correctly bound but deliberately under-rate receipt is rejected.
+
+Every rejection asserts the exact typed stage/reason and independently observes
+zero generation, scoring and archive allocations. Tests mutate opaque receipt
+fields only from a crate-private fixture module; no production caller gains a
+constructor or raw field access.
+
 This is only a necessary novelty-stage lower bound. Passing it does not prove
 that evaluation, scoring reductions, GA, archive staging, launch overhead and
 terminal work all fit within one hour. Headless execution remains fail-closed
 until a later combined deadline receipt sums conservative bounds for every
 stage and proves the entire current-config run fits `3_600_000 ms`.
+
+`ResidentArchiveKnnCalibrationReceiptV2` and the later
+`FullResidentDiscoveryDeadlineReceiptV1` are distinct opaque types and distinct
+run-identity domains. Slice 2 never implements a conversion between them. A
+compile-fail contract rejects passing the novelty receipt where the full
+deadline receipt is required, and the prepared-native behavioral invariant
+passes a valid novelty receipt while omitting the full deadline receipt and
+still requires fail-before-Search-allocation. Thus a novelty benchmark cannot
+open headless execution by type confusion or by a readiness-bit shortcut.
 
 ## Independent no-boundary evidence
 
@@ -438,6 +474,8 @@ Production counters are necessary but cannot validate themselves. The real RTX
 sequence therefore also links a test-only CUDA interception translation unit
 around:
 
+- synchronous and stream-ordered allocation entry points reached by the
+  combined Search admission;
 - runtime and driver D2H copies, synchronous and asynchronous;
 - stream, event, context and device synchronization calls.
 
@@ -448,6 +486,25 @@ synchronization inside that scope. At the terminal boundary it permits exactly
 one bounded compact receipt D2H after the combined commit and before the event;
 no gene, metric, signature or archive payload is permitted. Production receipt
 counters must independently agree with the interception log.
+
+The test binary link-wraps the exact runtime and driver symbols referenced by
+the production native objects. The interception state lives only in the
+test-only translation unit; production kernels, owners and receipt writers have
+no symbol, pointer or callback through which they can reset it. The runner
+records the wrapped-symbol manifest and fails if a production object resolves a
+covered call to an unwrapped symbol or an unexpected CUDA transfer/sync symbol.
+
+Zero calls are accepted only after a non-vacuity handshake in the same process.
+Before the measured scope, the test issues one bounded known allocation followed
+by its checked release through each wrapped allocator entry point, one bounded
+known D2H and one known synchronization through each runtime/driver API family
+that the production wrapper can reach. The interceptor must record the nonce,
+process/thread identity, exact symbol, direction, byte count and successful
+return for every control call. It then seals a fresh measurement epoch; Search
+cannot reset or write that epoch. A separate child run with the interposer
+disabled, a missing symbol hook, a wrong PID/nonce or a dropped control record
+must be rejected even if its reported measured counters are all zero. Controls
+occur outside the Search timing and zero-boundary scope.
 
 The RTX oracle does not evade that boundary to inspect arrays. Before the
 intercept scope, the CPU oracle creates the deterministic fixture and its
@@ -519,11 +576,34 @@ generation allocates.
 
 ### R7: executable move-only opacity
 
-Public owner documentation contains executable `compile_fail` doctests proving
-that callers cannot clone/copy the run, access the trim map/event/archive
-pointer, detach the population session, or manufacture a ranked/staged receipt.
-The normal R6 test supplies the separate missing-archive-preallocation RED.
-No source-string/token assertion is accepted for either property.
+Path: public doctests in
+`crates/neoethos-gpu-cuda/src/resident_archive_knn_v2.rs`, executed by the exact
+`neoethos-gpu-cuda` doc-test target with `--no-default-features --features
+cuda-device-fixtures`.
+
+Public owner documentation contains paired compile-pass and `compile_fail`
+doctests under the exact contract feature that exports the opaque public owner.
+The compile-pass control imports and moves each public owner and receipt through
+its supported typed API, proving that crate resolution, feature selection and
+the positive surface are live without constructing a GPU resource. Every
+negative fence is annotated `compile_fail,E####`, never bare `compile_fail`, so
+an unrelated compilation error is not a pass. The exact authored diagnostics
+cover eight negative fences:
+
+- cloning a move-only owner fails with `E0599`, and a generic `Copy` bound fails
+  with `E0277`;
+- four separate trim-map, event, archive-pointer and population-field probes
+  each fail with `E0616`;
+- calling the private staged-receipt constructor fails with `E0624`, and
+  directly constructing a ranked receipt with private fields fails with
+  `E0451`.
+
+The gate requires exactly one positive and eight negative doctest results. It
+rejects an unrelated diagnostic, missing crate/feature, skipped or `no_run`
+negative snippet, warning-only output, or a negative snippet that compiles. Thus
+a broken test topology cannot masquerade as opacity. The normal R6 behavioral
+test supplies the separate missing combined archive-preallocation RED. No
+source-string/token assertion is accepted for either property.
 
 ### R8: transactional faults and cleanup
 
@@ -538,18 +618,32 @@ fault, performs checked terminal cleanup and permits a fresh unrelated run.
 Paths:
 
 - `crates/neoethos-gpu-cuda/src/resident_archive_knn_v2_device_tests.rs`;
-- the test-only CUDA interception translation unit.
+- test-only CUDA interception translation unit
+  `crates/neoethos-gpu-cuda/native/resident_archive_knn_v2_cuda_intercept_test.cu`.
 
 One self-authenticating sequence runs:
 
-1. exact prefilled-50,000 calibration and under-rate refusal;
-2. current-capacity allocation receipt validation;
+1. `resident_archive_knn_v2_calibration_rejects_nonrepresentative_receipts_on_real_cuda`:
+   exact production fixed-K calibration with a genuinely prefilled 50,000-entry
+   archive, plus executable rejection of empty/inactive-tail archive, `K=14`,
+   proxy/popcount kernel and deliberately under-rate controls;
+2. `resident_archive_knn_v2_admission_rejects_stale_foreign_or_shape_drift_receipts_before_allocation`:
+   current-capacity allocation admission, including executable rejection of a
+   stale CUDA build/math identity, foreign UUID/context/stream/pool receipt and
+   independent `P`, `A`, `W` and `M` shape drift, with zero Search allocation
+   deltas on every rejection;
 3. at least three resident generations compared to the independent CPU oracle
    by the preloaded test-only device validator for neighbor identities, novelty
    values, rank, archive content/count and `g+1` visibility;
 4. duplicate, adversarial collision, cap and all fault/cleanup cases;
 5. interception assertions for zero intermediate D2H/synchronization and one
-   compact terminal D2H.
+   compact terminal D2H, accepted only after the positive-control handshake has
+   observed every wrapped runtime/driver family and an interposer-disabled child
+   has been rejected.
+
+The separately classified prepared-headless GREEN invariant below runs before
+and after this sequence. It is evidence in the final receipt, but it is never an
+R9 RED and a failure stops the sequence rather than authorizing implementation.
 
 The device sequence records GPU UUID/name/compute capability/memory, exact
 command and environment, source and binary hashes, receipt/counter values and
@@ -557,15 +651,62 @@ exit status. It runs once after an independent source review says safe to run.
 
 ## Continuously GREEN invariants
 
-The existing readiness/headless contract is a guard, not a RED. Before RED
-capture, after every implementation step, and after RTX validation it must
-remain GREEN:
+Readiness and prepared-headless refusal are guards, not REDs. They run before
+RED capture, after every implementation step, and after RTX validation.
 
-- all currently false Search readiness facts remain false;
-- `production_ready` remains false;
-- `run_native_cuda_prepared_discovery_v3` continues to refuse rather than
-  materialize host data or invoke CPU Search;
-- no full archive or terminal portfolio projection is added by Slice 2.
+The existing exact target is
+`crates/neoethos-gpu-cuda/tests/resident_search_generation_v2_production_contract.rs`,
+Cargo test target `resident_search_generation_v2_production_contract`, function
+`h_implementation_patch_keeps_all_five_unproven_readiness_facts_false`. It must
+continue to assert the source truth: `exact_generation_semantics`,
+`device_resident_generation_advance`, `immutable_scenario_admission`,
+`whole_workspace_preallocated`, `unified_device_fault_authority`,
+`terminal_cleanup_lease` and `production_ready` are false, while
+`device_owned_search_control` and `native_bridge_production_sealed` are true.
+Its exact focused invocation is:
+
+```text
+cargo test -p neoethos-gpu-cuda --no-default-features --features cuda --test resident_search_generation_v2_production_contract h_implementation_patch_keeps_all_five_unproven_readiness_facts_false -- --exact
+```
+
+Slice 2 also adds the GREEN behavioral target
+`crates/neoethos-search/src/prepared_discovery_run_input_v3/resident_slice2_headless_invariant_tests.rs`,
+function
+`resident_slice2_valid_novelty_receipt_still_refuses_prepared_headless_before_search_allocation`.
+It is a descendant test module, so it calls the private
+`run_native_cuda_prepared_discovery_v3` entry directly rather than accepting a
+public surrogate. The fixture first creates the real current-config plan and
+whole `ResidentTrimmedPopulationSessionV1`, then supplies a correctly sealed
+novelty calibration receipt but no `FullResidentDiscoveryDeadlineReceiptV1`.
+Only after trim setup does it open an independent Search-allocation interception
+epoch. The call must reach the private entry, return the exact missing-full-run-
+deadline/readiness error, leave the carrier under its checked cleanup lease, and
+show zero combined-admission calls and zero generation, scoring or archive
+allocation deltas in that epoch. The test also rejects CPU Search, host
+materialization and post-trim Search-generation progress. The exact existing
+`gpu_native_trim_prefilter` progress event is allowed and asserted. Trim
+allocations are explicitly outside the measured epoch, so the assertion is
+precisely
+fail-before-**Search**-allocation rather than a vacuous zero-allocation claim.
+
+This target is registered only under the dedicated
+`resident-search-slice2-device-fixtures` feature, which includes
+`gpu-b-native` and `neoethos-gpu-cuda/cuda-device-fixtures` and is absent from
+default, application and production feature closures. Its positive control
+proves that the allocation interceptor records a known test allocation in the
+same process before the epoch is sealed; disabled or missing interception makes
+the invariant test fail. No full archive or terminal portfolio projection is
+added by Slice 2.
+
+Its exact focused invocation on the admitted RTX runner is:
+
+```text
+NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --no-default-features --features resident-search-slice2-device-fixtures --lib prepared_discovery_run_input_v3::resident_slice2_headless_invariant_tests::resident_slice2_valid_novelty_receipt_still_refuses_prepared_headless_before_search_allocation -- --exact --nocapture
+```
+
+This second invariant is introduced only when the typed novelty calibration
+receipt and its crate-private fixture constructor exist. It must be GREEN in the
+same commit that first introduces those types; it is never captured as RED.
 
 ## Planned production files after design approval
 
@@ -580,7 +721,11 @@ The first implementation may touch only the bounded archive/transaction seam:
   `resident_search_v2.rs`;
 - the crate-private whole-carrier consumer in
   `resident_trim_prefilter_v1.rs`;
-- build registration and focused contract/device test modules.
+- build registration and focused contract/device test modules, including the
+  test-only prepared-headless GREEN invariant module and its non-production
+  fixture feature in `crates/neoethos-search/Cargo.toml`, plus only the
+  `#[cfg(test)]` child-module registration in
+  `prepared_discovery_run_input_v3.rs`.
 
 The old current-only mean-Jaccard path is not modified into a look-alike. It
 remains unreachable from current-config production and may be removed only
@@ -588,12 +733,16 @@ after the versioned replacement is fully verified.
 
 ## Implementation and review gates
 
-1. Land R1-R9 tests and capture pure RED while the GREEN invariants pass.
-2. Implement checked ABI/layout/query and exact calibration receipt.
+1. Run the existing exact readiness GREEN invariant, then land R1-R9 and capture
+   pure RED while that invariant continues to pass.
+2. Implement checked ABI/layout/query and exact calibration receipt; in the same
+   boundary add the prepared-headless invariant and require its first run GREEN.
 3. Implement whole-trim-carrier ownership and transactional create/unwind.
 4. Implement signatures, exact fixed-K and collision-safe archive equality.
 5. Implement the ranked/staged/evolve states and packed combined commit.
-6. Run focused contracts and the exact no-link feature gates only.
+6. Run both GREEN invariants, focused contracts and the exact no-link feature
+   gates only.
 7. Freeze source for independent lifecycle/math/source-contract review.
-8. Run the single authorized RTX sequence only after a safe-to-run verdict.
+8. Run the single authorized RTX sequence, including both GREEN invariants,
+   only after a safe-to-run verdict.
 9. Freeze bounded Slice 2 evidence without changing readiness or headless routing.
