@@ -1,0 +1,4 @@
+# Resident Search Slice 2 design authority manifest v2
+# Authoritative base: 7824e191c04b4eb78e547728ad7cdb78f915a2af
+# Digest input is the UTF-8 design text with CRLF normalized to LF.
+cbeaddffc1f1f6402261fdeebc9f21e9a92f30ecbdb615de90e06eb2737b938e  docs/superpowers/specs/2026-08-28-resident-search-slice2-archive-knn-design.md
