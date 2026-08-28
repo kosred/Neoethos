@@ -273,7 +273,7 @@ fn full_nvidia_training_refuses_the_explicit_cpu_bayes_boundary_until_its_gpu_ro
     let models = read("crates/neoethos-models/src/training_orchestrator.rs");
     let validator = function_body(&models, "fn validate_nvidia_model_config_v1(");
     assert!(
-        validator.contains("supports_gpu_for_model")
+        validator.contains("supports_nvidia_cuda_for_model")
             && validator.contains("CudaDevicePolicy::Gpu { ordinal: 0 }")
             && !validator.contains("CudaDevicePolicy::Cpu"),
         "the explicit bayes CPU boundary must make full-GPU preflight fail, not become a fallback"
@@ -342,7 +342,7 @@ fn full_run_preflights_the_complete_training_dispatch_on_exact_cuda_zero() {
 
     let strict_model = function_body(&models, "fn validate_nvidia_model_config_v1(");
     for required in [
-        "supports_gpu_for_model",
+        "supports_nvidia_cuda_for_model",
         "full_nvidia_device_policy_for_config",
         "CudaDevicePolicy::Gpu { ordinal: 0 }",
     ] {

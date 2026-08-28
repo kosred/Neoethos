@@ -188,13 +188,25 @@ fn registry_exposes_exact_cuda_surface_census() {
         "conformal_gate",
         "dqn",
         "elasticnet",
+        "exit_agent",
+        "kan",
         "lightgbm",
         "logistic",
         "meta_blender",
         "meta_stack",
+        "mlp",
+        "nbeats",
+        "nbeatsx_nf",
         "neat",
         "neuro_evo",
+        "patchtst",
         "probability_calibrator",
+        "sac",
+        "tabnet",
+        "tide",
+        "tide_nf",
+        "timesnet",
+        "transformer",
         "xgboost",
         "xgboost_dart",
         "xgboost_rf",
@@ -217,7 +229,7 @@ fn registry_exposes_exact_cuda_surface_census() {
 }
 
 #[test]
-fn all_fifteen_cuda_surfaces_have_mandatory_lifecycle_gates() {
+fn all_non_burn_cuda_surfaces_have_mandatory_lifecycle_gates() {
     let gates = [
         (
             "xgboost_cuda_named_surfaces_train_infer_save_load",

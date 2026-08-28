@@ -20,8 +20,9 @@
 
 use crate::runtime::capabilities::{ModelCapability, ModelFamily, model_capability};
 
-/// Every named production surface reachable through the normal `gpu-cuda`
-/// build whose training implementation can execute NVIDIA CUDA work.
+/// Every named production surface with a supported NVIDIA CUDA feature route.
+/// Each route is checked against its exact Cargo feature; Burn routes require
+/// the separately selected `burn-cuda-backend` feature.
 ///
 /// This is a census, not a promise that every model prefers CUDA under the
 /// current runtime settings. LightGBM has a separate operator opt-in and the
@@ -32,13 +33,25 @@ pub const CUDA_CAPABLE_MODEL_NAMES: &[&str] = &[
     "conformal_gate",
     "dqn",
     "elasticnet",
+    "exit_agent",
+    "kan",
     "lightgbm",
     "logistic",
     "meta_blender",
     "meta_stack",
+    "mlp",
+    "nbeats",
+    "nbeatsx_nf",
     "neat",
     "neuro_evo",
+    "patchtst",
     "probability_calibrator",
+    "sac",
+    "tabnet",
+    "tide",
+    "tide_nf",
+    "timesnet",
+    "transformer",
     "xgboost",
     "xgboost_dart",
     "xgboost_rf",
@@ -52,17 +65,19 @@ pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
     model_capability(name)
 }
 
-/// Whether this build contains a GPU code path that `name` can actually use.
+fn known_model_family_matches(name: &str, family: ModelFamily) -> bool {
+    model_capability(name).is_some_and(|capability| capability.family == family)
+}
+
+/// Whether this build contains an NVIDIA CUDA implementation for `name`.
 ///
-/// The full-NVIDIA training preflight consumes this table before launching any
-/// model. It reads the real Cargo features, so a build cannot advertise a CUDA
-/// implementation that was not compiled. Runtime artifacts and training
-/// summaries then record the requested/effective device selected by each
-/// model's own strict execution boundary.
-///
-/// Do not add an `#[allow(dead_code)]` here if a caller disappears — either
-/// wire it or delete it.
-pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+/// This is deliberately narrower than [`supports_gpu_for_model`]. A Burn WGPU
+/// build is a valid generic GPU backend, but it cannot satisfy an NVIDIA CUDA
+/// preflight or an exact `gpu:0` CUDA artifact contract.
+pub fn supports_nvidia_cuda_for_model(name: &str, family: ModelFamily) -> bool {
+    if !known_model_family_matches(name, family) {
+        return false;
+    }
     match name {
         "lightgbm" => cfg!(feature = "lightgbm-gpu"),
         "xgboost"
@@ -71,30 +86,48 @@ pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         | "meta_blender"
         | "probability_calibrator"
         | "conformal_gate"
-        | "meta_stack" => cfg!(feature = "xgboost"),
+        | "meta_stack" => cfg!(feature = "gpu-cuda"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
         "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
         "logistic" | "elasticnet" => cfg!(feature = "statistical-gpu"),
-        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
-        // rlkit/Candle DQN path.
-        "sac" => cfg!(any(
-            feature = "burn-wgpu-backend",
-            feature = "burn-cuda-backend"
-        )),
+        "sac" => cfg!(feature = "burn-cuda-backend"),
         _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(any(
-                feature = "burn-wgpu-backend",
-                feature = "burn-cuda-backend"
-            )),
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-cuda-backend"),
             _ => false,
         },
+    }
+}
+
+/// Whether this build contains a GPU code path that `name` can actually use.
+///
+/// This reporting query includes both CUDA and WGPU. The stricter full-NVIDIA
+/// preflight uses [`supports_nvidia_cuda_for_model`] so WGPU cannot satisfy a
+/// CUDA contract.
+pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    if !known_model_family_matches(name, family) {
+        return false;
+    }
+    if supports_nvidia_cuda_for_model(name, family) {
+        return true;
+    }
+    match name {
+        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
+        // rlkit/Candle DQN path.
+        "sac" => cfg!(feature = "burn-wgpu-backend"),
+        _ => {
+            matches!(family, ModelFamily::Deep | ModelFamily::Exit)
+                && cfg!(feature = "burn-wgpu-backend")
+        }
     }
 }
 
 /// Whether the GPU path is the one this model SHOULD take when a card is
 /// present under the installed runtime policy.
 pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    if !known_model_family_matches(name, family) {
+        return false;
+    }
     match name {
         "lightgbm" => {
             cfg!(feature = "lightgbm-gpu")
@@ -112,7 +145,7 @@ pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         | "meta_blender"
         | "probability_calibrator"
         | "conformal_gate"
-        | "meta_stack" => cfg!(feature = "xgboost"),
+        | "meta_stack" => supports_nvidia_cuda_for_model(name, family),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
         "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
@@ -255,6 +288,15 @@ mod tests {
     fn unknown_model_names_do_not_resolve() {
         assert!(get_model_capability("nonexistent").is_none());
         assert!(get_model_capability("").is_none());
+
+        for (name, family) in [
+            ("nonexistent", ModelFamily::Deep),
+            ("mlp", ModelFamily::Exit),
+        ] {
+            assert!(!supports_nvidia_cuda_for_model(name, family));
+            assert!(!supports_gpu_for_model(name, family));
+            assert!(!prefers_gpu_for_model(name, family));
+        }
     }
 
     #[test]
@@ -297,6 +339,11 @@ mod tests {
                 "{name} must report every compiled Burn GPU backend"
             );
             assert_eq!(
+                supports_nvidia_cuda_for_model(name, family),
+                cfg!(feature = "burn-cuda-backend"),
+                "{name} must report CUDA only when the Burn CUDA backend is compiled"
+            );
+            assert_eq!(
                 prefers_gpu_for_model(name, family),
                 burn_gpu_compiled,
                 "{name} must prefer the explicitly compiled Burn GPU backend"
@@ -324,14 +371,21 @@ mod tests {
             let capability = get_model_capability(name)
                 .unwrap_or_else(|| panic!("CUDA census name `{name}` lacks a capability"));
             assert_eq!(
-                supports_gpu_for_model(name, capability.family),
+                supports_nvidia_cuda_for_model(name, capability.family),
                 match *name {
                     "lightgbm" => cfg!(feature = "lightgbm-gpu"),
                     "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
                     "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
                     "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
                     "logistic" | "elasticnet" => cfg!(feature = "statistical-gpu"),
-                    _ => cfg!(feature = "xgboost"),
+                    "xgboost"
+                    | "xgboost_rf"
+                    | "xgboost_dart"
+                    | "meta_blender"
+                    | "probability_calibrator"
+                    | "conformal_gate"
+                    | "meta_stack" => cfg!(feature = "gpu-cuda"),
+                    _ => cfg!(feature = "burn-cuda-backend"),
                 },
                 "CUDA census feature mapping drifted for {name}"
             );

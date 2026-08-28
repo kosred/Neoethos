@@ -94,6 +94,13 @@ fn burn_cuda_reachable_surface_census_is_explicit_before_the_separate_rtx_matrix
 
 #[test]
 fn burn_cuda_capability_registry_reports_the_compiled_backend() {
+    let cuda_supports = REGISTRY
+        .split("pub fn supports_nvidia_cuda_for_model")
+        .nth(1)
+        .expect("the per-model NVIDIA CUDA support registry is missing")
+        .split("/// Whether this build contains a GPU code path")
+        .next()
+        .expect("generic GPU support documentation must follow CUDA support");
     let supports = REGISTRY
         .split("pub fn supports_gpu_for_model")
         .nth(1)
@@ -109,12 +116,27 @@ fn burn_cuda_capability_registry_reports_the_compiled_backend() {
         .next()
         .expect("registry tests must follow GPU preference");
 
-    for (name, body) in [("supports", supports), ("prefers", prefers)] {
-        assert!(
-            body.contains("feature = \"burn-wgpu-backend\"")
-                && body.contains("feature = \"burn-cuda-backend\""),
-            "Burn {name} capability must include both compiled GPU backends"
-        );
+    assert!(
+        cuda_supports.contains("feature = \"burn-cuda-backend\"")
+            && !cuda_supports.contains("feature = \"burn-wgpu-backend\""),
+        "NVIDIA CUDA capability must accept only the compiled Burn CUDA backend"
+    );
+    assert!(
+        supports.contains("supports_nvidia_cuda_for_model")
+            && supports.contains("feature = \"burn-wgpu-backend\""),
+        "generic GPU capability must combine delegated CUDA support with Burn WGPU"
+    );
+    assert!(
+        prefers.contains("feature = \"burn-wgpu-backend\"")
+            && prefers.contains("feature = \"burn-cuda-backend\""),
+        "Burn preference must include both compiled GPU backends"
+    );
+
+    for (name, body) in [
+        ("CUDA support", cuda_supports),
+        ("generic support", supports),
+        ("preference", prefers),
+    ] {
         assert!(
             body.contains("\"sac\" =>") && body.contains("ModelFamily::Deep | ModelFamily::Exit"),
             "Burn {name} capability must cover SAC, Deep, and Exit surfaces"

@@ -445,8 +445,8 @@ impl TrainingOrchestrator {
     fn validate_nvidia_model_config_v1(&self, config: &ModelConfig) -> Result<()> {
         let canonical = canonical_model_name(&config.name);
         anyhow::ensure!(
-            crate::registry::supports_gpu_for_model(canonical, config.capability_family),
-            "full NVIDIA model `{}` has no compiled GPU implementation in this build",
+            crate::registry::supports_nvidia_cuda_for_model(canonical, config.capability_family),
+            "full NVIDIA model `{}` has no compiled NVIDIA CUDA implementation in this build",
             config.name
         );
 
@@ -466,11 +466,12 @@ impl TrainingOrchestrator {
         Ok(())
     }
 
-    /// Validate the complete configured model expansion and its exact CUDA/CPU
+    /// Validate the complete configured model expansion and its exact CUDA-only
     /// routing before a canonical full run spends time building features or
     /// searching. This is deliberately stricter than ordinary CPU-capable
-    /// training: every selected model must have a compiled GPU implementation
-    /// and target exact CUDA ordinal zero. There is no CPU substitution.
+    /// training: every selected model must have a compiled NVIDIA CUDA
+    /// implementation and target exact CUDA ordinal zero. There is no CPU
+    /// substitution.
     pub fn preflight_full_nvidia_cuda_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
@@ -596,7 +597,7 @@ impl TrainingOrchestrator {
     /// NVIDIA training run. Unlike the full-ensemble preflight, this does not
     /// invent missing voters that are outside the configured plan; every model
     /// that is present still has to resolve to its real CUDA implementation on
-    /// ordinal zero or to an explicit CPU-only policy.
+    /// ordinal zero. An explicit CPU-only policy is rejected, not substituted.
     pub fn preflight_configured_nvidia_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
@@ -6288,7 +6289,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("online_hoeffding")
-                && message.contains("no compiled GPU implementation"),
+                && message.contains("no compiled NVIDIA CUDA implementation"),
             "full-GPU refusal must name the exact missing model and capability: {message}"
         );
     }
