@@ -2012,7 +2012,10 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     let (legacy, _) =
         prefilter_features(&frame, &ohlcv, &spec(3, 0)).expect("legacy prefilter succeeds");
     assert!(
-        !legacy.names.iter().any(|n| timeframe_group(n).is_some()),
+        !legacy
+            .names
+            .iter()
+            .any(|n| crate::prefilter_schema_v1::timeframe_group_v1(n).is_some()),
         "legacy prefilter should keep only base features, got {:?}",
         legacy.names
     );
