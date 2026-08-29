@@ -3,15 +3,15 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 6
+Version: 7
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
 
-Version 6 supersedes the version-5 design at commit
-`a17a2091e094f9064695de1f6a9e3247d995dfc6`. The version-2 through version-5
-manifests remain immutable historical receipts; the version-6 manifest alone
+Version 7 supersedes the version-6 design at commit
+`4f0880148677df0d8f58c11373b42d0bd87e5b13`. The version-2 through version-6
+manifests remain immutable historical receipts; the version-7 manifest alone
 binds this corrected document and its R6 implementation plan.
 
 ## Outcome and boundary
@@ -49,6 +49,12 @@ headless `DiscoveryResult` remain later gates.
 - Lehman's dissertation Appendix A records `K=15` for the referenced novelty
   experiments; Slice 2 exposes and seals that value rather than hiding it as a
   kernel constant: <https://www.joellehman.com/lehman-dissertation.pdf>.
+- Cargo's feature reference governs the empty, non-default host-contract
+  feature and proves that its feature array activates no optional dependency:
+  <https://doc.rust-lang.org/cargo/reference/features.html>.
+- Cargo's target reference governs the library/build-script separation used by
+  the host-contract verification topology:
+  <https://doc.rust-lang.org/cargo/reference/cargo-targets.html>.
 - The CUDA Runtime API memory-management contract governs the exact
   `cudaHostAlloc(..., cudaHostAllocPortable)` terminal allocation:
   <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html>.
@@ -64,7 +70,7 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated through version 6
+## Review corrections incorporated through version 7
 
 | Finding | Versioned decision |
 | --- | --- |
@@ -95,6 +101,10 @@ headless `DiscoveryResult` remain later gates.
 | Allocator reserve and full-workspace authority were conflated | Version 6 separates allocator/context headroom, full-workspace authority, retained pre-Search workspace and remaining Search allocation bytes, then requires checked partition and availability equations before native create. |
 | An R6 receipt could self-report a plausible ledger | Version 6 requires a separate recorder facade on the actual Rust admission path, exact cardinality before element comparison and mutation controls for missing, extra, reordered and field-drifted actual calls. |
 | R6 could fail to compile or fan out into unrelated production changes | Version 6 permits only a test-only stub/child registration in `resident_search_v2.rs` plus `resident_search_v2_tests.rs`, and freezes exactly five warning-clean runtime `ImplementationPending` failures. |
+| The v6 RED command activated CUDA on a host with no CUDA installation | Version 7 adds the empty non-default `resident-search-slice2-host-contract` feature, which activates neither `cust` nor `vector-ta` and leaves the CUDA feature/build semantics unchanged. |
+| A host-only copy could drift from the future production validator | Version 7 places DTOs, facade, move-only owner, pending seam and later validator in one private shared `resident_search_slice2_admission_v2` module. Host tests and future CUDA production use that same authority; no mirror is permitted. |
+| The v6 plan put test declarations inside the CUDA-gated production module | Version 7 keeps `resident_search_v2.rs` CUDA-gated and unchanged in R6 RED. The shared module owns the seam and registers its child tests only under the host-contract test feature. |
+| An empty feature could later acquire hidden CUDA edges | Version 7 adds Cargo-metadata, build-log, default/CUDA preservation and dual-feature cfg ratchets. Actual all-features compilation remains a later CUDA-toolchain gate rather than a false local claim. |
 
 ## Current source constraints
 
@@ -122,6 +132,22 @@ terminal receipt to the host and records the completion event in one private
 function. There is no valid insertion seam between rank and rotation. Slice 2
 therefore versions this orchestration rather than inserting an archive side
 effect around the existing function.
+
+### Version 7 local host-toolchain evidence
+
+The v6 focused command selected `--features cuda`. On the current Windows host
+it stopped during the `cust_raw`/`find_cuda_helper` build with the exact terminal
+diagnostic `Could not find a cuda installation`; no R6 test binary was produced.
+At that observation point `CUDA_PATH` and `CUDA_ROOT` were absent and neither
+`nvcc` nor `cuobjdump` resolved on `PATH`.
+
+The crate's own `build.rs:626-652` independently confirms the topology: when
+`CARGO_FEATURE_CUDA` is present it calls `resolve_cuda_build` before compiling
+the host ABI, and that path resolves/runs `nvcc` and `cuobjdump`. There is no
+`DOCS_RS` bypass. Therefore a command that enables `cuda` is not a truthful
+host-only R6 contract command on this machine. This evidence says nothing about
+the correctness of CUDA production code; it proves only that R6 needs a
+dependency-empty host-contract feature to compile and execute its pure Rust RED.
 
 ## Ownership model
 
@@ -845,14 +871,69 @@ D2H and record one event after the last combined commit.
 
 ### R6: combined preallocation
 
-Path: `crates/neoethos-gpu-cuda/src/resident_search_v2_tests.rs`
+The R6 RED may touch exactly four paths:
 
-The only companion edit is a `#[cfg(test)]` stub and child-module registration
-in `crates/neoethos-gpu-cuda/src/resident_search_v2.rs`. R6 RED may not touch
-`lib.rs`, any Cargo/build/native file, or any R1-R5 source/test. It is a pure
-host/test-fixture contract and makes no CUDA hardware claim.
+- `crates/neoethos-gpu-cuda/Cargo.toml`;
+- `crates/neoethos-gpu-cuda/src/lib.rs`;
+- new private shared authority
+  `crates/neoethos-gpu-cuda/src/resident_search_slice2_admission_v2.rs`;
+- `crates/neoethos-gpu-cuda/src/resident_search_v2_tests.rs`.
 
-The test-only error authority is
+`Cargo.toml` adds exactly the non-default empty feature
+`resident-search-slice2-host-contract = []`. It enables no dependency and is
+not included by `default`, `cuda`, `cuda-device-fixtures` or any production
+aggregate. `lib.rs` registers the private shared module exactly as:
+
+```rust
+#[cfg(any(
+    feature = "cuda",
+    all(test, feature = "resident-search-slice2-host-contract")
+))]
+#[cfg_attr(
+    all(
+        feature = "cuda",
+        not(all(test, feature = "resident-search-slice2-host-contract"))
+    ),
+    allow(dead_code)
+)]
+mod resident_search_slice2_admission_v2;
+```
+
+The narrow `cfg_attr` applies only while the shared authority is compiled by a
+CUDA build that cannot run the host-contract child. It prevents the deliberately
+unbound RED authority from breaking CUDA `-Dwarnings`; it is removed in the
+later commit that binds `resident_search_v2.rs`. Host-contract tests and
+all-features unit tests do not receive the allowance, so their dead-code
+coverage remains strict.
+
+The shared module registers its child tests exactly as:
+
+```rust
+#[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
+#[path = "resident_search_v2_tests.rs"]
+mod resident_search_v2_tests;
+```
+
+The shared module contains the exact R6 DTOs, allocator facade, move-only owner
+and pending seam frozen below. The later validator is implemented there too;
+there is no host-only mirror. To remain available under the empty host feature,
+the module imports only `core`, `std` and non-CUDA crate authorities; it may not
+import `cust`, `vector-ta`, a CUDA-gated sibling or native FFI. Production
+`resident_search_v2.rs` remains under its existing `#[cfg(feature = "cuda")]`
+gate and is byte-unchanged by R6 RED.
+Later CUDA implementation must call the private shared authority, but this RED
+does not claim that production binding yet. No build/native file, other source,
+R1-R5 test or dependency feature may change. This remains a pure host contract
+and makes no CUDA hardware claim.
+
+Because the RED seam returns `ImplementationPending` before any facade call,
+the five-test child references the concrete recorder's three trait method items
+inside its already-called mutation-register assertion. Those method items are
+never invoked, so native-create and allocator counters remain zero. This is the
+only host/all-features warning-clean mechanism for the otherwise-unused trait
+methods; a broad `dead_code` allowance on either unit-test branch is forbidden.
+
+The shared R6 and future-production error authority is
 `ResidentSearchSlice2AdmissionErrorV2`, with these exact discriminants and
 payload shapes:
 
@@ -966,6 +1047,18 @@ sequence.
 The first R6 commit compiles warning-clean and runs exactly these five tests.
 All five fail at runtime with the typed `ImplementationPending` discriminant;
 there is no compile failure, sixth test, unrelated failure or device execution.
+The exact Windows PowerShell command is:
+
+```powershell
+$env:CARGO_INCREMENTAL = '0'
+$env:RUSTFLAGS = '-Dwarnings'
+cargo +nightly-2026-04-07 test --locked --offline -j 7 -p neoethos-gpu-cuda --no-default-features --features resident-search-slice2-host-contract --lib 'resident_search_slice2_admission_v2::resident_search_v2_tests::slice2_' -- --nocapture
+```
+
+`-j 7` is a Cargo option before the test-runner `--`. The exact result is a
+successful warning-clean compile followed by `0 passed; 5 failed`, with all
+five failures caused only by `ImplementationPending`. The command must not
+resolve `cust`, `cust_raw`, `vector-ta`, `nvcc`, `cuobjdump` or a CUDA link.
 
 ### R7: executable move-only opacity
 
@@ -1140,10 +1233,25 @@ The device sequence records GPU UUID/name/compute capability/memory, exact
 command and environment, source and binary hashes, receipt/counter values and
 exit status. It runs once after an independent source review says safe to run.
 
-## Exact test-only feature and cfg topology
+## Exact host-contract feature and cfg topology
 
 The implementation may use only this topology:
 
+- `neoethos-gpu-cuda/Cargo.toml` declares exactly
+  `resident-search-slice2-host-contract = []`; it is non-default, has no
+  `dep:` or feature edge, and neither includes nor is included by `cuda`;
+- `neoethos-gpu-cuda/src/lib.rs` has exactly one private declaration of
+  `resident_search_slice2_admission_v2`, under
+  `cfg(any(feature="cuda", all(test,
+  feature="resident-search-slice2-host-contract")))`. The `any` means enabling
+  both features still declares the module once. The adjacent narrow
+  `cfg_attr` above permits dead code only for a CUDA compile without the host
+  child, until production binding removes it;
+- the shared module alone registers `resident_search_v2_tests` under
+  `cfg(all(test, feature="resident-search-slice2-host-contract"))`;
+- production `resident_search_v2` retains its existing public module
+  declaration under only `cfg(feature="cuda")`. R6 RED does not modify that
+  file or claim that it already consumes the shared validator;
 - `neoethos-gpu-cuda/src/lib.rs` registers production
   `resident_archive_knn_v2` under `#[cfg(feature = "cuda")]`, R8 under
   `#[cfg(all(test, feature = "cuda"))]`, and
@@ -1175,6 +1283,38 @@ No `cfg(test)`-only item is treated as visible to an integration test, and no
 test-only feature is allowed to unify into a production or application build.
 Source-contract tests assert these exact attributes and negative feature
 closures.
+
+R6 acceptance also records four host-topology ratchets:
+
+1. `cargo +nightly-2026-04-07 metadata --locked --offline --no-deps
+   --format-version 1` proves the host-contract feature value is the literal
+   empty array, `default` remains `[]`, `cuda` remains exactly
+   `["dep:cust", "dep:vector-ta"]`, and `cuda-device-fixtures` remains
+   `["cuda"]`. No feature includes the host-contract feature.
+2. The focused R6 command is repeated from a GUID-named target whose
+   nonexistence is asserted first, with verbose build logging. Its persisted
+   complete log and SHA-256 must show the five exact named tests in the panic
+   headers, failed-status lines and final failure list, with exactly five
+   `ImplementationPending` discriminants. Because the exact command uses
+   `--nocapture`, acceptance does not rely on absent captured-stdout sections.
+   Neither resolved packages nor build/link command lines may contain `cust`,
+   `cust_raw`, `find_cuda_helper`, `vector-ta`, an `nvcc`/`cuobjdump`
+   invocation, `-lcuda`, `cudart`, CUDA `rustc-link-lib` (including static
+   forms), or Windows `DEFAULTLIB` CUDA forms. A package/path containing the
+   crate name `neoethos-gpu-cuda` and the build-script declaration
+   `rerun-if-env-changed=CUDA_PATH` are not themselves CUDA links.
+3. Relative to v6 authority commit
+   `4f0880148677df0d8f58c11373b42d0bd87e5b13`, the R6 commit has zero diff in
+   `build.rs`, `resident_search_v2.rs` and `Cargo.lock`; normalized literal
+   source ratchets assert exactly one complete shared-module `cfg`/`cfg_attr`
+   declaration, one complete child-test gate and one continued CUDA-only
+   production module declaration, with no duplicate declaration of any of the
+   three modules.
+4. Cargo metadata with `--all-features` must resolve both features together,
+   and the one `cfg(any(...))` declaration prevents duplicate module ownership.
+   This host proves graph/topology compatibility only; actual all-features
+   compilation is repeated later on the authorized CUDA toolchain and is not
+   claimed by R6.
 
 ## Continuously GREEN invariants
 
@@ -1243,10 +1383,15 @@ The first implementation may touch only the bounded archive/transaction seam:
 - new `native/resident_archive_knn_v2_abi.cuh` and
   `native/resident_archive_knn_v2.cu`;
 - new `src/resident_archive_knn_v2.rs` plus focused tests;
+- private `src/resident_search_slice2_admission_v2.rs` as the single shared
+  R6 admission/validation authority for host contract and future CUDA
+  production, plus the empty non-default host-contract feature and exact
+  `lib.rs` gate above;
 - versioned combined admission and split-transaction additions in
   `resident_search_generation_v2_abi.cuh`, `resident_generation_v1.cu`,
   `resident_scoring_novelty_v1.cu`, `resident_scoring_v2.rs` and
-  `resident_search_v2.rs`;
+  `resident_search_v2.rs`; the latter later calls the shared authority under
+  `cuda`, but that binding is not present or claimed in R6 RED;
 - the crate-private whole-carrier consumer in
   `resident_trim_prefilter_v1.rs`;
 - `crates/neoethos-search/src/gpu_resident_current_config_plan_v1.rs` and its
