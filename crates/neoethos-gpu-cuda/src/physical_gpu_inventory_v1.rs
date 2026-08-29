@@ -20,6 +20,8 @@ const PCI_BASE_CLASS_PROCESSING_ACCELERATOR: u8 = 0x12;
 const NVIDIA_VENDOR_ID: u16 = 0x10de;
 const AMD_VENDOR_ID: u16 = 0x1002;
 const INTEL_VENDOR_ID: u16 = 0x8086;
+const ASPEED_VENDOR_ID: u16 = 0x1a03;
+const ASPEED_AST_GRAPHICS_DEVICE_ID: u16 = 0x2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PhysicalGpuInventoryPlatformV1 {
@@ -179,7 +181,7 @@ impl SealedNoPhysicalGpuReceiptV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PhysicalAdapterDispositionV1 {
     PhysicalGpu,
-    ProvenSoftwareOrVirtual,
+    ProvenNonCompute,
     Ambiguous,
     NotGpuClass,
 }
@@ -188,7 +190,7 @@ impl PhysicalAdapterDispositionV1 {
     const fn wire_code(self) -> u8 {
         match self {
             Self::PhysicalGpu => 1,
-            Self::ProvenSoftwareOrVirtual => 2,
+            Self::ProvenNonCompute => 2,
             Self::Ambiguous => 3,
             Self::NotGpuClass => 4,
         }
@@ -352,7 +354,7 @@ fn seal_complete_physical_gpu_inventory_v1(
                     pci_function: location.function(),
                 });
             }
-            PhysicalAdapterDispositionV1::ProvenSoftwareOrVirtual => {}
+            PhysicalAdapterDispositionV1::ProvenNonCompute => {}
             PhysicalAdapterDispositionV1::Ambiguous => Err(PhysicalGpuInventoryErrorV1::new(
                 PhysicalGpuInventoryErrorCodeV1::AmbiguousAdapter,
                 format!(
@@ -393,7 +395,7 @@ fn classify_physical_pci_adapter_v1(
     vendor_id: u16,
     device_id: u16,
     base_class: u8,
-    _subclass: u8,
+    subclass: u8,
 ) -> PhysicalAdapterDispositionV1 {
     if !matches!(
         base_class,
@@ -402,8 +404,8 @@ fn classify_physical_pci_adapter_v1(
         return PhysicalAdapterDispositionV1::NotGpuClass;
     }
 
-    if is_reviewed_software_or_virtual_adapter_v1(vendor_id, device_id) {
-        return PhysicalAdapterDispositionV1::ProvenSoftwareOrVirtual;
+    if is_reviewed_non_compute_adapter_v1(vendor_id, device_id, base_class, subclass) {
+        return PhysicalAdapterDispositionV1::ProvenNonCompute;
     }
 
     match vendor_id {
@@ -414,14 +416,25 @@ fn classify_physical_pci_adapter_v1(
     }
 }
 
-fn is_reviewed_software_or_virtual_adapter_v1(vendor_id: u16, device_id: u16) -> bool {
+fn is_reviewed_non_compute_adapter_v1(
+    vendor_id: u16,
+    device_id: u16,
+    base_class: u8,
+    subclass: u8,
+) -> bool {
     matches!(
-        (vendor_id, device_id),
-        (0x1414, 0x008c)
-            | (0x15ad, 0x0405 | 0x0710 | 0x0770)
-            | (0x80ee, 0xbeef)
-            | (0x1b36, 0x0100)
-            | (0x1af4, 0x1050)
+        (vendor_id, device_id, base_class, subclass),
+        (0x1414, 0x008c, _, _)
+            | (0x15ad, 0x0405 | 0x0710 | 0x0770, _, _)
+            | (0x80ee, 0xbeef, _, _)
+            | (0x1b36, 0x0100, _, _)
+            | (0x1af4, 0x1050, _, _)
+            | (
+                ASPEED_VENDOR_ID,
+                ASPEED_AST_GRAPHICS_DEVICE_ID,
+                PCI_BASE_CLASS_DISPLAY_CONTROLLER,
+                0x00
+            )
     )
 }
 
@@ -475,4 +488,41 @@ pub(crate) fn seal_no_physical_gpu_receipt_v1(
         platform: inventory.platform(),
         inventory_identity_sha256: inventory.inventory_identity_sha256(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aspeed_bmc_display_is_non_compute_only_for_exact_class() {
+        assert_eq!(
+            classify_physical_pci_adapter_v1(
+                ASPEED_VENDOR_ID,
+                ASPEED_AST_GRAPHICS_DEVICE_ID,
+                0x03,
+                0x00,
+            ),
+            PhysicalAdapterDispositionV1::ProvenNonCompute,
+        );
+        assert_eq!(
+            classify_physical_pci_adapter_v1(
+                NVIDIA_VENDOR_ID,
+                0x2b85,
+                PCI_BASE_CLASS_DISPLAY_CONTROLLER,
+                0x02,
+            ),
+            PhysicalAdapterDispositionV1::PhysicalGpu,
+        );
+        for (device_id, base_class, subclass) in [
+            (ASPEED_AST_GRAPHICS_DEVICE_ID + 1, 0x03, 0x00),
+            (ASPEED_AST_GRAPHICS_DEVICE_ID, 0x12, 0x00),
+            (ASPEED_AST_GRAPHICS_DEVICE_ID, 0x03, 0x01),
+        ] {
+            assert_eq!(
+                classify_physical_pci_adapter_v1(ASPEED_VENDOR_ID, device_id, base_class, subclass,),
+                PhysicalAdapterDispositionV1::Ambiguous,
+            );
+        }
+    }
 }

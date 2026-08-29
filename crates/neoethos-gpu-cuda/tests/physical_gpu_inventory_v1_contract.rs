@@ -162,23 +162,27 @@ fn fatal_partial_missing_class_or_missing_location_inventory_fails_closed() {
 }
 
 #[test]
-fn software_or_virtual_adapters_are_excluded_only_after_positive_proof() {
+fn non_compute_adapters_are_excluded_only_after_positive_proof() {
     let source = read("src/physical_gpu_inventory_v1.rs");
     require_all(
         &source,
         &[
             "enum PhysicalAdapterDispositionV1",
             "PhysicalGpu",
-            "ProvenSoftwareOrVirtual",
+            "ProvenNonCompute",
             "Ambiguous",
             "PhysicalAdapterDispositionV1::Ambiguous => Err(",
-            "PhysicalAdapterDispositionV1::ProvenSoftwareOrVirtual =>",
+            "PhysicalAdapterDispositionV1::ProvenNonCompute =>",
+            "ASPEED_VENDOR_ID: u16 = 0x1a03",
+            "ASPEED_AST_GRAPHICS_DEVICE_ID: u16 = 0x2000",
+            "is_reviewed_non_compute_adapter_v1(vendor_id, device_id, base_class, subclass)",
+            "aspeed_bmc_display_is_non_compute_only_for_exact_class",
         ],
     );
     let classifier = section(&source, "fn classify_physical_pci_adapter_v1(", "\n}");
     assert!(
-        !classifier.contains("_ => PhysicalAdapterDispositionV1::ProvenSoftwareOrVirtual"),
-        "unknown adapters were treated as proven software or virtual devices"
+        !classifier.contains("_ => PhysicalAdapterDispositionV1::ProvenNonCompute"),
+        "unknown adapters were treated as proven non-compute devices"
     );
 }
 
