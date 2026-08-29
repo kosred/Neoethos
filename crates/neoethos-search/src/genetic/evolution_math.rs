@@ -368,7 +368,7 @@ impl SeenSignatureMemoryRuntimeOverrides {
     // All four are typed on `models.seen_signature_runtime`.
 
     /// Config-driven constructor. `max_entries == 0` now means **DERIVE from
-    /// available RAM** (see [`derived_seen_max_entries`]) rather than
+    /// available RAM** (see `derived_seen_max_entries`) rather than
     /// UNBOUNDED.
     ///
     /// ⚠ WHAT THIS CHANGES. Eviction is FIFO, so a cap that BITES re-admits

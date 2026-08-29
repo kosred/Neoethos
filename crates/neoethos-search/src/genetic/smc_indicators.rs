@@ -459,7 +459,7 @@ pub struct SmcFlagTally {
     pub bound_frames: u64,
     pub fallback_frames: u64,
     /// The column that would bind this flag if the operator approved the
-    /// semantic equation named in [`SMC_ALIAS_SPECS`].
+    /// semantic equation named in `SMC_ALIAS_SPECS`.
     pub pending_candidate: Option<&'static str>,
 }
 

@@ -341,8 +341,8 @@ pub fn signals_for_gene_with_config(
 ///
 /// Confidence per bar: `0.0` when the signal is `0`; otherwise
 ///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
-///   long:  margin = combined[i] - long_threshold
-///   short: margin = short_threshold - combined[i]
+///   long:  margin = `combined[i] - long_threshold`
+///   short: margin = `short_threshold - combined[i]`
 ///   conf   = (margin / gap).clamp(0.0, 1.0)
 pub fn signals_and_confidence_for_gene_with_config(
     features: &FeatureFrame,
@@ -545,8 +545,8 @@ pub fn signals_for_gene_full_with_smc(
 ///
 /// Confidence per bar: `0.0` when the signal is `0`; otherwise
 ///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
-///   long:  margin = combined[i] - long_threshold
-///   short: margin = short_threshold - combined[i]
+///   long:  margin = `combined[i] - long_threshold`
+///   short: margin = `short_threshold - combined[i]`
 ///   conf   = (margin / gap).clamp(0.0, 1.0)
 pub fn signals_and_confidence_for_gene_full(
     features: &FeatureFrame,
@@ -1379,7 +1379,7 @@ where
 /// the GA), but with two deliberate differences so it reproduces the post-search
 /// validation screens (Monte-Carlo / re-eval) bit-for-bit:
 ///
-/// 1. It routes through [`crate::eval::validation_backtest_population`] (whole
+/// 1. It routes through `crate::eval::validation_backtest_population` (whole
 ///    population → ONE GPU launch, CPU fallback) instead of the GA's CPU+GPU
 ///    *split* [`crate::eval::evaluate_population_core`].
 /// 2. The caller supplies the **exact** [`BacktestSettings`] template the serial
@@ -1760,7 +1760,7 @@ pub fn validation_genes_population(
 ///     avoids this by gathering the *full-series* precomputed signals/confidence;
 ///     this helper mirrors it by computing the full-series SMC arrays ONCE and
 ///     GATHERING them at `absolute_idx`. Signal synthesis is fully pointwise
-///     (`combined[i]` = weighted sum of indicator[i]; the gate reads only
+///     (`combined[i]` = weighted sum of `indicator[i]`; the gate reads only
 ///     `smc_row[i]`), so the on-device synth at gathered position `k` reads the
 ///     SAME indicator+SMC values the full-series synth read at `absolute_idx[k]`
 ///     → identical signals/confidence → identical fold metrics.
@@ -2170,7 +2170,7 @@ impl WalkforwardPopulationGenePack {
 /// calls this once per qualifying split. It slices the FULL-SERIES indicators +
 /// SMC + OHLCV + calendar arrays contiguously at `[a, b)` (NO gather — the WF
 /// test slice is contiguous by construction) and runs ONE GPU population launch
-/// over all genes in `pack` via [`crate::eval::validation_backtest_population`]
+/// over all genes in `pack` via `crate::eval::validation_backtest_population`
 /// (GPU-try → CPU fallback, fail-loud).
 ///
 /// ## Parity with the single-gene walk-forward

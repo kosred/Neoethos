@@ -73,7 +73,7 @@ fn permutation_monte_carlo_p_value_v1(beats: usize, permutations: usize) -> Resu
 /// kept, how much data the stage-1 funnel sees, what counts as in-sample for
 /// the prefilter), so they belong in typed config rather than ambient env
 /// state. These are configured via `models.discovery_runtime` (typed config)
-/// and resolved by [`DiscoveryRuntimeOverrides::from_settings`], which is the
+/// and resolved by `DiscoveryRuntimeOverrides::from_settings`, which is the
 /// ONLY constructor that reads operator input.
 ///
 /// 2026-08-10: the legacy `from_env()` reader was deleted. It carried six
@@ -520,7 +520,7 @@ pub struct DiscoveryConfig {
     /// The evaluators subtract this exactly once per closed trade, so a
     /// per-side broker quote must already have been doubled before it lands
     /// here — `from_settings` does that through
-    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`], gated
+    /// `crate::genetic::strategy_gene::round_trip_commission_per_lot`, gated
     /// on `risk.commission_per_lot_is_per_side`.
     pub evaluation_commission_per_trade: f64,
     /// Session-aware spread curve in pips, `[asian, overlap, late_ny]`,
@@ -549,7 +549,7 @@ pub struct DiscoveryConfig {
     /// Friday-late / Monday-open entries (`eval.rs:1537`, `:1654`).
     ///
     /// WIRED 2026-08-10 (audit #75/#217). This was the literal `true` in
-    /// [`discovery_backtest_settings`], sitting between two fields that read
+    /// `discovery_backtest_settings`, sitting between two fields that read
     /// `config.`. Live read `risk.kill_zones_enabled`
     /// (`live_trading.rs:732-735`) and the search read nothing, so the knob was
     /// ONE-SIDED: setting it to `false` could only make live hold through
@@ -1631,7 +1631,7 @@ pub struct DiscoveryResult {
     /// with no band configured. A reader that treats an absent entry as
     /// `SurvivesBand` re-creates the defect; the verdict for a gene with no
     /// entry is [`CostBandVerdict::Unmeasured`], which is what
-    /// [`cost_band_for_strategy`] returns.
+    /// [`DiscoveryResult::cost_band_for_strategy`] returns.
     pub cost_band_by_strategy: Vec<(String, CostBandVerdict)>,
     pub portfolio: Vec<Gene>,
     pub candidates: Vec<Gene>,
@@ -11984,7 +11984,7 @@ pub fn save_prop_firm_validation_artifacts(
 ///   bridge will treat that as missing evidence if it requires the
 ///   gate).
 /// - `prop_firm_passed` aggregates the per-strategy
-///   [`PropFirmRiskValidationArtifactFile::summary.all_rules_passed`]
+///   [`PropFirmRiskValidationArtifactFile`] values' `summary().all_rules_passed`
 ///   flags: `Some(true)` when every persisted prop-firm artifact passes,
 ///   `Some(false)` when at least one fails, and `None` when no
 ///   prop-firm artifact was produced (the live bridge will treat that

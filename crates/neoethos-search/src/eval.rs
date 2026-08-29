@@ -375,7 +375,7 @@ pub struct BacktestMetrics {
 /// `average_trade_pnl`, which was dropped while the `[f64; 11]` shape was kept so the
 /// GPU kernel's per-gene output stride (11 floats/gene) stayed intact.
 ///
-/// It is no longer reserved. The RAW output of [`fast_evaluate_strategy_core`] carries
+/// It is no longer reserved. The RAW output of `fast_evaluate_strategy_core` carries
 /// `monthly_target_hit_rate` (fraction of months hitting the operator's >=4% bar) in
 /// slot 7 — the consistency signal [`crate::scoring::ga_fitness`] optimises toward, and
 /// its dominant term. The GA fitness reads the raw eval array directly (see

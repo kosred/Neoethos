@@ -421,7 +421,7 @@ pub struct CostProfileRuntimeOverrides {
     /// `infer_market_cost_profile` — `commission_per_trade` above is a caller's
     /// value and is already a round trip by the name of the field, so it is
     /// never doubled. See
-    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`] for
+    /// `crate::genetic::strategy_gene::round_trip_commission_per_lot` for
     /// why one subtraction per closed trade means this conversion has to happen
     /// somewhere, and why it happens at exactly two places.
     pub commission_is_per_side: bool,
