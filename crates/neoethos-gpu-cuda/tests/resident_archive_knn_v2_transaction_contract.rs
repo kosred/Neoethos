@@ -108,6 +108,7 @@ mod resident_archive_knn_v2_transaction_fixture {
         SameStreamOrdinal,
         StagedReceiptIdentity,
         StagedDependencyIdentity,
+        PriorStagedReceiptIdentity,
         StagedCount,
         TargetArchiveCount,
         TargetPackedWord,
@@ -238,6 +239,39 @@ mod resident_archive_knn_v2_transaction_fixture {
     }
 
     impl GenerationChain {
+        pub fn replace_stream_identity_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.stream_identity, replacement);
+            (self, original)
+        }
+
+        pub fn swap_authority_for_test(mut self, mut other: Self) -> (Self, Self) {
+            std::mem::swap(&mut self.authority, &mut other.authority);
+            (self, other)
+        }
+
+        pub fn replace_authority_run_token_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.authority.receipt.run_token, replacement);
+            (self, original)
+        }
+
+        pub fn replace_source_packed_word_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.source_packed_word, replacement);
+            (self, original)
+        }
+
+        pub fn replace_planned_generation_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.planned_generation, replacement);
+            (self, original)
+        }
+
+        pub fn replace_prior_staged_receipt_identity_for_test(
+            mut self,
+            replacement: Option<u64>,
+        ) -> (Self, Option<u64>) {
+            let original = std::mem::replace(&mut self.prior_staged_receipt_identity, replacement);
+            (self, original)
+        }
+
         pub fn stream_identity(&self) -> u64 {
             self.stream_identity
         }
@@ -266,6 +300,16 @@ mod resident_archive_knn_v2_transaction_fixture {
     }
 
     impl RankEnqueued {
+        pub fn swap_authority_for_test(mut self, mut other: Self) -> (Self, Self) {
+            std::mem::swap(&mut self.authority, &mut other.authority);
+            (self, other)
+        }
+
+        pub fn replace_authority_run_token_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.authority.receipt.run_token, replacement);
+            (self, original)
+        }
+
         pub fn boxed_receipt_identity(&self) -> usize {
             self.authority.boxed_receipt_identity()
         }
@@ -287,6 +331,16 @@ mod resident_archive_knn_v2_transaction_fixture {
     }
 
     impl ArchiveStaged {
+        pub fn swap_authority_for_test(mut self, mut other: Self) -> (Self, Self) {
+            std::mem::swap(&mut self.authority, &mut other.authority);
+            (self, other)
+        }
+
+        pub fn replace_authority_run_token_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.authority.receipt.run_token, replacement);
+            (self, original)
+        }
+
         pub fn boxed_receipt_identity(&self) -> usize {
             self.authority.boxed_receipt_identity()
         }
@@ -310,6 +364,24 @@ mod resident_archive_knn_v2_transaction_fixture {
     }
 
     impl TerminalPending {
+        pub fn swap_authority_for_test(mut self, mut other: Self) -> (Self, Self) {
+            std::mem::swap(&mut self.authority, &mut other.authority);
+            (self, other)
+        }
+
+        pub fn replace_authority_run_token_for_test(mut self, replacement: u64) -> (Self, u64) {
+            let original = std::mem::replace(&mut self.authority.receipt.run_token, replacement);
+            (self, original)
+        }
+
+        pub fn boxed_receipt_identity_for_test(&self) -> usize {
+            self.authority.boxed_receipt_identity()
+        }
+
+        pub fn query_authority_for_test(&self) -> TerminalQueryAuthority {
+            self.query_authority
+        }
+
         pub fn replace_query_authority_for_test(
             mut self,
             replacement: TerminalQueryAuthority,
@@ -358,6 +430,7 @@ mod resident_archive_knn_v2_transaction_fixture {
         expected_rank: Option<RankReceipt>,
         expected_stage: Option<StagedReceipt>,
         expected_terminal: Option<TerminalQueryAuthority>,
+        expected_prior_staged_receipt_identity: Option<u64>,
         consumed_rank_receipts: Vec<RankReceipt>,
         consumed_staged_receipts: Vec<StagedReceipt>,
         consumed_terminal_receipts: Vec<TerminalQueryAuthority>,
@@ -394,6 +467,7 @@ mod resident_archive_knn_v2_transaction_fixture {
                 expected_rank: None,
                 expected_stage: None,
                 expected_terminal: None,
+                expected_prior_staged_receipt_identity: None,
                 consumed_rank_receipts: Vec::new(),
                 consumed_staged_receipts: Vec::new(),
                 consumed_terminal_receipts: Vec::new(),
@@ -487,11 +561,43 @@ mod resident_archive_knn_v2_transaction_fixture {
             staged_count: u64,
         ) -> Result<ArchiveStaged, RejectedAuthority<RankEnqueued>> {
             let source = decode_commit_word(self.commit_word);
+            let target_generation = match source.generation.checked_add(1) {
+                Some(generation) if generation <= MAX_GENERATION => generation,
+                Some(generation) => {
+                    return Err(RejectedAuthority::new(
+                        TransitionError::Pack(PackError::GenerationOutOfBounds {
+                            value: generation,
+                        }),
+                        rank,
+                    ));
+                }
+                None => {
+                    return Err(RejectedAuthority::new(
+                        TransitionError::Pack(PackError::GenerationOutOfBounds { value: u64::MAX }),
+                        rank,
+                    ));
+                }
+            };
+            let target_epoch = match source.epoch.checked_add(1) {
+                Some(epoch) if epoch <= MAX_EPOCH => epoch,
+                Some(epoch) => {
+                    return Err(RejectedAuthority::new(
+                        TransitionError::Pack(PackError::EpochOutOfBounds { value: epoch }),
+                        rank,
+                    ));
+                }
+                None => {
+                    return Err(RejectedAuthority::new(
+                        TransitionError::Pack(PackError::EpochOutOfBounds { value: u64::MAX }),
+                        rank,
+                    ));
+                }
+            };
             self.enqueue_stage_archive_with_target_for_test(
                 rank,
                 staged_count,
-                source.generation + 1,
-                source.epoch + 1,
+                target_generation,
+                target_epoch,
             )
         }
 
@@ -594,6 +700,7 @@ mod resident_archive_knn_v2_transaction_fixture {
             );
             self.commit_word = staged.receipt.target_packed_word;
             self.consumed_staged_receipts.push(staged.receipt);
+            self.expected_prior_staged_receipt_identity = Some(staged.receipt.receipt_identity);
             self.expected_stage = None;
             self.state = RuntimeState::GenerationChain;
             let next = decode_commit_word(self.commit_word);
@@ -790,6 +897,11 @@ mod resident_archive_knn_v2_transaction_fixture {
                     axis: ReceiptAxis::Generation,
                 });
             }
+            if chain.prior_staged_receipt_identity != self.expected_prior_staged_receipt_identity {
+                return Err(TransitionError::ReceiptMismatch {
+                    axis: ReceiptAxis::PriorStagedReceiptIdentity,
+                });
+            }
             Ok(())
         }
 
@@ -799,14 +911,22 @@ mod resident_archive_knn_v2_transaction_fixture {
             boxed_receipt_identity: usize,
             run_token: u64,
         ) -> Result<(), TransitionError> {
-            if authority.boxed_receipt_identity() != boxed_receipt_identity
-                || boxed_receipt_identity != self.boxed_receipt_identity
-            {
+            if authority.boxed_receipt_identity() != boxed_receipt_identity {
                 return Err(TransitionError::ReceiptMismatch {
                     axis: ReceiptAxis::BoxedReceiptIdentity,
                 });
             }
-            if authority.run_token() != run_token || run_token != self.run_token {
+            if boxed_receipt_identity != self.boxed_receipt_identity {
+                return Err(TransitionError::ReceiptMismatch {
+                    axis: ReceiptAxis::BoxedReceiptIdentity,
+                });
+            }
+            if authority.run_token() != run_token {
+                return Err(TransitionError::ReceiptMismatch {
+                    axis: ReceiptAxis::RunToken,
+                });
+            }
+            if run_token != self.run_token {
                 return Err(TransitionError::ReceiptMismatch {
                     axis: ReceiptAxis::RunToken,
                 });
@@ -1074,6 +1194,10 @@ const SEED_WORD: u64 = 0x0000_0012_0008_000e;
 const FIRST_WORD: u64 = 0x0000_0014_000c_0011;
 const SECOND_WORD: u64 = 0x0000_0016_000c_0012;
 const THIRD_WORD: u64 = 0x0000_0018_0012_0015;
+const MAX_GENERATION_SEED_WORD: u64 = 0x0000_0012_0009_fffe;
+const MAX_GENERATION_RECOVERY_WORD: u64 = 0x0000_0014_000d_ffff;
+const MAX_EPOCH_SEED_WORD: u64 = 0xffff_fffe_0008_000e;
+const MAX_EPOCH_RECOVERY_WORD: u64 = 0xffff_fffe_000c_0011;
 
 fn admit_seed(run_token: u64) -> (ReferenceStream, GenerationChain) {
     ReferenceStream::admit(STREAM_ID, run_token, 0, 7, 4, 9).unwrap()
@@ -1404,6 +1528,94 @@ fn rank_receipt_axis_refusals_are_inert_before_the_exact_rank_is_consumed() {
         rank = restored_rank;
     }
 
+    let (mut forged_owner_stream, forged_owner_chain) =
+        ReferenceStream::admit(STREAM_ID + 10, RUN_TOKEN, 0, 7, 4, 9).unwrap();
+    let forged_owner_rank = forged_owner_stream
+        .enqueue_score_and_rank(forged_owner_chain)
+        .unwrap();
+    let forged_owner_receipt = forged_owner_rank.receipt();
+    let exact_owner_box = rank.boxed_receipt_identity();
+    let foreign_owner_box = forged_owner_rank.boxed_receipt_identity();
+    assert_ne!(exact_owner_box, foreign_owner_box);
+    let (rank_with_foreign_owner, forged_rank_with_exact_owner) =
+        rank.swap_authority_for_test(forged_owner_rank);
+    assert_eq!(rank_with_foreign_owner.receipt(), exact);
+    assert_eq!(
+        rank_with_foreign_owner.boxed_receipt_identity(),
+        foreign_owner_box
+    );
+    let (owner_box_error, returned_rank_with_foreign_owner) =
+        take_rejection(stream.enqueue_stage_archive(rank_with_foreign_owner, 2));
+    assert_eq!(
+        owner_box_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::BoxedReceiptIdentity,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            1,
+            1,
+            RuntimeState::RankEnqueued,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_rank, restored_forged_owner_rank) =
+        returned_rank_with_foreign_owner.swap_authority_for_test(forged_rank_with_exact_owner);
+    assert_eq!(restored_rank.boxed_receipt_identity(), exact_owner_box);
+    assert_eq!(restored_rank.receipt(), exact);
+    assert_eq!(
+        restored_forged_owner_rank.boxed_receipt_identity(),
+        foreign_owner_box
+    );
+    assert_eq!(restored_forged_owner_rank.receipt(), forged_owner_receipt);
+    rank = restored_rank;
+    let _forged_owner_staged = forged_owner_stream
+        .enqueue_stage_archive(restored_forged_owner_rank, 2)
+        .unwrap();
+
+    let (rank_with_foreign_token, displaced_owner_token) =
+        rank.replace_authority_run_token_for_test(RUN_TOKEN + 10);
+    assert_eq!(displaced_owner_token, RUN_TOKEN);
+    assert_eq!(rank_with_foreign_token.receipt(), exact);
+    let (owner_token_error, returned_rank_with_foreign_token) =
+        take_rejection(stream.enqueue_stage_archive(rank_with_foreign_token, 2));
+    assert_eq!(
+        owner_token_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::RunToken,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            1,
+            1,
+            RuntimeState::RankEnqueued,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_rank, rejected_owner_token) = returned_rank_with_foreign_token
+        .replace_authority_run_token_for_test(displaced_owner_token);
+    assert_eq!(rejected_owner_token, RUN_TOKEN + 10);
+    assert_eq!(restored_rank.receipt(), exact);
+    rank = restored_rank;
+
     let staged = stream.enqueue_stage_archive(rank, 2).unwrap();
     assert_eq!(staged.receipt().target_packed_word, FIRST_WORD);
 
@@ -1496,12 +1708,91 @@ fn staged_receipt_refusals_publish_neither_then_the_exact_authority_publishes_on
     let foreign_staged = foreign_stream
         .enqueue_stage_archive(foreign_rank, 2)
         .unwrap();
+    let foreign_receipt = foreign_staged.receipt();
     assert_ne!(
         exact.boxed_receipt_identity,
-        foreign_staged.receipt().boxed_receipt_identity
+        foreign_receipt.boxed_receipt_identity
     );
+    let exact_owner_box = staged.boxed_receipt_identity();
+    let foreign_owner_box = foreign_staged.boxed_receipt_identity();
+    let (staged_with_foreign_owner, foreign_staged_with_exact_owner) =
+        staged.swap_authority_for_test(foreign_staged);
+    assert_eq!(staged_with_foreign_owner.receipt(), exact);
+    assert_eq!(
+        staged_with_foreign_owner.boxed_receipt_identity(),
+        foreign_owner_box
+    );
+    let (owner_box_error, returned_staged_with_foreign_owner) =
+        take_rejection(stream.enqueue_evolve_and_publish(staged_with_foreign_owner));
+    assert_eq!(
+        owner_box_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::BoxedReceiptIdentity,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            2,
+            2,
+            RuntimeState::ArchiveStaged,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_staged, restored_foreign_staged) =
+        returned_staged_with_foreign_owner.swap_authority_for_test(foreign_staged_with_exact_owner);
+    assert_eq!(restored_staged.boxed_receipt_identity(), exact_owner_box);
+    assert_eq!(restored_staged.receipt(), exact);
+    assert_eq!(
+        restored_foreign_staged.boxed_receipt_identity(),
+        foreign_owner_box
+    );
+    assert_eq!(restored_foreign_staged.receipt(), foreign_receipt);
+    staged = restored_staged;
+
+    let (staged_with_foreign_token, displaced_owner_token) =
+        staged.replace_authority_run_token_for_test(RUN_TOKEN + 10);
+    assert_eq!(displaced_owner_token, RUN_TOKEN);
+    assert_eq!(staged_with_foreign_token.receipt(), exact);
+    let (owner_token_error, returned_staged_with_foreign_token) =
+        take_rejection(stream.enqueue_evolve_and_publish(staged_with_foreign_token));
+    assert_eq!(
+        owner_token_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::RunToken,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            2,
+            2,
+            RuntimeState::ArchiveStaged,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_staged, rejected_owner_token) = returned_staged_with_foreign_token
+        .replace_authority_run_token_for_test(displaced_owner_token);
+    assert_eq!(rejected_owner_token, RUN_TOKEN + 10);
+    assert_eq!(restored_staged.receipt(), exact);
+    staged = restored_staged;
+
     let (foreign_error, returned_foreign_staged) =
-        take_rejection(stream.enqueue_evolve_and_publish(foreign_staged));
+        take_rejection(stream.enqueue_evolve_and_publish(restored_foreign_staged));
     assert_eq!(
         foreign_error,
         TransitionError::ReceiptMismatch {
@@ -1974,6 +2265,107 @@ fn terminal_seal_follows_last_commit_and_only_pending_can_project_the_receipt() 
     );
     assert_eq!(COMPACT_TERMINAL_RECEIPT_BYTES, 32);
 
+    let (mut forged_owner_stream, forged_owner_final_chain) =
+        run_three_generations_for(STREAM_ID + 10, RUN_TOKEN);
+    let forged_owner_pending = forged_owner_stream
+        .enqueue_terminal_seal(forged_owner_final_chain)
+        .unwrap();
+    let forged_owner_query = forged_owner_pending.query_authority_for_test();
+    let exact_owner_box = boxed_receipt_identity;
+    let foreign_owner_box = forged_owner_pending.boxed_receipt_identity_for_test();
+    assert_ne!(exact_owner_box, foreign_owner_box);
+    let (pending_with_foreign_owner, forged_pending_with_exact_owner) =
+        pending.swap_authority_for_test(forged_owner_pending);
+    assert_eq!(
+        pending_with_foreign_owner.query_authority_for_test(),
+        TerminalQueryAuthority {
+            receipt_identity: 0x5445_524d_0000_000a,
+            boxed_receipt_identity,
+            run_token: RUN_TOKEN,
+            packed_word: THIRD_WORD,
+            generation: 10,
+            event_identity: 0x4556_454e_5400_0001,
+        }
+    );
+    assert_eq!(
+        pending_with_foreign_owner.boxed_receipt_identity_for_test(),
+        foreign_owner_box
+    );
+    let (owner_box_error, returned_pending_with_foreign_owner) =
+        take_rejection(stream.try_complete(pending_with_foreign_owner));
+    assert_eq!(
+        owner_box_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::BoxedReceiptIdentity,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            THIRD_WORD,
+            14,
+            14,
+            RuntimeState::TerminalPending,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            0,
+        )
+    );
+    let (restored_pending, restored_forged_owner_pending) = returned_pending_with_foreign_owner
+        .swap_authority_for_test(forged_pending_with_exact_owner);
+    assert_eq!(
+        restored_pending.boxed_receipt_identity_for_test(),
+        exact_owner_box
+    );
+    assert_eq!(
+        restored_forged_owner_pending.boxed_receipt_identity_for_test(),
+        foreign_owner_box
+    );
+    assert_eq!(
+        restored_forged_owner_pending.query_authority_for_test(),
+        forged_owner_query
+    );
+    pending = restored_pending;
+    let _forged_owner_projection = forged_owner_stream
+        .try_complete(restored_forged_owner_pending)
+        .unwrap();
+
+    let (pending_with_foreign_token, displaced_owner_token) =
+        pending.replace_authority_run_token_for_test(RUN_TOKEN + 10);
+    assert_eq!(displaced_owner_token, RUN_TOKEN);
+    let (owner_token_error, returned_pending_with_foreign_token) =
+        take_rejection(stream.try_complete(pending_with_foreign_token));
+    assert_eq!(
+        owner_token_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::RunToken,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            THIRD_WORD,
+            14,
+            14,
+            RuntimeState::TerminalPending,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            0,
+        )
+    );
+    let (restored_pending, rejected_owner_token) = returned_pending_with_foreign_token
+        .replace_authority_run_token_for_test(displaced_owner_token);
+    assert_eq!(rejected_owner_token, RUN_TOKEN + 10);
+    pending = restored_pending;
+
     let query_authority = TerminalQueryAuthority {
         receipt_identity: 0x5445_524d_0000_000a,
         boxed_receipt_identity,
@@ -2174,26 +2566,28 @@ fn terminal_seal_follows_last_commit_and_only_pending_can_project_the_receipt() 
 
 #[test]
 fn generation_archive_and_epoch_overflow_return_rank_authority_for_valid_retry() {
-    let (mut generation_stream, generation_chain) = admit_seed(RUN_TOKEN);
+    let (mut generation_stream, generation_chain) =
+        ReferenceStream::admit(STREAM_ID, RUN_TOKEN, 0, MAX_GENERATION, 4, 9).unwrap();
     let generation_rank = generation_stream
         .enqueue_score_and_rank(generation_chain)
         .unwrap();
-    let (generation_error, returned_generation_rank) = take_rejection(
-        generation_stream.enqueue_stage_archive_with_target_for_test(
-            generation_rank,
-            2,
-            65_536,
-            10,
-        ),
-    );
+    let generation_receipt = generation_rank.receipt();
+    let generation_box = generation_rank.boxed_receipt_identity();
+    let (generation_error, returned_generation_rank) =
+        take_rejection(generation_stream.enqueue_stage_archive(generation_rank, 2));
     assert_eq!(
         generation_error,
         TransitionError::Pack(PackError::GenerationOutOfBounds { value: 65_536 })
     );
+    assert_eq!(returned_generation_rank.receipt(), generation_receipt);
+    assert_eq!(
+        returned_generation_rank.boxed_receipt_identity(),
+        generation_box
+    );
     assert_eq!(
         generation_stream.observation(),
         expected_observation(
-            SEED_WORD,
+            MAX_GENERATION_SEED_WORD,
             1,
             1,
             RuntimeState::RankEnqueued,
@@ -2207,25 +2601,32 @@ fn generation_archive_and_epoch_overflow_return_rank_authority_for_valid_retry()
         )
     );
     let generation_staged = generation_stream
-        .enqueue_stage_archive(returned_generation_rank, 2)
+        .enqueue_stage_archive_with_target_for_test(returned_generation_rank, 2, MAX_GENERATION, 10)
         .unwrap();
-    assert_eq!(generation_staged.receipt().target_packed_word, FIRST_WORD);
-
-    let (mut epoch_stream, epoch_chain) = admit_seed(RUN_TOKEN + 1);
-    let epoch_rank = epoch_stream.enqueue_score_and_rank(epoch_chain).unwrap();
-    let (epoch_error, returned_epoch_rank) = take_rejection(
-        epoch_stream.enqueue_stage_archive_with_target_for_test(epoch_rank, 2, 8, 2_147_483_648),
+    assert_eq!(
+        generation_staged.receipt().target_packed_word,
+        MAX_GENERATION_RECOVERY_WORD
     );
+
+    let (mut epoch_stream, epoch_chain) =
+        ReferenceStream::admit(STREAM_ID, RUN_TOKEN + 1, 0, 7, 4, MAX_EPOCH).unwrap();
+    let epoch_rank = epoch_stream.enqueue_score_and_rank(epoch_chain).unwrap();
+    let epoch_receipt = epoch_rank.receipt();
+    let epoch_box = epoch_rank.boxed_receipt_identity();
+    let (epoch_error, returned_epoch_rank) =
+        take_rejection(epoch_stream.enqueue_stage_archive(epoch_rank, 2));
     assert_eq!(
         epoch_error,
         TransitionError::Pack(PackError::EpochOutOfBounds {
             value: 2_147_483_648,
         })
     );
+    assert_eq!(returned_epoch_rank.receipt(), epoch_receipt);
+    assert_eq!(returned_epoch_rank.boxed_receipt_identity(), epoch_box);
     assert_eq!(
         epoch_stream.observation(),
         expected_observation(
-            SEED_WORD,
+            MAX_EPOCH_SEED_WORD,
             1,
             1,
             RuntimeState::RankEnqueued,
@@ -2239,20 +2640,27 @@ fn generation_archive_and_epoch_overflow_return_rank_authority_for_valid_retry()
         )
     );
     let epoch_staged = epoch_stream
-        .enqueue_stage_archive(returned_epoch_rank, 2)
+        .enqueue_stage_archive_with_target_for_test(returned_epoch_rank, 2, 8, MAX_EPOCH)
         .unwrap();
-    assert_eq!(epoch_staged.receipt().target_packed_word, FIRST_WORD);
+    assert_eq!(
+        epoch_staged.receipt().target_packed_word,
+        MAX_EPOCH_RECOVERY_WORD
+    );
 
     let (mut archive_stream, archive_chain) = admit_seed(RUN_TOKEN + 2);
     let archive_rank = archive_stream
         .enqueue_score_and_rank(archive_chain)
         .unwrap();
+    let archive_receipt = archive_rank.receipt();
+    let archive_box = archive_rank.boxed_receipt_identity();
     let (archive_error, returned_archive_rank) =
-        take_rejection(archive_stream.enqueue_stage_archive(archive_rank, 65_532));
+        take_rejection(archive_stream.enqueue_stage_archive(archive_rank, u64::MAX));
     assert_eq!(
         archive_error,
-        TransitionError::Pack(PackError::ArchiveCountOutOfBounds { value: 65_536 })
+        TransitionError::Pack(PackError::ArchiveCountOutOfBounds { value: u64::MAX })
     );
+    assert_eq!(returned_archive_rank.receipt(), archive_receipt);
+    assert_eq!(returned_archive_rank.boxed_receipt_identity(), archive_box);
     assert_eq!(
         archive_stream.observation(),
         expected_observation(
@@ -2273,6 +2681,242 @@ fn generation_archive_and_epoch_overflow_return_rank_authority_for_valid_retry()
         .enqueue_stage_archive(returned_archive_rank, 2)
         .unwrap();
     assert_eq!(archive_staged.receipt().target_packed_word, FIRST_WORD);
+}
+
+#[test]
+fn generation_chain_owned_axis_refusals_return_exact_authority_for_retry() {
+    let (mut stream, chain) = admit_seed(RUN_TOKEN);
+    let (altered_chain, displaced_stream_identity) =
+        chain.replace_stream_identity_for_test(STREAM_ID + 1);
+    assert_eq!(displaced_stream_identity, STREAM_ID);
+    let (error, returned_chain) = take_rejection(stream.enqueue_score_and_rank(altered_chain));
+    assert_eq!(
+        error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::StreamIdentity,
+        }
+    );
+    assert_eq!(
+        stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            0,
+            0,
+            RuntimeState::GenerationChain,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_chain, rejected_stream_identity) =
+        returned_chain.replace_stream_identity_for_test(displaced_stream_identity);
+    assert_eq!(rejected_stream_identity, STREAM_ID + 1);
+    let _rank = stream.enqueue_score_and_rank(restored_chain).unwrap();
+
+    let (mut box_stream, box_chain) = admit_seed(RUN_TOKEN + 1);
+    let (mut other_box_stream, other_box_chain) = admit_seed(RUN_TOKEN + 1);
+    let exact_box_identity = box_chain.boxed_receipt_identity();
+    let other_box_identity = other_box_chain.boxed_receipt_identity();
+    assert_ne!(exact_box_identity, other_box_identity);
+    let (altered_box_chain, displaced_other_box_chain) =
+        box_chain.swap_authority_for_test(other_box_chain);
+    assert_eq!(
+        altered_box_chain.boxed_receipt_identity(),
+        other_box_identity
+    );
+    let (box_error, returned_box_chain) =
+        take_rejection(box_stream.enqueue_score_and_rank(altered_box_chain));
+    assert_eq!(
+        box_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::BoxedReceiptIdentity,
+        }
+    );
+    assert_eq!(
+        box_stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            0,
+            0,
+            RuntimeState::GenerationChain,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_box_chain, restored_other_box_chain) =
+        returned_box_chain.swap_authority_for_test(displaced_other_box_chain);
+    assert_eq!(
+        restored_box_chain.boxed_receipt_identity(),
+        exact_box_identity
+    );
+    assert_eq!(
+        restored_other_box_chain.boxed_receipt_identity(),
+        other_box_identity
+    );
+    let _box_rank = box_stream
+        .enqueue_score_and_rank(restored_box_chain)
+        .unwrap();
+    let _other_box_rank = other_box_stream
+        .enqueue_score_and_rank(restored_other_box_chain)
+        .unwrap();
+
+    let (mut token_stream, token_chain) = admit_seed(RUN_TOKEN + 2);
+    let (altered_token_chain, displaced_run_token) =
+        token_chain.replace_authority_run_token_for_test(RUN_TOKEN + 3);
+    assert_eq!(displaced_run_token, RUN_TOKEN + 2);
+    let (token_error, returned_token_chain) =
+        take_rejection(token_stream.enqueue_score_and_rank(altered_token_chain));
+    assert_eq!(
+        token_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::RunToken,
+        }
+    );
+    assert_eq!(
+        token_stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            0,
+            0,
+            RuntimeState::GenerationChain,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_token_chain, rejected_run_token) =
+        returned_token_chain.replace_authority_run_token_for_test(displaced_run_token);
+    assert_eq!(rejected_run_token, RUN_TOKEN + 3);
+    let _token_rank = token_stream
+        .enqueue_score_and_rank(restored_token_chain)
+        .unwrap();
+
+    let (mut source_stream, source_chain) = admit_seed(RUN_TOKEN + 4);
+    let (altered_source_chain, displaced_source_word) =
+        source_chain.replace_source_packed_word_for_test(FIRST_WORD);
+    assert_eq!(displaced_source_word, SEED_WORD);
+    let (source_error, returned_source_chain) =
+        take_rejection(source_stream.enqueue_score_and_rank(altered_source_chain));
+    assert_eq!(
+        source_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::SourcePackedWord,
+        }
+    );
+    assert_eq!(
+        source_stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            0,
+            0,
+            RuntimeState::GenerationChain,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_source_chain, rejected_source_word) =
+        returned_source_chain.replace_source_packed_word_for_test(displaced_source_word);
+    assert_eq!(rejected_source_word, FIRST_WORD);
+    let _source_rank = source_stream
+        .enqueue_score_and_rank(restored_source_chain)
+        .unwrap();
+
+    let (mut generation_stream, generation_chain) = admit_seed(RUN_TOKEN + 5);
+    let (altered_generation_chain, displaced_generation) =
+        generation_chain.replace_planned_generation_for_test(8);
+    assert_eq!(displaced_generation, 7);
+    let (generation_error, returned_generation_chain) =
+        take_rejection(generation_stream.enqueue_score_and_rank(altered_generation_chain));
+    assert_eq!(
+        generation_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::Generation,
+        }
+    );
+    assert_eq!(
+        generation_stream.observation(),
+        expected_observation(
+            SEED_WORD,
+            0,
+            0,
+            RuntimeState::GenerationChain,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_generation_chain, rejected_generation) =
+        returned_generation_chain.replace_planned_generation_for_test(displaced_generation);
+    assert_eq!(rejected_generation, 8);
+    let _generation_rank = generation_stream
+        .enqueue_score_and_rank(restored_generation_chain)
+        .unwrap();
+
+    let (mut prior_stream, prior_chain) = admit_seed(RUN_TOKEN + 6);
+    let prior_rank = prior_stream.enqueue_score_and_rank(prior_chain).unwrap();
+    let prior_staged = prior_stream.enqueue_stage_archive(prior_rank, 2).unwrap();
+    let next_chain = prior_stream
+        .enqueue_evolve_and_publish(prior_staged)
+        .unwrap();
+    assert_eq!(
+        next_chain.prior_staged_receipt_identity(),
+        Some(0x5354_4147_4500_0007)
+    );
+    let (altered_prior_chain, displaced_prior_identity) =
+        next_chain.replace_prior_staged_receipt_identity_for_test(Some(0x5354_4147_4500_00ff));
+    assert_eq!(displaced_prior_identity, Some(0x5354_4147_4500_0007));
+    let (prior_error, returned_prior_chain) =
+        take_rejection(prior_stream.enqueue_score_and_rank(altered_prior_chain));
+    assert_eq!(
+        prior_error,
+        TransitionError::ReceiptMismatch {
+            axis: ReceiptAxis::PriorStagedReceiptIdentity,
+        }
+    );
+    assert_eq!(
+        prior_stream.observation(),
+        expected_observation(
+            FIRST_WORD,
+            4,
+            4,
+            RuntimeState::GenerationChain,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+        )
+    );
+    let (restored_prior_chain, rejected_prior_identity) = returned_prior_chain
+        .replace_prior_staged_receipt_identity_for_test(displaced_prior_identity);
+    assert_eq!(rejected_prior_identity, Some(0x5354_4147_4500_00ff));
+    let _prior_rank = prior_stream
+        .enqueue_score_and_rank(restored_prior_chain)
+        .unwrap();
 }
 
 #[test]
