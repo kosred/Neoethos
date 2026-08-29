@@ -588,6 +588,138 @@ struct PassiveAggressiveArtifact {
     bias: Array1<f64>,
     aggressiveness: f64,
     epochs: usize,
+    #[serde(default = "legacy_online_pa_class_slack_weight_policy")]
+    class_slack_weight_policy: String,
+    #[serde(default)]
+    class_slack_weights: Option<[f64; 3]>,
+    #[serde(default = "legacy_online_pa_training_semantics")]
+    training_semantics_schema: String,
+    #[serde(default = "legacy_online_pa_training_backend")]
+    training_backend: String,
+    #[serde(default = "legacy_online_pa_effective_device_policy")]
+    effective_device_policy: String,
+    #[serde(default)]
+    cuda_training_evidence: Option<PassiveAggressiveCudaEvidenceV1>,
+}
+
+const ONLINE_PA_LEGACY_TRAINING_SEMANTICS_V1: &str =
+    "neoethos.online_pa.legacy_weighted_argmax.epsilon_norm.f64.v1";
+pub(super) const ONLINE_PA_CUDA_TRAINING_SEMANTICS_V2: &str =
+    "neoethos.online_pa.prediction_based.class_weighted_slack_cap.bias_augmented.f64.v2";
+pub(super) const ONLINE_PA_CUDA_FULL_PIPELINE_SCHEMA_V3: &str = "neoethos.online_pa.cuda_full_pipeline.raw_f64.original_i32.parallel_ddof0.pb_weighted_slack_v2.epoch_major_chunks.v3";
+pub(super) const ONLINE_PA_CUDA_PREPROCESSING_BACKEND_V2: &str =
+    "online_pa_cuda_preprocessing_parallel_f64_v2";
+const ONLINE_PA_CUDA_TRAINING_ROWS_PER_LAUNCH_V3: u64 = 1_024;
+const ONLINE_PA_LEGACY_CLASS_SLACK_WEIGHT_POLICY_V1: &str =
+    "neoethos.online_pa.legacy_implicit_loss_multiplier_clamped_[0.5,4].v1";
+const ONLINE_PA_CUDA_CLASS_SLACK_WEIGHT_POLICY_V1: &str =
+    "neoethos.online_pa.clamped_balanced_class_slack_weight_[0.5,4].v1";
+
+fn legacy_online_pa_training_semantics() -> String {
+    ONLINE_PA_LEGACY_TRAINING_SEMANTICS_V1.to_string()
+}
+
+fn legacy_online_pa_training_backend() -> String {
+    "online_pa_cpu_legacy_v1".to_string()
+}
+
+fn legacy_online_pa_class_slack_weight_policy() -> String {
+    ONLINE_PA_LEGACY_CLASS_SLACK_WEIGHT_POLICY_V1.to_string()
+}
+
+fn legacy_online_pa_effective_device_policy() -> String {
+    "cpu".to_string()
+}
+
+fn legacy_online_pa_cuda_evidence_scope() -> String {
+    "neoethos.online_pa.cuda_evidence.training_stage.v1".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PassiveAggressiveCudaEvidenceV1 {
+    #[serde(default = "legacy_online_pa_cuda_evidence_scope")]
+    pub(super) evidence_scope_schema: String,
+    pub(super) kernel_launch_count: u64,
+    pub(super) host_to_device_bytes: u64,
+    pub(super) device_to_host_bytes: u64,
+    pub(super) ordered_sample_visits: u64,
+    #[serde(default)]
+    pub(super) full_pipeline: Option<PassiveAggressiveCudaPipelineEvidenceV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PassiveAggressiveCudaDeviceIdentityV1 {
+    pub(super) ordinal: u32,
+    pub(super) uuid: [u8; 16],
+    pub(super) pci_domain: i32,
+    pub(super) pci_bus: i32,
+    pub(super) pci_device: i32,
+    pub(super) compute_capability_major: i32,
+    pub(super) compute_capability_minor: i32,
+    pub(super) multiprocessor_count: i32,
+    pub(super) total_memory_bytes: u64,
+    pub(super) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PassiveAggressiveCudaPipelineEvidenceV1 {
+    pub(super) execution_pipeline_schema: String,
+    pub(super) evidence_scope_schema: String,
+    pub(super) requested_device_policy: String,
+    pub(super) effective_device_policy: String,
+    pub(super) preprocessing_backend: String,
+    pub(super) training_backend: String,
+    pub(super) bound_inference_backend: String,
+    pub(super) device_identity: PassiveAggressiveCudaDeviceIdentityV1,
+    pub(super) loss_cost_policy: String,
+    pub(super) residency_scope: String,
+    pub(super) persistent_model_buffers: bool,
+    pub(super) class_counts: [u32; 3],
+    pub(super) kernel_launch_count: u64,
+    pub(super) initialization_launch_count: u64,
+    pub(super) label_map_launch_count: u64,
+    pub(super) label_count_partial_launch_count: u64,
+    pub(super) label_count_weight_finalize_launch_count: u64,
+    pub(super) scaler_partial_launch_count: u64,
+    pub(super) scaler_finalize_launch_count: u64,
+    pub(super) scaler_transform_launch_count: u64,
+    pub(super) transform_fault_partial_launch_count: u64,
+    pub(super) preprocess_fault_finalize_launch_count: u64,
+    #[serde(default)]
+    pub(super) training_rows_per_launch: u64,
+    #[serde(default)]
+    pub(super) training_row_chunk_count_per_epoch: u64,
+    #[serde(default)]
+    pub(super) training_epoch_count: u64,
+    pub(super) training_launch_count: u64,
+    #[serde(default)]
+    pub(super) training_interchunk_device_to_host_bytes: u64,
+    pub(super) raw_feature_h2d_bytes: u64,
+    pub(super) original_label_h2d_bytes: u64,
+    pub(super) scaled_feature_h2d_bytes: u64,
+    pub(super) remapped_label_h2d_bytes: u64,
+    pub(super) class_slack_weight_h2d_bytes: u64,
+    pub(super) parameter_initialization_h2d_bytes: u64,
+    pub(super) artifact_d2h_bytes: u64,
+}
+
+#[cfg(feature = "statistical-gpu")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PassiveAggressiveCudaInferenceEvidenceV1 {
+    pub(super) evidence_scope_schema: String,
+    pub(super) requested_device_policy: String,
+    pub(super) effective_device_policy: String,
+    pub(super) device_identity: PassiveAggressiveCudaDeviceIdentityV1,
+    pub(super) residency_scope: String,
+    pub(super) persistent_model_buffers: bool,
+    pub(super) kernel_launch_count: u64,
+    pub(super) host_to_device_bytes: u64,
+    pub(super) device_to_host_bytes: u64,
+    pub(super) raw_feature_h2d_bytes: u64,
+    pub(super) scaler_parameter_h2d_bytes: u64,
+    pub(super) model_parameter_h2d_bytes: u64,
+    pub(super) probability_d2h_bytes: u64,
+    pub(super) status_d2h_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +858,129 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
     }
 
     fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        ensure_feature_columns_match(&self.feature_columns, x)?;
+        let weights = self
+            .weights
+            .as_ref()
+            .context("online_pa model not fitted")?;
+        let bias = self.bias.as_ref().context("online_pa model not fitted")?;
+        let scaler = self.scaler.as_ref().context("online_pa scaler missing")?;
+        // This conversion is host I/O/packing; all numerical inference below
+        // stays on the backend bound into the artifact.
+        let (raw_features, _) = feature_matrix_from_frame(x)?;
+        let live_requested_device_policy = requested_runtime_device_policy("online_pa");
+        let live_effective_device_policy =
+            resolved_online_pa_device_policy(&live_requested_device_policy)?;
+
+        if let Some(full_pipeline) = self
+            .cuda_training_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.full_pipeline.as_ref())
+        {
+            #[cfg(feature = "statistical-gpu")]
+            {
+                if live_requested_device_policy != full_pipeline.requested_device_policy {
+                    bail!(
+                        "online_pa full CUDA requested-policy drift: artifact `{}`, current `{}`",
+                        full_pipeline.requested_device_policy,
+                        live_requested_device_policy
+                    );
+                }
+                let current_effective = live_effective_device_policy.clone();
+                if current_effective != self.effective_device_policy
+                    || current_effective != full_pipeline.effective_device_policy
+                {
+                    bail!(
+                        "online_pa full CUDA inference device drift: artifact {}, current {}",
+                        self.effective_device_policy,
+                        current_effective
+                    );
+                }
+                // ONLINE_PA_FULL_GPU_PREDICT_BEGIN
+                let prediction = try_predict_passive_aggressive_cuda_full_pipeline(
+                    &full_pipeline.requested_device_policy,
+                    &current_effective,
+                    &full_pipeline.device_identity,
+                    &raw_features,
+                    &scaler.means,
+                    &scaler.stds,
+                    weights,
+                    bias,
+                )
+                .context("predict online_pa through fused raw CUDA inference")?;
+                // ONLINE_PA_FULL_GPU_PREDICT_END
+                let expected_raw_h2d = u64::try_from(raw_features.len())
+                    .ok()
+                    .and_then(|elements| elements.checked_mul(8))
+                    .context("online_pa inference raw-byte evidence overflow")?;
+                let expected_scaler_h2d = u64::try_from(scaler.means.len())
+                    .ok()
+                    .and_then(|elements| elements.checked_mul(16))
+                    .context("online_pa inference scaler-byte evidence overflow")?;
+                let expected_model_h2d = u64::try_from(weights.len())
+                    .ok()
+                    .and_then(|elements| elements.checked_add(u64::try_from(bias.len()).ok()?))
+                    .and_then(|elements| elements.checked_mul(8))
+                    .context("online_pa inference model-byte evidence overflow")?;
+                let expected_probability_d2h = u64::try_from(raw_features.nrows())
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(3 * 8))
+                    .context("online_pa inference probability-byte evidence overflow")?;
+                let expected_status_d2h = u64::try_from(raw_features.nrows())
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(4))
+                    .context("online_pa inference status-byte evidence overflow")?;
+                let expected_whole_h2d = expected_raw_h2d
+                    .checked_add(expected_scaler_h2d)
+                    .and_then(|bytes| bytes.checked_add(expected_model_h2d))
+                    .context("online_pa inference whole-call H2D evidence overflow")?;
+                let expected_whole_d2h = expected_probability_d2h
+                    .checked_add(expected_status_d2h)
+                    .context("online_pa inference whole-call D2H evidence overflow")?;
+                if prediction.runtime_backend != full_pipeline.bound_inference_backend
+                    || prediction.effective_device_policy != current_effective
+                    || prediction.device_identity != full_pipeline.device_identity
+                    || prediction.evidence.requested_device_policy
+                        != full_pipeline.requested_device_policy
+                    || prediction.evidence.effective_device_policy != current_effective
+                    || prediction.evidence.device_identity != full_pipeline.device_identity
+                    || prediction.evidence.evidence_scope_schema
+                        != "neoethos.online_pa.cuda_evidence.whole_predict_call.v2"
+                    || prediction.evidence.residency_scope != "call_scoped"
+                    || prediction.evidence.persistent_model_buffers
+                    || prediction.evidence.kernel_launch_count != 1
+                    || prediction.evidence.host_to_device_bytes != expected_whole_h2d
+                    || prediction.evidence.device_to_host_bytes != expected_whole_d2h
+                    || prediction.evidence.raw_feature_h2d_bytes != expected_raw_h2d
+                    || prediction.evidence.scaler_parameter_h2d_bytes != expected_scaler_h2d
+                    || prediction.evidence.model_parameter_h2d_bytes != expected_model_h2d
+                    || prediction.evidence.probability_d2h_bytes != expected_probability_d2h
+                    || prediction.evidence.status_d2h_bytes != expected_status_d2h
+                {
+                    bail!("online_pa fused CUDA inference receipt is inconsistent");
+                }
+                return Ok(prediction.probabilities);
+            }
+            #[cfg(not(feature = "statistical-gpu"))]
+            {
+                bail!(
+                    "online_pa full CUDA artifact schema `{}` cannot infer because this binary lacks `statistical-gpu`",
+                    full_pipeline.execution_pipeline_schema
+                );
+            }
+        }
+
+        if self.effective_device_policy != "cpu" {
+            bail!(
+                "online_pa CUDA training-only artifact has no full-GPU inference receipt; refusing CPU fallback"
+            );
+        }
+        if live_effective_device_policy != "cpu" {
+            bail!(
+                "online_pa CPU artifact cannot infer under CUDA-required policy `{live_requested_device_policy}`; retrain through the full CUDA pipeline"
+            );
+        }
+
         lease.scope(|| {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let weights = self

@@ -43,20 +43,30 @@ fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
     panic!("unterminated function `{signature}`");
 }
 
+fn manifest_feature_block<'a>(manifest: &'a str, feature: &str) -> &'a str {
+    let assignment = format!("{feature} =");
+    let start = manifest
+        .find(&assignment)
+        .unwrap_or_else(|| panic!("missing {feature} feature"));
+    let rest = &manifest[start..];
+    let end = rest
+        .find(']')
+        .map(|offset| offset + 1)
+        .unwrap_or_else(|| panic!("unterminated {feature} feature"));
+    &rest[..end]
+}
+
 #[test]
 fn model_cubecl_calls_share_an_exact_stream_and_ordinal_lifecycle() {
     let lifecycle = lifecycle_source();
     assert!(
-        MANIFEST.contains("cubecl-common = { version = \"0.10.0\", optional = true }"),
+        MANIFEST.contains("cubecl-common = { version = \"=0.10.0\", optional = true }"),
         "the model lifecycle needs CubeCL's exact StreamId type as a direct dependency"
     );
     for feature in ["neuro-evolution-gpu", "statistical-gpu"] {
-        let line = MANIFEST
-            .lines()
-            .find(|line| line.starts_with(&format!("{feature} =")))
-            .unwrap_or_else(|| panic!("missing {feature} feature"));
+        let block = manifest_feature_block(MANIFEST, feature);
         assert!(
-            line.contains("dep:cubecl-common"),
+            block.contains("dep:cubecl-common"),
             "{feature} must enable exact CubeCL stream tracking"
         );
     }
