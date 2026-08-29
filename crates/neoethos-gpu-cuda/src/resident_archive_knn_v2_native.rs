@@ -7,8 +7,6 @@ use crate::population::RawResidentScoringPopulationSourceV2;
 #[cfg(feature = "cuda")]
 use crate::resident_generation_v1::{NativeResidentGenerationRunV1, RawReadyEventV1};
 #[cfg(feature = "cuda")]
-use crate::resident_scoring_v2::NativeResidentScoringRunV2;
-#[cfg(feature = "cuda")]
 use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
@@ -65,6 +63,7 @@ pub(super) struct RawResidentArchiveKnnBindV2 {
     pub(super) post_trim_receipt_identity: u64,
 }
 
+pub(super) enum NativeResidentScoringNoveltyRunV1 {}
 pub(super) enum NativeResidentArchiveKnnOwnerV2 {}
 
 #[repr(C)]
@@ -112,7 +111,7 @@ const _: [(); 8] = [(); std::mem::align_of::<RawResidentArchiveKnnTerminalV2>()]
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     pub(super) fn bind_preallocated_resident_archive_knn_v2(
-        scoring: *mut NativeResidentScoringRunV2,
+        scoring: *mut NativeResidentScoringNoveltyRunV1,
         generation: *mut NativeResidentGenerationRunV1,
         genes: *const RawResidentGenerationGeneViewV2,
         binding: *const RawResidentArchiveKnnBindV2,
@@ -669,12 +668,11 @@ mod tests {
     fn rust_archive_knn_v2_ffi_signatures_match_the_frozen_native_abi() {
         use crate::population::RawResidentScoringPopulationSourceV2;
         use crate::resident_generation_v1::{NativeResidentGenerationRunV1, RawReadyEventV1};
-        use crate::resident_scoring_v2::NativeResidentScoringRunV2;
         use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
         use std::ffi::c_void;
 
         let _: unsafe extern "C" fn(
-            *mut NativeResidentScoringRunV2,
+            *mut NativeResidentScoringNoveltyRunV1,
             *mut NativeResidentGenerationRunV1,
             *const RawResidentGenerationGeneViewV2,
             *const RawResidentArchiveKnnBindV2,
