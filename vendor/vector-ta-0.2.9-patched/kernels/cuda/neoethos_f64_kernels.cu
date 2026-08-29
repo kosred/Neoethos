@@ -937,18 +937,21 @@ extern "C" __global__ void neoethos_mfi_batch_f64(
 // truncated here.
 #define ADXR_MAX_PERIOD 512
 
-// TSI's periods are the dispatcher's defaults and are NOT the swept `period`.
-#define TSI_LONG 25
-#define TSI_SHORT 13
+// NeoEthos maps a swept TSI anchor P onto the coupled tuple
+// `(long=P, short=round(13*P/25))`. Keep the ratio constants here so the
+// device uses the same positive-number rounding rule as hpc_ta::sweep_params.
+#define TSI_DEFAULT_LONG 25
+#define TSI_DEFAULT_SHORT 13
 
 // ============================================================================
-// TSI — reference: tsi.rs::tsi_scalar_classic
-//   PERIOD-INVARIANT. long = 25, short = 13, so warm = first_valid + 38 for
-//   every row.
-//   `tsi_with_kernel` maps Auto -> Scalar and then, because long == 25 &&
-//   short == 13, takes `tsi_scalar_classic` specifically — so this reference is
-//   the one that actually runs, AVX feature or not. That makes tsi the safest
-//   of the three sweep-completing kernels.
+// TSI — reference: tsi.rs::tsi_compute_into_inline
+//   PERIOD-SWEPT. hpc_ta treats TSI as a coupled-window indicator: the swept
+//   period is the long EMA and the short EMA preserves the default 25:13
+//   shape. The old kernel ignored `periods` and hard-coded 25/13, so `tsi_7`
+//   stayed NaN through index 37 while the CPU emitted from index 11.
+//   Every tuple uses the same inline scalar path. The removed default-only
+//   implementation returned an all-NaN series when the first momentum bar was
+//   non-finite, while non-default tuples resumed at the next finite bar.
 //   Both EMA pairs are plain `alpha * x + (1 - alpha) * prev`; the CPU does NOT
 //   use mul_add here, so neither does this, and `-fmad=false` is what stops
 //   nvcc contracting it behind our back.
@@ -965,34 +968,43 @@ extern "C" __global__ void neoethos_tsi_batch_f64(
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_combos) return;
-    (void)periods;  // PERIOD-INVARIANT: see the batch header.
-
     double* row = out + (size_t)r * (size_t)n;
     if (first_valid < 0 || first_valid >= n) { neo_fill_warmup(row, n, n); return; }
 
-    const int warm = first_valid + TSI_LONG + TSI_SHORT;
+    const int long_period = periods[r];
+    if (long_period <= 0) { neo_fill_warmup(row, n, n); return; }
+    int short_period = (int)floor(
+        ((double)TSI_DEFAULT_SHORT * (double)long_period /
+         (double)TSI_DEFAULT_LONG) + 0.5);
+    if (short_period < 1) short_period = 1;
+
+    const int warm = first_valid + long_period + short_period;
     neo_fill_warmup(row, n, warm);
 
     if (first_valid + 1 >= n) return;
 
-    const double long_alpha = 2.0 / ((double)TSI_LONG + 1.0);
-    const double short_alpha = 2.0 / ((double)TSI_SHORT + 1.0);
+    const double long_alpha = 2.0 / ((double)long_period + 1.0);
+    const double short_alpha = 2.0 / ((double)short_period + 1.0);
     const double long_1minus = 1.0 - long_alpha;
     const double short_1minus = 1.0 - short_alpha;
 
     double prev = prices[first_valid];
-    const double x1 = prices[first_valid + 1];
-    if (!neo_is_finite(x1)) return;
+    int seed = first_valid + 1;
+    while (seed < n && !neo_is_finite(prices[seed])) {
+        row[seed] = neo_qnan();
+        ++seed;
+    }
+    if (seed >= n) return;
 
-    const double first_momentum = x1 - prev;
-    prev = x1;
+    const double first_momentum = prices[seed] - prev;
+    prev = prices[seed];
 
     double ema_long_num = first_momentum;
     double ema_short_num = first_momentum;
     double ema_long_den = fabs(first_momentum);
     double ema_short_den = fabs(first_momentum);
 
-    for (int i = first_valid + 2; i < n; ++i) {
+    for (int i = seed + 1; i < n; ++i) {
         const double cur = prices[i];
         if (!neo_is_finite(cur)) {
             row[i] = neo_qnan();

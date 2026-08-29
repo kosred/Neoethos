@@ -79,7 +79,7 @@ Forbidden this wave: `crates/neoethos-app/**`, `crates/neoethos-core/src/domain/
 | W2-22 💰 | **FILED ELSEWHERE IN THIS DOCUMENT — see [`models.blend_*`](#modelsblend_--the-live-blend-multipliers-need-a-config-recipient) at the end** | `crates/neoethos-core/src/config.rs` (`ModelsConfig`, beside `live_ml_gate` at `:1031` / `:2425`) | Pointer row only, so a reader of this TABLE finds it. The `models.blend.*` recipient was the fourth un-filed item in the 2026-08-10 record; the app/CLI/trader shard filed it in full while this reconciliation was running, and its version is better than mine — it names `blend_gate_floor` / `blend_veto_below` (flat, not nested), the exact `Default` sites, the full six-point drag, and the two waiting readers. **CLOSED 2026-08-10 (audit #232): the fields landed and the readers are wired.** `ModelsConfig::blend_gate_floor` / `blend_veto_below` exist, the desktop seed carries them, `settings.rs` + `knob_catalog.rs` + the MCP params/ops mirror them, and `operator_blend_gate_floor`/`_veto_below` now return the operator's number instead of `None`. See the closed section at the end of this document for the exact drag and the regression test. | — |
 | W2-23 💰 | **PENDING — filed 2026-08-10, two starting balances, neither reads the account** | `crates/neoethos-core/src/config.rs:586` and `:1910` | **Current values: `risk.initial_balance = 10_000.0` (`:586`) and `models.backtest_runtime.initial_equity = 100_000.0` (`:1910`) — a factor of ten apart, in one file, both shipped, neither documented as answering a different question.** Target: see §W2-23 below. Non-negotiable #1 applies — where two numbers conflict the SAFER wins, and the safer starting balance is the SMALLER one, because every percentage-of-equity limit converts to a smaller absolute loss against it. | Nothing compiles against the disagreement, which is why it survived. It reaches the objective through the monthly-PnL buckets. |
 | W2-24 | **PENDING — filed 2026-08-10, §6.3 of `docs/audit-status-2026-08-09.md`, one line** | `crates/neoethos-search/src/gpu_native/prototype_a_engine.rs:170` and `:172` | **Current values: `&& scenario.spread_ticks == 0` and `&& scenario.commission_micros == 0`. Target values: `== NO_TICK_OVERRIDE` and `== NO_MICRO_OVERRIDE` (both `-1`).** Confirmed present 2026-08-10 and confirmed still wrong: `scenario.rs:366`/`:368` write `NO_TICK_OVERRIDE`/`NO_MICRO_OVERRIDE` into every base scenario, so `validate_supported_scenarios` REJECTS every descriptor the base path produces — and would WAVE THROUGH a literal-zero, i.e. free-trading, one. | `bench` on Prototype A is broken. No live money (A is bench-only), but the bench cluster is five registered CLI subcommands. These are the LAST two zero-sentinel comparisons in the tree — `prototype_population.rs`, `prototype_b_population.cu:133-134` and `eval.rs:2663` all agree on `-1`. |
-| W2-25 | **PENDING — filed 2026-08-10, stale build guidance pointing at a loaded gun** | `crates/neoethos-app/Cargo.toml:33`, `crates/neoethos-data/Cargo.toml:110`, `crates/neoethos-data/src/core/hpc_ta.rs:1539` | Three sites still tell the operator to set the **singular** `CUDA_ARCH`, which `vendor/vector-ta-.../build.rs::target_archs` takes as the single-value branch and turns into a **SINGLE-architecture fatbin that will not load on any other card**. `crates/neoethos-data/build.rs:30-32` names this exact trap in its own header. The build logic was NOT narrowed and is correct — only the guidance is stale. Exact replacements in §W2-25 below. | Zero behaviour change in the tree; it changes what the operator is told to type on the card. |
+| W2-25 | **PARTIAL — 2026-08-15, superseded architecture paths deleted; typed manifest pending** | Shared `scripts/build/resolve_host.rs` + `vendor/cuda_build_arch.rs`; vector-ta/native/XGBoost/LightGBM builders; active CUDA docs/errors | Host builds now resolve visible NVIDIA cards and the CPU worker budget once, then every CUDA builder consumes the same validated `NEOETHOS_CUDA_ARCHS` set. The three old environment paths, per-builder/default architecture branches, fixed card labels, stale diagnostics, and broad LightGBM list were deleted. A whole-repository regression guard prevents them returning outside immutable design/audit evidence. | Embed and verify one typed `BuildHostPlanV1` identity in every CUDA artifact/runtime surface. Explicit architecture input is only for a reviewed cross/release build; real-card proof remains keyed to the exact tested architecture/artifact. |
 | W2-26 | **DONE — 2026-08-10, audit #206 (D5 landed)** | `crates/neoethos-core/src/config.rs` (`RiskConfig`), `crates/neoethos-search/src/discovery.rs` (`resolve_and_log_duplicate_knobs`) | The four `risk.trailing_*` fields are DELETED, together with their `Default` seeds, both shipped YAMLs, the `resolve_and_log_duplicate_knobs` trailing pair, the `NO_QUALIFIED_READER` ledger rows and the `ROOT_REGISTERED` / `ROOT_NOTES` / `PINNED` entries. The precondition W2-1 required is met: live execution reads `models.exit_policy` (`live_trading.rs:747-782` resolves and logs the policy, `:1479-1493` applies the geometry). All four old keys are in `RETIRED_KEYS`, so the operator's live store — which sets `trailing_enabled: true`, `trailing_atr_multiplier: 0.4`, `trailing_be_trigger_r: 0.1` — still loads, with each key NAMED at WARN and the rename `trailing_atr_multiplier` → `models.exit_policy.trailing_stop_multiplier` spelled out. | The comment and the struct moved in one change, as this row required. |
 
 ## The four items the 2026-08-10 record says were never written down
@@ -202,98 +202,22 @@ matches the account this system actually trades. Raising `initial_balance` to
 100,000 to match the backtest would silently multiply every absolute risk figure
 the operator reads by ten.
 
-### §W2-25 — three sites still tell the operator to set the singular `CUDA_ARCH`
+### §W2-25 — architecture aliases closed; typed build-plan identity pending
 
-The build is correct and was not narrowed. `vendor/vector-ta-0.2.9-patched/build.rs::target_archs`
-resolves, in order: `CUDA_ARCHS` (list) → `CUDA_ARCH` (**singular, yields
-`vec![a]`, i.e. one architecture**) → `DEFAULT_TARGET_ARCHS = [80, 86, 89, 90]`,
-intersected with `nvcc --list-gpu-arch`, plus `-gencode arch=compute_90,code=compute_90`
-so a newer card JITs instead of failing. So **the correct instruction is to set
-NOTHING**, and to narrow with the list form only.
-
-`crates/neoethos-data/build.rs:28-32` already states the trap in its own header:
-the old panic's remedy *"told the operator to export `CUDA_ARCH=sm_86` — which in
-vector-ta's `target_archs()` takes the single-value branch and builds a
-SINGLE-ARCHITECTURE fatbin that will not load on an A100. The error message
-recreated the exact trap it existed to prevent."* `docs/vector-ta-cuda-wiring.md:75-85`
-says **NEVER set `CUDA_ARCH=`** and is correct as written — it is not one of the
-three.
-
-These three are, with exact current text and exact replacement:
-
-**1. `crates/neoethos-app/Cargo.toml:33-34`**
-
-```toml
-# CURRENT
-    # in the build. Requires nvcc AND `CUDA_ARCH` set to the card's compute
-    # capability (see crates/neoethos-data/Cargo.toml for the arch trap).
-```
-```toml
-# REPLACEMENT
-    # in the build. Requires nvcc. Do NOT set an arch: vector-ta builds ONE
-    # fatbin covering sm_80/86/89/90 plus compute_90 PTX for forward JIT, so
-    # the default artifact runs on every card we target. `CUDA_ARCH=` (the
-    # SINGULAR form) narrows it to ONE architecture and the binary then fails
-    # to load anywhere else — see crates/neoethos-data/build.rs:28-32. To
-    # narrow deliberately for a faster iteration loop, use the LIST form,
-    # e.g. `CUDA_ARCHS=86`.
-```
-
-**2. `crates/neoethos-data/Cargo.toml:107-111`**
-
-```toml
-# CURRENT (:110)
-#   CUDA_ARCH=sm_86 CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
-```
-```toml
-# REPLACEMENT
-#   CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
-#
-# No arch variable. vector-ta compiles the multi-arch fatbin [80, 86, 89, 90]
-# + compute_90 PTX by default, which covers the 3090 (sm_86) and every other
-# card we target from ONE artifact. To narrow for a faster loop use the LIST
-# form — `CUDA_ARCHS=86` — never `CUDA_ARCH=`, which builds a
-# single-architecture fatbin that loads on nothing else.
-```
-
-The surrounding lines `:107-108` also need correcting: they say the build
-*"[resolves] the target arch from the card that is actually present rather than
-defaulting to a hardcoded `compute_89`"*. `neoethos-data/build.rs` **no longer
-resolves an arch at all** — that probe was deleted precisely because it made the
-build require a card on the build host. The sentence describes code that is gone.
-
-**3. `crates/neoethos-data/src/core/hpc_ta.rs:1536-1541`** — an operator-facing
-assert message, which is the worst of the three because it is read at the moment
-the operator is about to type the command:
-
-```rust
-// CURRENT
-        "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` (and CUDA_ARCH set to the card's \
-         compute capability), or use IndicatorComputePolicy::Auto/Cpu."
-```
-```rust
-// REPLACEMENT
-        "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` — set NO arch variable, the \
-         default fatbin covers sm_80/86/89/90 plus compute_90 PTX. (Never `CUDA_ARCH=`: the \
-         singular form builds a single-architecture fatbin that will not load on another card. \
-         To narrow deliberately, `CUDA_ARCHS=<list>`.) Or use IndicatorComputePolicy::Auto/Cpu."
-```
-
-#### Two lookalikes that are NOT defects — do not "fix" them
-
-* `crates/neoethos-data/src/core/indicator_telemetry.rs:124` and `:296` mention
-  `CUDA_ARCH`, but both are **historical**: `:124` explains that the constant
-  used to be recomputed from it and is now re-exported from
-  `vector_ta::cuda::module_loader::COMPILED_PTX_ARCH`, and `:296` is a test
-  asserting a card-less build never reports a resolved arch. Neither instructs
-  anyone to set anything.
-* `crates/neoethos-gpu-cuda/build.rs:19`, `:63-65` uses **`NEOETHOS_CUDA_ARCH`**,
-  a different variable in a different crate, defaulting to
-  `compute_70,code=compute_70` — virtual PTX that the driver JITs for whatever
-  card is present. That is the portable default, not the trap. It is a fourth
-  hit on a `CUDA_ARCH` grep and it is fine.
+The repository now accepts only `NEOETHOS_CUDA_ARCHS`, a semicolon-separated
+numeric capability set validated by `vendor/cuda_build_arch.rs`. Normal host
+builds obtain it from `scripts/build/resolve_host.rs`, which inventories every
+visible NVIDIA UUID/PCI/name/capability and applies the CPU reserve once before
+Cargo starts. vector-ta and the native CUDA archive emit SASS for every selected
+capability plus PTX for the highest; XGBoost receives the corresponding official
+CMake architecture setting and LightGBM receives the same translated set.
+Missing, malformed, duplicate, or toolkit-unsupported selections fail closed;
+manual input is reserved for a separately recorded cross/release matrix.
+Runtime diagnostics report the compiled artifact rather than inventing an
+architecture from the build host. The old aliases/defaults and their stale
+instructions are deleted, and
+`scripts/gpu-bench/test_cuda_model_arch_contract.py` scans active repository
+surfaces so they cannot silently return.
 
 ## Corrections to the decision documents that this wave established
 

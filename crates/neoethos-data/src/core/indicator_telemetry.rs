@@ -82,16 +82,16 @@ pub struct IndicatorRunSummary {
     pub cpu_indicators: Vec<(&'static str, IndicatorLane)>,
     pub gpu_time: Duration,
     pub cpu_time: Duration,
-    /// Number of `compute_cuda_device` calls issued. One per indicator per
-    /// frame — the whole period sweep is a single launch.
+    /// Number of `compute_cuda_device_f64` calls issued. One per indicator per
+    /// frame — the whole requested period sweep is one f64 device dispatch.
     pub device_calls: u64,
     /// Host→device uploads. Should be ONE per frame: the OHLCV stays resident
     /// across every indicator. More than one means residency broke.
     pub uploads: u64,
     /// Set when the card ran: the numeric class of the device result relative
-    /// to the CPU reference. vector-ta's device layer is f32-only while every
-    /// CPU indicator is f64, so this is NEVER "identical" — see
-    /// `hpc_ta::gpu_cpu_sma_sweep_parity` for the measured tolerance.
+    /// to the scalar f64 CPU parity reference. The NeoEthos production lane is
+    /// f64 upload, kernel, and readback; see
+    /// `hpc_ta::gpu_cpu_indicator_sweep_parity` for measured agreement.
     pub precision: Option<&'static str>,
 }
 
@@ -132,12 +132,9 @@ pub const fn indicator_gpu_lane_compiled() -> bool {
 /// The arch of the PTX embedded in the vector-ta fatbin — the one the driver
 /// JITs on a card newer than anything we compiled SASS for.
 ///
-/// RE-EXPORTED, not recomputed. This used to be `env!("NEOETHOS_VECTOR_TA_PTX_ARCH")`,
-/// resolved by `neoethos-data/build.rs` from `CUDA_ARCHS`/`CUDA_ARCH`/`nvidia-smi`
-/// — i.e. a fact about the BUILD HOST, printed in the diagnostic that exists to
-/// explain a mismatch on the RUN host. A portable binary built on a 4090
-/// reported `sm_89` in the message meant to explain why an sm_86 card failed.
-/// vector-ta records what it actually compiled; there is now one answer.
+/// Re-exported from vector-ta rather than recomputed from the build host.
+/// vector-ta records the artifact it actually compiled, so runtime telemetry
+/// has one authoritative answer.
 #[cfg(feature = "gpu-cuda")]
 pub const VECTOR_TA_PTX_ARCH: &str = vector_ta::cuda::module_loader::COMPILED_PTX_ARCH;
 /// `"none"` in a card-less build: there is no fatbin and no PTX.
@@ -305,7 +302,7 @@ mod tests {
                     !s.contains("sm_") && !s.contains("compute_"),
                     "a card-less build reported {s:?}, which reads like a resolved arch — \
                      this constant must be re-exported from vector-ta, never recomputed \
-                     from CUDA_ARCH / nvidia-smi"
+                     from the build host"
                 );
             }
         }

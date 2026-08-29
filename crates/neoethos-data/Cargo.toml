@@ -35,7 +35,7 @@ tracing = "0.1"
 # the single biggest CPU win for `hpc_ta::compute_classic_ta_columns` and needs
 # no GPU. (vector-ta's separate `cuda`/`cuda-build-ptx` GPU path is wired
 # separately once `hpc_ta` dispatches to `vector_ta::cuda::*` — task #22.)
-vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
+vector-ta = { version = "=0.2.9", features = ["nightly-avx"] }
 # STAY ON 0.2.9 — decided 2026-08-09 against the 0.3.1 API diff, not by habit.
 #   * A mechanical diff of every `pub fn|struct|enum|trait` across
 #     `src/indicators`, `src/cuda` and `src/utilities` between 0.2.9 and 0.3.1
@@ -102,12 +102,10 @@ vortex-session = "0.67.0"
 # only, so none of them JIT down onto the sm_86 of an RTX 3090 — the module
 # simply fails to load, per indicator, at first use.
 #
-# `cuda-build-ptx` compiles the kernels with nvcc instead, and
-# `vendor/vector-ta-0.2.9-patched/build.rs` was patched (2026-08-09) to DERIVE
-# the target arch from the card that is actually present rather than defaulting
-# to a hardcoded `compute_89`. On the rented 3090:
+# `cuda-build-ptx` compiles the kernels with nvcc instead. Every CUDA builder
+# consumes the same explicit, validated architecture set. On a rented 3090:
 #
-#   CUDA_ARCH=sm_86 CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
+#   NEOETHOS_CUDA_ARCHS=86 CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
 #
 # `CUDA_FAST_MATH=0` is not optional if any parity claim is to be made:
 # vector-ta's build.rs passes `--use_fast_math` by default, which turns on
@@ -120,4 +118,3 @@ vortex-session = "0.67.0"
 # machine with the CUDA toolkit — `cust_raw`'s build script panics without one.
 [features]
 gpu-cuda = ["dep:cust", "vector-ta/cuda-build-ptx"]
-

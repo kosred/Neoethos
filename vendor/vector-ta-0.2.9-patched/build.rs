@@ -1,13 +1,27 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+#[path = "../cuda_build_arch.rs"]
+mod cuda_build_arch;
 
 fn main() {
+    // SAFETY: this is the first operation in the build script, before it opens
+    // files or starts threads. Cargo owns the advertised descriptors/handles
+    // for the lifetime of this process, which is jobserver::from_env's exact
+    // contract.
+    let cargo_jobserver = unsafe { jobserver::Client::from_env() };
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../cuda_build_arch.rs");
     println!("cargo:rerun-if-changed=kernels/cuda");
     println!("cargo:rerun-if-changed=kernels/ptx");
-    println!("cargo:rerun-if-changed=kernels/cubin");
 
     // Sentinels first. `target_archs()` re-emits both with the real values
     // when kernels are compiled from source, and a later `cargo:rustc-env`
@@ -20,7 +34,7 @@ fn main() {
 
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         if env::var("CARGO_FEATURE_CUDA_BUILD_PTX").is_ok() {
-            compile_cuda_kernels();
+            compile_cuda_kernels(cargo_jobserver.as_ref());
         } else {
             stage_prebuilt_ptx();
         }
@@ -59,16 +73,6 @@ fn fatbin_name_for_ptx(ptx_name: &str) -> String {
         format!("{ptx_name}.fatbin")
     }
 }
-
-/// The architectures a stock build targets when the operator names none.
-///
-/// These are the four cards the project actually runs on — A100 (8.0),
-/// RTX 3090 / A10 (8.6), RTX 4090 / L40S (8.9), H100 (9.0). A device NEWER
-/// than the highest entry is served by the PTX that `compile_kernel` embeds
-/// in the same fatbin, so "a card we have not compiled for" is a JIT, not a
-/// failure. A device OLDER than 8.0 is not covered and is refused loudly by
-/// `module_loader.rs` rather than silently mis-run.
-const DEFAULT_TARGET_ARCHS: &[u32] = &[80, 86, 89, 90];
 
 /// Kernel sources whose entry points feed the NeoEthos f64 indicator lane.
 ///
@@ -393,7 +397,6 @@ const F64_LANE_SOURCES: &[&str] = &[
     "kernels/cuda/rank_correlation_index_kernel.cu",
     "kernels/cuda/random_walk_index_kernel.cu",
     "kernels/cuda/rolling_z_score_trend_kernel.cu",
-
     // ------------------------------------------------------------ closer 5
     // Same contract as the blocks above: each of these carries an
     // <id>_neo_batch_f64 entry point (search the file for NEOETHOS f64 LANE)
@@ -722,23 +725,6 @@ fn is_f64_lane_source(rel_src: &str) -> bool {
         .any(|needle| rel_src.ends_with(needle))
 }
 
-/// `sm_86` / `compute_86` / `8.6` / `86` → `86`. `None` when it is not an arch.
-fn parse_arch(s: &str) -> Option<u32> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() < 2 {
-        return None;
-    }
-    // `90a` / `100f` architecture-specific variants collapse to their base.
-    digits[..digits.len().min(3)].parse::<u32>().ok().map(|v| {
-        // "8.6" -> "86"; "100" stays 100 (Blackwell).
-        v
-    })
-}
-
 /// Which real-SASS architectures this nvcc can emit, e.g. `[70, 75, 80, 86,
 /// 89, 90]`. Parsed from `nvcc --list-gpu-arch`, which prints one
 /// `compute_XY` per line.
@@ -773,77 +759,26 @@ fn nvcc_supported_archs(nvcc: &str) -> &'static Vec<u32> {
     })
 }
 
-/// The architectures the fatbin will carry, ascending, always non-empty.
-///
-/// Precedence:
-///   1. `CUDA_ARCHS` — a comma/space separated LIST, all of which are built
-///   2. `CUDA_ARCH`  — a single architecture (narrow, deliberate build)
-///   3. [`DEFAULT_TARGET_ARCHS`] — the portable default, no card named at the
-///      call site and no auto-detection of the build host
-///
-/// Then intersected with [`nvcc_supported_archs`] so an older or newer toolkit
-/// produces a working narrower fatbin instead of failing the whole build.
+/// The explicit project architecture set the fatbin will carry.
 fn target_archs(nvcc: &str) -> &'static Vec<u32> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Vec<u32>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let requested: Vec<u32> = if let Ok(list) = env::var("CUDA_ARCHS") {
-            let v: Vec<u32> = list
-                .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                .filter_map(parse_arch)
-                .collect();
-            if v.is_empty() {
-                panic!("vector-ta: CUDA_ARCHS={list:?} contains no parseable architecture");
-            }
-            v
-        } else if let Ok(one) = env::var("CUDA_ARCH") {
-            let a = parse_arch(&one).unwrap_or_else(|| {
-                panic!("vector-ta: CUDA_ARCH={one:?} does not parse as an architecture")
-            });
-            println!(
-                "cargo:warning=vector-ta: CUDA_ARCH={one} builds a SINGLE-architecture fatbin. \
-                 The resulting binary runs on sm_{a} and (via embedded PTX) newer cards only. \
-                 Unset it — or use CUDA_ARCHS — for the portable default {DEFAULT_TARGET_ARCHS:?}."
-            );
-            vec![a]
-        } else {
-            DEFAULT_TARGET_ARCHS.to_vec()
-        };
+        let requested = cuda_build_arch::required_cuda_arch_numbers();
 
         let supported = nvcc_supported_archs(nvcc);
-        let mut archs: Vec<u32> = if supported.is_empty() {
-            requested.clone()
-        } else {
-            requested
-                .iter()
-                .copied()
-                .filter(|a| supported.contains(a))
-                .collect()
-        };
-        archs.sort_unstable();
-        archs.dedup();
-
-        if archs.is_empty() {
+        let unsupported = requested
+            .iter()
+            .copied()
+            .filter(|arch| !supported.is_empty() && !supported.contains(arch))
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
             panic!(
-                "vector-ta: none of the requested CUDA architectures {requested:?} are supported \
-                 by this nvcc (it offers {supported:?}). Set CUDA_ARCHS to a subset it can build, \
-                 or install a CUDA toolkit that covers the cards you intend to run on. Refusing \
-                 to silently substitute a different architecture."
+                "vector-ta: requested CUDA architectures {unsupported:?} are not supported by this \
+                 nvcc (it offers {supported:?}). Refusing to silently narrow NEOETHOS_CUDA_ARCHS."
             );
         }
-
-        if archs.len() != requested.len() {
-            let dropped: Vec<u32> = requested
-                .iter()
-                .copied()
-                .filter(|a| !archs.contains(a))
-                .collect();
-            println!(
-                "cargo:warning=vector-ta: this nvcc cannot emit SASS for {dropped:?}; the fatbin \
-                 will carry {archs:?} plus forward PTX. Cards matching the dropped architectures \
-                 will NOT run this build."
-            );
-        }
+        let archs = requested;
 
         // Recorded so the runtime loader's error can say what was compiled.
         let joined: Vec<String> = archs.iter().map(|a| format!("sm_{a}")).collect();
@@ -905,6 +840,7 @@ fn fast_math_requested(rel_src: &str) -> bool {
 fn stage_prebuilt_ptx() {
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILT_PTX_DIR");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILT_CUBIN_DIR");
+    println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILT_FATBIN_DIR");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
@@ -935,8 +871,8 @@ fn stage_prebuilt_ptx() {
              \n\
                1. RECOMMENDED — build the arch-agnostic fatbin from source:\n\
                     cargo build -p vector-ta --features cuda-build-ptx\n\
-                  This emits SASS for {DEFAULT_TARGET_ARCHS:?} plus embedded PTX for forward JIT, \
-                  in ONE artifact that runs unchanged on all of them.\n\
+                  Set NEOETHOS_CUDA_ARCHS to the exact release architectures; the build emits \
+                  SASS for every selected card plus PTX for the highest capability.\n\
              \n\
                2. Deliberately stage a single-architecture PTX tree, accepting that the \
                   resulting binary runs on that architecture and newer only:\n\
@@ -1052,11 +988,10 @@ Enable `--features cuda-build-ptx` to compile PTX artifacts with nvcc.",
     }
 }
 
-fn compile_cuda_kernels() {
+fn compile_cuda_kernels(cargo_jobserver: Option<&jobserver::Client>) {
     println!("cargo:rerun-if-changed=kernels/cuda");
 
-    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
-    println!("cargo:rerun-if-env-changed=CUDA_ARCHS");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=CUDA_FILTER");
     println!("cargo:rerun-if-env-changed=CUDA_KERNEL_DIR");
     println!("cargo:rerun-if-env-changed=NVCC");
@@ -1065,6 +1000,8 @@ fn compile_cuda_kernels() {
     println!("cargo:rerun-if-env-changed=CUDA_FAST_MATH");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILD_PTX_DIR");
     println!("cargo:rerun-if-env-changed=VECTOR_TA_PREBUILD_CUBIN_DIR");
+
+    reject_external_nvcc_args();
 
     let cuda_path = find_cuda_path();
 
@@ -1355,12 +1292,6 @@ fn compile_cuda_kernels() {
         "kernels/cuda/moving_averages/vwma_kernel.cu",
         "vwma_kernel.ptx",
     );
-    compile_kernel(
-        &cuda_path,
-        "kernels/cuda/moving_averages/vidya_kernel.cu",
-        "vidya_kernel.ptx",
-    );
-
     compile_kernel(
         &cuda_path,
         "kernels/cuda/moving_averages/vwmacd_kernel.cu",
@@ -2660,6 +2591,8 @@ fn compile_cuda_kernels() {
     );
 
     compile_kernel(&cuda_path, "kernels/cuda/lpc_kernel.cu", "lpc_kernel.ptx");
+
+    finish_kernel_compilations(cargo_jobserver);
 }
 
 fn find_cuda_path() -> String {
@@ -2827,7 +2760,146 @@ fn append_windows_nvcc_host_args(cmd: &mut std::process::Command) {
 #[cfg(not(target_os = "windows"))]
 fn append_windows_nvcc_host_args(_cmd: &mut std::process::Command) {}
 
+#[derive(Debug)]
+struct KernelJob {
+    cuda_path: String,
+    rel_src: String,
+    ptx_name: String,
+}
+
+thread_local! {
+    static KERNEL_JOBS: RefCell<Vec<KernelJob>> = const { RefCell::new(Vec::new()) };
+}
+
 fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
+    KERNEL_JOBS.with(|jobs| {
+        jobs.borrow_mut().push(KernelJob {
+            cuda_path: cuda_path.to_owned(),
+            rel_src: rel_src.to_owned(),
+            ptx_name: ptx_name.to_owned(),
+        });
+    });
+}
+
+fn finish_kernel_compilations(cargo_jobserver: Option<&jobserver::Client>) {
+    let jobs = KERNEL_JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
+    if jobs.is_empty() {
+        return;
+    }
+
+    let declared_capacity = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let max_workers = if cargo_jobserver.is_some() {
+        declared_capacity.min(jobs.len())
+    } else {
+        1
+    };
+    eprintln!(
+        "vector-ta CUDA build: queued {} unique translation units; Cargo jobserver max workers {}",
+        jobs.len(),
+        max_workers
+    );
+
+    if max_workers == 1 {
+        for job in jobs {
+            compile_kernel_now(&job.cuda_path, &job.rel_src, &job.ptx_name);
+        }
+        return;
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    std::thread::scope(|scope| {
+        for worker_index in 0..max_workers {
+            let queue = Arc::clone(&queue);
+            let cancelled = Arc::clone(&cancelled);
+            let failures = Arc::clone(&failures);
+            let client = cargo_jobserver.cloned();
+            scope.spawn(move || {
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Some(job) = queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front()
+                    else {
+                        break;
+                    };
+
+                    // Cargo grants the build script process one implicit slot.
+                    // Exactly one worker uses it; every additional active nvcc
+                    // translation unit must own a real inherited permit.
+                    let _permit = if worker_index == 0 {
+                        None
+                    } else {
+                        match client.as_ref().expect("jobserver present").acquire() {
+                            Ok(permit) => Some(permit),
+                            Err(error) => {
+                                failures
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(format!(
+                                        "{}: Cargo jobserver permit acquisition failed: {error}",
+                                        job.rel_src
+                                    ));
+                                cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    };
+
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let source = job.rel_src.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compile_kernel_now(&job.cuda_path, &job.rel_src, &job.ptx_name);
+                    }));
+                    if result.is_err() {
+                        failures
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(format!("{source}: nvcc translation-unit job panicked"));
+                        cancelled.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !failures.is_empty() {
+        panic!(
+            "parallel CUDA compilation failed; no successful build manifest may be published:\n{}",
+            failures.join("\n")
+        );
+    }
+}
+
+fn reject_external_nvcc_args() {
+    let Some(extra_args) = env::var_os("NVCC_ARGS") else {
+        return;
+    };
+    if extra_args.to_string_lossy().trim().is_empty() {
+        return;
+    }
+
+    panic!(
+        "external NVCC_ARGS is unsupported for vector-ta CUDA builds; the typed build plan owns architecture, output, optimization, and precision flags, so precision-changing NVCC_ARGS cannot override the recorded artifact contract"
+    );
+}
+
+fn compile_kernel_now(cuda_path: &str, rel_src: &str, ptx_name: &str) {
     use std::process::Command;
 
     let src_path = if let Ok(root) = env::var("CUDA_KERNEL_DIR") {
@@ -2899,7 +2971,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
     // the hardcoded default with auto-detection of the BUILD HOST's card —
     // which removed the silent degradation but still emitted a single-arch
     // artifact, so moving the same binary between a 3090 and an A100 still
-    // required a rebuild with a different `CUDA_ARCH`.
+    // required a rebuild with a different architecture setting.
     //
     // WHAT IT DOES NOW
     //
@@ -2915,25 +2987,12 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
     // not highest, because a fallback is worthless if it is narrower than the
     // artifact it is backing up.
     //
-    // HOW THE FOUR REQUIRED CARDS ARE SATISFIED, from ONE build with NO source
-    // change and NO rebuild flag change:
-    //   A100  sm_80 → SASS from `-gencode arch=compute_80,code=sm_80`
-    //   3090  sm_86 → SASS from `-gencode arch=compute_86,code=sm_86`
-    //   4090  sm_89 → SASS from `-gencode arch=compute_89,code=sm_89`
-    //   H100  sm_90 → SASS from `-gencode arch=compute_90,code=sm_90`
-    //   newer       → driver JITs the embedded compute_90 PTX
-    //
-    // `CUDA_ARCHS` still overrides the set (accepts a comma/space list now,
-    // not just a first entry), and `CUDA_ARCH` still names a single one — both
-    // for operators who want a faster, narrower build. Neither is required,
-    // and neither silently narrows: whatever is compiled is recorded in
-    // `VECTOR_TA_CUDA_ARCHS` and quoted back by the runtime error in
-    // `module_loader.rs` when a device is not covered.
-    //
-    // The set is INTERSECTED with what this nvcc actually supports
-    // (`nvcc --list-gpu-arch`), so CUDA 11 (no sm_90) and CUDA 13 (no sm_80)
-    // both produce a working narrower fatbin instead of failing the build on
-    // an "unsupported gpu architecture" for one entry of the list.
+    // `NEOETHOS_CUDA_ARCHS` is the sole architecture authority for every CUDA
+    // builder in this repository. It is explicit and fail-closed: an omitted,
+    // malformed, duplicate, or toolkit-unsupported capability stops the build
+    // rather than silently substituting another card. Whatever is compiled is
+    // recorded in `VECTOR_TA_CUDA_ARCHS` and quoted by `module_loader.rs` when
+    // a selected device is not covered.
     let archs = target_archs(&nvcc);
     let arch_min = *archs.first().expect("target_archs is never empty");
     let arch_max = *archs.last().expect("target_archs is never empty");
@@ -2974,6 +3033,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "--extended-lambda",
+        "--threads=1",
         "-ptx",
         "-O3",
     ]);
@@ -2991,14 +3051,6 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         ptx_path.to_str().expect("ptx path"),
         src_path.as_str(),
     ]);
-
-    if let Ok(extra) = env::var("NVCC_ARGS") {
-        for tok in extra.split_whitespace() {
-            if !tok.is_empty() {
-                cmd.arg(tok);
-            }
-        }
-    }
 
     if cfg!(target_os = "windows") {
         append_windows_nvcc_host_args(&mut cmd);
@@ -3041,6 +3093,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "--extended-lambda",
+        "--threads=1",
         "-fatbin",
         "-O3",
     ]);
@@ -3067,14 +3120,6 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         src_path.as_str(),
     ]);
 
-    if let Ok(extra) = env::var("NVCC_ARGS") {
-        for tok in extra.split_whitespace() {
-            if !tok.is_empty() {
-                fat_cmd.arg(tok);
-            }
-        }
-    }
-
     if cfg!(target_os = "windows") {
         append_windows_nvcc_host_args(&mut fat_cmd);
     }
@@ -3090,7 +3135,7 @@ fn compile_kernel(cuda_path: &str, rel_src: &str, ptx_name: &str) {
         panic!(
             "nvcc fatbin compilation failed for {rel_src} (archs {archs:?}). \
              Refusing to emit a single-architecture artifact instead: that is the arch trap this \
-             build exists to close. Narrow the set explicitly with CUDA_ARCHS if this toolkit \
+             build exists to close. Narrow NEOETHOS_CUDA_ARCHS explicitly if this toolkit \
              cannot serve all of them."
         );
     }
@@ -3159,10 +3204,5 @@ fn find_vs_installation() -> Result<String, ()> {
         }
     }
 
-    Err(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn find_vs_installation() -> Result<String, ()> {
     Err(())
 }

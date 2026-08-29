@@ -2,6 +2,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../vendor/cuda_build_arch.rs"]
+mod cuda_build_arch;
+
 const DEVICE_SOURCES: [&str; 3] = [
     "native/smoke.cu",
     "native/prototype_b.cu",
@@ -9,6 +12,7 @@ const DEVICE_SOURCES: [&str; 3] = [
 ];
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../vendor/cuda_build_arch.rs");
     println!("cargo:rerun-if-changed=native/neoethos_gpu_cuda.h");
     println!("cargo:rerun-if-changed=native/layout_asserts.cpp");
     println!("cargo:rerun-if-changed=native/stub.cpp");
@@ -16,7 +20,7 @@ fn main() {
         println!("cargo:rerun-if-changed={source}");
     }
     println!("cargo:rerun-if-env-changed=CUDACXX");
-    println!("cargo:rerun-if-env-changed=NEOETHOS_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_CUDA_ARCHS");
 
     let cuda_feature = env::var_os("CARGO_FEATURE_CUDA").is_some();
 
@@ -58,12 +62,16 @@ fn compile_device_objects() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    // PTX for a virtual architecture by default: the driver JITs it for
-    // whatever card is actually present, so one build runs on Turing through
-    // Hopper. Override for a specific card with NEOETHOS_CUDA_ARCH.
-    let arch = env::var("NEOETHOS_CUDA_ARCH")
-        .unwrap_or_else(|_| "compute_70,code=compute_70".to_string());
-    let debug = env::var("DEBUG").map(|value| value == "true").unwrap_or(false);
+    // The same explicit, validated architecture set drives vector-ta and both
+    // vendored model libraries. Emit SASS for every selected card and PTX for
+    // the highest capability; there is no implicit host/default architecture.
+    let architectures = cuda_build_arch::required_cuda_arch_numbers();
+    let ptx_architecture = *architectures
+        .last()
+        .expect("validated CUDA architecture set is non-empty");
+    let debug = env::var("DEBUG")
+        .map(|value| value == "true")
+        .unwrap_or(false);
 
     let mut objects = Vec::new();
     for source in DEVICE_SOURCES {
@@ -80,7 +88,6 @@ fn compile_device_objects() {
             .arg("-o")
             .arg(&object)
             .arg("-std=c++17")
-            .arg(format!("-gencode=arch={arch}"))
             .arg("-Xcompiler=-fPIC")
             // No fused multiply-add contraction. Measured on an RTX A6000 over
             // 20 000 real EURUSD H1 bars: with contraction enabled one
@@ -92,6 +99,14 @@ fn compile_device_objects() {
             .arg("-fmad=false")
             .arg("-I")
             .arg("native");
+        for architecture in &architectures {
+            command.arg(format!(
+                "-gencode=arch=compute_{architecture},code=sm_{architecture}"
+            ));
+        }
+        command.arg(format!(
+            "-gencode=arch=compute_{ptx_architecture},code=compute_{ptx_architecture}"
+        ));
         if debug {
             command.arg("-lineinfo");
         } else {

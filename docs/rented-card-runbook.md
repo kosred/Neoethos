@@ -53,7 +53,7 @@ migration, not tonight's search.
 ## Phase 2 — build + parity (45 min)
 
 ```bash
-cargo build --release -p neoethos-cli --features gpu-nvidia 2>&1 | tee ~/logs/build.log
+./scripts/build-host.sh build --release -p neoethos-cli --features gpu-nvidia 2>&1 | tee ~/logs/build.log
 
 # Parity gate — the measured-exact lane must stay exact:
 NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --release --features gpu-cuda gpu_ -- --nocapture 2>&1 | tee ~/logs/parity.log

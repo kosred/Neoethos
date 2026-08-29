@@ -5220,19 +5220,20 @@ pub(crate) fn try_evaluate_population_cuda(
     Ok(results)
 }
 
-/// GPU FTMO prop-firm observables path — sibling of [`try_evaluate_population_cuda`]
-/// that returns the per-gene `[f32; FTMO_WIDTH]` FTMO observables instead of the
-/// `[f64; 11]` ranking metrics. Reuses the EXACT same signal-synth
-/// (`try_generate_signal_flat_cuda`) + backtest (`launch_backtest_kernel`) path, so
-/// the trades the kernel realizes are identical to the metrics path — only the slot
-/// of the launch tuple that we keep differs. Layout per gene matches `FTMO_WIDTH`
-/// (see the const doc) and `validation.rs::compute_prop_firm_risk_summary`:
+/// Test-only regression adapter for the legacy CubeCL FTMO observables.
+///
+/// This is deliberately absent from production builds: it returns f32 values
+/// and is not an approved broker-real financial path. The unit parity fixture
+/// keeps it only long enough to expose changes while the superseding typed f64
+/// broker path is built and connected; that migration must delete this adapter
+/// and its old CubeCL kernel together. Layout per gene matches `FTMO_WIDTH`:
 ///   [0] net_return_pct  [1] max_daily_loss_pct  [2] max_overall_drawdown_pct
 ///   [3] largest_profit_share  [4] max_trades_per_day  [5] trading_days
 ///
 /// Isolating this in its own function keeps the proven `[f64;11]` metrics path
 /// untouched (its signature is unchanged); callers that need FTMO observables on the
 /// GPU call this instead of re-running a CPU `simulate_trades_core`.
+#[cfg(test)]
 pub(crate) fn try_evaluate_ftmo_population_cuda(
     close: &[f64],
     high: &[f64],

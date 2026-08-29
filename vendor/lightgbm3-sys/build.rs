@@ -1,9 +1,11 @@
 use cmake::Config;
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
+
+#[path = "../cuda_build_arch.rs"]
+mod cuda_build_arch;
 
 #[derive(Debug)]
 struct DoxygenCallback;
@@ -15,14 +17,20 @@ impl bindgen::callbacks::ParseCallbacks for DoxygenCallback {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../cuda_build_arch.rs");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_CUDA_ARCHS");
     let target = env::var("TARGET").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
     let lgbm_root = Path::new(&out_dir).join("lightgbm");
 
     // copy source code
     if !lgbm_root.exists() {
-        copy_dir_recursive(Path::new("lightgbm"), &lgbm_root)
-            .unwrap_or_else(|err| panic!("Failed to copy ./lightgbm to {}: {err}", lgbm_root.display()));
+        copy_dir_recursive(Path::new("lightgbm"), &lgbm_root).unwrap_or_else(|err| {
+            panic!(
+                "Failed to copy ./lightgbm to {}: {err}",
+                lgbm_root.display()
+            )
+        });
     }
 
     // CMake
@@ -56,6 +64,11 @@ fn main() {
     }
     if cuda_enabled {
         cfg.define("USE_CUDA", "1");
+        let cuda_architectures = cmake_cuda_architectures();
+        println!(
+            "cargo:warning=lightgbm3-sys: CUDA architectures explicitly limited to {cuda_architectures}"
+        );
+        cfg.define("NEOETHOS_CUDA_ARCHITECTURES", cuda_architectures);
     }
     let dst = cfg.build();
 
@@ -130,6 +143,22 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=static=_lightgbm");
     }
+}
+
+#[cfg(feature = "cuda")]
+fn cmake_cuda_architectures() -> String {
+    let architectures = cuda_build_arch::required_cuda_arch_numbers();
+    let mut targets = architectures
+        .iter()
+        .map(|architecture| format!("{architecture}-real"))
+        .collect::<Vec<_>>();
+    targets.push(format!(
+        "{}-virtual",
+        architectures
+            .last()
+            .expect("validated CUDA architecture set is non-empty")
+    ));
+    targets.join(";")
 }
 
 /// PATCHED (NeoEthos 2026-08-02): candidate directories holding `libcudart.so`,

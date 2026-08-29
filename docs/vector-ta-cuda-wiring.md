@@ -49,16 +49,35 @@ required a change.
 
 ## 2. Building and running on the card
 
-### Set nothing. That is the point.
+### Let the build resolve the current host
 
 ```sh
-cargo build -p neoethos-cli --features gpu-nvidia --release
+./scripts/build-host.sh build -p neoethos-cli --features gpu-nvidia --release
 ```
 
-One build, one artifact, four cards.
-`vendor/vector-ta-0.2.9-patched/build.rs` compiles every kernel to a single
-`-fatbin` carrying `-gencode arch=compute_X,code=sm_X` for **80, 86, 89, 90**
-plus `-gencode arch=compute_90,code=compute_90` for forward JIT:
+On Windows use the same entry point through
+`./scripts/build-host.ps1 build -p neoethos-cli --features gpu-nvidia --release`.
+The shared preflight reads the logical parallelism visible to the process,
+reserves two threads, queries every visible NVIDIA device, and passes the
+canonical architecture set to the project-owned vector-ta/native builders and
+the XGBoost/LightGBM native builders. It also prints each card's UUID, PCI bus
+ID, name, and compute capability before Cargo starts. On a host without
+`nvidia-smi`, the same entry point emits `accelerator_mode=cpu_only`, clears a
+stale `NEOETHOS_CUDA_ARCHS`, and still applies logical threads minus two.
+
+`NEOETHOS_CUDA_ARCHS` is the only CUDA architecture input used by vector-ta,
+the native search kernels, XGBoost, and LightGBM. It is a semicolon-separated
+set of numeric compute capabilities produced automatically by the common host
+preflight. The build emits real SASS for every selected capability and PTX for
+the highest capability.
+
+An explicit value is reserved for a reviewed cross/release build that is not
+supposed to describe the current host. For example, a release matrix intended
+to contain four card families may use:
+
+```sh
+NEOETHOS_CUDA_ARCHS='80;86;89;90' cargo build -p neoethos-cli --features gpu-nvidia --release
+```
 
 | Card | Arch | How it is served |
 |---|---|---|
@@ -66,28 +85,24 @@ plus `-gencode arch=compute_90,code=compute_90` for forward JIT:
 | RTX 3090 / A10 | sm_86 | real SASS from its own gencode |
 | RTX 4090 / L40S | sm_89 | real SASS from its own gencode |
 | H100 | sm_90 | real SASS from its own gencode |
-| anything newer | sm_100+ | driver JITs the embedded `compute_90` PTX |
+| newer card | higher sm | driver JITs the PTX for the highest selected arch, if compatible |
 
-The set is intersected with `nvcc --list-gpu-arch`, so CUDA 11 (no sm_90) and
-CUDA 13 (no sm_80) narrow gracefully with a `cargo:warning` naming exactly what
-was dropped, instead of failing the build.
-
-**NEVER set `CUDA_ARCH=`.** The singular form builds a
-**SINGLE-architecture fatbin**: `CUDA_ARCH=sm_89` produces an artifact that
-will not load on a 3090 or an A100. That is the defect class that cost this
-project eight months. It is still accepted, because narrowing is sometimes
-wanted deliberately, and vector-ta prints a `cargo:warning` when it happens. To
-narrow for a faster iteration loop, use the **list** form:
+Those four builders have no builder-local probe, first-card narrowing, or
+invented default. Missing, malformed, duplicate, or toolkit-unsupported
+capabilities fail the build. This statement does not cover model-local
+dependencies: CubeCL 0.10 performs per-device NVRTC compilation at runtime,
+whereas Candle 0.10.2/CudaForge still has an independent single-card detector.
+The Candle CUDA path therefore remains unapproved for strict/mixed-card
+selection until it consumes the canonical build plan and records the resulting
+artifact identity. A host-specific VPS experiment uses the same automatic
+entry point:
 
 ```sh
-CUDA_ARCHS=86 cargo build -p neoethos-cli --features gpu-nvidia --release
+./scripts/build-host.sh build -p neoethos-cli --features gpu-nvidia --release
 ```
 
-`crates/neoethos-data/build.rs` no longer resolves an arch at all. It used to,
-falling through to `nvidia-smi` and panicking when there was no card — which
-broke CUDA builds in containers and CI, and printed the BUILD host's arch in
-the diagnostic meant to explain a mismatch on the RUN host. The arch strings
-the runtime quotes now come from vector-ta's own
+`crates/neoethos-data/build.rs` does not resolve an architecture. The arch
+strings the runtime quotes come from vector-ta's own
 `module_loader::{COMPILED_ARCHS, COMPILED_PTX_ARCH}`: one source, describing
 the kernels rather than the machine that compiled them.
 
@@ -237,43 +252,35 @@ because the feature build runs once per frame per timeframe, not inside the GA
 hot loop. If it ever moves into a hot loop, hold the concrete
 `CudaSma`/`CudaRsi`/… handles instead of going through the dispatcher.
 
-### This lane cannot be bit-parity, and says so
+### The connected NeoEthos lane is f64 end to end
 
-vector-ta's device layer is **f32-only** — `src/cuda/device_types.rs` contains
-no `f64` at all — while every CPU indicator returns f64. Adoption is therefore
-a measured-divergence decision. Three things make it loud rather than silent:
+The production sweep no longer calls vector-ta's older f32 dispatcher. It uses
+`device_types_f64`, uploads OHLCV once as f64, launches only entries registered
+in `cuda_f64::F64_KERNELS`, and reads f64 output without narrowing. Missing or
+unproven f64 kernels stay explicitly on the CPU; they never fall through to an
+f32 CUDA wrapper. `IndicatorRunSummary::precision` reports
+`"f64 (no narrowing, no fast math)"`, and
+`gpu_cpu_indicator_sweep_parity` measures every connected indicator against
+the scalar f64 reference on real EURUSD M1 fixture data.
 
-* the first GPU-routed frame logs at **WARN** naming the device, both arches,
-  and the precision class;
-* `IndicatorRunSummary::precision` carries `"f32 device vs f64 cpu reference"`
-  into the run summary;
-* `gpu_cpu_indicator_sweep_parity` measures it per indicator against real
-  EURUSD M1 fixture data and prints the numbers.
+The fork still contains upstream public f32 CUDA wrappers and generated
+dispatch code outside the NeoEthos production route. Their presence is not a
+supported precision lane. They remain an explicit deletion/conversion target:
+once each required public consumer has a connected, tested f64 replacement,
+the superseded f32 module, kernel entry points, build calls, flags, examples,
+and documentation are removed together rather than retained as fallback code.
 
 ---
 
-## 4. Verbatim record of the edits outside `crates/neoethos-data/`
-
-Re-apply these if a merge drops them.
+## 4. Connected implementation outside `crates/neoethos-data/`
 
 ### `vendor/vector-ta-0.2.9-patched/build.rs` — multi-arch fatbin
 
-> **SUPERSEDED.** An earlier revision of this document recorded a
-> single-arch-plus-placeholder-cubin design here and said "re-apply if a merge
-> drops it". Do not. Re-applying it would put the arch pin back. What follows
-> is the shape that is actually in the tree.
-
-`fn target_archs(nvcc)` resolves the architecture SET once, in this order:
-
-1. `CUDA_ARCHS` — the list form, e.g. `80,86,89,90` or a narrowing `86`.
-2. `CUDA_ARCH` — the SINGULAR form, which yields `vec![a]`, i.e. a
-   single-architecture fatbin. It emits a `cargo:warning` saying so. Do not use
-   it (see §2).
-3. `DEFAULT_TARGET_ARCHS` = `[80, 86, 89, 90]` — no card named, no probing of
-   the build host.
-
-That set is intersected with `nvcc --list-gpu-arch`, and the surviving set is
-recorded as `VECTOR_TA_CUDA_ARCHS` / `VECTOR_TA_CUDA_PTX_ARCH`, which
+`fn target_archs(nvcc)` consumes only the validated numeric set from
+`vendor/cuda_build_arch.rs`. Every requested architecture must be supported by
+the selected toolkit; otherwise the build fails rather than changing the set.
+The exact set is recorded as `VECTOR_TA_CUDA_ARCHS` /
+`VECTOR_TA_CUDA_PTX_ARCH`, which
 `src/cuda/module_loader.rs` re-exports as `COMPILED_ARCHS` /
 `COMPILED_PTX_ARCH` and quotes verbatim in its load-failure diagnostic.
 
@@ -285,6 +292,14 @@ recorded as `VECTOR_TA_CUDA_ARCHS` / `VECTOR_TA_CUDA_PTX_ARCH`, which
 * one `<stem>.fatbin` with `-gencode=arch=compute_X,code=sm_X` for every arch
   in the set, plus `-gencode=arch=compute_MAX,code=compute_MAX` so a card
   newer than anything we compiled for JITs instead of failing.
+
+Translation units are queued once and scheduled with the inherited Cargo
+jobserver. The build script owns one implicit slot; every additional `nvcc`
+process holds a real Cargo permit for its full lifetime. Each invocation uses
+`--threads=1`, because translation-unit parallelism is already managed at the
+repository level. Non-empty external `NVCC_ARGS` is rejected before work: it
+cannot replace the detected architecture, precision, output, or optimization
+contract after the artifact has claimed different metadata.
 
 Gone entirely: `TARGET_CUBIN_MAJOR/MINOR = 8/9`, `current_context_is_sm89()`,
 the `kernels/ptx/compute_89` prebuilt default, the `_sm89.cubin` filename and

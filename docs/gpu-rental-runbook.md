@@ -40,7 +40,7 @@ nvidia-smi                     # name + total memory. If this fails, stop.
 
 # 2. Build the CLI first — it is the fastest path to a GPU run and needs no
 #    frontend toolchain. Same engine, same features as the app by design.
-cargo build --release -p neoethos-cli --features gpu-nvidia
+./scripts/build-host.sh build --release -p neoethos-cli --features gpu-nvidia
 
 # 3. Prove the lane is live BEFORE starting a long run.
 #    The auto-tuner logs its budgets at discovery start; grep for them.

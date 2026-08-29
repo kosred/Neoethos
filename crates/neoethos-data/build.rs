@@ -1,48 +1,9 @@
-//! Refuses one build configuration, and records nothing.
+//! Enforces the data crate's CUDA precision contract.
 //!
-//! # What this file used to do, and why that was wrong
-//!
-//! It used to resolve a CUDA architecture — `CUDA_ARCHS`, else `CUDA_ARCH`,
-//! else the minimum compute capability reported by `nvidia-smi` — and bake it
-//! into `NEOETHOS_VECTOR_TA_PTX_ARCH` so the runtime preflight could quote it.
-//!
-//! Two things were wrong with that.
-//!
-//! 1. **It was a second source of truth for a number vector-ta already
-//!    exports.** `vendor/vector-ta-0.2.9-patched/build.rs` compiles ONE fatbin
-//!    covering `[80, 86, 89, 90]` plus embedded `compute_90` PTX for forward
-//!    JIT, and records exactly that in `VECTOR_TA_CUDA_ARCHS` /
-//!    `VECTOR_TA_CUDA_PTX_ARCH`, surfaced as
-//!    `vector_ta::cuda::module_loader::{COMPILED_ARCHS, COMPILED_PTX_ARCH}`.
-//!    The number this script computed was a fact about the BUILD HOST, printed
-//!    in the diagnostic that exists to explain an arch mismatch — so a 4090
-//!    build box producing a fully portable binary reported `sm_89` in the
-//!    message meant to explain why an sm_86 card failed. Two independent
-//!    sources for one number is how the two-Settings and two-config-files
-//!    defects started.
-//!
-//! 2. **It made the build depend on the build host having a card.** Resolution
-//!    fell through to `nvidia-smi`, and failure PANICKED — so
-//!    `cargo build -p neoethos-data --features gpu-cuda` could not run in a
-//!    CUDA container, a cross-build, or a CI image with the toolkit and no
-//!    device, even though vector-ta no longer needs to know the host's card at
-//!    all. Worse, the panic's own remedy told the operator to export
-//!    `CUDA_ARCH=sm_86` — which in vector-ta's `target_archs()` takes the
-//!    single-value branch and builds a SINGLE-ARCHITECTURE fatbin that will not
-//!    load on an A100. The error message recreated the exact trap it existed to
-//!    prevent.
-//!
-//! Both are gone. `core::indicator_telemetry::VECTOR_TA_PTX_ARCH` is now a
-//! re-export of vector-ta's own constant, so there is one answer and it
-//! describes the KERNELS rather than the machine that compiled them.
-//!
-//! # What remains
-//!
-//! One refusal: `CUDA_FAST_MATH` must be off for a `gpu-cuda` build. That is
-//! not an arch question and it is not redundant with anything.
-//!
-//! To narrow the fatbin for a faster iteration loop, use the LIST form —
-//! `CUDA_ARCHS=86` — which vector-ta reads directly. Never `CUDA_ARCH=`.
+//! CUDA architecture selection has exactly one repository-wide authority:
+//! `NEOETHOS_CUDA_ARCHS`, validated by `vendor/cuda_build_arch.rs`. This build
+//! script does not resolve, infer, or override architectures. It only rejects
+//! approximate CUDA arithmetic for the indicator pipeline.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

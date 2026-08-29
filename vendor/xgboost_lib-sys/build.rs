@@ -2,9 +2,15 @@ use bindgen;
 use std::env;
 use std::path::{Path, PathBuf};
 
-const GITHUB_URL: &str = "https://github.com/marcomq/rust-xgboost/raw/refs/tags/v3.0.1/xgboost-sys/lib/";
+#[path = "../cuda_build_arch.rs"]
+mod cuda_build_arch;
+
+const GITHUB_URL: &str =
+    "https://github.com/marcomq/rust-xgboost/raw/refs/tags/v3.0.1/xgboost-sys/lib/";
 
 fn main() {
+    println!("cargo:rerun-if-changed=../cuda_build_arch.rs");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_CUDA_ARCHS");
     let target = env::var("TARGET").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
     // VENDORED FIX (2026-08-04, the reason this crate is vendored at all).
@@ -22,7 +28,10 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
         .clang_arg(format!("-I{}", xgb_root.join("include").display()))
-        .clang_arg(format!("-I{}", xgb_root.join("dmlc-core").join("include").display()));
+        .clang_arg(format!(
+            "-I{}",
+            xgb_root.join("dmlc-core").join("include").display()
+        ));
 
     #[cfg(feature = "cuda")]
     let bindings = bindings.clang_arg("-I/usr/local/cuda/include");
@@ -45,7 +54,8 @@ fn main() {
         if let Ok(xgboost_lib_dir) = std::env::var("XGBOOST_LIB_DIR") {
             println!("cargo:rustc-link-search=native={}", xgboost_lib_dir);
         } else {
-            let deps_path = dunce::canonicalize(Path::new(&format!("{}/../../../deps", out_dir))).unwrap();
+            let deps_path =
+                dunce::canonicalize(Path::new(&format!("{}/../../../deps", out_dir))).unwrap();
             let deps_path = deps_path.to_string_lossy();
             println!("cargo:rustc-link-search=native={}", deps_path);
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -56,7 +66,11 @@ fn main() {
                         &format!("{deps_path}/libxgboost.dylib"),
                     )
                     .unwrap();
-                    web_copy(&format!("{path}/libdmlc.a"), &format!("{deps_path}/libdmlc.a")).unwrap();
+                    web_copy(
+                        &format!("{path}/libdmlc.a"),
+                        &format!("{deps_path}/libdmlc.a"),
+                    )
+                    .unwrap();
                 }
             } else if cfg!(target_os = "linux") {
                 let path = if cfg!(target_arch = "aarch64") {
@@ -65,14 +79,30 @@ fn main() {
                     format!("{GITHUB_URL}/linux_amd64")
                 };
                 if !std::fs::exists(format!("{deps_path}/libxgboost.so")).unwrap() {
-                    web_copy(&format!("{path}/libxgboost.so"), &format!("{deps_path}/libxgboost.so")).unwrap();
-                    web_copy(&format!("{path}/libdmlc.a"), &format!("{deps_path}/libdmlc.a")).unwrap();
+                    web_copy(
+                        &format!("{path}/libxgboost.so"),
+                        &format!("{deps_path}/libxgboost.so"),
+                    )
+                    .unwrap();
+                    web_copy(
+                        &format!("{path}/libdmlc.a"),
+                        &format!("{deps_path}/libdmlc.a"),
+                    )
+                    .unwrap();
                 }
             } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
                 let path = format!("{GITHUB_URL}/win_amd64");
                 if !std::fs::exists(format!("{deps_path}/xgboost.dll")).unwrap() {
-                    web_copy(&format!("{path}/xgboost.dll"), &format!("{deps_path}/xgboost.dll")).unwrap();
-                    web_copy(&format!("{path}/xgboost.lib"), &format!("{deps_path}/xgboost.lib")).unwrap();
+                    web_copy(
+                        &format!("{path}/xgboost.dll"),
+                        &format!("{deps_path}/xgboost.dll"),
+                    )
+                    .unwrap();
+                    web_copy(
+                        &format!("{path}/xgboost.lib"),
+                        &format!("{deps_path}/xgboost.lib"),
+                    )
+                    .unwrap();
                 }
             } else {
                 if let Ok(homebrew_path) = std::env::var("HOMEBREW_PREFIX") {
@@ -91,20 +121,32 @@ fn main() {
 
         // CMake
         let mut dst = cmake::Config::new(&xgb_root);
-        let dst = dst.generator("Ninja");
-        let dst = dst.define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
+        dst.generator("Ninja");
+        dst.define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
 
         #[cfg(feature = "cuda")]
-        let mut dst = dst
-            .define("USE_CUDA", "ON")
-            .define("BUILD_WITH_CUDA", "ON")
-            .define("BUILD_WITH_CUDA_CUB", "ON");
+        {
+            dst.define("USE_CUDA", "ON")
+                .define("BUILD_WITH_CUDA", "ON")
+                .define("BUILD_WITH_CUDA_CUB", "ON");
+            let cuda_architectures = cmake_cuda_architectures();
+            println!(
+                "cargo:warning=xgboost_lib-sys: CUDA architectures explicitly limited to {cuda_architectures}"
+            );
+            dst.define("CMAKE_CUDA_ARCHITECTURES", cuda_architectures);
+        }
 
         let dst = dst.build();
 
         println!("cargo:rustc-link-search=native={}", dst.display());
-        println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
-        println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            dst.join("lib").display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            dst.join("lib64").display()
+        );
         println!("cargo:rustc-link-lib=static=dmlc");
     }
 
@@ -128,6 +170,22 @@ fn main() {
         println!("cargo:rustc-link-search={}", "/usr/local/cuda/lib64");
         println!("cargo:rustc-link-lib=static=cudart_static");
     }
+}
+
+#[cfg(all(feature = "local_build", feature = "cuda"))]
+fn cmake_cuda_architectures() -> String {
+    let architectures = cuda_build_arch::required_cuda_arch_numbers();
+    let mut targets = architectures
+        .iter()
+        .map(|architecture| format!("{architecture}-real"))
+        .collect::<Vec<_>>();
+    targets.push(format!(
+        "{}-virtual",
+        architectures
+            .last()
+            .expect("validated CUDA architecture set is non-empty")
+    ));
+    targets.join(";")
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

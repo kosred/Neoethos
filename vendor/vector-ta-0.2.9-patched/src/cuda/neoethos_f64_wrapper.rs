@@ -2081,18 +2081,19 @@ impl F64Kernel {
     /// `true` when the CPU reference this kernel mirrors does not read the
     /// swept `period` at all, so every row of the sweep is byte-identical.
     ///
-    /// This is FAITHFUL, not a defect to be fixed here: `compute_obv_batch`
-    /// (cpu_batch.rs:3897) takes `|_params|`, `compute_tsi_batch`
-    /// (cpu_batch.rs:4708) reads `long_period`/`short_period` only, and
-    /// `vwap`/`medprice`/`wclprice` have no period parameter. The CPU emits
-    /// five identical columns for `[7,21,50,100,200]`, so the kernel must emit
-    /// five identical rows. Reported so telemetry can explain the redundant
-    /// work instead of leaving it to be discovered.
+    /// This is FAITHFUL, not a shortcut: `compute_obv_batch` takes no params,
+    /// while `vwap`/`medprice`/`wclprice` have no period parameter. The CPU
+    /// emits identical columns for those ids, so the kernel must emit identical
+    /// rows and telemetry should explain the redundant work.
+    ///
+    /// TSI is deliberately absent. Although vector-ta names its two parameters
+    /// `long_period`/`short_period`, NeoEthos' period plan scales that coupled
+    /// tuple for every requested anchor. Treating it as invariant was a real
+    /// CPU/GPU warmup and value mismatch.
     pub fn is_period_invariant(self) -> bool {
         matches!(
             self,
-            F64Kernel::Tsi
-                | F64Kernel::Adosc
+            F64Kernel::Adosc
                 // ------------------------------------ closer 5, round 3
                 // Seven of the nine. `Rsmk` reads a parameter literally named
                 // `period` (cpu_batch.rs:16479) and `CorrectedMovingAverage`
@@ -5399,6 +5400,14 @@ mod tests {
             "F64Kernel::ALL has {before} entries. If a variant was added to the enum, add it here \
              too — otherwise entry_points_are_f64_and_unique silently stops covering it."
         );
+    }
+
+    /// NeoEthos scales TSI's coupled 25:13 windows for every sweep anchor.
+    /// Classifying it as invariant makes all GPU rows use 25/13 even when the
+    /// CPU receives 7/4, 21/11, 50/26, and so on.
+    #[test]
+    fn tsi_is_a_period_swept_kernel() {
+        assert!(!F64Kernel::Tsi.is_period_invariant());
     }
 
     /// Each kernel that carries a fixed per-thread ring must state its bound,

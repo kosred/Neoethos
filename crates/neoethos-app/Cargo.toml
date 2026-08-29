@@ -30,8 +30,8 @@ gpu-nvidia = [
     # by NOTHING — `grep -rn "neoethos-data/gpu-cuda"` over the repo returned
     # zero matches, so vector-ta's 329 CUDA indicator kernels have never been in
     # a shipped binary. Adding it here is what actually puts the indicator lane
-    # in the build. Requires nvcc AND `CUDA_ARCH` set to the card's compute
-    # capability (see crates/neoethos-data/Cargo.toml for the arch trap).
+    # in the build. Requires nvcc and the explicit `NEOETHOS_CUDA_ARCHS`
+    # capability set (see crates/neoethos-data/Cargo.toml).
     "neoethos-data/gpu-cuda",
     "neoethos-models/gpu-cuda",
     "neoethos-search/gpu-cuda",

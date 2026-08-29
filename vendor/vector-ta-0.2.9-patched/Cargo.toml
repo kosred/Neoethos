@@ -208,6 +208,9 @@ features = ["html_reports"]
 [dev-dependencies.proptest]
 version = "1.7.0"
 
+[build-dependencies.jobserver]
+version = "0.1.35"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.ctor]
 version = "0.4.2"
 

@@ -1112,10 +1112,9 @@ impl CacheAnalyzer {
     /// Read hardware cache counters (platform-specific implementations)
     #[cfg(target_arch = "x86_64")]
     fn read_cache_counters(&self) -> CacheStats {
-        // Patched: original code called `self.read_perf_counters()` which is
-        // gated on target_os="linux"; on Windows x86_64 the method does not
-        // exist, and writing `self.read_cache_counters()` would infinite-
-        // recurse. Fall back to zero counters like the aarch64 / fallback paths.
+        // The vendored upstream Linux perf helper was only a zero-valued stub
+        // and was unreachable after the portable x86_64 path was repaired.
+        // Keep one truthful implementation instead of retaining dead code.
         CacheStats {
             l1_hits: 0,
             l1_misses: 0,
@@ -1156,22 +1155,6 @@ impl CacheAnalyzer {
             branch_mispredictions: 0,
             tlb_misses: 0,
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_perf_counters(&self) -> Result<CacheStats> {
-        // Linux perf_event_open implementation
-        // This would use the perf_event_open syscall to read hardware counters
-        Ok(CacheStats {
-            l1_hits: 0,
-            l1_misses: 0,
-            l2_hits: 0,
-            l2_misses: 0,
-            l3_hits: 0,
-            l3_misses: 0,
-            branch_mispredictions: 0,
-            tlb_misses: 0,
-        })
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1790,4 +1773,3 @@ pub struct CacheAnalysis {
     pub best_efficiency: f64,
     pub worst_efficiency: f64,
 }
-

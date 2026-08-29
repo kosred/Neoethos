@@ -95,7 +95,9 @@ pub fn set_indicator_compute_policy(
 ) -> Result<(), IndicatorComputePolicy> {
     match POLICY_OVERRIDE.set(policy) {
         Ok(()) => Ok(()),
-        Err(_) => Err(*POLICY_OVERRIDE.get().expect("just failed to set, so it is set")),
+        Err(_) => Err(*POLICY_OVERRIDE
+            .get()
+            .expect("just failed to set, so it is set")),
     }
 }
 
@@ -313,7 +315,16 @@ pub fn compute_classic_ta_columns_sized(
         .map(|&id| {
             let mut out: Vec<(String, Vec<f64>)> = Vec::new();
             let mut ledger = IndicatorLedger::new();
-            dispatch_indicator_outputs(&candles, id, id, &[], n, Kernel::Auto, &mut out, &mut ledger);
+            dispatch_indicator_outputs(
+                &candles,
+                id,
+                id,
+                &[],
+                n,
+                Kernel::Auto,
+                &mut out,
+                &mut ledger,
+            );
             (out, ledger)
         })
         .collect();
@@ -699,26 +710,26 @@ fn dispatch_indicator_outputs(
                     continue;
                 }
                 match flatten_indicator_series(output.series, n) {
-                Ok((values, raw_len)) => {
-                    if raw_len > n {
-                        // The tail was dropped. A discard is a discard even when
-                        // the column survives it.
-                        ledger.dropped(
-                            id,
-                            &name,
-                            DropReason::Truncated,
-                            format!("kernel returned {raw_len} values for {n} bars; head kept"),
-                        );
+                    Ok((values, raw_len)) => {
+                        if raw_len > n {
+                            // The tail was dropped. A discard is a discard even when
+                            // the column survives it.
+                            ledger.dropped(
+                                id,
+                                &name,
+                                DropReason::Truncated,
+                                format!("kernel returned {raw_len} values for {n} bars; head kept"),
+                            );
+                        }
+                        if excluded.is_some() {
+                            // The exclusion table said this id cannot produce. It
+                            // did. That means the table is stale, which is a thing
+                            // to fix, not to shrug at.
+                            ledger.stale_exclusion(id);
+                        }
+                        ledger.produced(id);
+                        out.push((name.clone(), values));
                     }
-                    if excluded.is_some() {
-                        // The exclusion table said this id cannot produce. It
-                        // did. That means the table is stale, which is a thing
-                        // to fix, not to shrug at.
-                        ledger.stale_exclusion(id);
-                    }
-                    ledger.produced(id);
-                    out.push((name.clone(), values));
-                }
                     Err(e) => {
                         discard = Some((DropReason::ShortSeries, e.to_string()));
                     }
@@ -1274,12 +1285,20 @@ const COUPLED_WINDOWS: &[(&str, &[(&str, i64)])] = &[
     // the window that sets the indicator's timescale.
     (
         "macd",
-        &[("slow_period", 26), ("fast_period", 12), ("signal_period", 9)],
+        &[
+            ("slow_period", 26),
+            ("fast_period", 12),
+            ("signal_period", 9),
+        ],
     ),
     // registry.rs PARAM_STOCH: fastk 14, slowk 3, slowd 3. Anchored on fastk.
     (
         "stoch",
-        &[("fastk_period", 14), ("slowk_period", 3), ("slowd_period", 3)],
+        &[
+            ("fastk_period", 14),
+            ("slowk_period", 3),
+            ("slowd_period", 3),
+        ],
     ),
     // registry.rs PARAM_TSI (line 3030): long_period 25, short_period 13. tsi
     // declares NEITHER `period` nor `length`, so it used to fall through to
@@ -1288,10 +1307,7 @@ const COUPLED_WINDOWS: &[(&str, &[(&str, i64)])] = &[
     // [tsi, tsi_7, tsi_21, tsi_50, tsi_100, tsi_200]. Anchored on long_period,
     // the window that sets the timescale, with short_period scaled to keep the
     // 25:13 ratio that IS the indicator.
-    (
-        "tsi",
-        &[("long_period", 25), ("short_period", 13)],
-    ),
+    ("tsi", &[("long_period", 25), ("short_period", 13)]),
 ];
 
 /// Window-parameter keys the sweep knows how to drive directly.
@@ -1355,8 +1371,10 @@ fn unmatched_window_keys(ind_id: &str) -> Vec<&'static str> {
     info.params
         .iter()
         .filter(|p| {
-            matches!(p.kind, vector_ta::indicators::registry::IndicatorParamKind::Int)
-                && (p.key.contains("period") || p.key.contains("length"))
+            matches!(
+                p.kind,
+                vector_ta::indicators::registry::IndicatorParamKind::Int
+            ) && (p.key.contains("period") || p.key.contains("length"))
         })
         .map(|p| p.key)
         .collect()
@@ -1506,7 +1524,9 @@ fn sweep_one_id_ledgered(
 fn cpu_multi_period_all(candles: &Candles, n: usize) -> Vec<(String, Vec<f64>)> {
     let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = MULTI_PERIOD_IDS
         .par_iter()
-        .map(|&ind_id| cpu_multi_period_columns_ledgered(candles, ind_id, &ALT_PERIODS, n, Kernel::Auto))
+        .map(|&ind_id| {
+            cpu_multi_period_columns_ledgered(candles, ind_id, &ALT_PERIODS, n, Kernel::Auto)
+        })
         .collect();
     let mut cols = Vec::new();
     let mut ledger = IndicatorLedger::new();
@@ -1542,8 +1562,8 @@ fn compute_multi_period_columns(
     assert!(
         policy != IndicatorComputePolicy::RequireGpu,
         "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` (and CUDA_ARCH set to the card's \
-         compute capability), or use IndicatorComputePolicy::Auto/Cpu."
+         lane compiled in. Rebuild with `--features gpu-cuda` and an explicit \
+         NEOETHOS_CUDA_ARCHS capability set, or use IndicatorComputePolicy::Auto/Cpu."
     );
 
     let t0 = Instant::now();
@@ -1658,10 +1678,10 @@ fn compute_multi_period_columns(
     // Per-indicator slots, filled in `MULTI_PERIOD_IDS` order so the emitted
     // column order matches the pure-CPU path exactly.
     let mut slots: Vec<Vec<(String, Vec<f64>)>> = vec![Vec::new(); MULTI_PERIOD_IDS.len()];
-    // Tracked explicitly rather than inferred from `slots[i].is_empty()`: on a
-    // frame short enough that every period is skipped by the 1.25x pre-flight
-    // guard, a device sweep legitimately returns ZERO columns, and an
-    // emptiness test would then re-run it on the CPU and mislabel the lane.
+    // Tracked explicitly rather than inferred from `slots[i].is_empty()` so
+    // lane ownership does not depend on emitted values. A frame too short for
+    // every period still receives the canonical all-NaN columns without a
+    // kernel launch and remains device-owned rather than being recomputed.
     let mut device_handled = vec![false; MULTI_PERIOD_IDS.len()];
     let mut gpu_ids: Vec<&'static str> = Vec::new();
     let mut cpu_ids: Vec<(&'static str, IndicatorLane)> = Vec::new();
@@ -1685,7 +1705,10 @@ fn compute_multi_period_columns(
                 // longer cost five launches. Counting columns here would
                 // silently re-inflate this back to the old number and hide the
                 // improvement.
-                if !cols.is_empty() {
+                if ALT_PERIODS
+                    .iter()
+                    .any(|&period| (period as f64) * 1.25 < n as f64)
+                {
                     device_calls += 1;
                 }
                 gpu_time += t0.elapsed();
@@ -1744,7 +1767,12 @@ fn compute_multi_period_columns(
     let t0 = Instant::now();
     let cpu_filled: Vec<(usize, Vec<(String, Vec<f64>)>)> = cpu_pending
         .par_iter()
-        .map(|&(i, id)| (i, cpu_multi_period_columns(candles, id, &ALT_PERIODS, n, Kernel::Auto)))
+        .map(|&(i, id)| {
+            (
+                i,
+                cpu_multi_period_columns(candles, id, &ALT_PERIODS, n, Kernel::Auto),
+            )
+        })
         .collect();
     cpu_time += t0.elapsed();
     for (i, cols) in cpu_filled {
@@ -1851,18 +1879,17 @@ pub fn compute_single_indicator(
     // `output_id: None` fails with "output_id is required for
     // multi-output indicators". Single-output indicators use `None`
     // (the library's default output).
-    let output_ids: Vec<Option<&'static str>> =
-        vector_ta::indicators::registry::list_indicators()
-            .iter()
-            .find(|i| i.id == indicator_id)
-            .map(|info| {
-                if info.outputs.len() <= 1 {
-                    vec![None]
-                } else {
-                    info.outputs.iter().map(|o| Some(o.id)).collect()
-                }
-            })
-            .unwrap_or_else(|| vec![None]);
+    let output_ids: Vec<Option<&'static str>> = vector_ta::indicators::registry::list_indicators()
+        .iter()
+        .find(|i| i.id == indicator_id)
+        .map(|info| {
+            if info.outputs.len() <= 1 {
+                vec![None]
+            } else {
+                info.outputs.iter().map(|o| Some(o.id)).collect()
+            }
+        })
+        .unwrap_or_else(|| vec![None]);
 
     let mut lines = Vec::with_capacity(output_ids.len());
     for out_id in output_ids {
@@ -1909,7 +1936,10 @@ pub fn compute_single_indicator(
 /// Returns `(values, raw_value_count)`. The raw count is handed back so the
 /// caller can LEDGER a truncation instead of performing one silently — this
 /// function used to be the last uncounted discard on the repaired path.
-fn flatten_indicator_series(series: IndicatorSeries, n: usize) -> anyhow::Result<(Vec<f64>, usize)> {
+fn flatten_indicator_series(
+    series: IndicatorSeries,
+    n: usize,
+) -> anyhow::Result<(Vec<f64>, usize)> {
     match series {
         IndicatorSeries::F64(v) => normalize_indicator_len(v, n),
         IndicatorSeries::I32(v) => {
@@ -1956,7 +1986,6 @@ fn normalize_indicator_len(v: Vec<f64>, n: usize) -> anyhow::Result<(Vec<f64>, u
         anyhow::bail!("indicator returned {} values, expected ≥{}", raw, n)
     }
 }
-
 
 #[cfg(test)]
 mod streaming_advance_tests {
@@ -2025,7 +2054,11 @@ mod streaming_advance_tests {
             }
         }
         assert_eq!(cursor, space.len());
-        assert_eq!(seen.len(), space.len(), "every pair must appear exactly once");
+        assert_eq!(
+            seen.len(),
+            space.len(),
+            "every pair must appear exactly once"
+        );
         let unique: HashSet<SweepPair> = seen.iter().copied().collect();
         assert_eq!(unique.len(), space.len(), "no pair may appear twice");
         let space_set: HashSet<SweepPair> = space.iter().copied().collect();
@@ -2110,7 +2143,10 @@ mod streaming_advance_tests {
     fn installing_a_working_set_returns_the_previous_one() {
         let batch = std::sync::Arc::new(extended_sweep_batch(0, 8));
         let previous = install_extended_sweep_working_set(Some(batch.clone()));
-        assert_eq!(current_extended_sweep_working_set().as_deref(), Some(&*batch));
+        assert_eq!(
+            current_extended_sweep_working_set().as_deref(),
+            Some(&*batch)
+        );
         let restored = install_extended_sweep_working_set(previous);
         assert_eq!(restored.as_deref(), Some(&*batch));
         assert!(current_extended_sweep_working_set().is_none());
@@ -2274,7 +2310,12 @@ mod tests {
             compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
         assert!(!cols.is_empty());
         for (name, v) in &cols {
-            assert_eq!(v.len(), n, "column '{name}' is {} values, expected {n}", v.len());
+            assert_eq!(
+                v.len(),
+                n,
+                "column '{name}' is {} values, expected {n}",
+                v.len()
+            );
         }
     }
 
@@ -2294,7 +2335,10 @@ mod tests {
     #[test]
     fn the_column_set_is_independent_of_the_frame_length() {
         let full = crate::test_fixtures::ctrader_sample_ohlcv();
-        assert!(full.len() > 60, "fixture too short to truncate meaningfully");
+        assert!(
+            full.len() > 60,
+            "fixture too short to truncate meaningfully"
+        );
         let short = Ohlcv {
             timestamp: full.timestamp.as_ref().map(|t| t[..60].to_vec()),
             open: full.open[..60].to_vec(),
@@ -2319,7 +2363,10 @@ mod tests {
             names_a.len(),
             names_b.len()
         );
-        assert_eq!(names_a, names_b, "column names/order differ between frame lengths");
+        assert_eq!(
+            names_a, names_b,
+            "column names/order differ between frame lengths"
+        );
         for (name, v) in &b {
             assert_eq!(v.len(), 60, "column '{name}' is not frame length");
         }
@@ -2494,9 +2541,10 @@ mod tests {
             .unwrap_or(false);
 
         // REAL data. 100 bars clears the 7/21/50 periods under the 1.25x
-        // pre-flight guard; 100 and 200 are skipped by BOTH lanes, which is
-        // itself part of what the column-set assertion below checks. The
-        // full-length check is the CLI feature build on the box.
+        // pre-flight guard; 100 and 200 launch on neither lane but remain as
+        // full-length NaN columns on BOTH lanes. That frame-independent schema
+        // is part of the structural assertion below. The full-length check is
+        // the CLI feature build on the box.
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
         let n = ohlcv.len();
         assert!(n >= 64, "fixture too short to sweep anything: {n} bars");
@@ -2586,7 +2634,11 @@ mod tests {
             let mut worst_at = String::new();
 
             for ((name, gcol), (_, ccol)) in gpu.iter().zip(cpu.iter()) {
-                assert_eq!(gcol.len(), ccol.len(), "{name}: length differs between lanes");
+                assert_eq!(
+                    gcol.len(),
+                    ccol.len(),
+                    "{name}: length differs between lanes"
+                );
                 for (j, (&g, &c)) in gcol.iter().zip(ccol.iter()).enumerate() {
                     assert_eq!(
                         g.is_nan(),
@@ -2624,7 +2676,9 @@ mod tests {
             );
         }
 
-        engine.synchronize().expect("synchronize after parity sweep");
+        engine
+            .synchronize()
+            .expect("synchronize after parity sweep");
         eprintln!(
             "parity worst across all indicators: {worst_overall:.4} of budget. \
              0.0 means the two lanes are BIT-IDENTICAL on this frame. That is now a legitimate \
@@ -2635,6 +2689,94 @@ mod tests {
              differs and must be explained before acceptance; do not widen the tolerance to \
              make it pass."
         );
+    }
+
+    /// Regression for the TSI seed-path split that used to exist only at the
+    /// default `(long=25, short=13)` tuple.  The removed CPU implementation and
+    /// the old f64 CUDA kernel returned an all-NaN row when the bar immediately
+    /// after `first_valid` was non-finite, while every non-default CPU tuple
+    /// resumed at the next finite bar.  Exercise every production sweep period
+    /// on a long-enough frame so no row is hidden by the pre-flight skip gate.
+    #[cfg(feature = "gpu-cuda")]
+    #[test]
+    fn gpu_tsi_resumes_after_initial_nonfinite_bar_for_every_swept_period() {
+        use crate::core::gpu_indicators::{GPU_SWEEP_SPECS, GpuIndicatorEngine};
+
+        fn repeated(values: &[f64], len: usize) -> Vec<f64> {
+            values.iter().copied().cycle().take(len).collect()
+        }
+
+        let require_gpu = std::env::var("NEOETHOS_REQUIRE_GPU")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        let base = crate::test_fixtures::ctrader_sample_ohlcv();
+        let n = 320usize;
+        let mut ohlcv = Ohlcv {
+            timestamp: Some((0..n as i64).collect()),
+            open: repeated(&base.open, n),
+            high: repeated(&base.high, n),
+            low: repeated(&base.low, n),
+            close: repeated(&base.close, n),
+            volume: base.volume.as_deref().map(|v| repeated(v, n)),
+        };
+        ohlcv.close[1] = f64::NAN;
+
+        let engine = match GpuIndicatorEngine::new(&ohlcv, 0) {
+            Ok(engine) => engine,
+            Err(error) if !require_gpu => {
+                eprintln!(
+                    "gpu_tsi_resumes_after_initial_nonfinite_bar_for_every_swept_period: \
+                     SKIPPED - no usable CUDA lane: {error:?}"
+                );
+                return;
+            }
+            Err(error) => panic!("required CUDA lane would not open: {error:?}"),
+        };
+
+        let spec = GPU_SWEEP_SPECS
+            .iter()
+            .find(|spec| spec.id == "tsi")
+            .expect("TSI must remain connected to the production f64 CUDA sweep");
+        let gpu = engine
+            .sweep_columns(spec, &ALT_PERIODS)
+            .expect("TSI f64 CUDA sweep");
+        let candles = Candles::new(
+            ohlcv.timestamp.clone().expect("timestamps"),
+            ohlcv.open.clone(),
+            ohlcv.high.clone(),
+            ohlcv.low.clone(),
+            ohlcv.close.clone(),
+            ohlcv.volume.clone().expect("volume"),
+        );
+        let cpu = cpu_multi_period_columns(&candles, "tsi", &ALT_PERIODS, n, Kernel::Scalar);
+
+        assert_eq!(
+            gpu.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            cpu.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+        for ((name, gpu_row), (_, cpu_row)) in gpu.iter().zip(cpu.iter()) {
+            assert!(
+                cpu_row.iter().any(|value| value.is_finite()),
+                "{name}: CPU never recovered after the initial non-finite bar"
+            );
+            for (index, (&gpu_value, &cpu_value)) in gpu_row.iter().zip(cpu_row.iter()).enumerate()
+            {
+                assert_eq!(
+                    gpu_value.is_nan(),
+                    cpu_value.is_nan(),
+                    "{name}[{index}]: CUDA/CPU validity diverged"
+                );
+                if cpu_value.is_nan() {
+                    continue;
+                }
+                let allowed = 1e-12 + 1e-12 * cpu_value.abs();
+                assert!(
+                    (gpu_value - cpu_value).abs() <= allowed,
+                    "{name}[{index}]: CUDA={gpu_value} CPU={cpu_value} exceeds {allowed}"
+                );
+            }
+        }
+        engine.synchronize().expect("synchronize TSI regression");
     }
 
     /// The engine must never hand back a working-looking handle on a device

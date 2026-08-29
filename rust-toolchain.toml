@@ -1,7 +1,5 @@
 # Pinned to the nightly the operator builds with locally (rustc 1.96.0-nightly
-# 2026-04-07). Nightly unlocks `-Zthreads` (parallel rustc frontend) wired in
-# .cargo/config.toml for much faster compiles on many-core machines. Pinning a
-# fixed date keeps the toolchain identical everywhere — local WSL2 + the L40 VPS
-# + CI — so builds are reproducible (no "works on my nightly" drift).
+# 2026-04-07). A fixed date keeps the toolchain identical across local hosts,
+# rented NVIDIA machines, and CI without multiplying Cargo's adaptive job budget.
 [toolchain]
 channel = "nightly-2026-04-07"

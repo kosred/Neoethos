@@ -241,7 +241,7 @@ pub(crate) fn load_module_for_current_context(
                  runs on an OLDER device. If `{device}` is below every architecture listed above, \
                  rebuild with it included — the set is a build input, not a source constant:\n\
                  \n\
-                   CUDA_ARCHS={device_num},80,86,89,90 cargo build -p vector-ta \
+                   NEOETHOS_CUDA_ARCHS={device_num} cargo build -p vector-ta \
                  --features cuda-build-ptx\n\
                  \n\
                  If `{device}` is at or above them, the fatbin should have JIT-ed the embedded \
@@ -257,10 +257,7 @@ pub(crate) fn load_module_for_current_context(
                 } else {
                     " (none embedded for this stem)"
                 },
-                device_num = device
-                    .strip_prefix("sm_")
-                    .unwrap_or(&device)
-                    .to_string(),
+                device_num = device.strip_prefix("sm_").unwrap_or(&device).to_string(),
             );
             record_failure(message);
             Err(ptx_err)

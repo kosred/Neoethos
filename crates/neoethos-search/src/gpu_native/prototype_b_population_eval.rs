@@ -613,7 +613,6 @@ struct ResidentSession {
     /// and unchanged, was pure waste: the bars do not change between
     /// generations, only the genes do. It stays in RAM, ready.
     dataset: PrototypeADatasetUpload,
-    smc_rows: Vec<i8>,
     native_settings: neoethos_gpu_contracts::device::NeoPopulationSettings,
 }
 
@@ -1752,7 +1751,6 @@ fn evaluate_population_b_batch(
             device,
             workspace_scenarios: n_scenarios,
             dataset,
-            smc_rows,
             native_settings,
         }));
     }
