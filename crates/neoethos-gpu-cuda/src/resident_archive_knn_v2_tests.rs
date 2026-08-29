@@ -930,6 +930,7 @@ mod archive_reference {
         pub gene_identity: u64,
         pub population_ordinal: u32,
         pub admitted_generation: u32,
+        pub metric_bits: [u64; METRIC_COUNT],
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,6 +1109,7 @@ mod archive_reference {
                     gene_identity: candidate.gene_identity,
                     population_ordinal: candidate.population_ordinal,
                     admitted_generation: generation,
+                    metric_bits: candidate.metrics.map(f64::to_bits),
                 });
                 consumed_slots += 1;
             }
@@ -1244,6 +1246,17 @@ fn archive_record_keys(records: &[ArchiveRecord]) -> Vec<(ExactGene, u64, u32, u
             )
         })
         .collect()
+}
+
+fn archive_metric_bits(record: &ArchiveRecord) -> [u64; METRIC_COUNT] {
+    record.metric_bits
+}
+
+fn expected_archive_metric_bits(net_bits: u64, trade_count_bits: u64) -> [u64; METRIC_COUNT] {
+    let mut metric_bits = [0x3ff0_0000_0000_0000_u64; METRIC_COUNT];
+    metric_bits[NET_METRIC_SLOT] = net_bits;
+    metric_bits[TRADE_COUNT_METRIC_SLOT] = trade_count_bits;
+    metric_bits
 }
 
 fn assert_stage_receipt(
@@ -1560,7 +1573,24 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
             (ExactGene([20, 200]), 20, 2, 0),
         ],
     );
+    assert_eq!(generation_zero.records[0].exact_gene, ExactGene([10, 100]));
+    assert_eq!(
+        archive_metric_bits(&generation_zero.records[0]),
+        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    );
+    assert_ne!(
+        archive_metric_bits(&generation_zero.records[0]),
+        expected_archive_metric_bits(0x4010_0000_0000_0000, 0x401c_0000_0000_0000)
+    );
     archive.combined_commit(0).unwrap();
+    assert_eq!(
+        archive.committed_records()[0].exact_gene,
+        ExactGene([10, 100])
+    );
+    assert_eq!(
+        archive_metric_bits(&archive.committed_records()[0]),
+        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    );
 
     let committed_duplicate = archive_candidate([10, 100], 1, 0, 100.0, 99.0, 11.0);
     let first_new_unique = archive_candidate([30, 300], 30, 5, 90.0, 2.0, 2.0);
@@ -1578,6 +1608,15 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
         4,
         &[(ExactGene([30, 300]), 30, 5, 1)],
     );
+    assert_eq!(generation_one.records[0].exact_gene, ExactGene([30, 300]));
+    assert_eq!(
+        archive_metric_bits(&generation_one.records[0]),
+        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    );
+    assert_ne!(
+        archive_metric_bits(&generation_one.records[0]),
+        expected_archive_metric_bits(0x401c_0000_0000_0000, 0x4020_0000_0000_0000)
+    );
     archive.combined_commit(1).unwrap();
 
     assert_eq!(
@@ -1589,6 +1628,30 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
             (ExactGene([30, 300]), 30, 5, 1),
         ]
     );
+    assert_eq!(
+        archive.committed_records()[0].exact_gene,
+        ExactGene([10, 100])
+    );
+    assert_eq!(
+        archive_metric_bits(&archive.committed_records()[0]),
+        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    );
+    assert_ne!(
+        archive_metric_bits(&archive.committed_records()[0]),
+        expected_archive_metric_bits(0x4058_c000_0000_0000, 0x4026_0000_0000_0000)
+    );
+    assert_eq!(
+        archive.committed_records()[3].exact_gene,
+        ExactGene([30, 300])
+    );
+    assert_eq!(
+        archive_metric_bits(&archive.committed_records()[3]),
+        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    );
+    assert_ne!(
+        archive_metric_bits(&archive.committed_records()[3]),
+        expected_archive_metric_bits(0x401c_0000_0000_0000, 0x4020_0000_0000_0000)
+    );
 }
 
 #[test]
@@ -1599,6 +1662,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 100_000 + ordinal,
             population_ordinal: (ordinal % 200) as u32,
             admitted_generation: (ordinal / 200) as u32,
+            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1608,6 +1672,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 100_000,
             population_ordinal: 0,
             admitted_generation: 0,
+            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
         })
     );
     assert_eq!(
@@ -1617,6 +1682,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 149_998,
             population_ordinal: 198,
             admitted_generation: 249,
+            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
         })
     );
     let mut archive =
@@ -1659,6 +1725,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 200,
             population_ordinal: 2,
             admitted_generation: 250,
+            metric_bits: expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000,),
         })
     );
     let full_archive = archive.committed_records().to_vec();
