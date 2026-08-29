@@ -3,16 +3,18 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 7
+Version: 8
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
 
-Version 7 supersedes the version-6 design at commit
-`4f0880148677df0d8f58c11373b42d0bd87e5b13`. The version-2 through version-6
-manifests remain immutable historical receipts; the version-7 manifest alone
-binds this corrected document and its R6 implementation plan.
+Version 8 supersedes the version-7 design at commit
+`492c3eaa61c0709e381c2359c2b249558118d4b6`. The version-2 through version-7
+manifests remain immutable historical receipts; the version-8 manifest alone
+binds this corrected document and its R6 implementation plan. The prerequisite
+test-only cfg correction at `4837ff9b06dd6df8d276ba83aed8fa3ed3e52feb`
+does not change this design authority or authorize production implementation.
 
 ## Outcome and boundary
 
@@ -70,7 +72,7 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated through version 7
+## Review corrections incorporated through version 8
 
 | Finding | Versioned decision |
 | --- | --- |
@@ -105,6 +107,12 @@ headless `DiscoveryResult` remain later gates.
 | A host-only copy could drift from the future production validator | Version 7 places DTOs, facade, move-only owner, pending seam and later validator in one private shared `resident_search_slice2_admission_v2` module. Host tests and future CUDA production use that same authority; no mirror is permitted. |
 | The v6 plan put test declarations inside the CUDA-gated production module | Version 7 keeps `resident_search_v2.rs` CUDA-gated and unchanged in R6 RED. The shared module owns the seam and registers its child tests only under the host-contract test feature. |
 | An empty feature could later acquire hidden CUDA edges | Version 7 adds Cargo-metadata, build-log, default/CUDA preservation and dual-feature cfg ratchets. Actual all-features compilation remains a later CUDA-toolchain gate rather than a false local claim. |
+| The R6 generation fixture mixed incompatible population sizes and invented a retained workspace | Version 8 derives every deterministic generation component from `P=200`, `M=16` and the current native layout formulas. Only the host-contract CUB scratch value is opaque; the CUDA implementation must use the real runtime query. |
+| Caller totals could be trusted without recomputation | Version 8 adds typed subtotal/receipt mismatch axes, checked-add overflow axes and same-components/one-total-only plus overflow-precedence negatives for the replacement, generation and scoring/archive totals. |
+| Reserve identities could self-report, alias or detach bytes from their source receipts | Version 8 separates observed authorities from an opaque, by-value trusted capability with private fields, independently trusted expected bytes/calibration/provenance and no raw constructor. It binds all five byte facts to the full CUDA/run/workspace tuple and adds the coarse four-way alias, all six one-pair-only aliases, and coordinated byte/binding/plain-value negatives. |
+| The allocation recorder trusted a declared symbol and did not order native create | Version 8 derives the symbol and method count from the invoked facade method and records native create plus allocations in one phase-bearing chronology. Wrong-method and allocate-before-create implementations cannot reproduce the expected trace. |
+| Identity mutations exercised only one low bit and UUID byte zero | Version 8 requires low- and high-bit controls for every `u64` identity and both byte zero and the tail byte for every UUID equality boundary. |
+| The verbose host proof contained cap-linted dependency warnings | Version 8 calls only the `neoethos-gpu-cuda` crate warning-clean under `-Dwarnings`; it preserves and reports all dependency warning lines instead of claiming a globally warning-free log. |
 
 ## Current source constraints
 
@@ -133,7 +141,7 @@ function. There is no valid insertion seam between rank and rotation. Slice 2
 therefore versions this orchestration rather than inserting an archive side
 effect around the existing function.
 
-### Version 7 local host-toolchain evidence
+### Version 8 local host-toolchain evidence
 
 The v6 focused command selected `--features cuda`. On the current Windows host
 it stopped during the `cust_raw`/`find_cuda_helper` build with the exact terminal
@@ -534,6 +542,41 @@ added once by the native V2 layout query. The query returns every aligned
 component and the final total; Rust recomputes and compares each field before
 the first full Search allocation.
 
+The R6 host contract uses one deterministic generation receipt derived from the
+current `checked_physical_layout_v1` formulas at `P=200`, `M=16` and 256-byte
+device alignment:
+
+| Generation component | Host-contract bytes |
+| --- | ---: |
+| logical gene scalars | `14_592` |
+| logical gene indices | `25_600` |
+| logical gene weights | `25_600` |
+| offspring store | `65_792` |
+| metric rows | `20_992` |
+| rank keys | `8_192` |
+| selection state | `5_120` |
+| dedup hashes/control/seal | `9_472` |
+| CUB scratch | `65_536` |
+| retained evaluation coverage | `256` |
+| terminal device receipt | `256` |
+| checked host-contract total | `241_408` |
+
+The `65_536` CUB value is an opaque, deterministic host-contract fixture value,
+not a claim about a particular CUDA/CUB query. All other rows are fixed by the
+current formulas and ABI sizes. The later CUDA implementation must substitute
+the actual same-stream runtime-query result, recompute the checked total and
+bind the exact returned receipt; it may not require the device query to equal
+the host fixture. The scoring/archive host fixture analogously uses fitness
+`1_792`, decision keys `1_792`, opaque CUB scratch `65_536` and the exact
+`23_707_648` replacement subtotal, for checked total `23_776_768`.
+
+For each of the replacement subtotal, generation total and scoring/archive
+total, validation first recomputes the component sum with `checked_add`. An
+overflow returns its typed arithmetic error before any declared-total mismatch.
+Only a successful sum is compared with the declared total. Each relation has a
+negative that leaves every component byte-for-byte unchanged and changes only
+the declared total, plus a separate overflow-precedence negative.
+
 ### Exact combined-admission physical allocation ledger
 
 R6 freezes exactly three physical allocation calls, in this order:
@@ -548,8 +591,10 @@ R6 freezes exactly three physical allocation calls, in this order:
 the unchanged fitness-score, decision-key and CUB-scratch components exactly
 once and all twelve aligned Slice 2 rows in the table above exactly once. There
 is no fourth physical allocation and specifically no standalone archive arena.
-The generation receipt total and scoring/archive receipt total are exact
-runtime-query facts, not estimates or independently rounded copies.
+On CUDA, the generation receipt total and scoring/archive receipt total are
+exact runtime-query facts, not estimates or independently rounded copies. In
+the host RED they are the checked deterministic fixture totals above; only the
+two explicitly labelled CUB inputs are opaque test values.
 
 The legacy phrase "missing/zero archive arena" retained in the R6 test and error
 names means a missing or zero logical archive subreceipt inside this one
@@ -562,8 +607,32 @@ call as an allocator call.
 
 ### Exact reserve and workspace authority
 
-The combined admission carries four distinct checked byte authorities; none is
-an alias for another:
+The combined admission carries five observed byte facts and consumes a
+separately typed, opaque `ResidentSearchSlice2TrustedReserveSealV2` by value. An
+observed authority never carries its own expected value. The seal privately
+owns the trusted reserve set, expected calibration, common binding tuple and
+full-workspace/post-trim provenance. No ordinary crate caller can construct,
+clone, copy or default this capability from raw values.
+
+The R6 host fixture uses these canonical reserve bytes, with no hidden slack:
+
+| Canonical fact | Bytes |
+| --- | ---: |
+| requested device sum | `24_018_176` |
+| allocator-context headroom | `8_388_608` |
+| retained pre-Search workspace | `67_108_864` |
+| remaining Search allocation after trim | `24_018_176` |
+| full-workspace authority | `91_127_040` |
+| same-context free | `32_406_784` |
+
+Thus retained plus remaining equals full workspace, and both independent device
+budgets are exact fits in the canonical positive fixture.
+
+The canonical authority identities are headroom `0x3101`, full workspace
+`0x3202`, retained `0x3303`, remaining `0x3404` and same-context free `0x3505`.
+`PAIR_ALIAS_IDENTITY_V2 = 0xA11A_5E00_0000_0001` is distinct from all five.
+The original four reserve/workspace authority identities are pairwise distinct;
+none is an alias for another:
 
 - `allocator_context_headroom_bytes`: bytes intentionally left free in the
   same CUDA context for allocator/runtime operation;
@@ -572,6 +641,99 @@ an alias for another:
   evaluator, population and trim owners when the Search allocation epoch opens;
 - `remaining_search_allocation_bytes_after_trim`: the exact device budget left
   for the two Search device arenas after trim.
+
+The fifth fact is `same_context_free_bytes`, obtained from the same admitted
+primary CUDA context. It also has independently trusted expected bytes and the
+same complete binding, but it is not counted as one of the four sealed
+reserve/workspace receipt identities in the pairwise-distinct control.
+
+Every observed authority binds exactly this tuple:
+
+```text
+device_uuid[16]
+primary_context_identity: u64
+search_stream_identity: u64
+active_pool_identity: u64
+run_identity: u64
+full_workspace_receipt_identity: u64
+post_trim_receipt_identity: u64
+authority_identity: u64
+```
+
+The opaque seal owns the expected bytes and expected tuple. The eventual CUDA
+minter is deferred beyond R6 and must consume the actual opaque calibration,
+full-workspace and post-trim authorities; it may not accept raw bytes, raw
+bindings or the observed request. The seal is a separate by-value admission
+argument, not nested expected fields that the request can self-report. Every
+single-authority or single-binding-axis negative requires its own exact typed
+error but makes no mutual precedence claim against the other single-axis cases.
+Only these simultaneous-mismatch boundaries are frozen: `AllocatorContextHeadroom`
+wins over the other authorities in the plain-graph control;
+`FullWorkspaceAuthority` wins over `RetainedPreSearchWorkspace` in the
+workspace-shift control; headroom bytes win over a headroom binding mismatch in
+the plain-graph control; and headroom `DeviceUuid` wins over the other headroom
+binding axes in the all-binding control.
+
+The all-alias negative sets the four observed and trusted authority identities
+to the same nonzero value so pairwise observed/expected equality alone would
+pass; it must fail the typed distinctness relation. To make that negative
+reachable without weakening the capability, the cfg-gated descendant test
+first inspects a pristine newly minted seal, then directly mutates exactly the
+four private trusted
+`expected_binding.authority_identity` fields and the four observed counterparts
+to one common nonzero value. It changes no other field. Descendant privacy makes
+this test-only fault injection legal; production siblings cannot do it, and no
+second constructor or raw accessor is added.
+
+Six additional pair-only controls cover every unordered pair among headroom
+(`H`), full workspace (`F`), retained (`R`) and remaining (`Rem`): `HF`, `HR`,
+`HRem`, `FR`, `FRem`, `RRem`. For each control the descendant first inspects a
+pristine seal, then changes only that pair's trusted and observed
+`authority_identity` fields to `PAIR_ALIAS_IDENTITY_V2 =
+0xA11A_5E00_0000_0001`. The other two identities stay distinct and canonical.
+Every case requires `FourReserveAuthorityIdentitiesDistinct`; a validator that
+checks only one inequality or omits one member of the uniqueness set fails.
+
+Coordinated negatives preserve the old equations while changing authority:
+
+- retained and full-workspace observed bytes both move by one;
+- allocator headroom and same-context-free observed bytes both move by one;
+- every observed authority receives the same foreign-but-internally-consistent
+  binding tuple while the independently trusted tuple stays unchanged;
+- every observed authority and a child-local graph of plain expected-looking
+  bytes/bindings move together, while the zero-argument minter still produces
+  the unchanged opaque seal.
+
+The first case must report `ReserveAuthorityBytesMismatch` for
+`FullWorkspaceAuthority` because `AllocatorContextHeadroom` remains unchanged
+and full workspace precedes retained. The second must report the same error for
+`AllocatorContextHeadroom`. The third must report
+`ReserveAuthorityBindingMismatch` for `AllocatorContextHeadroom` and
+`DeviceUuid`. The fourth must report `ReserveAuthorityBytesMismatch` for
+`AllocatorContextHeadroom`; the plain value graph is not a capability and is
+never accepted by admission or the minter. All fail before native create. No
+validator may infer authority merely because the arithmetic remains
+self-consistent.
+
+Relation, checked-arithmetic and budget fixtures that alter authority bytes
+first inspect the pristine seal, then use descendant-only private-field access
+to update exactly these affected trusted expected bytes in lockstep with the
+observed values:
+
+- partition mismatch: full workspace becomes `91_127_041`;
+- `WorkspacePartitionAdd`: retained and remaining both become `u64::MAX`;
+- `SameContextFreeMinusHeadroom`: same-context free becomes `0` and headroom
+  becomes `1`;
+- remaining-budget one-byte-short: remaining becomes `24_018_175` and full
+  workspace becomes `91_127_039`;
+- same-context-budget one-byte-short: same-context free becomes `32_406_783`.
+
+`RequestedDeviceSumAdd` changes only generation/scoring receipt components and
+needs no seal mutation. Canonical exact fit uses the untouched constants above.
+Every case inspects the pristine seal before descendant mutation. This makes
+authority equality pass so the intended relation/arithmetic/budget error is
+reachable. No binding/provenance field, constructor or accessor changes for
+this fault injection.
 
 Before native create or any allocator call, checked arithmetic must prove:
 
@@ -590,33 +752,40 @@ requested_device_sum
 ```
 
 Every addition and subtraction above is checked; wrapping and saturating
-arithmetic are forbidden. The four byte fields and their authority identities
-must bind the same device UUID, primary context, stream, active pool, run,
-full-workspace receipt and post-trim receipt. Exact fit on both inequalities is
-GREEN. A budget that is one byte short on either independent inequality returns
-the corresponding typed refusal before native create. The 104-byte host receipt
-is governed by the host allocation ledger and is not added to
+arithmetic are forbidden. Exact fit on both inequalities is GREEN. A budget
+that is one byte short on either independent inequality returns the
+corresponding typed refusal before native create. The 104-byte host receipt is
+governed by the host allocation ledger and is not added to
 `requested_device_sum`.
 
 ### R6 independent admission recorder
 
-The R6 test facade sits on the actual Rust combined-admission path. The valid
-path invokes the native-create facade once, and that facade records the arguments
-of each actual allocator invocation as it occurs. The recorder does not accept
-the declared ledger, cannot copy a receipt into observed state and cannot be
-backfilled after the fact. Its record contains exact length/order plus symbol,
-category, requested bytes, aligned bytes, alignment, flags, stream and pool.
-Its state is private to the test implementation and has no append/setter API;
-the admission seam can affect it only by invoking the facade's native-create,
-host-allocation and async-device-allocation methods with the actual arguments.
+The R6 test facade sits on the actual Rust combined-admission path. Host and
+async allocation methods accept method-specific argument DTOs that contain no
+symbol field. The recorder derives `CudaHostAlloc` from `cuda_host_alloc` and
+`CudaMallocAsync` from `cuda_malloc_async`, counts those method invocations
+separately and constructs the observed allocation row itself. Calling the wrong
+method therefore cannot be hidden by passing a name that claims the other API.
+
+The recorder owns one ordered chronology. Its first expected event is
+`NativeCreate`, followed by the three derived allocation events. Each allocation
+event records the phase at call time; the only accepted phase is
+`NativeCreateBegun`, and the third allocation advances to
+`AllocationsComplete`. Thus three allocations followed by native create cannot
+match the expected trace even if the final counters and allocation rows look
+plausible. The recorder does not accept the declared ledger, cannot copy a
+receipt into observed state and cannot be backfilled after the fact. Its state
+is private to the test implementation and has no append/setter API.
 
 Every negative calls the real Rust admission API once, but validation completes
-before native create: native-create count, physical allocator count, generation
-arena count, scoring/archive arena count and forbidden archive-only arena count
-all remain zero, and the observed ledger is empty. The valid case requires one
-native-create call and the exact three entries above. After that admission it
-queues three generations and proves the complete ledger and every allocation
-counter remain byte-for-byte unchanged.
+before native create: native-create, host-method, async-method, physical
+allocator, generation-arena, scoring/archive-arena and forbidden archive-only
+counts all remain zero, and both chronology and observed allocation ledger are
+empty. The valid case requires chronology length `4`, with native create first,
+then host-method count `1`, async-method count `2` and the exact three entries
+above. After that admission it queues three generations and proves the phase,
+chronology, complete ledger and every allocation counter remain byte-for-byte
+unchanged.
 
 ## Calibration and deadline claims
 
@@ -927,11 +1096,17 @@ R1-R5 test or dependency feature may change. This remains a pure host contract
 and makes no CUDA hardware claim.
 
 Because the RED seam returns `ImplementationPending` before any facade call,
-the five-test child references the concrete recorder's three trait method items
-inside its already-called mutation-register assertion. Those method items are
-never invoked, so native-create and allocator counters remain zero. This is the
-only host/all-features warning-clean mechanism for the otherwise-unused trait
-methods; a broad `dead_code` allowance on either unit-test branch is forbidden.
+the fifth test uses exactly five separate control recorders before opening a
+fresh empty recorder for the real admission call: async `TerminalHostReceipt`,
+host `GenerationArena`, host `ScoringArchiveArena`, direct
+`begin_native_create`, and one allocation before native create. The first three
+prove all category-specific symbols and method counts are derived from the
+invoked facade method; the fourth proves the exact single `NativeCreate` event
+and `NativeCreateBegun` transition; the fifth proves pre-create phase evidence.
+The RED seam itself therefore leaves native-create and allocator counters zero.
+This makes the trait methods crate-warning-clean and non-vacuously proves
+method-derived evidence; a broad `dead_code` allowance on either unit-test
+branch is forbidden.
 
 The shared R6 and future-production error authority is
 `ResidentSearchSlice2AdmissionErrorV2`, with these exact discriminants and
@@ -946,8 +1121,25 @@ AlignedLayoutFieldMismatch {
     expected_aligned_bytes: u64,
     observed_aligned_bytes: u64,
 }
-ReserveAuthorityMismatch {
-    axis: ResidentSearchSlice2ReserveAuthorityAxisV2,
+ReceiptArithmeticOverflow {
+    operation: ResidentSearchSlice2ReceiptArithmeticV2,
+}
+ReceiptTotalMismatch {
+    axis: ResidentSearchSlice2ReceiptTotalAxisV2,
+    expected_total_bytes: u64,
+    observed_total_bytes: u64,
+}
+ReserveAuthorityBytesMismatch {
+    authority: ResidentSearchSlice2ReserveAuthorityKindV2,
+    expected_bytes: u64,
+    observed_bytes: u64,
+}
+ReserveAuthorityBindingMismatch {
+    authority: ResidentSearchSlice2ReserveAuthorityKindV2,
+    axis: ResidentSearchSlice2AuthorityBindingAxisV2,
+}
+ReserveAuthorityRelationMismatch {
+    relation: ResidentSearchSlice2ReserveRelationV2,
 }
 ReserveArithmeticOverflow {
     operation: ResidentSearchSlice2ReserveArithmeticV2,
@@ -968,12 +1160,22 @@ ForeignCalibration {
 `CurrentPopulationSignatures`, `NoveltyScores`, `ExactTopKKeys`,
 `AdmissionFlags`, `AdmissionOffsets` and `ArchiveControlAndSeal`.
 
-`ResidentSearchSlice2ReserveAuthorityAxisV2` has the exact axes
-`AllocatorContextHeadroomIdentity`, `FullWorkspaceAuthorityIdentity`,
-`RetainedPreSearchWorkspaceIdentity`,
-`RemainingSearchAllocationAfterTrimIdentity` and
-`RetainedPlusRemainingEqualsFullWorkspace`. The arithmetic operation enum has
-`WorkspacePartitionAdd`, `RequestedDeviceSumAdd` and
+`ResidentSearchSlice2ReceiptTotalAxisV2` has exactly
+`ReplacementSubtotal`, `GenerationReceiptTotal` and
+`ScoringArchiveReceiptTotal`. `ResidentSearchSlice2ReceiptArithmeticV2` has the
+parallel `ReplacementSubtotalAdd`, `GenerationReceiptTotalAdd` and
+`ScoringArchiveReceiptTotalAdd` operations.
+
+`ResidentSearchSlice2ReserveAuthorityKindV2` has exactly
+`AllocatorContextHeadroom`, `FullWorkspaceAuthority`,
+`RetainedPreSearchWorkspace`, `RemainingSearchAllocationAfterTrim` and
+`SameContextFree`. `ResidentSearchSlice2AuthorityBindingAxisV2` has exactly
+`DeviceUuid`, `PrimaryContext`, `SearchStream`, `ActivePool`, `RunIdentity`,
+`FullWorkspaceReceiptIdentity`, `PostTrimReceiptIdentity` and
+`AuthorityIdentity`. `ResidentSearchSlice2ReserveRelationV2` has exactly
+`FourReserveAuthorityIdentitiesDistinct` and
+`RetainedPlusRemainingEqualsFullWorkspace`. The reserve arithmetic operation
+enum retains `WorkspacePartitionAdd`, `RequestedDeviceSumAdd` and
 `SameContextFreeMinusHeadroom`. The insufficient-budget axes are
 `RemainingSearchAllocationAfterTrim` and
 `SameContextFreeAfterAllocatorHeadroom`.
@@ -981,8 +1183,176 @@ ForeignCalibration {
 `ResidentSearchSlice2CalibrationAxisV2` has the independent axes `DeviceUuid`,
 `PrimaryContext`, `SearchStream`, `ActivePool`, `CudaBuildIdentity`,
 `KernelSemanticsIdentity`, `Binary64MathIdentity`, `PlanIdentity` and
-`RunIdentity`. Each foreign case starts from the otherwise-valid calibration
-receipt and changes exactly one axis.
+`RunIdentity`.
+
+The exact reserve DTO and capability split is:
+
+```rust
+pub(crate) struct ResidentSearchSlice2AuthorityBindingV2 {
+    pub(crate) device_uuid: [u8; 16],
+    pub(crate) primary_context_identity: u64,
+    pub(crate) search_stream_identity: u64,
+    pub(crate) active_pool_identity: u64,
+    pub(crate) run_identity: u64,
+    pub(crate) full_workspace_receipt_identity: u64,
+    pub(crate) post_trim_receipt_identity: u64,
+    pub(crate) authority_identity: u64,
+}
+
+pub(crate) struct ResidentSearchSlice2ObservedReserveAuthorityV2 {
+    pub(crate) bytes: u64,
+    pub(crate) binding: ResidentSearchSlice2AuthorityBindingV2,
+}
+
+pub(crate) struct ResidentSearchSlice2ObservedReserveSetV2 {
+    pub(crate) allocator_context_headroom: ResidentSearchSlice2ObservedReserveAuthorityV2,
+    pub(crate) full_workspace_authority: ResidentSearchSlice2ObservedReserveAuthorityV2,
+    pub(crate) retained_pre_search_workspace: ResidentSearchSlice2ObservedReserveAuthorityV2,
+    pub(crate) remaining_search_allocation_after_trim: ResidentSearchSlice2ObservedReserveAuthorityV2,
+    pub(crate) same_context_free: ResidentSearchSlice2ObservedReserveAuthorityV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentSearchSlice2CalibrationBindingV2 {
+    pub(crate) device_uuid: [u8; 16],
+    pub(crate) primary_context_identity: u64,
+    pub(crate) search_stream_identity: u64,
+    pub(crate) active_pool_identity: u64,
+    pub(crate) cuda_build_identity: u64,
+    pub(crate) kernel_semantics_identity: u64,
+    pub(crate) binary64_math_identity: u64,
+    pub(crate) plan_identity: u64,
+    pub(crate) run_identity: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResidentSearchSlice2TrustedReserveAuthorityV2 {
+    expected_bytes: u64,
+    expected_binding: ResidentSearchSlice2AuthorityBindingV2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResidentSearchSlice2TrustedReserveSetV2 {
+    allocator_context_headroom: ResidentSearchSlice2TrustedReserveAuthorityV2,
+    full_workspace_authority: ResidentSearchSlice2TrustedReserveAuthorityV2,
+    retained_pre_search_workspace: ResidentSearchSlice2TrustedReserveAuthorityV2,
+    remaining_search_allocation_after_trim: ResidentSearchSlice2TrustedReserveAuthorityV2,
+    same_context_free: ResidentSearchSlice2TrustedReserveAuthorityV2,
+}
+
+pub(crate) struct ResidentSearchSlice2TrustedReserveSealV2 {
+    trusted_reserve: ResidentSearchSlice2TrustedReserveSetV2,
+    expected_calibration: ResidentSearchSlice2CalibrationBindingV2,
+    sealed_full_workspace_receipt_identity: u64,
+    sealed_post_trim_receipt_identity: u64,
+}
+```
+
+`ResidentSearchSlice2AdmissionRequestV2` contains only the observed reserve set
+and observed `calibration`; remove `expected_calibration`, every
+`expected_identity` field and bare `same_context_free_bytes`. Admission consumes
+`ResidentSearchSlice2TrustedReserveSealV2` by value. The trusted authority, set
+and seal fields are private; none implements `Clone`, `Copy` or `Default`; there
+is no raw constructor, mutable accessor or accessor returning the inner set.
+
+The only R6 minter is the zero-argument
+`mint_r6_trusted_reserve_seal_for_fixture_v2()` inside the descendant test
+module already gated by
+`#[cfg(all(test, feature = "resident-search-slice2-host-contract"))]`. It derives
+the exact expected bytes/calibration/provenance from independent fixture
+constants and never accepts or reads a request. Static source/topology ratchets
+freeze the private field spellings, by-value admission signature, absence of
+the three forbidden derives and production/raw constructors, the minter's
+zero-argument signature and its sole construction site. This is R6 internal
+constructor opacity, not an R7 public-opacity claim.
+
+Before moving each newly minted seal into admission, the child-only
+`assert_r6_trusted_reserve_seal_fixture_v2(&seal)` inspects and asserts every
+private expected byte, all eight fields of every expected authority binding,
+all nine expected-calibration fields and both sealed provenance fields against
+independent constants. This keeps the warning-clean host-contract branch
+non-vacuous without adding a production accessor. The topology ratchet requires
+that inspector and forbids any shared-source/raw inspector.
+
+Every expected authority binding inside the seal shares the seal's calibration
+UUID/context/stream/pool/run tuple and its sealed full-workspace/post-trim
+receipt identities. The deferred CUDA minter must establish that invariant by
+consuming the real opaque authorities. A foreign observed set plus coordinated
+plain expected-looking values cannot be converted to the seal and must still
+fail against the independently minted capability.
+
+Each foreign calibration case starts from the otherwise-valid receipt. Every
+`u64` calibration axis is exercised twice, once with bit `0` changed and once
+with bit `63` changed. `DeviceUuid` is exercised at byte `0` and byte `15`.
+The same low/high and byte-zero/tail controls apply to every corresponding field
+in each observed reserve binding before the independently trusted comparison.
+
+The facade accepts method-specific arguments without a caller-declared symbol:
+
+```rust
+pub(crate) struct ResidentSearchSlice2HostAllocationArgsV2 {
+    pub(crate) ordinal: u8,
+    pub(crate) category: ResidentSearchSlice2AllocationCategoryV2,
+    pub(crate) requested_bytes: u64,
+    pub(crate) aligned_bytes: u64,
+    pub(crate) alignment_bytes: u64,
+    pub(crate) flags: u32,
+}
+
+pub(crate) struct ResidentSearchSlice2AsyncAllocationArgsV2 {
+    pub(crate) ordinal: u8,
+    pub(crate) category: ResidentSearchSlice2AllocationCategoryV2,
+    pub(crate) requested_bytes: u64,
+    pub(crate) aligned_bytes: u64,
+    pub(crate) alignment_bytes: u64,
+    pub(crate) flags: u32,
+    pub(crate) stream_identity: u64,
+    pub(crate) pool_identity: u64,
+}
+
+pub(crate) trait ResidentSearchSlice2AllocationFacadeV2 {
+    fn begin_native_create(&mut self);
+    fn cuda_host_alloc(&mut self, actual: ResidentSearchSlice2HostAllocationArgsV2);
+    fn cuda_malloc_async(&mut self, actual: ResidentSearchSlice2AsyncAllocationArgsV2);
+}
+```
+
+The child recorder derives the symbol from the method and records these exact
+test-owned chronology authorities:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ResidentSearchSlice2RecorderPhaseV2 {
+    #[default]
+    BeforeNativeCreate,
+    NativeCreateBegun,
+    AllocationsComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentSearchSlice2RecorderEventV2 {
+    NativeCreate {
+        phase_before: ResidentSearchSlice2RecorderPhaseV2,
+    },
+    Allocation {
+        phase_at_call: ResidentSearchSlice2RecorderPhaseV2,
+        call: ResidentSearchSlice2AllocationCallV2,
+    },
+}
+```
+
+The exact valid chronology is `NativeCreate`, host allocation ordinal `0`,
+async allocation ordinal `1`, async allocation ordinal `2`; its method counts
+are `1/2`. Exactly five direct recorder controls inside the fifth existing test
+prove: a terminal-shaped call through the async method records
+`CudaMallocAsync`; a `GenerationArena` call through the host method records
+`CudaHostAlloc`; a distinct `ScoringArchiveArena` call through the host method
+also records `CudaHostAlloc`; direct `begin_native_create` records exactly one
+`NativeCreate { phase_before: BeforeNativeCreate }` event and advances to
+`NativeCreateBegun`; and an allocation before native create retains
+`BeforeNativeCreate` in the event. Each control owns a separate recorder and
+completes before the fresh real-admission recorder reaches
+`ImplementationPending`.
 
 Exactly these five named tests are the R6 authority:
 
@@ -993,46 +1363,152 @@ Exactly these five named tests are the R6 authority:
    mutates each of the twelve aligned fields independently while recomputing the
    declared subtotal so that subtotal-only validation would pass. Every case
    requires `AlignedLayoutFieldMismatch` with the exact field and byte payload.
+   The same test keeps all twelve fields fixed while changing only the declared
+   replacement subtotal, then separately overflows the checked subtotal and
+   requires overflow to take precedence over total mismatch.
 3. `slice2_combined_admission_rejects_insufficient_reserve_before_allocation`
-   covers every reserve-authority identity and partition relation, all three
-   checked-arithmetic failures, exact fit on both independent budgets and a
-   one-byte-short failure on each budget. Exact fit reaches the otherwise-valid
-   `ImplementationPending` RED seam; each short case returns the exact
-   `InsufficientAllocationBudget` axis and byte payload.
+   keeps generation components fixed while changing only their total, repeats
+   that control for scoring/archive, and separately proves checked-add overflow
+   precedence for both receipts. It then covers expected bytes and every tuple
+   field for all five observed/trusted reserve authorities, low/high `u64` and
+   UUID byte-zero/tail controls, four-way all-alias refusal, all six pair-only
+   alias refusals, the four coordinated substitution controls, the workspace
+   partition relation, all
+   three reserve checked-arithmetic failures, exact fit on both independent
+   budgets and a one-byte-short failure on each budget. Exact fit reaches the
+   otherwise-valid `ImplementationPending` RED seam; each rejection returns its
+   exact typed axis/operation and payload. This third test contains exactly
+   `107` controls.
 4. `slice2_combined_admission_rejects_foreign_calibration_before_allocation`
-   changes each calibration axis above independently and requires
-   `ForeignCalibration` with that exact axis.
+   changes each calibration axis independently and requires
+   `ForeignCalibration` with that exact axis. Every `u64` axis has low- and
+   high-bit cases; UUID has byte-zero and tail-byte cases. This fourth test has
+   exactly `18` mutations across the nine axes.
 5. `slice2_valid_combined_admission_executes_declared_ledger_once_and_later_generations_allocate_nothing`
-   opens the recorder before actual admission, requires one native-create call,
-   compares exact ledger length `3` before full vector equality with the frozen
-   ledger, queues generations one, two and three, and requires the ledger and
-   all allocation counters to remain byte-for-byte equal to the post-admission
-   snapshot.
+   first runs exactly five separate controls: async terminal, host generation,
+   host scoring/archive, direct native create and allocate-before-create. It
+   then opens a fresh recorder before actual admission. On GREEN it requires
+   chronology length `4` beginning with native create, host/async method counts
+   `1/2`, exact allocation-ledger length `3` before full vector equality, queues
+   generations one, two and three, and requires phase, chronology, ledger and
+   all counters to remain byte-for-byte equal to the post-admission snapshot.
 
 Every input-rejection case invokes the real Rust admission API exactly once but
-must stop before native create. The native-create count, physical allocator
-count, generation-arena count, scoring/archive-arena count and forbidden
-archive-only-arena count are all zero, and the observed ledger is empty.
+must stop before native create. The native-create, host-method, async-method,
+physical allocator, generation-arena, scoring/archive-arena and forbidden
+archive-only-arena counts are all zero, and chronology plus observed ledger are
+empty.
 
 The R6 mutation gate must kill every one of these edits:
 
 - delete missing-archive validation or zero-archive validation;
 - validate only the subtotal: each of the twelve fields is independently
   changed while the subtotal remains self-consistent;
+- trust any declared subtotal/receipt total, use wrapping/saturating component
+  addition, or report total mismatch before the corresponding checked-add
+  overflow;
 - replace checked reserve math with wrapping or saturating math;
-- delete any allocator-headroom, full-workspace, retained-workspace, remaining-
-  Search or partition relation;
+- delete any independently trusted expected-byte comparison, whole-authority
+  binding, individual binding-tuple field, any one of the six pairwise
+  distinctness checks, coordinated-substitution refusal or partition relation;
+- violate any of the four frozen simultaneous-mismatch boundaries: headroom
+  before other authorities, full workspace before retained, headroom bytes
+  before its binding, or headroom UUID before its other binding axes;
+- expose, clone, copy, default or raw-construct the trusted capability graph;
+  accept an unsealed set, minter input or coordinated plain expected-looking
+  values; omit expected calibration or full/post-trim provenance; or remove the
+  child-only full-field inspection;
 - accept exact fit incorrectly or accept a one-byte-short budget;
 - delete any calibration binding, with UUID-only foreign receipt mandatory and
   context, stream, pool, build, kernel-semantics, binary64-math, plan and run
-  axes independently controlled;
+  axes independently controlled; truncated-`u32` identity and UUID-byte-zero-
+  only comparisons are explicit mutants;
 - copy the declared ledger into observed state instead of recording actual
   allocator calls;
 - skip or reorder one call; independently change its ordinal, symbol, category,
   requested bytes, aligned bytes, alignment, flags, stream or resolved pool;
+- trust a declared symbol instead of the invoked host/async method, omit either
+  method count, remove native-create event recording, or allocate before native
+  create;
 - prepend or append an extra observed entry, proving a `zip` comparison without
   exact cardinality cannot pass;
 - allocate again while queueing generation two or generation three.
+
+The existing 63 names stay byte-for-byte and in the same order. Version 8
+appends exactly these 69 unique names, making
+`R6_MUTATION_NAMES.len() == 132`:
+
+```text
+trust_declared_replacement_subtotal
+trust_declared_generation_total
+trust_declared_scoring_archive_total
+replacement_subtotal_add_wrapping
+replacement_subtotal_add_saturating
+generation_total_add_wrapping
+generation_total_add_saturating
+scoring_archive_total_add_wrapping
+scoring_archive_total_add_saturating
+return_replacement_total_mismatch_before_overflow
+return_generation_total_mismatch_before_overflow
+return_scoring_archive_total_mismatch_before_overflow
+remove_allocator_context_headroom_expected_bytes
+remove_full_workspace_authority_expected_bytes
+remove_retained_pre_search_workspace_expected_bytes
+remove_remaining_search_allocation_expected_bytes
+remove_same_context_free_expected_bytes
+remove_allocator_context_headroom_full_binding
+remove_full_workspace_authority_full_binding
+remove_retained_pre_search_workspace_full_binding
+remove_remaining_search_allocation_full_binding
+remove_same_context_free_full_binding
+remove_reserve_binding_device_uuid
+remove_reserve_binding_primary_context
+remove_reserve_binding_search_stream
+remove_reserve_binding_active_pool
+remove_reserve_binding_run_identity
+remove_reserve_binding_full_workspace_receipt_identity
+remove_reserve_binding_post_trim_receipt_identity
+remove_reserve_binding_authority_identity
+accept_four_way_reserve_identity_alias
+accept_headroom_full_workspace_authority_identity_alias
+accept_headroom_retained_authority_identity_alias
+accept_headroom_remaining_authority_identity_alias
+accept_full_workspace_retained_authority_identity_alias
+accept_full_workspace_remaining_authority_identity_alias
+accept_retained_remaining_authority_identity_alias
+accept_coordinated_workspace_byte_substitution
+accept_coordinated_context_budget_byte_substitution
+accept_coordinated_reserve_binding_substitution
+truncate_reserve_binding_identities_to_u32
+compare_reserve_binding_uuid_byte_zero_only
+trust_terminal_declared_symbol_instead_of_host_method
+trust_generation_declared_symbol_instead_of_async_method
+trust_scoring_archive_declared_symbol_instead_of_async_method
+allocate_before_native_create
+remove_host_allocator_method_count
+remove_async_allocator_method_count
+truncate_calibration_identities_to_u32
+compare_calibration_uuid_byte_zero_only
+swap_allocator_context_headroom_and_full_workspace_precedence
+swap_full_workspace_and_retained_precedence
+validate_reserve_binding_before_bytes
+swap_device_uuid_and_primary_context_precedence
+expose_trusted_capability_fields
+derive_clone_for_trusted_capability_graph
+derive_copy_for_trusted_capability_graph
+derive_default_for_trusted_capability_graph
+add_raw_trusted_reserve_constructor
+add_raw_trusted_reserve_accessor
+pass_unsealed_trusted_reserve_set
+allow_trusted_fixture_minter_arguments
+ungate_trusted_fixture_minter
+omit_expected_calibration_from_trusted_seal
+omit_full_workspace_provenance_from_trusted_seal
+omit_post_trim_provenance_from_trusted_seal
+accept_coordinated_observed_and_plain_trusted_substitution
+remove_trusted_fixture_field_inspection
+remove_native_create_event_recording
+```
 
 The RED commit freezes this complete register and the input mutations inside
 the five test bodies, but it cannot truthfully claim to kill implementation
@@ -1044,9 +1520,15 @@ block R7-R9 RED scaffolding after R6 review; it blocks advancing production
 implementation beyond combined-admission GREEN and blocks the authorized RTX
 sequence.
 
-The first R6 commit compiles warning-clean and runs exactly these five tests.
-All five fail at runtime with the typed `ImplementationPending` discriminant;
-there is no compile failure, sixth test, unrelated failure or device execution.
+The first R6 commit compiles the `neoethos-gpu-cuda` crate with zero warning
+diagnostics under `-Dwarnings` and runs exactly these five tests. All five fail
+at runtime with the typed `ImplementationPending` discriminant; there is no
+crate warning, compile failure, sixth test, unrelated failure or device
+execution. A verbose Cargo log may contain cap-linted warnings from locked
+third-party dependencies and must preserve/count them rather than describe the
+entire log as warning-free. The current fresh log has twelve warning-prefixed
+third-party lines: six from `generic-array`, one from `windows-core`, two from
+`windows`, and three Cargo warning summaries.
 The exact Windows PowerShell command is:
 
 ```powershell
@@ -1056,8 +1538,8 @@ cargo +nightly-2026-04-07 test --locked --offline -j 7 -p neoethos-gpu-cuda --no
 ```
 
 `-j 7` is a Cargo option before the test-runner `--`. The exact result is a
-successful warning-clean compile followed by `0 passed; 5 failed`, with all
-five failures caused only by `ImplementationPending`. The command must not
+successful crate-warning-clean compile followed by `0 passed; 5 failed`, with
+all five failures caused only by `ImplementationPending`. The command must not
 resolve `cust`, `cust_raw`, `vector-ta`, `nvcc`, `cuobjdump` or a CUDA link.
 
 ### R7: executable move-only opacity
