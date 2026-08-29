@@ -23,6 +23,18 @@ use crate::resident_scoring_v2::{
     ResidentScoringV2Error, SealedResidentSearchAdmissionV2, seal_combined_search_admission_v2,
     seal_resident_scoring_plan_v2,
 };
+use crate::resident_search_slice2_admission_v2::{
+    ResidentSearchSlice2NativeBindAuthorityV2,
+    resident_archive_knn_v2_native::{
+        NativeResidentArchiveKnnOwnerV2, NativeResidentScoringNoveltyRunV1,
+        RawResidentArchiveKnnBindV2, RawResidentArchiveKnnPendingV2,
+        RawResidentArchiveKnnTerminalV2, bind_preallocated_resident_archive_knn_v2,
+        enqueue_resident_archive_evolve_and_publish_v2, enqueue_resident_archive_score_and_rank_v2,
+        enqueue_resident_archive_stage_from_rank_v2, enqueue_resident_archive_terminal_seal_v2,
+        neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2,
+        try_complete_resident_archive_terminal_v2,
+    },
+};
 use crate::{CudaPopulationError, NeoPopulationSettings, PopulationSession, ScenarioDescriptor};
 #[cfg(feature = "cuda-device-fixtures")]
 use crate::{NeoPopulationCounters, NeoPopulationMetricRow};
@@ -269,6 +281,23 @@ unsafe extern "C" {
         generation_plan: *const RawGenerationPlanV1,
         scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
         admission: *const RawResidentSearchCombinedAdmissionV2,
+        generation: *mut *mut NativeResidentGenerationRunV2,
+        scoring: *mut *mut NativeResidentScoringRunV2,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        expected_runtime: *const RawResidentSearchRuntimeFactsV2,
+        binding: *const RawResidentArchiveKnnBindV2,
+        admission: *mut RawResidentSearchCombinedAdmissionV2,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        admission: *const RawResidentSearchCombinedAdmissionV2,
+        binding: *const RawResidentArchiveKnnBindV2,
         generation: *mut *mut NativeResidentGenerationRunV2,
         scoring: *mut *mut NativeResidentScoringRunV2,
     ) -> i32;
@@ -751,6 +780,415 @@ pub struct ResidentSearchRunV2 {
     terminal_receipt: Option<ResidentSearchTerminalReceiptV2>,
     #[cfg(feature = "cuda-device-fixtures")]
     last_population_counters_fixture_v2: Option<NeoPopulationCounters>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentSearchSlice2NativeStateV3 {
+    Bound,
+    Ranked,
+    Staged,
+    Published,
+    TerminalPending,
+    TerminalComplete,
+    Poisoned,
+    Released,
+}
+
+/// Move-only owner of the complete Slice2 native graph. The existing Search
+/// run retains the population session, generation/scoring owners, stable ready
+/// receipt, gene view and sealed admission; this wrapper additionally retains
+/// the exact bind authority and the single native archive owner.
+#[allow(dead_code)] // Consumed by the typed V3 transitions in the next wiring slice.
+pub(crate) struct ResidentSearchSlice2NativeOwnerV3 {
+    run: Option<ResidentSearchRunV2>,
+    bind_authority: Option<ResidentSearchSlice2NativeBindAuthorityV2>,
+    archive: Option<NonNull<NativeResidentArchiveKnnOwnerV2>>,
+    population_source: Option<ResidentSearchPopulationCompletionLeaseV2>,
+    pending: Option<Box<RawResidentArchiveKnnPendingV2>>,
+    terminal: Option<RawResidentArchiveKnnTerminalV2>,
+    state: ResidentSearchSlice2NativeStateV3,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ResidentSearchSlice2NativeErrorV3 {
+    #[error(transparent)]
+    Search(#[from] ResidentSearchV2Error),
+    #[error("resident Search Slice2 native operation {operation} failed with status {status}")]
+    Native {
+        operation: &'static str,
+        status: i32,
+    },
+    #[error("resident Search Slice2 native owner state violation")]
+    StateViolation,
+}
+
+#[allow(dead_code)] // Converted into the public typed rejection in the next wiring slice.
+pub(crate) struct ResidentSearchSlice2NativeRejectedV3 {
+    error: ResidentSearchSlice2NativeErrorV3,
+    owner: ResidentSearchSlice2NativeOwnerV3,
+}
+
+#[allow(dead_code)]
+pub(crate) enum ResidentSearchSlice2NativeTryCompleteV3 {
+    NotReady(ResidentSearchSlice2NativeOwnerV3),
+    Complete(ResidentSearchSlice2NativeOwnerV3),
+}
+
+#[allow(dead_code)]
+impl ResidentSearchSlice2NativeRejectedV3 {
+    pub(crate) fn into_parts_v3(
+        self,
+    ) -> (
+        ResidentSearchSlice2NativeErrorV3,
+        ResidentSearchSlice2NativeOwnerV3,
+    ) {
+        (self.error, self.owner)
+    }
+}
+
+#[allow(dead_code)]
+impl ResidentSearchSlice2NativeOwnerV3 {
+    fn reject_v3(
+        mut self,
+        operation: &'static str,
+        status: i32,
+    ) -> ResidentSearchSlice2NativeRejectedV3 {
+        if let Some(source) = self.population_source.as_mut() {
+            source.poison_without_reuse_v2();
+        }
+        if let Some(run) = self.run.as_mut() {
+            run.state = ResidentSearchStateV2::Poisoned;
+            if let Some(scoring) = run.scoring.as_mut() {
+                scoring.poison_v2();
+            }
+            if let Some(session) = run.session.as_mut() {
+                session.poison_resident_search_owner_v2();
+            }
+        }
+        self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+        ResidentSearchSlice2NativeRejectedV3 {
+            error: ResidentSearchSlice2NativeErrorV3::Native { operation, status },
+            owner: self,
+        }
+    }
+
+    fn reject_state_v3(mut self) -> ResidentSearchSlice2NativeRejectedV3 {
+        if let Some(run) = self.run.as_mut() {
+            run.state = ResidentSearchStateV2::Poisoned;
+        }
+        self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+        ResidentSearchSlice2NativeRejectedV3 {
+            error: ResidentSearchSlice2NativeErrorV3::StateViolation,
+            owner: self,
+        }
+    }
+
+    fn bind_v3(
+        mut run: ResidentSearchRunV2,
+        bind_authority: ResidentSearchSlice2NativeBindAuthorityV2,
+    ) -> Result<Self, ResidentSearchSlice2NativeErrorV3> {
+        let generation = run
+            .generation
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let scoring = run
+            .scoring
+            .as_ref()
+            .and_then(ResidentScoringRunV2::native_v2)
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let mut archive = std::ptr::null_mut();
+        // SAFETY: the additive composite creator retained the exact bind before
+        // either arena allocation. All pointers below belong to that same
+        // admitted run and the stable gene view remains owned by `run`.
+        let status = unsafe {
+            bind_preallocated_resident_archive_knn_v2(
+                scoring.as_ptr().cast::<NativeResidentScoringNoveltyRunV1>(),
+                generation.as_ptr(),
+                &run.view,
+                bind_authority.raw_v2(),
+                &mut archive,
+            )
+        };
+        let Some(archive) = NonNull::new(archive) else {
+            run.state = ResidentSearchStateV2::Poisoned;
+            if let Some(scoring) = run.scoring.as_mut() {
+                scoring.poison_v2();
+            }
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "bind_preallocated_resident_archive_knn_v2",
+                status,
+            });
+        };
+        if status != STATUS_OK {
+            run.state = ResidentSearchStateV2::Poisoned;
+            if let Some(scoring) = run.scoring.as_mut() {
+                scoring.poison_v2();
+            }
+            // Native returned an owner together with failure. Deliberately do
+            // not release that raw pointer: its exact graph may be reachable
+            // by queued work, so the fail-closed policy is to leak it.
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "bind_preallocated_resident_archive_knn_v2",
+                status,
+            });
+        }
+        run.scoring
+            .as_mut()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
+            .mark_bound_v2();
+        Ok(Self {
+            run: Some(run),
+            bind_authority: Some(bind_authority),
+            archive: Some(archive),
+            population_source: None,
+            pending: None,
+            terminal: None,
+            state: ResidentSearchSlice2NativeStateV3::Bound,
+        })
+    }
+
+    pub(crate) fn upload_resident_scenarios_v3(
+        &mut self,
+        scenarios: &[ScenarioDescriptor],
+    ) -> Result<(), ResidentSearchSlice2NativeErrorV3> {
+        self.run
+            .as_mut()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
+            .upload_resident_scenarios_v2(scenarios)?;
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_score_and_rank_v3(
+        mut self,
+        settings: &NeoPopulationSettings,
+    ) -> Result<Self, ResidentSearchSlice2NativeRejectedV3> {
+        if !matches!(
+            self.state,
+            ResidentSearchSlice2NativeStateV3::Bound | ResidentSearchSlice2NativeStateV3::Published
+        ) || self.population_source.is_some()
+        {
+            return Err(self.reject_state_v3());
+        }
+        let run = self.run.as_mut().expect("Slice2 owner retains Search run");
+        let session = match run.session.take() {
+            Some(session) => session,
+            None => return Err(self.reject_state_v3()),
+        };
+        let source = match session.enqueue_resident_gene_metrics_owned_v2(
+            &run.view,
+            settings,
+            run.expected_population,
+            run.retained_evaluation_capacity,
+            run.expected_feature_count,
+            run.expected_max_terms,
+            run.admission
+                .as_ref()
+                .map_or(0, |admission| admission.full_discovery_reserve_bytes),
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                run.state = ResidentSearchStateV2::Poisoned;
+                self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+                return Err(ResidentSearchSlice2NativeRejectedV3 {
+                    error: ResidentSearchSlice2NativeErrorV3::Search(error.into()),
+                    owner: self,
+                });
+            }
+        };
+        let dependency = if self.state == ResidentSearchSlice2NativeStateV3::Bound {
+            run.ready
+                .as_deref()
+                .map_or(std::ptr::null(), std::ptr::from_ref)
+        } else {
+            std::ptr::null()
+        };
+        let archive = self.archive.expect("Slice2 owner retains archive");
+        let status = unsafe {
+            enqueue_resident_archive_score_and_rank_v2(
+                archive.as_ptr(),
+                source.raw_source_v2(),
+                dependency,
+            )
+        };
+        self.population_source = Some(source);
+        if status != STATUS_OK {
+            return Err(self.reject_v3("enqueue_resident_archive_score_and_rank_v2", status));
+        }
+        self.state = ResidentSearchSlice2NativeStateV3::Ranked;
+        Ok(self)
+    }
+
+    pub(crate) fn enqueue_stage_archive_from_rank_v3(
+        mut self,
+    ) -> Result<Self, ResidentSearchSlice2NativeRejectedV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::Ranked {
+            return Err(self.reject_state_v3());
+        }
+        let status = unsafe {
+            enqueue_resident_archive_stage_from_rank_v2(
+                self.archive.expect("Slice2 owner retains archive").as_ptr(),
+            )
+        };
+        if status != STATUS_OK {
+            return Err(self.reject_v3("enqueue_resident_archive_stage_from_rank_v2", status));
+        }
+        self.state = ResidentSearchSlice2NativeStateV3::Staged;
+        Ok(self)
+    }
+
+    pub(crate) fn enqueue_evolve_and_publish_v3(
+        mut self,
+    ) -> Result<Self, ResidentSearchSlice2NativeRejectedV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::Staged {
+            return Err(self.reject_state_v3());
+        }
+        let status = unsafe {
+            enqueue_resident_archive_evolve_and_publish_v2(
+                self.archive.expect("Slice2 owner retains archive").as_ptr(),
+            )
+        };
+        if status != STATUS_OK {
+            return Err(self.reject_v3("enqueue_resident_archive_evolve_and_publish_v2", status));
+        }
+        let source = self
+            .population_source
+            .take()
+            .expect("ranked Slice2 owner retains population source");
+        match source.finish_device_consume_v2() {
+            Ok(session) => {
+                self.run
+                    .as_mut()
+                    .expect("Slice2 owner retains Search run")
+                    .session = Some(session);
+            }
+            Err(error) => {
+                self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+                return Err(ResidentSearchSlice2NativeRejectedV3 {
+                    error: ResidentSearchSlice2NativeErrorV3::Search(error.into()),
+                    owner: self,
+                });
+            }
+        }
+        self.state = ResidentSearchSlice2NativeStateV3::Published;
+        Ok(self)
+    }
+
+    pub(crate) fn enqueue_terminal_seal_v3(
+        mut self,
+    ) -> Result<Self, ResidentSearchSlice2NativeRejectedV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::Published || self.pending.is_some() {
+            return Err(self.reject_state_v3());
+        }
+        let mut pending = Box::new(RawResidentArchiveKnnPendingV2::default());
+        let status = unsafe {
+            enqueue_resident_archive_terminal_seal_v2(
+                self.archive.expect("Slice2 owner retains archive").as_ptr(),
+                pending.as_mut(),
+            )
+        };
+        if status != STATUS_OK {
+            return Err(self.reject_v3("enqueue_resident_archive_terminal_seal_v2", status));
+        }
+        self.pending = Some(pending);
+        self.state = ResidentSearchSlice2NativeStateV3::TerminalPending;
+        Ok(self)
+    }
+
+    pub(crate) fn try_complete_terminal_v3(
+        mut self,
+    ) -> Result<ResidentSearchSlice2NativeTryCompleteV3, ResidentSearchSlice2NativeRejectedV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::TerminalPending {
+            return Err(self.reject_state_v3());
+        }
+        let mut committed = RawReadyEventV1::default();
+        let mut terminal = RawResidentArchiveKnnTerminalV2::default();
+        let status = unsafe {
+            try_complete_resident_archive_terminal_v2(
+                self.archive.expect("Slice2 owner retains archive").as_ptr(),
+                self.pending
+                    .as_deref()
+                    .expect("pending owner retains stable receipt"),
+                &mut committed,
+                &mut terminal,
+            )
+        };
+        if status == STATUS_NOT_READY_V2 {
+            return Ok(ResidentSearchSlice2NativeTryCompleteV3::NotReady(self));
+        }
+        if status != STATUS_OK {
+            return Err(self.reject_v3("try_complete_resident_archive_terminal_v2", status));
+        }
+        let run = self.run.as_mut().expect("Slice2 owner retains Search run");
+        run.ready_receipt_address = 0;
+        run.ready = Some(Box::new(committed));
+        run.ready_receipt_address = run
+            .ready
+            .as_deref()
+            .map_or(0, |ready| std::ptr::from_ref(ready) as usize);
+        self.terminal = Some(terminal);
+        self.state = ResidentSearchSlice2NativeStateV3::TerminalComplete;
+        Ok(ResidentSearchSlice2NativeTryCompleteV3::Complete(self))
+    }
+
+    pub(crate) fn release_terminal_v3(
+        mut self,
+    ) -> Result<PopulationSession, ResidentSearchSlice2NativeErrorV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::TerminalComplete {
+            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+        }
+        let run = self
+            .run
+            .as_mut()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let session_handle = run
+            .session
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
+            .resident_search_native_handle_v2();
+        let archive = self
+            .archive
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let status = unsafe {
+            neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(
+                session_handle,
+                archive.as_ptr(),
+            )
+        };
+        if status != STATUS_OK {
+            self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
+                status,
+            });
+        }
+        self.archive = None;
+        self.pending = None;
+        self.bind_authority = None;
+        self.state = ResidentSearchSlice2NativeStateV3::Released;
+        self.run
+            .take()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
+            .close_v2()
+            .map_err(Into::into)
+    }
+}
+
+impl Drop for ResidentSearchSlice2NativeOwnerV3 {
+    fn drop(&mut self) {
+        if self.archive.is_some() {
+            if let Some(source) = self.population_source.as_mut() {
+                source.poison_without_reuse_v2();
+            }
+            if let Some(run) = self.run.as_mut() {
+                run.state = ResidentSearchStateV2::Poisoned;
+                if let Some(scoring) = run.scoring.as_mut() {
+                    scoring.poison_v2();
+                }
+                if let Some(session) = run.session.as_mut() {
+                    session.poison_resident_search_owner_v2();
+                }
+            }
+        }
+    }
 }
 
 pub struct ResidentSearchAdvancePendingV2 {
@@ -1710,14 +2148,52 @@ impl PopulationSession {
         )
     }
 
+    #[allow(dead_code)] // Called by the typed V3 construction bridge in the next wiring slice.
+    pub(crate) fn begin_resident_search_slice2_native_v3(
+        self,
+        plan: SealedResidentGenerationPlanV1,
+        smc_weights: [f64; 11],
+        smc_gate_disabled: bool,
+        bind_authority: ResidentSearchSlice2NativeBindAuthorityV2,
+    ) -> Result<ResidentSearchSlice2NativeOwnerV3, ResidentSearchSlice2NativeErrorV3> {
+        let run = self.begin_resident_search_sealed_impl_v3(
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+            ResidentScoringObjectiveV2::PropFirmV4,
+            0.0,
+            Some(bind_authority.raw_v2()),
+        )?;
+        ResidentSearchSlice2NativeOwnerV3::bind_v3(run, bind_authority)
+    }
+
     #[allow(dead_code)] // Shared by the private bridge and device-only fixture.
     fn begin_resident_search_sealed_v2(
+        self,
+        plan: SealedResidentGenerationPlanV1,
+        smc_weights: [f64; 11],
+        smc_gate_disabled: bool,
+        scoring_objective: ResidentScoringObjectiveV2,
+        novelty_weight: f64,
+    ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
+        self.begin_resident_search_sealed_impl_v3(
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+            scoring_objective,
+            novelty_weight,
+            None,
+        )
+    }
+
+    fn begin_resident_search_sealed_impl_v3(
         mut self,
         plan: SealedResidentGenerationPlanV1,
         smc_weights: [f64; 11],
         smc_gate_disabled: bool,
         scoring_objective: ResidentScoringObjectiveV2,
         novelty_weight: f64,
+        slice2_binding: Option<&RawResidentArchiveKnnBindV2>,
     ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
         // No Search work exists yet. Authorize ordinary destruction before any
         // fallible validation/admission step so a clean start failure cannot
@@ -1763,13 +2239,23 @@ impl PopulationSession {
                 .map_err(scoring_error)?;
         let mut raw_admission = RawResidentSearchCombinedAdmissionV2::default();
         let status = unsafe {
-            neoethos_gpu_cuda_population_query_resident_search_combined_v2(
-                session_handle,
-                plan.raw_plan_v1(),
-                scoring_plan.raw_v2(),
-                &runtime,
-                &mut raw_admission,
-            )
+            match slice2_binding {
+                Some(binding) => neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    scoring_plan.raw_v2(),
+                    &runtime,
+                    binding,
+                    &mut raw_admission,
+                ),
+                None => neoethos_gpu_cuda_population_query_resident_search_combined_v2(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    scoring_plan.raw_v2(),
+                    &runtime,
+                    &mut raw_admission,
+                ),
+            }
         };
         if status != STATUS_OK {
             return Err(native_error(
@@ -1783,14 +2269,25 @@ impl PopulationSession {
         // SAFETY: native validates the sealed combined receipt and the exact
         // runtime facts before allocating either device arena.
         let status = unsafe {
-            neoethos_gpu_cuda_population_create_resident_search_combined_v2(
-                session_handle,
-                plan.raw_plan_v1(),
-                scoring_plan.raw_v2(),
-                &admission.raw,
-                &mut generation,
-                &mut scoring_native,
-            )
+            match slice2_binding {
+                Some(binding) => neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    scoring_plan.raw_v2(),
+                    &admission.raw,
+                    binding,
+                    &mut generation,
+                    &mut scoring_native,
+                ),
+                None => neoethos_gpu_cuda_population_create_resident_search_combined_v2(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    scoring_plan.raw_v2(),
+                    &admission.raw,
+                    &mut generation,
+                    &mut scoring_native,
+                ),
+            }
         };
         if status != STATUS_OK {
             return Err(native_error(

@@ -55,6 +55,18 @@ struct ResidentScoringFiniteObjectiveRowsV2 {
   std::uint8_t cuda_math_flags_sha256[32];
 };
 
+/// Allocation-free validation/query for the one Slice2 ScoringArchiveArena.
+/// The caller supplies the already captured same-context free-memory snapshot;
+/// this helper never probes CUDA and never allocates.
+std::int32_t query_slice2_combined_scoring_archive_run_v2(
+    const resident_scoring_novelty_v1::NeoResidentScoringAdmissionV2*
+        admission,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* plan,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    std::uint64_t same_context_free_bytes,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyAllocationReceiptV1*
+        receipt);
+
 /// Creates the one physical ScoringArchiveArena allocation. The complete
 /// checked BindV2 is retained by the opaque scoring owner so a later archive
 /// borrower cannot substitute a base, size, stream, or region layout.

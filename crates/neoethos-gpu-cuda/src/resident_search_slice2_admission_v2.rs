@@ -1,5 +1,5 @@
 #[path = "resident_archive_knn_v2_native.rs"]
-mod resident_archive_knn_v2_native;
+pub(crate) mod resident_archive_knn_v2_native;
 
 use self::resident_archive_knn_v2_native::{
     RawResidentArchiveKnnBindV2, ResidentScoringArchiveArenaLayoutV2,
@@ -377,6 +377,12 @@ pub(crate) struct ResidentSearchSlice2NativeBindAuthorityV2 {
     observed_reserve: ResidentSearchSlice2ObservedReserveSetV2,
 }
 
+impl ResidentSearchSlice2NativeBindAuthorityV2 {
+    pub(crate) const fn raw_v2(&self) -> &RawResidentArchiveKnnBindV2 {
+        &self.raw
+    }
+}
+
 impl ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
     pub(crate) fn into_native_bind_authority_v2(self) -> ResidentSearchSlice2NativeBindAuthorityV2 {
         let Self {
@@ -411,7 +417,7 @@ impl ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
 #[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
 impl ResidentSearchSlice2NativeBindAuthorityV2 {
     fn test_raw_v2(&self) -> &RawResidentArchiveKnnBindV2 {
-        &self.raw
+        self.raw_v2()
     }
 
     fn test_observed_reserve_v2(&self) -> &ResidentSearchSlice2ObservedReserveSetV2 {

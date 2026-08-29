@@ -1806,6 +1806,52 @@ extern "C" std::int32_t fixture_copy_resident_scoring_snapshot_v2(
 
 namespace neoethos::resident_scoring_novelty_v2_internal {
 
+std::int32_t query_slice2_combined_scoring_archive_run_v2(
+    const resident_scoring_novelty_v1::NeoResidentScoringAdmissionV2*
+        admission,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* plan,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    std::uint64_t same_context_free_bytes,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyAllocationReceiptV1*
+        receipt) {
+  using namespace resident_scoring_novelty_v1;
+  if (admission == nullptr) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  NeoResidentScoringAdmissionV2 query_admission = *admission;
+  if (query_admission.scoring_novelty_ready_event == nullptr) {
+    query_admission.scoring_novelty_ready_event =
+        reinterpret_cast<cudaEvent_t>(std::uintptr_t{1});
+  }
+  if (!validate_scoring_admission_v2(&query_admission, plan) ||
+      !validate_slice2_combined_binding_v2(binding) || receipt == nullptr ||
+      binding->population_count != plan->logical_population_count ||
+      binding->max_terms_per_gene != plan->max_terms_per_gene ||
+      binding->total_device_bytes > same_context_free_bytes ||
+      admission->full_discovery_reserve_bytes > same_context_free_bytes ||
+      binding->total_device_bytes >
+          same_context_free_bytes - admission->full_discovery_reserve_bytes) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  *receipt = {};
+  receipt->abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1;
+  receipt->scoring_store_allocation_count = 1;
+  receipt->fitness_score_bytes = binding->fitness_scores.size_bytes;
+  receipt->novelty_score_bytes = binding->novelty_scores.size_bytes;
+  receipt->decision_key_bytes = binding->decision_keys.size_bytes;
+  receipt->cub_scratch_bytes = binding->cub_scratch.size_bytes;
+  receipt->device_control_bytes = binding->archive_control_and_seal.size_bytes;
+  receipt->total_device_bytes = binding->total_device_bytes;
+  receipt->same_context_free_bytes = same_context_free_bytes;
+  receipt->full_discovery_reserve_bytes =
+      admission->full_discovery_reserve_bytes;
+  receipt->logical_population_count = plan->logical_population_count;
+  receipt->feature_word_count = binding->signature_word_count;
+  copy_identity_v1(receipt->allocation_plan_sha256,
+                   plan->plan_identity_sha256);
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
 std::int32_t create_slice2_combined_scoring_archive_run_v2(
     const resident_scoring_novelty_v1::NeoResidentScoringAdmissionV2*
         admission,

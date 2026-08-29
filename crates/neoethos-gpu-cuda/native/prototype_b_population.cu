@@ -27,6 +27,8 @@
 #include "resident_generation_v1_abi.cuh"
 #include "resident_generation_v2_abi.cuh"
 #include "resident_search_generation_v2_abi.cuh"
+#include "resident_archive_knn_v2_abi.cuh"
+#include "resident_scoring_novelty_v2_internal.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -3985,7 +3987,74 @@ neoethos_gpu_cuda_population_query_resident_search_combined_v2(
 }
 
 extern "C" std::int32_t
-neoethos_gpu_cuda_population_create_resident_search_combined_v2(
+neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        binding,
+    neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission) {
+  using namespace neoethos::resident_scoring_novelty_v1;
+  using namespace neoethos::resident_search_generation_v2;
+  if (binding == nullptr || admission == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  std::int32_t status =
+      neoethos_gpu_cuda_population_query_resident_search_combined_v2(
+          opaque_session, generation_plan, scoring_plan, expected_runtime,
+          admission);
+  if (status != NEO_POPULATION_STATUS_OK) {
+    return status;
+  }
+  NeoResidentScoringAdmissionV2 scoring_admission{};
+  scoring_admission.abi_version = 2u;
+  scoring_admission.selected_cuda_ordinal =
+      admission->runtime.selected_cuda_ordinal;
+  scoring_admission.admitted_run_stream =
+      admission->runtime.admitted_run_stream;
+  scoring_admission.full_discovery_reserve_bytes =
+      admission->full_discovery_reserve_bytes;
+  std::memcpy(scoring_admission.cuda_device_identity_sha256,
+              scoring_plan->cuda_device_identity_sha256, 32);
+  std::memcpy(scoring_admission.primary_context_identity_sha256,
+              scoring_plan->primary_context_identity_sha256, 32);
+  std::memcpy(scoring_admission.run_stream_identity_sha256,
+              scoring_plan->run_stream_identity_sha256, 32);
+  NeoResidentScoringNoveltyAllocationReceiptV1 scoring{};
+  status = neoethos::resident_scoring_novelty_v2_internal::
+      query_slice2_combined_scoring_archive_run_v2(
+          &scoring_admission, scoring_plan, binding,
+          admission->same_context_free_bytes, &scoring);
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    *admission = {};
+    return population_status_from_scoring_v2(status);
+  }
+  if (admission->generation_device_bytes >
+      UINT64_MAX - scoring.total_device_bytes) {
+    *admission = {};
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  const std::uint64_t total_device_bytes =
+      admission->generation_device_bytes + scoring.total_device_bytes;
+  if (admission->full_discovery_reserve_bytes >
+          admission->same_context_free_bytes ||
+      total_device_bytes > admission->same_context_free_bytes -
+                               admission->full_discovery_reserve_bytes) {
+    *admission = {};
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  admission->scoring = scoring;
+  admission->scoring_device_bytes = scoring.total_device_bytes;
+  admission->total_device_bytes = total_device_bytes;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+static std::int32_t create_resident_search_combined_impl_v3(
     void* opaque_session,
     const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
         generation_plan,
@@ -3993,6 +4062,8 @@ neoethos_gpu_cuda_population_create_resident_search_combined_v2(
         NeoResidentScoringNoveltyPlanV1* scoring_plan,
     const neoethos::resident_search_generation_v2::
         NeoResidentSearchCombinedAdmissionV2* admission,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        slice2_binding,
     neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
     neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
         scoring) {
@@ -4043,6 +4114,33 @@ neoethos_gpu_cuda_population_create_resident_search_combined_v2(
   if (status != NEO_POPULATION_STATUS_OK ||
       !runtime_facts_equal_v2(current_runtime, admission->runtime)) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (slice2_binding != nullptr) {
+    NeoResidentScoringAdmissionV2 preflight_scoring{};
+    preflight_scoring.abi_version = 2u;
+    preflight_scoring.selected_cuda_ordinal =
+        admission->runtime.selected_cuda_ordinal;
+    preflight_scoring.admitted_run_stream =
+        admission->runtime.admitted_run_stream;
+    preflight_scoring.full_discovery_reserve_bytes =
+        admission->full_discovery_reserve_bytes;
+    std::memcpy(preflight_scoring.cuda_device_identity_sha256,
+                scoring_plan->cuda_device_identity_sha256, 32);
+    std::memcpy(preflight_scoring.primary_context_identity_sha256,
+                scoring_plan->primary_context_identity_sha256, 32);
+    std::memcpy(preflight_scoring.run_stream_identity_sha256,
+                scoring_plan->run_stream_identity_sha256, 32);
+    NeoResidentScoringNoveltyAllocationReceiptV1 expected_scoring{};
+    const std::int32_t preflight_status =
+        neoethos::resident_scoring_novelty_v2_internal::
+            query_slice2_combined_scoring_archive_run_v2(
+                &preflight_scoring, scoring_plan, slice2_binding,
+                admission->same_context_free_bytes, &expected_scoring);
+    if (preflight_status != NEO_SCORING_STATUS_OK_V1 ||
+        std::memcmp(&expected_scoring, &admission->scoring,
+                    sizeof(expected_scoring)) != 0) {
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+    }
   }
   // The combined receipt is already sealed here. Only now may events, pinned
   // terminal storage, or either device arena be allocated. Keep every stage
@@ -4212,8 +4310,14 @@ neoethos_gpu_cuda_population_create_resident_search_combined_v2(
               scoring_plan->primary_context_identity_sha256, 32);
   std::memcpy(scoring_admission.run_stream_identity_sha256,
               scoring_plan->run_stream_identity_sha256, 32);
-  status = create_unbound_resident_scoring_run_v2(
-      &scoring_admission, scoring_plan, &admission->scoring, &created_scoring);
+  status = slice2_binding == nullptr
+               ? create_unbound_resident_scoring_run_v2(
+                     &scoring_admission, scoring_plan, &admission->scoring,
+                     &created_scoring)
+               : neoethos::resident_scoring_novelty_v2_internal::
+                     create_slice2_combined_scoring_archive_run_v2(
+                         &scoring_admission, scoring_plan, slice2_binding,
+                         &created_scoring);
   if (status != NEO_SCORING_STATUS_OK_V1) {
     const bool stream_state_unknown =
         status == NEO_SCORING_STATUS_CUDA_ERROR_V1 ||
@@ -4234,6 +4338,45 @@ neoethos_gpu_cuda_population_create_resident_search_combined_v2(
       static_cast<int>(generation_plan->logical_population_count);
   session->population = session->resident_planned_population_v2;
   return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_combined_v2(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
+        scoring) {
+  return create_resident_search_combined_impl_v3(
+      opaque_session, generation_plan, scoring_plan, admission, nullptr,
+      generation, scoring);
+}
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        binding,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
+        scoring) {
+  if (binding == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  return create_resident_search_combined_impl_v3(
+      opaque_session, generation_plan, scoring_plan, admission, binding,
+      generation, scoring);
 }
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_create_resident_generation_run_v2(

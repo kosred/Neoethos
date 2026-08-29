@@ -9,6 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace neoethos::resident_archive_knn_v2 {
+struct NeoResidentArchiveKnnBindV2;
+}
+
 namespace neoethos::resident_search_generation_v2 {
 
 constexpr std::uint32_t NEO_RESIDENT_SEARCH_GENERATION_ABI_V2 = 2;
@@ -125,6 +129,28 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_create_resident_search_comb
     const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
     const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
     const NeoResidentSearchCombinedAdmissionV2* admission,
+    resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** scoring);
+
+/// Additive Slice2 composite admission. The frozen archive binding is checked
+/// during the allocation-free query and is supplied again to creation before
+/// any event, pinned receipt, or device arena is allocated.
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    NeoResidentSearchCombinedAdmissionV2* admission);
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchCombinedAdmissionV2* admission,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
     resident_generation_v1::NeoResidentGenerationRunV1** generation,
     resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** scoring);
 
