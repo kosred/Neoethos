@@ -1,0 +1,29 @@
+CARGO_TARGET_DIR=C:\Users\konst\development\forex-ai\target\codex-stage\bayesian-r5-red\target-final-local
+CARGO_INCREMENTAL=0
+RUSTFLAGS=-Dwarnings
+
+GATE1=cargo +nightly-2026-04-07 test --locked --offline -j7 -p neoethos-models --no-default-features --test bayesian_full_gpu_r5_support -- --nocapture
+GATE1_EXIT=0
+GATE1_RESULT=7 passed; 0 failed; 0 ignored
+
+GATE2=cargo +nightly-2026-04-07 test --locked --offline -j7 -p neoethos-models --no-default-features --features statistical-gpu --test bayesian_full_gpu_r5_contract -- --nocapture
+GATE2_EXIT=0
+GATE2_RESULT=1 passed; 0 failed; 2 ignored
+
+GATE3_PRE_FIX=cargo +nightly-2026-04-07 test --locked --offline -j7 -p neoethos-models --no-default-features --test training_summary_embargo_r5_contract -- --nocapture
+GATE3_PRE_FIX_EXIT=1
+GATE3_PRE_FIX_RESULT=unexpected E0621 before test execution; stopped
+
+AUTHORIZED_TEST_ONLY_FIX=producer_summary_expression function parameter changed from &FunctionNode<'ast> to &'ast FunctionNode<'ast>
+
+GATE3=cargo +nightly-2026-04-07 test --locked --offline -j7 -p neoethos-models --no-default-features --test training_summary_embargo_r5_contract -- --nocapture
+GATE3_EXIT=1
+GATE3_RESULT=expected behavior RED; 2 passed; 4 failed; 0 ignored
+
+GATE4=cargo +nightly-2026-04-07 test --locked --offline -j7 -p neoethos-models --no-default-features --features statistical-gpu --test bayesian_full_gpu_r5_acceptance --no-run
+GATE4_EXIT=1
+GATE4_RESULT=expected compile RED; one E0599 for absent BudgetedCpuExecutor::execute_with_lease; no other warning/error family
+
+FORMAT_CHECK=rustfmt +nightly-2026-04-07 --edition 2024 --check crates/neoethos-models/tests/bayesian_full_gpu_r5_support.rs crates/neoethos-models/tests/bayesian_full_gpu_r5_contract.rs crates/neoethos-models/tests/bayesian_full_gpu_r5_acceptance.rs crates/neoethos-models/tests/support/bayesian_r5.rs crates/neoethos-models/tests/training_summary_embargo_r5_contract.rs
+DIFF_CHECK=git diff --check
+PRODUCTION_DIFF=git diff b114c01b036820e42c90ef6c10fa7aa35a1838de -- crates/neoethos-models/src crates/neoethos-core/src crates/neoethos-execution-budget/src

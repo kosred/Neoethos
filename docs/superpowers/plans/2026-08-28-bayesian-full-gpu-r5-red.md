@@ -103,7 +103,7 @@ Acquire exactly seven permits from one `CpuPermitBroker`, transfer them to its `
 
 - [ ] **Step 2: Pin the callback semantics**
 
-Inside the callback assert delivered lease width seven, current private pool width seven, seven distinct native `neoethos-cpu-*` identities, and fresh acquisition rejection in every broadcast worker. Place the public CPU fit and predict calls in that same callback and pass its delivered lease directly.
+Inside the callback assert delivered lease width seven, current private pool width seven, seven distinct native `neoethos-cpu-*` identities, and fresh acquisition rejection in every broadcast worker. Snapshot native CPU time for those seven workers around the real public CPU fit plus prediction and require meaningful growth on every worker. Pass the delivered lease directly; an identity-only broadcast or serial model call must fail.
 
 - [ ] **Step 3: Verify the authentic compile RED**
 
@@ -129,17 +129,17 @@ Expected: CPU control passes; GPU route fails at production `cpu_backend_for_pol
 
 - [ ] **Step 3: Write the recursive AST census**
 
-Parse all 81 production Rust files. Resolve `use` renames, type aliases, local summary bindings, and constructor-function aliases. Trace the summary argument reaching each exact producer's `try_build_runtime_artifact_metadata` call, without relying on one spelling of `TrainingSummaryMetadata`.
+Parse all 81 production Rust files. Resolve renamed/chained/nested imports, type aliases, qualified paths, `Self`, parenthesized callees, local summary bindings, constructor aliases, and local row-count aliases. Trace the summary argument reaching each exact producer and the row-identity expression in each exact validator without relying on one spelling of `TrainingSummaryMetadata`.
 
 - [ ] **Step 4: Accumulate all producer diagnostics**
 
-Inspect Bayesian, linear, and deep producers independently, append each failure to a vector, and assert only after all three have been visited. The failure text must name all three files/functions and the missing distinct embargo flow.
+Inspect Bayesian, linear, and deep producers and validators independently, append each failure to a vector, and assert only after all three sites in a category have been visited. The failure text must name all three files/functions and the missing distinct embargo flow.
 
 - [ ] **Step 5: Verify the embargo RED**
 
 Run: `cargo +nightly-2026-04-07 test --locked --offline -p neoethos-models --no-default-features --test training_summary_embargo_r5_contract -- --nocapture`
 
-Expected: recursive parse support passes; the one fail-all producer test fails and its output contains Bayesian, linear, and deep diagnostics.
+Expected: recursive parse and synthetic alias support pass; the fail-all producer and validator tests each fail with Bayesian, linear, and deep diagnostics.
 
 ## Chunk 3: Bounded real-card parent and immutable freeze
 
@@ -166,7 +166,7 @@ Require `git status --porcelain=v1` empty. Record live `HEAD`, `HEAD^{tree}`, re
 
 - [ ] **Step 5: Enforce the credit ceiling**
 
-Use one create-new lock, one parent, serialized roles, one excluded warm-up and three raw timed samples, short command deadlines, a single 30-minute parent deadline, child kill-on-timeout, and natural stop-on-first assertion failure.
+Use one create-new concurrency lock, one permanent create-new paid-attempt claim, one parent, serialized roles, one excluded warm-up and three raw timed samples, short command deadlines, a single 30-minute parent deadline, child kill-on-timeout, and natural stop-on-first assertion failure.
 
 - [ ] **Step 6: Keep hardware execution ignored**
 
@@ -184,7 +184,7 @@ Mark only the parent and private worker entry tests ignored. Never execute them 
 
 Run: `cargo +nightly-2026-04-07 fmt --all -- --check`
 
-Run: `git diff 45c64cc -- crates/neoethos-models/src crates/neoethos-core/src crates/neoethos-execution-budget/src`
+Run: `git diff b114c01 -- crates/neoethos-models/src crates/neoethos-core/src crates/neoethos-execution-budget/src`
 
 Expected: format exit 0 and empty production diff.
 
@@ -194,7 +194,7 @@ Set `CARGO_INCREMENTAL=0`, `RUSTFLAGS=-Dwarnings`, an isolated target, and captu
 
 - [ ] **Step 3: Validate classifications and exact counts**
 
-Require all support tests GREEN; CPU7 compile only E0599; public lifecycle only the production GPU-policy RED; embargo output names all three producer failures; hardware tests remain unexecuted.
+Require all support tests GREEN; CPU7 compile only E0599; the public GPU lifecycle stays ignored outside the paid parent; embargo output names all three producer and validator failures; hardware tests remain unexecuted.
 
 - [ ] **Step 4: Generate the immutable manifest**
 

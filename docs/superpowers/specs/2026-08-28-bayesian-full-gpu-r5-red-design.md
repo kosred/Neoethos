@@ -2,11 +2,11 @@
 
 ## Authority and scope
 
-- The branch starts at source authority `45c64ccacd3c42d5bd07cccbf8985020b931ef47` in a new isolated clone.
+- Source provenance starts at `45c64ccacd3c42d5bd07cccbf8985020b931ef47`; the R5 commits are replayed onto its reviewed authoritative descendant `b114c01b036820e42c90ef6c10fa7aa35a1838de` (via `fc4cf49` and `97a66b1`) in the isolated clone.
 - R5 may change tests, test-only dependencies, documentation, evidence, and the tracked vendor closure required by the preserved workspace.
 - R5 must not change `crates/neoethos-models/src`, `crates/neoethos-core/src`, or `crates/neoethos-execution-budget/src`.
 - No R5 command may contact the network, a GPU, a VPS, or a registry. Cargo commands use `--locked --offline`.
-- Runtime acceptance records the checked-out implementation commit and tree dynamically. The preimplementation authority above is provenance, never the claimed tested implementation.
+- Runtime acceptance records the checked-out implementation commit and tree dynamically. The provenance and preimplementation authority above are never the claimed tested implementation.
 
 ## R4 rejection and chosen approach
 
@@ -28,7 +28,7 @@ The wished-for production boundary is a `BudgetedCpuExecutor` operation that:
 4. enters the accepted lease scope and invokes `FnOnce(&CpuLease)` from that private pool;
 5. retains the accepted lease until the callback and every scoped worker task finish.
 
-The compile-RED fixture requests an exact seven-permit lease and calls the wished-for operation. Inside its callback it requires a width-seven delivered lease, a width-seven current Rayon pool, seven distinct `neoethos-cpu-*` native worker identities, and rejection of fresh nested acquisition in every worker context. The timed CPU fit and OOS prediction are performed inside that same callback and receive that delivered lease. A separate executor probe cannot satisfy the fixture.
+The compile-RED fixture requests an exact seven-permit lease and calls the wished-for operation. Inside its callback it requires a width-seven delivered lease, a width-seven current Rayon pool, seven distinct `neoethos-cpu-*` native worker identities, and rejection of fresh nested acquisition in every worker context. It snapshots native per-thread CPU time in all seven workers immediately before and after the real public fit plus OOS prediction and requires meaningful CPU-time growth in every worker. The timed calls receive the delivered lease directly. A broadcast-only identity probe or a serial fit surrounded by decoy worker activity cannot satisfy the fixture.
 
 The pinned API exposes only `execute`/`execute_scoped`, which consume and hide the accepted lease. Therefore this fixture must fail only on the absent lease-bearing method until production supplies the boundary.
 
@@ -47,7 +47,7 @@ The oracle compares saved public-model weights, biases, full covariance matrices
 
 ## Independent CUDA evidence
 
-The parent runs the public GPU lifecycle under Nsight Systems and exports profiler-owned SQLite. The validator resolves CUPTI kernel names from the database and requires stage-specific Bayesian kernels:
+The parent runs the public GPU lifecycle under Nsight Systems and exports profiler-owned SQLite. The validator resolves CUPTI kernel names from the database and requires five distinct, minimum-duration `neoethos_bayesian_*` activities, one for each stage:
 
 - preprocessing;
 - MAP update;
@@ -55,7 +55,7 @@ The parent runs the public GPU lifecycle under Nsight Systems and exports profil
 - Cholesky/factorization;
 - inference.
 
-It also requires non-trivial kernel duration, stage-appropriate launch counts, and host-to-device/device-to-host transfer bytes consistent with the hashed fixture dimensions. Generic kernels, CUDA API traffic alone, missing semantic stages, zero-duration activity, or CPU/fallback backend metadata fail. A local synthetic-ledger negative test proves that a decoy kernel plus CPU result is rejected. A recursive source census separately rejects GPU routing through Bayesian CPU fit/predict helpers.
+It also requires non-trivial aggregate named-stage duration, dimension-bound named-stage grid work, and host-to-device/device-to-host transfer bytes consistent with the hashed fixture dimensions. Generic kernels, CUDA API traffic alone, missing semantic stages, zero-duration activity, or CPU/fallback backend metadata fail. Local negative tests prove both that a decoy kernel plus CPU result is rejected and that one name-stuffed mega-kernel cannot impersonate five distinct stages.
 
 ## Reproducibility and evidence
 
@@ -75,16 +75,16 @@ The R5 commit tracks every local path dependency required by the preserved works
 
 ## Budgeted real-card flow
 
-One parent owns an exclusive evidence-directory lock. Work is serialized and stops at the first failed gate. Each exact shape gets one excluded warm-up and three timed samples per role; one profiled GPU lifecycle supplies semantic kernel evidence. The parent enforces short per-command deadlines and a single 30-minute wall ceiling for the entire hardware test. It kills the active child on timeout and never starts the next shape after a failure. There are no repeated six-hour waits.
+One parent owns an exclusive evidence-directory lock and atomically writes a permanent paid-attempt claim before launching hardware work, so a retry requires explicit human review. Work is serialized and stops at the first failed gate. Each exact shape gets one excluded warm-up and three timed samples per role; one profiled GPU lifecycle supplies semantic kernel evidence. The parent enforces short per-command deadlines and a single 30-minute wall ceiling for the entire hardware test. It kills the active child on timeout and never starts the next shape after a failure. There are no repeated six-hour waits.
 
 ## Alias-resistant embargo census
 
-The recursive 81-file AST census finds the typed summary schema and all three exact production producers. It traces each producer's summary argument structurally through imports, type aliases, local bindings, and constructor aliases instead of matching one spelling. It accumulates diagnostics for Bayesian, linear, and deep producers and asserts only after all three were inspected, so the RED report lists all producer failures in one run.
+The recursive 81-file AST census finds the typed summary schema plus all three exact production producers and validators. It resolves renamed, chained, and nested imports; type aliases; qualified paths; `Self`; parenthesized callees; local constructor bindings; and local row-count bindings instead of matching one spelling. It accumulates diagnostics for Bayesian, linear, and deep sites and asserts only after all three were inspected, so each RED report lists all producer or validator failures in one run.
 
 ## Expected local classification
 
 - Lease-bearing CPU7 compile fixture: **RED**, only because the production executor method is absent.
-- Public GPU lifecycle: **RED**, at the real GPU-only production boundary.
-- Embargo producer census: **RED**, listing all three stale producers.
+- Public CPU lifecycle support: **GREEN**; the real GPU lifecycle is compiled but ignored outside the one paid parent.
+- Embargo producer and validator censuses: **RED**, each listing all three stale sites.
 - Independent oracle self-checks, CUPTI semantic/decoy validators, provenance validators, recursive parsing, and ignored-test listing: **GREEN**.
 - Real-card parent: compile-gated by the missing executor API and ignored locally; it is never executed in R5.
