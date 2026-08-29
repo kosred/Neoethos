@@ -106,6 +106,186 @@ fn one_run_seals_full_range_and_index_views_against_one_exact_parent() {
 }
 
 #[test]
+fn population_auto_reads_parent_and_route_facts_from_the_existing_run_without_a_probe() {
+    let (scope, features, ohlcv) = parent(12);
+    let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let run =
+        begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv).unwrap();
+    let facts = run
+        .population_auto_sizing_primitives_v1()
+        .expect("run-owned sizing primitives");
+    assert_eq!(facts.resident_parent_rows, 12);
+    assert_eq!(facts.feature_count, 2);
+    assert_eq!(facts.parent_canonical_scope_identity_sha256.len(), 64);
+    assert_eq!(facts.parent_dataset_identity_sha256.len(), 64);
+    assert!(matches!(
+        facts.route,
+        crate::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+            | crate::PopulationAutoSizingRouteV1::NativeCuda { .. }
+    ));
+
+    let source = include_str!("population_execution_evidence_v1.rs");
+    let method = source
+        .split("pub(crate) fn population_auto_sizing_primitives_v1")
+        .nth(1)
+        .expect("sizing primitive method");
+    let body = method
+        .split("pub(crate) fn seal_evaluation")
+        .next()
+        .expect("method body");
+    for forbidden in [
+        "acquire_strict_discovery_device_admission_v1",
+        "mem_get_info",
+        "gpu_submission_ceiling",
+        "device_count",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "run-bound sizing must not probe again: {forbidden}"
+        );
+    }
+}
+
+#[cfg(feature = "gpu-b-native")]
+#[test]
+fn admitted_population_auto_runs_generation_zero_on_real_cuda() {
+    if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "SKIPPED admitted_population_auto_runs_generation_zero_on_real_cuda — \
+             set NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on the RTX host"
+        );
+        return;
+    }
+
+    crate::backend::install_evaluation_backend(
+        crate::backend::EvaluationBackend::parse("cuda_required")
+            .expect("typed CUDA-required backend"),
+    )
+    .expect("install CUDA-required evaluation backend");
+    crate::genetic::set_migration_enabled(false);
+
+    let (scope, features, ohlcv) = parent(400);
+    let admission = crate::acquire_strict_discovery_device_admission_v1()
+        .expect("real RTX strict-device admission");
+    let run = begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv)
+        .expect("seal resident parent on the admitted RTX route");
+
+    let mut config = crate::discovery::DiscoveryConfig::default();
+    config.population = 200;
+    config.population_auto = true;
+    config.generations = 0;
+    config.max_indicators = 5;
+    config.evaluation_symbol = "EURUSD".to_owned();
+    config.timeframe_label = "M15".to_owned();
+    config.evaluation_spread_pips = 1.2;
+    config.evaluation_commission_per_trade = 7.0;
+    config.target_profile.min_payoff_ratio = 0.5;
+
+    let stage1_len = ((features.n_samples() as f64
+        * config.runtime_overrides.resolved_funnel_stage1_pct()) as usize)
+        .min(features.n_samples());
+    assert!(stage1_len > 0 && stage1_len < features.n_samples());
+    let stage1_start = 0usize;
+    let stage1_end = stage1_len;
+    let stage1_features = features
+        .row_window(stage1_start, stage1_end)
+        .expect("exact Stage1 feature view");
+    let stage1_ohlcv = Ohlcv {
+        timestamp: ohlcv
+            .timestamp
+            .as_ref()
+            .map(|values| values[stage1_start..stage1_end].to_vec()),
+        open: ohlcv.open[stage1_start..stage1_end].to_vec(),
+        high: ohlcv.high[stage1_start..stage1_end].to_vec(),
+        low: ohlcv.low[stage1_start..stage1_end].to_vec(),
+        close: ohlcv.close[stage1_start..stage1_end].to_vec(),
+        volume: ohlcv
+            .volume
+            .as_ref()
+            .map(|values| values[stage1_start..stage1_end].to_vec()),
+    };
+
+    let primitives = run
+        .population_auto_sizing_primitives_v1()
+        .expect("borrow admitted no-probe sizing facts");
+    assert!(matches!(
+        primitives.route,
+        crate::PopulationAutoSizingRouteV1::NativeCuda { .. }
+    ));
+    let stage1_window =
+        crate::population_auto_sizing_receipt_v1::seal_population_auto_stage1_window_v1(
+            &primitives.parent_dataset_identity_sha256,
+            "selection_stage1",
+            stage1_start,
+            stage1_end,
+        )
+        .expect("seal exact Stage1 sizing identity");
+    let receipt = crate::population_auto_sizing_receipt_v1::seal_population_auto_sizing_receipt_v1(
+        crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRequestV1 {
+            population_auto: config.population_auto,
+            configured_population: config.population,
+            resident_parent_rows: primitives.resident_parent_rows,
+            evaluation_rows: stage1_len,
+            feature_count: primitives.feature_count,
+            month_capacity: crate::eval::current_backtest_runtime_overrides().month_capacity,
+            requested_max_indicators: config.max_indicators,
+            migration_enabled: false,
+            parent_canonical_scope_identity_sha256: primitives
+                .parent_canonical_scope_identity_sha256,
+            parent_dataset_identity_sha256: primitives.parent_dataset_identity_sha256,
+            stage1_window,
+            route: primitives.route,
+        },
+    )
+    .expect("seal admitted population-auto sizing receipt");
+    assert_eq!(receipt.configured_population(), 200);
+    assert!(
+        receipt.resolved_population() > receipt.configured_population(),
+        "the real RTX receipt must widen this M15-shaped generation-0 fixture"
+    );
+
+    let mut evaluation_config = config.evaluation_config(stage1_ohlcv.close.last().copied());
+    // This synthetic fixture has no installed broker research contract. Give
+    // it explicit EURUSD contract economics so the strict authority and the
+    // native evaluator exercise the same finite money-per-pip inputs.
+    evaluation_config.pip_value = 0.0001;
+    evaluation_config.pip_value_per_lot = 10.0;
+    let authority = crate::run_identity::build_population_auto_search_authority_v1(
+        &config,
+        &receipt,
+        evaluation_config.pip_value_per_lot,
+        neoethos_data::current_data_runtime_overrides().normalize_features,
+    )
+    .expect("build strict receipt-linked search authority");
+    let result = crate::genetic::evolve_search_with_progress_and_limits_exact(
+        &stage1_features,
+        &stage1_ohlcv,
+        receipt.resolved_population(),
+        0,
+        config.max_indicators,
+        None,
+        Some(evaluation_config),
+        &run,
+        ExactResidentDatasetViewRequestV1::ContiguousRange {
+            start: stage1_start,
+            end: stage1_end,
+        },
+        &authority,
+        |_, _, _, _, _| {},
+    )
+    .expect("execute exact generation zero on the admitted CUDA route");
+    assert_eq!(result.genes.len(), receipt.resolved_population());
+
+    let completed = run.finish().expect("complete exact CUDA execution receipt");
+    assert!(
+        completed
+            .engines()
+            .contains(&PopulationEvalEngine::CudaNativeF64),
+        "generation zero must record a successful native f64 population"
+    );
+}
+
+#[test]
 fn one_parent_is_sealed_once_and_views_derive_without_raw_parent_access() {
     let source = include_str!("population_execution_evidence_v1.rs");
     let begin = source

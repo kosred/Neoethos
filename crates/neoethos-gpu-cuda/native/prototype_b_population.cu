@@ -23,8 +23,13 @@
 // correctness failure, not a tuning opportunity.
 
 #include "neoethos_gpu_cuda.h"
+#include "resident_exact_log_v3.cuh"
+#include "resident_generation_v1_abi.cuh"
+#include "resident_generation_v2_abi.cuh"
+#include "resident_search_generation_v2_abi.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #include <climits>
 #include <cstring>
@@ -335,6 +340,18 @@ struct DeviceGenes {
   const double* smc_weights;
   double gate_threshold;
   int smc_gate_disabled;
+  const neoethos::resident_generation_v2::NeoResidentGenerationDeviceSealV2*
+      resident_seal_v2;
+  const neoethos::resident_generation_v2::NeoResidentSearchDeviceControlV2*
+      resident_control_v2;
+  unsigned long long expected_generation_index_v2;
+  unsigned long long expected_store_epoch_v2;
+  unsigned long long expected_run_token_v2;
+  unsigned long long expected_population_v2;
+  unsigned long long expected_feature_count_v2;
+  unsigned int expected_max_terms_v2;
+  unsigned int expected_smc_slots_v2;
+  unsigned char expected_plan_identity_v2[32];
   // No `population`. It bounded the old `candidate >= genes.population` early
   // return, and the thread's identity is the SCENARIO now — the gene index
   // comes from the descriptor and is validated against the uploaded population
@@ -343,6 +360,89 @@ struct DeviceGenes {
   // never reads is exactly the shape of the phantom event buffer that had the
   // host reserving VRAM for an allocation that did not exist.
 };
+
+__device__ inline double f64_from_raw_bits_v2(std::uint64_t bits) {
+  union {
+    std::uint64_t bits;
+    double value;
+  } representation{};
+  representation.bits = bits;
+  return representation.value;
+}
+
+__device__ inline void poison_resident_gene_seal_v2(
+    const neoethos::resident_generation_v2::NeoResidentGenerationDeviceSealV2* seal,
+    unsigned int fault_code) {
+  if (seal == nullptr) return;
+  auto* mutable_seal = const_cast<
+      neoethos::resident_generation_v2::NeoResidentGenerationDeviceSealV2*>(seal);
+  atomicCAS(&mutable_seal->fault_code, 0u, fault_code);
+  atomicOr(&mutable_seal->flags,
+           neoethos::resident_generation_v2::NEO_RESIDENT_GENERATION_SEAL_POISONED_V2);
+}
+
+__device__ inline bool resident_gene_view_is_valid_v2(const DeviceGenes& genes,
+                                                       int candidate) {
+  using namespace neoethos::resident_generation_v2;
+  const auto* seal = genes.resident_seal_v2;
+  const auto* control = genes.resident_control_v2;
+  if (seal == nullptr || control == nullptr ||
+      seal->abi_version != NEO_RESIDENT_GENERATION_GENE_VIEW_ABI_V2 ||
+      (seal->flags & NEO_RESIDENT_GENERATION_SEAL_INITIALIZED_V2) == 0u ||
+      (seal->flags & NEO_RESIDENT_GENERATION_SEAL_POISONED_V2) != 0u ||
+      (seal->flags & ~(NEO_RESIDENT_GENERATION_SEAL_INITIALIZED_V2 |
+                       NEO_RESIDENT_GENERATION_SEAL_SMC_GATE_DISABLED_V2 |
+                       NEO_RESIDENT_GENERATION_SEAL_POISONED_V2)) != 0u ||
+      seal->fault_code != 0u || seal->current_store_index > 1u ||
+      seal->generation_index != genes.expected_generation_index_v2 ||
+      seal->store_epoch != genes.expected_store_epoch_v2 ||
+      seal->run_token != genes.expected_run_token_v2 ||
+      seal->logical_population_count != genes.expected_population_v2 ||
+      seal->feature_count != genes.expected_feature_count_v2 ||
+      seal->max_terms_per_gene != genes.expected_max_terms_v2 ||
+      seal->smc_flag_count != genes.expected_smc_slots_v2 ||
+      seal->scalar_store[seal->current_store_index] == nullptr ||
+      seal->term_index_store[seal->current_store_index] == nullptr ||
+      seal->term_weight_store[seal->current_store_index] == nullptr ||
+      seal->smc_weights == nullptr ||
+      control->abi_version != NEO_RESIDENT_GENERATION_GENE_VIEW_ABI_V2 ||
+      control->fault_word != 0u || control->generation_index != seal->generation_index ||
+      control->current_store_index != seal->current_store_index || control->reserved != 0u ||
+      candidate < 0 || static_cast<std::uint64_t>(candidate) >=
+                           seal->logical_population_count) {
+    poison_resident_gene_seal_v2(seal, 1u);
+    return false;
+  }
+  for (int byte = 0; byte < 32; ++byte) {
+    if (seal->plan_identity_sha256[byte] != genes.expected_plan_identity_v2[byte]) {
+      poison_resident_gene_seal_v2(seal, 2u);
+      return false;
+    }
+  }
+  const auto& scalar = seal->scalar_store[seal->current_store_index][candidate];
+  if (scalar.term_count == 0u || scalar.term_count > seal->max_terms_per_gene ||
+      scalar.generation != static_cast<unsigned int>(seal->generation_index) ||
+      (scalar.smc_flags >> seal->smc_flag_count) != 0u ||
+      !isfinite(scalar.long_threshold) || !isfinite(scalar.short_threshold) ||
+      !isfinite(scalar.target_pips) || !isfinite(scalar.stop_pips) ||
+      !isfinite(scalar.stop_vol_multiplier)) {
+    poison_resident_gene_seal_v2(seal, 3u);
+    return false;
+  }
+  const std::uint64_t base =
+      static_cast<std::uint64_t>(candidate) * seal->max_terms_per_gene;
+  const auto* indices = seal->term_index_store[seal->current_store_index];
+  const auto* weights = seal->term_weight_store[seal->current_store_index];
+  for (unsigned int term = 0; term < scalar.term_count; ++term) {
+    const std::uint64_t feature = indices[base + term];
+    if (feature >= seal->feature_count || feature > static_cast<std::uint64_t>(INT_MAX) ||
+        !isfinite(weights[base + term])) {
+      poison_resident_gene_seal_v2(seal, 4u);
+      return false;
+    }
+  }
+  return true;
+}
 
 /// The work list. One entry per thread of the walk.
 ///
@@ -453,10 +553,17 @@ __global__ void transpose_indicators_to_bar_major(const double* __restrict__ sou
 
 /// The per-candidate half of signal synthesis, computed once per thread.
 struct SignalPlan {
-  int term_start;
-  int term_end;
+  long long term_start;
+  long long term_end;
   double long_threshold;
   double short_threshold;
+  double stop_pips;
+  double target_pips;
+  double stop_vol_multiplier;
+  const std::uint64_t* resident_indices_v2;
+  const double* resident_weights_v2;
+  const double* active_smc_weights;
+  int resident_mode_v2;
   /// `fabs(long - short)` in the canonical f64 threshold domain.
   double gap;
   /// Sum of the weights of this candidate's active SMC slots, ascending.
@@ -485,10 +592,33 @@ __device__ inline SignalPlan build_signal_plan(const DeviceGenes& genes,
                                                int perturbed,
                                                unsigned long long counter) {
   SignalPlan plan;
-  plan.term_start = genes.offsets[candidate];
-  plan.term_end = genes.offsets[candidate + 1];
-  plan.long_threshold = genes.long_thresholds[candidate];
-  plan.short_threshold = genes.short_thresholds[candidate];
+  plan.resident_mode_v2 = genes.resident_seal_v2 == nullptr ? 0 : 1;
+  plan.resident_indices_v2 = nullptr;
+  plan.resident_weights_v2 = nullptr;
+  if (plan.resident_mode_v2 != 0) {
+    const auto* seal = genes.resident_seal_v2;
+    const unsigned int store = seal->current_store_index;
+    const auto& scalar = seal->scalar_store[store][candidate];
+    plan.term_start = static_cast<long long>(candidate) * seal->max_terms_per_gene;
+    plan.term_end = plan.term_start + scalar.term_count;
+    plan.long_threshold = scalar.long_threshold;
+    plan.short_threshold = scalar.short_threshold;
+    plan.stop_pips = scalar.stop_pips;
+    plan.target_pips = scalar.target_pips;
+    plan.stop_vol_multiplier = scalar.stop_vol_multiplier;
+    plan.resident_indices_v2 = seal->term_index_store[store];
+    plan.resident_weights_v2 = seal->term_weight_store[store];
+    plan.active_smc_weights = seal->smc_weights;
+  } else {
+    plan.term_start = genes.offsets[candidate];
+    plan.term_end = genes.offsets[candidate + 1];
+    plan.long_threshold = genes.long_thresholds[candidate];
+    plan.short_threshold = genes.short_thresholds[candidate];
+    plan.stop_pips = genes.stop_pips[candidate];
+    plan.target_pips = genes.target_pips[candidate];
+    plan.stop_vol_multiplier = genes.stop_vol_multipliers[candidate];
+    plan.active_smc_weights = genes.smc_weights;
+  }
   plan.perturbed = perturbed;
   plan.rng_counter = counter;
   if (perturbed != 0) {
@@ -509,17 +639,36 @@ __device__ inline SignalPlan build_signal_plan(const DeviceGenes& genes,
   unsigned mask = 0u;
   double active_sum = 0.0;
   for (int slot = 0; slot < kSmcSlots; ++slot) {
-    if (genes.smc_flags[static_cast<long long>(candidate) * kSmcSlots + slot] != 0) {
+    const bool active = plan.resident_mode_v2 != 0
+                            ? ((genes.resident_seal_v2
+                                    ->scalar_store[genes.resident_seal_v2->current_store_index]
+                                      [candidate]
+                                    .smc_flags >>
+                                slot) &
+                               1u) != 0u
+                            : genes.smc_flags[static_cast<long long>(candidate) * kSmcSlots +
+                                              slot] != 0;
+    if (active) {
       mask |= (1u << slot);
-      active_sum += genes.smc_weights[slot];
+      active_sum += plan.active_smc_weights[slot];
     }
   }
-  if (genes.smc_gate_disabled != 0) {
+  const bool gate_disabled =
+      plan.resident_mode_v2 != 0
+          ? (genes.resident_seal_v2->flags &
+             neoethos::resident_generation_v2::
+                 NEO_RESIDENT_GENERATION_SEAL_SMC_GATE_DISABLED_V2) != 0u
+          : genes.smc_gate_disabled != 0;
+  if (gate_disabled) {
     active_sum = 0.0;
   }
   plan.smc_mask = mask;
   plan.active_sum = active_sum;
-  plan.gate = fmin(genes.gate_threshold, active_sum);
+  const double gate_threshold =
+      plan.resident_mode_v2 != 0
+          ? f64_from_raw_bits_v2(genes.resident_control_v2->gate_threshold_bits)
+          : genes.gate_threshold;
+  plan.gate = fmin(gate_threshold, active_sum);
   return plan;
 }
 
@@ -534,9 +683,14 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
   // accumulation order bit for bit.
   double combined = 0.0;
   if (plan.perturbed == 0) {
-    for (int term = plan.term_start; term < plan.term_end; ++term) {
-      const int feature = genes.indices[term];
-      combined += genes.weights[term] * population_feature_at(dataset, bar, feature);
+    for (long long term = plan.term_start; term < plan.term_end; ++term) {
+      const int feature = plan.resident_mode_v2 != 0
+                              ? static_cast<int>(plan.resident_indices_v2[term])
+                              : genes.indices[term];
+      const double weight = plan.resident_mode_v2 != 0
+                                ? plan.resident_weights_v2[term]
+                                : genes.weights[term];
+      combined += weight * population_feature_at(dataset, bar, feature);
     }
   } else {
     // The perturbed loop is written out rather than folded into the one above
@@ -549,11 +703,16 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
     // first term is always draw 2 whatever its offset into the shared CSR
     // arrays is. Using `term` directly would make a gene's perturbation depend
     // on how many terms the genes before it had.
-    for (int term = plan.term_start; term < plan.term_end; ++term) {
-      const int feature = genes.indices[term];
+    for (long long term = plan.term_start; term < plan.term_end; ++term) {
+      const int feature = plan.resident_mode_v2 != 0
+                              ? static_cast<int>(plan.resident_indices_v2[term])
+                              : genes.indices[term];
       const unsigned long long ordinal =
           static_cast<unsigned long long>(term - plan.term_start);
-      const double weight = genes.weights[term] *
+      const double base_weight = plan.resident_mode_v2 != 0
+                                     ? plan.resident_weights_v2[term]
+                                     : genes.weights[term];
+      const double weight = base_weight *
                             perturb_factor(plan.rng_counter, kDrawWeightBase + ordinal,
                                            kMcWeightAmplitude);
       combined += weight * population_feature_at(dataset, bar, feature);
@@ -588,10 +747,10 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
           dataset.smc_rows[static_cast<long long>(parent_row) * kSmcSlots + slot];
       if (slot == 5) {
         if (row == 1) {
-          score += genes.smc_weights[slot];
+          score += plan.active_smc_weights[slot];
         }
       } else if (row == signal) {
-        score += genes.smc_weights[slot];
+        score += plan.active_smc_weights[slot];
       }
     }
     passes_gate = score >= plan.gate;
@@ -610,14 +769,12 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
 // ---------------------------------------------------------------------------
 
 __device__ inline void entry_stop_target_pips(const DeviceDataset& dataset,
-                                              const DeviceGenes& genes,
                                               const NeoPopulationSettings& settings,
                                               const SignalPlan& plan,
-                                              int candidate,
                                               int signal_bar,
                                               double* stop_pips,
                                               double* target_pips) {
-  const double multiplier = genes.stop_vol_multipliers[candidate];
+  const double multiplier = plan.stop_vol_multiplier;
   if (multiplier > 0.0 && dataset.has_adaptive_base != 0 && signal_bar < dataset.bars) {
     const double distance = dataset.adaptive_base_pips[signal_bar];
     const double stop = multiplier * distance;
@@ -628,8 +785,8 @@ __device__ inline void entry_stop_target_pips(const DeviceDataset& dataset,
       return;
     }
   }
-  double stop = genes.stop_pips[candidate];
-  double target = genes.target_pips[candidate];
+  double stop = plan.stop_pips;
+  double target = plan.target_pips;
   if (plan.perturbed != 0) {
     // The draws come AFTER the weights, so their indices depend on this gene's
     // term count — which is why the plan carries the CSR window rather than the
@@ -663,6 +820,239 @@ __device__ inline void entry_stop_target_pips(const DeviceDataset& dataset,
 // budgeting VRAM for a buffer with no allocation (the `session->events`
 // phantom), so they are removed rather than left as documentation of a design
 // that is no longer in the file.
+
+// ---------------------------------------------------------------------------
+// Stage 2.5: resident adaptive-stop base (view-local, no host price/base copy)
+// ---------------------------------------------------------------------------
+
+constexpr int kResidentAdaptiveVolWindowV1 = 50;
+constexpr int kResidentAdaptiveTailWindowV1 = 100;
+constexpr int kResidentAdaptiveTailQuantileIndexV1 = 2;
+constexpr double kAdaptiveBaseDegenerateSentinelV1 = -1.0;
+
+struct alignas(8) ResidentAdaptiveControlV1 {
+  double median;
+  std::int32_t status;
+  std::uint32_t reserved;
+};
+
+static_assert(sizeof(ResidentAdaptiveControlV1) == 16,
+              "resident adaptive control must fit the pre-gap lifetime");
+
+__device__ inline double resident_adaptive_safe_log_v1(double value) {
+  double output = 0.0;
+  if (!neoethos_exact_math_v3::exact_log_positive_f64_v3(fmax(value, 1.0e-12),
+                                                          &output)) {
+    return __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
+  }
+  return output;
+}
+
+__global__ void resident_adaptive_parkinson_kernel_v1(DeviceDataset dataset,
+                                                       double* output) {
+  constexpr double denominator = 4.0 * 0.693147180559945309417232121458176568;
+  for (int bar = blockIdx.x * blockDim.x + threadIdx.x; bar < dataset.bars;
+       bar += blockDim.x * gridDim.x) {
+    const int parent_bar = population_parent_row(dataset, bar);
+    const double high_log = resident_adaptive_safe_log_v1(dataset.high[parent_bar]);
+    const double low_log = resident_adaptive_safe_log_v1(dataset.low[parent_bar]);
+    const double range = high_log - low_log;
+    output[bar] = (range * range) / denominator;
+  }
+}
+
+// One lane preserves the canonical host rolling accumulator order exactly:
+// add current -> emit -> subtract oldest. The only serial work is two cheap
+// operations per row; logarithms and ES scans remain row-parallel.
+__global__ void resident_adaptive_rolling_sigma_kernel_v1(double* values, int rows) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  __shared__ double ring[kResidentAdaptiveVolWindowV1];
+  double sum = 0.0;
+  for (int row = 0; row < rows; ++row) {
+    const int slot = row % kResidentAdaptiveVolWindowV1;
+    ring[slot] = values[row];
+    sum += ring[slot];
+    if (row + 1 >= kResidentAdaptiveVolWindowV1) {
+      values[row] = sqrt(fmax(sum / static_cast<double>(kResidentAdaptiveVolWindowV1), 0.0));
+      sum -= ring[(row + 1) % kResidentAdaptiveVolWindowV1];
+    } else {
+      values[row] = __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
+    }
+  }
+}
+
+__device__ inline double resident_adaptive_tail_es_v1(const DeviceDataset& dataset,
+                                                       int output_bar,
+                                                       unsigned long long tail_step) {
+  if (output_bar < kResidentAdaptiveTailWindowV1) {
+    return 0.0;
+  }
+  const unsigned long long delta =
+      static_cast<unsigned long long>(output_bar - kResidentAdaptiveTailWindowV1);
+  const int sample_bar = kResidentAdaptiveTailWindowV1 +
+                         static_cast<int>((delta / tail_step) * tail_step);
+  const int first_return_bar = sample_bar - kResidentAdaptiveTailWindowV1 + 1;
+  const double positive_infinity =
+      __longlong_as_double(static_cast<long long>(0x7ff0000000000000ULL));
+  double smallest = positive_infinity;
+  double second = positive_infinity;
+  double third = positive_infinity;
+  for (int bar = first_return_bar; bar <= sample_bar; ++bar) {
+    const int parent_bar = population_parent_row(dataset, bar);
+    const int previous_parent_bar = population_parent_row(dataset, bar - 1);
+    const double value = resident_adaptive_safe_log_v1(dataset.close[parent_bar]) -
+                         resident_adaptive_safe_log_v1(dataset.close[previous_parent_bar]);
+    if (value < smallest) {
+      third = second;
+      second = smallest;
+      smallest = value;
+    } else if (value < second) {
+      third = second;
+      second = value;
+    } else if (value < third) {
+      third = value;
+    }
+  }
+
+  double loss_sum = 0.0;
+  int loss_count = 0;
+  for (int bar = first_return_bar; bar <= sample_bar; ++bar) {
+    const int parent_bar = population_parent_row(dataset, bar);
+    const int previous_parent_bar = population_parent_row(dataset, bar - 1);
+    const double value = resident_adaptive_safe_log_v1(dataset.close[parent_bar]) -
+                         resident_adaptive_safe_log_v1(dataset.close[previous_parent_bar]);
+    if (value <= third) {
+      loss_sum += fabs(value);
+      loss_count += 1;
+    }
+  }
+  return loss_count > 0 ? loss_sum / static_cast<double>(loss_count) : 0.0;
+}
+
+__global__ void resident_adaptive_distance_kernel_v1(
+    DeviceDataset dataset,
+    NeoResidentAdaptiveBaseRequestV1 request,
+    const ResidentAdaptiveControlV1* control,
+    bool finalize,
+    double* output) {
+  const double scale = sqrt(static_cast<double>(request.vol_horizon_bars));
+  for (int bar = blockIdx.x * blockDim.x + threadIdx.x; bar < dataset.bars;
+       bar += blockDim.x * gridDim.x) {
+    if (finalize && control->status != NEO_POPULATION_STATUS_OK) {
+      output[bar] = kAdaptiveBaseDegenerateSentinelV1;
+      continue;
+    }
+    const double sigma = output[bar];
+    const int parent_bar = population_parent_row(dataset, bar);
+    const double close = dataset.close[parent_bar];
+    const double expected_shortfall =
+        resident_adaptive_tail_es_v1(dataset, bar, request.tail_step);
+    const double vol_distance = close * sigma * scale;
+    const double tail_distance = close * expected_shortfall * scale;
+    double distance = fmax(request.stop_k_vol * vol_distance,
+                           request.stop_k_tail * tail_distance);
+    distance = fmax(distance, request.meta_label_min_dist);
+    if (finalize) {
+      if (!isfinite(distance)) {
+        distance = control->median;
+      }
+      output[bar] = fmax(distance / request.pip_size, 1.0e-9);
+    } else {
+      output[bar] = distance;
+    }
+  }
+}
+
+// The host view contract rejects every non-finite adaptive base. A finite
+// distance divided by a positive but subnormal pip size can still overflow,
+// so validate the normalized result as a separate same-stream phase. The
+// sentinel is consumed by population_reduce_kernel before stop selection;
+// invalid adaptive values therefore cannot fall through to fixed stops.
+__global__ void resident_adaptive_validate_normalized_kernel_v1(double* output,
+                                                                 int rows) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int row = 0; row < rows; ++row) {
+    if (!isfinite(output[row])) {
+      output[0] = kAdaptiveBaseDegenerateSentinelV1;
+      return;
+    }
+  }
+}
+
+__device__ double resident_adaptive_select_v1(double* values, int count, int kth) {
+  int left = 0;
+  int right = count - 1;
+  while (left < right) {
+    const double pivot = values[left + (right - left) / 2];
+    int low = left;
+    int high = right;
+    while (low <= high) {
+      while (low <= right && values[low] < pivot) {
+        low += 1;
+      }
+      while (high >= left && values[high] > pivot) {
+        high -= 1;
+      }
+      if (low <= high) {
+        const double temporary = values[low];
+        values[low] = values[high];
+        values[high] = temporary;
+        low += 1;
+        high -= 1;
+      }
+    }
+    if (kth <= high) {
+      right = high;
+    } else if (kth >= low) {
+      left = low;
+    } else {
+      return values[kth];
+    }
+  }
+  return values[kth];
+}
+
+__global__ void resident_adaptive_median_kernel_v1(double* values,
+                                                    int rows,
+                                                    ResidentAdaptiveControlV1* control) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int finite_count = 0;
+  for (int row = 0; row < rows; ++row) {
+    if (isfinite(values[row])) {
+      values[finite_count] = values[row];
+      finite_count += 1;
+    }
+  }
+  if (finite_count == 0) {
+    control->median = __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
+    control->status = NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE;
+    control->reserved = 0u;
+    return;
+  }
+  const int middle = finite_count / 2;
+  const double upper = resident_adaptive_select_v1(values, finite_count, middle);
+  const double median = finite_count % 2 == 0
+                            ? (resident_adaptive_select_v1(values, finite_count, middle - 1) +
+                               upper) /
+                                  2.0
+                            : upper;
+  control->median = median;
+  control->status = isfinite(median) && median > 0.0
+                        ? NEO_POPULATION_STATUS_OK
+                        : NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE;
+  control->reserved = 0u;
+}
+
+__device__ inline bool adaptive_base_failed_v1(const DeviceDataset& dataset) {
+  return dataset.has_adaptive_base != 0 && dataset.adaptive_base_pips != nullptr &&
+         dataset.adaptive_base_pips[0] == kAdaptiveBaseDegenerateSentinelV1;
+}
 
 // ---------------------------------------------------------------------------
 // Stage 3: per-bar gap flags (bar-parallel, candidate-independent)
@@ -850,10 +1240,26 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   if (scenario >= scenarios.count) {
     return;
   }
+  if (adaptive_base_failed_v1(dataset)) {
+    NeoPopulationMetricRow invalid{};
+    invalid.candidate_id = ULLONG_MAX;
+    invalid.scenario_id = scenarios.ids[scenario];
+    invalid.values[0] = kAdaptiveBaseDegenerateSentinelV1;
+    rows[scenario] = invalid;
+    return;
+  }
   const int candidate = static_cast<int>(scenarios.base_candidate_ids[scenario]);
   const unsigned scenario_type = scenarios.types[scenario];
   const unsigned long long scenario_id = scenarios.ids[scenario];
   const bool diagnostics_enabled = outcomes != nullptr;
+  if (genes.resident_seal_v2 != nullptr &&
+      !resident_gene_view_is_valid_v2(genes, candidate)) {
+    NeoPopulationMetricRow invalid{};
+    invalid.candidate_id = ULLONG_MAX;
+    invalid.scenario_id = scenario_id;
+    rows[scenario] = invalid;
+    return;
+  }
 
   // Perturbation is a property of the SCENARIO. `kScenarioPerturb` is the only
   // type that reads `rng_counters`, and no existing caller emits it: the shipped
@@ -1282,7 +1688,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       }
       double entry_stop_pips = 0.0;
       double entry_target_pips = 0.0;
-      entry_stop_target_pips(dataset, genes, settings, signal_plan, candidate, signal_bar,
+      entry_stop_target_pips(dataset, settings, signal_plan, signal_bar,
                              &entry_stop_pips, &entry_target_pips);
       NeoPopulationEvent event;
       event.candidate_id = static_cast<unsigned long long>(candidate);
@@ -1487,7 +1893,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   // The gene's identity and the scenario's, separately. A mixed array shares one
   // `candidate_id` across every scenario of the same gene, and the host demuxes
   // by `scenario_id` — which is why both are carried and neither is a position.
-  row.candidate_id = genes.candidate_ids[candidate];
+  row.candidate_id =
+      genes.resident_seal_v2 != nullptr
+          ? genes.resident_seal_v2
+                ->scalar_store[genes.resident_seal_v2->current_store_index][candidate]
+                .gene_identity
+          : genes.candidate_ids[candidate];
   row.scenario_id = scenario_id;
   row.values[0] = sanitize(net_profit);
   row.values[1] = sharpe;
@@ -1536,6 +1947,18 @@ void device_free(T*& pointer) {
   }
 }
 
+template <typename T>
+bool device_free_checked(T*& pointer) {
+  if (pointer == nullptr) {
+    return true;
+  }
+  if (cudaFree(pointer) != cudaSuccess) {
+    return false;
+  }
+  pointer = nullptr;
+  return true;
+}
+
 }  // namespace
 
 enum class PopulationWorkspaceModeV1 : std::uint32_t {
@@ -1568,6 +1991,19 @@ struct NeoCudaPopulationSession {
   bool has_genes = false;
   bool has_scenarios = false;
   bool metrics_ready = false;
+  bool uses_resident_gene_view_v2 = false;
+  cudaEvent_t generation_ready_event_v2 = nullptr;
+  cudaEvent_t scoring_ready_event_v2 = nullptr;
+  neoethos::resident_generation_v1::NeoResidentGenerationRunV1*
+      resident_generation_run_v2 = nullptr;
+  neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1*
+      resident_scoring_run_v2 = nullptr;
+  neoethos::resident_generation_v2::NeoResidentSearchTerminalReceiptV2*
+      resident_search_terminal_host_receipt_v2 = nullptr;
+  std::uint64_t next_resident_search_admission_ordinal_v2 = 1ull;
+  bool resident_search_runtime_reserved_v2 = false;
+  neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2
+      resident_search_runtime_facts_v2{};
   int bars = 0;
   int parent_rows = 0;
   int feature_count = 0;
@@ -1575,6 +2011,7 @@ struct NeoCudaPopulationSession {
   int view_start = 0;
   int timestamp_mode = static_cast<int>(NEO_POPULATION_TIMESTAMP_CANONICAL);
   int population = 0;
+  int resident_planned_population_v2 = 0;
   /// Threads the walk launches, and the extent of every workspace array.
   ///
   /// This used to be implicitly equal to `population` — one scenario per gene,
@@ -1602,6 +2039,10 @@ struct NeoCudaPopulationSession {
   PopulationWorkspaceModeV1 workspace_mode = PopulationWorkspaceModeV1::Uninitialized;
   PopulationStrictExecutionStateV1 strict_execution_state =
       PopulationStrictExecutionStateV1::StrictIdle;
+  // Address of the Rust-owned boxed launch receipt. Event ids are scoped to a
+  // session and can collide across sessions, so they are not sufficient
+  // authority for consuming resident work.
+  const NeoPopulationResidentMetricsHandleV1* strict_receipt_token = nullptr;
   // How many outcome records `read_diagnostics` may copy back.
   //
   // Named for an event stream that no longer exists. It is NOT a count of
@@ -1619,6 +2060,9 @@ struct NeoCudaPopulationSession {
   std::uint64_t synchronization_events = 0ull;
   NeoPopulationResidencyCountersV1 residency_counters{};
   NeoPopulationDeviceIdentityV1 device_identity{};
+  CUcontext admitted_primary_context_v3 = nullptr;
+  std::uint64_t allocator_context_reserve_bytes_v3 = 64ull * 1024ull * 1024ull;
+  std::uint8_t run_stream_process_token_v3[32]{};
 
   double* close = nullptr;
   double* high = nullptr;
@@ -1732,6 +2176,106 @@ struct NeoCudaPopulationSession {
     // resident authority (or vice versa).
   }
 
+  bool release_scenarios_checked_v2() {
+    return device_free_checked(scenario_base_candidate_ids) &&
+           device_free_checked(scenario_ids) &&
+           device_free_checked(scenario_rng_counters) &&
+           device_free_checked(scenario_window_offsets) &&
+           device_free_checked(scenario_window_lens) &&
+           device_free_checked(scenario_types) &&
+           device_free_checked(scenario_spread_ticks) &&
+           device_free_checked(scenario_slippage_ticks) &&
+           device_free_checked(scenario_commission_micros);
+  }
+
+  bool release_workspace_checked_v2() {
+    if (!device_free_checked(outcomes) || !device_free_checked(monthly_pnls) ||
+        !device_free_checked(month_start_equities) ||
+        !device_free_checked(metric_rows) ||
+        !device_free_checked(accepted_trade_total)) {
+      return false;
+    }
+    workspace_scenarios = 0;
+    workspace_bars = 0;
+    month_capacity = 0;
+    return true;
+  }
+
+  bool release_terminal_checked_v2() {
+    if (!release_workspace_checked_v2()) {
+      return false;
+    }
+    if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {
+      if (!device_free_checked(close) || !device_free_checked(high) ||
+          !device_free_checked(low) ||
+          !device_free_checked(indicators_bar_major) ||
+          !device_free_checked(indicators_feature_major) ||
+          !device_free_checked(months) || !device_free_checked(days) ||
+          !device_free_checked(timestamps) || !device_free_checked(smc_rows)) {
+        return false;
+      }
+    } else {
+      close = nullptr;
+      high = nullptr;
+      low = nullptr;
+      indicators_bar_major = nullptr;
+      indicators_feature_major = nullptr;
+      months = nullptr;
+      days = nullptr;
+      timestamps = nullptr;
+      smc_rows = nullptr;
+    }
+    indicators_validity_u4 = nullptr;
+    indicators_validity_u4_bytes = 0;
+    if (!device_free_checked(view_indices) ||
+        !device_free_checked(adaptive_base_pips) ||
+        !device_free_checked(gap_flags) || !device_free_checked(candidate_ids) ||
+        !device_free_checked(gene_offsets) || !device_free_checked(gene_indices) ||
+        !device_free_checked(gene_weights) ||
+        !device_free_checked(long_thresholds) ||
+        !device_free_checked(short_thresholds) || !device_free_checked(stop_pips) ||
+        !device_free_checked(target_pips) ||
+        !device_free_checked(stop_vol_multipliers) ||
+        !device_free_checked(smc_flags) || !device_free_checked(smc_weights) ||
+        !release_scenarios_checked_v2()) {
+      return false;
+    }
+    view_indices_capacity = 0;
+    adaptive_base_pips_capacity = 0;
+    if (event != nullptr) {
+      if (cudaEventDestroy(event) != cudaSuccess) {
+        return false;
+      }
+      event = nullptr;
+    }
+    if (generation_ready_event_v2 != nullptr) {
+      if (cudaEventDestroy(generation_ready_event_v2) != cudaSuccess) {
+        return false;
+      }
+      generation_ready_event_v2 = nullptr;
+    }
+    if (scoring_ready_event_v2 != nullptr) {
+      if (cudaEventDestroy(scoring_ready_event_v2) != cudaSuccess) {
+        return false;
+      }
+      scoring_ready_event_v2 = nullptr;
+    }
+    if (resident_search_terminal_host_receipt_v2 != nullptr) {
+      if (resident_generation_run_v2 != nullptr ||
+          cudaFreeHost(resident_search_terminal_host_receipt_v2) != cudaSuccess) {
+        return false;
+      }
+      resident_search_terminal_host_receipt_v2 = nullptr;
+    }
+    if (stream != nullptr && stream_ownership == NEO_POPULATION_STREAM_OWNED) {
+      if (cudaStreamDestroy(stream) != cudaSuccess) {
+        return false;
+      }
+    }
+    stream = nullptr;
+    return true;
+  }
+
   void release() {
     release_workspace();
     if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {
@@ -1778,6 +2322,19 @@ struct NeoCudaPopulationSession {
       cudaEventDestroy(event);
       event = nullptr;
     }
+    if (generation_ready_event_v2 != nullptr) {
+      cudaEventDestroy(generation_ready_event_v2);
+      generation_ready_event_v2 = nullptr;
+    }
+    if (scoring_ready_event_v2 != nullptr) {
+      cudaEventDestroy(scoring_ready_event_v2);
+      scoring_ready_event_v2 = nullptr;
+    }
+    if (resident_search_terminal_host_receipt_v2 != nullptr &&
+        resident_generation_run_v2 == nullptr) {
+      cudaFreeHost(resident_search_terminal_host_receipt_v2);
+      resident_search_terminal_host_receipt_v2 = nullptr;
+    }
     if (stream != nullptr && stream_ownership == NEO_POPULATION_STREAM_OWNED) {
       cudaStreamDestroy(stream);
     }
@@ -1797,6 +2354,157 @@ std::int32_t strict_population_host_boundary_status_v1(
   return session->strict_execution_state == PopulationStrictExecutionStateV1::Poisoned
              ? NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED
              : NEO_POPULATION_STATUS_STRICT_RESIDENT_IN_FLIGHT;
+}
+
+bool bytes_nonzero_v2(const std::uint8_t* bytes, std::size_t count) {
+  std::uint8_t aggregate = 0;
+  for (std::size_t index = 0; index < count; ++index) {
+    aggregate |= bytes[index];
+  }
+  return aggregate != 0;
+}
+
+std::int32_t population_status_from_generation_v2(std::int32_t native_status) {
+  if (native_status ==
+      neoethos::resident_generation_v1::
+          NEO_RESIDENT_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2) {
+    return NEO_POPULATION_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN;
+  }
+  if (native_status ==
+      neoethos::resident_generation_v1::
+          NEO_RESIDENT_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2) {
+    return NEO_POPULATION_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN;
+  }
+  return native_status;
+}
+
+std::int32_t population_status_from_scoring_v2(std::int32_t native_status) {
+  if (native_status ==
+      neoethos::resident_scoring_novelty_v1::
+          NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2) {
+    return NEO_POPULATION_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN;
+  }
+  if (native_status ==
+      neoethos::resident_scoring_novelty_v1::
+          NEO_SCORING_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2) {
+    return NEO_POPULATION_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN;
+  }
+  return native_status;
+}
+
+bool runtime_facts_equal_v2(
+    const neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2& left,
+    const neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2& right) {
+  return left.abi_version == right.abi_version &&
+         left.selected_cuda_ordinal == right.selected_cuda_ordinal &&
+         left.run_admission_ordinal == right.run_admission_ordinal &&
+         std::memcmp(left.device_uuid, right.device_uuid, sizeof(left.device_uuid)) == 0 &&
+         left.compute_capability_major == right.compute_capability_major &&
+         left.compute_capability_minor == right.compute_capability_minor &&
+         left.primary_context_id == right.primary_context_id &&
+         left.run_stream_id == right.run_stream_id &&
+         left.admitted_primary_context == right.admitted_primary_context &&
+         left.admitted_run_stream == right.admitted_run_stream &&
+         left.admitted_memory_pool == right.admitted_memory_pool &&
+         left.pool_location_type == right.pool_location_type &&
+         left.pool_location_id == right.pool_location_id &&
+         left.pool_allocation_type == right.pool_allocation_type &&
+         left.pool_handle_types == right.pool_handle_types &&
+         left.active_pool_is_default == right.active_pool_is_default &&
+         left.reserved == 0u && right.reserved == 0u &&
+         left.pool_reserved_current_bytes == right.pool_reserved_current_bytes &&
+         left.pool_used_current_bytes == right.pool_used_current_bytes &&
+         left.allocator_context_reserve_bytes == right.allocator_context_reserve_bytes &&
+         std::memcmp(left.run_stream_process_token,
+                     right.run_stream_process_token,
+                     sizeof(left.run_stream_process_token)) == 0;
+}
+
+std::int32_t read_resident_search_runtime_facts_v2(
+    NeoCudaPopulationSession* session, std::uint64_t admission_ordinal,
+    neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2* facts) {
+  using neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2;
+  if (session == nullptr || facts == nullptr || session->stream == nullptr ||
+      session->admitted_primary_context_v3 == nullptr || admission_ordinal == 0ull ||
+      session->allocator_context_reserve_bytes_v3 == 0ull ||
+      !bytes_nonzero_v2(session->run_stream_process_token_v3,
+                        sizeof(session->run_stream_process_token_v3))) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  CUcontext current_context = nullptr;
+  CUcontext stream_context = nullptr;
+  CUdevice stream_device = -1;
+  unsigned long long context_id = 0ull;
+  unsigned long long stream_id = 0ull;
+  // cudaStream_t and CUstream are distinct typedefs for the same driver-owned
+  // 64-bit stream representation. This is the sole bridge cast; every queried
+  // context/device/id is checked before the representation is admitted.
+  static_assert(sizeof(cudaStream_t) == sizeof(CUstream));
+  static_assert(alignof(cudaStream_t) == alignof(CUstream));
+  const CUstream driver_stream = reinterpret_cast<CUstream>(session->stream);
+  if (cuCtxGetCurrent(&current_context) != CUDA_SUCCESS ||
+      current_context != session->admitted_primary_context_v3 ||
+      cuStreamGetCtx(driver_stream, &stream_context) != CUDA_SUCCESS ||
+      stream_context != current_context ||
+      cuStreamGetDevice(driver_stream, &stream_device) != CUDA_SUCCESS ||
+      stream_device != session->device ||
+      cuCtxGetId(current_context, &context_id) != CUDA_SUCCESS ||
+      context_id == 0ull ||
+      cuStreamGetId(driver_stream, &stream_id) != CUDA_SUCCESS ||
+      stream_id == 0ull) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  cudaMemPool_t active_pool = nullptr;
+  cudaMemPool_t default_pool = nullptr;
+  std::uint64_t reserved_current = 0;
+  std::uint64_t used_current = 0;
+  if (cudaDeviceGetMemPool(&active_pool, session->device) != cudaSuccess ||
+      cudaDeviceGetDefaultMemPool(&default_pool, session->device) != cudaSuccess ||
+      active_pool == nullptr || active_pool != default_pool ||
+      cudaMemPoolGetAttribute(active_pool, cudaMemPoolAttrReservedMemCurrent,
+                              &reserved_current) != cudaSuccess ||
+      cudaMemPoolGetAttribute(active_pool, cudaMemPoolAttrUsedMemCurrent,
+                              &used_current) != cudaSuccess ||
+      used_current > reserved_current) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  *facts = {};
+  facts->abi_version =
+      neoethos::resident_search_generation_v2::NEO_RESIDENT_SEARCH_GENERATION_ABI_V2;
+  facts->selected_cuda_ordinal = static_cast<std::uint32_t>(session->device);
+  facts->run_admission_ordinal = admission_ordinal;
+  std::memcpy(facts->device_uuid, session->device_identity.uuid,
+              sizeof(facts->device_uuid));
+  facts->compute_capability_major = static_cast<std::uint32_t>(properties.major);
+  facts->compute_capability_minor = static_cast<std::uint32_t>(properties.minor);
+  facts->primary_context_id = context_id;
+  facts->run_stream_id = stream_id;
+  facts->admitted_primary_context = current_context;
+  facts->admitted_run_stream = session->stream;
+  facts->admitted_memory_pool = active_pool;
+  // The active pool is required to be CUDA's default device pool above; its
+  // immutable creation properties are therefore exact rather than inferred
+  // from an arbitrary custom pool.
+  facts->pool_location_type = static_cast<std::uint32_t>(cudaMemLocationTypeDevice);
+  facts->pool_location_id = session->device;
+  facts->pool_allocation_type = static_cast<std::uint32_t>(cudaMemAllocationTypePinned);
+  facts->pool_handle_types = static_cast<std::uint32_t>(cudaMemHandleTypeNone);
+  facts->active_pool_is_default = 1u;
+  facts->pool_reserved_current_bytes = reserved_current;
+  facts->pool_used_current_bytes = used_current;
+  facts->allocator_context_reserve_bytes =
+      session->allocator_context_reserve_bytes_v3;
+  std::memcpy(facts->run_stream_process_token,
+              session->run_stream_process_token_v3,
+              sizeof(facts->run_stream_process_token));
+  return NEO_POPULATION_STATUS_OK;
 }
 
 struct GeneHostStagingV1 {
@@ -2001,6 +2709,35 @@ extern "C" NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
     delete session;
     return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
   }
+  if (cuCtxGetCurrent(&session->admitted_primary_context_v3) != CUDA_SUCCESS ||
+      session->admitted_primary_context_v3 == nullptr) {
+    session->release();
+    delete session;
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  // Mint a process-lifetime stream token from the actual device UUID and
+  // driver-owned context/stream representations. It is never persisted as a
+  // raw handle and the run-scoped ordinal is bound separately at admission.
+  std::uint64_t process_lane = 14695981039346656037ull;
+  const auto mix_process_byte = [&](std::uint8_t byte) {
+    process_lane = (process_lane ^ byte) * 1099511628211ull;
+  };
+  for (const std::uint8_t byte : session->device_identity.uuid) {
+    mix_process_byte(byte);
+  }
+  const std::uintptr_t context_representation =
+      reinterpret_cast<std::uintptr_t>(session->admitted_primary_context_v3);
+  const std::uintptr_t stream_representation =
+      reinterpret_cast<std::uintptr_t>(session->stream);
+  for (std::size_t byte = 0; byte < sizeof(context_representation); ++byte) {
+    mix_process_byte(static_cast<std::uint8_t>(context_representation >> (8u * byte)));
+    mix_process_byte(static_cast<std::uint8_t>(stream_representation >> (8u * byte)));
+  }
+  for (std::size_t lane = 0; lane < 4; ++lane) {
+    process_lane = (process_lane ^ lane) * 1099511628211ull;
+    std::memcpy(session->run_stream_process_token_v3 + lane * sizeof(process_lane),
+                &process_lane, sizeof(process_lane));
+  }
   session->residency_counters.stream_creation_count = 1ull;
   if (status != nullptr) {
     *status = NEO_POPULATION_STATUS_OK;
@@ -2040,7 +2777,10 @@ neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
                           sizeof(resident->admission_identity_sha256)) ||
       !hash_is_nonzero_v3(resident->canonical_content_merkle,
                           sizeof(resident->canonical_content_merkle)) ||
-      !hash_is_nonzero_v3(resident->device_uuid, sizeof(resident->device_uuid))) {
+      !hash_is_nonzero_v3(resident->device_uuid, sizeof(resident->device_uuid)) ||
+      resident->allocator_context_reserve_bytes == 0ull ||
+      !hash_is_nonzero_v3(resident->run_stream_process_token_v3,
+                          sizeof(resident->run_stream_process_token_v3))) {
     return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
   }
   const std::uint64_t cells =
@@ -2078,6 +2818,12 @@ neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
   }
   session->device = current_device;
   session->stream = resident->admitted_run_stream;
+  session->admitted_primary_context_v3 = resident->admitted_primary_context;
+  session->allocator_context_reserve_bytes_v3 =
+      resident->allocator_context_reserve_bytes;
+  std::memcpy(session->run_stream_process_token_v3,
+              resident->run_stream_process_token_v3,
+              sizeof(session->run_stream_process_token_v3));
   session->stream_ownership = NEO_POPULATION_STREAM_BORROWED;
   session->parent_ownership = NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3;
   const auto fail_session = [&](std::int32_t code) -> NeoCudaPopulationSession* {
@@ -2147,7 +2893,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
   }
-  if (strict_population_work_blocks_host_boundary_v1(session)) {
+  if (strict_population_work_blocks_host_boundary_v1(session) ||
+      session->resident_generation_run_v2 != nullptr) {
     return strict_population_host_boundary_status_v1(session);
   }
   if (session->parent_ownership == NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3) {
@@ -2532,6 +3279,168 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_view_v1(
   return NEO_POPULATION_STATUS_OK;
 }
 
+extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationEvaluationViewV1* view,
+    const NeoResidentAdaptiveBaseRequestV1* request) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (view == nullptr || request == nullptr ||
+      session->parent_ownership != NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3 ||
+      session->close == nullptr || session->high == nullptr || session->low == nullptr ||
+      session->gap_flags == nullptr || view->adaptive_base_pips != nullptr ||
+      view->adaptive_base_pips_len != 0 || view->ordered_indices != nullptr ||
+      view->ordered_index_count != 0 ||
+      view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (request->abi_version != NEOETHOS_GPU_ABI_VERSION ||
+      request->view_kind != view->view_kind ||
+      request->parent_row_count != view->parent_row_count ||
+      request->view_start != view->range_start ||
+      request->view_row_count != view->row_count ||
+      request->vol_window != kResidentAdaptiveVolWindowV1 ||
+      request->vol_horizon_bars != 5u ||
+      request->tail_window != kResidentAdaptiveTailWindowV1 ||
+      request->tail_quantile_index != kResidentAdaptiveTailQuantileIndexV1 ||
+      request->tail_step == 0ull || !isfinite(request->pip_size) ||
+      request->pip_size <= 0.0 || request->stop_k_vol != 1.0 ||
+      request->stop_k_tail != 1.25 || request->meta_label_min_dist != 0.0 ||
+      view->row_count < 101ull ||
+      (request->tail_max_bars > 0ull && view->row_count > request->tail_max_bars)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (view->row_count > static_cast<std::uint64_t>(INT_MAX) ||
+      view->parent_row_count > static_cast<std::uint64_t>(INT_MAX) ||
+      view->parent_row_count < sizeof(ResidentAdaptiveControlV1)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (session->kernel_submissions > UINT64_MAX - 8ull) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+
+  const std::size_t rows = static_cast<std::size_t>(view->row_count);
+  std::int32_t status = ensure_device_capacity_v3(&session->adaptive_base_pips,
+                                                   &session->adaptive_base_pips_capacity,
+                                                   rows);
+  if (status != NEO_POPULATION_STATUS_OK) {
+    return status;
+  }
+  status = neoethos_gpu_cuda_population_bind_view_v1(session, view);
+  if (status != NEO_POPULATION_STATUS_OK) {
+    return status;
+  }
+
+  DeviceDataset dataset{};
+  dataset.close = session->close;
+  dataset.high = session->high;
+  dataset.low = session->low;
+  dataset.indicators_bar_major = session->indicators_bar_major;
+  dataset.indicators_feature_major = session->indicators_feature_major;
+  dataset.months = session->months;
+  dataset.days = session->days;
+  dataset.timestamps = session->timestamps;
+  dataset.smc_rows = session->smc_rows;
+  dataset.view_indices = nullptr;
+  dataset.adaptive_base_pips = session->adaptive_base_pips;
+  dataset.has_adaptive_base = 1;
+  dataset.bars = static_cast<int>(rows);
+  dataset.parent_rows = session->parent_rows;
+  dataset.feature_count = session->feature_count;
+  dataset.view_kind = session->view_kind;
+  dataset.view_start = session->view_start;
+  dataset.timestamp_mode = session->timestamp_mode;
+
+  // resident_adaptive_control shares gap_flags only before gap generation.
+  // The admitted plan already charges the full parent-sized gap allocation;
+  // these 16 bytes have a disjoint same-stream lifetime and add no allocation.
+  auto* control = reinterpret_cast<ResidentAdaptiveControlV1*>(session->gap_flags);
+  const unsigned int blocks = static_cast<unsigned int>((rows + 255u) / 256u);
+  resident_adaptive_parkinson_kernel_v1<<<blocks, 256, 0, session->stream>>>(
+      dataset, session->adaptive_base_pips);
+  resident_adaptive_rolling_sigma_kernel_v1<<<1, 1, 0, session->stream>>>(
+      session->adaptive_base_pips, static_cast<int>(rows));
+  resident_adaptive_distance_kernel_v1<<<blocks, 256, 0, session->stream>>>(
+      dataset, *request, control, false, session->adaptive_base_pips);
+  resident_adaptive_median_kernel_v1<<<1, 1, 0, session->stream>>>(
+      session->adaptive_base_pips, static_cast<int>(rows), control);
+  resident_adaptive_parkinson_kernel_v1<<<blocks, 256, 0, session->stream>>>(
+      dataset, session->adaptive_base_pips);
+  resident_adaptive_rolling_sigma_kernel_v1<<<1, 1, 0, session->stream>>>(
+      session->adaptive_base_pips, static_cast<int>(rows));
+  resident_adaptive_distance_kernel_v1<<<blocks, 256, 0, session->stream>>>(
+      dataset, *request, control, true, session->adaptive_base_pips);
+  resident_adaptive_validate_normalized_kernel_v1<<<1, 1, 0, session->stream>>>(
+      session->adaptive_base_pips, static_cast<int>(rows));
+  if (cudaGetLastError() != cudaSuccess) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+  }
+
+  session->kernel_submissions += 8ull;
+  session->has_adaptive_base = 1;
+  // adaptive_upload_bytes must remain zero: the base was produced from the
+  // resident parent and never crossed a host/device transfer boundary.
+  return NEO_POPULATION_STATUS_OK;
+}
+
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_copy_resident_adaptive_base_fixture_v1(
+    NeoCudaPopulationSession* session,
+    double* host_values,
+    std::size_t value_count) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (host_values == nullptr || value_count == 0u ||
+      value_count != static_cast<std::size_t>(session->bars) ||
+      session->adaptive_base_pips == nullptr || session->has_adaptive_base == 0 ||
+      session->adaptive_base_pips_capacity < value_count ||
+      value_count > SIZE_MAX / sizeof(double)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  const std::size_t bytes = value_count * sizeof(double);
+  const auto rows_u64 = static_cast<std::uint64_t>(value_count);
+  const auto bytes_u64 = static_cast<std::uint64_t>(bytes);
+  if (static_cast<std::size_t>(rows_u64) != value_count ||
+      static_cast<std::size_t>(bytes_u64) != bytes ||
+      session->residency_counters.explicit_synchronization_count == UINT64_MAX ||
+      session->residency_counters.diagnostic_readback_count == UINT64_MAX ||
+      rows_u64 > UINT64_MAX - session->residency_counters.diagnostic_readback_rows ||
+      bytes_u64 > UINT64_MAX - session->residency_counters.diagnostic_readback_bytes) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (cudaMemcpyAsync(host_values, session->adaptive_base_pips, bytes,
+                      cudaMemcpyDeviceToHost, session->stream) != cudaSuccess) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_TRANSFER_FAILED;
+  }
+  if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_SYNC_FAILED;
+  }
+  session->residency_counters.explicit_synchronization_count += 1ull;
+  session->residency_counters.diagnostic_readback_count += 1ull;
+  session->residency_counters.diagnostic_readback_rows += rows_u64;
+  session->residency_counters.diagnostic_readback_bytes += bytes_u64;
+  return NEO_POPULATION_STATUS_OK;
+}
+#endif
+
 extern "C" std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(
     NeoCudaPopulationSession* session,
     NeoPopulationResidencyCountersV1* counters) {
@@ -2614,6 +3523,18 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
       return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
     }
   }
+  // The prior generation's descriptor arrays and strict workspace are no
+  // longer observable once a new gene upload begins. Release them before the
+  // new unsplittable gene store is allocated, so peak VRAM is the checked
+  // parent + NEW genes + NEW strict scenario plan. Keeping the old workspace
+  // alive here made a smaller next batch coexist with a larger previous batch,
+  // which no steady-state byte plan could represent safely.
+  session->release_scenarios();
+  session->release_workspace();
+  session->scenario_count = 0;
+  session->scenario_upload_bytes = 0ull;
+  session->has_scenarios = false;
+  session->metrics_ready = false;
   // Host-side staging of the descriptor-derived arrays keeps the device layout
   // flat and coalesced without changing canonical identity or ordering.
   auto* staging = new (std::nothrow) GeneHostStagingV1();
@@ -2738,6 +3659,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
       (population + 1) * sizeof(int) + terms * (sizeof(int) + sizeof(double)) +
       kSmcSlots * sizeof(double));
   session->has_genes = true;
+  session->uses_resident_gene_view_v2 = false;
   session->has_scenarios = false;
   session->metrics_ready = false;
   return NEO_POPULATION_STATUS_OK;
@@ -3736,15 +4658,20 @@ std::int32_t ensure_metrics_only_workspace_v1(NeoCudaPopulationSession* session,
   }
 
   if (session->metric_rows != nullptr) {
-    if (session->workspace_scenarios != scenario_count ||
-        session->month_capacity != month_capacity) {
-      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
-    }
     if (session->monthly_pnls == nullptr || session->month_start_equities == nullptr ||
         session->outcomes != nullptr || session->accepted_trade_total != nullptr) {
       return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
     }
-    return NEO_POPULATION_STATUS_OK;
+    if (session->workspace_scenarios == scenario_count &&
+        session->month_capacity == month_capacity) {
+      return NEO_POPULATION_STATUS_OK;
+    }
+    // Strict execution is idle before this function is reachable. A search may
+    // legitimately change its scenario count after a split or population
+    // update; rebuild the same metrics-only workspace at the new exact extent.
+    // release_workspace deliberately retains StrictMetricsOnly mode, so this
+    // cannot relabel compatibility allocations or introduce outcome storage.
+    session->release_workspace();
   }
   if (session->monthly_pnls != nullptr || session->month_start_equities != nullptr ||
       session->outcomes != nullptr || session->accepted_trade_total != nullptr ||
@@ -3779,6 +4706,8 @@ std::int32_t ensure_metrics_only_workspace_v1(NeoCudaPopulationSession* session,
 std::int32_t enqueue_population_evaluation_v1(
     NeoCudaPopulationSession* session,
     const NeoPopulationSettings* settings,
+    const neoethos::resident_generation_v2::NeoResidentGenerationGeneViewV2*
+        resident_genes_v2,
     PopulationEvaluationModeV1 mode,
     NeoPopulationResidentMetricsHandleV1* resident_metrics,
     std::uint64_t* compatibility_event_id,
@@ -3789,14 +4718,38 @@ std::int32_t enqueue_population_evaluation_v1(
   if (strict_population_work_blocks_host_boundary_v1(session)) {
     return strict_population_host_boundary_status_v1(session);
   }
+  const bool resident_gene_mode = resident_genes_v2 != nullptr;
+  const auto* resident_control_v2 =
+      resident_gene_mode ? resident_genes_v2->control_device : nullptr;
   if (settings == nullptr ||
       (mode == PopulationEvaluationModeV1::StrictMetricsOnly && resident_metrics == nullptr) ||
       (mode == PopulationEvaluationModeV1::CompatibilityDeviceParity &&
        compatibility_event_id == nullptr)) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  if (!session->has_dataset || !session->has_genes || !session->has_scenarios) {
+  if (!session->has_dataset || !session->has_scenarios ||
+      (!resident_gene_mode && !session->has_genes)) {
     return NEO_POPULATION_STATUS_MISSING_UPLOAD;
+  }
+  if (resident_gene_mode) {
+    if (mode != PopulationEvaluationModeV1::StrictMetricsOnly ||
+        !session->uses_resident_gene_view_v2 || session->has_genes ||
+        session->resident_generation_run_v2 == nullptr ||
+        resident_genes_v2->logical_population_count !=
+            static_cast<std::uint64_t>(session->population) ||
+        resident_genes_v2->feature_count !=
+            static_cast<std::uint64_t>(session->feature_count) ||
+        resident_genes_v2->smc_flag_count != kSmcSlots ||
+        neoethos::resident_generation_v2::validate_resident_gene_view_owner_v2(
+            session->resident_generation_run_v2, resident_genes_v2) !=
+            neoethos::resident_generation_v1::NEO_RESIDENT_STATUS_OK_V1) {
+      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+    }
+    cudaPointerAttributes attributes{};
+    if (cudaPointerGetAttributes(&attributes, resident_control_v2) != cudaSuccess ||
+        attributes.type != cudaMemoryTypeDevice || attributes.device != session->device) {
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+    }
   }
   if (settings->abi_version != NEOETHOS_GPU_ABI_VERSION) {
     return NEO_POPULATION_STATUS_ABI_MISMATCH;
@@ -3836,20 +4789,35 @@ std::int32_t enqueue_population_evaluation_v1(
   dataset.view_start = session->view_start;
   dataset.timestamp_mode = session->timestamp_mode;
 
-  DeviceGenes genes;
-  genes.candidate_ids = session->candidate_ids;
-  genes.offsets = session->gene_offsets;
-  genes.indices = session->gene_indices;
-  genes.weights = session->gene_weights;
-  genes.long_thresholds = session->long_thresholds;
-  genes.short_thresholds = session->short_thresholds;
-  genes.stop_pips = session->stop_pips;
-  genes.target_pips = session->target_pips;
-  genes.stop_vol_multipliers = session->stop_vol_multipliers;
-  genes.smc_flags = session->smc_flags;
-  genes.smc_weights = session->smc_weights;
-  genes.gate_threshold = session->gate_threshold;
-  genes.smc_gate_disabled = session->smc_gate_disabled;
+  DeviceGenes genes{};
+  if (resident_gene_mode) {
+    genes.resident_seal_v2 = resident_genes_v2->seal_device;
+    genes.resident_control_v2 = resident_genes_v2->control_device;
+    genes.expected_generation_index_v2 = resident_genes_v2->expected_generation_index;
+    genes.expected_store_epoch_v2 = resident_genes_v2->expected_store_epoch;
+    genes.expected_run_token_v2 = resident_genes_v2->expected_run_token;
+    genes.expected_population_v2 = resident_genes_v2->logical_population_count;
+    genes.expected_feature_count_v2 = resident_genes_v2->feature_count;
+    genes.expected_max_terms_v2 = resident_genes_v2->max_terms_per_gene;
+    genes.expected_smc_slots_v2 = resident_genes_v2->smc_flag_count;
+    std::memcpy(genes.expected_plan_identity_v2,
+                resident_genes_v2->plan_identity_sha256, 32);
+  } else
+  {
+    genes.candidate_ids = session->candidate_ids;
+    genes.offsets = session->gene_offsets;
+    genes.indices = session->gene_indices;
+    genes.weights = session->gene_weights;
+    genes.long_thresholds = session->long_thresholds;
+    genes.short_thresholds = session->short_thresholds;
+    genes.stop_pips = session->stop_pips;
+    genes.target_pips = session->target_pips;
+    genes.stop_vol_multipliers = session->stop_vol_multipliers;
+    genes.smc_flags = session->smc_flags;
+    genes.smc_weights = session->smc_weights;
+    genes.gate_threshold = session->gate_threshold;
+    genes.smc_gate_disabled = session->smc_gate_disabled;
+  }
 
   DeviceScenarios scenario_view;
   scenario_view.base_candidate_ids = session->scenario_base_candidate_ids;
@@ -3962,6 +4930,7 @@ std::int32_t enqueue_population_evaluation_v1(
     resident_metrics->total_device_bytes = resident_plan.total_device_bytes;
     resident_metrics->outcome_bytes = 0ull;
     resident_metrics->accepted_trade_total_bytes = 0ull;
+    session->strict_receipt_token = resident_metrics;
   } else {
     *compatibility_event_id = session->pending_event_id;
   }
@@ -3985,9 +4954,23 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
     const NeoPopulationSettings* settings,
     NeoPopulationResidentMetricsHandleV1* resident_metrics,
     NeoPopulationCounters* counters) {
-  return enqueue_population_evaluation_v1(session, settings,
-                                          PopulationEvaluationModeV1::StrictMetricsOnly,
-                                          resident_metrics, nullptr, counters);
+  return enqueue_population_evaluation_v1(session, settings, nullptr,
+                                           PopulationEvaluationModeV1::StrictMetricsOnly,
+                                           resident_metrics, nullptr, counters);
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(
+    NeoCudaPopulationSession* session,
+    const neoethos::resident_generation_v2::NeoResidentGenerationGeneViewV2* genes,
+    const NeoPopulationSettings* settings,
+    NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationCounters* counters) {
+  if (genes == nullptr || genes->control_device == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  return enqueue_population_evaluation_v1(
+      session, settings, genes, PopulationEvaluationModeV1::StrictMetricsOnly,
+      resident_metrics, nullptr, counters);
 }
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
@@ -4018,6 +5001,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_re
       session->event == nullptr ||
       !metrics_only_byte_plan_v1(1, session->month_capacity, &expected_plan) ||
       resident_metrics->abi_version != NEOETHOS_GPU_ABI_VERSION ||
+      session->strict_receipt_token != resident_metrics ||
       resident_metrics->reserved != 0u || resident_metrics->event_id == 0ull ||
       resident_metrics->event_id != session->pending_event_id ||
       resident_metrics->scenario_count != 1ull ||
@@ -4049,6 +5033,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_re
                  sizeof(NeoPopulationMetricRow), cudaMemcpyDeviceToHost) != cudaSuccess) {
     return poison(NEO_POPULATION_STATUS_TRANSFER_FAILED);
   }
+  if (compact_result->metric_row.candidate_id == ULLONG_MAX &&
+      compact_result->metric_row.values[0] == kAdaptiveBaseDegenerateSentinelV1) {
+    return poison(NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE);
+  }
   compact_result->abi_version = NEOETHOS_GPU_ABI_VERSION;
   compact_result->event_id = resident_metrics->event_id;
   compact_result->scenario_count = 1ull;
@@ -4058,8 +5046,129 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_re
   compact_result->terminal_readback_bytes = sizeof(NeoPopulationMetricRow);
   session->metrics_ready = false;
   session->pending_event_id = 0ull;
+  session->strict_receipt_token = nullptr;
   session->strict_execution_state = PopulationStrictExecutionStateV1::StrictIdle;
   return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_consume_host_metrics_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationReadback* readback,
+    NeoPopulationHostMetricsResultV1* result) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  const auto poison = [&](std::int32_t status) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return status;
+  };
+  if (session->strict_execution_state != PopulationStrictExecutionStateV1::InFlight) {
+    return session->strict_execution_state == PopulationStrictExecutionStateV1::Poisoned
+               ? NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED
+               : NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (resident_metrics == nullptr || readback == nullptr || result == nullptr ||
+      readback->rows == nullptr || readback->written == nullptr) {
+    return poison(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+
+  MetricsOnlyBytePlanV1 expected_plan;
+  if (session->workspace_mode != PopulationWorkspaceModeV1::StrictMetricsOnly ||
+      session->workspace_scenarios <= 0 ||
+      session->scenario_count != session->workspace_scenarios ||
+      session->month_capacity <= 0 || session->metric_rows == nullptr ||
+      session->monthly_pnls == nullptr || session->month_start_equities == nullptr ||
+      session->outcomes != nullptr || session->accepted_trade_total != nullptr ||
+      session->event == nullptr || session->strict_receipt_token != resident_metrics ||
+      !metrics_only_byte_plan_v1(session->workspace_scenarios, session->month_capacity,
+                                 &expected_plan) ||
+      resident_metrics->abi_version != NEOETHOS_GPU_ABI_VERSION ||
+      resident_metrics->reserved != 0u || resident_metrics->event_id == 0ull ||
+      resident_metrics->event_id != session->pending_event_id ||
+      resident_metrics->scenario_count !=
+          static_cast<std::uint64_t>(session->workspace_scenarios) ||
+      resident_metrics->month_capacity != static_cast<std::uint64_t>(session->month_capacity) ||
+      resident_metrics->metric_rows_bytes != expected_plan.metric_rows_bytes ||
+      resident_metrics->monthly_pnls_bytes != expected_plan.monthly_pnls_bytes ||
+      resident_metrics->month_start_equities_bytes != expected_plan.month_start_equities_bytes ||
+      resident_metrics->scenario_descriptor_bytes != expected_plan.scenario_descriptor_bytes ||
+      resident_metrics->total_device_bytes != expected_plan.total_device_bytes ||
+      resident_metrics->outcome_bytes != 0ull ||
+      resident_metrics->accepted_trade_total_bytes != 0ull) {
+    return poison(NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH);
+  }
+
+  const std::size_t rows = static_cast<std::size_t>(session->workspace_scenarios);
+  if (readback->capacity != rows || rows > SIZE_MAX / sizeof(NeoPopulationMetricRow)) {
+    return poison(readback->capacity == rows ? NEO_POPULATION_STATUS_INVALID_ARGUMENT
+                                             : NEO_POPULATION_STATUS_READBACK_CAPACITY);
+  }
+  const std::size_t bytes = rows * sizeof(NeoPopulationMetricRow);
+  const auto rows_u64 = static_cast<std::uint64_t>(rows);
+  const auto bytes_u64 = static_cast<std::uint64_t>(bytes);
+  if (static_cast<std::size_t>(rows_u64) != rows ||
+      static_cast<std::size_t>(bytes_u64) != bytes ||
+      bytes_u64 != expected_plan.metric_rows_bytes ||
+      session->synchronization_events == UINT64_MAX ||
+      session->residency_counters.explicit_synchronization_count == UINT64_MAX ||
+      session->residency_counters.metric_rows_readback_count == UINT64_MAX ||
+      rows_u64 > UINT64_MAX - session->residency_counters.metric_rows_readback_rows ||
+      bytes_u64 > UINT64_MAX - session->residency_counters.metric_rows_readback_bytes) {
+    return poison(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  if (cudaEventSynchronize(session->event) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_SYNC_FAILED);
+  }
+  if (cudaGetLastError() != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_LAUNCH_FAILED);
+  }
+  if (cudaMemcpy(readback->rows, session->metric_rows, bytes,
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_TRANSFER_FAILED);
+  }
+  for (std::size_t row = 0; row < rows; ++row) {
+    if (readback->rows[row].candidate_id == ULLONG_MAX &&
+        readback->rows[row].values[0] == kAdaptiveBaseDegenerateSentinelV1) {
+      return poison(NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE);
+    }
+  }
+
+  *readback->written = rows;
+  std::memset(result, 0, sizeof(NeoPopulationHostMetricsResultV1));
+  result->abi_version = NEOETHOS_GPU_ABI_VERSION;
+  result->event_id = resident_metrics->event_id;
+  result->scenario_count = rows_u64;
+  result->terminal_synchronization_count = 1ull;
+  result->terminal_readback_count = 1ull;
+  result->terminal_readback_rows = rows_u64;
+  result->terminal_readback_bytes = bytes_u64;
+  session->synchronization_events += 1ull;
+  session->residency_counters.explicit_synchronization_count += 1ull;
+  session->residency_counters.metric_rows_readback_count += 1ull;
+  session->residency_counters.metric_rows_readback_rows += rows_u64;
+  session->residency_counters.metric_rows_readback_bytes += bytes_u64;
+  session->metrics_ready = false;
+  session->pending_event_id = 0ull;
+  session->strict_receipt_token = nullptr;
+  session->strict_execution_state = PopulationStrictExecutionStateV1::StrictIdle;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  const bool exact_owner = resident_metrics != nullptr &&
+                           session->strict_receipt_token == resident_metrics;
+  session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+  return exact_owner ? NEO_POPULATION_STATUS_OK
+                     : NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
 }
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
@@ -4067,8 +5176,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     const NeoPopulationSettings* settings,
     std::uint64_t* event_id,
     NeoPopulationCounters* counters) {
-  return enqueue_population_evaluation_v1(session, settings,
-                                          PopulationEvaluationModeV1::CompatibilityDeviceParity,
+  return enqueue_population_evaluation_v1(session, settings, nullptr,
+                                           PopulationEvaluationModeV1::CompatibilityDeviceParity,
                                           nullptr, event_id, counters);
 }
 
@@ -4237,17 +5346,36 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
   return NEO_POPULATION_STATUS_OK;
 }
 
-extern "C" void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session) {
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_destroy_terminal_checked_v2(
+    NeoCudaPopulationSession* session) {
   if (session == nullptr) {
-    return;
+    return NEO_POPULATION_STATUS_NULL_SESSION;
   }
-  if (strict_population_work_blocks_host_boundary_v1(session)) {
-    // Leak-only fail-closed teardown. `release()` uses synchronous CUDA frees;
-    // those cannot run until a future resident stage consumes the event on the
-    // same stream and atomically clears strict execution state.
-    return;
+  if (strict_population_work_blocks_host_boundary_v1(session) ||
+      session->resident_generation_run_v2 != nullptr ||
+      session->resident_scoring_run_v2 != nullptr ||
+      session->strict_receipt_token != nullptr ||
+      session->pending_event_id != 0ull) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  cudaSetDevice(session->device);
-  session->release();
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  if (!session->release_terminal_checked_v2()) {
+    // The session remains the explicit tombstone owner of every pointer/event
+    // whose release was not acknowledged. Never delete it or authorize reuse.
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+  }
   delete session;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session) {
+  // Compatibility ABI intentionally ignores the status, but the checked
+  // implementation never deletes a session whose cleanup was not proven.
+  (void)neoethos_gpu_cuda_population_destroy_terminal_checked_v2(session);
 }

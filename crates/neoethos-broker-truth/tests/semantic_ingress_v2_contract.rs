@@ -7,20 +7,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use neoethos_broker_truth::{
     BrokerFinancialOperationV1, BrokerFinancialTruthArtifactSourceV1,
-    BrokerFinancialTruthBindingV1, BrokerFinancialTruthBundleManifestV2,
-    BrokerFinancialTruthBundleStoreV1, BrokerFinancialTruthSemanticIngressErrorCodeV2,
-    BrokerFinancialTruthVortexSchemaV1, EvidenceWindowV1, ExactBrokerRequestChunkV2,
-    ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1, ExactConversionRouteEvidenceV2,
-    ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2, ExactSymbolContractEvidenceV2,
-    ImmutableVortexArtifactV1, QuoteSideV1, ReviewedQuoteReplayRuleEvidenceV2,
+    BrokerFinancialTruthAuthoritySourceClassV2, BrokerFinancialTruthBindingV1,
+    BrokerFinancialTruthBundleManifestV2, BrokerFinancialTruthBundleStoreV1,
+    BrokerFinancialTruthEvidenceClassV2, BrokerFinancialTruthSemanticIngressErrorCodeV2,
+    BrokerFinancialTruthVortexSchemaV1, BrokerTruthAcquisitionArtifactRoleV1,
+    BrokerTruthAcquisitionArtifactSourceV1, BrokerTruthAcquisitionArtifactV1,
+    BrokerTruthAcquisitionAuthorityManifestV1, BrokerTruthAcquisitionLinkReceiptV1,
+    BrokerTruthAcquisitionPromotionEligibilityV1, BrokerTruthAcquisitionSemanticStatusV1,
+    BrokerTruthAcquisitionStoreV1, BrokerTruthReviewedSynchronizationBindingV1, EvidenceWindowV1,
+    ExactBrokerRequestChunkV2, ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1,
+    ExactConversionRouteEvidenceV2, ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2,
+    ExactSymbolContractEvidenceV2, ImmutableVortexArtifactV1, QuoteSideV1,
+    ReviewedBrokerFinancialTruthEvidenceV2, ReviewedQuoteReplayRuleEvidenceV2,
     ReviewedQuoteReplayRuleIdentityV2, SynchronizedBidAskEvidenceV2,
     current_broker_financial_truth_capability_v1,
     inspect_untrusted_broker_financial_truth_bundle_v2,
+    validate_reviewed_broker_financial_truth_authority_v2,
 };
 use neoethos_dataset_contracts::{
     BarTimestampConvention, CTraderEnvironment, CanonicalDatasetIdentity, CanonicalTimeframe,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use vortex_array::IntoArray;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinArray};
 use vortex_array::scalar_fn::session::ScalarFnSession;
@@ -37,9 +45,10 @@ const SYMBOL_ID: i64 = 42;
 const WINDOW_FROM: i64 = 1_700_000_000_000;
 const WINDOW_TO: i64 = WINDOW_FROM + 60_000;
 const TICK_TIMESTAMP: i64 = WINDOW_FROM + 30_000;
-const REVIEW_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const PROTOCOL_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const OBSERVATION_SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const CANONICAL_RUN_BYTES: &[u8] = b"exact canonical run receipt fixture v2";
+const REVIEW_RECORD_BYTES: &[u8] = b"reviewed quote semantics fixture v2";
+const PROTOCOL_EVIDENCE_BYTES: &[u8] = b"reviewed cTrader protocol fixture v2";
+const TRUST_ROOT_BYTES: &[u8] = b"offline fixture trust root v2";
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 static VORTEX_RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
@@ -72,6 +81,12 @@ impl Drop for FixtureRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+struct AuthorityFixture {
+    store: BrokerTruthAcquisitionStoreV1,
+    link_receipt: BrokerTruthAcquisitionLinkReceiptV1,
+    reviewed: ReviewedBrokerFinancialTruthEvidenceV2,
 }
 
 struct ArtifactBuilder {
@@ -150,7 +165,7 @@ struct EvidenceRow {
 
 #[test]
 fn structurally_consistent_synthetic_bundle_remains_explicitly_untrusted() {
-    let (_root, verified) = fixture(Tamper::None);
+    let (_root, verified, _authority) = fixture(Tamper::None);
     let ingress = inspect_untrusted_broker_financial_truth_bundle_v2(verified)
         .expect("synthetic rows may prove only sealed structural ingress");
     assert_eq!(ingress.artifact_count(), 16);
@@ -177,7 +192,7 @@ fn corrupt_or_schema_tampered_vortex_is_refused_before_row_semantics() {
             BrokerFinancialTruthSemanticIngressErrorCodeV2::ArtifactRowCountMismatch,
         ),
     ] {
-        let (_root, verified) = fixture(tamper);
+        let (_root, verified, _authority) = fixture(tamper);
         let error = inspect_untrusted_broker_financial_truth_bundle_v2(verified)
             .expect_err("structural tampering must fail closed");
         assert_eq!(error.code(), expected, "unexpected error: {error}");
@@ -192,7 +207,7 @@ fn raw_decoded_identity_and_tick_mismatches_are_refused() {
         Tamper::GenericRawDecodedLinkMismatch,
         Tamper::DealPageMismatch,
     ] {
-        let (_root, verified) = fixture(tamper);
+        let (_root, verified, _authority) = fixture(tamper);
         let error = inspect_untrusted_broker_financial_truth_bundle_v2(verified)
             .expect_err("raw/decoded divergence must fail closed");
         assert!(
@@ -204,6 +219,64 @@ fn raw_decoded_identity_and_tick_mismatches_are_refused() {
             "unexpected error: {error}"
         );
     }
+}
+
+#[test]
+fn exact_reviewed_fixture_mints_only_a_move_only_run_authority() {
+    let (_root, _verified, fixture) = fixture(Tamper::None);
+    let authority = validate_reviewed_broker_financial_truth_authority_v2(
+        &fixture.store,
+        &fixture.link_receipt,
+        fixture.reviewed,
+    )
+    .expect("exact reviewed semantic fixture mints run-scoped authority");
+    assert_eq!(authority.reviewed_synchronization_count(), 1);
+    assert_eq!(
+        authority.source_artifact_class(),
+        BrokerFinancialTruthAuthoritySourceClassV2::ResearchOnly
+    );
+    assert_eq!(
+        authority.source_semantic_status(),
+        BrokerTruthAcquisitionSemanticStatusV1::UnvalidatedEvidenceOnly
+    );
+    assert_eq!(
+        authority.source_promotion_eligibility(),
+        BrokerTruthAcquisitionPromotionEligibilityV1::NotPromotionEligible
+    );
+    for class in [
+        BrokerFinancialTruthEvidenceClassV2::PrimaryBidAsk,
+        BrokerFinancialTruthEvidenceClassV2::ConversionLegs,
+        BrokerFinancialTruthEvidenceClassV2::ExactSymbolAndAccountContracts,
+        BrokerFinancialTruthEvidenceClassV2::UnrealizedPnl,
+        BrokerFinancialTruthEvidenceClassV2::CloseDealReconciliation,
+    ] {
+        let digest = authority.evidence_class_binding_sha256(class);
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("run authority must not mutate the global V1 gate");
+}
+
+#[test]
+fn reviewed_identity_never_overrides_raw_decoded_semantic_failure() {
+    for tamper in [
+        Tamper::TickRawDecodedMismatch,
+        Tamper::GenericRawDecodedLinkMismatch,
+        Tamper::DealPageMismatch,
+    ] {
+        let (_root, _verified, fixture) = fixture(tamper);
+        validate_reviewed_broker_financial_truth_authority_v2(
+            &fixture.store,
+            &fixture.link_receipt,
+            fixture.reviewed,
+        )
+        .expect_err("review metadata cannot override a semantic class mismatch");
+    }
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("failed reviewed fixtures must leave the global V1 gate closed");
 }
 
 #[test]
@@ -234,13 +307,15 @@ fn fixture(
 ) -> (
     FixtureRoot,
     neoethos_broker_truth::VerifiedImmutableBrokerFinancialTruthBundleV2,
+    AuthorityFixture,
 ) {
     let root = FixtureRoot(unique_root());
     let source_root = root.0.join("sources");
     fs::create_dir_all(&source_root).expect("create source directory");
-    let mut artifacts = ArtifactBuilder::new(source_root);
+    let mut artifacts = ArtifactBuilder::new(source_root.clone());
     let window = EvidenceWindowV1::new(WINDOW_FROM, WINDOW_TO).expect("fixture window");
-    let binding = binding(window);
+    let canonical_run_identity_sha256 = sha256(CANONICAL_RUN_BYTES);
+    let binding = binding(window, &canonical_run_identity_sha256);
 
     let bid_raw_json = tick_response("bid-page", 110_000);
     let ask_raw_json = tick_response("ask-page", 120_000);
@@ -339,9 +414,17 @@ fn fixture(
         evidence_array(&sync_decoded_rows),
         None,
     );
-    let review_identity =
-        ReviewedQuoteReplayRuleIdentityV2::new(REVIEW_SHA, PROTOCOL_SHA, OBSERVATION_SHA)
-            .expect("syntactic review identity only");
+    let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+        sha256(REVIEW_RECORD_BYTES),
+        sha256(PROTOCOL_EVIDENCE_BYTES),
+        observations_raw.sha256(),
+    )
+    .expect("exact fixture review identity");
+    let authority_review_identity = review_identity.clone();
+    let authority_observations_sha256 = observations_raw.sha256().to_owned();
+    let authority_observations_byte_len = observations_raw.byte_len();
+    let authority_rules_sha256 = rules_decoded.sha256().to_owned();
+    let authority_rules_byte_len = rules_decoded.byte_len();
     let replay_rule =
         ReviewedQuoteReplayRuleEvidenceV2::new(review_identity, observations_raw, rules_decoded)
             .expect("review artifact contract");
@@ -640,10 +723,144 @@ fn fixture(
     let verified = store
         .open_exact_v2(&receipt, &binding)
         .expect("integrity reopen before semantic ingress");
-    (root, verified)
+    let authority_source_root = root.0.join("authority-sources");
+    fs::create_dir_all(&authority_source_root).expect("create authority source directory");
+    let scope_bytes = b"exact canonical holdout scope fixture v2";
+    let root_verification_bytes = b"exact canonical root verification fixture v2";
+    let window_binding_bytes = b"exact canonical scope-window binding fixture v2";
+    let capture_plan_bytes = b"exact BFT2 capture plan fixture v2";
+    let base_specs = [
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::CanonicalSearchInputReceipt,
+            "canonical-search-input-receipt.json",
+            CANONICAL_RUN_BYTES,
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::CanonicalSearchArtifactScope,
+            "canonical-search-artifact-scope.json",
+            scope_bytes.as_slice(),
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::CanonicalRootVerificationReceipt,
+            "canonical-root-verification.json",
+            root_verification_bytes.as_slice(),
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::CanonicalScopeWindowBinding,
+            "canonical-scope-window-binding.json",
+            window_binding_bytes.as_slice(),
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::CapturePlan,
+            "broker-truth-capture-plan.json",
+            capture_plan_bytes.as_slice(),
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::ReviewRecord,
+            "quote-replay-review-record.json",
+            REVIEW_RECORD_BYTES,
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::ProtocolEvidence,
+            "ctrader-protocol-evidence.json",
+            PROTOCOL_EVIDENCE_BYTES,
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::TrustRoot,
+            "quote-review-trust-root.pub",
+            TRUST_ROOT_BYTES,
+        ),
+    ];
+    let mut authority_artifacts = Vec::new();
+    let mut authority_sources = Vec::new();
+    for (role, relative_path, bytes) in base_specs {
+        let (artifact, source) =
+            authority_artifact_from_bytes(&authority_source_root, role, relative_path, bytes);
+        authority_artifacts.push(artifact);
+        authority_sources.push(source);
+    }
+    let (observations_artifact, observations_source) = authority_artifact_from_existing(
+        BrokerTruthAcquisitionArtifactRoleV1::QuoteSessionObservations { ordinal: 0 },
+        "quote-session-observations-000.vortex",
+        &source_root.join("primary-quote-session-observations-raw.vortex"),
+        &authority_observations_sha256,
+        authority_observations_byte_len,
+    );
+    authority_artifacts.push(observations_artifact);
+    authority_sources.push(observations_source);
+    let (rules_artifact, rules_source) = authority_artifact_from_existing(
+        BrokerTruthAcquisitionArtifactRoleV1::ReviewedQuoteReplayRules { ordinal: 0 },
+        "reviewed-quote-replay-rules-000.vortex",
+        &source_root.join("primary-reviewed-quote-replay-rules-decoded.vortex"),
+        &authority_rules_sha256,
+        authority_rules_byte_len,
+    );
+    authority_artifacts.push(rules_artifact);
+    authority_sources.push(rules_source);
+
+    let synchronization = BrokerTruthReviewedSynchronizationBindingV1::new(
+        0,
+        ACCOUNT_ID,
+        SYMBOL_ID,
+        window,
+        authority_review_identity,
+        authority_rules_sha256,
+    )
+    .expect("exact reviewed synchronization fixture");
+    let canonical_scope_identity_sha256 = sha256(scope_bytes);
+    let canonical_root_verification_sha256 = sha256(root_verification_bytes);
+    let canonical_scope_window_binding_sha256 = sha256(window_binding_bytes);
+    let capture_plan_sha256 = sha256(capture_plan_bytes);
+    let review_record_sha256 = sha256(REVIEW_RECORD_BYTES);
+    let protocol_evidence_sha256 = sha256(PROTOCOL_EVIDENCE_BYTES);
+    let trust_root_sha256 = sha256(TRUST_ROOT_BYTES);
+    let authority_manifest = BrokerTruthAcquisitionAuthorityManifestV1::new(
+        canonical_run_identity_sha256.clone(),
+        canonical_scope_identity_sha256.clone(),
+        canonical_root_verification_sha256.clone(),
+        canonical_scope_window_binding_sha256.clone(),
+        capture_plan_sha256.clone(),
+        trust_root_sha256.clone(),
+        authority_artifacts,
+        vec![synchronization.clone()],
+    )
+    .expect("complete reviewed acquisition fixture");
+    let acquisition_store = BrokerTruthAcquisitionStoreV1::new(root.0.join("store"));
+    let authority_receipt = acquisition_store
+        .publish_authority(&authority_manifest, &authority_sources)
+        .expect("publish reviewed acquisition fixture");
+    let link_receipt = acquisition_store
+        .publish_link(&authority_receipt, &receipt, &binding)
+        .expect("publish reviewed BFT2 link fixture");
+    let reviewed = ReviewedBrokerFinancialTruthEvidenceV2::checked_new(
+        canonical_run_identity_sha256,
+        canonical_scope_identity_sha256,
+        canonical_root_verification_sha256,
+        canonical_scope_window_binding_sha256,
+        capture_plan_sha256,
+        trust_root_sha256,
+        review_record_sha256,
+        protocol_evidence_sha256,
+        receipt.manifest_sha256(),
+        window,
+        vec![synchronization],
+    )
+    .expect("checked independent review fixture");
+    (
+        root,
+        verified,
+        AuthorityFixture {
+            store: acquisition_store,
+            link_receipt,
+            reviewed,
+        },
+    )
 }
 
-fn binding(window: EvidenceWindowV1) -> BrokerFinancialTruthBindingV1 {
+fn binding(
+    window: EvidenceWindowV1,
+    canonical_run_identity_sha256: &str,
+) -> BrokerFinancialTruthBindingV1 {
     let identity = CanonicalDatasetIdentity::ctrader(
         CTraderEnvironment::Demo,
         "demo.ctraderapi.com",
@@ -656,7 +873,7 @@ fn binding(window: EvidenceWindowV1) -> BrokerFinancialTruthBindingV1 {
     .expect("canonical identity");
     BrokerFinancialTruthBindingV1::new(
         &identity,
-        "11".repeat(32),
+        canonical_run_identity_sha256,
         window,
         1,
         "EUR",
@@ -666,6 +883,47 @@ fn binding(window: EvidenceWindowV1) -> BrokerFinancialTruthBindingV1 {
         "USD",
     )
     .expect("binding")
+}
+
+fn authority_artifact_from_bytes(
+    root: &Path,
+    role: BrokerTruthAcquisitionArtifactRoleV1,
+    relative_path: &str,
+    bytes: &[u8],
+) -> (
+    BrokerTruthAcquisitionArtifactV1,
+    BrokerTruthAcquisitionArtifactSourceV1,
+) {
+    let path = root.join(relative_path);
+    fs::write(&path, bytes).expect("write authority input fixture");
+    authority_artifact_from_existing(
+        role,
+        relative_path,
+        &path,
+        &sha256(bytes),
+        bytes.len() as u64,
+    )
+}
+
+fn authority_artifact_from_existing(
+    role: BrokerTruthAcquisitionArtifactRoleV1,
+    relative_path: &str,
+    source_path: &Path,
+    digest: &str,
+    byte_len: u64,
+) -> (
+    BrokerTruthAcquisitionArtifactV1,
+    BrokerTruthAcquisitionArtifactSourceV1,
+) {
+    let artifact = BrokerTruthAcquisitionArtifactV1::new(role, relative_path, digest, byte_len)
+        .expect("authority artifact fixture");
+    let source = BrokerTruthAcquisitionArtifactSourceV1::new(relative_path, source_path)
+        .expect("authority source fixture");
+    (artifact, source)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn quote_side(

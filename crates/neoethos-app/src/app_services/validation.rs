@@ -4,29 +4,31 @@
 //! dataset. Triggered by `--validation-mode` on the CLI; not reachable
 //! from the HTTP server or the existing `--auto-discovery` path.
 //!
-//! Design: sequential per-TF runs that share `DiscoveryConfig::try_from_settings`
-//! so the operator's `config.yaml` drives population / generations /
-//! candidate-count — the in-code defaults are deliberately small for
-//! unit tests and would not give a meaningful pass/fail signal here.
+//! Design: sequential per-TF runs enter through the typed Discovery boundary.
+//! The worker acquires the process lease before it loads Settings, resolves
+//! exact Data, or creates Search inputs; it then applies the validation-only
+//! generation floor to the operator's configured search space.
 //! Each TF gets a hard timeout (`--validation-tf-timeout-secs`) so a
 //! single bad TF cannot stall the whole sweep. The CSV is flushed after
 //! every row so a crash mid-sweep still leaves partial evidence on disk.
 
-use crate::app_services::{
-    ServiceEvent,
-    discovery::{DiscoveryRequest, pin_current_discovery_input, start_discovery_job},
-    jobs::JobState,
-};
+use crate::app_services::jobs::JobState;
 use crate::app_state::AppRuntimeConfig;
+use crate::server::engines_control::{
+    TypedDiscoveryDatasetPolicyV1, TypedDiscoveryExecutionIntentV1,
+    TypedDiscoveryGenerationOverrideV1, TypedDiscoveryOverridesV1, TypedDiscoverySettingsGateV1,
+    TypedHigherTimeframePolicyV1, TypedLegacyExecutionStartErrorV1, TypedLegacyExecutionTerminalV1,
+    start_typed_discovery_execution_v1,
+};
+use crate::server::state::AppApiState;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use neoethos_core::Settings;
-use neoethos_search::{DiscoveryConfig, PropFirmRiskRules};
+use neoethos_data::CanonicalTimeframe;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -110,12 +112,12 @@ const CSV_HEADER: &str = "tf,status,duration_secs,candidate_count,portfolio_coun
 /// Returns the exit code the caller should propagate: 0 if at least one TF
 /// succeeded, 1 otherwise.
 ///
-/// `min_generations` is the GA generation floor applied per TF —
-/// `DiscoveryConfig.generations` is bumped up to this value when the
-/// operator's `config.yaml` set it lower. `0` honors `config.yaml` as-is.
+/// `min_generations` is the GA generation floor applied per TF inside the
+/// admitted worker. `0` honors `config.yaml` as-is.
 pub async fn run_validation_sweep(
     runtime: &AppRuntimeConfig,
     settings: &Settings,
+    state: AppApiState,
     tfs_csv: &str,
     tf_timeout_secs: u64,
     min_generations: usize,
@@ -156,8 +158,7 @@ pub async fn run_validation_sweep(
             "validation-mode: starting TF run"
         );
         let outcome = run_one_tf(
-            runtime,
-            settings,
+            state.clone(),
             &symbol,
             tf,
             Duration::from_secs(tf_timeout_secs),
@@ -257,166 +258,84 @@ fn open_csv_writer(path: &Path) -> Result<File> {
 /// Drive one Discovery job to a terminal state (or timeout) and
 /// distil the result into a single [`TfOutcome`] row.
 async fn run_one_tf(
-    runtime: &AppRuntimeConfig,
-    settings: &Settings,
+    state: AppApiState,
     symbol: &str,
     base_tf: &str,
     tf_timeout: Duration,
     min_generations: usize,
 ) -> TfOutcome {
     let started = Instant::now();
-    let dataset_identity =
-        match crate::app_services::discovery::resolve_unique_background_dataset_identity(
-            &runtime.data_dir,
-            symbol,
-            base_tf,
-        ) {
-            Ok(identity) => identity,
-            Err(error) => {
-                return TfOutcome {
-                    tf: base_tf.to_string(),
-                    status: "DatasetSelectionFailed".to_string(),
-                    duration_secs: started.elapsed().as_secs_f64(),
-                    candidate_count: 0,
-                    portfolio_count: 0,
-                    top_sharpe_is: None,
-                    top_sharpe_oos: None,
-                    top_max_dd_pct: None,
-                    error_message: format!("{error:#}"),
-                };
-            }
-        };
-    // Honor the operator's config.yaml — defaults in code are smaller
-    // than what we need for a meaningful validation signal.
-    let mut config = match DiscoveryConfig::try_from_settings(settings) {
-        Ok(config) => config,
-        Err(error) => {
-            return TfOutcome {
-                tf: base_tf.to_string(),
-                status: "BrokerTruthUnavailable".to_string(),
-                duration_secs: started.elapsed().as_secs_f64(),
-                candidate_count: 0,
-                portfolio_count: 0,
-                top_sharpe_is: None,
-                top_sharpe_oos: None,
-                top_max_dd_pct: None,
-                error_message: format!("{error:#}"),
-            };
+    let base_timeframe = match base_tf.parse::<CanonicalTimeframe>() {
+        Ok(timeframe) => timeframe,
+        Err(error) => return failed_tf_outcome(base_tf, started, "InvalidTimeframe", error),
+    };
+    let higher_timeframes = higher_tfs_for(base_tf)
+        .into_iter()
+        .map(|label| {
+            label
+                .parse::<CanonicalTimeframe>()
+                .expect("validation timeframe ladder contains only canonical labels")
+        })
+        .collect();
+    let overrides = if min_generations == 0 {
+        TypedDiscoveryOverridesV1::default()
+    } else {
+        TypedDiscoveryOverridesV1::checked_new(
+            None,
+            Some(TypedDiscoveryGenerationOverrideV1::Floor(min_generations)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("the nonzero validation generation floor is valid")
+    };
+    let intent = TypedDiscoveryExecutionIntentV1 {
+        symbol: symbol.to_owned(),
+        base_timeframe,
+        higher_timeframes: TypedHigherTimeframePolicyV1::Exact(higher_timeframes),
+        overrides,
+        settings_gate: TypedDiscoverySettingsGateV1::None,
+        dataset_policy: TypedDiscoveryDatasetPolicyV1::Current,
+        training_after_success: false,
+    };
+
+    let mut handle = match start_typed_discovery_execution_v1(state, intent) {
+        Ok(handle) => handle,
+        Err(TypedLegacyExecutionStartErrorV1::Busy(busy)) => {
+            return failed_tf_outcome(
+                base_tf,
+                started,
+                "Busy",
+                format!(
+                    "requested {} while {} is active",
+                    busy.requested(),
+                    busy.active()
+                ),
+            );
         }
-    };
-    // `start_discovery_job` binds evaluation_symbol, timeframe_label and the
-    // temporal higher-timeframe policy from `dataset_identity` + this exact
-    // request. Do not maintain a second symbol/timeframe copy here.
-    // #215: floor the GA generation count so short-data TFs (D1/H4) can't
-    // smoke-test through the sweep with a 0.2s run that produces a tiny
-    // archive. The floor is applied per-TF — `min_generations = 0` skips
-    // the override entirely.
-    if min_generations > 0 && config.generations < min_generations {
-        info!(
-            target: "neoethos_app::validation",
-            tf = %base_tf,
-            configured_generations = config.generations,
-            floor = min_generations,
-            "applying --validation-min-generations floor"
-        );
-        config.generations = min_generations;
-    }
-    let higher_tfs = higher_tfs_for(base_tf);
-    let pinned_input =
-        match pin_current_discovery_input(&runtime.data_dir, &dataset_identity, &higher_tfs) {
-            Ok(pinned) => std::sync::Arc::new(pinned),
-            Err(error) => {
-                return TfOutcome {
-                    tf: base_tf.to_string(),
-                    status: "DatasetAcquisitionRequired".to_string(),
-                    duration_secs: started.elapsed().as_secs_f64(),
-                    candidate_count: 0,
-                    portfolio_count: 0,
-                    top_sharpe_is: None,
-                    top_sharpe_oos: None,
-                    top_max_dd_pct: None,
-                    error_message: format!("{error:#}"),
-                };
-            }
-        };
-    let request = DiscoveryRequest {
-        data_root: runtime.data_dir.clone(),
-        pinned_input,
-        higher_tfs,
-        config,
-        prop_firm_rules: PropFirmRiskRules::default(),
+        Err(error) => return failed_tf_outcome(base_tf, started, "FailedToStart", error),
     };
 
-    // One-shot channel large enough to absorb the discovery progress
-    // burst without dropping the terminal snapshot. 4096 mirrors the
-    // pattern in `start_discovery_job` callers in the server path.
-    let (tx, mut rx) = mpsc::channel::<ServiceEvent>(4096);
-
-    let handle = match start_discovery_job(request, tx.clone()) {
-        Ok(h) => h,
-        Err(err) => {
-            return TfOutcome {
-                tf: base_tf.to_string(),
-                status: "FailedToStart".to_string(),
-                duration_secs: started.elapsed().as_secs_f64(),
-                candidate_count: 0,
-                portfolio_count: 0,
-                top_sharpe_is: None,
-                top_sharpe_oos: None,
-                top_max_dd_pct: None,
-                error_message: err.to_string(),
-            };
-        }
-    };
-
-    // Drop the local sender so when the discovery task finishes its
-    // job (and drops its own sender clones held inside the spawned
-    // task) the receiver's `recv` returns None. We don't actually
-    // rely on close-to-detect-completion — we watch for terminal
-    // JobState transitions in the snapshot itself — but holding the
-    // sender open would prevent rx from closing if the discovery
-    // task panics mid-flight, which would otherwise mask the bug.
-    drop(tx);
-
-    // Wait for a terminal snapshot OR the per-TF timeout. The
-    // discovery job itself can't be cancelled cooperatively from
-    // here without changing the public API, so on timeout we flag
-    // it as Timeout and move on — the job's background task will
-    // keep running until natural completion but its events will
-    // hit a closed channel (drop above + recv-loop exit) and be
-    // silently dropped.
-    let mut last_snapshot = handle.snapshot.clone();
     let drain = async {
-        while let Some(event) = rx.recv().await {
-            if let ServiceEvent::DiscoveryUpdated(snap) = event {
-                let state = snap.state;
-                last_snapshot = snap;
-                if matches!(
-                    state,
-                    JobState::Succeeded
-                        | JobState::Degraded
-                        | JobState::Failed
-                        | JobState::Cancelled
-                ) {
-                    return;
-                }
+        loop {
+            if handle.snapshot_receiver_mut().changed().await.is_err() {
+                return;
+            }
+            let observed_state = handle.snapshot_receiver_mut().borrow().state();
+            if !matches!(observed_state, JobState::Queued | JobState::Running) {
+                return;
             }
         }
-        // rx closed before reaching terminal — the spawned task
-        // dropped its sender (panic) or completed without emitting
-        // a final terminal snapshot. Either way we treat the last
-        // snapshot we saw as authoritative.
     };
 
     let timed_out = timeout(tf_timeout, drain).await.is_err();
-    let duration_secs = started.elapsed().as_secs_f64();
-
     if timed_out {
-        // Best-effort: request cancellation so the background task
-        // exits its tight loops at the next checkpoint. The CSV row
-        // still shows Timeout because we did not get a terminal
-        // snapshot within the cap.
-        handle.cancel.request();
+        handle.cancel();
+    }
+    let terminal = handle.await_terminal().await;
+    let duration_secs = started.elapsed().as_secs_f64();
+    if timed_out {
         return TfOutcome {
             tf: base_tf.to_string(),
             status: "Timeout".to_string(),
@@ -426,11 +345,41 @@ async fn run_one_tf(
             top_sharpe_is: None,
             top_sharpe_oos: None,
             top_max_dd_pct: None,
-            error_message: format!("hit per-TF timeout {}s", tf_timeout.as_secs()),
+            error_message: format!(
+                "hit per-TF timeout {}s; cancellation reached terminal {terminal:?}",
+                tf_timeout.as_secs()
+            ),
         };
     }
 
-    snapshot_to_outcome(base_tf, &last_snapshot, duration_secs)
+    let final_snapshot = match terminal {
+        TypedLegacyExecutionTerminalV1::Succeeded { final_snapshot, .. }
+        | TypedLegacyExecutionTerminalV1::Failed { final_snapshot, .. }
+        | TypedLegacyExecutionTerminalV1::Cancelled { final_snapshot, .. } => final_snapshot,
+        TypedLegacyExecutionTerminalV1::WorkerPanicked { detail, .. } => {
+            return failed_tf_outcome(base_tf, started, "WorkerPanicked", detail);
+        }
+    };
+    snapshot_to_outcome(base_tf, &final_snapshot, duration_secs)
+}
+
+fn failed_tf_outcome(
+    base_tf: &str,
+    started: Instant,
+    status: &str,
+    error: impl std::fmt::Display,
+) -> TfOutcome {
+    TfOutcome {
+        tf: base_tf.to_owned(),
+        status: status.to_owned(),
+        duration_secs: started.elapsed().as_secs_f64(),
+        candidate_count: 0,
+        portfolio_count: 0,
+        top_sharpe_is: None,
+        top_sharpe_oos: None,
+        top_max_dd_pct: None,
+        error_message: error.to_string(),
+    }
 }
 
 fn snapshot_to_outcome(

@@ -696,12 +696,63 @@ fn every_operation_uses_the_imported_stream_and_only_event_dependencies_cross_st
         "cudaDeviceSynchronize",
         "cudaStreamSynchronize",
         "cudaEventSynchronize",
-        "cudaMemcpy",
-        "cudaMemcpyAsync",
     ] {
         assert!(
             !cuda.contains(forbidden),
             "stream/transfer violation via {forbidden:?}"
+        );
+    }
+
+    let configure = section(&cuda, "configure_resident_generation_evaluator_v2(", "\n}");
+    assert_eq!(
+        configure.matches("cudaMemcpyAsync(").count(),
+        1,
+        "admission must upload immutable evaluator SMC weights exactly once"
+    );
+    require_all(
+        configure,
+        &[
+            "run->smc_weights_device_v2, smc_weights",
+            "11 * sizeof(double), cudaMemcpyHostToDevice",
+            "run->admitted_run_stream",
+        ],
+    );
+    for forbidden in [
+        "cudaMemcpyDeviceToHost",
+        "cudaMemcpy(",
+        "cudaStreamSynchronize",
+        "cudaEventSynchronize",
+    ] {
+        assert!(
+            !configure.contains(forbidden),
+            "one-time evaluator admission used forbidden transfer/sync {forbidden:?}"
+        );
+    }
+
+    let generation_loop = [
+        section(
+            &cuda,
+            "initialize_resident_generation_population_v1(",
+            "\n}",
+        ),
+        section(&cuda, "enqueue_exact_generation_chunk_v1(", "\n}"),
+        section(
+            &cuda,
+            "enqueue_resident_rank_selection_offspring_v1(",
+            "\n}",
+        ),
+    ]
+    .join("\n");
+    for forbidden in [
+        "cudaMemcpy",
+        "cudaMemcpyAsync",
+        "cudaDeviceSynchronize",
+        "cudaStreamSynchronize",
+        "cudaEventSynchronize",
+    ] {
+        assert!(
+            !generation_loop.contains(forbidden),
+            "generation loop crossed a host transfer/sync boundary via {forbidden:?}"
         );
     }
 }

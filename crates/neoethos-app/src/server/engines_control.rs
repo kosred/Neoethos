@@ -15,26 +15,49 @@
 //! channel and writes the latest `JobState` back into the slot, which
 //! `/engines/status` then reads.
 
+#[expect(
+    dead_code,
+    reason = "Chunk4C entrypoint adapters consume this crate-private typed boundary"
+)]
+mod typed_execution_v1;
+#[allow(
+    unused_imports,
+    reason = "Chunk4C entrypoint adapters consume this crate-private typed boundary"
+)]
+pub(crate) use typed_execution_v1::{
+    TypedDiscoveryDatasetPolicyV1, TypedDiscoveryExecutionIntentV1,
+    TypedDiscoveryGenerationOverrideV1, TypedDiscoveryOverridesV1, TypedDiscoverySettingsGateV1,
+    TypedHigherTimeframePolicyV1, TypedLegacyExecutionAdmissionErrorV1,
+    TypedLegacyExecutionAdmissionV1, TypedLegacyExecutionJobHandleV1,
+    TypedLegacyExecutionSnapshotV1, TypedLegacyExecutionStartErrorV1,
+    TypedLegacyExecutionTerminalV1, TypedTrainingExecutionIntentV1, TypedTrainingSelectionPolicyV1,
+    detach_typed_legacy_execution_observer_v1, start_typed_discovery_execution_v1,
+    start_typed_training_execution_v1,
+};
+
 use anyhow::Result;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
-use neoethos_data::{ExactDatasetGenerationConflict, SelectedDatasetGenerationV1};
-use std::path::PathBuf;
+use neoethos_data::{CanonicalTimeframe, SelectedDatasetGenerationV1};
+use neoethos_search::{
+    CanonicalNativeGenerationZeroOverridesV1, CanonicalNativeRuntimeInstallReceiptV1,
+    CanonicalResearchContractArtifactRefV1, ProcessExecutionKindV1,
+};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use crate::app_services::ServiceEvent;
-use crate::app_services::discovery::{
-    DirectTimeframeAcquisitionRequired, DiscoveryRequest, pin_discovery_input, start_discovery_job,
+use crate::app_services::canonical_native_discovery::{
+    CanonicalNativeResearchEventV1, CanonicalNativeResearchIntentV1,
+    CanonicalNativeResearchJobHandleV1, CanonicalNativeResearchSnapshotV1,
+    CanonicalNativeResearchStartErrorV1, start_canonical_native_research_lane_v1,
 };
 use crate::app_services::jobs::{JobKind, JobState};
-use crate::app_services::training::{TrainingRequest, start_training_job};
 
 use super::errors::actionable_error;
-use super::state::AppApiState;
+use super::state::{AppApiState, CanonicalNativeResearchCancellationOutcomeV1};
 
 /// Shared request body for `start` endpoints. Discovery requires an exact
 /// canonical `dataset_selection`; the legacy symbol/base fields may only
@@ -120,6 +143,234 @@ pub struct StopResponse {
     pub kind: &'static str,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalNativeResearchContractArtifactBodyV1 {
+    pub relative_path: String,
+    pub expected_sha256: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalNativeResearchStartBodyV1 {
+    pub contract_artifact: CanonicalNativeResearchContractArtifactBodyV1,
+    #[serde(default)]
+    pub population: Option<usize>,
+    #[serde(default)]
+    pub population_auto: Option<bool>,
+    #[serde(default)]
+    pub max_indicators: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalNativeResearchStartResponseV1 {
+    pub started: bool,
+    pub kind: &'static str,
+    pub lease_token: String,
+    pub state: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalNativeResearchStartErrorResponseV1 {
+    pub started: bool,
+    pub kind: &'static str,
+    pub error_code: &'static str,
+    pub detail: String,
+    pub requested_kind: Option<&'static str>,
+    pub active_kind: Option<&'static str>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalNativeResearchCancelBodyV1 {
+    pub lease_token: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalNativeResearchCancelResponseV1 {
+    pub cancellation_requested: bool,
+    pub kind: &'static str,
+    pub lease_token: String,
+    pub state: &'static str,
+    pub error_code: Option<&'static str>,
+}
+
+pub async fn canonical_native_research_start(
+    State(state): State<AppApiState>,
+    Json(body): Json<CanonicalNativeResearchStartBodyV1>,
+) -> Response {
+    let contract_ref = match CanonicalResearchContractArtifactRefV1::checked_new(
+        body.contract_artifact.relative_path,
+        body.contract_artifact.expected_sha256,
+    ) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return native_start_error_response_v1(
+                StatusCode::BAD_REQUEST,
+                "invalid_contract_artifact_reference",
+                error.to_string(),
+                None,
+                None,
+            );
+        }
+    };
+    let overrides = match CanonicalNativeGenerationZeroOverridesV1::checked_new(
+        body.population,
+        body.population_auto,
+        body.max_indicators,
+    ) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            return native_start_error_response_v1(
+                StatusCode::BAD_REQUEST,
+                "invalid_generation_zero_overrides",
+                error.to_string(),
+                None,
+                None,
+            );
+        }
+    };
+    let Some(authority) = state.canonical_native_startup_authority_v1() else {
+        return native_start_error_response_v1(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_runtime_authority_unavailable",
+            "canonical native startup authority is not installed".to_owned(),
+            None,
+            None,
+        );
+    };
+    let intent = CanonicalNativeResearchIntentV1::new(contract_ref, overrides);
+    match start_and_observe_canonical_native_research_v1(
+        state,
+        authority.settings(),
+        authority.runtime_install_receipt(),
+        intent,
+    )
+    .await
+    {
+        Ok(lease_token) => (
+            StatusCode::ACCEPTED,
+            Json(CanonicalNativeResearchStartResponseV1 {
+                started: true,
+                kind: "canonical_native_research",
+                lease_token: lease_token.to_string(),
+                state: "Queued",
+            }),
+        )
+            .into_response(),
+        Err(CanonicalNativeResearchStartErrorV1::Busy(error)) => native_start_error_response_v1(
+            StatusCode::CONFLICT,
+            "process_execution_busy",
+            error.to_string(),
+            Some(process_execution_kind_wire_v1(error.requested())),
+            Some(process_execution_kind_wire_v1(error.active())),
+        ),
+        Err(CanonicalNativeResearchStartErrorV1::RuntimeUnavailable(detail)) => {
+            native_start_error_response_v1(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_runtime_unavailable",
+                detail,
+                None,
+                None,
+            )
+        }
+    }
+}
+
+pub async fn canonical_native_research_cancel(
+    State(state): State<AppApiState>,
+    Json(body): Json<CanonicalNativeResearchCancelBodyV1>,
+) -> Response {
+    let lease_token = match body
+        .lease_token
+        .parse::<u64>()
+        .ok()
+        .filter(|token| *token != 0)
+    {
+        Some(token) => token,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(CanonicalNativeResearchCancelResponseV1 {
+                    cancellation_requested: false,
+                    kind: "canonical_native_research",
+                    lease_token: body.lease_token,
+                    state: "Invalid",
+                    error_code: Some("invalid_native_research_lease_token"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let (status, cancellation_requested, state_name, error_code) = match state
+        .cancel_canonical_native_research_exact_v1(lease_token)
+        .await
+    {
+        CanonicalNativeResearchCancellationOutcomeV1::Requested => {
+            (StatusCode::ACCEPTED, true, "Running", None)
+        }
+        CanonicalNativeResearchCancellationOutcomeV1::AlreadyRequested => {
+            (StatusCode::OK, true, "Running", None)
+        }
+        CanonicalNativeResearchCancellationOutcomeV1::NotRunning => (
+            StatusCode::CONFLICT,
+            false,
+            "Idle",
+            Some("native_research_not_running"),
+        ),
+        CanonicalNativeResearchCancellationOutcomeV1::TokenMismatch => (
+            StatusCode::CONFLICT,
+            false,
+            "Running",
+            Some("native_research_token_mismatch"),
+        ),
+    };
+    (
+        status,
+        Json(CanonicalNativeResearchCancelResponseV1 {
+            cancellation_requested,
+            kind: "canonical_native_research",
+            lease_token: body.lease_token,
+            state: state_name,
+            error_code,
+        }),
+    )
+        .into_response()
+}
+
+fn native_start_error_response_v1(
+    status: StatusCode,
+    error_code: &'static str,
+    detail: String,
+    requested_kind: Option<&'static str>,
+    active_kind: Option<&'static str>,
+) -> Response {
+    (
+        status,
+        Json(CanonicalNativeResearchStartErrorResponseV1 {
+            started: false,
+            kind: "canonical_native_research",
+            error_code,
+            detail,
+            requested_kind,
+            active_kind,
+        }),
+    )
+        .into_response()
+}
+
+const fn process_execution_kind_wire_v1(kind: ProcessExecutionKindV1) -> &'static str {
+    match kind {
+        ProcessExecutionKindV1::Discovery => "discovery",
+        ProcessExecutionKindV1::Training => "training",
+        ProcessExecutionKindV1::NativeResearch => "canonical_native_research",
+        ProcessExecutionKindV1::Migration => "migration",
+    }
+}
+
 // ─── Discovery ────────────────────────────────────────────────────────────
 
 pub async fn discovery_start(
@@ -127,7 +378,6 @@ pub async fn discovery_start(
     body: Option<Json<StartJobBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-
     let dataset_selection = match resolve_discovery_selection(&body) {
         Ok(selection) => selection,
         Err(error) => {
@@ -138,236 +388,102 @@ pub async fn discovery_start(
             );
         }
     };
-
-    // 2026-06-04 PARITY: resolve symbol / base / higher-TFs through the SAME
-    // shared `SystemConfig` resolvers the CLI uses, seeded from config.yaml,
-    // with the request body as the explicit override. Previously this endpoint
-    // hardcoded "EURUSD" / "M1" and a *pure* canonical higher-TF ladder,
-    // silently ignoring the operator's config.yaml (`symbol`, `base_timeframe`,
-    // `multi_resolution_enabled`, `multi_resolution_timeframes`,
-    // `higher_timeframes`). That was a UI↔CLI divergence — the same config could
-    // produce a different search depending on which entry point launched it.
-    // `settings` is loaded ONCE here and reused for the DiscoveryConfig seed.
-    let settings = match Settings::from_yaml(state.config_path()) {
-        Ok(s) => Some(s),
-        Err(err) => {
-            tracing::warn!(
-                target: "neoethos_app::engines_control",
-                error = %err,
-                config_path = %state.config_path().display(),
-                "failed to load Settings; exact dataset identity remains selected, \
-                 but DiscoveryConfig and configured higher timeframes are unavailable; \
-                 the request will fail closed until config.yaml is fixed"
-            );
-            None
-        }
-    };
     let dataset_identity = dataset_selection.identity().clone();
     let symbol = dataset_identity.symbol_name().to_owned();
-    let base_tf = dataset_identity.timeframe().as_str().to_owned();
-    let higher_tfs: Vec<String> = match body.higher_tfs {
-        Some(v) => v.into_iter().map(|s| s.trim().to_uppercase()).collect(),
-        // Default = the operator-configured ladder above THIS base (the shared
-        // resolver honours multi_resolution_* / higher_timeframes), NOT a raw
-        // canonical sweep — identical to a CLI `discover` with no `--higher`.
-        None => settings
-            .as_ref()
-            .map(|s| s.system.resolve_higher_timeframes(&base_tf))
-            .unwrap_or_default(),
+    let base_timeframe = dataset_identity.timeframe();
+    let higher_timeframes = match body.higher_tfs {
+        Some(labels) => {
+            let parsed = labels
+                .into_iter()
+                .map(|label| {
+                    label
+                        .trim()
+                        .parse::<CanonicalTimeframe>()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>();
+            match parsed {
+                Ok(timeframes) => TypedHigherTimeframePolicyV1::Exact(timeframes),
+                Err(error) => {
+                    return actionable_error(
+                        StatusCode::BAD_REQUEST,
+                        "Discovery higher_tfs contains a non-canonical timeframe.",
+                        &error,
+                    );
+                }
+            }
+        }
+        None => TypedHigherTimeframePolicyV1::Configured,
     };
-
-    if state.engine_state(JobKind::Discovery).await == EngineRunState::Running {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "discovery already running — stop the current job first",
-            })),
-        )
-            .into_response();
-    }
-
-    let data_root = match resolve_data_root().await {
-        Ok(p) => p,
-        Err(err) => {
-            return actionable_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Discovery can't start — config.yaml couldn't be loaded. \
-                 Check the data directory path in Settings, then try again.",
-                &err,
-            );
-        }
-    };
-
-    // Linearize the run against the exact selected generation and pin every
-    // direct higher timeframe before the background job exists. A stale
-    // anchor is a typed 409; missing higher frames are a separate explicit
-    // acquisition step. Discovery itself never downloads or rebinds data.
-    let pin_root = data_root.clone();
-    let pin_selection = dataset_selection.clone();
-    let pin_higher = higher_tfs.clone();
-    let pinned_input = match tokio::task::spawn_blocking(move || {
-        pin_discovery_input(&pin_root, pin_selection, &pin_higher)
-    })
-    .await
-    {
-        Ok(Ok(pinned)) => Arc::new(pinned),
-        Ok(Err(error))
-            if error
-                .downcast_ref::<ExactDatasetGenerationConflict>()
-                .is_some() =>
-        {
-            return actionable_error(
-                StatusCode::CONFLICT,
-                "The selected dataset generation is no longer current. Refresh Data and explicitly select the new generation.",
-                &error,
-            );
-        }
-        Ok(Err(error))
-            if error
-                .downcast_ref::<DirectTimeframeAcquisitionRequired>()
-                .is_some() =>
-        {
-            return actionable_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Discovery requires each requested timeframe as its own direct broker/import generation. Acquire the missing timeframe(s), refresh Data, and start again.",
-                &error,
-            );
-        }
-        Ok(Err(error)) => {
+    let overrides = match TypedDiscoveryOverridesV1::checked_new(
+        body.population.filter(|value| *value > 0),
+        body.generations
+            .filter(|value| *value > 0)
+            .map(TypedDiscoveryGenerationOverrideV1::Exact),
+        body.max_indicators.filter(|value| *value > 0),
+        None,
+        body.target_candidates.filter(|value| *value > 0),
+        body.portfolio_size.filter(|value| *value > 0),
+    ) {
+        Ok(overrides) => overrides,
+        Err(detail) => {
             return actionable_error(
                 StatusCode::BAD_REQUEST,
-                "Discovery could not verify and pin the selected dataset generations.",
-                &error,
+                "Discovery overrides are invalid.",
+                &anyhow::anyhow!(detail),
+            );
+        }
+    };
+    let intent = TypedDiscoveryExecutionIntentV1 {
+        symbol: symbol.clone(),
+        base_timeframe,
+        higher_timeframes,
+        overrides,
+        settings_gate: TypedDiscoverySettingsGateV1::None,
+        dataset_policy: TypedDiscoveryDatasetPolicyV1::Exact(dataset_selection.clone()),
+        training_after_success: true,
+    };
+    let mut handle = match start_typed_discovery_execution_v1(state.clone(), intent) {
+        Ok(handle) => handle,
+        Err(error) => return typed_legacy_start_error_response_v1("Discovery", error),
+    };
+    let admitted = match handle.await_admission_v1().await {
+        Ok(TypedLegacyExecutionAdmissionV1::Discovery {
+            selected_generation,
+        }) => selected_generation,
+        Ok(TypedLegacyExecutionAdmissionV1::Training { .. }) => {
+            handle.cancel();
+            let _ = handle.await_terminal().await;
+            return actionable_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Discovery worker returned the wrong admission evidence.",
+                &anyhow::anyhow!("typed Discovery admission was Training"),
             );
         }
         Err(error) => {
-            return actionable_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The exact dataset pinning task failed before Discovery started.",
-                &anyhow::anyhow!("exact dataset pinning task panicked: {error}"),
-            );
+            let response = typed_legacy_admission_error_response_v1("Discovery", &error);
+            let _ = handle.await_terminal().await;
+            return response;
         }
     };
-
-    // #194: stitch operator overrides into the default DiscoveryConfig.
-    // Anything the body omits stays at the engine default (which itself
-    // pulls from config.yaml).
-    //
-    // F-304 fix (2026-05-28): seed the config via `from_settings` rather
-    // than `default()` so `evaluation_symbol` + `evaluation_account_currency`
-    // arrive populated from `Settings.system.*`, then explicitly override
-    // the symbol with the request-body value. Without this seed, every
-    // /engines/discovery/start request ran with empty symbol + empty
-    // account_currency + NaN spread/commission, tripping the cost-model
-    // NaN guard and producing zero-trade GA candidates that the
-    // sanitizer scrubbed to 0.0 — invisible failure mode.
-    // Reuse the `settings` already loaded (+ warned) at the top of this handler
-    // — no second read, no second warning. Parity unification 2026-06-04.
-    let mut config = match settings.as_ref() {
-        Some(settings) => match neoethos_search::DiscoveryConfig::try_from_settings(settings) {
-            Ok(config) => config,
-            Err(error) => {
-                return actionable_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Discovery is disabled until synchronized broker financial evidence is available.",
-                    &error,
-                );
-            }
-        },
-        None => {
-            return actionable_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Discovery can't start because config.yaml could not be loaded; compiled financial defaults are not a valid fallback.",
-                &anyhow::anyhow!("settings unavailable"),
-            );
-        }
-    };
-    // The exact identity is the selector; the legacy body symbol was checked
-    // only as a consistency assertion above.
-    config.evaluation_symbol = symbol.clone();
-    // Account currency comes from Settings (loaded into config by
-    // from_settings). An empty value propagates to the guard, which bails with
-    // an actionable error. Config is the single source — the legacy
-    // `NEOETHOS_BOT_PROP_ACCOUNT_CURRENCY` env fallback was removed in v0.4.36.
-    if let Some(p) = body.population.filter(|&p| p > 0) {
-        config.population = p;
+    if admitted != dataset_selection {
+        handle.cancel();
+        let _ = handle.await_terminal().await;
+        return actionable_error(
+            StatusCode::CONFLICT,
+            "Discovery pinned a different dataset generation. Refresh Data and explicitly select the current generation.",
+            &anyhow::anyhow!("typed Discovery admission differs from the requested generation"),
+        );
     }
-    if let Some(g) = body.generations.filter(|&g| g > 0) {
-        config.generations = g;
-    }
-    if let Some(m) = body.max_indicators.filter(|&m| m > 0) {
-        config.max_indicators = m;
-    }
-    if let Some(t) = body.target_candidates.filter(|&t| t > 0) {
-        config.candidate_count = t;
-    }
-    if let Some(s) = body.portfolio_size.filter(|&s| s > 0) {
-        config.portfolio_size = s;
-    }
-
-    // F-314 fix (2026-05-29): wire env runtime overrides into the
-    // UI-driven Discovery path. Until today, only `neoethos-cli`
-    // (`main.rs:487`) called this helper; the UI route silently ran
-    // in accidental "Strict" mode with `prop_firm_gate=None`, no
-    // F-305 timeframe-aware `min_trades_per_month` scaling, and no
-    // F-277 adaptive threshold ladder — hitting the legacy walk-
-    // forward consistency gate that rejects almost every candidate.
-    // The visible symptom: every UI Discovery run produced an empty
-    // portfolio while CLI runs found strategies for the developer.
-    //
-    // Apply this AFTER the body-supplied GA knob overrides above so
-    // the operator's UI-tuned population/generations/etc. survive,
-    // and AFTER the `evaluation_symbol`/`evaluation_account_currency`
-    // mode-dependent overrides (config-driven mode from
-    // models.discovery_mode + the prop-firm window-pass gate) so they see
-    // the final config — not the from-yaml-defaults version.
-    config = config.apply_mode_overrides();
-
-    let request = DiscoveryRequest {
-        data_root,
-        pinned_input,
-        higher_tfs: higher_tfs.clone(),
-        config,
-        prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
-    };
-
-    let (tx, rx) = mpsc::channel::<ServiceEvent>(1000);
-    let handle = match start_discovery_job(request, tx) {
-        Ok(h) => h,
-        Err(err) => {
-            return actionable_error(
-                StatusCode::BAD_REQUEST,
-                "Discovery failed to start. Verify the selected canonical dataset identity \
-                 and its direct timeframe artifacts, then try again.",
-                &err,
-            );
-        }
-    };
-
-    state
-        .install_engine(JobKind::Discovery, handle.cancel.clone())
-        .await;
-    // The fourth arg arms the auto-chain: when this discovery run
-    // hits a terminal "Succeeded" state, the drainer fires
-    // `start_training_job` with the same (symbol, base_tf) — that's
-    // the "natural sequence" the user explicitly asked for
-    // (discovery → training → trading). Skipped if the user is
-    // already running training manually when discovery finishes.
-    spawn_state_drainer(
-        state.clone(),
-        JobKind::Discovery,
-        rx,
-        Some((symbol.clone(), base_tf.clone())),
-    );
-
+    detach_typed_legacy_execution_observer_v1(state, handle);
     Json(StartResponse {
         started: true,
         kind: "discovery",
         symbol,
-        base_tf,
+        base_tf: base_timeframe.as_str().to_owned(),
         dataset_identity: Some(dataset_identity.to_path_component()),
-        dataset_generation: Some(dataset_selection.generation_id().to_owned()),
-        manifest_binding_sha256: Some(dataset_selection.manifest_binding_sha256().to_owned()),
+        dataset_generation: Some(admitted.generation_id().to_owned()),
+        manifest_binding_sha256: Some(admitted.manifest_binding_sha256().to_owned()),
     })
     .into_response()
 }
@@ -387,85 +503,73 @@ pub async fn training_start(
     body: Option<Json<StartJobBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-
-    // 2026-06-04 PARITY: resolve symbol/base through the shared `SystemConfig`
-    // resolvers (config.yaml seed + request override), matching the CLI and the
-    // discovery endpoint. No more hardcoded "EURUSD"/"M1" that ignored config.
-    let settings = Settings::from_yaml(state.config_path()).ok();
-    let symbol = body
-        .symbol
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| settings.as_ref().map(|s| s.system.resolve_symbol()))
-        .unwrap_or_default();
-    let base_tf = body
-        .base_tf
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| settings.as_ref().map(|s| s.system.resolve_base_timeframe()))
-        .unwrap_or_default();
-
-    // Fail loud (parity with the CLI's F-CORE2 doctrine): no synthetic fallback.
-    if symbol.is_empty() || base_tf.is_empty() {
-        return actionable_error(
-            StatusCode::BAD_REQUEST,
-            "Training can't start — no symbol / base timeframe was supplied and \
-             config.yaml couldn't be read to provide a default. Set them in \
-             Settings (or include them in the request) and try again.",
-            &anyhow::anyhow!("symbol='{symbol}' base_tf='{base_tf}'"),
-        );
-    }
-
-    if state.engine_state(JobKind::Training).await == EngineRunState::Running {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "training already running — stop the current job first",
-            })),
-        )
-            .into_response();
-    }
-
-    // 2026-07-19 deep-audit fix: thread the RESOLVED config path (CLI
-    // --config override or the canonical user-data config.yaml) instead of
-    // the literal "config.yaml" — a CWD-relative path that does not exist
-    // in an installed app, so training would fail to load Settings (or
-    // load a stale dev copy) while discovery right above resolved
-    // correctly. Same S05 class as the runtime-overrides fix.
-    let request = TrainingRequest {
-        config_path: state.config_path().display().to_string(),
-        models_dir: PathBuf::from("models"),
-        symbol: symbol.clone(),
-        base_tf: base_tf.clone(),
-    };
-
-    let (tx, rx) = mpsc::channel::<ServiceEvent>(1000);
-    let handle = match start_training_job(request, tx) {
-        Ok(h) => h,
-        Err(err) => {
+    let selection = match (body.symbol, body.base_tf) {
+        (None, None) => TypedTrainingSelectionPolicyV1::Configured,
+        (Some(symbol), Some(base_tf)) => {
+            let symbol = symbol.trim().to_uppercase();
+            if symbol.is_empty() {
+                return actionable_error(
+                    StatusCode::BAD_REQUEST,
+                    "Training symbol must not be empty.",
+                    &anyhow::anyhow!("empty Training symbol"),
+                );
+            }
+            let base_timeframe = match base_tf.trim().parse::<CanonicalTimeframe>() {
+                Ok(timeframe) => timeframe,
+                Err(error) => {
+                    return actionable_error(
+                        StatusCode::BAD_REQUEST,
+                        "Training base_tf must be a canonical timeframe.",
+                        &anyhow::anyhow!(error.to_string()),
+                    );
+                }
+            };
+            TypedTrainingSelectionPolicyV1::Exact {
+                symbol,
+                base_timeframe,
+            }
+        }
+        _ => {
             return actionable_error(
                 StatusCode::BAD_REQUEST,
-                "Training failed to start. Make sure Discovery finished for this \
-                 symbol/timeframe and model_targets.json exists in the models folder.",
-                &err,
+                "Training requires both symbol and base_tf together, or neither to use Settings.",
+                &anyhow::anyhow!("partial Training symbol/base_tf selection"),
             );
         }
     };
-
-    state
-        .install_engine(JobKind::Training, handle.cancel.clone())
-        .await;
-    // Training has no further auto-chain step yet (the auto-trader
-    // wiring lands in a follow-up), so the drainer gets None for the
-    // chain arg — a Succeeded training run leaves the operator on
-    // the dashboard, not in autonomous mode.
-    spawn_state_drainer(state.clone(), JobKind::Training, rx, None);
-
+    let mut handle = match start_typed_training_execution_v1(
+        state.clone(),
+        TypedTrainingExecutionIntentV1 { selection },
+    ) {
+        Ok(handle) => handle,
+        Err(error) => return typed_legacy_start_error_response_v1("Training", error),
+    };
+    let (symbol, base_timeframe) = match handle.await_admission_v1().await {
+        Ok(TypedLegacyExecutionAdmissionV1::Training {
+            symbol,
+            base_timeframe,
+        }) => (symbol, base_timeframe),
+        Ok(TypedLegacyExecutionAdmissionV1::Discovery { .. }) => {
+            handle.cancel();
+            let _ = handle.await_terminal().await;
+            return actionable_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Training worker returned the wrong admission evidence.",
+                &anyhow::anyhow!("typed Training admission was Discovery"),
+            );
+        }
+        Err(error) => {
+            let response = typed_legacy_admission_error_response_v1("Training", &error);
+            let _ = handle.await_terminal().await;
+            return response;
+        }
+    };
+    detach_typed_legacy_execution_observer_v1(state, handle);
     Json(StartResponse {
         started: true,
         kind: "training",
         symbol,
-        base_tf,
+        base_tf: base_timeframe.as_str().to_owned(),
         dataset_identity: None,
         dataset_generation: None,
         manifest_binding_sha256: None,
@@ -481,179 +585,127 @@ pub async fn training_stop(State(state): State<AppApiState>) -> Json<StopRespons
     })
 }
 
-// ─── shared helpers ───────────────────────────────────────────────────────
-
-/// Where the engines pull their input data from. Mirrors backend startup
-/// wiring: load the CLI-configured `config.yaml` (see
-/// `server::state::install_config_path`), then take `system.data_dir`
-/// from it.
-async fn resolve_data_root() -> Result<PathBuf> {
-    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
-    // install so a non-default `--config` flag still works.
-    let config_path = super::state::current_config_path();
-    tokio::task::spawn_blocking(move || {
-        let settings = Settings::from_yaml(&config_path)
-            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
-        Ok(settings.system.data_dir)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("blocking task panicked: {e}"))?
+/// Typed in-process native entry used by the forthcoming frontend adapters.
+/// There is intentionally no JSON self-call and no legacy Discovery result.
+#[allow(
+    dead_code,
+    reason = "Chunk4C entrypoint adapters consume this crate-private native boundary"
+)]
+pub(crate) async fn start_and_observe_canonical_native_research_v1(
+    state: AppApiState,
+    startup_settings: Arc<Settings>,
+    runtime_install_receipt: Arc<CanonicalNativeRuntimeInstallReceiptV1>,
+    intent: CanonicalNativeResearchIntentV1,
+) -> Result<u64, CanonicalNativeResearchStartErrorV1> {
+    let mut handle =
+        start_canonical_native_research_lane_v1(startup_settings, runtime_install_receipt, intent)?;
+    let lease_token = handle.snapshot_receiver_mut().borrow().lease_token();
+    observe_canonical_native_research_v1(state, handle).await;
+    Ok(lease_token)
 }
 
-/// Spawn a background task that drains the ServiceEvent rx channel
-/// emitted by the job and reflects the latest `JobState` into the
-/// `AppApiState` engine slot. The task exits when the channel closes
-/// (job's send end dropped after terminal event).
-///
-/// `auto_chain_args` is `Some((symbol, base_tf))` for Discovery only —
-/// when discovery terminates with `Succeeded`, the drainer fires
-/// `start_training_job` against the same pair. That's the
-/// "natural sequence" the operator expects:
-///
-/// ```text
-/// Discovery (GA-evolves a portfolio)
-///    ↓ writes model_targets.json
-/// Training (34-model ensemble fits per model_targets.json)
-///    ↓ writes models/*.{pkl,joblib,pt}
-/// (Auto-Trader — lands in a follow-up)
-/// ```
-///
-/// The fence is `text` and is LOAD-BEARING, not cosmetic. Indented four
-/// spaces, rustdoc took this diagram for a Rust code block and compiled it:
-/// `↓` is "unknown start of token" and the `/*` inside `models/*.{...}` opens
-/// a block comment that never closes (E0758). `cargo test -p neoethos-app
-/// --doc` failed on it until 2026-08-10 — a `--lib` run never builds
-/// doctests, which is why it survived.
-///
-/// Auto-chain is suppressed if the user already started Training
-/// manually before Discovery finishes (Training is single-job:
-/// `state.engine_state(Training)` would be Running). Failed,
-/// Cancelled, or Degraded discoveries also skip the chain — we only
-/// promote a clean Success.
-fn spawn_state_drainer(
+#[allow(
+    dead_code,
+    reason = "Chunk4C entrypoint adapters consume this crate-private native boundary"
+)]
+pub(crate) async fn observe_canonical_native_research_v1(
     state: AppApiState,
-    kind: JobKind,
-    mut rx: mpsc::Receiver<ServiceEvent>,
-    auto_chain_args: Option<(String, String)>,
+    mut handle: CanonicalNativeResearchJobHandleV1,
 ) {
+    let initial = handle.snapshot_receiver_mut().borrow().clone();
+    let lease_token = initial.lease_token();
+    state
+        .install_canonical_native_research_v1(handle.cancellation_token().clone(), initial)
+        .await;
     tokio::spawn(async move {
-        let mut terminal_state: Option<JobState> = None;
-        while let Some(event) = rx.recv().await {
-            let snapshot = match (&event, kind) {
-                (ServiceEvent::DiscoveryUpdated(s), JobKind::Discovery) => Some(s),
-                (ServiceEvent::TrainingUpdated(s), JobKind::Training) => Some(s),
-                _ => None,
-            };
-            let Some(snap) = snapshot else { continue };
-            terminal_state = Some(snap.state);
-            let run_state = EngineRunState::from(snap.state);
-            state
-                .update_engine(kind, run_state, snap.report.summary.clone())
-                .await;
-            // F-340 (Feature #14): mirror the live discovery/training
-            // progress (stage + percent + counters) from the same
-            // JobSnapshot into the slot so `/engines/status` can expose
-            // the rich counters the GA loop accumulates. Only do this
-            // while the engine is still Running — `update_engine` wipes
-            // the progress on any terminal state, and re-populating it
-            // here would leave a stale "search_generations / 0.83"
-            // line hanging around after the run finished.
-            if matches!(run_state, EngineRunState::Running) {
-                // `JobProgress::percent` is `Option<f32>` in 0.0..=1.0;
-                // default to 0.0 when the job hasn't reported a fraction
-                // yet. `JobReport::counters` is already a `(name, u64)`
-                // list — forward it verbatim.
-                let percent = snap.progress.percent.unwrap_or(0.0) as f64;
-                state
-                    .set_engine_progress(
-                        kind,
-                        snap.progress.stage.clone(),
-                        percent,
-                        snap.report.counters.clone(),
-                    )
-                    .await;
+        loop {
+            let changed = handle.snapshot_receiver_mut().changed().await;
+            if changed.is_err() {
+                break;
+            }
+            let snapshot = handle.snapshot_receiver_mut().borrow().clone();
+            let terminal = snapshot.state().is_terminal();
+            reduce_canonical_native_research_event_v1(
+                &state,
+                ServiceEvent::CanonicalNativeResearchUpdated(CanonicalNativeResearchEventV1::new(
+                    snapshot,
+                )),
+            )
+            .await;
+            if terminal {
+                break;
             }
         }
-        // Channel closed — make sure we don't leave a dangling
-        // "Running" state if the producer side dropped without a
-        // terminal event (shouldn't happen, defensive guard).
-        state.finalize_engine_if_running(kind).await;
-
-        // Auto-chain Discovery → Training when:
-        //   1. We're the discovery drainer (Some auto_chain_args).
-        //   2. Discovery succeeded (Degraded counts as success in
-        //      EngineRunState but Training needs the strictly-clean
-        //      `model_targets.json` from a Succeeded run).
-        //   3. Training isn't already running (idempotency — the user
-        //      might have hit Train manually while Discovery was
-        //      still grinding).
-        if let Some((symbol, base_tf)) = auto_chain_args {
-            if matches!(terminal_state, Some(JobState::Succeeded)) {
-                let already_training = matches!(
-                    state.engine_state(JobKind::Training).await,
-                    EngineRunState::Running
-                );
-                if already_training {
-                    tracing::info!(
-                        target: "neoethos_app::server::engines_control",
-                        "Discovery succeeded but Training is already \
-                         running — skipping auto-chain to avoid 409"
-                    );
-                } else {
-                    tracing::info!(
-                        target: "neoethos_app::server::engines_control",
-                        symbol = %symbol,
-                        base_tf = %base_tf,
-                        "Discovery succeeded — auto-chaining Training \
-                         on the same (symbol, base_tf) per natural \
-                         pipeline sequence"
-                    );
-                    spawn_auto_chained_training(state, symbol, base_tf);
-                }
-            } else {
-                tracing::info!(
-                    target: "neoethos_app::server::engines_control",
-                    ?terminal_state,
-                    "Discovery did NOT succeed cleanly — skipping \
-                     auto-chain. Operator can re-trigger Discovery \
-                     or start Training manually."
-                );
-            }
-        }
+        let terminal = handle.await_terminal().await;
+        state
+            .update_canonical_native_research_v1(CanonicalNativeResearchSnapshotV1::from_terminal(
+                lease_token,
+                terminal.clone(),
+            ))
+            .await;
+        tracing::info!(
+            target: "neoethos_app::server::engines_control",
+            terminal_state = terminal.state().as_str(),
+            "canonical native research worker reached terminal and released its lease"
+        );
     });
 }
 
-/// Helper: kick off a Training job from inside the Discovery drainer
-/// (not an HTTP path), wiring up its own drainer with no further
-/// auto-chain. Pulled out so the recursive shape stays readable.
-fn spawn_auto_chained_training(state: AppApiState, symbol: String, base_tf: String) {
-    // Same resolved-config-path rule as training_start (2026-07-19 fix).
-    let request = TrainingRequest {
-        config_path: state.config_path().display().to_string(),
-        models_dir: PathBuf::from("models"),
-        symbol,
-        base_tf,
-    };
-    let (tx, rx) = mpsc::channel::<ServiceEvent>(1000);
-    match start_training_job(request, tx) {
-        Ok(handle) => {
-            let state_for_install = state.clone();
-            tokio::spawn(async move {
-                state_for_install
-                    .install_engine(JobKind::Training, handle.cancel.clone())
-                    .await;
-            });
-            spawn_state_drainer(state, JobKind::Training, rx, None);
-        }
-        Err(err) => {
-            tracing::warn!(
-                target: "neoethos_app::server::engines_control",
-                error = %err,
-                "auto-chained Training failed to start — operator \
-                 must launch it manually from the Training screen"
-            );
-        }
+#[allow(
+    dead_code,
+    reason = "Chunk4C entrypoint adapters consume this crate-private native boundary"
+)]
+async fn reduce_canonical_native_research_event_v1(state: &AppApiState, event: ServiceEvent) {
+    if let ServiceEvent::CanonicalNativeResearchUpdated(event) = event {
+        state
+            .update_canonical_native_research_v1(event.snapshot().clone())
+            .await;
     }
+}
+
+// ─── shared helpers ───────────────────────────────────────────────────────
+
+fn typed_legacy_start_error_response_v1(
+    kind: &'static str,
+    error: TypedLegacyExecutionStartErrorV1,
+) -> Response {
+    match error {
+        TypedLegacyExecutionStartErrorV1::Busy(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        TypedLegacyExecutionStartErrorV1::RuntimeUnavailable(detail) => actionable_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{kind} runtime is unavailable. Restart the application and try again."),
+            &anyhow::anyhow!(detail),
+        ),
+    }
+}
+
+fn typed_legacy_admission_error_response_v1(
+    kind: &'static str,
+    error: &TypedLegacyExecutionAdmissionErrorV1,
+) -> Response {
+    let status = match error {
+        TypedLegacyExecutionAdmissionErrorV1::BadRequest(_) => StatusCode::BAD_REQUEST,
+        TypedLegacyExecutionAdmissionErrorV1::Conflict(_)
+        | TypedLegacyExecutionAdmissionErrorV1::Cancelled(_) => StatusCode::CONFLICT,
+        TypedLegacyExecutionAdmissionErrorV1::UnprocessableEntity(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        TypedLegacyExecutionAdmissionErrorV1::ServiceUnavailable(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        TypedLegacyExecutionAdmissionErrorV1::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    actionable_error(
+        status,
+        format!(
+            "{kind} could not be admitted. Check Settings and the selected inputs, then try again."
+        ),
+        &anyhow::anyhow!(error.detail().to_owned()),
+    )
 }
 
 #[cfg(test)]

@@ -30,6 +30,8 @@ const ABI_VERSION_V1: u32 = 1;
 const PARENT_RANK_WEIGHTED_V1: u32 = 1;
 const SURVIVOR_RANK_WEIGHTED_V1: u32 = 1;
 const STATUS_OK_V1: i32 = 0;
+const STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2: i32 = -13;
+const STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2: i32 = -14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -61,6 +63,12 @@ pub enum ResidentGenerationDeviceErrorV1 {
     IdentityMismatch(&'static str),
     ArithmeticOverflow,
     CapacityUnavailable,
+    AsyncFreeOutcomeUnknownDeliberateLeak {
+        operation: &'static str,
+    },
+    AsyncAllocationOutcomeUnknownDeliberateLeak {
+        operation: &'static str,
+    },
     Native {
         operation: &'static str,
         status: i32,
@@ -207,7 +215,7 @@ pub(crate) struct RawResidentGenerationMetricRowV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RawGenerationPlanV1 {
+pub(crate) struct RawGenerationPlanV1 {
     abi_version: u32,
     parent_selection_policy: u32,
     survivor_selection_policy: u32,
@@ -242,26 +250,27 @@ struct RawGenerationPlanV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct RawAllocationReceiptV1 {
-    abi_version: u32,
-    generation_store_allocation_count: u32,
-    logical_gene_scalar_bytes: u64,
-    logical_gene_index_bytes: u64,
-    logical_gene_weight_bytes: u64,
-    offspring_bytes: u64,
-    metric_row_bytes: u64,
-    rank_key_bytes: u64,
-    selection_bytes: u64,
-    dedup_hash_bytes: u64,
-    cub_scratch_bytes: u64,
-    retained_evaluation_workspace_bytes: u64,
-    total_device_bytes: u64,
-    same_context_free_bytes: u64,
-    full_discovery_reserve_bytes: u64,
-    logical_population_count: u64,
-    retained_evaluation_capacity: u64,
-    generation_chunk_count: u64,
-    allocation_plan_sha256: [u8; 32],
+pub(crate) struct RawAllocationReceiptV1 {
+    pub(crate) abi_version: u32,
+    pub(crate) generation_store_allocation_count: u32,
+    pub(crate) logical_gene_scalar_bytes: u64,
+    pub(crate) logical_gene_index_bytes: u64,
+    pub(crate) logical_gene_weight_bytes: u64,
+    pub(crate) offspring_bytes: u64,
+    pub(crate) metric_row_bytes: u64,
+    pub(crate) rank_key_bytes: u64,
+    pub(crate) selection_bytes: u64,
+    pub(crate) dedup_hash_bytes: u64,
+    pub(crate) cub_scratch_bytes: u64,
+    pub(crate) retained_evaluation_workspace_bytes: u64,
+    pub(crate) terminal_device_receipt_bytes: u64,
+    pub(crate) total_device_bytes: u64,
+    pub(crate) same_context_free_bytes: u64,
+    pub(crate) full_discovery_reserve_bytes: u64,
+    pub(crate) logical_population_count: u64,
+    pub(crate) retained_evaluation_capacity: u64,
+    pub(crate) generation_chunk_count: u64,
+    pub(crate) allocation_plan_sha256: [u8; 32],
 }
 
 #[repr(C)]
@@ -284,14 +293,14 @@ pub(crate) struct RawMetricRowsImportV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct RawReadyEventV1 {
-    abi_version: u32,
-    reserved: u32,
-    event_id: u64,
-    generation_index: u64,
-    same_stream_enqueue_count: u64,
-    intermediate_host_wait_count: u64,
-    intermediate_readback_count: u64,
+pub(crate) struct RawReadyEventV1 {
+    pub(crate) abi_version: u32,
+    pub(crate) reserved: u32,
+    pub(crate) event_id: u64,
+    pub(crate) generation_index: u64,
+    pub(crate) same_stream_enqueue_count: u64,
+    pub(crate) intermediate_host_wait_count: u64,
+    pub(crate) intermediate_readback_count: u64,
 }
 
 #[repr(C)]
@@ -327,13 +336,13 @@ struct RawPostGaInPlaceReceiptV1 {
 const _: [(); 208] = [(); std::mem::size_of::<RawPopulationSessionImportV1>()];
 const _: [(); 104] = [(); std::mem::size_of::<RawResidentGenerationMetricRowV1>()];
 const _: [(); 632] = [(); std::mem::size_of::<RawGenerationPlanV1>()];
-const _: [(); 168] = [(); std::mem::size_of::<RawAllocationReceiptV1>()];
+const _: [(); 176] = [(); std::mem::size_of::<RawAllocationReceiptV1>()];
 const _: [(); 216] = [(); std::mem::size_of::<RawMetricRowsImportV1>()];
 const _: [(); 48] = [(); std::mem::size_of::<RawReadyEventV1>()];
 const _: [(); 48] = [(); std::mem::size_of::<RawContentReceiptV1>()];
 const _: [(); 96] = [(); std::mem::size_of::<RawPostGaInPlaceReceiptV1>()];
 
-enum NativeResidentGenerationRunV1 {}
+pub(crate) enum NativeResidentGenerationRunV1 {}
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
@@ -351,7 +360,7 @@ unsafe extern "C" {
         run: *mut *mut NativeResidentGenerationRunV1,
     ) -> i32;
     #[link_name = "initialize_resident_generation_population_v1"]
-    fn ffi_initialize_resident_generation_population_v1(
+    pub(crate) fn ffi_initialize_resident_generation_population_v1(
         run: *mut NativeResidentGenerationRunV1,
         ready: *mut RawReadyEventV1,
     ) -> i32;
@@ -382,8 +391,6 @@ unsafe extern "C" {
         generation_receipt_identity_handle: u64,
         receipt: *mut RawPostGaInPlaceReceiptV1,
     ) -> i32;
-    #[link_name = "enqueue_resident_generation_release_v1"]
-    fn ffi_enqueue_resident_generation_release_v1(run: *mut NativeResidentGenerationRunV1) -> i32;
 }
 
 /// One private, move-only import minted by the existing population owner. The
@@ -472,6 +479,134 @@ pub struct SealedResidentGenerationPlanV1 {
     plan_identity_sha256: [u8; 32],
 }
 
+impl SealedResidentGenerationPlanV1 {
+    pub(crate) const fn raw_plan_v1(&self) -> &RawGenerationPlanV1 {
+        &self.raw
+    }
+
+    pub(crate) const fn logical_population_count_v1(&self) -> u64 {
+        self.raw.logical_population_count
+    }
+
+    pub(crate) const fn feature_count_v1(&self) -> u64 {
+        self.raw.feature_count
+    }
+
+    pub(crate) const fn retained_evaluation_capacity_v1(&self) -> u64 {
+        self.raw.retained_evaluation_capacity
+    }
+
+    pub(crate) const fn max_terms_per_gene_v1(&self) -> u32 {
+        self.raw.max_terms_per_gene
+    }
+
+    pub(crate) const fn survivor_count_v1(&self) -> u64 {
+        self.raw.survivor_count
+    }
+
+    pub(crate) const fn generation_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.generation_semantics_sha256
+    }
+
+    pub(crate) const fn plan_identity_sha256_v1(&self) -> [u8; 32] {
+        self.plan_identity_sha256
+    }
+
+    pub(crate) const fn run_identity_sha256_v1(&self) -> [u8; 32] {
+        self.raw.run_identity_sha256
+    }
+
+    pub(crate) const fn strategy_gene_schema_sha256_v1(&self) -> [u8; 32] {
+        self.raw.strategy_gene_schema_sha256
+    }
+
+    pub(crate) const fn rank_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.rank_semantics_sha256
+    }
+
+    pub(crate) const fn metric_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.metric_semantics_sha256
+    }
+
+    pub(crate) const fn scoring_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.scoring_semantics_sha256
+    }
+
+    pub(crate) const fn novelty_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.novelty_semantics_sha256
+    }
+
+    pub(crate) const fn scenario_order_semantics_sha256_v1(&self) -> [u8; 32] {
+        self.raw.scenario_order_semantics_sha256
+    }
+
+    pub(crate) const fn cuda_build_manifest_sha256_v1(&self) -> [u8; 32] {
+        self.raw.cuda_build_manifest_sha256
+    }
+
+    #[cfg(feature = "cuda-device-fixtures")]
+    pub(crate) fn resident_search_fixture_v2(
+        logical_population_count: usize,
+        feature_count: usize,
+    ) -> Self {
+        Self::resident_search_scoring_fixture_v2(
+            logical_population_count,
+            feature_count,
+            crate::resident_scoring_v2::ResidentScoringObjectiveV2::PropFirmV4,
+        )
+    }
+
+    pub(crate) fn resident_search_scoring_fixture_v2(
+        logical_population_count: usize,
+        feature_count: usize,
+        objective: crate::resident_scoring_v2::ResidentScoringObjectiveV2,
+    ) -> Self {
+        let max_terms_per_gene = feature_count.min(3) as u32;
+        let threshold_ladder_bits =
+            std::array::from_fn(|index| (0.05 * (index as f64 + 1.0)).to_bits());
+        let stop_bounds_bits = std::array::from_fn(|index| (index as f64 + 1.0).to_bits());
+        let plan_identity_sha256 = [0x6b; 32];
+        Self {
+            raw: RawGenerationPlanV1 {
+                abi_version: ABI_VERSION_V1,
+                parent_selection_policy: PARENT_RANK_WEIGHTED_V1,
+                survivor_selection_policy: SURVIVOR_RANK_WEIGHTED_V1,
+                max_terms_per_gene,
+                minimum_terms_per_gene: 1,
+                threshold_level_count: 6,
+                smc_flag_count: 11,
+                reserved: 0,
+                logical_population_count: logical_population_count as u64,
+                retained_evaluation_capacity: logical_population_count as u64,
+                feature_count: feature_count as u64,
+                generation_count: 2,
+                survivor_count: 1,
+                immigrant_count: 0,
+                search_seed: 0x1234_5678_9abc_def0,
+                mutation_intensity_q32: 1_u64 << 32,
+                threshold_ladder_bits,
+                stop_bounds_bits,
+                smc_probability_q32: [0; 11],
+                generation_semantics_sha256: [0x61; 32],
+                run_identity_sha256: [0x62; 32],
+                strategy_gene_schema_sha256: [0x63; 32],
+                rank_semantics_sha256: crate::resident_scoring_v2::rank_semantics_sha256_v2(),
+                metric_semantics_sha256: [0x65; 32],
+                scoring_semantics_sha256: crate::resident_scoring_v2::scoring_semantics_sha256_v2(
+                    objective,
+                ),
+                novelty_semantics_sha256:
+                    crate::resident_scoring_v2::novelty_disabled_semantics_sha256_v2(),
+                scenario_order_semantics_sha256: [0x68; 32],
+                cuda_build_manifest_sha256: [0x69; 32],
+                rng_mapping_sha256: [0x6a; 32],
+                plan_identity_sha256,
+            },
+            plan_identity_sha256,
+        }
+    }
+}
+
 pub(crate) fn seal_resident_generation_plan_v1(
     input: ResidentGenerationPlanAuthorityInputV1,
 ) -> Result<SealedResidentGenerationPlanV1, ResidentGenerationDeviceErrorV1> {
@@ -518,7 +653,7 @@ pub(crate) fn seal_resident_generation_plan_v1(
             "SMC Q32 probability exceeds one",
         ));
     }
-    let expected_semantics = sha256_v1(&[DISCOVERY_GENERATION_SEMANTICS_V1.as_bytes()]);
+    let expected_semantics = discovery_generation_semantics_sha256_v1();
     if input.generation_semantics_sha256 != expected_semantics {
         return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
             "generation semantics",
@@ -609,6 +744,7 @@ pub struct ActualResidentGenerationAllocationPlanV1 {
     dedup_hash_bytes: u64,
     cub_scratch_bytes: u64,
     retained_evaluation_workspace_bytes: u64,
+    terminal_device_receipt_bytes: u64,
     same_context_free_bytes: u64,
     full_discovery_reserve_bytes: u64,
     total_device_bytes: u64,
@@ -698,7 +834,21 @@ pub(crate) fn bind_population_session_import_v1(
                 &mut native,
             )
         };
-        require_native_ok_v1("create_resident_generation_run_from_import_v1", status)?;
+        if status != STATUS_OK_V1 {
+            if !native.is_null() {
+                // Creator failures are forbidden from publishing any pointer.
+                // Do not call/query/free an unexpected identity; the import's
+                // leak-only Drop keeps its session/context/stream alive.
+                return Err(ResidentGenerationDeviceErrorV1::Native {
+                    operation: "create_resident_generation_run_from_import_v1_published_pointer_on_error",
+                    status,
+                });
+            }
+            return Err(native_error_v1(
+                "create_resident_generation_run_from_import_v1",
+                status,
+            ));
+        }
         let native = NonNull::new(native).ok_or(ResidentGenerationDeviceErrorV1::Native {
             operation: "create_resident_generation_run_from_import_v1",
             status,
@@ -1236,6 +1386,7 @@ fn validate_allocation_receipt_v1(
         raw.dedup_hash_bytes,
         raw.cub_scratch_bytes,
         raw.retained_evaluation_workspace_bytes,
+        raw.terminal_device_receipt_bytes,
     ]
     .into_iter()
     .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
@@ -1259,6 +1410,7 @@ fn validate_allocation_receipt_v1(
         dedup_hash_bytes: raw.dedup_hash_bytes,
         cub_scratch_bytes: raw.cub_scratch_bytes,
         retained_evaluation_workspace_bytes: raw.retained_evaluation_workspace_bytes,
+        terminal_device_receipt_bytes: raw.terminal_device_receipt_bytes,
         same_context_free_bytes: raw.same_context_free_bytes,
         full_discovery_reserve_bytes: raw.full_discovery_reserve_bytes,
         total_device_bytes: raw.total_device_bytes,
@@ -1435,6 +1587,10 @@ fn sha256_v1(fields: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+pub(crate) fn discovery_generation_semantics_sha256_v1() -> [u8; 32] {
+    sha256_v1(&[DISCOVERY_GENERATION_SEMANTICS_V1.as_bytes()])
+}
+
 fn identity_is_zero_v1(identity: &[u8; 32]) -> bool {
     identity.iter().all(|byte| *byte == 0)
 }
@@ -1459,7 +1615,17 @@ fn require_native_ok_v1(
 }
 
 fn native_error_v1(operation: &'static str, status: i32) -> ResidentGenerationDeviceErrorV1 {
-    ResidentGenerationDeviceErrorV1::Native { operation, status }
+    match status {
+        STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2 => {
+            ResidentGenerationDeviceErrorV1::AsyncFreeOutcomeUnknownDeliberateLeak { operation }
+        }
+        STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2 => {
+            ResidentGenerationDeviceErrorV1::AsyncAllocationOutcomeUnknownDeliberateLeak {
+                operation,
+            }
+        }
+        _ => ResidentGenerationDeviceErrorV1::Native { operation, status },
+    }
 }
 
 #[cfg(test)]

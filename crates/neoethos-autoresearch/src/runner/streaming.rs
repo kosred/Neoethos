@@ -1091,33 +1091,34 @@ impl SweepExecutor for StreamingSweepExecutor {
             "promotion evidence written"
         );
 
+        let band_discriminates = neoethos_search::discovery::cost_band_discriminates(
+            request.config.cost_band_pips,
+            neoethos_search::run_identity::cost_pips_round_trip(
+                request.config.evaluation_spread_pips,
+                request.config.evaluation_commission_per_trade,
+                request
+                    .config
+                    .try_evaluation_config(None)?
+                    .pip_value_per_lot,
+            ),
+        );
+        let cost_band = aggregate_cost_band_censuses_v1(
+            outcome
+                .batches
+                .iter()
+                .map(|batch| &batch.result.cost_band_census),
+            band_discriminates,
+        )?;
+
         Ok(SearchOutcome {
             slot: request.slot,
             config_hash: request.config_hash.to_string(),
             trials_offered,
             statistics,
-            // The census is produced INSIDE the search and `DiscoveryResult`
-            // has no field carrying it out (§17.5), so every survivor is
-            // reported as `unmeasured` and `discriminates` is carried from the
-            // band the run actually charged. That combination FAILS screen
-            // conjunct S3 rather than passing it silently: an unmeasured band
-            // recorded as `survives` would make every census read clean, which
-            // is worse than no census because a reader takes it as evidence.
-            cost_band: CostBandCounts {
-                unmeasured: survivors,
-                discriminates: neoethos_search::discovery::cost_band_discriminates(
-                    request.config.cost_band_pips,
-                    neoethos_search::run_identity::cost_pips_round_trip(
-                        request.config.evaluation_spread_pips,
-                        request.config.evaluation_commission_per_trade,
-                        request
-                            .config
-                            .try_evaluation_config(None)?
-                            .pip_value_per_lot,
-                    ),
-                ),
-                ..CostBandCounts::default()
-            },
+            // These are the Search-owned measured totals, aggregated across
+            // the exact streaming batches. Zero/unmeasured stays a refusal;
+            // only an actual `survives` count can clear Stage-1 S3.
+            cost_band,
             rejections,
             survivors,
             e_screen_pess: best.map(|(metrics, _, _)| metrics.profit_per_trade),
@@ -1153,26 +1154,6 @@ impl SweepExecutor for StreamingSweepExecutor {
             portfolio.batch_bindings.len() == 1,
             "quote-validated OOS V1 accepts exactly one immutable finalist batch binding; multi-batch replay requires a separately versioned contract"
         );
-        let replay_set = self.quote_validated_oos_replay.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no sealed historical quote replay set is installed for the locked finalist; legacy OHLC OOS evidence is insufficient and the window is NOT spent"
-            )
-        })?;
-        let promotion_portfolio_sha256 =
-            neoethos_search::canonical_locked_portfolio_identity_sha256_v1(portfolio)
-                .map_err(anyhow::Error::new)?;
-        anyhow::ensure!(
-            replay_set.portfolio_identity_sha256() == promotion_portfolio_sha256,
-            "installed quote replay belongs to a different immutable PromotionPortfolio"
-        );
-        let locked_window = replay_set.locked_evaluation_window();
-        anyhow::ensure!(
-            locked_window.from_unix_ms_inclusive() >= self.oos_window.start_ms
-                && locked_window.from_unix_ms_inclusive() <= self.oos_window.end_ms
-                && locked_window.to_unix_ms_exclusive() > self.oos_window.end_ms,
-            "installed quote replay does not cover the exact finalist OOS window"
-        );
-
         // The adaptive-stop hazard, refused rather than approximated.
         //
         // When adaptive stops are installed, a gene's effective SL is
@@ -1207,6 +1188,15 @@ impl SweepExecutor for StreamingSweepExecutor {
                 "{} slot {} carries no exact batch-bound genes, so there is nothing to evaluate out of sample",
                 portfolio.sweep,
                 portfolio.slot
+            );
+        }
+        if portfolio.batch_bindings.iter().any(|binding| {
+            binding.genes.iter().any(|tagged| {
+                !tagged.gene.stop_vol_mult.is_finite() || tagged.gene.stop_vol_mult != 0.0
+            })
+        }) {
+            bail!(
+                "quote-coverage V1 accepts fixed-stop finalists only; every gene must carry finite stop_vol_mult=0 before a request can be persisted"
             );
         }
         let base = self
@@ -1408,6 +1398,36 @@ impl SweepExecutor for StreamingSweepExecutor {
         )
         .map_err(anyhow::Error::new)
     }
+}
+
+fn aggregate_cost_band_censuses_v1<'a>(
+    censuses: impl IntoIterator<Item = &'a neoethos_search::discovery::CostBandCensus>,
+    discriminates: bool,
+) -> Result<CostBandCounts> {
+    let mut aggregate = neoethos_search::discovery::CostBandCensus::default();
+    for census in censuses {
+        aggregate.survives = aggregate
+            .survives
+            .checked_add(census.survives)
+            .context("aggregating measured cost-band survivors")?;
+        aggregate.optimistic_edge_only = aggregate
+            .optimistic_edge_only
+            .checked_add(census.optimistic_edge_only)
+            .context("aggregating optimistic-edge-only cost-band candidates")?;
+        aggregate.fails = aggregate
+            .fails
+            .checked_add(census.fails)
+            .context("aggregating failed cost-band candidates")?;
+        aggregate.unmeasured = aggregate
+            .unmeasured
+            .checked_add(census.unmeasured)
+            .context("aggregating unmeasured cost-band candidates")?;
+        aggregate.not_discriminating = aggregate
+            .not_discriminating
+            .checked_add(census.not_discriminating)
+            .context("aggregating non-discriminating cost-band candidates")?;
+    }
+    Ok(CostBandCounts::from_census(&aggregate, discriminates))
 }
 
 const SCRATCH_LEDGER_MANIFEST_SCHEMA: &str = "neoethos.autoresearch.scratch-ledger-manifest.v1";
@@ -1770,6 +1790,35 @@ mod tests {
     use super::*;
     use crate::runner::{PROMOTION_EVIDENCE_SCHEMA, PromotionPortfolio, load_promotion_portfolio};
 
+    #[test]
+    fn streaming_bridge_preserves_and_aggregates_measured_cost_band_censuses() {
+        let censuses = [
+            neoethos_search::discovery::CostBandCensus {
+                survives: 1,
+                optimistic_edge_only: 2,
+                fails: 3,
+                unmeasured: 4,
+                not_discriminating: 5,
+            },
+            neoethos_search::discovery::CostBandCensus {
+                survives: 6,
+                optimistic_edge_only: 7,
+                fails: 8,
+                unmeasured: 9,
+                not_discriminating: 10,
+            },
+        ];
+
+        let counts = aggregate_cost_band_censuses_v1(censuses.iter(), true)
+            .expect("bounded measured census aggregation");
+        assert_eq!(counts.survives, 7);
+        assert_eq!(counts.optimistic_edge_only, 9);
+        assert_eq!(counts.fails, 11);
+        assert_eq!(counts.unmeasured, 13);
+        assert_eq!(counts.not_discriminating, 15);
+        assert!(counts.discriminates);
+    }
+
     fn dataset_receipt(generation_id: &str) -> DatasetReceiptV1 {
         let identity = neoethos_data::CanonicalDatasetIdentity::external(
             "autoresearch-streaming-test",
@@ -2055,6 +2104,7 @@ mod tests {
             holdout_scope: Some(holdout_scope),
             search_config_hash: EFFECTIVE_SEARCH_CONFIG_HASH.to_owned(),
             cost_band_by_strategy: Vec::new(),
+            cost_band_census: neoethos_search::discovery::CostBandCensus::default(),
             portfolio: vec![gene(&[0])],
             candidates: Vec::new(),
             quality_metrics: Vec::new(),

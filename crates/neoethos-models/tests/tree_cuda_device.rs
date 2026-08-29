@@ -10,7 +10,9 @@ use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, Wor
 use neoethos_models::tree_models::config::{
     ParamValue, install_tree_runtime_from_settings, nvidia_gpu_count,
 };
-use neoethos_models::tree_models::{CatBoostExpert, LightGBMExpert, TreeModel, XGBoostExpert};
+use neoethos_models::tree_models::{
+    CatBoostExpert, LightGBMExpert, SklearsTreeExpert, TreeModel, XGBoostExpert,
+};
 use neoethos_models::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
     ProbabilityCalibrationExpert,
@@ -369,4 +371,26 @@ fn catboost_cuda_named_surfaces_train_infer_save_load() {
             },
         );
     }
+}
+
+#[test]
+fn sklears_tree_cuda_surface_trains_infers_and_reopens_without_cpu_fallback() {
+    install_mandatory_cuda_runtime();
+    let (frame, labels) = fixture(TREE_ROWS, TREE_FEATURES);
+    exercise_cuda_lifecycle(
+        "sklears_tree",
+        Box::new(SklearsTreeExpert::new()),
+        Box::new(SklearsTreeExpert::new()),
+        &frame,
+        &labels,
+        Path::new("runtime.json"),
+        |runtime| {
+            assert_eq!(runtime["requested_device_policy"], "gpu:0");
+            assert_eq!(runtime["effective_device"], "cuda:0");
+            assert_eq!(runtime["runtime_backend_kind"], "native_cuda");
+            assert!(runtime["fit_kernel_launches"].as_u64().unwrap_or(0) > 0);
+            assert!(runtime["predict_kernel_launches"].as_u64().unwrap_or(0) > 0);
+            assert_eq!(runtime["cpu_fallback_used"], false);
+        },
+    );
 }

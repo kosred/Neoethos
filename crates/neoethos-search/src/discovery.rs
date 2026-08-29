@@ -254,7 +254,7 @@ impl DiscoveryRuntimeOverrides {
         overrides
     }
 
-    fn resolved_funnel_stage1_pct(&self) -> f64 {
+    pub(crate) fn resolved_funnel_stage1_pct(&self) -> f64 {
         if self.funnel_stage1_pct.is_finite() {
             self.funnel_stage1_pct.clamp(0.01, 1.0)
         } else {
@@ -1610,6 +1610,12 @@ pub struct DiscoveryResult {
     /// trial-return matrix, and every result artifact. Never recompute this from
     /// ambient settings after the run.
     pub search_config_hash: String,
+    /// Exact run-level classification across every candidate whose cost band
+    /// was measured. This is carried separately from the per-strategy verdicts
+    /// so downstream screens can prove both the population totals and the
+    /// identity of each surviving strategy without reconstructing either from
+    /// logs or a truncated funnel profile.
+    pub cost_band_census: CostBandCensus,
     /// The cost-band verdict for every candidate that SURVIVED the quality
     /// screen, as `(strategy_id, verdict)` — audit #71.
     ///
@@ -5193,7 +5199,7 @@ struct QualityScreenRejects {
 /// candidates cleared every configured gate and are still not results: they are
 /// profitable only at the cheap end of a cost the operator cannot pin down to a
 /// tenth of a pip.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CostBandCensus {
     pub survives: usize,
     pub optimistic_edge_only: usize,
@@ -5897,12 +5903,33 @@ where
         .expect("with_holdout always constructs a held-out evidence suffix");
     let n_rows = input.ohlcv().len();
     let is_end = selection.ohlcv().len();
+    let gpu_manifest = crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline();
+    let host_feature_preparation = gpu_manifest
+        .capability(crate::gpu_native::capability::PipelineStage::FeaturePreparation)
+        .ok_or_else(|| anyhow::anyhow!("GPU capability manifest omitted feature preparation"))?;
+    anyhow::ensure!(
+        host_feature_preparation.capability
+            == crate::gpu_native::capability::StageGpuCapability::CpuOnly,
+        "feature-preparation capability changed without a reviewed resident-Data continuation"
+    );
+    // Discovery is still a mixed CPU/GPU pipeline. Preflight only the stage
+    // that this entrypoint is about to require from the exact device route;
+    // the separate full-Discovery permit remains fail-closed over all stages.
+    // In particular, do not label host feature preparation or GA orchestration
+    // as resident GPU work merely because population evaluation is native.
     crate::gpu_native::capability::gpu_pipeline_preflight(
         crate::backend::current_evaluation_backend(),
-        &crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline(),
-        &crate::gpu_native::capability::PipelineStage::FULL_DISCOVERY,
+        &gpu_manifest,
+        &[crate::gpu_native::capability::PipelineStage::PopulationEvaluation],
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    tracing::warn!(
+        target: "neoethos_search::discovery",
+        feature_preparation = ?host_feature_preparation.capability,
+        feature_preparation_detail = host_feature_preparation.detail,
+        population_evaluation = ?crate::gpu_native::capability::StageGpuCapability::StrictGpu,
+        "stage-scoped Discovery admission: population evaluation must use its exact native/typed CPU route; feature preparation remains explicitly host-side"
+    );
 
     tracing::info!(
         target: "neoethos_search::discovery",
@@ -6343,7 +6370,9 @@ where
                 // Stamp the resolved config into the LOG as well as the ledger,
                 // so a run with the ledger disabled still names what it
                 // searched under. Same function, same hash — a log line and a
-                // ledger entry from one run are comparable by `config_hash`.
+                // ledger entry from one run are comparable by the same legacy
+                // resolved-config subset hash. Full S3b search authority also
+                // requires the sizing receipt and exact stage-1 projection.
                 let normalize_features =
                     neoethos_data::current_data_runtime_overrides().normalize_features;
                 match crate::run_identity::stamp_resolved_config(
@@ -6360,9 +6389,9 @@ where
                             target: "neoethos_search::run_identity",
                             config_hash = %stamp.config_hash,
                             stamp = %stamp_json,
-                            "resolved-config stamp — the decision-critical values this run \
-                             resolved. Two runs with the same config_hash are the same \
-                             experiment."
+                            "resolved-config stamp — the legacy decision subset this run \
+                             resolved. Equal subset hashes are not an exhaustive experiment \
+                             identity; use the strict search authority plus sizing receipt."
                         );
                     }
                     Err(err) => tracing::warn!(
@@ -6736,49 +6765,71 @@ where
     );
     let ohlcv_stage1 = slice_ohlcv(&ohlcv, stage1_start, stage1_end);
     let features_stage1 = features.row_window(stage1_start, stage1_end)?;
-    // ── The search-more knob, resolved here and nowhere else ────────────────
-    //
-    // Population is NOT a batching parameter: a bigger one creates different
-    // candidates and selects different survivors. So it may only grow when the
-    // operator asked (`population_auto`), it is logged with both the configured
-    // and the resolved value, and it never shrinks below what was configured.
-    // The 16 384 bound is where the measured throughput curve flattens
-    // (843 M cand-bars/s at 16 384 vs 966 M at 131 072) and roughly the card's
-    // own fits ceiling at H1 bar counts — beyond it a generation splits into
-    // multiple launches for ~14 % more rate while multiplying the downstream
-    // validation funnel's work linearly.
-    let ga_population = if config.population_auto {
-        match crate::eval::gpu_submission_ceiling(
-            ohlcv_stage1.close.len(),
-            features_stage1.n_features(),
-        ) {
-            Some(fits) => {
-                let resolved = fits.min(16_384).max(config.population);
-                tracing::warn!(
-                    target: "neoethos_search::funnel",
-                    configured = config.population,
-                    card_fits = fits,
-                    resolved,
-                    "population_auto is ON — GA population sized from the card. \
-                     This SEARCHES MORE than the configured population: different \
-                     candidates, different survivors, different exports."
-                );
-                resolved
-            }
-            None => {
-                tracing::warn!(
-                    target: "neoethos_search::funnel",
-                    configured = config.population,
-                    "population_auto is ON but no card ceiling is readable \
-                     (no CUDA device, kernels disabled, or CPU build) — \
-                     keeping the configured population"
-                );
-                config.population
-            }
-        }
+    // Borrow the already-admitted run's immutable route facts. This performs
+    // no device operation and therefore cannot select a different ordinal or
+    // observe a post-parent free-memory value. Full resident-parent rows size
+    // fixed VRAM; the exact Stage1 range above sizes evaluation time.
+    let sizing_primitives = population_execution_run
+        .population_auto_sizing_primitives_v1()
+        .map_err(anyhow::Error::new)?;
+    let stage1_sizing_window =
+        crate::population_auto_sizing_receipt_v1::seal_population_auto_stage1_window_v1(
+            &sizing_primitives.parent_dataset_identity_sha256,
+            "selection_stage1",
+            stage1_start,
+            stage1_end,
+        )
+        .map_err(anyhow::Error::new)?;
+    let migration_enabled_for_run = crate::genetic::migration_enabled();
+    let month_capacity = crate::eval::current_backtest_runtime_overrides().month_capacity;
+    let stage1_evaluation_config = config.evaluation_config(ohlcv_stage1.close.last().copied());
+    let population_auto_sizing_receipt =
+        crate::population_auto_sizing_receipt_v1::seal_population_auto_sizing_receipt_v1(
+            crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRequestV1 {
+                population_auto: config.population_auto,
+                configured_population: config.population,
+                resident_parent_rows: sizing_primitives.resident_parent_rows,
+                evaluation_rows: ohlcv_stage1.close.len(),
+                feature_count: sizing_primitives.feature_count,
+                month_capacity,
+                requested_max_indicators: config.max_indicators,
+                migration_enabled: migration_enabled_for_run,
+                parent_canonical_scope_identity_sha256: sizing_primitives
+                    .parent_canonical_scope_identity_sha256,
+                parent_dataset_identity_sha256: sizing_primitives.parent_dataset_identity_sha256,
+                stage1_window: stage1_sizing_window,
+                route: sizing_primitives.route,
+            },
+        )
+        .map_err(anyhow::Error::new)?;
+    let search_authority = crate::run_identity::build_population_auto_search_authority_v1(
+        config,
+        &population_auto_sizing_receipt,
+        stage1_evaluation_config.pip_value_per_lot,
+        neoethos_data::current_data_runtime_overrides().normalize_features,
+    )?;
+    let ga_population = population_auto_sizing_receipt.resolved_population();
+    if ga_population != config.population {
+        tracing::warn!(
+            target: "neoethos_search::funnel",
+            configured = config.population,
+            resolved = ga_population,
+            term_cap = population_auto_sizing_receipt.term_cap(),
+            reason = population_auto_sizing_receipt.resolution_reason(),
+            sizing_receipt_sha256 = population_auto_sizing_receipt.identity_sha256(),
+            "population_auto widened the exact receipt-governed search"
+        );
     } else {
-        config.population
-    };
+        tracing::info!(
+            target: "neoethos_search::funnel",
+            configured = config.population,
+            resolved = ga_population,
+            population_auto = config.population_auto,
+            reason = population_auto_sizing_receipt.resolution_reason(),
+            sizing_receipt_sha256 = population_auto_sizing_receipt.identity_sha256(),
+            "exact population sizing receipt kept the configured search population"
+        );
+    }
     // Everything downstream of this point must see the RESOLVED population, or
     // the artifacts this run writes from `config` (the search ledger at the
     // end of this function records `config.population`) would describe a
@@ -6802,14 +6853,7 @@ where
     // edge. This is resolved only after population auto-sizing, so the prior
     // ledger, trial-return matrix, and new ledger all name the search that
     // actually runs rather than the caller's unresolved request.
-    let search_state_config_hash = crate::run_identity::config_hash_for(
-        config,
-        config.evaluation_config(None).pip_value_per_lot,
-        neoethos_data::current_data_runtime_overrides().normalize_features,
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!("cannot derive the exact config hash for receipt-bound discovery state")
-    })?;
+    let search_state_config_hash = search_authority.search_config_hash().to_owned();
 
     // Search-memory + weekly-refresh: seed only from state addressed by this
     // exact receipt and resolved config. Corruption, a legacy unbound ledger, or
@@ -6873,12 +6917,13 @@ where
         config.generations,
         config.max_indicators,
         max_runtime,
-        Some(config.evaluation_config(ohlcv_stage1.close.last().copied())),
+        Some(stage1_evaluation_config),
         &population_execution_run,
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
             start: stage1_start,
             end: stage1_end,
         },
+        &search_authority,
         |generation, total_generations, best_fitness, stagnant_generations, archived_profitable| {
             progress_fn(DiscoveryProgress::GenerationCompleted {
                 generation,
@@ -7954,11 +7999,8 @@ fn validate_regime_robustness(
     let trend_idx = features
         .names
         .iter()
-        .position(|n| n == "regime_wilder_adx_14_v3");
-    let vol_idx = features
-        .names
-        .iter()
-        .position(|n| n == "neoethos_custom_gk_vol_ratio_state_10_50_v3");
+        .position(|n| n == "regime_trend_strength");
+    let vol_idx = features.names.iter().position(|n| n == "regime_vol_state");
 
     // **2026-05-25 unwrap audit**: collapsed the early-return guard +
     // two `.unwrap()` calls into a single `let-else` destructure. Same
@@ -8016,9 +8058,9 @@ fn validate_regime_robustness(
         let trend_str = trend_column.values[idx];
         let vol_state = volatility_column.values[idx];
 
-        if trend_str > 25.0 {
+        if trend_str > 0.25 {
             trend_pnl += trade.pnl;
-        } else if trend_str < 15.0 {
+        } else if trend_str < 0.15 {
             range_pnl += trade.pnl;
         }
 
@@ -9092,14 +9134,6 @@ where
         //
         // What remains is a HOST-memory bound, and it is a different quantity
         // for a different reason. See `MAX_STAGED_CLONES`.
-        // REPORTED, NOT USED. This queries free VRAM through `submission_ceiling`
-        // and the screen sizes nothing from it — the evaluator asks the card
-        // itself and splits the descriptor array. It is logged so an operator can
-        // compare what the card would host against what the launch actually
-        // asked for; a caller that SIZED from it could only get it wrong, which
-        // is what the six-chunk device loop was.
-        let gpu_ceiling =
-            crate::eval::gpu_submission_ceiling(ohlcv.close.len(), features.n_features());
         let bars = ohlcv.close.len();
         let candidates = pairs.len();
         let device_mc = crate::gpu_native::scenario::device_monte_carlo();
@@ -9180,8 +9214,6 @@ where
             launches = candidates.div_ceil(screen_chunk.max(1)),
             scenarios_per_chunk = screen_chunk * (mc_runs + usize::from(fuse_costs)),
             fused_cost_pass = fuse_costs,
-            // For comparison only — nothing here is sized from it.
-            gpu_ceiling_reported = gpu_ceiling.unwrap_or(0),
             "quality screen — ONE work list per chunk, Monte-Carlo and costs together; \
              the evaluator sizes and splits it against free VRAM, and per-candidate \
              results are split-invariant"
@@ -10954,6 +10986,7 @@ where
         selection_scope: selection_scope.clone(),
         holdout_scope: holdout_scope.cloned(),
         search_config_hash: search_state_config_hash.to_string(),
+        cost_band_census,
         cost_band_by_strategy,
         portfolio,
         candidates: ranked_candidate_genes,

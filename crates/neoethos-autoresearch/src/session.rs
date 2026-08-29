@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::awaiting_quote_coverage_v1::QuoteCoverageStateV1;
 use crate::journal::{Journal, OosWindow, PosteriorCredit, Record, SearchRecord, SweepKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,7 +286,7 @@ impl DatasetReceiptV1 {
         DatasetReceiptId(format!("dr1-{}", encode_hex(&digest)))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.schema == DATASET_RECEIPT_SCHEMA,
             "dataset receipt schema {:?} is not {DATASET_RECEIPT_SCHEMA}",
@@ -1023,6 +1024,9 @@ pub struct Session {
     /// matrix that restarts empty makes `pbo_session` refuse forever, and a
     /// refusal is a fail, so NO PROMOTION IS POSSIBLE after any restart.
     pub champions: Vec<ChampionRow>,
+    /// Durable pre-touch quote-coverage handshake, folded only from its two
+    /// versioned journal records.
+    quote_coverage: Option<QuoteCoverageStateV1>,
     pub oos_touches_spent: u32,
     pub census: AbandonCensus,
     /// Set by `SessionStopped`. A stopped session is never resumed into more
@@ -1402,8 +1406,98 @@ impl Session {
                 });
             }
 
-            Record::OosTouchSpent { .. } => {
-                self.oos_touches_spent += 1;
+            Record::AwaitingQuoteCoverageV1 { request } => {
+                request.validate().map_err(anyhow::Error::new)?;
+                let opened = self
+                    .opened
+                    .as_ref()
+                    .context("quote coverage cannot be awaited before SessionOpened")?;
+                ensure!(
+                    self.stopped.is_none() && self.oos_touches_spent == 0,
+                    "quote coverage cannot be awaited after terminal stop or OOS touch"
+                );
+                ensure!(
+                    request.session_id() == &opened.session_id
+                        && request.window() == opened.oos_window
+                        && request.dataset_receipt() == &opened.dataset_receipt,
+                    "quote-coverage request is detached from the opened session/dataset/window"
+                );
+                match &self.quote_coverage {
+                    None => {
+                        self.quote_coverage = Some(QuoteCoverageStateV1::Awaiting(request.clone()));
+                    }
+                    Some(QuoteCoverageStateV1::Awaiting(existing)) if existing == request => {}
+                    Some(QuoteCoverageStateV1::Awaiting(_)) => {
+                        bail!(
+                            "the journal carries a different quote-coverage request while one is already awaiting exact coverage"
+                        );
+                    }
+                    Some(QuoteCoverageStateV1::Ready { .. }) => {
+                        bail!(
+                            "an AwaitingQuoteCoverageV1 record cannot regress a Ready quote-coverage state"
+                        );
+                    }
+                }
+            }
+
+            Record::QuoteCoverageReadyV1 { ready } => {
+                ensure!(
+                    self.stopped.is_none() && self.oos_touches_spent == 0,
+                    "quote coverage cannot become Ready after terminal stop or OOS touch"
+                );
+                let request = match &self.quote_coverage {
+                    Some(QuoteCoverageStateV1::Awaiting(request)) => request.clone(),
+                    Some(QuoteCoverageStateV1::Ready { request, coverage })
+                        if coverage == ready =>
+                    {
+                        ready
+                            .validate_against(request)
+                            .map_err(anyhow::Error::new)?;
+                        return Ok(());
+                    }
+                    Some(QuoteCoverageStateV1::Ready { .. }) => {
+                        bail!(
+                            "the journal carries a different quote-coverage Ready record after exact coverage was already fixed"
+                        );
+                    }
+                    None => {
+                        bail!(
+                            "QuoteCoverageReadyV1 has no preceding AwaitingQuoteCoverageV1 request"
+                        );
+                    }
+                };
+                ready
+                    .validate_against(&request)
+                    .map_err(anyhow::Error::new)?;
+                self.quote_coverage = Some(QuoteCoverageStateV1::Ready {
+                    request,
+                    coverage: ready.clone(),
+                });
+            }
+
+            Record::OosTouchSpent {
+                window,
+                sweep,
+                candidate,
+            } => {
+                ensure!(
+                    self.oos_touches_spent == 0,
+                    "the journal attempts to spend the single OOS touch more than once"
+                );
+                match &self.quote_coverage {
+                    Some(QuoteCoverageStateV1::Awaiting(_)) => bail!(
+                        "OosTouchSpent cannot follow AwaitingQuoteCoverageV1 before exact coverage is Ready"
+                    ),
+                    Some(QuoteCoverageStateV1::Ready { request, .. }) => ensure!(
+                        request.window() == *window
+                            && request.sweep() == *sweep
+                            && request.candidate_config_hash() == candidate,
+                        "OosTouchSpent is detached from the exact Ready quote-coverage request"
+                    ),
+                    None => {}
+                }
+                self.quote_coverage = None;
+                self.oos_touches_spent = 1;
             }
 
             Record::Promoted { .. } | Record::PromotionRefused { .. } => {}
@@ -1439,6 +1533,10 @@ impl Session {
             }
 
             Record::SessionStopped { verdict } => {
+                ensure!(
+                    self.quote_coverage.is_none(),
+                    "SessionStopped cannot terminalize a resumable quote-coverage boundary"
+                );
                 self.stopped = Some(verdict.clone());
             }
 
@@ -1550,6 +1648,10 @@ impl Session {
 
     pub fn has_stopped(&self) -> bool {
         self.stopped.is_some()
+    }
+
+    pub fn quote_coverage_state(&self) -> Option<&QuoteCoverageStateV1> {
+        self.quote_coverage.as_ref()
     }
 
     /// Has this session's one OOS touch been spent?

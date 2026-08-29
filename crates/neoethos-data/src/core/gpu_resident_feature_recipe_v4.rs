@@ -1226,7 +1226,7 @@ fn derive_route_plan_sha256_v4(routes: &[ResidentFeatureRouteV3]) -> AnyResult<[
     Ok(hasher.finalize().into())
 }
 
-fn derive_route_semantic_source_sha256_v4(
+pub(crate) fn derive_route_semantic_source_sha256_v4(
     route_domain: &str,
     exact_math_authority: &str,
     route_receipt_sha256: [u8; 32],

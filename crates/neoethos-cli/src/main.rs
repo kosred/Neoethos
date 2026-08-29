@@ -12,6 +12,7 @@ mod gpu_bench;
 mod gpu_bench_population;
 mod gpu_bench_prepare;
 mod gpu_bench_snapshot;
+mod native_research;
 mod tui;
 
 fn main() -> Result<()> {
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
                     | "--version"
                     | "-V"
                     | "version"
+                    | "native-research"
             );
             eprintln!("──────────────────────────────────────────────────────────────");
             eprintln!("CONFIG NOT LOADED");
@@ -226,6 +228,7 @@ fn main() -> Result<()> {
         "canonical-cost-build" => canonical_full_run::build_cost_assumptions(tail, settings),
         "canonical-train" => canonical_full_run::train_receipt_bound(tail, settings),
         "canonical-full-run" => canonical_full_run::run(&args[2..], &startup_settings),
+        "native-research" => native_research::run(tail),
         "train" => cmd_train(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
         "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
@@ -2577,6 +2580,38 @@ fn cmd_discover(args: &[String]) -> Result<()> {
     result.map(|_| ())
 }
 
+fn apply_batch_discover_cli_overrides(
+    args: &[String],
+    config: &mut neoethos_search::DiscoveryConfig,
+) -> Result<()> {
+    if let Some(p) = parse_flag(args, "--population")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.population = p;
+    }
+    if has_flag(args, "--population-auto") {
+        let raw = parse_flag(args, "--population-auto")
+            .context("--population-auto requires an explicit true or false value")?;
+        config.population_auto = raw.parse::<bool>().with_context(|| {
+            format!("invalid --population-auto value `{raw}`; expected true or false")
+        })?;
+    }
+    if let Some(g) = parse_flag(args, "--generations")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.generations = g;
+    }
+    if let Some(ps) = parse_flag(args, "--portfolio-size")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        config.portfolio_size = ps;
+    }
+    Ok(())
+}
+
 fn cmd_batch_discover(args: &[String]) -> Result<()> {
     let result = (|| -> Result<(String, usize, usize)> {
         let settings = resolve_cli_settings(args)?;
@@ -2610,24 +2645,7 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
         // precedence as env > config elsewhere). These let the TUI Discover
         // form's Population/Generations/Portfolio-size fields actually take
         // effect instead of being silently dropped (parity fix 2026-06-08).
-        if let Some(p) = parse_flag(args, "--population")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-        {
-            config.population = p;
-        }
-        if let Some(g) = parse_flag(args, "--generations")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-        {
-            config.generations = g;
-        }
-        if let Some(ps) = parse_flag(args, "--portfolio-size")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-        {
-            config.portfolio_size = ps;
-        }
+        apply_batch_discover_cli_overrides(args, &mut config)?;
         let inventory = neoethos_data::DatasetDiscovery::scan(&root)
             .with_context(|| format!("fully verify canonical batch inventory under {root}"))?;
         for entry in &inventory.entries {
@@ -4622,6 +4640,11 @@ fn maybe_blank(s: &str) -> &str {
 fn print_help() {
     println!("neoethos-cli");
     println!("  [--cpu-threads N] [--startup-diagnostics]");
+    println!(
+        "  native-research start --contract-relative-path <path> --expected-sha256 <64-lowerhex> [--population N] [--population-auto true|false] [--max-indicators N] [--api-base http://127.0.0.1:PORT]"
+    );
+    println!("  native-research status [--api-base http://127.0.0.1:PORT]");
+    println!("  native-research cancel [--api-base http://127.0.0.1:PORT]");
     println!("  symbols --root data");
     println!("  timeframes --symbol EURUSD --root data");
     println!("  load --symbol EURUSD --timeframe M1 [--dataset-identity d1-...] --root data");
@@ -4782,9 +4805,9 @@ fn system_time_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SliceDatasetProvenanceV1, cli_record, gpu_assignment_env, publish_canonical_dataset_slice,
-        schedule_series_rows, section_record, select_runtime_timeframe_identities,
-        select_runtime_timeframe_identities_for_base,
+        SliceDatasetProvenanceV1, apply_batch_discover_cli_overrides, cli_record,
+        gpu_assignment_env, publish_canonical_dataset_slice, schedule_series_rows, section_record,
+        select_runtime_timeframe_identities, select_runtime_timeframe_identities_for_base,
     };
     use neoethos_core::sectioned_log::SubsystemSection;
 
@@ -4811,6 +4834,40 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    #[test]
+    fn batch_population_auto_override_is_typed_and_inherits_when_absent() {
+        let mut inherited = neoethos_search::DiscoveryConfig::default();
+        inherited.population_auto = true;
+        apply_batch_discover_cli_overrides(&[], &mut inherited)
+            .expect("missing override inherits Settings-derived value");
+        assert!(inherited.population_auto);
+
+        let mut enabled = neoethos_search::DiscoveryConfig::default();
+        apply_batch_discover_cli_overrides(
+            &["--population-auto".to_owned(), "true".to_owned()],
+            &mut enabled,
+        )
+        .expect("explicit true override");
+        assert!(enabled.population_auto);
+
+        let mut disabled = neoethos_search::DiscoveryConfig::default();
+        disabled.population_auto = true;
+        apply_batch_discover_cli_overrides(
+            &["--population-auto".to_owned(), "false".to_owned()],
+            &mut disabled,
+        )
+        .expect("explicit false override");
+        assert!(!disabled.population_auto);
+
+        let mut malformed = neoethos_search::DiscoveryConfig::default();
+        let error = apply_batch_discover_cli_overrides(
+            &["--population-auto".to_owned(), "maybe".to_owned()],
+            &mut malformed,
+        )
+        .expect_err("malformed boolean must fail loudly");
+        assert!(error.to_string().contains("expected true or false"));
     }
 
     fn publish_fixture(root: &std::path::Path, identity: &neoethos_data::CanonicalDatasetIdentity) {

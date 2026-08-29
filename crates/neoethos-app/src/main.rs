@@ -21,7 +21,6 @@ use neoethos_core::logging::{
 };
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -233,6 +232,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // single config via ONE shared installer, before any executor can observe
     // a default or initialize a dependency-owned worker pool.
     neoethos_app::install_runtime_overrides_from_settings(&settings);
+    #[cfg(all(feature = "gpu-nvidia", target_os = "linux"))]
+    neoethos_app::server::state::install_canonical_native_startup_authority_v1(&settings)?;
     startup_trace.record(StartupEvent::RuntimeSettingsInstalled)?;
 
     let runtime_workers = installed.resolved().effective_worker_limit.get();
@@ -327,9 +328,12 @@ async fn async_main(args: Args, settings: Settings) -> Result<(), Box<dyn std::e
             tf_timeout_secs = args.validation_tf_timeout_secs,
             "Starting neoethos-app in VALIDATION-MODE (multi-TF Discovery sweep)..."
         );
+        server::state::install_config_path(args.config.clone());
+        let validation_state = server::state::AppApiState::new();
         let exit_code = app_services::validation::run_validation_sweep(
             &runtime,
             &settings,
+            validation_state,
             &args.validation_tfs,
             args.validation_tf_timeout_secs,
             args.validation_min_generations,
@@ -462,7 +466,15 @@ async fn async_main(args: Args, settings: Settings) -> Result<(), Box<dyn std::e
 
     if args.headless {
         info!("Starting neoethos in headless server mode...");
-        run_headless_loop(runtime).await;
+        server::state::install_config_path(args.config.clone());
+        let headless_state = server::state::AppApiState::new();
+        let intent = app_services::entrypoints::HeadlessExecutionPipelineIntentV1::checked_new(
+            settings.system.resolve_symbol(),
+            settings.system.resolve_base_timeframe(),
+            args.auto_discovery,
+            args.auto_training,
+        )?;
+        run_headless_loop(runtime, headless_state, intent).await;
         return Ok(());
     }
 
@@ -571,149 +583,20 @@ fn spawn_parent_watchdog(parent_pid: u32) {
         });
 }
 
-async fn run_headless_loop(runtime: AppRuntimeConfig) {
-    use app_services::{
-        discovery::{DiscoveryRequest, start_discovery_job},
-        training::{TrainingRequest, start_training_job},
-    };
-    use std::path::PathBuf;
-
+async fn run_headless_loop(
+    runtime: AppRuntimeConfig,
+    state: server::state::AppApiState,
+    intent: app_services::entrypoints::HeadlessExecutionPipelineIntentV1,
+) {
     info!("Loading configuration from: {}", runtime.config_path);
-
-    let symbols = match neoethos_data::discover_symbols(&runtime.data_dir) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(
-                target: "neoethos_app::main",
-                data_dir = %runtime.data_dir.display(),
-                error = %err,
-                "headless: discover_symbols failed; continuing with empty symbol list"
-            );
-            Vec::new()
-        }
-    };
-    info!(
-        "Headless: mapped {} local symbols in '{}'",
-        symbols.len(),
-        runtime.data_dir.display()
-    );
-
-    let (tx, _rx) = mpsc::channel(1000);
-
-    if runtime.auto_discovery {
-        // ── 2026-08-10, config consolidation ─────────────────────────────
-        // This built `DiscoveryConfig::default()`. Every discovery knob the
-        // operator had set — population, generations, gates, cost model,
-        // `min_history_years` — was IGNORED on the headless auto-discovery
-        // path, while the UI path (`server/engines_control.rs:205`) and the
-        // validation sweep (`app_services/validation.rs:283`) both used
-        // `from_settings`. Same binary, same config file, three different
-        // answers depending on how the run was started.
-        //
-        // FAIL LOUD, do not substitute. If the config cannot be read we do
-        // NOT quietly fall back to the compiled defaults and run anyway —
-        // that is the failure wearing the costume of a choice. The run is
-        // refused and the reason is named.
-        let discovery_setup = match Settings::from_yaml(&runtime.config_path) {
-            Ok(settings) => match neoethos_search::DiscoveryConfig::try_from_settings(&settings) {
-                Ok(cfg) => {
-                    let symbol = settings.system.resolve_symbol();
-                    let base_tf = settings.system.resolve_base_timeframe();
-                    match app_services::discovery::resolve_unique_background_dataset_identity(
-                        &runtime.data_dir,
-                        &symbol,
-                        &base_tf,
-                    ) {
-                        Ok(dataset_identity) => {
-                            let higher_tfs = settings.system.resolve_higher_timeframes(&base_tf);
-                            info!(
-                                config_path = %runtime.config_path,
-                                dataset_identity = %dataset_identity.to_path_component(),
-                                population = cfg.population,
-                                generations = cfg.generations,
-                                min_history_years = cfg.runtime_overrides.min_history_years,
-                                "Headless: discovery config and exact dataset identity resolved"
-                            );
-                            Some((dataset_identity, higher_tfs, cfg))
-                        }
-                        Err(err) => {
-                            error!(
-                                symbol = %symbol,
-                                base_tf = %base_tf,
-                                error = %err,
-                                "Headless: refusing auto-discovery because background selection did not resolve exactly one canonical dataset identity"
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!(
-                        config_path = %runtime.config_path,
-                        error = %err,
-                        "Headless: refusing to auto-start discovery because exact broker financial evidence is unavailable"
-                    );
-                    None
-                }
-            },
-            Err(err) => {
-                error!(
-                    config_path = %runtime.config_path,
-                    error = %err,
-                    "Headless: REFUSING to auto-start discovery — the config file \
-                     could not be read, and running on the compiled defaults would \
-                     search a different space than the operator configured without \
-                     saying so. Fix the config and restart. (Auto-training, if \
-                     requested, is unaffected and still runs.)"
-                );
+    let mut headless_execution =
+        match app_services::entrypoints::run_headless_execution_pipeline_v1(state, intent) {
+            Ok(handle) => handle,
+            Err(error) => {
+                error!(error = %error, "Headless execution was not admitted");
                 None
             }
         };
-        if let Some((dataset_identity, higher_tfs, discovery_config)) = discovery_setup {
-            match app_services::discovery::pin_current_discovery_input(
-                &runtime.data_dir,
-                &dataset_identity,
-                &higher_tfs,
-            ) {
-                Ok(pinned_input) => {
-                    let request = DiscoveryRequest {
-                        data_root: runtime.data_dir.clone(),
-                        pinned_input: std::sync::Arc::new(pinned_input),
-                        higher_tfs,
-                        config: discovery_config,
-                        prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
-                    };
-                    match start_discovery_job(request, tx.clone()) {
-                        Ok(_handle) => info!("Headless: discovery job started"),
-                        Err(err) => error!("Headless: failed to start discovery: {}", err),
-                    }
-                }
-                Err(err) => error!(
-                    dataset_identity = %dataset_identity.to_path_component(),
-                    error = %err,
-                    "Headless: exact discovery generations could not be pinned; acquire/refresh data before retrying"
-                ),
-            }
-        }
-    }
-
-    if runtime.auto_training {
-        let symbol = symbols
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "EURUSD".to_string());
-        info!("Headless: auto-starting training for {}", symbol);
-        let request = TrainingRequest {
-            config_path: runtime.config_path.clone(),
-            models_dir: PathBuf::from("models"),
-            symbol,
-            base_tf: "M1".to_string(),
-        };
-        match start_training_job(request, tx.clone()) {
-            Ok(_handle) => info!("Headless: training job started"),
-            Err(err) => error!("Headless: failed to start training: {}", err),
-        }
-    }
 
     let mode = if runtime.start_local {
         "LOCAL"
@@ -736,13 +619,31 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                info!(
+                    "Headless keep-alive: Cores={} Mode={} Discovery={} Training={}",
+                    num_cpus::get(),
+                    mode,
+                    runtime.auto_discovery,
+                    runtime.auto_training,
+                );
+            }
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    error!(error = %error, "Headless shutdown signal listener failed");
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(headless_execution) = headless_execution.take() {
+        headless_execution.cancel();
+        let terminal = headless_execution.await_terminal().await;
         info!(
-            "Headless keep-alive: Cores={} Mode={} Discovery={} Training={}",
-            num_cpus::get(),
-            mode,
-            runtime.auto_discovery,
-            runtime.auto_training,
+            ?terminal,
+            "Headless execution reached its real terminal state"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Source-only contract proving the former A2 dead-code frontier is connected.
+//! Source-only contract for the intentionally narrow A2 dead-code frontier.
 
 use std::fs;
 use std::path::PathBuf;
@@ -32,10 +32,28 @@ fn bound_robust_receipt_is_validated_after_run_device_binding() {
 }
 
 #[test]
-fn regime_append_is_consumed_without_dead_code_suppression() {
-    let regime = read("src/core/gpu_resident_regime_v3.rs");
-    let store = read("src/core/gpu_resident_feature_store_v3.rs");
-    assert!(regime.contains("pub(crate) fn append_to("));
-    assert!(store.contains("regime_input.append_to(&mut assembler, regime_bindings)?"));
-    assert!(!regime.contains("dead_code"));
+fn deferred_regime_seams_use_only_item_scoped_expectations() {
+    let source = read("src/core/gpu_resident_regime_v3.rs");
+    let reason = "the complete ordered A2 ledger still fails closed before run-device acquisition";
+    let expected_attribute =
+        format!("#[expect(\n        dead_code,\n        reason = \"{reason}\"\n    )]");
+
+    let item = "pub(crate) fn append_to(";
+    let item_offset = source
+        .find(item)
+        .unwrap_or_else(|| panic!("missing {item}"));
+    let prefix_start = item_offset.saturating_sub(240);
+    let prefix = &source[prefix_start..item_offset];
+    assert!(
+        prefix.contains(&expected_attribute),
+        "{item} must carry the exact item-scoped deferred-frontier expectation"
+    );
+
+    assert_eq!(
+        source.matches(&expected_attribute).count(),
+        1,
+        "only the truly dead Regime append seam may expect dead_code"
+    );
+    assert!(!source.contains("#![allow(dead_code)]"));
+    assert!(!source.contains("#[allow(dead_code)]"));
 }

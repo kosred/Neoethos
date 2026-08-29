@@ -25,7 +25,9 @@ use crate::contracts::{
     BrokerFinancialTruthContractErrorV1, max_manifest_bytes, sha256_bytes, sha256_file,
     validate_sha256_hex,
 };
-use crate::contracts_v2::BrokerFinancialTruthBundleReceiptV2;
+use crate::contracts_v2::{
+    BrokerFinancialTruthBundleManifestV2, BrokerFinancialTruthBundleReceiptV2,
+};
 use crate::store::BrokerFinancialTruthBundleStoreV1;
 
 pub const BROKER_TRUTH_ACQUISITION_LINK_SCHEMA_VERSION_V1: u16 = 1;
@@ -655,8 +657,7 @@ impl BrokerTruthAcquisitionStoreV1 {
                 format!("referenced authority cannot be reopened exactly: {error}"),
             )
         })?;
-        validate_authority_binding(authority.manifest(), expected_binding)?;
-        BrokerFinancialTruthBundleStoreV1::new(self.root.clone())
+        let bundle = BrokerFinancialTruthBundleStoreV1::new(self.root.clone())
             .open_exact_v2(broker_truth_receipt, expected_binding)
             .map_err(|error| {
                 BrokerTruthAcquisitionStoreErrorV1::new(
@@ -664,6 +665,7 @@ impl BrokerTruthAcquisitionStoreV1 {
                     format!("referenced BFT2 bundle cannot be reopened exactly: {error}"),
                 )
             })?;
+        validate_authority_binding(authority.manifest(), expected_binding, bundle.manifest())?;
         Ok(())
     }
 
@@ -759,6 +761,7 @@ impl BrokerTruthAcquisitionStoreV1 {
 fn validate_authority_binding(
     authority: &BrokerTruthAcquisitionAuthorityManifestV1,
     expected_binding: &BrokerFinancialTruthBindingV1,
+    broker_manifest: &BrokerFinancialTruthBundleManifestV2,
 ) -> Result<(), BrokerTruthAcquisitionStoreErrorV1> {
     let CanonicalDatasetScope::CTrader {
         account_id,
@@ -773,16 +776,56 @@ fn validate_authority_binding(
     };
     if authority.canonical_search_input_receipt_sha256()
         != expected_binding.canonical_search_input_receipt_sha256()
-        || authority.reviewed_synchronizations().iter().any(|binding| {
-            binding.account_id() != *account_id
-                || binding.symbol_id() != *symbol_id
-                || binding.window() != expected_binding.evaluated_window()
-        })
+        || broker_manifest.binding() != expected_binding
     {
         return Err(BrokerTruthAcquisitionStoreErrorV1::new(
             BrokerTruthAcquisitionStoreErrorCodeV1::ReferencedAuthorityInvalid,
-            "acquisition authority differs from the exact receipt/account/symbol/window binding",
+            "acquisition authority or BFT2 manifest differs from the exact run binding",
         ));
+    }
+    let mut expected_synchronizations = vec![broker_manifest.primary_quotes()];
+    for route in broker_manifest.conversion_routes() {
+        for leg in route.legs() {
+            expected_synchronizations.push(leg.quotes());
+        }
+    }
+    if expected_synchronizations.len() != authority.reviewed_synchronizations().len() {
+        return Err(BrokerTruthAcquisitionStoreErrorV1::new(
+            BrokerTruthAcquisitionStoreErrorCodeV1::ReferencedAuthorityInvalid,
+            "acquisition authority does not exactly cover primary and conversion synchronizations",
+        ));
+    }
+    for (ordinal, (reviewed, quotes)) in authority
+        .reviewed_synchronizations()
+        .iter()
+        .zip(expected_synchronizations)
+        .enumerate()
+    {
+        let expected_ordinal = u32::try_from(ordinal).map_err(|_| {
+            BrokerTruthAcquisitionStoreErrorV1::new(
+                BrokerTruthAcquisitionStoreErrorCodeV1::ReferencedAuthorityInvalid,
+                "reviewed synchronization count exceeds u32",
+            )
+        })?;
+        let expected_symbol_id = if ordinal == 0 {
+            *symbol_id
+        } else {
+            quotes.bid().symbol_id()
+        };
+        if reviewed.ordinal() != expected_ordinal
+            || reviewed.account_id() != *account_id
+            || reviewed.symbol_id() != expected_symbol_id
+            || reviewed.symbol_id() != quotes.bid().symbol_id()
+            || reviewed.window() != expected_binding.evaluated_window()
+            || reviewed.window() != quotes.bid().requested_window()
+            || reviewed.review_identity() != quotes.replay_rule().identity()
+            || reviewed.reviewed_rules_sha256() != quotes.replay_rule().rules_decoded().sha256()
+        {
+            return Err(BrokerTruthAcquisitionStoreErrorV1::new(
+                BrokerTruthAcquisitionStoreErrorCodeV1::ReferencedAuthorityInvalid,
+                "reviewed synchronization differs from exact primary or conversion BFT2 evidence",
+            ));
+        }
     }
     Ok(())
 }

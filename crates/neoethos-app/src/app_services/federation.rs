@@ -305,10 +305,8 @@ pub fn worker_start(
     };
 
     tokio::spawn(async move {
-        use crate::app_services::jobs::JobKind;
+        use crate::app_services::jobs::JobState;
         use crate::server::engines_control;
-        use axum::Json;
-        use axum::extract::State;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -348,78 +346,100 @@ pub fn worker_start(
                 continue;
             };
 
-            // 2. Run the local discovery for it (same path as the UI button).
+            // 2. Run the local discovery through the typed admitted path.
             set_worker_status(format!(
                 "job {} {} — starting discovery",
                 job.symbol, job.base_tf
             ));
-            let dataset_identity = match neoethos_core::Settings::from_yaml(
-                &crate::server::state::current_config_path(),
-            )
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .and_then(|settings| {
-                crate::app_services::discovery::resolve_unique_background_dataset_identity(
-                    &settings.system.data_dir,
-                    &job.symbol,
-                    &job.base_tf,
-                )
-            }) {
-                Ok(identity) => identity,
+            let base_timeframe = match job
+                .base_tf
+                .trim()
+                .to_uppercase()
+                .parse::<neoethos_data::CanonicalTimeframe>()
+            {
+                Ok(timeframe) => timeframe,
                 Err(error) => {
                     set_worker_status(format!(
-                        "job {} {} — exact dataset selection failed: {error}; skipping job",
+                        "job {} {} — invalid timeframe: {error}; skipping job",
                         job.symbol, job.base_tf
                     ));
                     continue 'outer;
                 }
             };
             let started_ms = chrono::Utc::now().timestamp_millis();
-            loop {
+            let mut handle = loop {
                 if !WORKER_RUNNING.load(Ordering::SeqCst) {
                     break 'outer;
                 }
-                let body: engines_control::StartJobBody =
-                    match serde_json::from_value(serde_json::json!({
-                        "dataset_identity": dataset_identity.to_path_component(),
-                        "symbol": job.symbol,
-                        "base_tf": job.base_tf,
-                    })) {
-                        Ok(b) => b,
-                        Err(_) => break,
-                    };
-                let resp =
-                    engines_control::discovery_start(State(state.clone()), Some(Json(body))).await;
-                let status = resp.status();
-                if status.is_success() {
+                let start = engines_control::start_typed_discovery_execution_v1(
+                    state.clone(),
+                    engines_control::TypedDiscoveryExecutionIntentV1 {
+                        symbol: job.symbol.clone(),
+                        base_timeframe,
+                        higher_timeframes:
+                            engines_control::TypedHigherTimeframePolicyV1::Configured,
+                        overrides: engines_control::TypedDiscoveryOverridesV1::default(),
+                        settings_gate: engines_control::TypedDiscoverySettingsGateV1::None,
+                        dataset_policy: engines_control::TypedDiscoveryDatasetPolicyV1::Current,
+                        training_after_success: false,
+                    },
+                );
+                match start {
+                    Ok(handle) => break handle,
+                    Err(engines_control::TypedLegacyExecutionStartErrorV1::Busy(busy)) => {
+                        set_worker_status(format!(
+                            "job {} {} — local {} lane busy with {}, waiting",
+                            job.symbol,
+                            job.base_tf,
+                            busy.requested(),
+                            busy.active()
+                        ));
+                        tokio::time::sleep(Duration::from_secs(300)).await;
+                    }
+                    Err(error) => {
+                        set_worker_status(format!(
+                            "job {} {} — discovery refused ({error}); skipping job",
+                            job.symbol, job.base_tf
+                        ));
+                        continue 'outer;
+                    }
+                }
+            };
+
+            // 3. Retain the move-only handle until the exact worker reaches a
+            // terminal and releases its process lease. Stopping federation
+            // requests cancellation, then still waits for that real terminal.
+            loop {
+                if !WORKER_RUNNING.load(Ordering::SeqCst) {
+                    handle.cancel();
                     break;
                 }
-                if status == axum::http::StatusCode::CONFLICT {
-                    set_worker_status(format!(
-                        "job {} {} — local engine busy, waiting",
-                        job.symbol, job.base_tf
-                    ));
-                    tokio::time::sleep(Duration::from_secs(300)).await;
-                    continue;
+                tokio::select! {
+                    changed = handle.snapshot_receiver_mut().changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let observed = handle.snapshot_receiver_mut().borrow().clone();
+                        if !matches!(observed.state(), JobState::Queued | JobState::Running) {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
+            }
+            let terminal = handle.await_terminal().await;
+            if !WORKER_RUNNING.load(Ordering::SeqCst) {
+                break 'outer;
+            }
+            if !matches!(
+                terminal,
+                engines_control::TypedLegacyExecutionTerminalV1::Succeeded { .. }
+            ) {
                 set_worker_status(format!(
-                    "job {} {} — discovery refused ({status}); skipping job",
+                    "job {} {} — discovery ended without clean success; skipping artifacts",
                     job.symbol, job.base_tf
                 ));
                 continue 'outer;
-            }
-
-            // 3. Wait for the run to finish (poll the engine state).
-            loop {
-                if !WORKER_RUNNING.load(Ordering::SeqCst) {
-                    break 'outer;
-                }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                if !matches!(
-                    state.engine_state(JobKind::Discovery).await,
-                    crate::server::engines_control::EngineRunState::Running
-                ) {
-                    break;
-                }
             }
 
             // 4. Submit every artifact this run produced for the combo.

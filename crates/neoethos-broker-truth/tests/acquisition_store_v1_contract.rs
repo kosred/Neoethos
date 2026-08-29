@@ -15,10 +15,11 @@ use neoethos_broker_truth::{
     BrokerTruthAcquisitionSemanticStatusV1, BrokerTruthAcquisitionStoreErrorCodeV1,
     BrokerTruthAcquisitionStoreV1, BrokerTruthReviewedSynchronizationBindingV1, EvidenceWindowV1,
     ExactBrokerRequestChunkV2, ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1,
-    ExactConversionRouteEvidenceV2, ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2,
-    ExactSymbolContractEvidenceV2, ImmutableVortexArtifactV1, QuoteSideV1,
-    ReviewedQuoteReplayRuleEvidenceV2, ReviewedQuoteReplayRuleIdentityV2,
-    SynchronizedBidAskEvidenceV2, current_broker_financial_truth_capability_v1,
+    ExactConversionLegEvidenceV2, ExactConversionRouteEvidenceV2,
+    ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2, ExactSymbolContractEvidenceV2,
+    ImmutableVortexArtifactV1, QuoteSideV1, ReviewedQuoteReplayRuleEvidenceV2,
+    ReviewedQuoteReplayRuleIdentityV2, SynchronizedBidAskEvidenceV2,
+    current_broker_financial_truth_capability_v1,
 };
 use neoethos_dataset_contracts::{
     BarTimestampConvention, CTraderEnvironment, CanonicalDatasetIdentity, CanonicalTimeframe,
@@ -27,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 const ACCOUNT_ID: i64 = 7;
 const SYMBOL_ID: i64 = 42;
+const CONVERSION_SYMBOL_ID: i64 = 84;
 const WINDOW_FROM_MS: i64 = 1_700_000_000_000;
 const WINDOW_TO_MS: i64 = WINDOW_FROM_MS + 60_000;
 
@@ -81,8 +83,8 @@ fn binding() -> BrokerFinancialTruthBindingV1 {
         "EUR",
         2,
         "USD",
-        2,
-        "USD",
+        3,
+        "JPY",
     )
     .expect("exact broker financial binding")
 }
@@ -166,6 +168,16 @@ fn acquisition_fixture(test_name: &str) -> AcquisitionFixture {
             "reviewed-quote-replay-rules-000.vortex",
             b"retained reviewed replay rule bytes".as_slice(),
         ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::QuoteSessionObservations { ordinal: 1 },
+            "quote-session-observations-001.vortex",
+            b"retained conversion broker observation bytes".as_slice(),
+        ),
+        (
+            BrokerTruthAcquisitionArtifactRoleV1::ReviewedQuoteReplayRules { ordinal: 1 },
+            "reviewed-quote-replay-rules-001.vortex",
+            b"retained conversion reviewed replay rule bytes".as_slice(),
+        ),
     ];
     let mut artifacts = Vec::with_capacity(specs.len());
     let mut sources = Vec::with_capacity(specs.len());
@@ -181,7 +193,7 @@ fn acquisition_fixture(test_name: &str) -> AcquisitionFixture {
         artifacts[8].sha256(),
     )
     .expect("reviewed replay identity");
-    let synchronization = BrokerTruthReviewedSynchronizationBindingV1::new(
+    let primary_synchronization = BrokerTruthReviewedSynchronizationBindingV1::new(
         0,
         ACCOUNT_ID,
         SYMBOL_ID,
@@ -190,6 +202,21 @@ fn acquisition_fixture(test_name: &str) -> AcquisitionFixture {
         artifacts[9].sha256(),
     )
     .expect("reviewed synchronization");
+    let conversion_review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+        artifacts[5].sha256(),
+        artifacts[6].sha256(),
+        artifacts[10].sha256(),
+    )
+    .expect("conversion reviewed replay identity");
+    let conversion_synchronization = BrokerTruthReviewedSynchronizationBindingV1::new(
+        1,
+        ACCOUNT_ID,
+        CONVERSION_SYMBOL_ID,
+        EvidenceWindowV1::new(WINDOW_FROM_MS, WINDOW_TO_MS).expect("evidence window"),
+        conversion_review_identity,
+        artifacts[11].sha256(),
+    )
+    .expect("conversion reviewed synchronization");
     let canonical_root_verification_sha256 = artifacts[2].sha256().to_owned();
     let canonical_scope_window_binding_sha256 = artifacts[3].sha256().to_owned();
     let capture_plan_sha256 = artifacts[4].sha256().to_owned();
@@ -202,7 +229,7 @@ fn acquisition_fixture(test_name: &str) -> AcquisitionFixture {
         capture_plan_sha256,
         expected_trust_root_sha256,
         artifacts,
-        vec![synchronization],
+        vec![primary_synchronization, conversion_synchronization],
     )
     .expect("complete acquisition authority");
 
@@ -235,10 +262,33 @@ fn write_vortex_descriptor(
     artifact
 }
 
+fn write_vortex_descriptor_bytes(
+    source_root: &Path,
+    sources: &mut Vec<BrokerFinancialTruthArtifactSourceV1>,
+    relative_path: &str,
+    schema: BrokerFinancialTruthVortexSchemaV1,
+    bytes: &[u8],
+) -> ImmutableVortexArtifactV1 {
+    let source_path = source_root.join(relative_path);
+    fs::write(&source_path, bytes).expect("write exact opaque broker artifact");
+    let artifact = ImmutableVortexArtifactV1::from_file(relative_path, schema, 1, &source_path)
+        .expect("describe exact opaque broker artifact");
+    sources.push(
+        BrokerFinancialTruthArtifactSourceV1::new(relative_path, source_path)
+            .expect("exact broker artifact source"),
+    );
+    artifact
+}
+
 fn quote_side(
     source_root: &Path,
     sources: &mut Vec<BrokerFinancialTruthArtifactSourceV1>,
+    prefix: &str,
     side: QuoteSideV1,
+    symbol_id: i64,
+    symbol_name: &str,
+    base_asset_id: i64,
+    quote_asset_id: i64,
 ) -> ExactQuoteSideEvidenceV2 {
     let label = match side {
         QuoteSideV1::Bid => "bid",
@@ -248,7 +298,7 @@ fn quote_side(
     let page = ExactBrokerRequestPageV2::new(
         0,
         0,
-        format!("primary-{label}-page"),
+        format!("{prefix}-{label}-page"),
         window,
         Some(WINDOW_FROM_MS + 30_000),
         Some(WINDOW_FROM_MS + 30_000),
@@ -261,21 +311,21 @@ fn quote_side(
     let raw = write_vortex_descriptor(
         source_root,
         sources,
-        &format!("primary-{label}-pages-raw.vortex"),
+        &format!("{prefix}-{label}-pages-raw.vortex"),
         BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2,
     );
     let decoded = write_vortex_descriptor(
         source_root,
         sources,
-        &format!("primary-{label}-ticks-decoded.vortex"),
+        &format!("{prefix}-{label}-ticks-decoded.vortex"),
         BrokerFinancialTruthVortexSchemaV1::CTraderTicksDecodedV2,
     );
     ExactQuoteSideEvidenceV2::new(
         side,
-        SYMBOL_ID,
-        "EURUSD",
-        1,
-        2,
+        symbol_id,
+        symbol_name,
+        base_asset_id,
+        quote_asset_id,
         window,
         vec![chunk],
         raw,
@@ -295,27 +345,102 @@ fn publish_integrity_only_bft2(
     let mut sources = Vec::new();
     let window = EvidenceWindowV1::new(WINDOW_FROM_MS, WINDOW_TO_MS).expect("bundle window");
     let exact_binding = binding();
-    let bid = quote_side(&source_root, &mut sources, QuoteSideV1::Bid);
-    let ask = quote_side(&source_root, &mut sources, QuoteSideV1::Ask);
-    let observations = write_vortex_descriptor(
+    let bid = quote_side(
+        &source_root,
+        &mut sources,
+        "primary",
+        QuoteSideV1::Bid,
+        SYMBOL_ID,
+        "EURUSD",
+        1,
+        2,
+    );
+    let ask = quote_side(
+        &source_root,
+        &mut sources,
+        "primary",
+        QuoteSideV1::Ask,
+        SYMBOL_ID,
+        "EURUSD",
+        1,
+        2,
+    );
+    let observations = write_vortex_descriptor_bytes(
         &source_root,
         &mut sources,
         "quote-session-observations-raw.vortex",
         BrokerFinancialTruthVortexSchemaV1::CTraderQuoteSessionObservationsRawV2,
+        b"retained broker observation bytes",
     );
-    let rules = write_vortex_descriptor(
+    let rules = write_vortex_descriptor_bytes(
         &source_root,
         &mut sources,
         "reviewed-quote-replay-rules-decoded.vortex",
         BrokerFinancialTruthVortexSchemaV1::CTraderReviewedQuoteReplayRulesDecodedV2,
+        b"retained reviewed replay rule bytes",
     );
-    let review_identity =
-        ReviewedQuoteReplayRuleIdentityV2::new(digest(0xa1), digest(0xa2), observations.sha256())
-            .expect("integrity-only review identity");
+    let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+        sha256(b"immutable external review bytes"),
+        sha256(b"immutable reviewed protocol bytes"),
+        observations.sha256(),
+    )
+    .expect("integrity-only review identity");
     let replay = ReviewedQuoteReplayRuleEvidenceV2::new(review_identity, observations, rules)
         .expect("reviewed replay evidence shape");
     let primary =
         SynchronizedBidAskEvidenceV2::new(bid, ask, replay).expect("primary quote evidence");
+
+    let conversion_bid = quote_side(
+        &source_root,
+        &mut sources,
+        "conversion-usdjpy",
+        QuoteSideV1::Bid,
+        CONVERSION_SYMBOL_ID,
+        "USDJPY",
+        2,
+        3,
+    );
+    let conversion_ask = quote_side(
+        &source_root,
+        &mut sources,
+        "conversion-usdjpy",
+        QuoteSideV1::Ask,
+        CONVERSION_SYMBOL_ID,
+        "USDJPY",
+        2,
+        3,
+    );
+    let conversion_observations = write_vortex_descriptor_bytes(
+        &source_root,
+        &mut sources,
+        "conversion-quote-session-observations-raw.vortex",
+        BrokerFinancialTruthVortexSchemaV1::CTraderQuoteSessionObservationsRawV2,
+        b"retained conversion broker observation bytes",
+    );
+    let conversion_rules = write_vortex_descriptor_bytes(
+        &source_root,
+        &mut sources,
+        "conversion-reviewed-quote-replay-rules-decoded.vortex",
+        BrokerFinancialTruthVortexSchemaV1::CTraderReviewedQuoteReplayRulesDecodedV2,
+        b"retained conversion reviewed replay rule bytes",
+    );
+    let conversion_review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+        sha256(b"immutable external review bytes"),
+        sha256(b"immutable reviewed protocol bytes"),
+        conversion_observations.sha256(),
+    )
+    .expect("conversion integrity-only review identity");
+    let conversion_replay = ReviewedQuoteReplayRuleEvidenceV2::new(
+        conversion_review_identity,
+        conversion_observations,
+        conversion_rules,
+    )
+    .expect("conversion reviewed replay evidence shape");
+    let conversion_quotes =
+        SynchronizedBidAskEvidenceV2::new(conversion_bid, conversion_ask, conversion_replay)
+            .expect("conversion quote evidence");
+    let conversion_leg = ExactConversionLegEvidenceV2::new(2, "USD", 3, "JPY", conversion_quotes)
+        .expect("exact USDJPY conversion leg");
 
     let symbol_contracts = ExactSymbolContractEvidenceV2::new(
         write_vortex_descriptor(
@@ -396,11 +521,11 @@ fn publish_integrity_only_bft2(
         "primary_pnl_settlement",
         2,
         "USD",
-        2,
-        "USD",
-        Vec::new(),
+        3,
+        "JPY",
+        vec![conversion_leg],
     )
-    .expect("identity settlement route");
+    .expect("exact settlement route");
     let manifest = BrokerFinancialTruthBundleManifestV2::new(
         exact_binding.clone(),
         primary,
@@ -616,6 +741,14 @@ fn exact_authority_and_bft2_publish_one_immutable_evidence_only_link() {
         .publish_authority(&fixture.manifest, &fixture.sources)
         .expect("publish authority before link");
     let (broker_receipt, exact_binding) = publish_integrity_only_bft2(fixture.store.root());
+    let broker_bundle = BrokerFinancialTruthBundleStoreV1::new(fixture.store.root())
+        .open_exact_v2(&broker_receipt, &exact_binding)
+        .expect("reopen BFT2 conversion fixture");
+    assert_eq!(fixture.manifest.reviewed_synchronizations().len(), 2);
+    assert_eq!(
+        broker_bundle.manifest().conversion_routes()[0].legs().len(),
+        1
+    );
 
     let link_receipt = fixture
         .store

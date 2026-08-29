@@ -570,7 +570,7 @@ where
         Pin,
         neoethos_gpu_cuda::full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1,
     ) -> Result<(
-        crate::data_selection::CanonicalSearchInputReceiptV2,
+        crate::data_selection::CanonicalGpuResidentSearchInputReceiptV3,
         neoethos_data::SealedGpuResidentFeatureStoreV3,
     )>,
     RunPrepared: FnMut(crate::PreparedCanonicalDiscoveryRunInputV3) -> Result<R>,

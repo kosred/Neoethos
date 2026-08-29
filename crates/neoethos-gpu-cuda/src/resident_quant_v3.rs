@@ -170,6 +170,7 @@ pub fn seal_resident_quant_migration_closure_v3() -> SealedResidentQuantMigratio
     implementation.update(include_bytes!("resident_quant_v3.rs"));
     implementation.update(include_bytes!("resident_quant_v3_census.rs"));
     implementation.update(include_bytes!("../native/resident_quant_v3_abi.cuh"));
+    implementation.update(include_bytes!("../native/resident_exact_log_v3.cuh"));
     implementation.update(include_bytes!("../native/resident_quant_v3.cu"));
     implementation.update(include_bytes!(
         "../../neoethos-data/src/core/quant_features.rs"

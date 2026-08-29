@@ -39,11 +39,20 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
 mod acquisition_orchestration_v1;
+mod bounded_reviewed_finalist_acquisition_v2;
 mod finalist_quote_replay_acquisition_v1;
 
 pub use acquisition_orchestration_v1::{
     BrokerTruthAcquisitionOrchestrationErrorCodeV1, BrokerTruthAcquisitionOrchestrationErrorV1,
     BrokerTruthAcquisitionOutcomeV1, execute_prepared_acquisition_v1,
+};
+pub use bounded_reviewed_finalist_acquisition_v2::{
+    BOUNDED_REVIEWED_FINALIST_ACQUISITION_REFUSED_V2,
+    BoundedReviewedFinalistAcquisitionErrorCodeV2, BoundedReviewedFinalistAcquisitionErrorV2,
+    LockedFinalistBrokerTruthAcquisitionInputV2, PreparedBoundedReviewedFinalistAcquisitionV2,
+    UnvalidatedLockedFinalistBrokerTruthEvidenceV2,
+    execute_bounded_reviewed_finalist_acquisition_v2,
+    prepare_bounded_reviewed_finalist_acquisition_v2,
 };
 pub use finalist_quote_replay_acquisition_v1::{
     BrokerTruthPromotionEligibilityV1, BrokerTruthSemanticStatusV1,

@@ -1927,6 +1927,53 @@ mod tests {
     }
 
     #[test]
+    fn only_a_measured_search_census_can_clear_stage_one_cost_band_screening() {
+        let st = statistics(Some(0.99), 0.20, Some(0.20), N);
+        let measured = neoethos_search::discovery::CostBandCensus {
+            survives: 1,
+            optimistic_edge_only: 0,
+            fails: 2,
+            unmeasured: 0,
+            not_discriminating: 0,
+        };
+        let mut measured_evidence = evidence(&st);
+        measured_evidence.cost_band = CostBandCounts::from_census(&measured, true);
+        let passed = screen(
+            measured_evidence,
+            &JudgeThresholds::frozen(),
+            N,
+            &ready_null(),
+        );
+        assert!(
+            passed.passed(),
+            "measured survivor must reach Stage-1: {passed:?}"
+        );
+
+        for refused in [
+            neoethos_search::discovery::CostBandCensus::default(),
+            neoethos_search::discovery::CostBandCensus {
+                unmeasured: 1,
+                ..neoethos_search::discovery::CostBandCensus::default()
+            },
+        ] {
+            let mut refused_evidence = evidence(&st);
+            refused_evidence.cost_band = CostBandCounts::from_census(&refused, true);
+            assert!(matches!(
+                screen(
+                    refused_evidence,
+                    &JudgeThresholds::frozen(),
+                    N,
+                    &ready_null(),
+                ),
+                ScreenResult::Failed {
+                    conjunct: ScreenConjunct::S3CostBand,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn a_pbo_refusal_is_a_fail_and_never_a_pass() {
         // "No number is never good news." An unknown overfitting probability is
         // not a low one.

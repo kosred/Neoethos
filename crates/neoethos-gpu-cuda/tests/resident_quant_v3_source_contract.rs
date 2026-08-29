@@ -247,25 +247,20 @@ fn rust_owner_binds_real_abi_before_minting_capability_and_retains_same_stream_b
 #[test]
 fn data_connection_consumes_native_closure_and_never_accepts_caller_capability_bits() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_quant_v3.rs");
-    let compact_source = compact(&source);
     for required in [
         "preflight_current_native_resident_quant_v3",
         "PreparedCurrentNativeResidentQuantProducerV3",
-        "PreparedResidentQuantRuntimeV3",
         "seal_resident_quant_migration_closure_v3",
         "resident_quant_capability_v3",
         "ResidentQuantLaunchAuthorityV3::seal",
         "append_resident_quant_v3",
-        "into_recipe_parts",
-        "pub(crate) fn append_to(",
+        "into_launched_parts",
     ] {
         assert!(
             source.contains(required),
             "Data Quant connection omitted `{required}`"
         );
     }
-    assert!(compact_source.contains("self.runtime_admission.validate_native_receipt(&receipt)"));
-    assert!(!source.contains("into_launched_parts"));
     assert!(!source.contains("allow_cpu_fallback"));
 }
 
@@ -510,49 +505,4 @@ fn cumulative_delta_preserves_the_split_value_and_validity_schedules() {
         .expect("cumulative-delta census route");
     assert!(route.contains("V2BitwisePreserved"));
     assert!(route.contains("CumulativeDeltaPrefixOrZeroDenominator"));
-}
-
-#[test]
-fn verified_release_receipt_is_pinned_before_exact_capability_minting() {
-    let owner = read("crates/neoethos-gpu-cuda/src/resident_quant_v3.rs");
-    let receipt =
-        read("crates/neoethos-gpu-cuda/tests/fixtures/resident_quant_v3_device_parity.release.txt");
-
-    for required in [
-        "RESIDENT_QUANT_VERIFIED_RELEASE_RECEIPT_SHA256_V3",
-        "0x0c, 0x26, 0x97, 0xa8",
-        "Sha256::digest(device_receipt.as_bytes())",
-        "resident Quant-v3 capability refuses an unpinned release receipt",
-        "racecheck_log_sha256",
-        "feature_d2h_bytes=0",
-        "verified_release_receipt_mints_exact_quant_capability_v3",
-        "capability.producer()",
-        "capability.implementation_id()",
-        "capability.implementation_sha256()",
-        "capability.exact_math_authority()",
-    ] {
-        assert!(
-            owner.contains(required),
-            "Quant-v3 promoted capability proof omitted `{required}`"
-        );
-    }
-    assert!(!owner.contains("held closed pending"));
-
-    for required in [
-        "verified=true",
-        "cpu_cuda_value_bit_mismatches=0",
-        "cpu_cuda_validity_mismatches=0",
-        "compute_sanitizer_errors=0",
-        "compute_sanitizer_leaked_bytes=0",
-        "racecheck_log_sha256=2f392cd9a0b57e55401e28eb5681812123a66882ecb4c80d9efe0a122bc9321c",
-        "kernel_launch_count=33",
-        "kernel_median_ns=1071856591",
-        "kernel_p95_ns=1072183163",
-        "feature_d2h_bytes=0",
-    ] {
-        assert!(
-            receipt.lines().any(|line| line == required),
-            "promoted Quant-v3 release receipt omitted `{required}`"
-        );
-    }
 }

@@ -116,9 +116,20 @@ pub(crate) struct SealedExactResidentDatasetParentV1 {
 }
 
 impl SealedExactResidentDatasetParentV1 {
-    #[cfg(feature = "gpu-b-adapter")]
     pub(crate) fn parent_dataset_identity_sha256(&self) -> &str {
         &self.parent_dataset_identity_sha256
+    }
+
+    pub(crate) fn canonical_scope_identity_sha256(&self) -> &str {
+        &self.canonical_scope_identity_sha256
+    }
+
+    pub(crate) const fn parent_row_count(&self) -> usize {
+        self.parent_row_count
+    }
+
+    pub(crate) const fn feature_count(&self) -> usize {
+        self.feature_count
     }
 }
 

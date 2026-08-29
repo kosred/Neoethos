@@ -595,34 +595,47 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
         SupervisorAction::Note { text } => Ok(format!("noted: {text}")),
 
         SupervisorAction::StartDiscovery { symbol, base_tf } => {
-            let settings = neoethos_core::Settings::from_yaml(state.config_path())
-                .context("cannot resolve data root for exact Supervisor discovery selection")?;
-            let dataset_identity =
-                crate::app_services::discovery::resolve_unique_background_dataset_identity(
-                    &settings.system.data_dir,
-                    &symbol,
-                    &base_tf,
-                )?;
-            let body: engines_control::StartJobBody = serde_json::from_value(serde_json::json!({
-                "dataset_identity": dataset_identity.to_path_component(),
-                "symbol": symbol,
-                "base_tf": base_tf,
-            }))?;
-            let resp =
-                engines_control::discovery_start(State(state.clone()), Some(Json(body))).await;
-            Ok(format!("discovery start → {}", response_status(&resp)))
+            let base_timeframe = base_tf
+                .trim()
+                .to_uppercase()
+                .parse::<neoethos_data::CanonicalTimeframe>()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let handle = engines_control::start_typed_discovery_execution_v1(
+                state.clone(),
+                engines_control::TypedDiscoveryExecutionIntentV1 {
+                    symbol,
+                    base_timeframe,
+                    higher_timeframes: engines_control::TypedHigherTimeframePolicyV1::Configured,
+                    overrides: engines_control::TypedDiscoveryOverridesV1::default(),
+                    settings_gate: engines_control::TypedDiscoverySettingsGateV1::None,
+                    dataset_policy: engines_control::TypedDiscoveryDatasetPolicyV1::Current,
+                    training_after_success: true,
+                },
+            )?;
+            engines_control::detach_typed_legacy_execution_observer_v1(state.clone(), handle);
+            Ok("discovery start → accepted".to_owned())
         }
         SupervisorAction::StopDiscovery => {
             let _ = engines_control::discovery_stop(State(state.clone())).await;
             Ok("discovery stop requested".into())
         }
         SupervisorAction::StartTraining { symbol, base_tf } => {
-            let body: engines_control::StartJobBody = serde_json::from_value(
-                serde_json::json!({ "symbol": symbol, "base_tf": base_tf }),
+            let base_timeframe = base_tf
+                .trim()
+                .to_uppercase()
+                .parse::<neoethos_data::CanonicalTimeframe>()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let handle = engines_control::start_typed_training_execution_v1(
+                state.clone(),
+                engines_control::TypedTrainingExecutionIntentV1 {
+                    selection: engines_control::TypedTrainingSelectionPolicyV1::Exact {
+                        symbol,
+                        base_timeframe,
+                    },
+                },
             )?;
-            let resp =
-                engines_control::training_start(State(state.clone()), Some(Json(body))).await;
-            Ok(format!("training start → {}", response_status(&resp)))
+            engines_control::detach_typed_legacy_execution_observer_v1(state.clone(), handle);
+            Ok("training start → accepted".to_owned())
         }
         SupervisorAction::StopTraining => {
             let _ = engines_control::training_stop(State(state.clone())).await;

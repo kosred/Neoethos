@@ -18,14 +18,72 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::app_services::canonical_native_discovery::{
+    CanonicalNativeResearchSnapshotV1, CanonicalNativeResearchStateV1,
+    CanonicalNativeResearchTerminalSnapshotV1,
+};
 use crate::app_services::jobs::{CancellationFlag, JobKind};
 use crate::server::codex::CodexFlowState;
 use crate::server::engines_control::EngineRunState;
+use neoethos_core::Settings;
+use neoethos_search::{
+    CanonicalNativeCancellationTokenV1, CanonicalNativeDiscoveryRequestErrorV1,
+    CanonicalNativeRuntimeInstallReceiptV1, install_and_seal_canonical_native_runtime_authority_v1,
+};
 
 /// Process-wide config-file path, defaulting to `"config.yaml"` when no
 /// CLI `--config` override is provided. Set once at startup via
 /// [`install_config_path`]; queried via [`current_config_path`].
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Clone)]
+pub(crate) struct CanonicalNativeStartupAuthorityV1 {
+    settings: Arc<Settings>,
+    runtime_install_receipt: Arc<CanonicalNativeRuntimeInstallReceiptV1>,
+}
+
+impl CanonicalNativeStartupAuthorityV1 {
+    pub(crate) fn settings(&self) -> Arc<Settings> {
+        self.settings.clone()
+    }
+
+    pub(crate) fn runtime_install_receipt(&self) -> Arc<CanonicalNativeRuntimeInstallReceiptV1> {
+        self.runtime_install_receipt.clone()
+    }
+}
+
+static CANONICAL_NATIVE_STARTUP_AUTHORITY_V1: OnceLock<CanonicalNativeStartupAuthorityV1> =
+    OnceLock::new();
+
+/// Install and seal the process-wide canonical-native authority from the exact
+/// startup Settings. This must run once after the ordinary runtime overrides
+/// are installed and before any [`AppApiState`] is constructed.
+pub fn install_canonical_native_startup_authority_v1(
+    settings: &Settings,
+) -> Result<(), CanonicalNativeDiscoveryRequestErrorV1> {
+    let receipt = install_and_seal_canonical_native_runtime_authority_v1(settings)?;
+    if let Some(installed) = CANONICAL_NATIVE_STARTUP_AUTHORITY_V1.get() {
+        if installed.runtime_install_receipt.identity_sha256() == receipt.identity_sha256()
+            && installed.runtime_install_receipt.startup_settings_sha256()
+                == receipt.startup_settings_sha256()
+        {
+            return Ok(());
+        }
+        return Err(CanonicalNativeDiscoveryRequestErrorV1::RuntimeAuthority(
+            "conflicting app startup authority was already installed".to_owned(),
+        ));
+    }
+    CANONICAL_NATIVE_STARTUP_AUTHORITY_V1
+        .set(CanonicalNativeStartupAuthorityV1 {
+            settings: Arc::new(settings.clone()),
+            runtime_install_receipt: Arc::new(receipt),
+        })
+        .map_err(|_| {
+            CanonicalNativeDiscoveryRequestErrorV1::RuntimeAuthority(
+                "app startup authority raced with another installer".to_owned(),
+            )
+        })
+}
 
 /// **F-231-related closure (2026-05-25)** — process-wide handle to
 /// the bridge's `account_refresh` trigger channel. Set once at
@@ -156,6 +214,7 @@ pub struct PositionPayload {
 #[derive(Clone)]
 pub struct AppApiState {
     inner: Arc<RwLock<AppApiInner>>,
+    canonical_native_startup_authority: Option<CanonicalNativeStartupAuthorityV1>,
     /// The only async admission coordinator for CPU-heavy app work. Production
     /// startup installs the process budget before constructing this state; a
     /// state built without that preflight (small router tests) keeps this
@@ -219,6 +278,7 @@ pub(crate) struct AppApiInner {
     pub account: Option<AccountSnapshotPayload>,
     pub discovery: EngineSlot,
     pub training: EngineSlot,
+    pub canonical_native_research: CanonicalNativeResearchSlotV1,
     /// Cached map from cTrader `symbol_id` (i64) to human-readable
     /// ticker (e.g. `1` → `"EURUSD"`). Populated by:
     ///   1. The `/broker/symbols` route after a successful fetch.
@@ -252,6 +312,31 @@ pub struct EngineSlot {
     pub stage: String,
     pub percent: f64,
     pub counters: Vec<(String, u64)>,
+}
+
+/// Native research owns an exact Search cancellation token and its own typed
+/// terminal evidence. It must never be represented by the legacy Discovery
+/// slot because that would permit the Discovery-to-Training auto-chain.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalNativeResearchSlotV1 {
+    snapshot: Option<CanonicalNativeResearchSnapshotV1>,
+    cancellation: Option<CanonicalNativeCancellationTokenV1>,
+    cancellation_requested: bool,
+    terminal: Option<CanonicalNativeResearchTerminalSnapshotV1>,
+}
+
+impl CanonicalNativeResearchSlotV1 {
+    pub fn snapshot(&self) -> Option<&CanonicalNativeResearchSnapshotV1> {
+        self.snapshot.as_ref()
+    }
+
+    pub const fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    pub fn terminal(&self) -> Option<&CanonicalNativeResearchTerminalSnapshotV1> {
+        self.terminal.as_ref()
+    }
 }
 
 impl Default for EngineRunState {
@@ -288,6 +373,9 @@ impl AppApiState {
             });
         Self {
             inner: Arc::new(RwLock::new(AppApiInner::default())),
+            canonical_native_startup_authority: CANONICAL_NATIVE_STARTUP_AUTHORITY_V1
+                .get()
+                .cloned(),
             execution,
             codex: Arc::new(Mutex::new(None)),
             config_path: Arc::new(current_config_path()),
@@ -303,6 +391,12 @@ impl AppApiState {
     /// must return a startup/admission error instead of creating capacity.
     pub fn execution_state(&self) -> Option<Arc<crate::app_state::AppExecutionState>> {
         self.execution.clone()
+    }
+
+    pub(crate) fn canonical_native_startup_authority_v1(
+        &self,
+    ) -> Option<CanonicalNativeStartupAuthorityV1> {
+        self.canonical_native_startup_authority.clone()
     }
 
     /// Clone of the account-refresh sender, suitable for installing
@@ -464,6 +558,12 @@ impl AppApiState {
         match kind {
             JobKind::Discovery => inner.discovery.state,
             JobKind::Training => inner.training.state,
+            JobKind::CanonicalNativeResearch => inner
+                .canonical_native_research
+                .snapshot
+                .as_ref()
+                .map(|snapshot| native_engine_state_v1(snapshot.state()))
+                .unwrap_or(EngineRunState::Idle),
         }
     }
 
@@ -473,6 +573,12 @@ impl AppApiState {
         match kind {
             JobKind::Discovery => inner.discovery.summary.clone(),
             JobKind::Training => inner.training.summary.clone(),
+            JobKind::CanonicalNativeResearch => inner
+                .canonical_native_research
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.stage().to_owned())
+                .unwrap_or_default(),
         }
     }
 
@@ -485,6 +591,16 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &inner.discovery,
             JobKind::Training => &inner.training,
+            JobKind::CanonicalNativeResearch => {
+                let Some(snapshot) = inner.canonical_native_research.snapshot.as_ref() else {
+                    return (String::new(), 0.0, Vec::new());
+                };
+                return (
+                    snapshot.stage().to_owned(),
+                    f64::from(snapshot.percent_basis_points()) / 10_000.0,
+                    Vec::new(),
+                );
+            }
         };
         (slot.stage.clone(), slot.percent, slot.counters.clone())
     }
@@ -497,6 +613,7 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
+            JobKind::CanonicalNativeResearch => return,
         };
         slot.state = EngineRunState::Running;
         slot.cancel = Some(cancel);
@@ -510,6 +627,7 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
+            JobKind::CanonicalNativeResearch => return,
         };
         slot.state = state;
         if !summary.is_empty() {
@@ -548,6 +666,7 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
+            JobKind::CanonicalNativeResearch => return,
         };
         slot.stage = stage;
         slot.percent = percent.clamp(0.0, 1.0);
@@ -562,6 +681,7 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
             JobKind::Training => &mut inner.training,
+            JobKind::CanonicalNativeResearch => return,
         };
         if matches!(slot.state, EngineRunState::Running) {
             slot.state = EngineRunState::Idle;
@@ -577,6 +697,16 @@ impl AppApiState {
         let slot = match kind {
             JobKind::Discovery => &inner.discovery,
             JobKind::Training => &inner.training,
+            JobKind::CanonicalNativeResearch => {
+                let Some(cancel) = inner.canonical_native_research.cancellation.clone() else {
+                    return false;
+                };
+                drop(inner);
+                cancel.cancel();
+                let mut inner = self.inner.write().await;
+                inner.canonical_native_research.cancellation_requested = true;
+                return true;
+            }
         };
         if let Some(cancel) = &slot.cancel {
             cancel.request();
@@ -585,10 +715,138 @@ impl AppApiState {
             false
         }
     }
+
+    pub(crate) async fn cancel_canonical_native_research_exact_v1(
+        &self,
+        expected_lease_token: u64,
+    ) -> CanonicalNativeResearchCancellationOutcomeV1 {
+        let mut inner = self.inner.write().await;
+        let slot = &mut inner.canonical_native_research;
+        let Some(snapshot) = slot.snapshot.as_ref() else {
+            return CanonicalNativeResearchCancellationOutcomeV1::NotRunning;
+        };
+        if snapshot.lease_token() != expected_lease_token {
+            return CanonicalNativeResearchCancellationOutcomeV1::TokenMismatch;
+        }
+        let Some(cancellation) = slot.cancellation.as_ref() else {
+            return CanonicalNativeResearchCancellationOutcomeV1::NotRunning;
+        };
+        cancellation.cancel();
+        let already_requested = slot.cancellation_requested;
+        slot.cancellation_requested = true;
+        if already_requested {
+            CanonicalNativeResearchCancellationOutcomeV1::AlreadyRequested
+        } else {
+            CanonicalNativeResearchCancellationOutcomeV1::Requested
+        }
+    }
+
+    pub async fn install_canonical_native_research_v1(
+        &self,
+        cancellation: CanonicalNativeCancellationTokenV1,
+        snapshot: CanonicalNativeResearchSnapshotV1,
+    ) {
+        let mut inner = self.inner.write().await;
+        inner.canonical_native_research = CanonicalNativeResearchSlotV1 {
+            snapshot: Some(snapshot),
+            cancellation: Some(cancellation),
+            cancellation_requested: false,
+            terminal: None,
+        };
+    }
+
+    pub async fn update_canonical_native_research_v1(
+        &self,
+        snapshot: CanonicalNativeResearchSnapshotV1,
+    ) {
+        let mut inner = self.inner.write().await;
+        let slot = &mut inner.canonical_native_research;
+        if let Some(terminal) = snapshot.terminal().cloned() {
+            slot.terminal = Some(terminal);
+            slot.cancellation = None;
+        }
+        slot.snapshot = Some(snapshot);
+    }
+
+    pub async fn canonical_native_research_slot_v1(&self) -> CanonicalNativeResearchSlotV1 {
+        self.inner.read().await.canonical_native_research.clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CanonicalNativeResearchCancellationOutcomeV1 {
+    Requested,
+    AlreadyRequested,
+    NotRunning,
+    TokenMismatch,
+}
+
+fn native_engine_state_v1(state: CanonicalNativeResearchStateV1) -> EngineRunState {
+    match state {
+        CanonicalNativeResearchStateV1::Queued | CanonicalNativeResearchStateV1::Running => {
+            EngineRunState::Running
+        }
+        CanonicalNativeResearchStateV1::Published => EngineRunState::Succeeded,
+        CanonicalNativeResearchStateV1::Failed | CanonicalNativeResearchStateV1::WorkerPanicked => {
+            EngineRunState::Failed
+        }
+        CanonicalNativeResearchStateV1::Cancelled => EngineRunState::Cancelled,
+    }
 }
 
 impl Default for AppApiState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod canonical_native_startup_authority_tests {
+    use super::*;
+
+    #[test]
+    fn app_state_captures_only_an_already_installed_native_startup_authority() {
+        let before_install = AppApiState::new();
+        assert!(
+            before_install
+                .canonical_native_startup_authority_v1()
+                .is_none()
+        );
+
+        let mut settings = Settings::default();
+        settings.models.seen_signature_runtime.max_entries = 3_000_000;
+        install_canonical_native_startup_authority_v1(&settings).unwrap();
+
+        let after_install = AppApiState::new();
+        let installed = after_install
+            .canonical_native_startup_authority_v1()
+            .expect("startup authority must be captured by newly constructed state");
+        let receipt = installed.runtime_install_receipt();
+        assert_eq!(
+            receipt.startup_settings_sha256(),
+            install_and_seal_canonical_native_runtime_authority_v1(&settings)
+                .unwrap()
+                .startup_settings_sha256()
+        );
+        assert_eq!(
+            receipt.identity_sha256(),
+            install_and_seal_canonical_native_runtime_authority_v1(&settings)
+                .unwrap()
+                .identity_sha256()
+        );
+        assert_eq!(
+            installed
+                .settings()
+                .models
+                .seen_signature_runtime
+                .max_entries,
+            settings.models.seen_signature_runtime.max_entries
+        );
+        assert!(
+            before_install
+                .canonical_native_startup_authority_v1()
+                .is_none(),
+            "state construction must capture authority rather than ambiently reread it"
+        );
     }
 }

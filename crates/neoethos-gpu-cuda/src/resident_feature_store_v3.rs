@@ -6,10 +6,12 @@
 //! without host synchronization. It never owns all producer feature columns at
 //! once and never creates a full feature-major staging allocation.
 
+use crate::data_population_workspace_plan_v1::SealedDataPopulationExecutionLimitsV1;
 use crate::population::{
     CudaPopulationError, PopulationEvaluationViewV1, PopulationGeneView,
     PopulationResidencyCountersV1, PopulationSession, RawResidentFeatureStoreBindV3,
-    ResidentPopulationMetricsV1,
+    ResidentAdaptiveBaseRequestV1, ResidentAdaptiveBaseViewTokenIdentityV1,
+    ResidentAdaptiveBaseViewTokenV1, ResidentPopulationMetricsV1,
 };
 use crate::resident_classic_ta_v3::{
     ResidentClassicTaExecutorErrorV3, ResidentClassicTaExecutorV3,
@@ -18,6 +20,7 @@ use crate::resident_classic_ta_v3::{
 use crate::resident_footprint_v2::{
     ResidentFootprintRuntimeReceiptV2, launch_resident_footprint_v2,
 };
+use crate::resident_generation_v1::SealedResidentGenerationPlanV1;
 use crate::resident_higher_timeframe_alignment_v3::{
     ResidentHigherTimeframeDirectParentV3, ResidentHigherTimeframeExecutorV3,
     ResidentHigherTimeframeLaunchAuthorityV3, ResidentHigherTimeframeRuntimeReceiptV3,
@@ -30,6 +33,7 @@ use crate::resident_robust_normalization_v2::{
     ResidentRobustNormalizationPlanV2, ResidentRobustNormalizationRuntimeReceiptV2,
     disabled_resident_robust_normalization_receipt_v2, launch_resident_robust_normalization_v2,
 };
+use crate::resident_search_v2::{ResidentSearchRunV2, ResidentSearchV2Error};
 use crate::resident_session_v2::{
     ResidentSessionLaunchAuthorityV2, ResidentSessionRuntimeReceiptV2, launch_resident_session_v2,
 };
@@ -49,7 +53,7 @@ use cust::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING;
 use cust::sys::cudaError_enum::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS};
 use cust::sys::{
     CUcontext, CUevent, CUresult, CUstream, cuEventCreate, cuEventDestroy_v2, cuEventQuery,
-    cuEventRecord, cuEventSynchronize, cuStreamGetCtx, cuStreamWaitEvent,
+    cuEventRecord, cuEventSynchronize, cuStreamGetCtx, cuStreamSynchronize, cuStreamWaitEvent,
 };
 use neoethos_gpu_contracts::resident_feature_store_v3::{
     CudaPrimaryContextBuildIdentityV3, PORTABLE_CUDA_SHA256_AUTHORITY_V3,
@@ -199,6 +203,8 @@ pub enum ResidentFeatureStoreCudaErrorV3 {
     ),
     #[error(transparent)]
     Population(#[from] CudaPopulationError),
+    #[error(transparent)]
+    ResidentSearch(#[from] ResidentSearchV2Error),
 }
 
 /// Opaque full-workspace slice reserved for the resident trim/prefilter. Its
@@ -449,6 +455,7 @@ struct ResidentTrimAdmissionLifetimeV1 {
 #[derive(Debug)]
 pub struct GpuOnlyRunDeviceAdmissionV3 {
     admission_identity_sha256: [u8; SHA256_BYTES],
+    workspace_plan_identity_sha256: [u8; SHA256_BYTES],
     device_identity: CudaPrimaryContextBuildIdentityV3,
     device_uuid: [u8; 16],
     compute_capability_major: u16,
@@ -463,7 +470,7 @@ pub struct GpuOnlyRunDeviceAdmissionV3 {
 }
 
 #[derive(Debug)]
-pub(crate) struct FullDiscoveryRunDeviceAdmissionRequestV3 {
+pub(crate) struct GpuOnlyRunDeviceAdmissionRequestV3 {
     pub(crate) source_admission_identity_sha256: [u8; SHA256_BYTES],
     pub(crate) workspace_plan_identity_sha256: [u8; SHA256_BYTES],
     pub(crate) selected_device_ordinal: u32,
@@ -539,7 +546,7 @@ impl GpuOnlyRunDeviceAdmissionV3 {
 }
 
 pub(crate) fn seal_gpu_only_run_device_admission_v3(
-    request: FullDiscoveryRunDeviceAdmissionRequestV3,
+    request: GpuOnlyRunDeviceAdmissionRequestV3,
 ) -> Result<GpuOnlyRunDeviceAdmissionV3, ResidentFeatureStoreCudaErrorV3> {
     if request.source_admission_identity_sha256 == [0; SHA256_BYTES]
         || request.workspace_plan_identity_sha256 == [0; SHA256_BYTES]
@@ -613,6 +620,7 @@ pub(crate) fn seal_gpu_only_run_device_admission_v3(
     )?;
     Ok(GpuOnlyRunDeviceAdmissionV3 {
         admission_identity_sha256,
+        workspace_plan_identity_sha256: request.workspace_plan_identity_sha256,
         device_identity,
         device_uuid: request.device_uuid,
         compute_capability_major: request.compute_capability_major,
@@ -628,7 +636,7 @@ pub(crate) fn seal_gpu_only_run_device_admission_v3(
 }
 
 fn hash_gpu_only_run_device_admission_v3(
-    request: &FullDiscoveryRunDeviceAdmissionRequestV3,
+    request: &GpuOnlyRunDeviceAdmissionRequestV3,
 ) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
     hasher.update(b"neoethos.gpu-only-run-device-admission.v3");
@@ -784,6 +792,20 @@ impl<T: DeviceCopy> StreamOrderedDeviceBufferV3<T> {
 
     fn is_owned_by_stream(&self, stream: &Stream) -> bool {
         !stream.as_inner().is_null() && self.stream.as_inner() == stream.as_inner()
+    }
+
+    fn release_async(mut self, stream: &Stream) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        if !self.is_owned_by_stream(stream) {
+            return Err(ResidentFeatureStoreCudaErrorV3::ProducerStreamMismatch);
+        }
+        CurrentContext::set_current(self.context.as_ref())?;
+        let buffer = self.buffer.take().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "stream-ordered Data transient was already released".into(),
+            )
+        })?;
+        buffer.drop_async(stream)?;
+        Ok(())
     }
 }
 
@@ -2494,6 +2516,7 @@ impl ResidentFeatureStoreAssemblerV3 {
             search_bar_major_validity_u4: self.search_bar_major_validity_u4.take(),
             parent_source: self.parent_source.take(),
             hash_transient: Mutex::new(Some(hash_transient)),
+            hash_transient_retirement_event: Mutex::new(None),
             producer_stream: Arc::clone(&self.producer_stream),
             context: Arc::clone(&self.context),
             device_ordinal: self.device_ordinal,
@@ -2685,12 +2708,103 @@ impl ResidentHashTransientV3 {
             std::mem::forget(host_name_offsets);
             std::mem::forget(host_name_bytes);
         }
-        drop(name_offsets);
-        drop(name_bytes);
-        drop(merkle_scratch_a);
-        drop(merkle_scratch_b);
+        name_offsets.release_async(stream)?;
+        name_bytes.release_async(stream)?;
+        merkle_scratch_a.release_async(stream)?;
+        merkle_scratch_b.release_async(stream)?;
         Ok(())
     }
+}
+
+/// One-shot proof that every async Data transient free was queued before this
+/// event on the exact admitted producer stream. It is intentionally pending:
+/// population allocations remain forbidden until the proof is synchronized.
+#[derive(Debug)]
+#[must_use = "synchronize the exact producer stream before any population allocation"]
+struct PendingDataTransientRetirementV1 {
+    event: OwnedCudaEventV3,
+    primary_context: CUcontext,
+    producer_stream: CUstream,
+    device_ordinal: u32,
+    admission_identity_sha256: [u8; SHA256_BYTES],
+    workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+}
+
+#[derive(Debug)]
+#[must_use = "consume this synchronized retirement authority into population binding"]
+struct SealedDataTransientRetirementV1 {
+    admission_identity_sha256: [u8; SHA256_BYTES],
+    workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+    retirement_event_process_token: [u8; SHA256_BYTES],
+}
+
+impl PendingDataTransientRetirementV1 {
+    fn synchronize_before_population_allocation(
+        self,
+        context: &Context,
+        stream: &Stream,
+        expected_device_ordinal: u32,
+        expected_admission_identity_sha256: [u8; SHA256_BYTES],
+        expected_workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+    ) -> Result<SealedDataTransientRetirementV1, ResidentFeatureStoreCudaErrorV3> {
+        if self.primary_context != context.as_raw()
+            || self.producer_stream != stream.as_inner()
+            || self.device_ordinal != expected_device_ordinal
+            || self.admission_identity_sha256 != expected_admission_identity_sha256
+            || self.workspace_plan_identity_sha256 != expected_workspace_plan_identity_sha256
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "Data transient-retirement proof does not match the admitted population run".into(),
+            ));
+        }
+        CurrentContext::set_current(context)?;
+        let expected_ordinal = i32::try_from(expected_device_ordinal).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "Data transient-retirement device ordinal ABI",
+            )
+        })?;
+        if CurrentContext::get_device()?.as_raw() != expected_ordinal
+            || stream_context(stream)? != context.as_raw()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch);
+        }
+        // This is deliberately a full synchronization of the exact stream,
+        // not merely a wait on the earlier Data-ready event. `drop_async`
+        // returns bytes through CUDA's default async pool; the legacy
+        // population allocator may begin only after those frees have retired.
+        driver_result("cuStreamSynchronize(Data transient retirement)", unsafe {
+            cuStreamSynchronize(stream.as_inner())
+        })?;
+        if !self.event.query()? {
+            return Err(ResidentFeatureStoreCudaErrorV3::NotReady);
+        }
+        let retirement_event_process_token =
+            self.event.process_token(self.admission_identity_sha256, 2);
+        Ok(SealedDataTransientRetirementV1 {
+            admission_identity_sha256: self.admission_identity_sha256,
+            workspace_plan_identity_sha256: self.workspace_plan_identity_sha256,
+            retirement_event_process_token,
+        })
+    }
+}
+
+fn bind_population_after_data_transient_retirement_v1(
+    retirement: SealedDataTransientRetirementV1,
+    expected_admission_identity_sha256: [u8; SHA256_BYTES],
+    expected_workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+    raw: RawResidentFeatureStoreBindV3,
+) -> Result<(PopulationSession, SealedDataTransientRetirementV1), ResidentFeatureStoreCudaErrorV3> {
+    if retirement.admission_identity_sha256 != expected_admission_identity_sha256
+        || retirement.workspace_plan_identity_sha256 != expected_workspace_plan_identity_sha256
+        || retirement.retirement_event_process_token == [0; SHA256_BYTES]
+    {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "synchronized Data transient-retirement authority drifted before population binding"
+                .into(),
+        ));
+    }
+    let session = PopulationSession::bind_resident_feature_store_v3(raw)?;
+    Ok((session, retirement))
 }
 
 #[derive(Debug)]
@@ -2713,6 +2827,7 @@ pub struct ResidentFeatureStoreOwnerV3 {
     search_bar_major_validity_u4: Option<StreamOrderedDeviceBufferV3<u8>>,
     parent_source: Option<Box<dyn ResidentParentDatasetSourceV3>>,
     hash_transient: Mutex<Option<ResidentHashTransientV3>>,
+    hash_transient_retirement_event: Mutex<Option<OwnedCudaEventV3>>,
     producer_stream: Arc<Stream>,
     context: Arc<Context>,
     device_ordinal: u32,
@@ -2815,10 +2930,10 @@ impl ResidentFeatureStoreOwnerV3 {
         let hashes = ResidentFeatureCompactHashesV3 {
             canonical_content_merkle,
         };
-        // Cache before transient retirement so even a stream-ordered release
-        // error cannot authorize a second 32-byte device readback.
-        *compact_hashes = Some(hashes.clone());
+        // Retirement records a new event only after every async free is
+        // queued. Never cache success without that later lifetime proof.
         self.retire_hash_transient_after_ready()?;
+        *compact_hashes = Some(hashes.clone());
         Ok(hashes)
     }
 
@@ -2834,8 +2949,53 @@ impl ResidentFeatureStoreOwnerV3 {
             .take();
         if let Some(transient) = transient {
             transient.release(&self.producer_stream, true)?;
+            let retirement_event = OwnedCudaEventV3::new()?;
+            retirement_event.record(&self.producer_stream)?;
+            let mut slot = self.hash_transient_retirement_event.lock().map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident transient-retirement event state was poisoned".into(),
+                )
+            })?;
+            if slot.is_some() {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident Data transients were retired more than once".into(),
+                ));
+            }
+            *slot = Some(retirement_event);
         }
         Ok(())
+    }
+
+    fn take_data_transient_retirement_proof_v1(
+        &self,
+    ) -> Result<PendingDataTransientRetirementV1, ResidentFeatureStoreCudaErrorV3> {
+        let event = self
+            .hash_transient_retirement_event
+            .lock()
+            .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident transient-retirement event state was poisoned".into(),
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident Data transients have no post-free retirement event".into(),
+                )
+            })?;
+        let run_device = self.run_device.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident store lost its admitted run-device authority".into(),
+            )
+        })?;
+        Ok(PendingDataTransientRetirementV1 {
+            event,
+            primary_context: self.context.as_raw(),
+            producer_stream: self.producer_stream.as_inner(),
+            device_ordinal: self.device_ordinal,
+            admission_identity_sha256: run_device.admission_identity_sha256(),
+            workspace_plan_identity_sha256: run_device.workspace_plan_identity_sha256(),
+        })
     }
 
     pub fn layout_evidence(
@@ -3566,6 +3726,15 @@ impl ResidentFeatureStoreImportV3 {
             ));
         }
         let compact_hashes = owner.compact_hashes_if_ready()?;
+        let transient_retirement = owner
+            .take_data_transient_retirement_proof_v1()?
+            .synchronize_before_population_allocation(
+                consumer_context,
+                consumer_stream,
+                owner.device_ordinal,
+                admitted.admission_identity_sha256(),
+                admitted.workspace_plan_identity_sha256(),
+            )?;
         let packed_validity_bytes = u64::try_from(validity.len()).map_err(|_| {
             ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
                 "resident packed-validity ABI bytes",
@@ -3596,11 +3765,21 @@ impl ResidentFeatureStoreImportV3 {
             device_uuid: admitted.device_uuid,
             admission_identity_sha256: admitted.admission_identity_sha256(),
             canonical_content_merkle: compact_hashes.canonical_content_merkle,
+            allocator_context_reserve_bytes: admitted.allocator_context_reserve_bytes(),
+            run_stream_process_token_v3: admitted.run_stream_process_token_v3(),
         };
-        let population_session = PopulationSession::bind_resident_feature_store_v3(raw)?;
+        let (population_session, transient_retirement) =
+            bind_population_after_data_transient_retirement_v1(
+                transient_retirement,
+                admitted.admission_identity_sha256(),
+                admitted.workspace_plan_identity_sha256(),
+                raw,
+            )?;
         let device_identity = admitted.device_identity().clone();
+        let data_population_limits = admitted.data_population_limits().copied();
         let parent_dataset_layout = parent_layout.clone();
         let admission_identity_sha256 = admitted.admission_identity_sha256();
+        let pre_materialization_free_bytes_snapshot = owner.pre_materialization_free_bytes_snapshot;
         Ok(ResidentPopulationSessionV3 {
             population_session,
             resident_import: Some(self),
@@ -3609,6 +3788,10 @@ impl ResidentFeatureStoreImportV3 {
             canonical_content_merkle: compact_hashes.canonical_content_merkle,
             device_identity,
             parent_dataset_layout,
+            pre_materialization_free_bytes_snapshot,
+            data_transient_retirement_process_token: transient_retirement
+                .retirement_event_process_token,
+            data_population_limits,
             rows,
             columns,
         })
@@ -3670,11 +3853,148 @@ pub struct ResidentPopulationSessionV3 {
     canonical_content_merkle: [u8; SHA256_BYTES],
     device_identity: CudaPrimaryContextBuildIdentityV3,
     parent_dataset_layout: ResidentParentDatasetLayoutV4,
+    pre_materialization_free_bytes_snapshot: u64,
+    data_transient_retirement_process_token: [u8; SHA256_BYTES],
+    data_population_limits: Option<SealedDataPopulationExecutionLimitsV1>,
     rows: usize,
     columns: usize,
 }
 
+#[must_use = "record Search completion and retain the resident consumer lease"]
+pub struct ResidentFeatureStoreSearchRunV2 {
+    search_run: Option<ResidentSearchRunV2>,
+    resident_import: Option<ResidentFeatureStoreImportV3>,
+}
+
+/// Move-only start failure that preserves the V3 owner until an event recorded
+/// after every attempted Search enqueue reaches the admitted stream boundary.
+#[derive(Debug, Error)]
+pub(crate) enum ResidentFeatureStoreSearchStartErrorV2 {
+    #[error(transparent)]
+    Precondition(#[from] ResidentFeatureStoreCudaErrorV3),
+    #[error("resident Search start failed; a completion lease retains the V3 owner: {source}")]
+    Search {
+        #[source]
+        source: ResidentSearchV2Error,
+        cleanup_lease: ResidentFeatureStoreConsumerLeaseV3,
+    },
+    #[error(
+        "resident Search start failed ({search}); recording its V3 cleanup event also failed: {cleanup}"
+    )]
+    CleanupEvent {
+        search: ResidentSearchV2Error,
+        #[source]
+        cleanup: ResidentFeatureStoreCudaErrorV3,
+    },
+}
+
+impl ResidentFeatureStoreSearchStartErrorV2 {
+    #[allow(dead_code)] // The next private Search coordinator retains this lease explicitly.
+    pub(crate) fn into_cleanup_lease(self) -> Option<ResidentFeatureStoreConsumerLeaseV3> {
+        match self {
+            Self::Search { cleanup_lease, .. } => Some(cleanup_lease),
+            Self::Precondition(_) | Self::CleanupEvent { .. } => None,
+        }
+    }
+}
+
+impl ResidentFeatureStoreSearchRunV2 {
+    #[allow(dead_code)] // The next Search chunk consumes this private enqueue seam.
+    pub(crate) fn upload_resident_scenarios_v2(
+        &mut self,
+        scenarios: &[ScenarioDescriptor],
+    ) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        self.search_run
+            .as_mut()
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident Search run was already consumed".into(),
+                )
+            })?
+            .upload_resident_scenarios_v2(scenarios)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda-device-fixtures")]
+    pub(crate) fn enqueue_resident_gene_metrics_fixture_v2(
+        &mut self,
+        settings: &NeoPopulationSettings,
+    ) -> Result<ResidentPopulationMetricsV1<'_>, ResidentFeatureStoreCudaErrorV3> {
+        self.search_run
+            .as_mut()
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident Search run was already consumed".into(),
+                )
+            })?
+            .enqueue_resident_gene_metrics_fixture_v2(settings)
+            .map_err(Into::into)
+    }
+
+    pub fn record_consumer_completion(
+        mut self,
+    ) -> Result<ResidentFeatureStoreConsumerLeaseV3, ResidentFeatureStoreCudaErrorV3> {
+        let search_run = self.search_run.take().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident Search run was already consumed".into(),
+            )
+        })?;
+        let population_session = search_run.close_v2()?;
+        let resident_import = self.resident_import.take().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident Search import was already consumed".into(),
+            )
+        })?;
+        let mut consumer_lease = resident_import.record_consumer_completion()?;
+        consumer_lease.attach_population_session_v3(population_session)?;
+        Ok(consumer_lease)
+    }
+}
+
 impl ResidentPopulationSessionV3 {
+    #[allow(dead_code)] // First bounded production owner seam; next chunk calls it.
+    pub(crate) fn consume_into_resident_search_run_v2(
+        mut self,
+        plan: SealedResidentGenerationPlanV1,
+        smc_weights: [f64; SMC_SLOTS_V3],
+        smc_gate_disabled: bool,
+    ) -> Result<ResidentFeatureStoreSearchRunV2, ResidentFeatureStoreSearchStartErrorV2> {
+        if self.consumer_lease.is_some() {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident population session already owns a completion lease".into(),
+            )
+            .into());
+        }
+        let resident_import = self.resident_import.take().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident population import was already consumed".into(),
+            )
+        })?;
+        let population_session = self
+            .population_session
+            .take_for_resident_consumer_lease_v3();
+        match population_session.begin_resident_search_from_plan_v2(
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+        ) {
+            Ok(search_run) => Ok(ResidentFeatureStoreSearchRunV2 {
+                search_run: Some(search_run),
+                resident_import: Some(resident_import),
+            }),
+            Err(source) => match resident_import.record_consumer_completion() {
+                Ok(cleanup_lease) => Err(ResidentFeatureStoreSearchStartErrorV2::Search {
+                    source,
+                    cleanup_lease,
+                }),
+                Err(cleanup) => Err(ResidentFeatureStoreSearchStartErrorV2::CleanupEvent {
+                    search: source,
+                    cleanup,
+                }),
+            },
+        }
+    }
+
     pub const fn admission_identity_sha256(&self) -> [u8; SHA256_BYTES] {
         self.admission_identity_sha256
     }
@@ -3691,6 +4011,21 @@ impl ResidentPopulationSessionV3 {
         &self.parent_dataset_layout
     }
 
+    /// Exact free-memory snapshot captured on the admitted primary context
+    /// before the resident parent was materialized. Search may use this sealed
+    /// value for deterministic population sizing; it must not probe CUDA again.
+    pub const fn pre_materialization_free_bytes_snapshot(&self) -> u64 {
+        self.pre_materialization_free_bytes_snapshot
+    }
+
+    pub const fn data_transient_retirement_process_token(&self) -> [u8; SHA256_BYTES] {
+        self.data_transient_retirement_process_token
+    }
+
+    pub const fn data_population_limits(&self) -> Option<&SealedDataPopulationExecutionLimitsV1> {
+        self.data_population_limits.as_ref()
+    }
+
     pub const fn rows(&self) -> usize {
         self.rows
     }
@@ -3703,8 +4038,134 @@ impl ResidentPopulationSessionV3 {
         &mut self,
         view: PopulationEvaluationViewV1,
     ) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        if let Some(limits) = self.data_population_limits {
+            let parent_rows = u64::try_from(self.rows).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident parent rows do not fit the stage authority".into(),
+                )
+            })?;
+            let feature_count = u64::try_from(self.columns).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident feature count does not fit the stage authority".into(),
+                )
+            })?;
+            let view_rows = u64::try_from(view.row_count()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population view rows do not fit the stage authority".into(),
+                )
+            })?;
+            let ordered_rows = u64::try_from(view.ordered_index_values().map_or(0, <[u64]>::len))
+                .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population ordered-view rows do not fit the stage authority".into(),
+                )
+            })?;
+            let adaptive_rows = u64::try_from(view.adaptive_base_pips().map_or(0, <[f64]>::len))
+                .map_err(|_| {
+                    ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                        "population adaptive-view rows do not fit the stage authority".into(),
+                    )
+                })?;
+            if limits.parent_row_count() != parent_rows
+                || limits.feature_count() != feature_count
+                || view_rows > limits.parent_row_count()
+                || ordered_rows > limits.max_ordered_index_count()
+                || adaptive_rows > limits.max_adaptive_row_count()
+            {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population evaluation view exceeds the sealed Data+population workspace"
+                        .into(),
+                ));
+            }
+        }
         self.population_session
             .bind_evaluation_view_v1(view)
+            .map_err(Into::into)
+    }
+
+    /// Bind a full/contiguous view and produce its canonical adaptive-stop base
+    /// directly from the resident parent on the admitted stream. The host view
+    /// must contain no adaptive slice; its exact row extent is charged against
+    /// the sealed adaptive capacity as if all output rows were already live.
+    pub(crate) fn bind_evaluation_view_with_resident_adaptive_base_v1(
+        &mut self,
+        view: PopulationEvaluationViewV1,
+        request: ResidentAdaptiveBaseRequestV1,
+    ) -> Result<&ResidentAdaptiveBaseViewTokenV1, ResidentFeatureStoreCudaErrorV3> {
+        if let Some(limits) = self.data_population_limits {
+            let parent_rows = u64::try_from(self.rows).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident parent rows do not fit the adaptive stage authority".into(),
+                )
+            })?;
+            let feature_count = u64::try_from(self.columns).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident feature count does not fit the adaptive stage authority".into(),
+                )
+            })?;
+            let view_rows = u64::try_from(view.row_count()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident adaptive view rows do not fit the stage authority".into(),
+                )
+            })?;
+            if limits.parent_row_count() != parent_rows
+                || limits.feature_count() != feature_count
+                || view_rows > limits.parent_row_count()
+                || view_rows > limits.max_adaptive_row_count()
+                || request.parent_row_count() != parent_rows
+                || request.view_row_count() != view_rows
+            {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident adaptive view exceeds or drifts from the sealed Data+population workspace"
+                        .into(),
+                ));
+            }
+        }
+        self.population_session
+            .bind_evaluation_view_with_resident_adaptive_base_v1(view, request)
+            .map_err(Into::into)
+    }
+
+    /// Bind the resident adaptive view and immediately give the exact
+    /// non-Clone token borrowed from this session to the caller's receipt
+    /// validator. The public API accepts no caller-supplied token, so a token
+    /// from another or earlier session cannot be substituted. Validator
+    /// rejection poisons and clears the bound state before any upload can run.
+    /// Copyable evidence is returned only after validation and is not itself
+    /// an authorization capability.
+    pub fn bind_evaluation_view_with_resident_adaptive_base_checked_v1(
+        &mut self,
+        view: PopulationEvaluationViewV1,
+        request: ResidentAdaptiveBaseRequestV1,
+        validator: impl FnOnce(
+            &ResidentAdaptiveBaseViewTokenV1,
+        ) -> Result<(), ResidentFeatureStoreCudaErrorV3>,
+    ) -> Result<ResidentAdaptiveBaseViewTokenIdentityV1, ResidentFeatureStoreCudaErrorV3> {
+        self.bind_evaluation_view_with_resident_adaptive_base_v1(view, request)?;
+        let (facts, validation) = {
+            let current = self
+                .population_session
+                .arm_resident_adaptive_validator_guard_v1()?;
+            let facts = current.identity_facts_v1();
+            (facts, validator(current))
+        };
+        if let Err(error) = validation {
+            self.population_session
+                .poison_after_resident_adaptive_validator_rejection_v1();
+            return Err(error);
+        }
+        self.population_session
+            .accept_resident_adaptive_validator_guard_v1()?;
+        Ok(facts)
+    }
+
+    #[cfg(feature = "cuda-device-fixtures")]
+    #[cfg_attr(not(test), allow(dead_code))] // Used only by the feature-gated device oracle.
+    pub(crate) fn copy_resident_adaptive_base_fixture_v1(
+        &mut self,
+    ) -> Result<Vec<f64>, ResidentFeatureStoreCudaErrorV3> {
+        self.population_session
+            .copy_resident_adaptive_base_fixture_v1()
             .map_err(Into::into)
     }
 
@@ -3712,6 +4173,25 @@ impl ResidentPopulationSessionV3 {
         &mut self,
         genes: PopulationGeneView<'_>,
     ) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        if let Some(limits) = self.data_population_limits {
+            let candidate_count = u64::try_from(genes.descriptors.len()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population candidate count does not fit the stage authority".into(),
+                )
+            })?;
+            let term_count = u64::try_from(genes.indices.len()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population gene-term count does not fit the stage authority".into(),
+                )
+            })?;
+            if candidate_count > limits.max_candidate_count()
+                || term_count > limits.max_gene_term_count()
+            {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population gene upload exceeds the sealed Data+population workspace".into(),
+                ));
+            }
+        }
         self.population_session
             .upload_genes(genes)
             .map_err(Into::into)
@@ -3721,6 +4201,18 @@ impl ResidentPopulationSessionV3 {
         &mut self,
         scenarios: &[ScenarioDescriptor],
     ) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        if let Some(limits) = self.data_population_limits {
+            let scenario_count = u64::try_from(scenarios.len()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population scenario count does not fit the stage authority".into(),
+                )
+            })?;
+            if scenario_count > limits.max_concurrent_scenario_count() {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "population scenario upload exceeds the sealed concurrent chunk cap".into(),
+                ));
+            }
+        }
         self.population_session
             .upload_scenarios(scenarios)
             .map_err(Into::into)
@@ -3730,6 +4222,14 @@ impl ResidentPopulationSessionV3 {
         &mut self,
         settings: &NeoPopulationSettings,
     ) -> Result<ResidentPopulationMetricsV1<'_>, ResidentFeatureStoreCudaErrorV3> {
+        if self
+            .data_population_limits
+            .is_some_and(|limits| u64::from(settings.month_capacity) != limits.month_capacity())
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "population month capacity differs from the sealed workspace authority".into(),
+            ));
+        }
         self.population_session
             .enqueue_metrics_only_v1(settings)
             .map_err(Into::into)

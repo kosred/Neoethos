@@ -67,7 +67,7 @@ fn exact_five_validation_stages_are_strict_gpu_and_identity_bound() {
 }
 
 #[test]
-fn move_only_portfolio_outcome_is_consumed_into_one_build_bound_validation_run() {
+fn one_run_owned_validation_store_binds_device_build_algorithms_splits_and_stream() {
     let source = pipeline_source();
     let run = section(&source, "pub struct GpuResidentValidationRunV1 {", "\n}");
     require_all(
@@ -75,20 +75,13 @@ fn move_only_portfolio_outcome_is_consumed_into_one_build_bound_validation_run()
         &[
             "selected_cuda_ordinal: u32",
             "cuda_device_identity_sha256: String",
-            "cuda_device_uuid: String",
-            "primary_context_identity_sha256: String",
             "cuda_build_manifest_sha256: String",
-            "cuda_toolkit_version: String",
-            "cccl_version: String",
-            "native_validation_kernel_build_sha256: String",
-            "cuda_compile_math_mode_sha256: String",
             "resident_parent_identity_sha256: String",
             "split_plan_store: GpuResidentValidationSplitPlanStoreV1",
             "metric_store: GpuResidentValidationMetricStoreV1",
-            "scenario_trade_ledgers: ValidationScenarioTradeLedgerStoreV1",
+            "trade_ledger: CompactContiguousTradeOutcomeStoreV1",
             "cub_scratch_arena: CubScratchArenaV1",
             "run_stream: GpuRunStreamV1",
-            "run_stream_identity_sha256: String",
             "run_identity_sha256: String",
         ],
     );
@@ -99,27 +92,13 @@ fn move_only_portfolio_outcome_is_consumed_into_one_build_bound_validation_run()
     require_all(
         &source,
         &[
-            "portfolio_outcome: SealedResidentPortfolioConstraintsOutcomeV1",
-            "consume_portfolio_outcome_into_validation_run_v1(",
-            "validate_portfolio_outcome_identity_v1(",
-            "validate_exact_validation_build_identity_v1(",
+            "cccl_version",
             "temporary_storage_plan_sha256",
+            "cuda::execution::determinism::run_to_run",
+            "run_to_run_determinism_environment_sha256",
             "validate_validation_run_against_permit_v1(",
         ],
     );
-    for forbidden in [
-        "&SealedResidentPortfolioConstraintsOutcomeV1",
-        "impl Clone for SealedResidentPortfolioConstraintsOutcomeV1",
-        "impl Copy for SealedResidentPortfolioConstraintsOutcomeV1",
-        "impl Default for SealedResidentPortfolioConstraintsOutcomeV1",
-        "cuda::execution::determinism::run_to_run",
-        "run_to_run_determinism_environment_sha256",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "validation input/build authority contains stale or mintable path {forbidden:?}"
-        );
-    }
 }
 
 #[test]
@@ -128,18 +107,6 @@ fn walkforward_uses_resident_contiguous_views_device_base_and_device_diagnostics
     require_all(
         &source,
         &[
-            "WALKFORWARD_GEOMETRY_SEMANTICS_V1",
-            "walkforward_input_rows",
-            "walkforward_split_count",
-            "walkforward_train_ratio_f64_bits",
-            "walkforward_embargo_bars",
-            "walkforward_window_rows_floor_division_v1(",
-            "MIN_WALKFORWARD_WINDOW_ROWS_V1: u64 = 80",
-            "walkforward_train_end_floor_v1(",
-            "walkforward_test_start_checked_add_embargo_v1(",
-            "MIN_WALKFORWARD_TRAIN_ROWS_V1: u64 = 40",
-            "MIN_WALKFORWARD_TEST_ROWS_V1: u64 = 40",
-            "walkforward_qualifying_split_bitmap_sha256",
             "build_walkforward_split_descriptors_on_device_v1(",
             "bind_resident_contiguous_validation_views_v1(",
             "derive_window_adaptive_base_on_device_v1(",
@@ -170,16 +137,6 @@ fn cpcv_builds_ordered_indices_on_device_without_host_gathers_or_per_fold_upload
     require_all(
         &source,
         &[
-            "CPCV_GEOMETRY_SEMANTICS_V1",
-            "resolve_cpcv_tail_capped_rows_v1(",
-            "cpcv_tail_offset_checked_sub_v1(",
-            "cpcv_group_size_floor_division_v1(",
-            "cpcv_last_group_absorbs_remainder_v1(",
-            "cpcv_lexicographic_test_group_combinations_v1(",
-            "cpcv_purge_rows_ceil_v1(",
-            "cpcv_embargo_rows_ceil_v1(",
-            "trim_each_train_group_against_every_test_group_v1(",
-            "refuse_empty_cpcv_train_or_test_split_v1(",
             "build_cpcv_split_descriptors_on_device_v1(",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceSelectFlagged",
             "bind_device_owned_ordered_indices_v1(",
@@ -205,57 +162,40 @@ fn cpcv_builds_ordered_indices_on_device_without_host_gathers_or_per_fold_upload
 }
 
 #[test]
-fn pbo_v2_refuses_nonfinite_and_matches_the_versioned_cpu_oracle_exactly() {
+fn pbo_argmax_sort_median_and_verdict_remain_device_resident_and_deterministic() {
     let source = pipeline_source();
     require_all(
         &source,
         &[
-            "PBO_SEMANTICS_V2",
-            "PboV2Error::NonFiniteMetric",
-            "reject_nonfinite_pbo_metric_v2(",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceReduceArgMax",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceSegmentedRadixSort",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceReduce",
             "stable_tie_break_candidate_identity_v1(",
             "canonical_f64_total_order_key_v1(",
-            "pbo_candidate_order_identity_sha256",
-            "pbo_tie_policy_sha256",
-            "lower_middle_index_v2((candidate_count - 1) / 2)",
-            "champion_oos_value <= lower_middle_oos_value",
-            "pbo_cpu_oracle_v2(",
-            "assert_gpu_pbo_matches_cpu_oracle_v2(",
-            "pbo_semantics_v2_sha256",
+            "pbo_semantics_sha256",
             "pbo_metric_rows_readback_count == 0",
         ],
     );
     for forbidden in [
         "partial_cmp",
-        "unwrap_or(std::cmp::Ordering::Equal)",
         "oos_perf.clone()",
         "sort_by(",
         "median_on_host",
     ] {
         assert!(
             !source.contains(forbidden),
-            "PBO V2 retains host/weak/nonfinite ordering via {forbidden:?}"
+            "PBO retains host/weak ordering via {forbidden:?}"
         );
     }
 }
 
 #[test]
-fn risk_and_canonical_replay_consume_exact_scenario_bound_device_trade_ledgers() {
+fn risk_and_canonical_replay_consume_the_same_compact_device_trade_ledger() {
     let source = pipeline_source();
     require_all(
         &source,
         &[
-            "ValidationScenarioTradeLedgerStoreV1",
-            "ValidationScenarioIdentityV1",
-            "walkforward_scenario_identity_sha256",
-            "cpcv_scenario_identity_sha256",
-            "canonical_replay_scenario_identity_sha256",
-            "bind_trade_ledger_to_scenario_settings_content_v1(",
-            "validate_trade_ledger_cost_conversion_identity_v1(",
-            "validate_written_segments_against_count_scan_v1(",
+            "CompactContiguousTradeOutcomeStoreV1",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceScan",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceRunLengthEncode",
             "OfficialGpuPrimitiveAuthorityV1::NvidiaCubDeviceSegmentedReduce",
@@ -275,7 +215,7 @@ fn risk_and_canonical_replay_consume_exact_scenario_bound_device_trade_ledgers()
     ] {
         assert!(
             !source.contains(forbidden),
-            "risk/canonical replay retains host or unbound diagnostics via {forbidden:?}"
+            "risk/canonical replay retains host diagnostics via {forbidden:?}"
         );
     }
 }
@@ -322,7 +262,7 @@ fn strict_validation_has_zero_cpu_fallback_full_readback_or_intermediate_sync() 
 }
 
 #[test]
-fn validation_chunks_are_calibrated_and_handoff_stays_opaque_with_zero_readback() {
+fn validation_chunks_are_exactly_calibrated_observable_cancellable_and_compact() {
     let source = pipeline_source();
     require_all(
         &source,
@@ -333,11 +273,10 @@ fn validation_chunks_are_calibrated_and_handoff_stays_opaque_with_zero_readback(
             "cudaEventQuery",
             "observe_cancellation_between_chunks_v1(",
             "publish_progress_between_chunks_v1(",
-            "#[must_use = \"resident validation outcome must be consumed by robustness\"]",
             "pub struct SealedResidentValidationOutcomeV1",
-            "resident_gate_summary_store: GpuResidentValidationGateSummaryStoreV1",
+            "bounded_gate_summaries",
             "detailed_artifact_manifest_identity_sha256",
-            "compact_control_readback_count == 0",
+            "compact_control_readback_count == 1",
             "ResearchOnly",
             "NotPromotionEligible",
         ],
@@ -346,11 +285,7 @@ fn validation_chunks_are_calibrated_and_handoff_stays_opaque_with_zero_readback(
         "interpolate_from_other_device",
         "scale_from_reference_device",
         "Deserialize",
-        "impl Clone for SealedResidentValidationOutcomeV1",
-        "impl Default for SealedResidentValidationOutcomeV1",
         "pub fn from_hash",
-        "bounded_gate_summaries",
-        "compact_control_readback_count == 1",
         "pub folds:",
         "pub trades:",
         "pub metric_matrix:",

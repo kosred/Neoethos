@@ -55,6 +55,11 @@ use neoethos_search::deflated::TrialStatisticsReport;
 use neoethos_search::discovery::DiscoveryConfig;
 
 use crate::QuoteValidatedOosTouchEvidenceV1;
+use crate::awaiting_quote_coverage_v1::{
+    AutoresearchNonterminalBoundaryErrorV1, AutoresearchRunOutcomeV1, AwaitingQuoteCoverageV1,
+    QuoteCoverageProviderOutcomeV1, QuoteCoverageProviderV1, QuoteCoverageReadyBoundaryV1,
+    QuoteCoverageRequestV1, QuoteCoverageStateV1, QuoteCoverageWaitReasonV1,
+};
 use crate::contracts::{self, ResolvedInputs};
 use crate::goals::GoalSet;
 use crate::journal::{CostBandCounts, NamedValues, OosWindow, Record, SearchRecord, SweepKind};
@@ -928,6 +933,16 @@ fn hash_named(values: &NamedValues) -> String {
 /// This is the ONE function the CLI calls (§14.2). It resolves the real
 /// executor and hands off to [`run_with_executor`].
 pub fn run(args: RunArgs, settings: &Settings) -> Result<crate::verdict::SessionVerdict> {
+    terminal_only_v1(run_until_boundary_v1(args, settings, None)?)
+}
+
+/// Run until a terminal verdict or the durable pre-touch quote-coverage
+/// boundary. The provider is invoked only after the exact request is fsynced.
+pub fn run_until_boundary_v1(
+    args: RunArgs,
+    settings: &Settings,
+    quote_coverage_provider: Option<&mut dyn QuoteCoverageProviderV1>,
+) -> Result<AutoresearchRunOutcomeV1> {
     let base_config = DiscoveryConfig::try_from_settings(settings)?.apply_mode_overrides();
     assert_identity_matches_config(&args.dataset_identity, &base_config)?;
 
@@ -937,7 +952,13 @@ pub fn run(args: RunArgs, settings: &Settings) -> Result<crate::verdict::Session
     let mut executor =
         streaming::StreamingSweepExecutor::resolve(settings, &base_config, &args.dataset_identity)
             .context("resolving the search executor for the autoresearch loop")?;
-    run_with_executor(args, settings, base_config, &mut executor)
+    run_until_boundary_with_executor_v1(
+        args,
+        settings,
+        base_config,
+        &mut executor,
+        quote_coverage_provider,
+    )
 }
 
 /// The state machine proper, against any [`SweepExecutor`].
@@ -947,6 +968,23 @@ pub fn run_with_executor(
     base_config: DiscoveryConfig,
     executor: &mut dyn SweepExecutor,
 ) -> Result<crate::verdict::SessionVerdict> {
+    terminal_only_v1(run_until_boundary_with_executor_v1(
+        args,
+        settings,
+        base_config,
+        executor,
+        None,
+    )?)
+}
+
+/// Versioned state-machine boundary that preserves resumable pre-touch states.
+pub fn run_until_boundary_with_executor_v1(
+    args: RunArgs,
+    settings: &Settings,
+    base_config: DiscoveryConfig,
+    executor: &mut dyn SweepExecutor,
+    quote_coverage_provider: Option<&mut dyn QuoteCoverageProviderV1>,
+) -> Result<AutoresearchRunOutcomeV1> {
     assert_identity_matches_config(&args.dataset_identity, &base_config)?;
 
     // `run()` already reaches this refusal through
@@ -973,11 +1011,16 @@ pub fn run_with_executor(
             session = %ctx.store.session_id(),
             "this session has already stopped with a verdict; nothing further to run"
         );
-        return Ok(verdict);
+        return Ok(AutoresearchRunOutcomeV1::Terminal(verdict));
+    }
+
+    if writer.session().quote_coverage_state().is_some() {
+        return resume_quote_coverage_boundary_v1(&mut writer, quote_coverage_provider);
     }
 
     if args.dry_run {
-        return dry_run(&mut ctx, &mut writer, &mut proposer);
+        return dry_run(&mut ctx, &mut writer, &mut proposer)
+            .map(AutoresearchRunOutcomeV1::Terminal);
     }
 
     // ── the loop ────────────────────────────────────────────────────────────
@@ -985,7 +1028,7 @@ pub fn run_with_executor(
         // Budget first, so a session that has run out stops with a verdict
         // rather than beginning a sweep it cannot finish.
         if let Some(reason) = budget_exhausted(&ctx, writer.session(), started) {
-            return stop(&mut ctx, &mut writer, reason);
+            return stop_boundary(&mut ctx, &mut writer, reason);
         }
 
         let sweep = writer.session().next_sweep();
@@ -1004,7 +1047,7 @@ pub fn run_with_executor(
         if drawn.exhausted {
             // U5 — the reachable space is enumerated. That is a result about a
             // searched space, not a failure.
-            return stop(
+            return stop_boundary(
                 &mut ctx,
                 &mut writer,
                 crate::verdict::StopReason::ProposerExhausted,
@@ -1035,7 +1078,7 @@ pub fn run_with_executor(
         ) {
             Ok(run) => run,
             Err(err) => {
-                return stop(
+                return stop_boundary(
                     &mut ctx,
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
@@ -1058,7 +1101,7 @@ pub fn run_with_executor(
                 .first()
                 .map(|(s, r)| (*s, r.clone()))
                 .unwrap_or((0, "<unnamed>".to_string()));
-            return stop(
+            return stop_boundary(
                 &mut ctx,
                 &mut writer,
                 crate::verdict::StopReason::InfrastructureAbort {
@@ -1085,7 +1128,7 @@ pub fn run_with_executor(
                 readable,
                 "every search in sweep 1 returned an unreadable trial-returns matrix",
             ) {
-                return stop(
+                return stop_boundary(
                     &mut ctx,
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
@@ -1110,7 +1153,7 @@ pub fn run_with_executor(
         let aligned = match align_screen(sweep, &drawn.proposals, evidence, &screen, &run.not_run) {
             Ok(aligned) => aligned,
             Err(err) => {
-                return stop(
+                return stop_boundary(
                     &mut ctx,
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
@@ -1147,7 +1190,7 @@ pub fn run_with_executor(
             // are all keyed by it. `unwrap_or(0)` here would silently name slot
             // 0's configuration as the session's best.
             let Some(champion_slot) = aligned.champion_slot else {
-                return stop(
+                return stop_boundary(
                     &mut ctx,
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
@@ -1189,7 +1232,7 @@ pub fn run_with_executor(
                 // A block with no control is a block whose results are
                 // unfalsifiable, so this stops the session rather than
                 // continuing without a null.
-                return stop(
+                return stop_boundary(
                     &mut ctx,
                     &mut writer,
                     crate::verdict::StopReason::InfrastructureAbort {
@@ -1215,7 +1258,7 @@ pub fn run_with_executor(
                     sweeps_in_block,
                     streamed,
                 ) {
-                    return stop(
+                    return stop_boundary(
                         &mut ctx,
                         &mut writer,
                         crate::verdict::StopReason::InfrastructureAbort {
@@ -1232,12 +1275,30 @@ pub fn run_with_executor(
                 gc(&mut ctx, &mut writer, sweep)?;
             }
             crate::verdict::Decision::Promote(candidate) => {
-                return promote(&mut ctx, &mut writer, executor, candidate);
+                return promote(
+                    &mut ctx,
+                    &mut writer,
+                    executor,
+                    candidate,
+                    quote_coverage_provider,
+                );
             }
             crate::verdict::Decision::Stop(reason) => {
-                return stop(&mut ctx, &mut writer, reason);
+                return stop_boundary(&mut ctx, &mut writer, reason);
             }
         }
+    }
+}
+
+fn terminal_only_v1(outcome: AutoresearchRunOutcomeV1) -> Result<crate::verdict::SessionVerdict> {
+    match outcome {
+        AutoresearchRunOutcomeV1::Terminal(verdict) => Ok(verdict),
+        AutoresearchRunOutcomeV1::AwaitingQuoteCoverage(awaiting) => Err(anyhow::Error::new(
+            AutoresearchNonterminalBoundaryErrorV1::awaiting(awaiting.request()),
+        )),
+        AutoresearchRunOutcomeV1::QuoteCoverageReady(ready) => Err(anyhow::Error::new(
+            AutoresearchNonterminalBoundaryErrorV1::ready(ready.request()),
+        )),
     }
 }
 
@@ -2190,15 +2251,97 @@ fn run_block_control(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S10 — the one OOS touch
+// S10 — durable pre-touch quote coverage
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn resume_quote_coverage_boundary_v1(
+    writer: &mut SessionWriter,
+    quote_coverage_provider: Option<&mut dyn QuoteCoverageProviderV1>,
+) -> Result<AutoresearchRunOutcomeV1> {
+    advance_quote_coverage_boundary_v1(writer, None, quote_coverage_provider)
+}
+
+fn advance_quote_coverage_boundary_v1(
+    writer: &mut SessionWriter,
+    initial_request: Option<QuoteCoverageRequestV1>,
+    quote_coverage_provider: Option<&mut dyn QuoteCoverageProviderV1>,
+) -> Result<AutoresearchRunOutcomeV1> {
+    let durable_state = writer.session().quote_coverage_state().cloned();
+    let request = match durable_state {
+        Some(QuoteCoverageStateV1::Ready { request, coverage }) => {
+            if let Some(initial) = initial_request
+                && initial != request
+            {
+                bail!(
+                    "a different quote-coverage request was proposed after exact coverage was already Ready"
+                );
+            }
+            return Ok(AutoresearchRunOutcomeV1::QuoteCoverageReady(
+                QuoteCoverageReadyBoundaryV1::new(request, coverage).map_err(anyhow::Error::new)?,
+            ));
+        }
+        Some(QuoteCoverageStateV1::Awaiting(request)) => {
+            if let Some(initial) = initial_request
+                && initial != request
+            {
+                bail!(
+                    "a different quote-coverage request cannot replace the durable awaiting request"
+                );
+            }
+            request
+        }
+        None => {
+            let request = initial_request.context(
+                "there is no durable quote-coverage request to resume and no finalist request was supplied",
+            )?;
+            request.validate().map_err(anyhow::Error::new)?;
+            writer.append(Record::AwaitingQuoteCoverageV1 {
+                request: request.clone(),
+            })?;
+            request
+        }
+    };
+
+    let Some(provider) = quote_coverage_provider else {
+        return Ok(AutoresearchRunOutcomeV1::AwaitingQuoteCoverage(
+            AwaitingQuoteCoverageV1::new(request, QuoteCoverageWaitReasonV1::NoProvider),
+        ));
+    };
+    match provider
+        .provide_quote_coverage_v1(&request)
+        .map_err(anyhow::Error::new)?
+    {
+        QuoteCoverageProviderOutcomeV1::Pending => {
+            Ok(AutoresearchRunOutcomeV1::AwaitingQuoteCoverage(
+                AwaitingQuoteCoverageV1::new(request, QuoteCoverageWaitReasonV1::Pending),
+            ))
+        }
+        QuoteCoverageProviderOutcomeV1::Cancelled => {
+            Ok(AutoresearchRunOutcomeV1::AwaitingQuoteCoverage(
+                AwaitingQuoteCoverageV1::new(request, QuoteCoverageWaitReasonV1::Cancelled),
+            ))
+        }
+        QuoteCoverageProviderOutcomeV1::Ready(ready) => {
+            ready
+                .validate_against(&request)
+                .map_err(anyhow::Error::new)?;
+            writer.append(Record::QuoteCoverageReadyV1 {
+                ready: ready.clone(),
+            })?;
+            Ok(AutoresearchRunOutcomeV1::QuoteCoverageReady(
+                QuoteCoverageReadyBoundaryV1::new(request, ready).map_err(anyhow::Error::new)?,
+            ))
+        }
+    }
+}
 
 fn promote(
     ctx: &mut LoopContext,
     writer: &mut SessionWriter,
     executor: &mut dyn SweepExecutor,
     candidate: crate::verdict::PromotionCandidate,
-) -> Result<crate::verdict::SessionVerdict> {
+    quote_coverage_provider: Option<&mut dyn QuoteCoverageProviderV1>,
+) -> Result<AutoresearchRunOutcomeV1> {
     if writer.session().oos_spent() {
         bail!(
             "the promotion path was reached with the OOS touch ALREADY SPENT. A configuration \
@@ -2229,7 +2372,7 @@ fn promote(
         .proposals_of(candidate.sweep)
         .map(<[_]>::to_vec);
     let Some(proposals) = recorded else {
-        return stop(
+        return stop_boundary(
             ctx,
             writer,
             crate::verdict::StopReason::InfrastructureAbort {
@@ -2257,7 +2400,7 @@ fn promote(
     ) {
         Ok(proposal) => proposal.clone(),
         Err(err) => {
-            return stop(
+            return stop_boundary(
                 ctx,
                 writer,
                 crate::verdict::StopReason::InfrastructureAbort {
@@ -2273,7 +2416,7 @@ fn promote(
     let config = match proposal.resolve(&ctx.base_config) {
         Ok(config) => config,
         Err(err) => {
-            return stop(
+            return stop_boundary(
                 ctx,
                 writer,
                 crate::verdict::StopReason::InfrastructureAbort {
@@ -2311,7 +2454,7 @@ fn promote(
     ) {
         Ok(portfolio) => portfolio,
         Err(err) => {
-            return stop(
+            return stop_boundary(
                 ctx,
                 writer,
                 crate::verdict::StopReason::InfrastructureAbort {
@@ -2328,7 +2471,7 @@ fn promote(
 
     // Anything the executor can refuse without reading a bar, refused now.
     if let Err(err) = executor.oos_preflight(&portfolio) {
-        return stop(
+        return stop_boundary(
             ctx,
             writer,
             crate::verdict::StopReason::InfrastructureAbort {
@@ -2341,135 +2484,13 @@ fn promote(
         );
     }
 
-    // ── THE TOUCH ───────────────────────────────────────────────────────────
-    //
-    // The budget is spent immediately BEFORE the evaluation and after every
-    // check that could have avoided it, so a crash inside the evaluation cannot
-    // leave the session believing the window is still clean, and a refusal that
-    // never read a bar cannot leave it believing the window is gone.
-    writer.append(Record::OosTouchSpent {
-        window: ctx.oos_window,
-        sweep: candidate.sweep,
-        candidate: proposal.config_hash.clone(),
-    })?;
-
-    let oos: QuoteValidatedOosTouchEvidenceV1 = match executor.evaluate_oos(
-        candidate.sweep,
-        candidate.slot,
-        &config,
-        &portfolio,
-    ) {
-        Ok(oos) => oos,
-        Err(err) => {
-            // The window IS spent — the record above is already fsynced — so
-            // this stops with a verdict rather than losing the session. A
-            // session that spent its window and reported nothing is the worst
-            // of both outcomes.
-            return stop(
-                ctx,
-                writer,
-                crate::verdict::StopReason::InfrastructureAbort {
-                    detail: format!(
-                        "evaluating {} slot {} on the out-of-sample window failed AFTER the touch \
-                         was journalled as spent, so this session cannot try again: {err:#}",
-                        candidate.sweep, candidate.slot
-                    ),
-                },
-            );
-        }
-    };
-
-    let outcome = match crate::judge::promote(
-        &candidate,
-        &oos,
-        &ctx.thresholds,
-        &ctx.goals,
-        &ctx.scenario,
-        writer.session(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return stop(
-                ctx,
-                writer,
-                crate::verdict::StopReason::InfrastructureAbort {
-                    detail: format!(
-                        "the out-of-sample evidence for {} slot {} could not be judged: {err:#}",
-                        candidate.sweep, candidate.slot
-                    ),
-                },
-            );
-        }
-    };
-
-    if outcome.promoted {
-        writer.append(Record::Promoted {
-            sweep: candidate.sweep,
-            goal_metric: outcome.goal_metric,
-            goal_bar: outcome.goal_bar,
-            frontier: outcome.frontier.clone(),
-        })?;
-        // The loop's ONLY tradeable output. It is not `live_portfolio.json`, it
-        // is not written where the trading side reads, and nothing here sizes a
-        // position or contacts a broker. The operator promotes.
-        ctx.store.write_proposal(&serde_json::json!({
-            "schema": "neoethos.autoresearch.proposal.v1",
-            "session_id": ctx.store.session_id().as_str(),
-            "sweep": candidate.sweep,
-            "slot": candidate.slot,
-            "config_hash": proposal.config_hash,
-            "goal_hash": ctx.goals.goal_hash(),
-            "judge_hash": ctx.judge_hash,
-            "cost_hash": ctx.cost_hash,
-            "scenario": ctx.scenario.label(),
-            "goal_metric": outcome.goal_metric,
-            "goal_bar": outcome.goal_bar,
-            "frontier": outcome.frontier,
-            "oos_window": ctx.oos_window,
-            "oos_trades": oos.per_trade_net_pips().len(),
-            "proposal": proposal,
-            // WHICH genes were evaluated, and where they are. The counts are
-            // here so a reader can tell a portfolio from a single strategy
-            // without opening the artifact; the artifact itself is not inlined,
-            // because this file is the loop's only tradeable output and it stays
-            // a description of a configuration rather than a deployable one.
-            "promotion_evidence": {
-                "path": evidence_path.display().to_string(),
-                "config_hash": portfolio.config_hash,
-                "genes": portfolio.gene_count,
-                "feature_names": portfolio.batch_bindings.iter()
-                    .map(|binding| binding.feature_names.len())
-                    .sum::<usize>(),
-                "streamed": portfolio.streamed,
-                "batches": portfolio.batch_count,
-            },
-            "NOT_A_PROMOTION": "This file is a PROPOSAL. Nothing in the trading path reads it. \
-                                Promoting it is the operator's act.",
-        }))?;
-        stop(
-            ctx,
-            writer,
-            crate::verdict::StopReason::GoalReached(candidate),
-        )
-    } else {
-        let conjunct = outcome
-            .failing_conjunct
-            .clone()
-            .unwrap_or_else(|| "unnamed".to_string());
-        writer.append(Record::PromotionRefused {
-            sweep: candidate.sweep,
-            failing_conjunct: conjunct.clone(),
-        })?;
-        // STOP either way — the OOS window is spent.
-        stop(
-            ctx,
-            writer,
-            crate::verdict::StopReason::PromotionRefused {
-                sweep: candidate.sweep,
-                failing_conjunct: conjunct,
-            },
-        )
-    }
+    // P1 stops here. The exact bounded request is fsynced before any provider
+    // call, and Ready remains pre-touch: no OOS bar, signal, judge or budget is
+    // consumed by this versioned boundary.
+    let request =
+        QuoteCoverageRequestV1::from_candidate(ctx.store.session_id(), ctx.oos_window, &portfolio)
+            .map_err(anyhow::Error::new)?;
+    advance_quote_coverage_boundary_v1(writer, Some(request), quote_coverage_provider)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2526,6 +2547,14 @@ fn stop(
         writer.session().census_line()
     );
     Ok(verdict)
+}
+
+fn stop_boundary(
+    ctx: &mut LoopContext,
+    writer: &mut SessionWriter,
+    reason: crate::verdict::StopReason,
+) -> Result<AutoresearchRunOutcomeV1> {
+    stop(ctx, writer, reason).map(AutoresearchRunOutcomeV1::Terminal)
 }
 
 /// §3.2 — delete the trial-returns matrices this session no longer needs, under
@@ -2605,3 +2634,6 @@ pub mod streaming;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod awaiting_quote_coverage_v1_tests;

@@ -596,6 +596,217 @@ impl ResidentFeatureRouteV3 {
     pub const fn route_receipt_sha256(&self) -> [u8; SHA256_BYTES] {
         self.route_receipt_sha256
     }
+
+    pub fn route_id(&self) -> &str {
+        &self.route_id
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidentWorkingSetExtentRequestV3 {
+    pub row_count: usize,
+    pub column_count: usize,
+    pub max_live_producer_bytes: u64,
+    pub max_live_producer_scratch_bytes: u64,
+    pub normalization_scratch_bytes: u64,
+    pub fit_metadata_bytes: u64,
+    pub pointer_and_schema_metadata_bytes: u64,
+}
+
+/// Hardware-independent exact extent derived from one sealed Data recipe.
+/// It contains no ordinal, free-memory snapshot or admission authority and
+/// therefore cannot be mistaken for runtime capacity evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResidentWorkingSetExtentV3 {
+    row_count: u64,
+    column_count: u64,
+    parent_dataset_bytes: u64,
+    final_bar_major_value_bytes: u64,
+    packed_validity_allocated_bytes: u64,
+    fit_metadata_bytes: u64,
+    steady_device_bytes: u64,
+    merkle_scratch_bytes: u64,
+    max_live_producer_bytes: u64,
+    max_live_producer_scratch_bytes: u64,
+    normalization_scratch_bytes: u64,
+    pointer_and_schema_metadata_bytes: u64,
+    compact_hash_and_error_bytes: u64,
+    peak_device_bytes: u64,
+}
+
+impl ResidentWorkingSetExtentRequestV3 {
+    pub fn seal(self) -> Result<ResidentWorkingSetExtentV3, ResidentFeatureContractErrorV3> {
+        if self.row_count == 0 || self.column_count == 0 {
+            return Err(ResidentFeatureContractErrorV3::EmptyField {
+                field: "resident extent rows and columns",
+            });
+        }
+        let row_count = u64::try_from(self.row_count).map_err(|_| {
+            ResidentFeatureContractErrorV3::ArithmeticOverflow {
+                field: "resident extent row count",
+            }
+        })?;
+        let column_count = u64::try_from(self.column_count).map_err(|_| {
+            ResidentFeatureContractErrorV3::ArithmeticOverflow {
+                field: "resident extent column count",
+            }
+        })?;
+        let cells = checked_mul(row_count, column_count, "resident extent cell count")?;
+        let final_bar_major_value_bytes =
+            checked_mul(cells, F64_BYTES, "resident extent final values")?;
+        let packed_validity_allocated_bytes = align_up_u64(
+            packed_validity_logical_bytes(cells),
+            VALIDITY_ATOMIC_ALIGNMENT_BYTES,
+            "resident extent packed validity allocation",
+        )?;
+        let parent_ohlcv_bytes = checked_mul(
+            checked_mul(row_count, 5, "resident extent parent OHLCV arrays")?,
+            F64_BYTES,
+            "resident extent parent OHLCV bytes",
+        )?;
+        let parent_clock_bytes = checked_mul(
+            checked_mul(row_count, 3, "resident extent parent clock arrays")?,
+            I64_BYTES,
+            "resident extent parent clock bytes",
+        )?;
+        let parent_smc_bytes =
+            checked_mul(row_count, SMC_SLOTS_V3, "resident extent parent SMC bytes")?;
+        let parent_dataset_bytes = checked_sum(
+            [parent_ohlcv_bytes, parent_clock_bytes, parent_smc_bytes],
+            "resident extent parent dataset bytes",
+        )?;
+        let chunk_rows = u64::try_from(CANONICAL_MERKLE_CHUNK_ROWS_V3).map_err(|_| {
+            ResidentFeatureContractErrorV3::ArithmeticOverflow {
+                field: "resident extent Merkle chunk rows",
+            }
+        })?;
+        let timestamp_chunk_count = row_count / chunk_rows + u64::from(row_count % chunk_rows != 0);
+        let merkle_leaf_count = checked_mul(
+            timestamp_chunk_count,
+            checked_add(column_count, 1, "resident extent Merkle producer count")?,
+            "resident extent Merkle leaf count",
+        )?;
+        let merkle_scratch_bytes = checked_mul(
+            checked_mul(
+                merkle_leaf_count,
+                MERKLE_DIGEST_BYTES,
+                "resident extent one Merkle level",
+            )?,
+            2,
+            "resident extent two Merkle levels",
+        )?;
+        let compact_hash_and_error_bytes = VALIDITY_ERROR_FLAG_BYTES;
+        let steady_device_bytes = checked_sum(
+            [
+                final_bar_major_value_bytes,
+                packed_validity_allocated_bytes,
+                parent_dataset_bytes,
+                MERKLE_DIGEST_BYTES,
+                self.fit_metadata_bytes,
+            ],
+            "resident extent steady bytes",
+        )?;
+        let peak_device_bytes = checked_sum(
+            [
+                steady_device_bytes,
+                self.max_live_producer_bytes,
+                self.max_live_producer_scratch_bytes,
+                self.normalization_scratch_bytes,
+                self.pointer_and_schema_metadata_bytes,
+                merkle_scratch_bytes,
+                compact_hash_and_error_bytes,
+            ],
+            "resident extent peak bytes",
+        )?;
+        Ok(ResidentWorkingSetExtentV3 {
+            row_count,
+            column_count,
+            parent_dataset_bytes,
+            final_bar_major_value_bytes,
+            packed_validity_allocated_bytes,
+            fit_metadata_bytes: self.fit_metadata_bytes,
+            steady_device_bytes,
+            merkle_scratch_bytes,
+            max_live_producer_bytes: self.max_live_producer_bytes,
+            max_live_producer_scratch_bytes: self.max_live_producer_scratch_bytes,
+            normalization_scratch_bytes: self.normalization_scratch_bytes,
+            pointer_and_schema_metadata_bytes: self.pointer_and_schema_metadata_bytes,
+            compact_hash_and_error_bytes,
+            peak_device_bytes,
+        })
+    }
+}
+
+impl ResidentWorkingSetExtentV3 {
+    /// Canonical identity of every byte-affecting field in the exact Data
+    /// extent. Hardware admission facts are deliberately excluded; this hash
+    /// binds a prepared recipe to its stage plan before either is allocated.
+    pub fn identity_sha256(&self) -> [u8; SHA256_BYTES] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"neoethos.resident-working-set-extent.v3");
+        for value in [
+            self.row_count,
+            self.column_count,
+            self.parent_dataset_bytes,
+            self.final_bar_major_value_bytes,
+            self.packed_validity_allocated_bytes,
+            self.fit_metadata_bytes,
+            self.steady_device_bytes,
+            self.merkle_scratch_bytes,
+            self.max_live_producer_bytes,
+            self.max_live_producer_scratch_bytes,
+            self.normalization_scratch_bytes,
+            self.pointer_and_schema_metadata_bytes,
+            self.compact_hash_and_error_bytes,
+            self.peak_device_bytes,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    pub const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+    pub const fn column_count(&self) -> u64 {
+        self.column_count
+    }
+    pub const fn parent_dataset_bytes(&self) -> u64 {
+        self.parent_dataset_bytes
+    }
+    pub const fn final_bar_major_value_bytes(&self) -> u64 {
+        self.final_bar_major_value_bytes
+    }
+    pub const fn packed_validity_allocated_bytes(&self) -> u64 {
+        self.packed_validity_allocated_bytes
+    }
+    pub const fn fit_metadata_bytes(&self) -> u64 {
+        self.fit_metadata_bytes
+    }
+    pub const fn steady_device_bytes(&self) -> u64 {
+        self.steady_device_bytes
+    }
+    pub const fn merkle_scratch_bytes(&self) -> u64 {
+        self.merkle_scratch_bytes
+    }
+    pub const fn max_live_producer_bytes(&self) -> u64 {
+        self.max_live_producer_bytes
+    }
+    pub const fn max_live_producer_scratch_bytes(&self) -> u64 {
+        self.max_live_producer_scratch_bytes
+    }
+    pub const fn normalization_scratch_bytes(&self) -> u64 {
+        self.normalization_scratch_bytes
+    }
+    pub const fn pointer_and_schema_metadata_bytes(&self) -> u64 {
+        self.pointer_and_schema_metadata_bytes
+    }
+    pub const fn compact_hash_and_error_bytes(&self) -> u64 {
+        self.compact_hash_and_error_bytes
+    }
+    pub const fn peak_device_bytes(&self) -> u64 {
+        self.peak_device_bytes
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -961,6 +1172,9 @@ impl GpuOnlyResidentAdmissionV3 {
 
     pub fn planned_routes(&self) -> &[ResidentFeatureRouteV3] {
         &self.planned_routes
+    }
+    pub const fn capabilities(&self) -> &ResidentProducerCapabilityManifestV3 {
+        &self.capabilities
     }
     pub const fn device(&self) -> &CudaPrimaryContextBuildIdentityV3 {
         &self.device

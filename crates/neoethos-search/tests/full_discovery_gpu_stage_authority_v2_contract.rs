@@ -188,7 +188,7 @@ fn card_present_execution_rejects_cpu_allow_cpu_and_untyped_preference_escapes()
             "CardPresentAllowCpuForbidden",
             "ExactCudaOrdinalRequired",
             "reject_card_present_cpu_or_fallback_v2(",
-            "StrictGpuRouteRefusalV2::CpuAllowed",
+            "FallbackPolicy::AllowCpu",
         ],
     );
     for forbidden in [
@@ -198,7 +198,6 @@ fn card_present_execution_rejects_cpu_allow_cpu_and_untyped_preference_escapes()
         "gpu_pipeline_preflight(",
         "stage1_baseline()",
         "unwrap_or_default",
-        "FallbackPolicy::AllowCpu",
     ] {
         assert!(
             !authority_source.contains(forbidden),

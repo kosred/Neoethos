@@ -29,8 +29,22 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::discovery::DiscoveryConfig;
+
+pub const RESOLVED_CONFIG_STAMP_SCHEMA_VERSION_V2: u16 = 2;
+pub const POPULATION_AUTO_SEARCH_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
+
+fn deserialize_required_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 /// Maximum payoff ratio EVER observed on real bars under the production
 /// trailing configuration (`trailing_enabled: true`, `be_trigger_r: 1.0`,
@@ -138,6 +152,7 @@ impl BindingConstraint {
 
 /// The computed ceiling and every number the operator needs to argue with it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayoffCeiling {
     /// Highest payoff ratio the search space can express AT ALL, over the box
     /// mutation can reach: `(tp_max − c) / (sl_min + c)`.
@@ -160,6 +175,7 @@ pub struct PayoffCeiling {
     /// which every armed trade exits at that floor:
     /// `(min_lock − c) / (sl_min + c)`. It is the degenerate value the trail
     /// collapses toward, NOT a maximum.
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub trailing_armed_floor_payoff: Option<f64>,
     /// The ceiling the gate actually enforces: the arithmetic one, lowered to
     /// [`MEASURED_TRAILING_PAYOFF_CEILING`] when the trail is in the
@@ -172,7 +188,6 @@ pub struct PayoffCeiling {
     /// that passes here has not been checked against anything empirical. It is
     /// also the reward-hack corner — payoff 2.53 at expectancy −4.18 pips per
     /// trade — which only the net-expectancy gate can refuse.
-    #[serde(default)]
     pub trailing_ceiling_unmeasured: bool,
     /// Win rate at which a strategy sitting EXACTLY at the configured floor
     /// breaks even in gross-R terms: `1 / (1 + floor)`.
@@ -211,23 +226,43 @@ fn finite(name: &str, v: f64) -> Result<f64> {
 /// PROVABLY unreachable.
 pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeiling> {
     let sl_min = finite("sl_min_pips", inputs.sl_min_pips)?;
-    let _sl_max = finite("sl_max_pips", inputs.sl_max_pips)?;
-    let _tp_min = finite("tp_min_pips", inputs.tp_min_pips)?;
+    let sl_max = finite("sl_max_pips", inputs.sl_max_pips)?;
+    let tp_min = finite("tp_min_pips", inputs.tp_min_pips)?;
     let tp_max = finite("tp_max_pips", inputs.tp_max_pips)?;
+    let rr_min = finite("initializer_rr_min", inputs.initializer_rr_min)?;
     let rr_max = finite("initializer_rr_max", inputs.initializer_rr_max)?;
     let cost = finite("cost_pips_round_trip", inputs.cost_pips_round_trip)?;
     let be_trigger = finite("trailing_be_trigger_r", inputs.trailing_be_trigger_r)?;
     let give_back = finite("trailing_give_back_r", inputs.trailing_give_back_r)?;
     let min_lock = finite("trailing_min_lock_pips", inputs.trailing_min_lock_pips)?;
 
-    if sl_min <= 0.0 {
-        bail!("payoff-ceiling input `sl_min_pips` must be > 0 (got {sl_min})");
+    if sl_min <= 0.0 || sl_max <= 0.0 || sl_min > sl_max {
+        bail!("payoff-ceiling stop clamp must satisfy 0 < min <= max (got {sl_min}..={sl_max})");
     }
-    if tp_max <= 0.0 {
-        bail!("payoff-ceiling input `tp_max_pips` must be > 0 (got {tp_max})");
+    if tp_min <= 0.0 || tp_max <= 0.0 || tp_min > tp_max {
+        bail!(
+            "payoff-ceiling take-profit clamp must satisfy 0 < min <= max (got {tp_min}..={tp_max})"
+        );
+    }
+    if rr_min <= 0.0 || rr_max <= 0.0 || rr_min > rr_max {
+        bail!(
+            "payoff-ceiling initializer RR band must satisfy 0 < min <= max (got {rr_min}..={rr_max})"
+        );
+    }
+    if let Some(atr_pips) = inputs.atr_pips {
+        let atr_pips = finite("atr_pips", atr_pips)?;
+        if atr_pips <= 0.0 {
+            bail!("payoff-ceiling input `atr_pips` must be > 0 (got {atr_pips})");
+        }
     }
     if cost < 0.0 {
         bail!("payoff-ceiling input `cost_pips_round_trip` must be >= 0 (got {cost})");
+    }
+    if be_trigger < 0.0 || give_back < 0.0 || min_lock < 0.0 {
+        bail!(
+            "payoff-ceiling trailing geometry must be nonnegative (trigger={be_trigger}, \
+             give_back={give_back}, min_lock_pips={min_lock})"
+        );
     }
 
     let denom = sl_min + cost;
@@ -452,17 +487,24 @@ pub fn assert_payoff_floor_reachable(
 // Resolved-config stamp.
 // ---------------------------------------------------------------------------
 
-/// The decision-critical values, resolved. Written into the discovery ledger
-/// every run so a result can be attributed to a configuration after the fact.
+/// A legacy decision-critical subset, resolved. Written into the discovery
+/// ledger so an operator can attribute the major search controls after the
+/// fact. This is not an exhaustive experiment identity: the population-sizing
+/// receipt, canonical input receipt, and exact stage-1 view remain separate
+/// authorities.
 ///
 /// Deliberately NOT the whole `DiscoveryConfig` (that is
 /// `DiscoveryRunProfile`'s job, and it lands next to the portfolio JSON): this
-/// is the short list an operator reads first, and the hash that says whether
-/// two runs were the same experiment.
+/// is the short list an operator reads first. Its hash compares only this
+/// stamped subset; the strict S3b search authority adds the sizing/stage facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedConfigStamp {
-    /// `fnv64:…` over every other field of this struct, in declaration order.
-    /// Two runs with the same hash searched under the same decisions.
+    /// Strict schema 2: all authority fields are required and unknown fields
+    /// are rejected. Legacy/default-filled stamps are not current authority.
+    pub schema_version: u16,
+    /// `fnv64:…` over every other field of this legacy subset, in declaration
+    /// order. Equality does not claim that every DiscoveryConfig field matches.
     pub config_hash: String,
     pub symbol: String,
     pub timeframe: String,
@@ -476,11 +518,9 @@ pub struct ResolvedConfigStamp {
     // equality between two runs that searched under different rules.
     /// `TargetProfile::min_net_expectancy_per_trade`. Checked UNCONDITIONALLY,
     /// ahead of the payoff floor: `0.0` means "strictly positive".
-    #[serde(default)]
     pub min_net_expectancy_per_trade: f64,
     /// `TargetProfile::min_expectancy_t_stat`. `0.0` = the significance bar is
     /// OFF, which is the shipped state.
-    #[serde(default)]
     pub min_expectancy_t_stat: f64,
 
     // ── the gate that decided the LAST run's outcome, now demoted ─────────
@@ -497,11 +537,11 @@ pub struct ResolvedConfigStamp {
     /// and it moves the prefilter's label geometry — see
     /// `PayoffCeilingInputs::initializer_rr_min`. Without it two runs that
     /// ranked features differently hashed identically.
-    #[serde(default)]
     pub initializer_rr_min: f64,
     /// Median ATR (pips) the band was scaled to; `None` = absolute pip band.
     /// Without this the four pip numbers above are un-interpretable across
     /// timeframes.
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub band_atr_pips: Option<f64>,
     pub trailing_enabled: bool,
     pub trailing_be_trigger_r: f64,
@@ -523,11 +563,11 @@ pub struct ResolvedConfigStamp {
     /// The per-UTC-bucket spread curve, or `None` for a FLAT spread charged at
     /// 03:00 Tokyo and at the London open alike. Without this in the hash, a
     /// flat-spread run and a per-hour-curve run hash identically.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub session_spread_pips: Option<[f64; 3]>,
     /// The band every reported result is measured against, so a ledger can say
     /// what its own `cost_band_*` counts were measured at.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub cost_band_pips: Option<(f64, f64)>,
 
     // ── the shape of the search ───────────────────────────────────────────
@@ -537,19 +577,21 @@ pub struct ResolvedConfigStamp {
     /// CPCV settings. They now decide the PREFILTER's refit windows as well as
     /// the validation folds, so two runs that differ here explored different
     /// feature sets and are not the same experiment.
-    #[serde(default)]
     pub enable_cpcv: bool,
-    #[serde(default)]
     pub cpcv_n_splits: usize,
-    #[serde(default)]
     pub cpcv_n_test_groups: usize,
-    #[serde(default)]
     pub cpcv_embargo_pct: f64,
-    #[serde(default)]
     pub cpcv_purge_pct: f64,
-    #[serde(default)]
     pub cpcv_max_rows: usize,
     pub population: usize,
+    pub population_auto: bool,
+    pub max_indicators: usize,
+    pub max_rows: usize,
+    pub max_rows_by_timeframe: BTreeMap<String, usize>,
+    pub max_hours: f64,
+    pub funnel_stage1_pct: f64,
+    /// Stable schema token: `earliest` or `most_recent` (never `Debug`).
+    pub stage1_window: String,
     pub generations: usize,
     pub candidate_count: usize,
     pub portfolio_size: usize,
@@ -572,6 +614,7 @@ pub struct ResolvedConfigStamp {
 /// Everything except the hash, so the hash can be computed over it.
 #[derive(Serialize)]
 struct StampBody<'a> {
+    schema_version: u16,
     symbol: &'a str,
     timeframe: &'a str,
     mode: &'a str,
@@ -608,6 +651,13 @@ struct StampBody<'a> {
     cpcv_purge_pct: f64,
     cpcv_max_rows: usize,
     population: usize,
+    population_auto: bool,
+    max_indicators: usize,
+    max_rows: usize,
+    max_rows_by_timeframe: &'a BTreeMap<String, usize>,
+    max_hours: f64,
+    funnel_stage1_pct: f64,
+    stage1_window: &'a str,
     generations: usize,
     candidate_count: usize,
     portfolio_size: usize,
@@ -618,6 +668,276 @@ struct StampBody<'a> {
     risk_per_trade_max: f64,
     adaptive_thresholds: bool,
     normalize_features: bool,
+}
+
+impl ResolvedConfigStamp {
+    fn hash_body_v2(&self) -> StampBody<'_> {
+        StampBody {
+            schema_version: self.schema_version,
+            symbol: &self.symbol,
+            timeframe: &self.timeframe,
+            mode: &self.mode,
+            min_net_expectancy_per_trade: self.min_net_expectancy_per_trade,
+            min_expectancy_t_stat: self.min_expectancy_t_stat,
+            payoff_floor: self.payoff_floor,
+            min_win_rate: self.min_win_rate,
+            max_in_market: self.max_in_market,
+            sl_clamp_pips: self.sl_clamp_pips,
+            tp_clamp_pips: self.tp_clamp_pips,
+            initializer_rr_max: self.initializer_rr_max,
+            initializer_rr_min: self.initializer_rr_min,
+            band_atr_pips: self.band_atr_pips,
+            trailing_enabled: self.trailing_enabled,
+            trailing_be_trigger_r: self.trailing_be_trigger_r,
+            trailing_give_back_r: self.trailing_give_back_r,
+            trailing_min_lock_pips: self.trailing_min_lock_pips,
+            spread_pips: self.spread_pips,
+            commission_per_trade: self.commission_per_trade,
+            pip_value_per_lot: self.pip_value_per_lot,
+            cost_pips_round_trip: self.cost_pips_round_trip,
+            swap_long_pips_per_day: self.swap_long_pips_per_day,
+            swap_short_pips_per_day: self.swap_short_pips_per_day,
+            kill_zones_enabled: self.kill_zones_enabled,
+            session_spread_pips: self.session_spread_pips,
+            cost_band_pips: self.cost_band_pips,
+            prefilter_top_k: self.prefilter_top_k,
+            prefilter_insample_frac: self.prefilter_insample_frac,
+            prefilter_min_per_timeframe: self.prefilter_min_per_timeframe,
+            enable_cpcv: self.enable_cpcv,
+            cpcv_n_splits: self.cpcv_n_splits,
+            cpcv_n_test_groups: self.cpcv_n_test_groups,
+            cpcv_embargo_pct: self.cpcv_embargo_pct,
+            cpcv_purge_pct: self.cpcv_purge_pct,
+            cpcv_max_rows: self.cpcv_max_rows,
+            population: self.population,
+            population_auto: self.population_auto,
+            max_indicators: self.max_indicators,
+            max_rows: self.max_rows,
+            max_rows_by_timeframe: &self.max_rows_by_timeframe,
+            max_hours: self.max_hours,
+            funnel_stage1_pct: self.funnel_stage1_pct,
+            stage1_window: &self.stage1_window,
+            generations: self.generations,
+            candidate_count: self.candidate_count,
+            portfolio_size: self.portfolio_size,
+            mc_runs: self.mc_runs,
+            mc_min_profitable: self.mc_min_profitable,
+            initial_balance: self.initial_balance,
+            risk_per_trade_min: self.risk_per_trade_min,
+            risk_per_trade_max: self.risk_per_trade_max,
+            adaptive_thresholds: self.adaptive_thresholds,
+            normalize_features: self.normalize_features,
+        }
+    }
+
+    fn computed_config_hash_v2(&self) -> Result<String> {
+        crate::artifact_io::stable_json_hash(&self.hash_body_v2())
+    }
+
+    fn validate_persisted_float_domains_v2(&self) -> Result<()> {
+        let required_finite = [
+            (
+                "min_net_expectancy_per_trade",
+                self.min_net_expectancy_per_trade,
+            ),
+            ("min_expectancy_t_stat", self.min_expectancy_t_stat),
+            ("payoff_floor", self.payoff_floor),
+            ("min_win_rate", self.min_win_rate),
+            ("max_in_market", self.max_in_market),
+            ("sl_clamp_pips.min", self.sl_clamp_pips.0),
+            ("sl_clamp_pips.max", self.sl_clamp_pips.1),
+            ("tp_clamp_pips.min", self.tp_clamp_pips.0),
+            ("tp_clamp_pips.max", self.tp_clamp_pips.1),
+            ("initializer_rr_max", self.initializer_rr_max),
+            ("initializer_rr_min", self.initializer_rr_min),
+            ("trailing_be_trigger_r", self.trailing_be_trigger_r),
+            ("trailing_give_back_r", self.trailing_give_back_r),
+            ("trailing_min_lock_pips", self.trailing_min_lock_pips),
+            ("spread_pips", self.spread_pips),
+            ("commission_per_trade", self.commission_per_trade),
+            ("pip_value_per_lot", self.pip_value_per_lot),
+            ("cost_pips_round_trip", self.cost_pips_round_trip),
+            ("swap_long_pips_per_day", self.swap_long_pips_per_day),
+            ("swap_short_pips_per_day", self.swap_short_pips_per_day),
+            ("prefilter_insample_frac", self.prefilter_insample_frac),
+            ("cpcv_embargo_pct", self.cpcv_embargo_pct),
+            ("cpcv_purge_pct", self.cpcv_purge_pct),
+            ("max_hours", self.max_hours),
+            ("funnel_stage1_pct", self.funnel_stage1_pct),
+            ("initial_balance", self.initial_balance),
+            ("risk_per_trade_min", self.risk_per_trade_min),
+            ("risk_per_trade_max", self.risk_per_trade_max),
+            (
+                "payoff_ceiling.arithmetic_ceiling",
+                self.payoff_ceiling.arithmetic_ceiling,
+            ),
+            (
+                "payoff_ceiling.initializer_ceiling",
+                self.payoff_ceiling.initializer_ceiling,
+            ),
+            (
+                "payoff_ceiling.ceiling_tp_pips",
+                self.payoff_ceiling.ceiling_tp_pips,
+            ),
+            (
+                "payoff_ceiling.ceiling_sl_pips",
+                self.payoff_ceiling.ceiling_sl_pips,
+            ),
+            (
+                "payoff_ceiling.enforced_ceiling",
+                self.payoff_ceiling.enforced_ceiling,
+            ),
+            (
+                "payoff_ceiling.required_win_rate_at_floor",
+                self.payoff_ceiling.required_win_rate_at_floor,
+            ),
+            (
+                "payoff_ceiling.breakeven_win_rate_at_ceiling",
+                self.payoff_ceiling.breakeven_win_rate_at_ceiling,
+            ),
+            (
+                "payoff_ceiling.zero_edge_base_rate",
+                self.payoff_ceiling.zero_edge_base_rate,
+            ),
+        ];
+        for (name, value) in required_finite {
+            anyhow::ensure!(
+                value.is_finite(),
+                "resolved-config stamp field `{name}` is not finite"
+            );
+        }
+        if let Some(value) = self.band_atr_pips {
+            anyhow::ensure!(
+                value.is_finite() && value > 0.0,
+                "resolved-config stamp ATR scale must be finite and > 0"
+            );
+        }
+        if let Some(value) = self.payoff_ceiling.trailing_armed_floor_payoff {
+            anyhow::ensure!(
+                value.is_finite(),
+                "resolved-config stamp trailing armed-floor payoff is not finite"
+            );
+        }
+        if let Some(curve) = self.session_spread_pips {
+            for (bucket, value) in ["asian", "overlap", "late_ny"].into_iter().zip(curve) {
+                anyhow::ensure!(
+                    value.is_finite() && value >= 0.0,
+                    "resolved-config stamp session spread `{bucket}` must be finite and >= 0"
+                );
+            }
+        }
+        if let Some((lo, hi)) = self.cost_band_pips {
+            anyhow::ensure!(
+                lo.is_finite() && hi.is_finite() && 0.0 <= lo && lo <= hi,
+                "resolved-config stamp cost band must satisfy 0 <= lo <= hi"
+            );
+        }
+
+        // Negative target floors are intentionally retained as disabled or
+        // lenient sentinels by direct DiscoveryConfig callers. They must be
+        // finite, but only the fields that are fractions have an upper domain.
+        anyhow::ensure!(
+            self.min_win_rate <= 1.0 && self.max_in_market <= 1.0,
+            "resolved-config stamp target fractions must be <= 1"
+        );
+        anyhow::ensure!(
+            self.prefilter_insample_frac > 0.0 && self.prefilter_insample_frac <= 1.0,
+            "resolved-config stamp prefilter fraction must be in (0, 1]"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cpcv_embargo_pct)
+                && (0.0..=1.0).contains(&self.cpcv_purge_pct),
+            "resolved-config stamp CPCV percentages must be in [0, 1]"
+        );
+        anyhow::ensure!(
+            (0.01..=1.0).contains(&self.funnel_stage1_pct),
+            "resolved-config stamp stage1 percentage must be in [0.01, 1]"
+        );
+        anyhow::ensure!(
+            self.max_hours >= 0.0,
+            "resolved-config stamp max-hours must be >= 0"
+        );
+        anyhow::ensure!(
+            self.initial_balance > 0.0,
+            "resolved-config stamp initial balance must be > 0"
+        );
+        anyhow::ensure!(
+            0.0 <= self.risk_per_trade_min
+                && self.risk_per_trade_min <= self.risk_per_trade_max
+                && self.risk_per_trade_max <= 1.0,
+            "resolved-config stamp risk band must satisfy 0 <= min <= max <= 1"
+        );
+        anyhow::ensure!(
+            self.spread_pips >= 0.0
+                && self.commission_per_trade >= 0.0
+                && self.pip_value_per_lot > 0.0
+                && self.cost_pips_round_trip >= 0.0,
+            "resolved-config stamp cost inputs must be nonnegative with positive pip value"
+        );
+        anyhow::ensure!(
+            self.trailing_be_trigger_r >= 0.0
+                && self.trailing_give_back_r >= 0.0
+                && self.trailing_min_lock_pips >= 0.0,
+            "resolved-config stamp trailing geometry must be nonnegative"
+        );
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == RESOLVED_CONFIG_STAMP_SCHEMA_VERSION_V2,
+            "unsupported resolved-config stamp schema {}",
+            self.schema_version
+        );
+        anyhow::ensure!(
+            self.config_hash == self.computed_config_hash_v2()?,
+            "resolved-config stamp self-hash mismatch"
+        );
+        anyhow::ensure!(
+            !self.symbol.is_empty()
+                && !self.timeframe.is_empty()
+                && self.population > 0
+                && self.max_indicators > 0,
+            "resolved-config stamp has an empty identity or zero search extent"
+        );
+        anyhow::ensure!(
+            matches!(self.mode.as_str(), "strict" | "prop_firm" | "risky"),
+            "resolved-config stamp has an unknown mode token"
+        );
+        anyhow::ensure!(
+            matches!(self.stage1_window.as_str(), "earliest" | "most_recent"),
+            "resolved-config stamp has an unknown stage1-window token"
+        );
+        self.validate_persisted_float_domains_v2()?;
+        let inputs = PayoffCeilingInputs {
+            sl_min_pips: self.sl_clamp_pips.0,
+            sl_max_pips: self.sl_clamp_pips.1,
+            tp_min_pips: self.tp_clamp_pips.0,
+            tp_max_pips: self.tp_clamp_pips.1,
+            initializer_rr_max: self.initializer_rr_max,
+            initializer_rr_min: self.initializer_rr_min,
+            atr_pips: self.band_atr_pips,
+            cost_pips_round_trip: self.cost_pips_round_trip,
+            trailing_enabled: self.trailing_enabled,
+            trailing_be_trigger_r: self.trailing_be_trigger_r,
+            trailing_give_back_r: self.trailing_give_back_r,
+            trailing_min_lock_pips: self.trailing_min_lock_pips,
+        };
+        anyhow::ensure!(
+            self.cost_pips_round_trip
+                == cost_pips_round_trip(
+                    self.spread_pips,
+                    self.commission_per_trade,
+                    self.pip_value_per_lot,
+                ),
+            "resolved-config stamp raw cost fields do not reconcile to round-trip cost"
+        );
+        anyhow::ensure!(
+            self.payoff_ceiling == assert_payoff_floor_reachable(self.payoff_floor, &inputs)?,
+            "resolved-config stamp payoff ceiling is detached from its inputs"
+        );
+        Ok(())
+    }
 }
 
 /// Round-trip cost in pips, from the resolved cost model.
@@ -706,7 +1026,8 @@ pub fn config_hash_for(
     normalize_features: bool,
 ) -> Option<String> {
     let inputs = payoff_inputs_for_config(config, pip_value_per_lot);
-    let ceiling = max_achievable_payoff(&inputs).ok()?;
+    let ceiling =
+        assert_payoff_floor_reachable(config.target_profile.min_payoff_ratio, &inputs).ok()?;
     stamp_resolved_config(
         config,
         &inputs,
@@ -718,6 +1039,231 @@ pub fn config_hash_for(
     .map(|s| s.config_hash)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PopulationAutoSelectionSemanticsV1 {
+    schema_version: u16,
+    resolved_config_stamp_hash: String,
+    population_auto: bool,
+    configured_population: u64,
+    resolved_population: u64,
+    requested_max_indicators: u64,
+    term_cap: u64,
+    month_capacity: u64,
+    migration_enabled_for_run: bool,
+    stage1_role: String,
+    stage1_row_start: u64,
+    stage1_row_end: u64,
+    stage1_identity_sha256: String,
+}
+
+/// Strict persisted authority for the selection-changing population decision.
+///
+/// The full sizing receipt remains embedded so device/admission facts are not
+/// lost. Its hardware-only fields are intentionally excluded from
+/// `search_config_hash`: two valid cards that resolve the same P/K/stage view
+/// execute the same search. The containing result additionally cross-links the
+/// exact sizing-receipt identity to its completed execution receipt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PopulationAutoSearchAuthorityV1 {
+    schema_version: u16,
+    resolved_config_stamp: ResolvedConfigStamp,
+    population_auto_sizing_receipt:
+        crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1,
+    search_config_hash: String,
+}
+
+impl PopulationAutoSearchAuthorityV1 {
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub const fn resolved_config_stamp(&self) -> &ResolvedConfigStamp {
+        &self.resolved_config_stamp
+    }
+
+    pub const fn population_auto_sizing_receipt(
+        &self,
+    ) -> &crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1 {
+        &self.population_auto_sizing_receipt
+    }
+
+    pub fn search_config_hash(&self) -> &str {
+        &self.search_config_hash
+    }
+
+    fn semantic_projection_unchecked_v1(&self) -> Result<PopulationAutoSelectionSemanticsV1> {
+        let receipt = &self.population_auto_sizing_receipt;
+        let stage1 = receipt.stage1_window();
+        Ok(PopulationAutoSelectionSemanticsV1 {
+            schema_version: self.schema_version,
+            resolved_config_stamp_hash: self.resolved_config_stamp.config_hash.clone(),
+            population_auto: receipt.population_auto(),
+            configured_population: u64::try_from(receipt.configured_population())?,
+            resolved_population: u64::try_from(receipt.resolved_population())?,
+            requested_max_indicators: u64::try_from(receipt.requested_max_indicators())?,
+            term_cap: u64::try_from(receipt.term_cap())?,
+            month_capacity: u64::try_from(receipt.month_capacity())?,
+            migration_enabled_for_run: receipt.migration_enabled_for_run(),
+            stage1_role: stage1.role().to_owned(),
+            stage1_row_start: stage1.row_start(),
+            stage1_row_end: stage1.row_end(),
+            stage1_identity_sha256: stage1.identity_sha256().to_owned(),
+        })
+    }
+
+    fn computed_search_config_hash_v1(&self) -> Result<String> {
+        crate::artifact_io::stable_json_hash(&self.semantic_projection_unchecked_v1()?)
+    }
+
+    pub fn selection_semantics_v1(&self) -> Result<PopulationAutoSelectionSemanticsV1> {
+        self.validate()?;
+        self.semantic_projection_unchecked_v1()
+    }
+
+    pub fn semantically_matches(&self, other: &Self) -> Result<bool> {
+        Ok(self.selection_semantics_v1()? == other.selection_semantics_v1()?)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == POPULATION_AUTO_SEARCH_AUTHORITY_SCHEMA_VERSION_V1,
+            "unsupported population-auto search authority schema {}",
+            self.schema_version
+        );
+        self.resolved_config_stamp.validate()?;
+        self.population_auto_sizing_receipt
+            .validate()
+            .map_err(anyhow::Error::new)?;
+        let stamp = &self.resolved_config_stamp;
+        let receipt = &self.population_auto_sizing_receipt;
+        anyhow::ensure!(
+            stamp.population == receipt.resolved_population(),
+            "resolved-config population is detached from its sizing receipt"
+        );
+        anyhow::ensure!(
+            stamp.population_auto == receipt.population_auto(),
+            "resolved-config population_auto is detached from its sizing receipt"
+        );
+        anyhow::ensure!(
+            stamp.max_indicators == receipt.requested_max_indicators(),
+            "resolved-config max_indicators is detached from its sizing receipt"
+        );
+
+        let resident_rows = receipt.resident_parent_rows();
+        let expected_stage1_rows =
+            ((resident_rows as f64 * stamp.funnel_stage1_pct) as usize).min(resident_rows);
+        anyhow::ensure!(
+            expected_stage1_rows == receipt.evaluation_rows(),
+            "resolved stage1 percentage is detached from the exact evaluation extent"
+        );
+        let stage1 = receipt.stage1_window();
+        let expected_range = match stamp.stage1_window.as_str() {
+            "earliest" => (0, expected_stage1_rows),
+            "most_recent" => (
+                resident_rows.saturating_sub(expected_stage1_rows),
+                resident_rows,
+            ),
+            other => anyhow::bail!("unknown strict stage1 window token {other}"),
+        };
+        anyhow::ensure!(
+            stage1.row_start() == u64::try_from(expected_range.0)?
+                && stage1.row_end() == u64::try_from(expected_range.1)?,
+            "resolved stage1 policy is detached from the exact stage1 range"
+        );
+        anyhow::ensure!(
+            self.search_config_hash == self.computed_search_config_hash_v1()?,
+            "population-auto search semantic hash mismatch"
+        );
+        Ok(())
+    }
+}
+
+pub fn build_population_auto_search_authority_v1(
+    config: &DiscoveryConfig,
+    receipt: &crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1,
+    pip_value_per_lot: f64,
+    normalize_features: bool,
+) -> Result<PopulationAutoSearchAuthorityV1> {
+    receipt.validate().map_err(anyhow::Error::new)?;
+    anyhow::ensure!(
+        config.population == receipt.configured_population(),
+        "requested DiscoveryConfig population does not match the sizing receipt"
+    );
+    anyhow::ensure!(
+        config.population_auto == receipt.population_auto(),
+        "requested DiscoveryConfig population_auto does not match the sizing receipt"
+    );
+    anyhow::ensure!(
+        config.max_indicators == receipt.requested_max_indicators(),
+        "requested DiscoveryConfig max_indicators does not match the sizing receipt"
+    );
+    let resolved_config = DiscoveryConfig {
+        population: receipt.resolved_population(),
+        ..config.clone()
+    };
+    let inputs = payoff_inputs_for_config(&resolved_config, pip_value_per_lot);
+    let ceiling =
+        assert_payoff_floor_reachable(resolved_config.target_profile.min_payoff_ratio, &inputs)?;
+    let resolved_config_stamp = stamp_resolved_config(
+        &resolved_config,
+        &inputs,
+        ceiling,
+        pip_value_per_lot,
+        normalize_features,
+    )?;
+    let mut authority = PopulationAutoSearchAuthorityV1 {
+        schema_version: POPULATION_AUTO_SEARCH_AUTHORITY_SCHEMA_VERSION_V1,
+        resolved_config_stamp,
+        population_auto_sizing_receipt: receipt.clone(),
+        search_config_hash: String::new(),
+    };
+    authority.search_config_hash = authority.computed_search_config_hash_v1()?;
+    authority.validate()?;
+    Ok(authority)
+}
+
+/// Receipt-linked sizing/search semantic hash.
+///
+/// This deliberately excludes the selected device, free-memory snapshot, and
+/// probe identities: those are persisted and validated in the sizing receipt,
+/// but a different card that resolves the same population and stage-1 search
+/// does not create a different search. It remains narrower than an exhaustive
+/// `DiscoveryConfig` experiment identity because the legacy stamp has known
+/// pre-existing omissions outside S3b.
+pub fn population_auto_semantic_config_hash_for_v1(
+    config: &DiscoveryConfig,
+    receipt: &crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1,
+    pip_value_per_lot: f64,
+    normalize_features: bool,
+) -> Result<String> {
+    Ok(build_population_auto_search_authority_v1(
+        config,
+        receipt,
+        pip_value_per_lot,
+        normalize_features,
+    )?
+    .search_config_hash)
+}
+
+#[cfg(all(test, feature = "gpu-b-adapter"))]
+pub(crate) fn recompute_population_auto_search_authority_hash_for_test_v1(
+    authority: &mut PopulationAutoSearchAuthorityV1,
+) -> Result<()> {
+    authority.search_config_hash = authority.computed_search_config_hash_v1()?;
+    Ok(())
+}
+
+#[cfg(all(test, feature = "gpu-b-adapter"))]
+pub(crate) fn recompute_resolved_config_stamp_hash_for_test_v2(
+    authority: &mut PopulationAutoSearchAuthorityV1,
+) -> Result<()> {
+    authority.resolved_config_stamp.config_hash =
+        authority.resolved_config_stamp.computed_config_hash_v2()?;
+    authority.search_config_hash = authority.computed_search_config_hash_v1()?;
+    Ok(())
+}
+
 /// Stamp the resolved configuration. Pure: takes every ambient value as an
 /// argument so it is testable without a process-wide install.
 pub fn stamp_resolved_config(
@@ -727,11 +1273,31 @@ pub fn stamp_resolved_config(
     pip_value_per_lot: f64,
     normalize_features: bool,
 ) -> Result<ResolvedConfigStamp> {
-    let mode = format!("{:?}", config.mode);
+    let canonical_ceiling =
+        assert_payoff_floor_reachable(config.target_profile.min_payoff_ratio, inputs)?;
+    anyhow::ensure!(
+        ceiling == canonical_ceiling,
+        "resolved-config stamp ceiling must come from the canonical payoff-floor gate"
+    );
+    let mode = match config.mode {
+        crate::discovery::DiscoveryMode::Strict => "strict",
+        crate::discovery::DiscoveryMode::PropFirm => "prop_firm",
+        crate::discovery::DiscoveryMode::Risky => "risky",
+    };
+    let max_rows_by_timeframe = config
+        .max_rows_by_timeframe
+        .iter()
+        .map(|(timeframe, rows)| (timeframe.clone(), *rows))
+        .collect::<BTreeMap<_, _>>();
+    let stage1_window = match config.runtime_overrides.stage1_window {
+        crate::discovery::Stage1Window::Earliest => "earliest",
+        crate::discovery::Stage1Window::MostRecent => "most_recent",
+    };
     let body = StampBody {
+        schema_version: RESOLVED_CONFIG_STAMP_SCHEMA_VERSION_V2,
         symbol: &config.evaluation_symbol,
         timeframe: &config.timeframe_label,
-        mode: &mode,
+        mode,
         min_net_expectancy_per_trade: config.target_profile.min_net_expectancy_per_trade,
         min_expectancy_t_stat: config.target_profile.min_expectancy_t_stat,
         payoff_floor: config.target_profile.min_payoff_ratio,
@@ -765,6 +1331,13 @@ pub fn stamp_resolved_config(
         cpcv_purge_pct: config.cpcv_purge_pct,
         cpcv_max_rows: config.cpcv_max_rows,
         population: config.population,
+        population_auto: config.population_auto,
+        max_indicators: config.max_indicators,
+        max_rows: config.max_rows,
+        max_rows_by_timeframe: &max_rows_by_timeframe,
+        max_hours: config.max_hours,
+        funnel_stage1_pct: config.runtime_overrides.resolved_funnel_stage1_pct(),
+        stage1_window,
         generations: config.generations,
         candidate_count: config.candidate_count,
         portfolio_size: config.portfolio_size,
@@ -777,7 +1350,8 @@ pub fn stamp_resolved_config(
         normalize_features,
     };
     let config_hash = crate::artifact_io::stable_json_hash(&body)?;
-    Ok(ResolvedConfigStamp {
+    let stamp = ResolvedConfigStamp {
+        schema_version: body.schema_version,
         config_hash,
         symbol: body.symbol.to_string(),
         timeframe: body.timeframe.to_string(),
@@ -815,6 +1389,13 @@ pub fn stamp_resolved_config(
         cpcv_purge_pct: body.cpcv_purge_pct,
         cpcv_max_rows: body.cpcv_max_rows,
         population: body.population,
+        population_auto: body.population_auto,
+        max_indicators: body.max_indicators,
+        max_rows: body.max_rows,
+        max_rows_by_timeframe: max_rows_by_timeframe.clone(),
+        max_hours: body.max_hours,
+        funnel_stage1_pct: body.funnel_stage1_pct,
+        stage1_window: body.stage1_window.to_owned(),
         generations: body.generations,
         candidate_count: body.candidate_count,
         portfolio_size: body.portfolio_size,
@@ -826,7 +1407,9 @@ pub fn stamp_resolved_config(
         adaptive_thresholds: body.adaptive_thresholds,
         normalize_features: body.normalize_features,
         payoff_ceiling: ceiling,
-    })
+    };
+    stamp.validate()?;
+    Ok(stamp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,17 +1619,26 @@ mod tests {
     /// were the same experiment.
     #[test]
     fn the_stamp_separates_runs_that_differ_only_in_the_lower_rr_bound() {
-        let config = crate::discovery::DiscoveryConfig::default();
+        let mut config = crate::discovery::DiscoveryConfig::default();
+        config.target_profile.min_payoff_ratio = 0.5;
+        config.evaluation_symbol = "EURUSD".to_owned();
+        config.evaluation_spread_pips = 1.89;
+        config.evaluation_commission_per_trade = 10.0;
         let stamp_for = |rr_min: f64| {
             let mut inputs = production_inputs();
             inputs.initializer_rr_min = rr_min;
-            let ceiling = max_achievable_payoff(&inputs).expect("finite inputs");
+            inputs.cost_pips_round_trip = cost_pips_round_trip(
+                config.evaluation_spread_pips,
+                config.evaluation_commission_per_trade,
+                10.0,
+            );
+            let ceiling = assert_payoff_floor_reachable(0.5, &inputs).expect("reachable floor");
             stamp_resolved_config(&config, &inputs, ceiling, 10.0, false).expect("stamp")
         };
         let a = stamp_for(1.5);
-        let b = stamp_for(3.0);
+        let b = stamp_for(2.0);
         assert_eq!(a.initializer_rr_min, 1.5);
-        assert_eq!(b.initializer_rr_min, 3.0);
+        assert_eq!(b.initializer_rr_min, 2.0);
         assert_ne!(
             a.config_hash, b.config_hash,
             "rr_min changes the prefilter's label geometry and therefore the \
@@ -1054,5 +1646,333 @@ mod tests {
         );
         // And the same inputs must still be stable, or the hash is noise.
         assert_eq!(stamp_for(1.5).config_hash, a.config_hash);
+    }
+
+    #[test]
+    fn the_stamp_separates_population_auto_and_stage1_search_semantics() {
+        let mut base = crate::discovery::DiscoveryConfig::default();
+        base.target_profile.min_payoff_ratio = 0.5;
+        base.evaluation_symbol = "EURUSD".to_owned();
+        base.evaluation_spread_pips = 1.89;
+        base.evaluation_commission_per_trade = 10.0;
+        let stamp_for = |config: &crate::discovery::DiscoveryConfig| {
+            let mut inputs = production_inputs();
+            inputs.cost_pips_round_trip = cost_pips_round_trip(
+                config.evaluation_spread_pips,
+                config.evaluation_commission_per_trade,
+                10.0,
+            );
+            let ceiling = assert_payoff_floor_reachable(0.5, &inputs).expect("reachable floor");
+            stamp_resolved_config(config, &inputs, ceiling, 10.0, false)
+                .expect("resolved config stamp")
+                .config_hash
+        };
+        let expected = stamp_for(&base);
+
+        let mut mutations: Vec<(&str, crate::discovery::DiscoveryConfig)> = Vec::new();
+        let mut config = base.clone();
+        config.population_auto = !config.population_auto;
+        mutations.push(("population_auto", config));
+        let mut config = base.clone();
+        config.max_indicators = config.max_indicators.saturating_add(1);
+        mutations.push(("max_indicators", config));
+        let mut config = base.clone();
+        config.max_rows = config.max_rows.saturating_add(1);
+        mutations.push(("max_rows", config));
+        let mut config = base.clone();
+        config
+            .max_rows_by_timeframe
+            .insert("M15".to_string(), 123_456);
+        mutations.push(("max_rows_by_timeframe", config));
+        let mut config = base.clone();
+        config.max_hours += 1.0;
+        mutations.push(("max_hours", config));
+        let mut config = base.clone();
+        config.runtime_overrides.funnel_stage1_pct = 0.5;
+        mutations.push(("funnel_stage1_pct", config));
+        let mut config = base.clone();
+        config.runtime_overrides.stage1_window = crate::discovery::Stage1Window::MostRecent;
+        mutations.push(("stage1_window", config));
+
+        for (field, config) in mutations {
+            assert_ne!(
+                stamp_for(&config),
+                expected,
+                "selection-changing {field} must change the config hash"
+            );
+        }
+
+        let mut first_order = base.clone();
+        first_order
+            .max_rows_by_timeframe
+            .insert("H1".to_string(), 50_000);
+        first_order
+            .max_rows_by_timeframe
+            .insert("M15".to_string(), 200_000);
+        let mut opposite_order = base;
+        opposite_order
+            .max_rows_by_timeframe
+            .insert("M15".to_string(), 200_000);
+        opposite_order
+            .max_rows_by_timeframe
+            .insert("H1".to_string(), 50_000);
+        assert_eq!(
+            stamp_for(&first_order),
+            stamp_for(&opposite_order),
+            "HashMap insertion order must not change the canonical config hash"
+        );
+    }
+
+    #[test]
+    fn public_stamp_constructor_never_emits_a_cost_contradiction() {
+        let mut config = crate::discovery::DiscoveryConfig::default();
+        config.evaluation_symbol = "EURUSD".to_owned();
+        config.evaluation_spread_pips = 1.89;
+        config.evaluation_commission_per_trade = 10.0;
+        config.target_profile.min_payoff_ratio = 0.5;
+        let mut inputs = production_inputs();
+        inputs.cost_pips_round_trip = cost_pips_round_trip(
+            config.evaluation_spread_pips,
+            config.evaluation_commission_per_trade,
+            10.0,
+        );
+        let ceiling = assert_payoff_floor_reachable(0.5, &inputs).expect("reachable floor");
+        let valid = stamp_resolved_config(&config, &inputs, ceiling, 10.0, false)
+            .expect("consistent stamp");
+        valid.validate().expect("constructor output self-validates");
+
+        let mut contradictory = inputs;
+        contradictory.cost_pips_round_trip += 0.1;
+        let contradictory_ceiling =
+            assert_payoff_floor_reachable(0.5, &contradictory).expect("reachable floor");
+        assert!(
+            stamp_resolved_config(&config, &contradictory, contradictory_ceiling, 10.0, false,)
+                .is_err(),
+            "caller-supplied derived cost cannot contradict the raw config fields"
+        );
+    }
+
+    #[test]
+    fn payoff_geometry_rejects_reversed_or_nonpositive_search_bounds() {
+        let base = production_inputs();
+        let mut cases = Vec::new();
+        let mut inputs = base;
+        inputs.sl_max_pips = inputs.sl_min_pips - 1.0;
+        cases.push(("reversed stop clamp", inputs));
+        let mut inputs = base;
+        inputs.tp_min_pips = inputs.tp_max_pips + 1.0;
+        cases.push(("reversed take-profit clamp", inputs));
+        let mut inputs = base;
+        inputs.sl_max_pips = 0.0;
+        cases.push(("nonpositive stop maximum", inputs));
+        let mut inputs = base;
+        inputs.tp_min_pips = 0.0;
+        cases.push(("nonpositive take-profit minimum", inputs));
+        let mut inputs = base;
+        inputs.initializer_rr_min = inputs.initializer_rr_max + 0.1;
+        cases.push(("reversed initializer RR", inputs));
+        let mut inputs = base;
+        inputs.initializer_rr_min = 0.0;
+        cases.push(("nonpositive initializer RR minimum", inputs));
+        let mut inputs = base;
+        inputs.initializer_rr_max = 0.0;
+        cases.push(("nonpositive initializer RR maximum", inputs));
+        let mut inputs = base;
+        inputs.atr_pips = Some(0.0);
+        cases.push(("nonpositive ATR scale", inputs));
+        let mut inputs = base;
+        inputs.atr_pips = Some(f64::NAN);
+        cases.push(("nonfinite ATR scale", inputs));
+
+        for (name, inputs) in cases {
+            assert!(
+                max_achievable_payoff(&inputs).is_err(),
+                "{name} must not mint a payoff/search authority"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_stamp_rejects_every_nonfinite_or_out_of_domain_persisted_float() {
+        fn valid_stamp() -> ResolvedConfigStamp {
+            let mut config = crate::discovery::DiscoveryConfig::default();
+            config.evaluation_symbol = "EURUSD".to_owned();
+            config.evaluation_spread_pips = 1.89;
+            config.evaluation_commission_per_trade = 10.0;
+            config.target_profile.min_payoff_ratio = 0.5;
+            let mut inputs = production_inputs();
+            inputs.cost_pips_round_trip = cost_pips_round_trip(
+                config.evaluation_spread_pips,
+                config.evaluation_commission_per_trade,
+                10.0,
+            );
+            let ceiling =
+                assert_payoff_floor_reachable(0.5, &inputs).expect("reachable payoff floor");
+            stamp_resolved_config(&config, &inputs, ceiling, 10.0, false)
+                .expect("valid strict stamp")
+        }
+
+        fn reject(name: &str, mutate: fn(&mut ResolvedConfigStamp)) {
+            let mut stamp = valid_stamp();
+            mutate(&mut stamp);
+            stamp.config_hash = stamp
+                .computed_config_hash_v2()
+                .expect("an attacker can recompute the unkeyed inner hash");
+            assert!(
+                stamp.validate().is_err(),
+                "rehashed invalid persisted field `{name}` must fail closed"
+            );
+        }
+
+        let nonfinite: &[(&str, fn(&mut ResolvedConfigStamp))] = &[
+            ("min_net_expectancy_per_trade", |s| {
+                s.min_net_expectancy_per_trade = f64::NAN
+            }),
+            ("min_expectancy_t_stat", |s| {
+                s.min_expectancy_t_stat = f64::NAN
+            }),
+            ("payoff_floor", |s| s.payoff_floor = f64::NAN),
+            ("min_win_rate", |s| s.min_win_rate = f64::NAN),
+            ("max_in_market", |s| s.max_in_market = f64::NAN),
+            ("sl_clamp_pips.0", |s| s.sl_clamp_pips.0 = f64::NAN),
+            ("sl_clamp_pips.1", |s| s.sl_clamp_pips.1 = f64::NAN),
+            ("tp_clamp_pips.0", |s| s.tp_clamp_pips.0 = f64::NAN),
+            ("tp_clamp_pips.1", |s| s.tp_clamp_pips.1 = f64::NAN),
+            ("initializer_rr_max", |s| s.initializer_rr_max = f64::NAN),
+            ("initializer_rr_min", |s| s.initializer_rr_min = f64::NAN),
+            ("band_atr_pips", |s| s.band_atr_pips = Some(f64::NAN)),
+            ("trailing_be_trigger_r", |s| {
+                s.trailing_be_trigger_r = f64::NAN
+            }),
+            ("trailing_give_back_r", |s| {
+                s.trailing_give_back_r = f64::NAN
+            }),
+            ("trailing_min_lock_pips", |s| {
+                s.trailing_min_lock_pips = f64::NAN
+            }),
+            ("spread_pips", |s| s.spread_pips = f64::NAN),
+            ("commission_per_trade", |s| {
+                s.commission_per_trade = f64::NAN
+            }),
+            ("pip_value_per_lot", |s| s.pip_value_per_lot = f64::NAN),
+            ("cost_pips_round_trip", |s| {
+                s.cost_pips_round_trip = f64::NAN
+            }),
+            ("swap_long_pips_per_day", |s| {
+                s.swap_long_pips_per_day = f64::NAN
+            }),
+            ("swap_short_pips_per_day", |s| {
+                s.swap_short_pips_per_day = f64::NAN
+            }),
+            ("session_spread_pips[0]", |s| {
+                s.session_spread_pips = Some([f64::NAN, 1.0, 1.0])
+            }),
+            ("session_spread_pips[1]", |s| {
+                s.session_spread_pips = Some([1.0, f64::NAN, 1.0])
+            }),
+            ("session_spread_pips[2]", |s| {
+                s.session_spread_pips = Some([1.0, 1.0, f64::NAN])
+            }),
+            ("cost_band_pips.0", |s| {
+                s.cost_band_pips = Some((f64::NAN, 2.4))
+            }),
+            ("cost_band_pips.1", |s| {
+                s.cost_band_pips = Some((1.6, f64::NAN))
+            }),
+            ("prefilter_insample_frac", |s| {
+                s.prefilter_insample_frac = f64::NAN
+            }),
+            ("cpcv_embargo_pct", |s| s.cpcv_embargo_pct = f64::NAN),
+            ("cpcv_purge_pct", |s| s.cpcv_purge_pct = f64::NAN),
+            ("max_hours", |s| s.max_hours = f64::NAN),
+            ("max_hours positive infinity", |s| {
+                s.max_hours = f64::INFINITY
+            }),
+            ("funnel_stage1_pct", |s| s.funnel_stage1_pct = f64::NAN),
+            ("initial_balance", |s| s.initial_balance = f64::NAN),
+            ("risk_per_trade_min", |s| s.risk_per_trade_min = f64::NAN),
+            ("risk_per_trade_max", |s| s.risk_per_trade_max = f64::NAN),
+            ("payoff_ceiling.arithmetic_ceiling", |s| {
+                s.payoff_ceiling.arithmetic_ceiling = f64::NAN
+            }),
+            ("payoff_ceiling.initializer_ceiling", |s| {
+                s.payoff_ceiling.initializer_ceiling = f64::NAN
+            }),
+            ("payoff_ceiling.ceiling_tp_pips", |s| {
+                s.payoff_ceiling.ceiling_tp_pips = f64::NAN
+            }),
+            ("payoff_ceiling.ceiling_sl_pips", |s| {
+                s.payoff_ceiling.ceiling_sl_pips = f64::NAN
+            }),
+            ("payoff_ceiling.trailing_armed_floor_payoff", |s| {
+                s.payoff_ceiling.trailing_armed_floor_payoff = Some(f64::NAN)
+            }),
+            ("payoff_ceiling.enforced_ceiling", |s| {
+                s.payoff_ceiling.enforced_ceiling = f64::NAN
+            }),
+            ("payoff_ceiling.required_win_rate_at_floor", |s| {
+                s.payoff_ceiling.required_win_rate_at_floor = f64::NAN
+            }),
+            ("payoff_ceiling.breakeven_win_rate_at_ceiling", |s| {
+                s.payoff_ceiling.breakeven_win_rate_at_ceiling = f64::NAN
+            }),
+            ("payoff_ceiling.zero_edge_base_rate", |s| {
+                s.payoff_ceiling.zero_edge_base_rate = f64::NAN
+            }),
+        ];
+        for (name, mutate) in nonfinite {
+            reject(name, *mutate);
+        }
+
+        let invalid_domains: &[(&str, fn(&mut ResolvedConfigStamp))] = &[
+            ("win-rate above one", |s| s.min_win_rate = 1.1),
+            ("in-market fraction above one", |s| s.max_in_market = 1.1),
+            ("zero ATR scale", |s| s.band_atr_pips = Some(0.0)),
+            ("negative trail trigger", |s| s.trailing_be_trigger_r = -0.1),
+            ("negative trail give-back", |s| {
+                s.trailing_give_back_r = -0.1
+            }),
+            ("negative trail lock", |s| s.trailing_min_lock_pips = -0.1),
+            ("negative spread", |s| s.spread_pips = -0.1),
+            ("negative commission", |s| s.commission_per_trade = -0.1),
+            ("nonpositive pip value", |s| s.pip_value_per_lot = 0.0),
+            ("negative session spread", |s| {
+                s.session_spread_pips = Some([-0.1, 1.0, 1.0])
+            }),
+            ("reversed cost band", |s| {
+                s.cost_band_pips = Some((2.4, 1.6))
+            }),
+            ("negative cost band", |s| {
+                s.cost_band_pips = Some((-0.1, 2.4))
+            }),
+            ("zero prefilter fraction", |s| {
+                s.prefilter_insample_frac = 0.0
+            }),
+            ("prefilter fraction above one", |s| {
+                s.prefilter_insample_frac = 1.1
+            }),
+            ("CPCV embargo above one", |s| s.cpcv_embargo_pct = 1.1),
+            ("negative CPCV embargo", |s| s.cpcv_embargo_pct = -0.1),
+            ("negative CPCV purge", |s| s.cpcv_purge_pct = -0.1),
+            ("CPCV purge above one", |s| s.cpcv_purge_pct = 1.1),
+            ("negative max-hours", |s| s.max_hours = -0.1),
+            ("nonpositive initial balance", |s| s.initial_balance = 0.0),
+            ("negative risk minimum", |s| s.risk_per_trade_min = -0.1),
+            ("risk maximum above one", |s| s.risk_per_trade_max = 1.1),
+            ("reversed risk band", |s| {
+                s.risk_per_trade_min = 0.2;
+                s.risk_per_trade_max = 0.1;
+            }),
+        ];
+        for (name, mutate) in invalid_domains {
+            reject(name, *mutate);
+        }
+
+        let stamp = valid_stamp();
+        let encoded = serde_json::to_string(&stamp).expect("strict stamp serializes");
+        let decoded: ResolvedConfigStamp =
+            serde_json::from_str(&encoded).expect("strict stamp roundtrips");
+        assert_eq!(decoded, stamp, "strict stamp must roundtrip losslessly");
+        decoded.validate().expect("roundtripped stamp validates");
     }
 }

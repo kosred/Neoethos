@@ -1,5 +1,5 @@
 #[cfg(feature = "gpu-b-adapter")]
-use neoethos_gpu_contracts::device::{NeoPopulationMetricRow, NeoPopulationOutcome};
+use neoethos_gpu_contracts::device::NeoPopulationMetricRow;
 #[cfg(feature = "gpu-b-adapter")]
 use neoethos_gpu_cuda::{CudaPopulationDeviceIdentityV1, PopulationResidencyCountersV1};
 use serde::Serialize;
@@ -530,31 +530,21 @@ pub(crate) fn seal_native_population_residency_receipt_v1(
     let expected_metric_bytes = counters
         .metric_rows_readback_rows()
         .checked_mul(std::mem::size_of::<NeoPopulationMetricRow>() as u64);
-    let expected_diagnostic_bytes = counters
-        .diagnostic_readback_rows()
-        .checked_mul(std::mem::size_of::<NeoPopulationOutcome>() as u64);
-    let expected_control_bytes = counters
-        .accepted_trade_total_readback_count()
-        .checked_mul(std::mem::size_of::<u64>() as u64);
-    let diagnostic_accounting_is_valid = if counters.diagnostic_readback_count() == 0 {
-        counters.diagnostic_readback_rows() == 0 && counters.diagnostic_readback_bytes() == 0
-    } else {
-        counters.diagnostic_readback_rows() >= counters.diagnostic_readback_count()
-            && expected_diagnostic_bytes == Some(counters.diagnostic_readback_bytes())
-    };
     if counters.metric_rows_readback_count() == 0
         || counters.metric_rows_readback_rows() < counters.metric_rows_readback_count()
         || expected_metric_bytes != Some(counters.metric_rows_readback_bytes())
-        || expected_control_bytes != Some(counters.accepted_trade_total_readback_bytes())
-        || !diagnostic_accounting_is_valid
+        || counters.diagnostic_readback_count() != 0
+        || counters.diagnostic_readback_rows() != 0
+        || counters.diagnostic_readback_bytes() != 0
+        || counters.accepted_trade_total_readback_count() != 0
+        || counters.accepted_trade_total_readback_bytes() != 0
     {
         return Err(error(
             NativePopulationResidencyReceiptErrorCodeV1::TransferAccountingMismatch,
             "native population D2H readback count, row, and byte accounting is inconsistent",
         ));
     }
-    if counters.explicit_synchronization_count() != counters.accepted_trade_total_readback_count()
-        || counters.explicit_synchronization_count() != counters.metric_rows_readback_count()
+    if counters.explicit_synchronization_count() != counters.metric_rows_readback_count()
         || successful_native_population_count != counters.metric_rows_readback_count()
     {
         return Err(error(

@@ -62,11 +62,13 @@ struct RoleSpec {
 
 /// One named template (e.g. "Trend Pullback Long"). Roles are tried in
 /// order; templates with fewer than 2 resolvable roles are skipped.
+pub(crate) const PROFESSIONAL_TEMPLATE_MAX_TERMS_V1: usize = 5;
+
 struct Template {
     name: &'static str,
     long_threshold: f64,
     short_threshold: f64,
-    roles: [RoleSpec; 5],
+    roles: [RoleSpec; PROFESSIONAL_TEMPLATE_MAX_TERMS_V1],
     /// SMC flag preset: (use_ob, use_fvg, use_liq_sweep, mtf, premium,
     /// inducement, bos, choch, eqh, eql, displacement).
     smc_flags: [bool; 11],

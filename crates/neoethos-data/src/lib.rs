@@ -146,8 +146,12 @@ pub use crate::core::gpu_only_feature_workspace_preflight_v3::{
 };
 #[cfg(feature = "gpu-cuda")]
 pub use crate::core::gpu_resident_feature_store_v3::{
-    GpuOnlyFeatureMaterializationAdmissionV3, GpuOnlyFeatureMaterializationErrorV3,
-    SealedGpuResidentFeatureStoreV3, materialize_gpu_only_feature_store_v3,
+    CanonicalGpuResidentFeatureExecutionSemanticV1, GpuOnlyFeatureMaterializationAdmissionV3,
+    GpuOnlyFeatureMaterializationErrorV3, PreparedGpuOnlyFeatureMaterializationV3,
+    SealedGpuResidentFeatureStoreV3, ValidatedGpuResidentFeatureExecutionAuthorityV1,
+    materialize_gpu_only_feature_store_v3,
+    materialize_prepared_gpu_only_feature_store_for_data_population_v3,
+    materialize_prepared_gpu_only_feature_store_v3, prepare_gpu_only_feature_materialization_v3,
 };
 pub use crate::core::hpc_ta::*;
 pub use crate::core::import_discover::{
@@ -157,6 +161,17 @@ pub use crate::core::import_discover::{
 pub use crate::core::indicators::*;
 pub use crate::core::pinned_canonical_series_v1::{
     PinnedCanonicalSeriesV1, pin_exact_canonical_series_v1,
+};
+#[cfg(feature = "gpu-cuda")]
+pub use crate::core::pinned_source_projection_v1::{
+    CANONICAL_PINNED_SOURCE_PROJECTION_SCHEMA_VERSION_V1, CanonicalPinnedSourceBindingFactsV1,
+    CanonicalPinnedSourceProjectionErrorV1, CanonicalPinnedSourceProjectionV1,
+    CanonicalPinnedSourceSegmentFactsV1,
+};
+pub use crate::core::quant_exact_math_v3::{
+    QUANT_LOG_OPERATION_SCHEDULE_V3, QUANT_OPENLIBM_COMMIT_V3, QUANT_OPENLIBM_E_LOG_RECEIPT_V3,
+    QUANT_OPENLIBM_E_LOG_SOURCE_SHA256_V3, QUANT_OPENLIBM_E_LOG_SOURCE_V3,
+    quant_log_positive_f64_v3,
 };
 pub use crate::core::quant_features::*;
 pub use crate::core::regime_detection::*;

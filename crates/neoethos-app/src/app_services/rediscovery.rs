@@ -35,18 +35,15 @@
 //!
 //! Design: the live-engine loop only PUSHES a request into a process-global
 //! queue (it has no access to `AppApiState`); a watcher spawned at server
-//! startup drains the queue through the SAME `engines_control::discovery_start`
-//! handler the UI and the Supervisor use — every validation, preflight and
-//! single-engine gate applies. Gated by `system.auto_rediscover_on_cull`
+//! startup drains the queue through the shared typed Discovery start — every
+//! validation, preflight and process-wide execution gate applies without a
+//! JSON/HTTP round trip. Gated by `system.auto_rediscover_on_cull`
 //! (Settings toggle, default ON). Fail-soft everywhere: a full engine queue
 //! retries on the next tick, a permanent failure (e.g. no data) drops the
 //! request with a WARN instead of looping forever.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-
-use axum::Json;
-use axum::extract::State;
 
 use crate::server::state::AppApiState;
 
@@ -88,18 +85,19 @@ pub fn spawn(state: AppApiState) {
                 continue;
             };
 
-            // Settings gate — read fresh each tick so the toggle applies live.
-            let settings = match neoethos_core::Settings::from_yaml(
-                &crate::server::state::current_config_path(),
-            ) {
-                Ok(settings) => settings,
+            let base_timeframe = match base_tf
+                .trim()
+                .to_uppercase()
+                .parse::<neoethos_data::CanonicalTimeframe>()
+            {
+                Ok(timeframe) => timeframe,
                 Err(error) => {
                     tracing::warn!(
                         target: "neoethos_app::rediscovery",
                         %symbol,
                         %base_tf,
                         error = %error,
-                        "cannot resolve exact rediscovery dataset identity because Settings are unavailable — dropping request"
+                        "rediscovery base timeframe is invalid — dropping request"
                     );
                     if let Ok(mut q) = queue().lock() {
                         q.pop_front();
@@ -107,91 +105,58 @@ pub fn spawn(state: AppApiState) {
                     continue;
                 }
             };
-            if !settings.system.auto_rediscover_on_cull {
-                tracing::info!(
-                    target: "neoethos_app::rediscovery",
-                    %symbol, %base_tf,
-                    "auto_rediscover_on_cull is OFF in Settings — dropping queued rediscovery"
-                );
-                if let Ok(mut q) = queue().lock() {
-                    q.pop_front();
-                }
-                continue;
-            }
-
-            let dataset_identity =
-                match crate::app_services::discovery::resolve_unique_background_dataset_identity(
-                    &settings.system.data_dir,
-                    &symbol,
-                    &base_tf,
-                ) {
-                    Ok(identity) => identity,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "neoethos_app::rediscovery",
-                            %symbol,
-                            %base_tf,
-                            error = %error,
-                            "rediscovery did not resolve exactly one canonical dataset identity — dropping request"
-                        );
-                        if let Ok(mut q) = queue().lock() {
-                            q.pop_front();
-                        }
-                        continue;
+            let start = crate::server::engines_control::start_typed_discovery_execution_v1(
+                state.clone(),
+                crate::server::engines_control::TypedDiscoveryExecutionIntentV1 {
+                    symbol: symbol.clone(),
+                    base_timeframe,
+                    higher_timeframes:
+                        crate::server::engines_control::TypedHigherTimeframePolicyV1::Configured,
+                    overrides:
+                        crate::server::engines_control::TypedDiscoveryOverridesV1::default(),
+                    settings_gate: crate::server::engines_control::TypedDiscoverySettingsGateV1::RequireAutoRediscoveryEnabled,
+                    dataset_policy: crate::server::engines_control::TypedDiscoveryDatasetPolicyV1::Current,
+                    training_after_success: true,
+                },
+            );
+            match start {
+                Ok(handle) => {
+                    crate::server::engines_control::detach_typed_legacy_execution_observer_v1(
+                        state.clone(),
+                        handle,
+                    );
+                    tracing::info!(
+                        target: "neoethos_app::rediscovery",
+                        %symbol, %base_tf,
+                        "rediscovery started — refilling the slot the retired strategy left"
+                    );
+                    if let Ok(mut q) = queue().lock() {
+                        q.pop_front();
                     }
-                };
-
-            let body: crate::server::engines_control::StartJobBody =
-                match serde_json::from_value(serde_json::json!({
-                    "dataset_identity": dataset_identity.to_path_component(),
-                    "symbol": symbol,
-                    "base_tf": base_tf,
-                })) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "neoethos_app::rediscovery",
-                            error = %e, "malformed rediscovery request — dropping"
-                        );
-                        if let Ok(mut q) = queue().lock() {
-                            q.pop_front();
-                        }
-                        continue;
-                    }
-                };
-            let resp = crate::server::engines_control::discovery_start(
-                State(state.clone()),
-                Some(Json(body)),
-            )
-            .await;
-            let status = resp.status();
-            if status.is_success() {
-                tracing::info!(
-                    target: "neoethos_app::rediscovery",
-                    %symbol, %base_tf,
-                    "rediscovery started — refilling the slot the retired strategy left"
-                );
-                if let Ok(mut q) = queue().lock() {
-                    q.pop_front();
                 }
-            } else if status == axum::http::StatusCode::CONFLICT {
-                // Discovery (or its training auto-chain) is busy — keep the
-                // request queued and retry on a later tick.
-                tracing::debug!(
-                    target: "neoethos_app::rediscovery",
-                    %symbol, %base_tf, "discovery engine busy — will retry"
-                );
-            } else {
-                // Permanent-looking failure (no data for the combo, bad config…):
-                // drop instead of retry-looping; the WARN tells the operator why.
-                tracing::warn!(
-                    target: "neoethos_app::rediscovery",
-                    %symbol, %base_tf, status = %status,
-                    "rediscovery start failed — dropping request (fix the cause and \
-                     start Discovery manually if still wanted)"
-                );
-                if let Ok(mut q) = queue().lock() {
-                    q.pop_front();
+                Err(crate::server::engines_control::TypedLegacyExecutionStartErrorV1::Busy(
+                    busy,
+                )) => {
+                    tracing::debug!(
+                        target: "neoethos_app::rediscovery",
+                        %symbol,
+                        %base_tf,
+                        requested = %busy.requested(),
+                        active = %busy.active(),
+                        "discovery engine busy — will retry"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "neoethos_app::rediscovery",
+                        %symbol,
+                        %base_tf,
+                        error = %error,
+                        "rediscovery start failed — dropping request"
+                    );
+                    if let Ok(mut q) = queue().lock() {
+                        q.pop_front();
+                    }
                 }
             }
         }

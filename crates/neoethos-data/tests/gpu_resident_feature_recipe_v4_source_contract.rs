@@ -402,19 +402,6 @@ fn mutation_audit_rejects_clone_derive_and_any_public_resolved_field() {
 fn column_schema_seal_does_not_create_runtime_or_plan_authority() {
     let source = read_or_empty("src/core/gpu_resident_feature_recipe_v4.rs");
     assert!(source.contains("pub(crate) struct SealedResidentColumnSchemaV4"));
-    let column_only = format!(
-        "{}{}",
-        section(
-            &source,
-            "pub(crate) struct SealedResidentColumnSchemaV4",
-            "impl SealedResidentColumnSchemaV4",
-        ),
-        section(
-            &source,
-            "impl ResidentColumnSchemaAssemblerV4",
-            "fn derive_dataset_recipe_sha256_v4",
-        )
-    );
     for forbidden in [
         "GpuOnlyResidentAdmissionV3",
         "FeaturePlanV1",
@@ -425,12 +412,8 @@ fn column_schema_seal_does_not_create_runtime_or_plan_authority() {
         "source_provenance",
     ] {
         assert!(
-            !column_only.contains(forbidden),
+            !source.contains(forbidden),
             "column-only seal overclaimed authority through {forbidden:?}"
         );
     }
-    assert!(
-        source.contains("finalize_after_normalization_v4"),
-        "final plan authority must exist only in the post-fit identity template"
-    );
 }

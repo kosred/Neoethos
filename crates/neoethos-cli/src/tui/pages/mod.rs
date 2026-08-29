@@ -14,6 +14,7 @@ pub mod dashboard;
 pub mod discover;
 pub mod funnel;
 pub mod logs;
+pub mod native_research;
 pub mod strategies;
 pub mod symbols;
 pub mod train;
@@ -24,6 +25,7 @@ pub mod train;
 pub enum Page {
     Dashboard,
     Discover,
+    NativeResearch,
     Strategies,
     Symbols,
     Train,
@@ -38,6 +40,7 @@ impl Page {
     pub const ALL: &'static [Page] = &[
         Page::Dashboard,
         Page::Discover,
+        Page::NativeResearch,
         Page::Strategies,
         Page::Symbols,
         Page::Train,
@@ -52,6 +55,7 @@ impl Page {
         match self {
             Page::Dashboard => "Dashboard",
             Page::Discover => "Discover",
+            Page::NativeResearch => "Native Research",
             Page::Strategies => "Strategies",
             Page::Symbols => "Symbols",
             Page::Train => "Train",
@@ -79,6 +83,14 @@ impl Page {
                 ("L", "launch"),
                 ("Tab", "page"),
                 ("Q", "quit"),
+            ],
+            Page::NativeResearch => &[
+                ("↑↓", "focus field"),
+                ("Enter", "edit"),
+                ("L", "start"),
+                ("S", "status"),
+                ("K", "cancel"),
+                ("N", "open page"),
             ],
             Page::Strategies => &[
                 ("↑↓", "select"),
@@ -135,6 +147,7 @@ impl Page {
         match self {
             Page::Dashboard => dashboard::draw(area, buf, shared),
             Page::Discover => discover::draw(area, buf, shared),
+            Page::NativeResearch => native_research::draw(area, buf, shared),
             Page::Strategies => strategies::draw(area, buf, shared),
             Page::Symbols => symbols::draw(area, buf, shared),
             Page::Train => train::draw(area, buf, shared),
@@ -151,6 +164,7 @@ impl Page {
     pub fn handle_key(self, code: KeyCode, shared: &mut AppShared) -> bool {
         match self {
             Page::Discover => discover::handle_key(code, shared),
+            Page::NativeResearch => native_research::handle_key(code, shared),
             Page::Train => train::handle_key(code, shared),
             Page::AutoLoop => auto_loop::handle_key(code, shared),
             Page::Chart => chart::handle_key(code, shared),
@@ -168,6 +182,7 @@ impl Page {
     pub fn activate(self, shared: &mut AppShared) {
         match self {
             Page::Discover => discover::launch_now(shared),
+            Page::NativeResearch => native_research::launch_now(shared),
             Page::Train => train::launch_now(shared),
             Page::AutoLoop => auto_loop::launch_now(shared),
             _ => {}

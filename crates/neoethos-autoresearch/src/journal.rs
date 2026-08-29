@@ -44,6 +44,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::awaiting_quote_coverage_v1::{QuoteCoverageReadyV1, QuoteCoverageRequestV1};
 use crate::session::{
     BestEver, BlockId, ChampionRow, DatasetReceiptV1, GcCensus, SessionId, SweepId,
 };
@@ -51,12 +52,9 @@ use crate::session::{
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialisable mirrors of upstream types
 //
-// `neoethos_search::discovery::CostBandCensus` and
-// `neoethos_search::goal_report::RiskOutcome` are NOT `Serialize` today. Rather
-// than reach into another crate's derive list (forbidden territory) the journal
-// carries its own field-for-field mirrors, built by `From`. If those derives
-// land, these can be deleted — see the REQUIRED ELSEWHERE note in
-// `docs/autoresearch-loop.md`.
+// The journal keeps stable serialisable mirrors of upstream evidence. Its
+// cost-band row additionally carries `discriminates`, which is a run/config
+// fact and cannot be reconstructed from an all-zero measured census.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Mirror of `neoethos_search::discovery::CostBandCensus`, plus the one fact
@@ -383,6 +381,13 @@ pub enum Record {
         indistinguishable: bool,
     },
 
+    /// Durable, pre-touch request for exact quote coverage. Repeating the exact
+    /// request is idempotent; a different request is journal corruption.
+    AwaitingQuoteCoverageV1 { request: QuoteCoverageRequestV1 },
+    /// The provider supplied exact coverage for the durable request. This is
+    /// still pre-touch and does not authorize evaluation by itself.
+    QuoteCoverageReadyV1 { ready: QuoteCoverageReadyV1 },
+
     /// The OOS window is spent. There is one of these per session, ever.
     OosTouchSpent {
         window: OosWindow,
@@ -456,6 +461,8 @@ impl Record {
             | Self::Promoted { sweep, .. }
             | Self::PromotionRefused { sweep, .. }
             | Self::GarbageCollected { sweep, .. } => Some(*sweep),
+            Self::AwaitingQuoteCoverageV1 { request } => Some(request.sweep()),
+            Self::QuoteCoverageReadyV1 { ready } => Some(ready.sweep()),
             Self::ShuffleControlCompleted { source_sweep, .. } => Some(*source_sweep),
             Self::BestEverAdvanced { best } => Some(best.sweep),
             Self::ChampionRecorded { row } => Some(row.sweep),
@@ -485,6 +492,8 @@ impl Record {
             Self::PosteriorRetracted { .. } => "PosteriorRetracted",
             Self::ShuffleControlCompleted { .. } => "ShuffleControlCompleted",
             Self::BlockJudged { .. } => "BlockJudged",
+            Self::AwaitingQuoteCoverageV1 { .. } => "AwaitingQuoteCoverageV1",
+            Self::QuoteCoverageReadyV1 { .. } => "QuoteCoverageReadyV1",
             Self::OosTouchSpent { .. } => "OosTouchSpent",
             Self::Promoted { .. } => "Promoted",
             Self::PromotionRefused { .. } => "PromotionRefused",

@@ -10,14 +10,17 @@ use std::sync::Arc;
 use std::{error::Error as StdError, fmt};
 
 use anyhow::{Context as _, Result, bail};
-use neoethos_feature_contracts::{DatasetFeatureArtifactProvenanceV1, FeaturePlanV1};
+use neoethos_feature_contracts::{
+    DatasetFeatureArtifactProvenanceV1, FeatureOperationTagV1, FeaturePlanV1,
+};
 use neoethos_gpu_contracts::resident_feature_store_v3::{
     CANONICAL_MERKLE_CHUNK_ROWS_V3, CanonicalCudaSha256AuthorityV3,
     CudaPrimaryContextBuildIdentityV3, GpuOnlyResidentAdmissionRequestV3,
     GpuOnlyResidentAdmissionV3, ResidentFeatureContractErrorV3, ResidentFeatureProducerV3,
     ResidentFeatureRouteV3, ResidentFeatureStageV3, ResidentProducerCapabilityManifestV3,
     ResidentProducerCapabilityV3, ResidentReadyEventV3, ResidentWorkingSetBoundV3,
-    ResidentWorkingSetRequestV3, SealedResidentFeatureStoreRequestV3, SealedResidentFeatureStoreV3,
+    ResidentWorkingSetExtentRequestV3, ResidentWorkingSetExtentV3, ResidentWorkingSetRequestV3,
+    SealedResidentFeatureStoreRequestV3, SealedResidentFeatureStoreV3,
 };
 use neoethos_gpu_cuda::resident_classic_ta_v3::{
     ResidentClassicTaExecutorErrorV3, ResidentClassicTaPreDeviceMemoryReceiptV4,
@@ -53,10 +56,15 @@ use neoethos_gpu_cuda::resident_smc_v3::{
     resident_smc_capability_v3,
 };
 use neoethos_gpu_cuda::{
-    FullDiscoveryWorkspacePlanErrorV1,
+    AdmittedNativeCudaDataPopulationRunV1, DataPopulationWorkspacePlanErrorV1,
+    DataPopulationWorkspacePreflightRequestV1, FullDiscoveryWorkspacePlanErrorV1,
+    PopulationGeneStorePlanV1, PopulationMetricsOnlyPlanV1, SealedDataPopulationGpuWorkspacePlanV1,
+    SealedNativeCudaDataPopulationPreflightFactsV1,
     full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1,
+    seal_data_population_gpu_workspace_plan_v1,
 };
 use sha2::{Digest, Sha256};
+use vector_ta::cuda::F64_EXACT_MATH_AUTHORITY_V3;
 
 use crate::CanonicalOhlcvFrame;
 
@@ -64,12 +72,14 @@ use super::features::FeatureProfile;
 use super::footprint_features::{FOOTPRINT_FEATURE_NAMES, FOOTPRINT_SEMANTIC_VERSION};
 use super::gpu_only_feature_workspace_preflight_v3::PreparedGpuOnlyFeatureWorkspacePreflightV3;
 use super::gpu_resident_classic_ta_v3::{
-    ResidentClassicTaPlanV3, preflight_resident_classic_ta_v3,
+    RESIDENT_CLASSIC_TA_LOCAL_ROUTE_DOMAIN_V4, ResidentClassicTaPlanV3,
+    preflight_resident_classic_ta_v3,
 };
 use super::gpu_resident_feature_recipe_v4::{
     ResidentCanonicalParameterV4, ResidentCanonicalParameterValueV4,
     ResidentFeatureIdentityTemplateV4, ResidentFeatureRecipeErrorV4, ResidentProducerBatchDraftV4,
     ResidentProducerDraftV4, ResidentRouteDraftV4, ResidentTransformCapabilityDraftV4,
+    derive_route_semantic_source_sha256_v4,
 };
 use super::gpu_resident_higher_timeframe_alignment_v3::{
     HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3, PendingResidentHigherTimeframeRuntimeV3,
@@ -93,6 +103,9 @@ use super::hpc_ta::{
     prepare_classic_ta_run_plan,
 };
 use super::pinned_canonical_series_v1::MaterializedPinnedResidentCanonicalSourcesV1;
+use super::pinned_source_projection_v1::{
+    CanonicalPinnedSourceProjectionV1, derive_pinned_source_projection_v1,
+};
 use super::regime_detection::{
     REGIME_FEATURE_NAMES_V3, REGIME_OPERATION_SCHEDULE_V1, REGIME_SEMANTIC_V3_FIXTURE_SHA256,
     REGIME_SEMANTIC_VERSION, REGIME_V2_ARTIFACT_MIGRATION_POLICY,
@@ -185,6 +198,12 @@ impl From<ResidentFeatureRecipeErrorV4> for GpuOnlyFeatureMaterializationErrorV3
 
 impl From<FullDiscoveryWorkspacePlanErrorV1> for GpuOnlyFeatureMaterializationErrorV3 {
     fn from(error: FullDiscoveryWorkspacePlanErrorV1) -> Self {
+        Self::Other(error.into())
+    }
+}
+
+impl From<DataPopulationWorkspacePlanErrorV1> for GpuOnlyFeatureMaterializationErrorV3 {
+    fn from(error: DataPopulationWorkspacePlanErrorV1) -> Self {
         Self::Other(error.into())
     }
 }
@@ -1593,11 +1612,9 @@ fn checked_u64(value: usize, field: &'static str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{field} exceeds the V3 receipt width"))
 }
 
-fn derive_exact_resident_working_set_v3(
+fn exact_resident_working_set_extent_request_v3(
     plan: &ResolvedGpuOnlyFeatureMaterializationPlanV3,
-    phase_one_free_bytes_snapshot: u64,
-    allocator_context_reserve_bytes: u64,
-) -> Result<neoethos_gpu_contracts::resident_feature_store_v3::ResidentWorkingSetBoundV3> {
+) -> Result<ResidentWorkingSetExtentRequestV3> {
     if plan.row_count == 0 || plan.planned_routes.is_empty() {
         bail!("strict resident recipe rows and routes must be nonempty")
     }
@@ -1658,7 +1675,7 @@ fn derive_exact_resident_working_set_v3(
         .and_then(|bytes| bytes.checked_add(name_bytes))
         .context("pointer/schema metadata byte count overflow")?;
 
-    ResidentWorkingSetRequestV3 {
+    Ok(ResidentWorkingSetExtentRequestV3 {
         row_count: plan.row_count,
         column_count: plan.planned_routes.len(),
         max_live_producer_bytes,
@@ -1666,6 +1683,23 @@ fn derive_exact_resident_working_set_v3(
         normalization_scratch_bytes: plan.normalization_scratch_bytes,
         fit_metadata_bytes: plan.fit_metadata_bytes,
         pointer_and_schema_metadata_bytes,
+    })
+}
+
+fn derive_exact_resident_working_set_v3(
+    plan: &ResolvedGpuOnlyFeatureMaterializationPlanV3,
+    phase_one_free_bytes_snapshot: u64,
+    allocator_context_reserve_bytes: u64,
+) -> Result<neoethos_gpu_contracts::resident_feature_store_v3::ResidentWorkingSetBoundV3> {
+    let extent = exact_resident_working_set_extent_request_v3(plan)?;
+    ResidentWorkingSetRequestV3 {
+        row_count: extent.row_count,
+        column_count: extent.column_count,
+        max_live_producer_bytes: extent.max_live_producer_bytes,
+        max_live_producer_scratch_bytes: extent.max_live_producer_scratch_bytes,
+        normalization_scratch_bytes: extent.normalization_scratch_bytes,
+        fit_metadata_bytes: extent.fit_metadata_bytes,
+        pointer_and_schema_metadata_bytes: extent.pointer_and_schema_metadata_bytes,
         device_free_bytes_snapshot: phase_one_free_bytes_snapshot,
         allocator_context_reserve_bytes,
         reserve_policy_id: EXACT_ALLOCATOR_RESERVE_POLICY_V3.into(),
@@ -1748,6 +1782,88 @@ pub(crate) struct GpuOnlyFeatureMaterializationSealTokenV3 {
     feature_identity: ResidentFeatureIdentityTemplateV4,
 }
 
+/// Stable semantic marker exposed to Search only after Data has revalidated
+/// the concrete resident Classic TA implementation against the exact device
+/// build and the final FeaturePlan. It intentionally carries no raw authority
+/// string, ordinal, or free-memory fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalGpuResidentFeatureExecutionSemanticV1 {
+    GpuCudaF64Strict,
+}
+
+/// Non-forgeable projection minted from a sealed resident store. This is
+/// receipt evidence, not a CUDA admission or allocation capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedGpuResidentFeatureExecutionAuthorityV1 {
+    semantic: CanonicalGpuResidentFeatureExecutionSemanticV1,
+    final_feature_plan_v3_sha256: [u8; 32],
+    classic_ta_implementation_sha256: [u8; 32],
+    vector_ta_build_sha256: [u8; 32],
+    identity_sha256: [u8; 32],
+}
+
+impl ValidatedGpuResidentFeatureExecutionAuthorityV1 {
+    pub const fn semantic(&self) -> CanonicalGpuResidentFeatureExecutionSemanticV1 {
+        self.semantic
+    }
+
+    pub const fn final_feature_plan_v3_sha256(&self) -> [u8; 32] {
+        self.final_feature_plan_v3_sha256
+    }
+
+    pub const fn classic_ta_implementation_sha256(&self) -> [u8; 32] {
+        self.classic_ta_implementation_sha256
+    }
+
+    pub const fn vector_ta_build_sha256(&self) -> [u8; 32] {
+        self.vector_ta_build_sha256
+    }
+
+    pub const fn identity_sha256(&self) -> [u8; 32] {
+        self.identity_sha256
+    }
+}
+
+fn seal_gpu_resident_feature_execution_authority_v1(
+    final_feature_plan_v3_sha256: [u8; 32],
+    classic_ta_capability: &ResidentProducerCapabilityV3,
+    device: &CudaPrimaryContextBuildIdentityV3,
+) -> std::result::Result<
+    ValidatedGpuResidentFeatureExecutionAuthorityV1,
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    let classic_ta_implementation_sha256 = classic_ta_capability.implementation_sha256();
+    let vector_ta_build_sha256 = device.vector_ta_build_sha256();
+    if final_feature_plan_v3_sha256 == [0; 32]
+        || classic_ta_capability.producer() != ResidentFeatureProducerV3::ClassicTa
+        || classic_ta_implementation_sha256 == [0; 32]
+        || vector_ta_build_sha256 != classic_ta_implementation_sha256
+        || classic_ta_capability.exact_math_authority() != F64_EXACT_MATH_AUTHORITY_V3
+        || device.exact_math_authority() != F64_EXACT_MATH_AUTHORITY_V3
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
+    }
+    let semantic = CanonicalGpuResidentFeatureExecutionSemanticV1::GpuCudaF64Strict;
+    let mut identity = Sha256::new();
+    identity.update(b"neoethos.data.gpu-resident-feature-execution-authority.v1\0");
+    identity.update(b"gpu-cuda-f64-strict");
+    identity.update(final_feature_plan_v3_sha256);
+    identity.update(classic_ta_implementation_sha256);
+    identity.update(vector_ta_build_sha256);
+    identity.update(F64_EXACT_MATH_AUTHORITY_V3.as_bytes());
+    let identity_sha256: [u8; 32] = identity.finalize().into();
+    if identity_sha256 == [0; 32] {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
+    }
+    Ok(ValidatedGpuResidentFeatureExecutionAuthorityV1 {
+        semantic,
+        final_feature_plan_v3_sha256,
+        classic_ta_implementation_sha256,
+        vector_ta_build_sha256,
+        identity_sha256,
+    })
+}
+
 impl GpuOnlyFeatureMaterializationSealTokenV3 {
     fn apply_resident_robust_normalization_v2(
         &self,
@@ -1777,6 +1893,7 @@ pub struct SealedGpuResidentFeatureStoreV3 {
     canonical_content_sha256: SealedCanonicalContentSha256ComponentReceiptV3,
     feature_plan: FeaturePlanV1,
     source_provenance: DatasetFeatureArtifactProvenanceV1,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
     resident_sources: MaterializedPinnedResidentCanonicalSourcesV1,
     owner: Arc<ResidentFeatureStoreOwnerV3>,
 }
@@ -1820,6 +1937,13 @@ impl SealedGpuResidentFeatureStoreV3 {
         &self.source_provenance
     }
 
+    /// Node-name-independent source generation identity rederived from the
+    /// same leases that survived native materialization. This does not alias
+    /// the resident V3 feature receipt to a CPU V2 feature receipt.
+    pub const fn pinned_source_projection_v1(&self) -> &CanonicalPinnedSourceProjectionV1 {
+        &self.pinned_source_projection_v1
+    }
+
     pub fn ordered_feature_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.admission
             .planned_routes()
@@ -1831,6 +1955,62 @@ impl SealedGpuResidentFeatureStoreV3 {
         self.admission.device()
     }
 
+    /// Revalidate and project the concrete plan-bound Classic TA execution
+    /// authority into the canonical strict GPU semantic used by Search. The
+    /// concrete V3 authority is never compared to, or replaced by, an abstract
+    /// legacy string.
+    pub fn validated_gpu_resident_feature_execution_authority_v1(
+        &self,
+    ) -> std::result::Result<
+        ValidatedGpuResidentFeatureExecutionAuthorityV1,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        self.validate_resident_feature_store_import_v3()?;
+        let classic_ta_capability = self
+            .admission
+            .capabilities()
+            .capabilities()
+            .iter()
+            .find(|capability| capability.producer() == ResidentFeatureProducerV3::ClassicTa)
+            .ok_or(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch)?;
+        let classic_routes = self
+            .admission
+            .planned_routes()
+            .iter()
+            .filter(|route| route.producer() == ResidentFeatureProducerV3::ClassicTa)
+            .collect::<Vec<_>>();
+        if classic_routes.is_empty() {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
+        }
+        for route in classic_routes {
+            let expected_semantic_source_sha256 = derive_route_semantic_source_sha256_v4(
+                RESIDENT_CLASSIC_TA_LOCAL_ROUTE_DOMAIN_V4,
+                classic_ta_capability.exact_math_authority(),
+                route.route_receipt_sha256(),
+            )
+            .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+            let node = self
+                .feature_plan
+                .nodes()
+                .iter()
+                .find(|node| node.id() == route.route_id())
+                .ok_or(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch)?;
+            if node.operation() != FeatureOperationTagV1::Indicator
+                || node.formula_manifest_hash() != classic_ta_capability.implementation_sha256()
+                || node.semantic_source_hash() != expected_semantic_source_sha256
+            {
+                return Err(
+                    GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch,
+                );
+            }
+        }
+        seal_gpu_resident_feature_execution_authority_v1(
+            self.final_feature_plan_v3_sha256,
+            classic_ta_capability,
+            self.admission.device(),
+        )
+    }
+
     pub const fn ready_event(&self) -> &ResidentReadyEventV3 {
         self.contract.ready_event()
     }
@@ -1838,6 +2018,9 @@ impl SealedGpuResidentFeatureStoreV3 {
     fn validate_resident_feature_store_import_v3(
         &self,
     ) -> std::result::Result<(), GpuOnlyFeatureMaterializationErrorV3> {
+        let runtime_pinned_source_projection_v1 =
+            derive_pinned_source_projection_v1(&self.resident_sources)
+                .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
         let compact_hashes = self.owner.compact_hashes_if_ready()?;
         let owner_ready_event = self.owner.ready_event_contract()?;
         let runtime_layout_evidence = self.owner.layout_evidence(&compact_hashes);
@@ -1903,6 +2086,7 @@ impl SealedGpuResidentFeatureStoreV3 {
             || self.normalization_fit_sha256 != runtime_normalization_fit_sha256
             || self.source_provenance_sha256 == [0; 32]
             || self.source_provenance_sha256 != *self.source_provenance.identity().as_bytes()
+            || self.pinned_source_projection_v1 != runtime_pinned_source_projection_v1
             || !htf_runtime_evidence_matches
             || self.resident_sources.base().frame().len() != usize::try_from(row_count).unwrap_or(0)
             || self.owner.admission_identity_sha256() != self.admission_identity_sha256()
@@ -2133,6 +2317,8 @@ pub(crate) fn seal_gpu_resident_feature_store_v3(
         .finalize_after_normalization_v4(normalization_fit_sha256)
         .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
     let (feature_plan, source_provenance, resident_sources) = finalized_identity.into_parts();
+    let pinned_source_projection_v1 = derive_pinned_source_projection_v1(&resident_sources)
+        .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
     let final_feature_plan_v3_sha256 = *feature_plan.identity().as_bytes();
     let source_provenance_sha256 = *source_provenance.identity().as_bytes();
     let owner_steady_device_bytes = checked_u64(
@@ -2236,6 +2422,7 @@ pub(crate) fn seal_gpu_resident_feature_store_v3(
         canonical_content_sha256: seal_token.canonical_content_sha256,
         feature_plan,
         source_provenance,
+        pinned_source_projection_v1,
         resident_sources,
         owner,
     })
@@ -2801,17 +2988,164 @@ fn current_resident_producer_capabilities_v3()
     ])
 }
 
-/// The only Data entrypoint that may materialize a strict GPU-only resident
-/// feature store. Exact recipe/capability resolution happens before the
-/// already-sealed full-workspace carrier is consumed. No public producer
-/// trait object, raw device pointer, host feature matrix, or fallback lane can
-/// enter this sequence.
+/// Move-only continuation produced after every Data-owned recipe, route,
+/// producer-memory and normalization preflight has sealed, but before a CUDA
+/// run carrier is consumed. This is the staging boundary required by the
+/// application workspace planner: the complete exact recipe is frozen once
+/// and later materialized on the same admitted run without re-resolution.
+#[must_use = "the prepared resident feature materialization must consume one admitted CUDA run"]
+#[derive(Debug)]
+pub struct PreparedGpuOnlyFeatureMaterializationV3 {
+    workspace_extent: ResidentWorkingSetExtentV3,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    producers: CrateOwnedResidentProducerFactoryV3,
+}
+
+impl PreparedGpuOnlyFeatureMaterializationV3 {
+    /// Exact hardware-independent Data allocation extent for the immutable
+    /// recipe carried by this token. Full-run workspace admission may account
+    /// for these bytes before a CUDA ordinal or free-memory snapshot is bound.
+    pub const fn workspace_extent(&self) -> &ResidentWorkingSetExtentV3 {
+        &self.workspace_extent
+    }
+
+    /// Exact pinned input identity available before native workspace sealing
+    /// or Data allocation. It projects immutable source facts only; feature
+    /// plan/content identities remain versioned separately for CPU and GPU.
+    pub const fn pinned_source_projection_v1(&self) -> &CanonicalPinnedSourceProjectionV1 {
+        &self.pinned_source_projection_v1
+    }
+
+    /// Seal the exact current-stage Data+population workspace using Data's
+    /// already-resolved recipe and crate-owned Classic TA implementation
+    /// capability. Search supplies checked population plans resolved from the
+    /// exact native admission facts. The stage sealer mints the sizing
+    /// authority; legacy population-sizing receipts are not accepted here.
+    pub fn seal_data_population_workspace_plan_v1(
+        &self,
+        native_admission_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        max_ordered_index_count: usize,
+        max_adaptive_row_count: usize,
+        gene_plan: PopulationGeneStorePlanV1,
+        metrics_plan: PopulationMetricsOnlyPlanV1,
+    ) -> std::result::Result<
+        SealedDataPopulationGpuWorkspacePlanV1,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        let classic_ta_capability = self
+            .preflight
+            .plan
+            .producer_capabilities
+            .capabilities()
+            .iter()
+            .find(|capability| capability.producer() == ResidentFeatureProducerV3::ClassicTa)
+            .cloned()
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "prepared resident recipe lacks its Classic TA capability"
+                ))
+            })?;
+        seal_data_population_gpu_workspace_plan_v1(DataPopulationWorkspacePreflightRequestV1 {
+            native_admission_facts,
+            data_extent: self.workspace_extent.clone(),
+            max_ordered_index_count,
+            max_adaptive_row_count,
+            gene_plan,
+            metrics_plan,
+            classic_ta_capability,
+        })
+        .map_err(Into::into)
+    }
+}
+
+pub fn prepare_gpu_only_feature_materialization_v3(
+    workspace_preflight: PreparedGpuOnlyFeatureWorkspacePreflightV3,
+) -> std::result::Result<
+    PreparedGpuOnlyFeatureMaterializationV3,
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    let (plan, producers) = CrateOwnedResidentProducerFactoryV3::resolve(workspace_preflight)?;
+    let workspace_extent = exact_resident_working_set_extent_request_v3(&plan)?.seal()?;
+    let preflight = preflight_gpu_only_feature_recipe_v3(plan)?;
+    let pinned_source_projection_v1 =
+        derive_pinned_source_projection_v1(preflight.resident_sources())
+            .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
+    Ok(PreparedGpuOnlyFeatureMaterializationV3 {
+        workspace_extent,
+        pinned_source_projection_v1,
+        preflight,
+        producers,
+    })
+}
+
+/// Compatibility entrypoint for callers that already own the admitted full
+/// run. New orchestration should call `prepare_*` before workspace binding and
+/// then consume the continuation through `materialize_prepared_*`.
 pub fn materialize_gpu_only_feature_store_v3(
     workspace_preflight: PreparedGpuOnlyFeatureWorkspacePreflightV3,
     admitted_run: AdmittedNativeCudaFullDiscoveryRunV1,
 ) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
-    let (plan, mut producers) = CrateOwnedResidentProducerFactoryV3::resolve(workspace_preflight)?;
-    let preflight = preflight_gpu_only_feature_recipe_v3(plan)?;
+    let prepared = prepare_gpu_only_feature_materialization_v3(workspace_preflight)?;
+    materialize_prepared_gpu_only_feature_store_v3(prepared, admitted_run)
+}
+
+/// The only Data entrypoint that may consume a staged exact recipe and
+/// materialize a strict GPU-only resident feature store. No public producer
+/// trait object, raw device pointer, host feature matrix, or fallback lane can
+/// enter this sequence.
+pub fn materialize_prepared_gpu_only_feature_store_v3(
+    prepared: PreparedGpuOnlyFeatureMaterializationV3,
+    admitted_run: AdmittedNativeCudaFullDiscoveryRunV1,
+) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
+    let run_device = admitted_run.into_gpu_only_run_device_admission_v3()?;
+    materialize_prepared_gpu_only_feature_store_on_run_device_v3(prepared, run_device)
+}
+
+/// Current production Search stage: materialize the prepared Data recipe on
+/// the exact Data+population carrier whose limits will remain attached to the
+/// resident population session.
+pub fn materialize_prepared_gpu_only_feature_store_for_data_population_v3(
+    prepared: PreparedGpuOnlyFeatureMaterializationV3,
+    admitted_run: AdmittedNativeCudaDataPopulationRunV1,
+) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
+    materialize_prepared_gpu_only_feature_store_on_run_device_v3(
+        prepared,
+        admitted_run.into_gpu_only_run_device_admission_v3(),
+    )
+}
+
+fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(
+    prepared: PreparedGpuOnlyFeatureMaterializationV3,
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
+    if let Some(limits) = run_device.data_population_limits()
+        && (prepared.workspace_extent.identity_sha256() != limits.data_extent_identity_sha256()
+            || prepared.workspace_extent.row_count() != limits.parent_row_count()
+            || prepared.workspace_extent.column_count() != limits.feature_count())
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!(
+                "prepared Data recipe extent does not match the exact Data+population stage plan"
+            ),
+        ));
+    }
+    let materialized_pinned_source_projection_v1 =
+        derive_pinned_source_projection_v1(prepared.preflight.resident_sources())
+            .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
+    if prepared.pinned_source_projection_v1 != materialized_pinned_source_projection_v1 {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!(
+                "prepared pinned-source projection does not match the immutable resident source leases"
+            ),
+        ));
+    }
+    let PreparedGpuOnlyFeatureMaterializationV3 {
+        workspace_extent: _,
+        pinned_source_projection_v1: _,
+        preflight,
+        mut producers,
+    } = prepared;
     let smc_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Smc)?;
     let classic_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::ClassicTa)?;
     let quant_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Quant)?;
@@ -2825,7 +3159,6 @@ pub fn materialize_gpu_only_feature_store_v3(
     let session_runtime = producers.take_session_runtime()?;
     let (htf_runtime, htf_capture_templates) = producers.take_higher_timeframe_runtime()?;
     let regime_input = producers.take_regime_input()?;
-    let run_device = admitted_run.into_gpu_only_run_device_admission_v3()?;
     producers.prepare_smc(
         &run_device,
         preflight.resident_sources().base().frame(),
@@ -2911,6 +3244,101 @@ mod tests {
                 .iter()
                 .map(ResidentProducerCapabilityV3::producer)
                 .eq(ResidentFeatureProducerV3::ALL)
+        );
+    }
+
+    #[test]
+    fn resident_execution_projection_rejects_vector_build_and_math_mutation() {
+        let classic = resident_classic_ta_capability_v3()
+            .expect("current resident Classic TA capability must seal");
+        let exact_math = vector_ta::cuda::F64_EXACT_MATH_AUTHORITY_V3;
+        let device = CudaPrimaryContextBuildIdentityV3::new(
+            0,
+            [1; 16],
+            8,
+            6,
+            [2; 32],
+            "fixture-driver",
+            "fixture-runtime",
+            "fixture-nvcc",
+            "sm_86",
+            classic.implementation_sha256(),
+            [3; 32],
+            exact_math,
+        )
+        .expect("matching fixture identity must seal");
+        let plan_sha256 = [4; 32];
+        let projection =
+            seal_gpu_resident_feature_execution_authority_v1(plan_sha256, &classic, &device)
+                .expect("matching plan/capability/device authority must seal");
+        assert_eq!(
+            projection.semantic(),
+            CanonicalGpuResidentFeatureExecutionSemanticV1::GpuCudaF64Strict
+        );
+        assert_eq!(projection.final_feature_plan_v3_sha256(), plan_sha256);
+        assert_ne!(projection.identity_sha256(), [0; 32]);
+
+        let wrong_build = CudaPrimaryContextBuildIdentityV3::new(
+            0,
+            [1; 16],
+            8,
+            6,
+            [2; 32],
+            "fixture-driver",
+            "fixture-runtime",
+            "fixture-nvcc",
+            "sm_86",
+            [5; 32],
+            [3; 32],
+            exact_math,
+        )
+        .expect("non-zero mismatched build is structurally valid");
+        assert!(
+            seal_gpu_resident_feature_execution_authority_v1(plan_sha256, &classic, &wrong_build,)
+                .is_err(),
+            "device vector build drift must fail before Search receipt mint",
+        );
+
+        let wrong_math = ResidentProducerCapabilityV3::new(
+            ResidentFeatureProducerV3::ClassicTa,
+            classic.implementation_id(),
+            classic.implementation_sha256(),
+            "neoethos.fixture.wrong-exact-math",
+        )
+        .expect("non-empty mismatched authority is structurally valid");
+        assert!(
+            seal_gpu_resident_feature_execution_authority_v1(plan_sha256, &wrong_math, &device,)
+                .is_err(),
+            "abstract or mutated math text must not authorize concrete resident execution",
+        );
+
+        let wrong_device_math = CudaPrimaryContextBuildIdentityV3::new(
+            0,
+            [1; 16],
+            8,
+            6,
+            [2; 32],
+            "fixture-driver",
+            "fixture-runtime",
+            "fixture-nvcc",
+            "sm_86",
+            classic.implementation_sha256(),
+            [3; 32],
+            "neoethos.fixture.wrong-device-exact-math",
+        )
+        .expect("non-empty mismatched device authority is structurally valid");
+        assert!(
+            seal_gpu_resident_feature_execution_authority_v1(
+                plan_sha256,
+                &classic,
+                &wrong_device_math,
+            )
+            .is_err(),
+            "device exact-math drift must fail before Search receipt mint",
+        );
+        assert!(
+            seal_gpu_resident_feature_execution_authority_v1([0; 32], &classic, &device).is_err(),
+            "a zero final FeaturePlan identity must never mint execution authority",
         );
     }
 }

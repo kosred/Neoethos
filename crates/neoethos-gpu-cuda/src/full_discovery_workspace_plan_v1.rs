@@ -829,7 +829,7 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
             exact_math_authority,
             ..
         } = plan;
-        seal_gpu_only_run_device_admission_v3(FullDiscoveryRunDeviceAdmissionRequestV3 {
+        seal_gpu_only_run_device_admission_v3(GpuOnlyRunDeviceAdmissionRequestV3 {
             source_admission_identity_sha256: admission_identity_sha256,
             workspace_plan_identity_sha256,
             selected_device_ordinal,

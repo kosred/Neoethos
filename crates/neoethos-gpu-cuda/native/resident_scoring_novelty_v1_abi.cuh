@@ -1,5 +1,7 @@
 #pragma once
 
+#include "neoethos_gpu_cuda.h"
+
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -11,6 +13,11 @@ constexpr std::uint32_t NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 = 1;
 constexpr std::uint32_t NEO_RESIDENT_SCORING_VERSION_V1 = 5;
 constexpr std::uint32_t NEO_RESIDENT_SCORING_PROPFIRM_V4 = 1;
 constexpr std::uint32_t NEO_RESIDENT_SCORING_RISKY_GROWTH_V5 = 2;
+inline constexpr std::uint8_t NEO_RESIDENT_CUDA_MATH_SEMANTICS_SHA256_V2[32] = {
+    0xaa, 0x03, 0x90, 0xaa, 0xb6, 0xb1, 0xfd, 0x8e,
+    0xd9, 0x59, 0x7d, 0x5d, 0x7b, 0xa0, 0x60, 0xc2,
+    0xf5, 0x33, 0xcd, 0x64, 0x17, 0xe4, 0x4b, 0xe2,
+    0x7f, 0x7e, 0xde, 0x2b, 0xd4, 0xf4, 0x97, 0xd5};
 
 constexpr std::int32_t NEO_SCORING_STATUS_OK_V1 = 0;
 constexpr std::int32_t NEO_SCORING_STATUS_INVALID_ARGUMENT_V1 = -1;
@@ -21,14 +28,12 @@ constexpr std::int32_t NEO_SCORING_STATUS_OUT_OF_MEMORY_V1 = -5;
 constexpr std::int32_t NEO_SCORING_STATUS_CUDA_ERROR_V1 = -6;
 constexpr std::int32_t NEO_SCORING_STATUS_CUB_ERROR_V1 = -7;
 constexpr std::int32_t NEO_SCORING_STATUS_STATE_ERROR_V1 = -8;
+constexpr std::int32_t NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2 = -9;
+constexpr std::int32_t NEO_SCORING_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2 = -10;
 
 /// Exact metrics-only row from the resident population reducer. The values
 /// remain borrowed device data; no host representation is minted here.
-struct NeoResidentScoringNoveltyMetricRowV1 {
-  std::uint64_t candidate_id;
-  std::uint64_t scenario_id;
-  double values[11];
-};
+using NeoResidentScoringNoveltyMetricRowV1 = ::NeoPopulationMetricRow;
 
 /// Fixed scalar portion of the normalized Generation V1 gene ABI.
 struct NeoResidentScoringNoveltyGeneScalarV1 {
@@ -118,6 +123,20 @@ struct NeoResidentScoringNoveltyAllocationReceiptV1 {
   std::uint8_t allocation_plan_sha256[32];
 };
 
+/// Allocation-only V2 admission. It deliberately carries no metric or gene
+/// pointer, so the complete scoring store can be allocated before the first
+/// generation/evaluation kernel is launched.
+struct NeoResidentScoringAdmissionV2 {
+  std::uint32_t abi_version;
+  std::uint32_t selected_cuda_ordinal;
+  cudaStream_t admitted_run_stream;
+  cudaEvent_t scoring_novelty_ready_event;
+  std::uint64_t full_discovery_reserve_bytes;
+  std::uint8_t cuda_device_identity_sha256[32];
+  std::uint8_t primary_context_identity_sha256[32];
+  std::uint8_t run_stream_identity_sha256[32];
+};
+
 struct NeoResidentScoringNoveltyReadyEventV1 {
   std::uint32_t abi_version;
   std::uint32_t reserved;
@@ -171,6 +190,8 @@ static_assert(sizeof(NeoResidentScoringNoveltyPlanV1) == 432,
                "scoring plan ABI changed");
 static_assert(sizeof(NeoResidentScoringNoveltyAllocationReceiptV1) == 128,
               "allocation receipt ABI changed");
+static_assert(sizeof(NeoResidentScoringAdmissionV2) == 128,
+              "scoring admission V2 ABI changed");
 static_assert(sizeof(NeoResidentScoringNoveltyReadyEventV1) == 40,
               "ready event ABI changed");
 static_assert(sizeof(NeoResidentScoringNoveltyDeviceSealV1) == 48,
@@ -198,5 +219,59 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
 
 extern "C" std::int32_t enqueue_resident_scoring_novelty_release_v1(
     NeoResidentScoringNoveltyRunV1* run);
+
+extern "C" std::int32_t query_resident_scoring_admission_v2(
+    const NeoResidentScoringAdmissionV2* admission,
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    NeoResidentScoringNoveltyAllocationReceiptV1* receipt);
+
+/// Computes the exact scoring layout against the composite Search admission's
+/// sole free-memory snapshot. This function does not allocate or launch work.
+extern "C" std::int32_t calculate_resident_scoring_allocation_v2(
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    cudaStream_t admitted_run_stream,
+    std::uint64_t same_context_free_bytes,
+    std::uint64_t full_discovery_reserve_bytes,
+    NeoResidentScoringNoveltyAllocationReceiptV1* receipt);
+
+extern "C" std::int32_t create_unbound_resident_scoring_run_v2(
+    const NeoResidentScoringAdmissionV2* admission,
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    const NeoResidentScoringNoveltyAllocationReceiptV1* receipt,
+    NeoResidentScoringNoveltyRunV1** run);
+
+extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
+    NeoResidentScoringNoveltyRunV1* run,
+    const NeoResidentScoringNoveltyPopulationImportV1* population,
+    NeoResidentScoredDecisionRowsV1* output,
+    NeoResidentScoringNoveltyReadyEventV1* ready);
+
+extern "C" std::int32_t enqueue_resident_scoring_release_v2(
+    NeoResidentScoringNoveltyRunV1* run);
+
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+struct NeoResidentScoringFixtureSnapshotV2 {
+  std::uint32_t abi_version;
+  std::uint32_t scoring_objective;
+  std::uint32_t device_fault_word;
+  std::uint32_t reserved;
+  std::uint64_t logical_population_count;
+  std::uint64_t terminal_synchronization_count;
+  std::uint64_t terminal_readback_count;
+  std::uint64_t terminal_readback_bytes;
+};
+static_assert(sizeof(NeoResidentScoringFixtureSnapshotV2) == 48);
+
+extern "C" std::int32_t fixture_set_resident_scoring_metric_mode_v2(
+    NeoResidentScoringNoveltyRunV1* run, std::uint32_t mode);
+extern "C" std::int32_t fixture_set_resident_scoring_metric_fault_v2(
+    NeoResidentScoringNoveltyRunV1* run, std::uint32_t metric_slot,
+    std::uint64_t nonfinite_bits);
+extern "C" std::int32_t fixture_copy_resident_scoring_snapshot_v2(
+    NeoResidentScoringNoveltyRunV1* run,
+    NeoResidentScoringNoveltyMetricRowV1* metric_rows_host,
+    double* fitness_scores_host, std::uint64_t* decision_keys_host,
+    std::uint64_t capacity, NeoResidentScoringFixtureSnapshotV2* snapshot);
+#endif
 
 }  // namespace neoethos::resident_scoring_novelty_v1

@@ -663,6 +663,11 @@ fn emit_rerun_contract(cuda_feature: bool) {
     println!("cargo:rerun-if-changed=native/neoethos_gpu_cuda.h");
     println!("cargo:rerun-if-changed=native/resident_higher_timeframe_alignment_v3_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_quant_v3_abi.cuh");
+    println!("cargo:rerun-if-changed=native/resident_exact_log_v3.cuh");
+    println!("cargo:rerun-if-changed=native/resident_scoring_novelty_v1_abi.cuh");
+    println!("cargo:rerun-if-changed=native/resident_generation_v1_abi.cuh");
+    println!("cargo:rerun-if-changed=native/resident_generation_v2_abi.cuh");
+    println!("cargo:rerun-if-changed=native/resident_search_generation_v2_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_trim_prefilter_v1_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_session_v2_abi.cuh");
     println!("cargo:rerun-if-changed=native/layout_asserts.cpp");
@@ -891,6 +896,8 @@ fn compile_device_objects(cuda_build: &ResolvedCudaBuild) {
     let debug = env::var("DEBUG")
         .map(|value| value == "true")
         .unwrap_or(false);
+    let resident_search_v2_device_fixtures =
+        env::var_os("CARGO_FEATURE_CUDA_DEVICE_FIXTURES").is_some();
 
     let mut objects = Vec::new();
     for source in DEVICE_SOURCES {
@@ -906,13 +913,16 @@ fn compile_device_objects(cuda_build: &ResolvedCudaBuild) {
                 object.display()
             )
         });
-        let arguments = build_nvcc_argv(
+        let mut arguments = build_nvcc_argv(
             &cuda_build.plan,
             source,
             object_text,
             debug,
             cuda_build.platform,
         );
+        if resident_search_v2_device_fixtures {
+            arguments.push("-DNEOETHOS_CUDA_DEVICE_FIXTURES_V2=1".to_string());
+        }
         let status = Command::new(&cuda_build.nvcc)
             .args(&arguments)
             .status()

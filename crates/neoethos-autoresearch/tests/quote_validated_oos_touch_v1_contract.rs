@@ -145,34 +145,64 @@ fn sweep_executor_returns_quote_validated_evidence_not_detached_ohlc_statistics(
 }
 
 #[test]
-fn single_touch_order_is_preflight_then_durable_spend_then_quote_evaluation_then_judge() {
+fn pre_touch_quote_coverage_boundary_never_spends_or_evaluates_oos() {
     let runner = read("crates/neoethos-autoresearch/src/runner.rs");
     let promote = function_body(&runner, "fn promote(");
     let preflight = promote
         .find("executor.oos_preflight(&portfolio)")
         .expect("OOS preflight before spending the touch");
-    let spent = promote
-        .find("writer.append(Record::OosTouchSpent")
-        .expect("durable OOS touch-spent record");
-    let evaluate = promote
-        .find("executor.evaluate_oos(")
-        .expect("single quote-validated OOS evaluation");
-    let judge = promote
-        .find("crate::judge::promote(")
-        .expect("judge after quote-validated evaluation");
+    let request = promote
+        .find("QuoteCoverageRequestV1::from_candidate")
+        .expect("bounded exact coverage request");
+    let boundary = promote
+        .find("advance_quote_coverage_boundary_v1")
+        .expect("nonterminal quote-coverage boundary");
     assert!(
-        preflight < spent && spent < evaluate && evaluate < judge,
-        "the only OOS touch must be preflight -> durable spend -> quote evaluation -> judge"
+        preflight < request && request < boundary,
+        "the pre-touch path must be shape preflight -> exact request -> nonterminal boundary"
     );
-    assert_eq!(
-        promote.matches("executor.evaluate_oos(").count(),
-        1,
-        "autoresearch may perform exactly one final OOS evaluation"
+    for forbidden in [
+        "Record::OosTouchSpent",
+        "executor.evaluate_oos(",
+        "crate::judge::promote(",
+        "signals_for_gene",
+    ] {
+        assert!(
+            !promote.contains(forbidden),
+            "P1 crossed the pre-touch coverage boundary through `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn versioned_boundary_is_additive_and_legacy_runner_remains_terminal_only() {
+    let runner = read("crates/neoethos-autoresearch/src/runner.rs");
+    require_tokens(
+        &runner,
+        &[
+            "pub fn run_until_boundary_v1(",
+            "pub fn run_until_boundary_with_executor_v1(",
+            "AutoresearchRunOutcomeV1",
+            "AwaitingQuoteCoverage",
+            "QuoteCoverageReady",
+            "fn terminal_only_v1(",
+            "pub fn run(args: RunArgs, settings: &Settings) -> Result<crate::verdict::SessionVerdict>",
+        ],
     );
-    assert!(
-        promote.contains("QuoteValidatedOosTouchEvidenceV1"),
-        "the spent touch is not statically typed as quote-validated evidence"
-    );
+    let resume = function_body(&runner, "fn resume_quote_coverage_boundary_v1(");
+    for forbidden in [
+        "budget_exhausted",
+        "draw_sweep",
+        "execute(",
+        "oos_preflight",
+        "evaluate_oos",
+        "OosTouchSpent",
+    ] {
+        assert!(
+            !resume.contains(forbidden),
+            "resuming exact quote coverage performed forbidden work through `{forbidden}`"
+        );
+    }
 }
 
 #[test]

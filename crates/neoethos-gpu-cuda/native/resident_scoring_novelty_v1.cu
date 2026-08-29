@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <new>
 
@@ -176,6 +177,30 @@ bool validate_plan_v1(const NeoResidentScoringNoveltyPlanV1* plan) {
   }
   const double novelty_weight = f64_from_bits_v1(plan->novelty_weight_bits);
   return std::isfinite(novelty_weight) && novelty_weight >= 0.0 && novelty_weight <= 1.0;
+}
+
+bool validate_scoring_admission_v2(const NeoResidentScoringAdmissionV2* admission,
+                                   const NeoResidentScoringNoveltyPlanV1* plan) {
+  if (admission == nullptr || !validate_plan_v1(plan) ||
+      admission->abi_version != 2u ||
+      admission->selected_cuda_ordinal ==
+          std::numeric_limits<std::uint32_t>::max() ||
+      admission->admitted_run_stream == nullptr ||
+      admission->scoring_novelty_ready_event == nullptr ||
+      plan->novelty_weight_bits != 0ull ||
+      !identity_equal_v1(plan->cuda_math_flags_sha256,
+                         NEO_RESIDENT_CUDA_MATH_SEMANTICS_SHA256_V2) ||
+      !all_identity_bytes_present_v1(admission->cuda_device_identity_sha256) ||
+      !all_identity_bytes_present_v1(admission->primary_context_identity_sha256) ||
+      !all_identity_bytes_present_v1(admission->run_stream_identity_sha256)) {
+    return false;
+  }
+  return identity_equal_v1(admission->cuda_device_identity_sha256,
+                           plan->cuda_device_identity_sha256) &&
+         identity_equal_v1(admission->primary_context_identity_sha256,
+                           plan->primary_context_identity_sha256) &&
+         identity_equal_v1(admission->run_stream_identity_sha256,
+                           plan->run_stream_identity_sha256);
 }
 
 std::int32_t cuda_status_v1(cudaError_t status) {
@@ -501,6 +526,74 @@ __device__ std::uint64_t ordered_f64_decision_key_v1(double value) {
   const std::uint64_t key = (bits >> 63) == 0 ? bits ^ (1ull << 63) : ~bits;
   return key == 0 ? 1 : key;
 }
+
+__device__ std::uint64_t ordered_f64_decision_key_v2(double value) {
+  if (!isfinite(value)) {
+    return 0;
+  }
+  const double canonical = value == 0.0 ? 0.0 : value;
+  const std::uint64_t bits = f64_bits_v1(canonical);
+  const std::uint64_t key = (bits >> 63) == 0 ? bits ^ (1ull << 63) : ~bits;
+  return key == 0 ? 1 : key;
+}
+
+__global__ void encode_finite_objective_keys_kernel_v2(
+    const double* fitness_scores,
+    std::uint64_t* decision_keys,
+    std::uint32_t* device_fault_word,
+    std::uint64_t population) {
+  const std::uint64_t candidate =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= population) {
+    return;
+  }
+  if (*device_fault_word != 0u || !isfinite(fitness_scores[candidate])) {
+    atomicExch(device_fault_word, 1u);
+    decision_keys[candidate] = 0;
+    return;
+  }
+  decision_keys[candidate] =
+      ordered_f64_decision_key_v2(fitness_scores[candidate]);
+}
+
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+__global__ void fixture_rewrite_resident_metric_rows_kernel_v2(
+    NeoResidentScoringNoveltyMetricRowV1* rows, std::uint64_t population,
+    std::uint32_t mode, std::uint32_t fault_enabled,
+    std::uint32_t fault_metric_slot, std::uint64_t fault_value_bits) {
+  const std::uint64_t candidate =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= population) {
+    return;
+  }
+  if (mode == 1u) {
+    for (std::uint32_t metric = 0; metric < 11; ++metric) {
+      rows[candidate].values[metric] = rows[0].values[metric];
+    }
+  } else if (mode == 2u && candidate == 0) {
+    rows[0].values[0] = __longlong_as_double(0x7ff8000000000000ull);
+  } else if (mode == 3u) {
+    const std::uint32_t levels[8] = {3u, 6u, 6u, 1u, 7u, 2u, 5u, 4u};
+    const double level = static_cast<double>(levels[candidate % 8ull]);
+    for (std::uint32_t metric = 0; metric < 11u; ++metric) {
+      rows[candidate].values[metric] = 0.0;
+    }
+    rows[candidate].values[0] = (level - 4.0) * 2000.0;
+    rows[candidate].values[1] = level * 0.1;
+    rows[candidate].values[3] = (8.0 - level) * 0.005;
+    rows[candidate].values[4] = 0.45 + level * 0.02;
+    rows[candidate].values[5] = 0.8 + level * 0.1;
+    rows[candidate].values[7] = 0.4 + level * 0.04;
+    rows[candidate].values[8] = 30.0;
+    rows[candidate].values[9] = 0.5 + level * 0.03;
+    rows[candidate].values[10] = (8.0 - level) * 0.002;
+  }
+  if (fault_enabled != 0u && candidate == 0 && fault_metric_slot < 11u) {
+    rows[0].values[fault_metric_slot] =
+        __longlong_as_double(static_cast<long long>(fault_value_bits));
+  }
+}
+#endif
 
 __global__ void blend_and_encode_decision_keys_kernel_v1(
     const NeoResidentScoringNoveltyMetricRowV1* metric_rows,
@@ -1165,29 +1258,51 @@ extern "C" std::int32_t create_resident_scoring_novelty_run_v1(
   created->same_stream_enqueue_count = 0;
   created->next_event_id = 0;
   created->sealed = false;
-  cudaError_t status = cudaMallocAsync(&created->allocation_base,
-                                       static_cast<std::size_t>(receipt->total_device_bytes),
-                                       created->admitted_run_stream);
+  created->bound_v2 = true;
+  created->poisoned_v2 = false;
+  created->allocation_free_issued_v2 = false;
+  created->free_outcome_unknown_deliberate_leak_v2 = false;
+  void* attempted_allocation = nullptr;
+  cudaError_t status = cudaMallocAsync(
+      &attempted_allocation,
+      static_cast<std::size_t>(receipt->total_device_bytes),
+      created->admitted_run_stream);
   if (status != cudaSuccess) {
+    // Runtime allocation APIs may surface an earlier asynchronous fault. An
+    // attempted output identity is deliberately discarded without query/free.
+    attempted_allocation = nullptr;
     delete created;
-    return NEO_SCORING_STATUS_OUT_OF_MEMORY_V1;
+    return NEO_SCORING_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2;
   }
+  created->allocation_base = attempted_allocation;
   if (!partition_allocation_v1(created)) {
+    void* allocation_to_retire =
+        retire_scoring_allocation_identity_v2(created);
     const cudaError_t release_status =
-        cudaFreeAsync(created->allocation_base, created->admitted_run_stream);
-    if (release_status == cudaSuccess) {
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
       delete created;
+      return NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
     }
+    delete created;
     return NEO_SCORING_STATUS_ARITHMETIC_OVERFLOW_V1;
   }
   status = cudaStreamWaitEvent(created->admitted_run_stream,
                                created->metrics_ready_event, 0);
   if (status != cudaSuccess) {
+    void* allocation_to_retire =
+        retire_scoring_allocation_identity_v2(created);
     const cudaError_t release_status =
-        cudaFreeAsync(created->allocation_base, created->admitted_run_stream);
-    if (release_status == cudaSuccess) {
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
       delete created;
+      return NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
     }
+    delete created;
     return NEO_SCORING_STATUS_CUDA_ERROR_V1;
   }
   created->same_stream_enqueue_count = 1;
@@ -1597,15 +1712,18 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
 extern "C" std::int32_t enqueue_resident_scoring_novelty_release_v1(
     NeoResidentScoringNoveltyRunV1* run) {
   if (run == nullptr || run->allocation_base == nullptr ||
-      run->admitted_run_stream == nullptr) {
+      run->admitted_run_stream == nullptr || run->allocation_free_issued_v2) {
     return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
   }
+  void* allocation_to_retire =
+      retire_scoring_allocation_identity_v2(run);
   const cudaError_t status =
-      cudaFreeAsync(run->allocation_base, run->admitted_run_stream);
+      cudaFreeAsync(allocation_to_retire, run->admitted_run_stream);
   if (status != cudaSuccess) {
-    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+    run->poisoned_v2 = true;
+    run->free_outcome_unknown_deliberate_leak_v2 = true;
+    return NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
   }
-  run->allocation_base = nullptr;
   run->scoring_novelty_ready_event = nullptr;
   delete run;
   return NEO_SCORING_STATUS_OK_V1;

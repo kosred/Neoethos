@@ -601,15 +601,18 @@ fn cupqc_is_optional_and_portable_in_tree_v3_is_mandatory() {
 }
 
 #[test]
-fn strict_data_entrypoint_owns_the_entire_resident_materialization_sequence() {
+fn strict_data_staged_entrypoints_own_the_entire_resident_materialization_sequence() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
     let library = read("crates/neoethos-data/src/lib.rs");
-    let entrypoint = source
-        .split_once("pub fn materialize_gpu_only_feature_store_v3(")
-        .expect("strict Data V3 materialization entrypoint")
+    let staged_materializer = source
+        .split_once("fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(")
+        .expect("strict staged Data V3 materializer")
         .1;
     for token in [
+        "pub fn prepare_gpu_only_feature_materialization_v3(",
         "pub fn materialize_gpu_only_feature_store_v3(",
+        "pub fn materialize_prepared_gpu_only_feature_store_v3(",
+        "fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(",
         "workspace_preflight: PreparedGpuOnlyFeatureWorkspacePreflightV3",
         "admitted_run: AdmittedNativeCudaFullDiscoveryRunV1",
         "CrateOwnedResidentProducerFactoryV3::resolve(",
@@ -650,7 +653,12 @@ fn strict_data_entrypoint_owns_the_entire_resident_materialization_sequence() {
             "seal_gpu_resident_feature_store_v3(",
         ),
     ] {
-        before(entrypoint, left, right);
+        let ordering_source = if left == "let owner = assembler.seal()?" {
+            staged_materializer
+        } else {
+            &source
+        };
+        before(ordering_source, left, right);
     }
     assert!(library.contains("materialize_gpu_only_feature_store_v3"));
     assert!(!source.contains("pub Box<dyn Resident"));

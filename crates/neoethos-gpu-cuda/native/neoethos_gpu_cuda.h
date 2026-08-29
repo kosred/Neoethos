@@ -4,6 +4,26 @@
 
 #define NEOETHOS_GPU_ABI_VERSION 4u
 
+namespace neoethos::resident_generation_v1 {
+struct NeoResidentGenerationAllocationReceiptV1;
+struct NeoResidentGenerationPlanV1;
+struct NeoResidentGenerationRunV1;
+}  // namespace neoethos::resident_generation_v1
+
+namespace neoethos::resident_generation_v2 {
+struct NeoResidentGenerationGeneViewV2;
+}  // namespace neoethos::resident_generation_v2
+
+namespace neoethos::resident_scoring_novelty_v1 {
+struct NeoResidentScoringNoveltyAllocationReceiptV1;
+struct NeoResidentScoringNoveltyPlanV1;
+struct NeoResidentScoringNoveltyRunV1;
+}  // namespace neoethos::resident_scoring_novelty_v1
+
+namespace neoethos::resident_search_generation_v2 {
+struct NeoResidentScoringPopulationSourceV2;
+}  // namespace neoethos::resident_search_generation_v2
+
 extern "C" {
 
 struct CUctx_st;
@@ -279,7 +299,24 @@ struct NeoPopulationResidentFeatureStoreV3 {
   std::uint8_t device_uuid[16];
   std::uint8_t admission_identity_sha256[32];
   std::uint8_t canonical_content_merkle[32];
+  std::uint64_t allocator_context_reserve_bytes;
+  std::uint8_t run_stream_process_token_v3[32];
 };
+
+static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 256,
+              "resident feature-store V3 ABI changed");
+static_assert(alignof(NeoPopulationResidentFeatureStoreV3) == 8,
+              "resident feature-store V3 alignment changed");
+static_assert(offsetof(NeoPopulationResidentFeatureStoreV3,
+                       allocator_context_reserve_bytes) == 216,
+              "resident feature-store reserve offset changed");
+static_assert(offsetof(NeoPopulationResidentFeatureStoreV3,
+                       run_stream_process_token_v3) == 224,
+              "resident feature-store stream-token offset changed");
+static_assert(offsetof(NeoPopulationResidentFeatureStoreV3,
+                       run_stream_process_token_v3) + 32 ==
+                  sizeof(NeoPopulationResidentFeatureStoreV3),
+              "resident feature-store V3 has unratcheted trailing padding");
 
 #define NEO_POPULATION_VIEW_FULL 0u
 #define NEO_POPULATION_VIEW_CONTIGUOUS_RANGE 1u
@@ -301,6 +338,30 @@ struct NeoPopulationEvaluationViewV1 {
   std::uint32_t timestamp_mode;
   const double* adaptive_base_pips;
   std::size_t adaptive_base_pips_len;
+};
+
+/// Canonical, view-local adaptive-stop base recipe for one resident V3 parent.
+///
+/// This descriptor contains control scalars only. High/low/close are read from
+/// the already-bound resident parent on its admitted stream, and the resulting
+/// f64 base series is written directly to the population session's retained
+/// adaptive buffer. No host price/base pointer is part of this ABI.
+struct NeoResidentAdaptiveBaseRequestV1 {
+  std::uint32_t abi_version;
+  std::uint32_t view_kind;
+  std::uint64_t parent_row_count;
+  std::uint64_t view_start;
+  std::uint64_t view_row_count;
+  std::uint32_t vol_window;
+  std::uint32_t vol_horizon_bars;
+  std::uint32_t tail_window;
+  std::uint32_t tail_quantile_index;
+  std::uint64_t tail_step;
+  std::uint64_t tail_max_bars;
+  double pip_size;
+  double stop_k_vol;
+  double stop_k_tail;
+  double meta_label_min_dist;
 };
 
 /// Exact transfer and synchronization facts for one native resident session.
@@ -362,6 +423,20 @@ struct NeoPopulationTerminalCompactResultV1 {
   std::uint64_t event_id;
   std::uint64_t scenario_count;
   NeoPopulationMetricRow metric_row;
+  std::uint64_t terminal_synchronization_count;
+  std::uint64_t terminal_readback_count;
+  std::uint64_t terminal_readback_rows;
+  std::uint64_t terminal_readback_bytes;
+};
+
+/// Metadata for the single bounded host transfer that terminates a strict
+/// metrics-only launch. The metric rows themselves use NeoPopulationReadback;
+/// this fixed-width value proves the synchronized event and exact transfer.
+struct NeoPopulationHostMetricsResultV1 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  std::uint64_t event_id;
+  std::uint64_t scenario_count;
   std::uint64_t terminal_synchronization_count;
   std::uint64_t terminal_readback_count;
   std::uint64_t terminal_readback_rows;
@@ -499,6 +574,9 @@ struct NeoCudaPopulationSession;
 #define NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH (-44)
 #define NEO_POPULATION_STATUS_STRICT_RESIDENT_IN_FLIGHT (-45)
 #define NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED (-46)
+#define NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE (-47)
+#define NEO_POPULATION_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN (-48)
+#define NEO_POPULATION_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN (-49)
 
 #define NEO_CUDA_DEVICE_PROBE_OK 0
 #define NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT (-50)
@@ -528,6 +606,16 @@ NeoCudaPopulationSession* neoethos_gpu_cuda_population_bind_resident_feature_sto
 std::int32_t neoethos_gpu_cuda_population_bind_view_v1(
     NeoCudaPopulationSession* session,
     const NeoPopulationEvaluationViewV1* view);
+std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationEvaluationViewV1* view,
+    const NeoResidentAdaptiveBaseRequestV1* request);
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+std::int32_t neoethos_gpu_cuda_population_copy_resident_adaptive_base_fixture_v1(
+    NeoCudaPopulationSession* session,
+    double* host_values,
+    std::size_t value_count);
+#endif
 std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(
     NeoCudaPopulationSession* session,
     NeoPopulationResidencyCountersV1* counters);
@@ -540,6 +628,43 @@ std::int32_t neoethos_gpu_cuda_population_upload_genes(
 std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
     NeoCudaPopulationSession* session,
     const NeoPopulationScenarioView* scenarios);
+std::int32_t neoethos_gpu_cuda_population_upload_resident_scenarios_v2(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationScenarioView* scenarios,
+    std::uint64_t planned_population);
+std::int32_t neoethos_gpu_cuda_population_create_resident_generation_run_v2(
+    NeoCudaPopulationSession* session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1* plan,
+    neoethos::resident_generation_v1::NeoResidentGenerationAllocationReceiptV1* allocation,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1** run);
+std::int32_t neoethos_gpu_cuda_population_release_resident_generation_run_v2(
+    NeoCudaPopulationSession* session,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1* run);
+std::int32_t neoethos_gpu_cuda_population_create_unbound_resident_scoring_run_v2(
+    NeoCudaPopulationSession* session,
+    const neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* plan,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyAllocationReceiptV1*
+        allocation,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** run);
+std::int32_t neoethos_gpu_cuda_population_release_resident_scoring_run_v2(
+    NeoCudaPopulationSession* session,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1* run);
+std::int32_t neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    std::uint64_t expected_population,
+    std::uint64_t expected_feature_count,
+    std::uint32_t expected_max_terms,
+    neoethos::resident_search_generation_v2::NeoResidentScoringPopulationSourceV2* source);
+std::int32_t neoethos_gpu_cuda_population_finish_resident_scoring_source_v2(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics);
+std::int32_t neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(
+    NeoCudaPopulationSession* session,
+    const neoethos::resident_generation_v2::NeoResidentGenerationGeneViewV2* genes,
+    const NeoPopulationSettings* settings,
+    NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationCounters* counters);
 std::int32_t neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
     NeoCudaPopulationSession* session,
     const NeoPopulationSettings* settings,
@@ -549,6 +674,14 @@ std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
     NeoCudaPopulationSession* session,
     const NeoPopulationResidentMetricsHandleV1* resident_metrics,
     NeoPopulationTerminalCompactResultV1* compact_result);
+std::int32_t neoethos_gpu_cuda_population_consume_host_metrics_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationReadback* readback,
+    NeoPopulationHostMetricsResultV1* result);
+std::int32_t neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics);
 /// Compatibility/DeviceParityOnly. Strict resident production uses the
 /// metrics-only enqueue above and never waits or reads metric rows on the host.
 std::int32_t neoethos_gpu_cuda_population_b_evaluate(
@@ -569,6 +702,8 @@ std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
     NeoCudaPopulationSession* session,
     NeoPopulationDiagnosticReadback* readback);
 void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session);
+int32_t neoethos_gpu_cuda_population_destroy_terminal_checked_v2(
+    NeoCudaPopulationSession* session);
 
 std::uint32_t neoethos_gpu_cuda_abi_version();
 std::int32_t neoethos_gpu_cuda_runtime_available();

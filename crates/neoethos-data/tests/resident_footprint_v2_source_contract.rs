@@ -193,7 +193,7 @@ fn data_owns_move_only_footprint_preflight_lifetime_and_runtime_validation() {
 }
 
 #[test]
-fn production_census_retains_footprint_after_later_receipts_advance() {
+fn capability_census_advances_to_five_of_ten_only_after_receipt_wiring() {
     let data = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
     let preflight =
         read("crates/neoethos-data/src/core/gpu_only_feature_workspace_preflight_v3.rs");
@@ -207,9 +207,7 @@ fn production_census_retains_footprint_after_later_receipts_advance() {
         &[
             "resident_classic_ta_capability_v3()?",
             "resident_smc_capability_v3()?",
-            "resident_regime_capability_v3()?",
             "resident_footprint_capability_v2()?",
-            "resident_robust_normalization_capability_v2()?",
             "resident_canonical_content_sha256_capability_v3()?",
             "resident_feature_major_to_bar_major_capability_v3()?",
         ],
@@ -222,13 +220,14 @@ fn production_census_retains_footprint_after_later_receipts_advance() {
     for producer in [
         "ResidentFeatureProducerV3::Quant",
         "ResidentFeatureProducerV3::Session",
+        "ResidentFeatureProducerV3::Regime",
         "ResidentFeatureProducerV3::HigherTimeframeAlignment",
+        "ResidentFeatureProducerV3::RobustNormalization",
     ] {
         assert!(pending.contains(producer), "missing pending {producer}");
     }
-    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 3);
+    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 5);
     assert!(!pending.contains("ResidentFeatureProducerV3::Footprint"));
-    assert!(!pending.contains("ResidentFeatureProducerV3::RobustNormalization"));
 }
 
 #[test]

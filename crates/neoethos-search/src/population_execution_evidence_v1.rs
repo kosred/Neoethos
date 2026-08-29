@@ -72,6 +72,28 @@ impl fmt::Display for ExactPopulationExecutionErrorV1 {
 
 impl std::error::Error for ExactPopulationExecutionErrorV1 {}
 
+/// A device allocation whose byte extent is invariant under scenario-list
+/// splitting. Parent and gene-store uploads use this marker so an allocation
+/// failure cannot recurse through thousands of leaves while retrying the same
+/// immutable allocation.
+#[cfg(feature = "gpu-b-adapter")]
+#[derive(Debug)]
+pub(crate) struct UnsplittablePopulationAllocationV1(pub(crate) &'static str);
+
+#[cfg(feature = "gpu-b-adapter")]
+impl fmt::Display for UnsplittablePopulationAllocationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} does not depend on the work list size — splitting it cannot help",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "gpu-b-adapter")]
+impl std::error::Error for UnsplittablePopulationAllocationV1 {}
+
 fn error(
     code: ExactPopulationExecutionErrorCodeV1,
     message: impl Into<String>,
@@ -101,6 +123,18 @@ pub(crate) struct ExactPopulationExecutionRunV1<'a> {
     native_residency: NativePopulationResidencyRunV1,
     engine_run: PopulationEngineRunScopeV1,
     source_lifetime: PhantomData<(&'a FeatureFrame, &'a Ohlcv)>,
+}
+
+/// Immutable sizing primitives borrowed from the already-created exact run.
+/// It deliberately excludes month capacity and the Stage-1 view: those become
+/// known only after the caller resolves the actual evaluation configuration and
+/// range. Reading this value performs no device operation.
+pub(crate) struct ExactPopulationAutoSizingPrimitivesV1 {
+    pub(crate) parent_canonical_scope_identity_sha256: String,
+    pub(crate) parent_dataset_identity_sha256: String,
+    pub(crate) resident_parent_rows: usize,
+    pub(crate) feature_count: usize,
+    pub(crate) route: crate::PopulationAutoSizingRouteV1,
 }
 
 /// One sealed evaluation view plus the exact buffers/settings it is allowed to
@@ -303,6 +337,30 @@ pub(crate) fn begin_exact_population_execution_run_v1<'a>(
 }
 
 impl ExactPopulationExecutionRunV1<'_> {
+    pub(crate) fn population_auto_sizing_primitives_v1(
+        &self,
+    ) -> Result<ExactPopulationAutoSizingPrimitivesV1, ExactPopulationExecutionErrorV1> {
+        let route = self
+            .strict_device_route
+            .population_auto_sizing_route_v1()
+            .map_err(|source| {
+                error(
+                    ExactPopulationExecutionErrorCodeV1::DeviceRoute,
+                    format!("read run-owned population-auto route facts: {source}"),
+                )
+            })?;
+        Ok(ExactPopulationAutoSizingPrimitivesV1 {
+            parent_canonical_scope_identity_sha256: self
+                .parent
+                .canonical_scope_identity_sha256()
+                .to_owned(),
+            parent_dataset_identity_sha256: self.parent.parent_dataset_identity_sha256().to_owned(),
+            resident_parent_rows: self.parent.parent_row_count(),
+            feature_count: self.parent.feature_count(),
+            route,
+        })
+    }
+
     pub(crate) fn seal_evaluation(
         &self,
         settings: &BacktestSettings,
@@ -497,6 +555,16 @@ impl ExactPopulationEvaluationV1<'_> {
     #[cfg(feature = "gpu-b-adapter")]
     pub(crate) fn row_count(&self) -> usize {
         self.authority.view().row_count()
+    }
+
+    #[cfg(feature = "gpu-b-adapter")]
+    pub(crate) fn parent_row_count(&self) -> usize {
+        self.authority.parent_row_count()
+    }
+
+    #[cfg(feature = "gpu-b-adapter")]
+    pub(crate) fn parent_dataset_identity_sha256(&self) -> &str {
+        self.authority.parent_dataset_identity_sha256()
     }
 
     #[cfg(feature = "gpu-b-adapter")]

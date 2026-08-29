@@ -261,6 +261,14 @@ pub fn router(state: AppApiState) -> Router {
             "/engines/training/stop",
             post(engines_control::training_stop),
         )
+        .route(
+            "/engines/native-research/start",
+            post(engines_control::canonical_native_research_start),
+        )
+        .route(
+            "/engines/native-research/cancel",
+            post(engines_control::canonical_native_research_cancel),
+        )
         // F-330 Strategy Lab — Promotion Gate status + promote-to-live.
         .route(
             "/strategy_lab/promotion",

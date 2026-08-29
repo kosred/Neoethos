@@ -123,10 +123,7 @@ fn every_production_family_is_visible_through_column_metadata() {
         ("rsi", FeatureSource::ClassicTechnicalAnalysis),
         ("quant_log_return", FeatureSource::Quantitative),
         ("session_london_open_dist", FeatureSource::Session),
-        (
-            "neoethos_custom_gk_vol_ratio_state_10_50_v3",
-            FeatureSource::Regime,
-        ),
+        ("regime_vol_state", FeatureSource::Regime),
         ("fp_effort_result_div", FeatureSource::Footprint),
     ];
 
@@ -262,7 +259,7 @@ fn classic_vector_ta_validity_contract_has_its_own_semantic_version() {
         .expect("classic/vector-ta manifest row");
     assert_eq!(
         row.semantic_version(),
-        9,
-        "Classic semantic-v9 preserves the EVWMA-v8 identities and adds creator-aligned CCI Cycle; semantic-v8, older and unversioned Classic artifacts must fail closed and be regenerated"
+        7,
+        "Evasive Supertrend's canonical four-output base and atr_length sweeps replace the old anonymous band-only receipt; existing classic feature artifacts must fail closed and be regenerated under a new content-addressed identity"
     );
 }

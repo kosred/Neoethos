@@ -757,6 +757,7 @@ mod tests {
             holdout_scope: Some(holdout_scope),
             search_config_hash: CONFIG_HASH.to_string(),
             cost_band_by_strategy: Vec::new(),
+            cost_band_census: crate::discovery::CostBandCensus::default(),
             portfolio,
             candidates: Vec::new(),
             quality_metrics: Vec::new(),

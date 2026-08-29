@@ -1,5 +1,7 @@
 #pragma once
 
+#include "neoethos_gpu_cuda.h"
+
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -24,6 +26,8 @@ constexpr std::int32_t NEO_RESIDENT_STATUS_STATE_ERROR_V1 = -9;
 constexpr std::int32_t NEO_RESIDENT_STATUS_RANGE_ERROR_V1 = -10;
 constexpr std::int32_t NEO_RESIDENT_STATUS_CONTENT_COLLISION_V1 = -11;
 constexpr std::int32_t NEO_RESIDENT_STATUS_DEVICE_FAULT_V1 = -12;
+constexpr std::int32_t NEO_RESIDENT_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2 = -13;
+constexpr std::int32_t NEO_RESIDENT_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2 = -14;
 
 enum class NeoResidentPhiloxOperatorV1 : std::uint32_t {
   InitializeTermCount = 1,
@@ -78,11 +82,7 @@ struct NeoResidentGenerationGeneScalarV1 {
 /// Exact metrics-only row emitted by the resident population reducer. V1 uses
 /// it solely to bind candidate/scenario identity and final content; ranking is
 /// driven by the separately sealed integer decision-key store below.
-struct NeoResidentGenerationMetricRowV1 {
-  std::uint64_t candidate_id;
-  std::uint64_t scenario_id;
-  double values[11];
-};
+using NeoResidentGenerationMetricRowV1 = ::NeoPopulationMetricRow;
 
 /// All f64 inputs are transmitted as raw bits in the sealed metadata plan.
 /// Device code converts them with bit-casts, preventing locale or text parsing
@@ -133,6 +133,7 @@ struct NeoResidentGenerationAllocationReceiptV1 {
   std::uint64_t dedup_hash_bytes;
   std::uint64_t cub_scratch_bytes;
   std::uint64_t retained_evaluation_workspace_bytes;
+  std::uint64_t terminal_device_receipt_bytes;
   std::uint64_t total_device_bytes;
   std::uint64_t same_context_free_bytes;
   std::uint64_t full_discovery_reserve_bytes;
@@ -211,7 +212,7 @@ static_assert(sizeof(NeoResidentGenerationMetricRowV1) == 104,
               "metric row ABI changed");
 static_assert(sizeof(NeoResidentGenerationPlanV1) == 632,
               "generation plan ABI changed");
-static_assert(sizeof(NeoResidentGenerationAllocationReceiptV1) == 168,
+static_assert(sizeof(NeoResidentGenerationAllocationReceiptV1) == 176,
               "allocation receipt ABI changed");
 static_assert(sizeof(NeoResidentGenerationMetricRowsImportV1) == 216,
               "metric import ABI changed");
@@ -229,6 +230,16 @@ extern "C" {
 std::int32_t query_resident_generation_allocation_v1(
     const NeoResidentGenerationPopulationSessionImportV1* import,
     const NeoResidentGenerationPlanV1* plan,
+    NeoResidentGenerationAllocationReceiptV1* receipt);
+
+/// Computes the exact generation layout against the single free-memory
+/// snapshot owned by the composite Search admission. It performs no allocation,
+/// event creation, kernel launch or additional cudaMemGetInfo call.
+std::int32_t calculate_resident_generation_allocation_v2(
+    const NeoResidentGenerationPlanV1* plan,
+    cudaStream_t admitted_run_stream,
+    std::uint64_t same_context_free_bytes,
+    std::uint64_t full_discovery_reserve_bytes,
     NeoResidentGenerationAllocationReceiptV1* receipt);
 
 std::int32_t create_resident_generation_run_from_import_v1(
@@ -266,6 +277,9 @@ std::int32_t begin_resident_post_ga_in_place_v1(
 
 std::int32_t enqueue_resident_generation_release_v1(
     NeoResidentGenerationRunV1* run);
+std::int32_t detach_resident_search_terminal_receipt_v2(
+    NeoResidentGenerationRunV1* run,
+    const void* expected_terminal_host_receipt);
 
 }  // extern "C"
 

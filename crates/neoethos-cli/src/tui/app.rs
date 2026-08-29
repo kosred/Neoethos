@@ -67,6 +67,8 @@ pub enum PendingAction {
     SymbolsImport,
     /// Stop the running discovery job (`discover::K`).
     DiscoverStop,
+    /// Request exact-token cancellation of the app-owned Native Research job.
+    NativeResearchCancel,
     /// Create the auto-loop stop flag (`auto_loop::K`).
     AutoLoopStop,
 }
@@ -78,6 +80,7 @@ impl PendingAction {
             PendingAction::ConfigSave => "save config to config.yaml",
             PendingAction::SymbolsImport => "import data into data/",
             PendingAction::DiscoverStop => "stop the running discovery",
+            PendingAction::NativeResearchCancel => "cancel canonical Native Research",
             PendingAction::AutoLoopStop => "create the auto-loop stop flag",
         }
     }
@@ -88,6 +91,9 @@ impl PendingAction {
             PendingAction::ConfigSave => crate::tui::pages::config_view::do_save(shared),
             PendingAction::SymbolsImport => crate::tui::pages::symbols::launch_import(shared),
             PendingAction::DiscoverStop => crate::tui::pages::discover::do_stop(shared),
+            PendingAction::NativeResearchCancel => {
+                crate::tui::pages::native_research::do_cancel(shared)
+            }
             PendingAction::AutoLoopStop => {
                 crate::tui::pages::auto_loop::do_create_stop_flag(shared)
             }
@@ -114,6 +120,8 @@ pub struct AppShared {
     pub hits: Vec<Hit>,
     /// Editable form for Discover page parameters.
     pub discover_form: FormState,
+    /// Exact contract reference and optional generation-zero overrides.
+    pub native_research_form: FormState,
     /// Editable form for Train page parameters.
     pub train_form: FormState,
     /// Chart page state — selected symbol/timeframe + cached candles.
@@ -150,6 +158,7 @@ impl AppShared {
             jobs: JobManager::new(),
             hits: Vec::new(),
             discover_form: make_discover_form(&root_str),
+            native_research_form: crate::tui::pages::native_research::make_form(),
             train_form: make_train_form(&root_str),
             chart_state,
             config_form: crate::tui::pages::config_view::make_config_form(),
@@ -267,6 +276,7 @@ impl App {
                 }
                 let form = match page {
                     Page::Discover => &mut self.shared.discover_form,
+                    Page::NativeResearch => &mut self.shared.native_research_form,
                     Page::Train => &mut self.shared.train_form,
                     _ => return,
                 };
@@ -326,6 +336,7 @@ impl App {
         // page); Tab still cycles fields (handled by the page);
         // outside edit mode the global shortcuts apply.
         let editing = self.shared.discover_form.editing
+            || self.shared.native_research_form.editing
             || self.shared.train_form.editing
             || self.shared.config_form.editing
             || self.shared.import_form.editing;
@@ -349,6 +360,7 @@ impl App {
             KeyCode::Char('8') => self.current = Page::Config,
             KeyCode::Char('9') => self.current = Page::Logs,
             KeyCode::Char('0') => self.current = Page::Chart,
+            KeyCode::Char('n') | KeyCode::Char('N') => self.current = Page::NativeResearch,
             // Refresh: re-stamp last_refresh so the next render's
             // dataset summary is recomputed from disk and the status
             // bar shows "Refreshed Xs ago". The help text on every

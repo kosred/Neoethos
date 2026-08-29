@@ -104,6 +104,20 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_re
   return NEO_POPULATION_STATUS_UNSUPPORTED;
 }
 
+extern "C" std::int32_t neoethos_gpu_cuda_population_consume_host_metrics_v1(
+    NeoCudaPopulationSession*,
+    const NeoPopulationResidentMetricsHandleV1*,
+    NeoPopulationReadback*,
+    NeoPopulationHostMetricsResultV1*) {
+  return NEO_POPULATION_STATUS_UNSUPPORTED;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+    NeoCudaPopulationSession*,
+    const NeoPopulationResidentMetricsHandleV1*) {
+  return NEO_POPULATION_STATUS_UNSUPPORTED;
+}
+
 extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     NeoCudaPopulationSession*,
     const NeoPopulationSettings*,

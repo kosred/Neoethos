@@ -86,6 +86,8 @@ pub(crate) enum StrictDiscoveryDeviceRouteErrorCodeV1 {
     #[cfg(feature = "gpu-b-native")]
     DeviceIdentityMismatch,
     #[cfg(feature = "gpu-b-native")]
+    UnreadableDeviceMemory,
+    #[cfg(feature = "gpu-b-native")]
     WrongDeviceRoute,
 }
 
@@ -121,6 +123,10 @@ impl StrictDiscoveryDeviceRouteErrorV1 {
             #[cfg(feature = "gpu-b-native")]
             StrictDiscoveryDeviceRouteErrorCodeV1::DeviceIdentityMismatch => {
                 "device_identity_mismatch"
+            }
+            #[cfg(feature = "gpu-b-native")]
+            StrictDiscoveryDeviceRouteErrorCodeV1::UnreadableDeviceMemory => {
+                "unreadable_device_memory"
             }
             #[cfg(feature = "gpu-b-native")]
             StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute => "wrong_device_route",
@@ -285,6 +291,7 @@ pub(crate) fn decide_strict_native_failure_v1(
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ExactCudaDeviceOrdinalV1 {
     selected_ordinal: u32,
+    pre_parent_free_memory_bytes: u64,
     cuda_device_identity_sha256: String,
     cuda_build_manifest_sha256: String,
     probe_receipt_identity_sha256: String,
@@ -293,6 +300,12 @@ pub struct ExactCudaDeviceOrdinalV1 {
 impl ExactCudaDeviceOrdinalV1 {
     pub const fn selected_ordinal(&self) -> u32 {
         self.selected_ordinal
+    }
+
+    /// Free-memory snapshot captured on this exact ordinal after device/build
+    /// admission and before any Discovery parent allocation.
+    pub const fn pre_parent_free_memory_bytes(&self) -> u64 {
+        self.pre_parent_free_memory_bytes
     }
 
     pub fn cuda_device_identity_sha256(&self) -> &str {
@@ -435,6 +448,67 @@ impl SealedStrictDiscoveryDeviceAdmissionV1 {
 }
 
 impl SealedStrictDiscoveryDeviceRouteV1 {
+    pub(crate) fn population_auto_sizing_route_v1(
+        &self,
+    ) -> Result<crate::PopulationAutoSizingRouteV1, StrictDiscoveryDeviceRouteErrorV1> {
+        #[cfg(feature = "gpu-b-native")]
+        {
+            return Ok(match &self.kind {
+                SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(ordinal) => {
+                    crate::PopulationAutoSizingRouteV1::NativeCuda {
+                        selected_ordinal: ordinal.selected_ordinal(),
+                        pre_parent_free_memory_bytes: ordinal.pre_parent_free_memory_bytes(),
+                        cuda_device_identity_sha256: ordinal
+                            .cuda_device_identity_sha256()
+                            .to_owned(),
+                        cuda_build_manifest_sha256: ordinal.cuda_build_manifest_sha256().to_owned(),
+                        probe_receipt_identity_sha256: ordinal
+                            .probe_receipt_identity_sha256()
+                            .to_owned(),
+                    }
+                }
+                SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt) => {
+                    let authority = match &receipt.kind {
+                        SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt) => {
+                            crate::PopulationAutoCpuAuthorityV1::LegacyCudaZero {
+                                probe_receipt_identity_sha256: receipt
+                                    .probe_receipt_identity_sha256()
+                                    .to_owned(),
+                            }
+                        }
+                        #[cfg(feature = "gpu-cuda")]
+                        SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence {
+                            platform,
+                            inventory_identity_sha256,
+                        } => {
+                            let platform = match platform {
+                                neoethos_gpu_cuda::PhysicalGpuInventoryPlatformV1::WindowsSetupApi => {
+                                    "windows-setupapi"
+                                }
+                                neoethos_gpu_cuda::PhysicalGpuInventoryPlatformV1::LinuxProcFsExhaustive => {
+                                    "linux-procfs-exhaustive"
+                                }
+                            };
+                            crate::PopulationAutoCpuAuthorityV1::PhysicalGpuAbsence {
+                                platform: platform.to_owned(),
+                                inventory_identity_sha256: hex_lower(inventory_identity_sha256),
+                            }
+                        }
+                    };
+                    crate::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { authority }
+                }
+            });
+        }
+        #[cfg(not(feature = "gpu-b-native"))]
+        {
+            let _ = self;
+            Err(route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::NativeAdapterNotCompiled,
+                "native adapter is not compiled; no exact population-auto device route can be read",
+            ))
+        }
+    }
+
     pub(crate) fn require_cpu_route_receipt_v1(
         &self,
     ) -> Result<&SealedCpuDiscoveryRouteReceiptV2, StrictDiscoveryDeviceRouteErrorV1> {
@@ -733,6 +807,21 @@ fn probe_real_strict_discovery_device_route_v1()
             })?;
             let cuda_build_manifest_sha256 =
                 hex_lower(&Sha256::digest(cuda_build_manifest.as_bytes()));
+            let selected_ordinal_usize = usize::try_from(selected_ordinal).map_err(|_| {
+                route_error(
+                    StrictDiscoveryDeviceRouteErrorCodeV1::UnreadableDeviceMemory,
+                    "selected CUDA ordinal does not fit the free-memory probe",
+                )
+            })?;
+            let pre_parent_free_memory_bytes = neoethos_gpu_cuda::device_free_memory_bytes(
+                selected_ordinal_usize,
+            )
+            .ok_or_else(|| {
+                route_error(
+                    StrictDiscoveryDeviceRouteErrorCodeV1::UnreadableDeviceMemory,
+                    "selected CUDA ordinal has no readable pre-parent free-memory snapshot",
+                )
+            })?;
             let ordinal_observation_manifest_sha256 =
                 ordinal_observation_manifest_sha256(&observation);
             let mut probe_hasher = Sha256::new();
@@ -740,12 +829,14 @@ fn probe_real_strict_discovery_device_route_v1()
             probe_hasher.update(ordinal_observation_manifest_sha256.as_bytes());
             probe_hasher.update(cuda_device_identity_sha256.as_bytes());
             probe_hasher.update(cuda_build_manifest_sha256.as_bytes());
+            probe_hasher.update(pre_parent_free_memory_bytes.to_le_bytes());
             let probe_receipt_identity_sha256 = hex_lower(&probe_hasher.finalize());
             Ok(SealedStrictDiscoveryDeviceRouteV1 {
                 _sealed: (),
                 kind: SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(
                     ExactCudaDeviceOrdinalV1 {
                         selected_ordinal,
+                        pre_parent_free_memory_bytes,
                         cuda_device_identity_sha256,
                         cuda_build_manifest_sha256,
                         probe_receipt_identity_sha256,

@@ -434,17 +434,20 @@ pub fn save_discovery_ledger(
     let pip_value_per_lot = config.evaluation_config(None).pip_value_per_lot;
     let inputs = crate::run_identity::payoff_inputs_for_config(config, pip_value_per_lot);
     let normalize_features = neoethos_data::current_data_runtime_overrides().normalize_features;
-    let resolved_config = crate::run_identity::max_achievable_payoff(&inputs)
-        .and_then(|ceiling| {
-            crate::run_identity::stamp_resolved_config(
-                config,
-                &inputs,
-                ceiling,
-                pip_value_per_lot,
-                normalize_features,
-            )
-        })
-        .context("resolve exact discovery config before writing its ledger")?;
+    let resolved_config = crate::run_identity::assert_payoff_floor_reachable(
+        config.target_profile.min_payoff_ratio,
+        &inputs,
+    )
+    .and_then(|ceiling| {
+        crate::run_identity::stamp_resolved_config(
+            config,
+            &inputs,
+            ceiling,
+            pip_value_per_lot,
+            normalize_features,
+        )
+    })
+    .context("resolve exact discovery config before writing its ledger")?;
     anyhow::ensure!(
         resolved_config.config_hash == expected_config_hash,
         "discovery ledger config identity drift: recomputed `{}`, expected `{}`",

@@ -8,6 +8,8 @@ use neoethos_gpu_contracts::device::{
 use thiserror::Error;
 
 #[cfg(feature = "cuda")]
+pub mod data_population_workspace_plan_v1;
+#[cfg(feature = "cuda")]
 pub mod resident_classic_ta_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_feature_store_v3;
@@ -15,6 +17,11 @@ pub mod resident_feature_store_v3;
 pub mod resident_feature_store_v3_device_fixture;
 #[cfg(feature = "cuda")]
 pub mod resident_footprint_v2;
+#[cfg(feature = "cuda")]
+// The pre-existing V1 generation owner was source-contract-only. Root it
+// privately for the first V3 -> Search consumer without widening its API.
+#[allow(dead_code)]
+mod resident_generation_v1;
 #[cfg(feature = "cuda")]
 pub mod resident_higher_timeframe_alignment_v3;
 #[cfg(feature = "cuda-device-fixtures")]
@@ -62,6 +69,15 @@ pub mod run_device_admission_v1;
 
 mod population;
 
+#[cfg(feature = "cuda")]
+pub use data_population_workspace_plan_v1::{
+    AdmittedNativeCudaDataPopulationRunV1, DATA_POPULATION_ALLOCATOR_RESERVE_BYTES_V1,
+    DATA_POPULATION_ALLOCATOR_RESERVE_POLICY_V1, DataPopulationWorkspacePlanErrorCodeV1,
+    DataPopulationWorkspacePlanErrorV1, DataPopulationWorkspacePreflightRequestV1,
+    SealedDataPopulationExecutionLimitsV1, SealedDataPopulationGpuWorkspacePlanV1,
+    SealedNativeCudaDataPopulationPreflightFactsV1, bind_data_population_gpu_workspace_plan_v1,
+    native_cuda_data_population_preflight_facts_v1, seal_data_population_gpu_workspace_plan_v1,
+};
 pub use full_discovery_workspace_plan_v1::{
     AdmittedFullDiscoveryGpuRunV1, FullDiscoveryGpuRunReceiptV1,
     FullDiscoveryWorkspacePlanErrorCodeV1, FullDiscoveryWorkspacePlanErrorV1,
@@ -78,16 +94,23 @@ pub use run_device_admission_v1::{
 };
 
 pub use population::{
-    CudaPopulationDeviceIdentityV1, CudaPopulationError, PopulationDatasetView,
-    PopulationDiagnostics, PopulationEvaluationViewV1, PopulationGeneView,
-    PopulationParentDatasetInputV1, PopulationParentDatasetV1, PopulationResidencyCountersV1,
-    PopulationSession, PopulationTimestampModeV1, PopulationViewKindV1,
+    CudaPopulationDeviceIdentityV1, CudaPopulationError, HostPopulationMetricsReceiptV1,
+    PopulationDatasetView, PopulationDiagnostics, PopulationEvaluationViewV1,
+    PopulationGeneStorePlanV1, PopulationGeneView, PopulationMetricsOnlyPlanV1,
+    PopulationParentDatasetInputV1, PopulationParentDatasetV1, PopulationParentDevicePlanV1,
+    PopulationResidencyCountersV1, PopulationSession, PopulationTimestampModeV1,
+    PopulationViewKindV1, ResidentAdaptiveBaseRequestV1, ResidentAdaptiveBaseViewTokenV1,
     TerminalCompactPopulationResultReceiptV1, population_status_message,
 };
+#[cfg(feature = "cuda")]
+pub use population::{ResidentAdaptiveBaseViewTokenIdentityV1, ResidentPopulationMetricsV1};
 // Callers that decide what to do about a failure need to name the failure.
 // Without these, the only handle on a status was its rendered message, and a
 // caller matching on that text silently stopped working when the wording moved.
-pub use population::{STATUS_ALLOCATION_FAILED, STATUS_EVENT_CAPACITY, STATUS_LAUNCH_FAILED};
+pub use population::{
+    RESIDENT_ADAPTIVE_BASE_SEMANTIC_V1, STATUS_ADAPTIVE_BASE_DEGENERATE, STATUS_ALLOCATION_FAILED,
+    STATUS_EVENT_CAPACITY, STATUS_LAUNCH_FAILED,
+};
 // A caller sizing a batch has to know what the kernel reserves per candidate.
 pub use population::MAX_TRADES_PER_CANDIDATE;
 

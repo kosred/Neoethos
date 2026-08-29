@@ -171,6 +171,11 @@ pub fn make_discover_form(default_root: &str) -> FormState {
             "1000",
             "GA population per generation. Default: 1000",
         ),
+        Field::new(
+            "Population auto",
+            "",
+            "true/false. Blank inherits the configured setting.",
+        ),
         Field::new("Generations", "10", "GA generations. Default: 10"),
         Field::new(
             "Portfolio size",

@@ -271,6 +271,14 @@ impl FeatureNodeV1 {
     pub const fn operation(&self) -> FeatureOperationTagV1 {
         self.operation
     }
+
+    pub const fn formula_manifest_hash(&self) -> [u8; 32] {
+        self.formula_manifest_hash
+    }
+
+    pub const fn semantic_source_hash(&self) -> [u8; 32] {
+        self.semantic_source_hash
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

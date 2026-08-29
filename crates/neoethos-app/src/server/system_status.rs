@@ -18,6 +18,7 @@ use neoethos_core::Settings;
 use neoethos_data::{CanonicalDatasetIdentity, DatasetDiscovery};
 
 use crate::app_services::broker_persistence::load_broker_settings;
+use crate::app_services::canonical_native_discovery::CanonicalNativeResearchTerminalSnapshotV1;
 use crate::app_services::jobs::JobKind;
 
 use super::errors::{actionable_error, internal_panic};
@@ -30,6 +31,7 @@ use super::state::AppApiState;
 pub struct EnginesDto {
     pub discovery: String,
     pub training: String,
+    pub canonical_native_research: CanonicalNativeResearchStatusDto,
     pub auto_trader: String,
     /// Human-readable progress / status line for whichever engine is
     /// currently active. Empty when all three are Idle.
@@ -60,6 +62,44 @@ pub struct EnginesDto {
     pub feature_store_mb: u64,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalNativeResearchStatusDto {
+    pub state: String,
+    pub stage: String,
+    pub percent: f64,
+    /// Opaque decimal token for exact cancellation. A string avoids loss of
+    /// `u64` precision in JavaScript clients and disappears at terminal.
+    pub lease_token: Option<String>,
+    pub cancellation_requested: bool,
+    pub failure_stage: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_detail: Option<String>,
+    pub published: Option<CanonicalNativeResearchPublishedStatusDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalNativeResearchPublishedStatusDto {
+    pub relative_path: String,
+    pub byte_count: u64,
+    pub file_sha256: String,
+    pub evidence_identity_sha256: String,
+    pub configured_population: usize,
+    pub resolved_population: usize,
+    pub population_cap: usize,
+    pub hard_growth_cap: usize,
+    pub term_cap: usize,
+    pub selected_device_ordinal: u32,
+    pub engine: String,
+    pub parent_h2d_bytes: u64,
+    pub adaptive_h2d_bytes: u64,
+    pub metric_rows: u64,
+    pub metric_bytes: u64,
+    pub consumer_completion_confirmed: bool,
+    pub replay_identity_sealed: bool,
+}
+
 /// Sum regular files under the only production feature scratch root without
 /// following symlinks. Vortex is the sole shared feature format, so the status
 /// endpoint reads the same lease-backed root as the production writer.
@@ -87,6 +127,31 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
     // (stage, percent, counters) alongside the existing state/summary.
     let (discovery_stage, discovery_percent, discovery_counters) =
         state.engine_progress(JobKind::Discovery).await;
+    let native_slot = state.canonical_native_research_slot_v1().await;
+    let native_snapshot = native_slot.snapshot();
+    let native_terminal = native_slot.terminal();
+    let native_failure = native_terminal.and_then(|terminal| terminal.failure());
+    let native_published = native_terminal
+        .and_then(CanonicalNativeResearchTerminalSnapshotV1::published)
+        .map(|published| CanonicalNativeResearchPublishedStatusDto {
+            relative_path: published.relative_path().to_owned(),
+            byte_count: published.byte_count(),
+            file_sha256: published.file_sha256().to_owned(),
+            evidence_identity_sha256: published.evidence_identity_sha256().to_owned(),
+            configured_population: published.configured_population(),
+            resolved_population: published.resolved_population(),
+            population_cap: published.population_cap(),
+            hard_growth_cap: published.hard_growth_cap(),
+            term_cap: published.term_cap(),
+            selected_device_ordinal: published.selected_device_ordinal(),
+            engine: published.engine().to_owned(),
+            parent_h2d_bytes: published.parent_h2d_bytes(),
+            adaptive_h2d_bytes: published.adaptive_h2d_bytes(),
+            metric_rows: published.metric_rows(),
+            metric_bytes: published.metric_bytes(),
+            consumer_completion_confirmed: published.consumer_completion_confirmed(),
+            replay_identity_sealed: published.replay_identity_sealed(),
+        });
     Json(EnginesDto {
         discovery: state
             .engine_state(JobKind::Discovery)
@@ -98,6 +163,26 @@ pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
             .await
             .as_str()
             .to_string(),
+        canonical_native_research: CanonicalNativeResearchStatusDto {
+            state: native_snapshot
+                .map(|snapshot| snapshot.state().as_str())
+                .unwrap_or("Idle")
+                .to_owned(),
+            stage: native_snapshot
+                .map(|snapshot| snapshot.stage().to_owned())
+                .unwrap_or_default(),
+            percent: native_snapshot
+                .map(|snapshot| f64::from(snapshot.percent_basis_points()) / 100.0)
+                .unwrap_or(0.0),
+            lease_token: native_snapshot
+                .filter(|snapshot| !snapshot.state().is_terminal())
+                .map(|snapshot| snapshot.lease_token().to_string()),
+            cancellation_requested: native_slot.cancellation_requested(),
+            failure_stage: native_failure.map(|failure| failure.stable_stage().to_owned()),
+            failure_code: native_failure.map(|failure| failure.stable_code().to_owned()),
+            failure_detail: native_failure.map(|failure| failure.detail().to_owned()),
+            published: native_published,
+        },
         auto_trader: "Idle".to_string(),
         discovery_summary: state.engine_summary(JobKind::Discovery).await,
         training_summary: state.engine_summary(JobKind::Training).await,

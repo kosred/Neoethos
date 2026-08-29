@@ -60,6 +60,7 @@
 //! never a silent no-op that makes the loop appear to run while doing nothing.
 
 // ── the loop: session + state machine ───────────────────────────────────────
+mod awaiting_quote_coverage_v1;
 pub mod contracts;
 pub mod goals;
 pub mod journal;
@@ -78,6 +79,14 @@ pub mod judge;
 pub mod shuffle;
 pub mod verdict;
 
+pub use awaiting_quote_coverage_v1::{
+    AutoresearchNonterminalBoundaryErrorV1, AutoresearchRunOutcomeV1, AwaitingQuoteCoverageV1,
+    MAX_QUOTE_COVERAGE_REQUEST_BYTES_V1, QUOTE_COVERAGE_READY_SCHEMA_V1,
+    QUOTE_COVERAGE_REQUEST_SCHEMA_V1, QuoteCoverageErrorCodeV1, QuoteCoverageErrorV1,
+    QuoteCoverageProviderErrorV1, QuoteCoverageProviderOutcomeV1, QuoteCoverageProviderV1,
+    QuoteCoverageReadyBoundaryV1, QuoteCoverageReadyV1, QuoteCoverageRequestV1,
+    QuoteCoverageStateV1, QuoteCoverageWaitReasonV1,
+};
 pub use goals::{GoalRefusal, GoalSet, Scenario, ScenarioKind};
 pub use journal::{Journal, Record, SweepKind};
 pub use quote_validated_oos_touch_v1::{
@@ -86,7 +95,10 @@ pub use quote_validated_oos_touch_v1::{
     QuoteValidatedOosTouchErrorV1, QuoteValidatedOosTouchEvidenceV1,
     QuoteValidatedOosTouchReceiptV1, evaluate_quote_validated_oos_touch_v1,
 };
-pub use runner::{RunArgs, SearchOutcome, SweepExecutor, run};
+pub use runner::{
+    RunArgs, SearchOutcome, SweepExecutor, run, run_until_boundary_v1,
+    run_until_boundary_with_executor_v1,
+};
 pub use session::{
     AbandonCensus, BestEver, BlockId, ChampionRow, CoverageCounters, Session, SessionHeader,
     SessionId, SessionStore, SweepId, n_session,

@@ -12,11 +12,12 @@ use neoethos_broker_truth::{
     BrokerFinancialTruthBundleManifestV2, BrokerFinancialTruthBundleReceiptV2,
     BrokerFinancialTruthBundleStoreV1, BrokerFinancialTruthVortexSchemaV1,
     BrokerTruthAcquisitionPromotionEligibilityV1, BrokerTruthAcquisitionSemanticStatusV1,
-    BrokerTruthAcquisitionStoreV1, EvidenceWindowV1, ExactBrokerRequestChunkV2,
-    ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1, ExactConversionRouteEvidenceV2,
-    ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2, ExactSymbolContractEvidenceV2,
-    ImmutableVortexArtifactV1, QuoteSideV1, ReviewedQuoteReplayRuleEvidenceV2,
-    ReviewedQuoteReplayRuleIdentityV2, SynchronizedBidAskEvidenceV2,
+    BrokerTruthAcquisitionStoreV1, BrokerTruthReviewedSynchronizationBindingV1, EvidenceWindowV1,
+    ExactBrokerRequestChunkV2, ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1,
+    ExactConversionRouteEvidenceV2, ExactDealReconciliationEvidenceV2,
+    ExactQuoteSideEvidenceV2, ExactSymbolContractEvidenceV2, ImmutableVortexArtifactV1,
+    QuoteSideV1, ReviewedQuoteReplayRuleEvidenceV2, ReviewedQuoteReplayRuleIdentityV2,
+    SynchronizedBidAskEvidenceV2,
 };
 use neoethos_data::core::dataset_manifest::PublishResult;
 use neoethos_data::{
@@ -598,6 +599,27 @@ fn write_bft2_artifact(
     artifact
 }
 
+fn bind_reviewed_bft2_artifact(
+    sources: &mut Vec<BrokerFinancialTruthArtifactSourceV1>,
+    relative_path: &str,
+    schema: BrokerFinancialTruthVortexSchemaV1,
+    row_count: u64,
+    reviewed_source_path: &Path,
+) -> ImmutableVortexArtifactV1 {
+    let artifact = ImmutableVortexArtifactV1::from_file(
+        relative_path,
+        schema,
+        row_count,
+        reviewed_source_path,
+    )
+    .expect("describe exact authority-reviewed BFT2 artifact");
+    sources.push(
+        BrokerFinancialTruthArtifactSourceV1::new(relative_path, reviewed_source_path.to_path_buf())
+            .expect("bind exact authority-reviewed BFT2 source"),
+    );
+    artifact
+}
+
 fn bft2_quote_side(
     source_root: &Path,
     sources: &mut Vec<BrokerFinancialTruthArtifactSourceV1>,
@@ -655,6 +677,9 @@ fn publish_integrity_only_bft2(
     source_root: &Path,
     binding: &BrokerFinancialTruthBindingV1,
     instrument: &ExactQuoteInstrumentV2,
+    reviewed_synchronization: &BrokerTruthReviewedSynchronizationBindingV1,
+    reviewed_observations_path: &Path,
+    reviewed_rules_path: &Path,
 ) -> BrokerFinancialTruthBundleReceiptV2 {
     let mut sources = Vec::new();
     let bid = bft2_quote_side(
@@ -671,23 +696,38 @@ fn publish_integrity_only_bft2(
         instrument,
         QuoteSideV1::Ask,
     );
-    let observations = write_bft2_artifact(
-        source_root,
+    let observations = bind_reviewed_bft2_artifact(
         &mut sources,
         "quote-session-observations-raw.vortex",
         BrokerFinancialTruthVortexSchemaV1::CTraderQuoteSessionObservationsRawV2,
+        2,
+        reviewed_observations_path,
     );
-    let rules = write_bft2_artifact(
-        source_root,
+    let rules = bind_reviewed_bft2_artifact(
         &mut sources,
         "reviewed-quote-replay-rules-decoded.vortex",
         BrokerFinancialTruthVortexSchemaV1::CTraderReviewedQuoteReplayRulesDecodedV2,
+        1,
+        reviewed_rules_path,
     );
-    let review_identity =
-        ReviewedQuoteReplayRuleIdentityV2::new(digest(0xa1), digest(0xa2), observations.sha256())
-            .expect("integrity-only BFT2 review identity");
-    let replay = ReviewedQuoteReplayRuleEvidenceV2::new(review_identity, observations, rules)
-        .expect("integrity-only replay evidence");
+    assert_eq!(
+        observations.sha256(),
+        reviewed_synchronization
+            .review_identity()
+            .broker_observation_sha256(),
+        "BFT2 observation bytes must be the authority-reviewed bytes"
+    );
+    assert_eq!(
+        rules.sha256(),
+        reviewed_synchronization.reviewed_rules_sha256(),
+        "BFT2 replay-rule bytes must be the authority-reviewed bytes"
+    );
+    let replay = ReviewedQuoteReplayRuleEvidenceV2::new(
+        reviewed_synchronization.review_identity().clone(),
+        observations,
+        rules,
+    )
+    .expect("authority-reviewed replay evidence");
     let primary =
         SynchronizedBidAskEvidenceV2::new(bid, ask, replay).expect("synchronized primary quotes");
     let symbol_contracts = ExactSymbolContractEvidenceV2::new(
@@ -889,13 +929,30 @@ fn exact_ingress_authority_runner_bft2_and_link_are_ordered_and_evidence_only() 
         prepared,
         store_root,
         bft2_source_root,
-        observations_path: _,
+        observations_path,
         trust_root_path: _,
         binding,
         instrument,
     } = Fixture::new();
-    let broker_receipt =
-        publish_integrity_only_bft2(&store_root, &bft2_source_root, &binding, &instrument);
+    let reviewed_rules_path = observations_path
+        .parent()
+        .expect("reviewed input root")
+        .join("reviewed-quote-replay-rules-000.vortex");
+    let reviewed_synchronization = prepared
+        .authority_manifest()
+        .reviewed_synchronizations()
+        .first()
+        .expect("primary reviewed synchronization")
+        .clone();
+    let broker_receipt = publish_integrity_only_bft2(
+        &store_root,
+        &bft2_source_root,
+        &binding,
+        &instrument,
+        &reviewed_synchronization,
+        &observations_path,
+        &reviewed_rules_path,
+    );
     let cancellation = ProductionBrokerTruthCancellationV2::new();
     let mut runner = OfflineRunnerSpy::new(
         store_root.clone(),

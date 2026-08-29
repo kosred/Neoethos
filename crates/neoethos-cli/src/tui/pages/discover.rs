@@ -370,6 +370,20 @@ pub fn do_stop(shared: &mut AppShared) {
     };
 }
 
+fn append_population_auto_override(args: &mut Vec<String>, raw: &str) -> Result<(), String> {
+    match raw.trim() {
+        "" => Ok(()),
+        value @ ("true" | "false") => {
+            args.push("--population-auto".to_string());
+            args.push(value.to_string());
+            Ok(())
+        }
+        value => Err(format!(
+            "Population auto must be true, false, or blank to inherit settings; got `{value}`"
+        )),
+    }
+}
+
 pub fn launch_now(shared: &mut AppShared) {
     if shared.jobs.has_running(JOB_LABEL_PREFIX) {
         shared.status = "discovery already running".to_string();
@@ -416,6 +430,13 @@ pub fn launch_now(shared: &mut AppShared) {
             }
         }
     }
+    if let Err(message) =
+        append_population_auto_override(&mut args, form.value_for("Population auto").unwrap_or(""))
+    {
+        shared.discover_form.message = Some(message.clone());
+        shared.status = message;
+        return;
+    }
 
     shared.jobs.spawn("discover", args);
     shared.status = "Spawned batch-discover".to_string();
@@ -448,7 +469,27 @@ fn strip_ansi(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{append_population_auto_override, strip_ansi};
+
+    #[test]
+    fn population_auto_launch_override_is_tri_state_and_typed() {
+        let mut inherited = vec!["batch-discover".to_owned()];
+        append_population_auto_override(&mut inherited, "")
+            .expect("blank inherits Settings without emitting an override");
+        assert_eq!(inherited, ["batch-discover"]);
+
+        let mut enabled = vec!["batch-discover".to_owned()];
+        append_population_auto_override(&mut enabled, "true").expect("explicit true");
+        assert_eq!(enabled, ["batch-discover", "--population-auto", "true"]);
+
+        let mut disabled = vec!["batch-discover".to_owned()];
+        append_population_auto_override(&mut disabled, "false").expect("explicit false");
+        assert_eq!(disabled, ["batch-discover", "--population-auto", "false"]);
+
+        let mut malformed = vec!["batch-discover".to_owned()];
+        assert!(append_population_auto_override(&mut malformed, "maybe").is_err());
+        assert_eq!(malformed, ["batch-discover"]);
+    }
 
     #[test]
     fn strip_ansi_preserves_multibyte_utf8() {

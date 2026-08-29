@@ -9,6 +9,7 @@
 
 mod acquisition_store_v1;
 mod acquisition_v1;
+mod authority_v2;
 mod contracts;
 mod contracts_v2;
 mod execution_economics_v1;
@@ -33,6 +34,12 @@ pub use acquisition_v1::{
     BrokerTruthAcquisitionArtifactV1, BrokerTruthAcquisitionAuthorityManifestV1,
     BrokerTruthAcquisitionPromotionEligibilityV1, BrokerTruthAcquisitionSemanticStatusV1,
     BrokerTruthReviewedSynchronizationBindingV1,
+};
+pub use authority_v2::{
+    BROKER_FINANCIAL_TRUTH_AUTHORITY_REFUSED_V2, BrokerFinancialTruthAuthorityErrorCodeV2,
+    BrokerFinancialTruthAuthorityErrorV2, BrokerFinancialTruthAuthoritySourceClassV2,
+    BrokerFinancialTruthAuthorityV2, BrokerFinancialTruthEvidenceClassV2,
+    ReviewedBrokerFinancialTruthEvidenceV2, validate_reviewed_broker_financial_truth_authority_v2,
 };
 
 pub use contracts::{

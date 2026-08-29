@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <new>
 
@@ -31,6 +32,7 @@ constexpr std::size_t DEVICE_ALIGNMENT_V1 = 256;
 constexpr std::uint64_t FNV_OFFSET_0_V1 = 14695981039346656037ull;
 constexpr std::uint64_t FNV_OFFSET_1_V1 = 1099511628211ull ^ 0x9e3779b97f4a7c15ull;
 constexpr std::uint64_t FNV_PRIME_V1 = 1099511628211ull;
+constexpr std::uint64_t RESIDENT_CUB_FAULT_SENTINEL_KEY_V2 = 0ull;
 
 struct Uint4V1 {
   std::uint32_t x;
@@ -55,6 +57,7 @@ struct GenerationPhysicalLayoutV1 {
   std::size_t dedup_hash_bytes;
   std::size_t cub_scratch_bytes;
   std::size_t retained_evaluation_workspace_bytes;
+  std::size_t terminal_device_receipt_bytes;
   std::size_t total_device_bytes;
   std::size_t generation_chunk_count;
 };
@@ -298,6 +301,9 @@ bool checked_physical_layout_v1(const NeoResidentGenerationPlanV1& plan,
       !checked_add_v1(dedup_raw, dedup_flags, &dedup_raw) ||
       !checked_add_v1(dedup_raw, std::size_t{2} * sizeof(std::uint32_t), &dedup_raw) ||
       !checked_add_v1(dedup_raw, std::size_t{12} * sizeof(std::uint64_t), &dedup_raw) ||
+      !checked_add_v1(dedup_raw, sizeof(NeoResidentGenerationDeviceSealV2), &dedup_raw) ||
+      !checked_add_v1(dedup_raw, sizeof(NeoResidentSearchDeviceControlV2), &dedup_raw) ||
+      !checked_add_v1(dedup_raw, std::size_t{11} * sizeof(double), &dedup_raw) ||
       !align_device_bytes_v1(dedup_raw, &layout->dedup_hash_bytes)) {
     return false;
   }
@@ -309,6 +315,10 @@ bool checked_physical_layout_v1(const NeoResidentGenerationPlanV1& plan,
   if (!checked_mul_v1(population, sizeof(std::uint8_t), &coverage_bytes) ||
       !align_device_bytes_v1(coverage_bytes,
                              &layout->retained_evaluation_workspace_bytes)) {
+    return false;
+  }
+  if (!align_device_bytes_v1(sizeof(NeoResidentSearchTerminalReceiptV2),
+                             &layout->terminal_device_receipt_bytes)) {
     return false;
   }
   std::size_t total = 0;
@@ -323,6 +333,7 @@ bool checked_physical_layout_v1(const NeoResidentGenerationPlanV1& plan,
       layout->dedup_hash_bytes,
       layout->cub_scratch_bytes,
       layout->retained_evaluation_workspace_bytes,
+      layout->terminal_device_receipt_bytes,
   };
   for (const std::size_t charge : charges) {
     if (!checked_add_v1(total, charge, &total)) {
@@ -346,6 +357,12 @@ bool checked_physical_layout_v1(const NeoResidentGenerationPlanV1& plan,
 struct NeoResidentGenerationRunV1 {
   NeoResidentGenerationPlanV1 plan;
   NeoResidentGenerationAllocationReceiptV1 allocation;
+  // Exact run-scoped identities minted from the admitted CUDA UUID/context/
+  // stream/pool facts. These are retained separately from plan semantics so a
+  // later scoring bind cannot substitute run/plan hashes for runtime facts.
+  std::uint8_t cuda_device_identity_sha256[32];
+  std::uint8_t primary_context_identity_sha256[32];
+  std::uint8_t run_stream_identity_sha256[32];
   cudaStream_t admitted_run_stream;
   cudaEvent_t resident_parent_ready_event;
   cudaEvent_t ready_event;
@@ -379,13 +396,19 @@ struct NeoResidentGenerationRunV1 {
   std::uint32_t* gene_hash_collision_fault_device;
   std::uint32_t* device_content_fault_device;
   std::uint64_t* content_identities_device;
+  NeoResidentGenerationDeviceSealV2* device_seal_v2;
+  NeoResidentSearchDeviceControlV2* resident_control_device_v2;
+  double* smc_weights_device_v2;
   void* cub_scratch_device;
   std::uint8_t* exact_chunk_coverage_device;
+  NeoResidentSearchTerminalReceiptV2* terminal_device_receipt_v2;
+  NeoResidentSearchTerminalReceiptV2* terminal_host_receipt_v2;
   std::size_t cub_scratch_bytes;
   std::uint64_t logical_population_count;
   std::uint64_t retained_evaluation_capacity;
   std::uint64_t next_expected_logical_offset;
   std::uint64_t current_generation_index;
+  std::uint64_t store_epoch_v2;
   std::uint64_t same_stream_enqueue_count;
   std::uint64_t next_event_id;
   std::uint64_t run_token;
@@ -398,6 +421,21 @@ struct NeoResidentGenerationRunV1 {
   const NeoResidentSearchAdvancePendingReceiptV2* pending_receipt_token_v2;
   bool sealed;
   bool post_ga_in_place_bound;
+  bool initialized_v2;
+  bool evaluator_constants_configured_v2;
+  bool smc_gate_disabled_v2;
+  bool one_generation_advance_enqueued_v2;
+  bool one_generation_advance_pending_v2;
+  bool terminal_committed_v2;
+  bool terminal_event_proven_v2;
+  bool poisoned_v2;
+  bool allocation_free_issued_v2;
+  bool free_outcome_unknown_deliberate_leak_v2;
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+  bool fixture_duplicate_final_content_v2;
+  std::uint64_t fixture_duplicate_source_v2;
+  std::uint64_t fixture_duplicate_destination_v2;
+#endif
 };
 
 namespace {
@@ -406,6 +444,57 @@ static_assert(sizeof(NeoResidentGenerationGeneScalarV1) == 72,
               "fixed resident generation scalar ABI changed");
 static_assert(sizeof(NeoResidentGenerationMetricRowV1) == 104,
               "resident generation metric row ABI changed");
+
+void* retire_generation_allocation_identity_v2(
+    NeoResidentGenerationRunV1* run) {
+  if (run == nullptr || run->allocation_free_issued_v2) {
+    return nullptr;
+  }
+  void* allocation_to_retire = run->allocation_base;
+  run->allocation_base = nullptr;
+  run->gene_scalars_device = nullptr;
+  run->gene_indices_device = nullptr;
+  run->gene_weights_device = nullptr;
+  run->offspring_gene_scalars_device = nullptr;
+  run->offspring_gene_indices_device = nullptr;
+  run->offspring_gene_weights_device = nullptr;
+  run->metric_rows_device = nullptr;
+  run->resident_decision_keys_device = nullptr;
+  run->rank_keys_a_device = nullptr;
+  run->rank_keys_b_device = nullptr;
+  run->rank_values_a_device = nullptr;
+  run->rank_values_b_device = nullptr;
+  run->parent_a_device = nullptr;
+  run->parent_b_device = nullptr;
+  run->selected_indices_device = nullptr;
+  run->selection_flags_device = nullptr;
+  run->selected_count_device = nullptr;
+  run->dedup_run_count_device = nullptr;
+  run->gene_hashes_a_device = nullptr;
+  run->gene_hashes_b_device = nullptr;
+  run->dedup_values_a_device = nullptr;
+  run->dedup_values_b_device = nullptr;
+  run->unique_gene_hashes_device = nullptr;
+  run->dedup_run_lengths_device = nullptr;
+  run->dedup_flags_device = nullptr;
+  run->gene_hash_collision_fault_device = nullptr;
+  run->device_content_fault_device = nullptr;
+  run->content_identities_device = nullptr;
+  run->device_seal_v2 = nullptr;
+  run->resident_control_device_v2 = nullptr;
+  run->smc_weights_device_v2 = nullptr;
+  run->cub_scratch_device = nullptr;
+  run->cub_scratch_bytes = 0;
+  run->exact_chunk_coverage_device = nullptr;
+  run->terminal_device_receipt_v2 = nullptr;
+  run->allocation_free_issued_v2 = true;
+  // CUDA's stream-ordered allocator contract says cudaFreeAsync may surface a
+  // prior asynchronous error. The identity is therefore retired before
+  // invocation and is never queried, accessed, or freed again, regardless of
+  // the returned status:
+  // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY__POOLS.html
+  return allocation_to_retire;
+}
 
 std::uint64_t generation_content_identity_handle_v1(std::uint64_t run_token,
                                                      std::uint64_t lane) {
@@ -466,6 +555,11 @@ bool partition_generation_allocation_v1(NeoResidentGenerationRunV1* run) {
   cursor.offset = selection_start + static_cast<std::size_t>(run->allocation.selection_bytes);
 
   const std::size_t dedup_start = cursor.offset;
+  run->device_seal_v2 =
+      take_device_array_v1<NeoResidentGenerationDeviceSealV2>(&cursor, 1);
+  run->resident_control_device_v2 =
+      take_device_array_v1<NeoResidentSearchDeviceControlV2>(&cursor, 1);
+  run->smc_weights_device_v2 = take_device_array_v1<double>(&cursor, 11);
   run->gene_hashes_a_device = take_device_array_v1<std::uint64_t>(&cursor, population);
   run->gene_hashes_b_device = take_device_array_v1<std::uint64_t>(&cursor, population);
   run->dedup_values_a_device = take_device_array_v1<std::uint64_t>(&cursor, population);
@@ -487,6 +581,12 @@ bool partition_generation_allocation_v1(NeoResidentGenerationRunV1* run) {
       take_device_array_v1<std::uint8_t>(&cursor, population);
   cursor.offset = coverage_start +
                   static_cast<std::size_t>(run->allocation.retained_evaluation_workspace_bytes);
+  const std::size_t terminal_start = cursor.offset;
+  run->terminal_device_receipt_v2 =
+      take_device_array_v1<NeoResidentSearchTerminalReceiptV2>(&cursor, 1);
+  cursor.offset = terminal_start +
+                  static_cast<std::size_t>(
+                      run->allocation.terminal_device_receipt_bytes);
 
   return run->gene_scalars_device != nullptr && run->gene_indices_device != nullptr &&
          run->gene_weights_device != nullptr && run->offspring_gene_scalars_device != nullptr &&
@@ -503,7 +603,10 @@ bool partition_generation_allocation_v1(NeoResidentGenerationRunV1* run) {
          run->unique_gene_hashes_device != nullptr && run->dedup_run_lengths_device != nullptr &&
          run->dedup_flags_device != nullptr && run->gene_hash_collision_fault_device != nullptr &&
          run->device_content_fault_device != nullptr && run->content_identities_device != nullptr &&
+         run->device_seal_v2 != nullptr && run->resident_control_device_v2 != nullptr &&
+         run->smc_weights_device_v2 != nullptr &&
          run->cub_scratch_device != nullptr && run->exact_chunk_coverage_device != nullptr &&
+         run->terminal_device_receipt_v2 != nullptr &&
          cursor.offset == cursor.capacity;
 }
 
@@ -813,17 +916,26 @@ __global__ void gene_hash_kernel_v1(
     const double* weights,
     std::uint64_t* hashes,
     std::uint64_t* values,
-    NeoResidentGenerationPlanV1 plan) {
+    NeoResidentGenerationPlanV1 plan,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t candidate =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (candidate < plan.logical_population_count) {
-    const std::uint64_t base = candidate * plan.max_terms_per_gene;
-    const std::uint64_t hash = full_fixed_stride_gene_hash_v1(
-        scalars[candidate], indices + base, weights + base, plan);
-    scalars[candidate].content_hash = hash;
-    hashes[candidate] = hash;
-    values[candidate] = candidate;
+  if (candidate >= plan.logical_population_count) {
+    return;
   }
+  // CUB is enqueued without a host-side fault round trip. Its complete input
+  // range therefore has to be defined even when an earlier device stage has
+  // latched a fault. Later semantic kernels and commit remain fault-gated.
+  values[candidate] = candidate;
+  if (*device_content_fault != 0u) {
+    hashes[candidate] = RESIDENT_CUB_FAULT_SENTINEL_KEY_V2;
+    return;
+  }
+  const std::uint64_t base = candidate * plan.max_terms_per_gene;
+  const std::uint64_t hash = full_fixed_stride_gene_hash_v1(
+      scalars[candidate], indices + base, weights + base, plan);
+  scalars[candidate].content_hash = hash;
+  hashes[candidate] = hash;
 }
 
 __global__ void verify_sorted_gene_dedup_kernel_v1(
@@ -840,6 +952,13 @@ __global__ void verify_sorted_gene_dedup_kernel_v1(
   const std::uint64_t position =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (position >= plan.logical_population_count) {
+    return;
+  }
+  // DeviceSelect consumes every flag. On a fault, write a deterministic empty
+  // selection instead of leaving cudaMallocAsync storage undefined.
+  if (*device_content_fault_device != 0u) {
+    sorted_unique_flags[position] = 0;
+    candidate_valid_flags[position] = 0;
     return;
   }
   const std::uint64_t candidate = sorted_values[position];
@@ -866,13 +985,17 @@ __global__ void build_gene_identity_rank_keys_kernel_v1(
     const NeoResidentGenerationGeneScalarV1* scalars,
     std::uint64_t* keys,
     std::uint64_t* values,
-    std::uint64_t count) {
+    std::uint64_t count,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t index =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < count) {
-    keys[index] = stable_gene_identity_tie_key_v1(scalars[index]);
-    values[index] = index;
+  if (index >= count) {
+    return;
   }
+  values[index] = index;
+  keys[index] = *device_content_fault == 0u
+                    ? stable_gene_identity_tie_key_v1(scalars[index])
+                    : RESIDENT_CUB_FAULT_SENTINEL_KEY_V2;
 }
 
 __global__ void gather_resident_decision_rank_keys_kernel_v1(
@@ -881,16 +1004,23 @@ __global__ void gather_resident_decision_rank_keys_kernel_v1(
     const std::uint64_t* stable_order,
     std::uint64_t* keys,
     std::uint64_t* values,
-    std::uint64_t count) {
+    std::uint64_t count,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t position =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (position < count) {
-    const std::uint64_t candidate = stable_order[position];
-    keys[position] = candidate_valid_flags[candidate] != 0
-                         ? resident_decision_keys[candidate]
-                         : 0;
-    values[position] = candidate;
+  if (position >= count) {
+    return;
   }
+  if (*device_content_fault != 0u) {
+    keys[position] = RESIDENT_CUB_FAULT_SENTINEL_KEY_V2;
+    values[position] = position;
+    return;
+  }
+  const std::uint64_t candidate = stable_order[position];
+  keys[position] = candidate_valid_flags[candidate] != 0
+                       ? resident_decision_keys[candidate]
+                       : 0;
+  values[position] = candidate;
 }
 
 __device__ bool checked_rank_weight_total_v1(std::uint64_t count,
@@ -939,7 +1069,8 @@ __global__ void select_rank_weighted_parents_kernel_v1(
     std::uint32_t* device_content_fault_device) {
   const std::uint64_t child =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (child >= plan.logical_population_count) {
+  if (*device_content_fault_device != 0u ||
+      child >= plan.logical_population_count) {
     return;
   }
   const std::uint64_t logical_population_count = plan.logical_population_count;
@@ -965,10 +1096,19 @@ __global__ void select_rank_weighted_survivors_kernel_v1(
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  const std::uint64_t u64_max_v1 = ~std::uint64_t{0};
-  for (std::uint64_t rank = 0; rank < plan.logical_population_count; ++rank) {
-    rank_available[rank] = 1;
+  // SortKeys always consumes survivor_count entries. Identity sentinels make
+  // the full range deterministic even if a prior or in-kernel fault aborts the
+  // semantic survivor draw before overwriting every entry.
+  for (std::uint64_t selected = 0; selected < plan.survivor_count; ++selected) {
+    selected_rank_indices[selected] = selected;
   }
+  for (std::uint64_t rank = 0; rank < plan.logical_population_count; ++rank) {
+    rank_available[rank] = *device_content_fault_device == 0u ? 1 : 0;
+  }
+  if (*device_content_fault_device != 0u) {
+    return;
+  }
+  const std::uint64_t u64_max_v1 = ~std::uint64_t{0};
   for (std::uint64_t selected = 0; selected < plan.survivor_count; ++selected) {
     std::uint64_t total = 0;
     for (std::uint64_t rank = 0; rank < plan.logical_population_count; ++rank) {
@@ -1013,10 +1153,11 @@ __global__ void gather_rank_weighted_survivors_kernel_v1(
     const std::uint64_t* ranked_candidates,
     const std::uint64_t* sorted_selected_ranks,
     std::uint64_t* selected_candidates,
-    std::uint64_t survivor_count) {
+    std::uint64_t survivor_count,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t selected =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (selected < survivor_count) {
+  if (*device_content_fault == 0u && selected < survivor_count) {
     selected_candidates[selected] = ranked_candidates[sorted_selected_ranks[selected]];
   }
 }
@@ -1051,10 +1192,12 @@ __global__ void crossover_resident_genes_kernel_v1(
     std::uint64_t* offspring_indices,
     double* offspring_weights,
     NeoResidentGenerationPlanV1 plan,
-    std::uint64_t generation_index) {
+    std::uint64_t generation_index,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t destination =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (destination >= plan.logical_population_count) {
+  if (*device_content_fault != 0u ||
+      destination >= plan.logical_population_count) {
     return;
   }
   if (destination < plan.survivor_count) {
@@ -1111,10 +1254,13 @@ __global__ void mutate_resident_genes_kernel_v1(
     std::uint64_t* indices,
     double* weights,
     NeoResidentGenerationPlanV1 plan,
-    std::uint64_t generation_index) {
+    std::uint64_t generation_index,
+    const std::uint32_t* device_content_fault) {
   const std::uint64_t candidate =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (candidate >= plan.logical_population_count || candidate < plan.survivor_count) {
+  if (*device_content_fault != 0u ||
+      candidate >= plan.logical_population_count ||
+      candidate < plan.survivor_count) {
     return;
   }
   auto& scalar = scalars[candidate];
@@ -1166,6 +1312,9 @@ __global__ void validate_and_import_scored_rows_kernel_v1(
   const std::uint64_t item =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (item >= active_scenarios) {
+    return;
+  }
+  if (*device_content_fault_device != 0u) {
     return;
   }
   const std::uint64_t logical_candidate = logical_offset + item;
@@ -1379,6 +1528,9 @@ __global__ void verify_exact_chunk_coverage_kernel_v1(
     std::uint32_t* device_content_fault_device) {
   const std::uint64_t index =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (*device_content_fault_device != 0u) {
+    return;
+  }
   if (index < population && exact_chunk_coverage_device[index] != 1) {
     atomicExch(device_content_fault_device, 1u);
   }
@@ -1461,8 +1613,21 @@ std::uint32_t grid_for_v1(std::uint64_t count) {
 
 std::int32_t record_ready_event_v1(NeoResidentGenerationRunV1* run,
                                    NeoResidentGenerationReadyEventV1* ready) {
-  const cudaError_t status = cudaEventRecord(run->ready_event, run->admitted_run_stream);
-  if (status != cudaSuccess) {
+  publish_resident_generation_device_seal_v2<<<1, 1, 0, run->admitted_run_stream>>>(
+      run->device_seal_v2, run->resident_control_device_v2,
+      run->device_content_fault_device,
+      run->gene_scalars_device, run->gene_indices_device, run->gene_weights_device,
+      run->offspring_gene_scalars_device, run->offspring_gene_indices_device,
+      run->offspring_gene_weights_device, run->smc_weights_device_v2, run->plan,
+      run->run_token, run->current_generation_index, run->store_epoch_v2,
+      run->current_store_index_v2, run->smc_gate_disabled_v2);
+  ++run->same_stream_enqueue_count;
+  const std::int32_t launch_status = launch_status_v1();
+  if (launch_status != NEO_RESIDENT_STATUS_OK_V1) {
+    return launch_status;
+  }
+  const cudaError_t event_status = cudaEventRecord(run->ready_event, run->admitted_run_stream);
+  if (event_status != cudaSuccess) {
     return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
   }
   ++run->same_stream_enqueue_count;
@@ -1474,6 +1639,7 @@ std::int32_t record_ready_event_v1(NeoResidentGenerationRunV1* run,
   ready->same_stream_enqueue_count = run->same_stream_enqueue_count;
   ready->intermediate_host_wait_count = 0;
   ready->intermediate_readback_count = 0;
+  run->ready_receipt_token_v2 = ready;
   return NEO_RESIDENT_STATUS_OK_V1;
 }
 
@@ -1494,7 +1660,8 @@ std::int32_t launch_device_gene_hash_v1(NeoResidentGenerationRunV1* run,
   gene_hash_kernel_v1<<<grid_for_v1(run->logical_population_count), threads, 0,
                         run->admitted_run_stream>>>(
       scalars, indices, weights, run->gene_hashes_a_device,
-      run->dedup_values_a_device, run->plan);
+      run->dedup_values_a_device, run->plan,
+      run->device_content_fault_device);
   ++run->same_stream_enqueue_count;
   std::int32_t status = launch_status_v1();
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
@@ -1547,7 +1714,8 @@ std::int32_t launch_device_parent_selection_v1(NeoResidentGenerationRunV1* run,
   build_gene_identity_rank_keys_kernel_v1<<<grid_for_v1(run->logical_population_count),
                                             threads, 0, run->admitted_run_stream>>>(
       run->gene_scalars_device, run->rank_keys_a_device,
-      run->rank_values_a_device, run->logical_population_count);
+      run->rank_values_a_device, run->logical_population_count,
+      run->device_content_fault_device);
   ++run->same_stream_enqueue_count;
   std::int32_t status = launch_status_v1();
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
@@ -1568,7 +1736,8 @@ std::int32_t launch_device_parent_selection_v1(NeoResidentGenerationRunV1* run,
       run->admitted_run_stream>>>(
       run->resident_decision_keys_device, run->selection_flags_device,
       run->rank_values_b_device, run->rank_keys_a_device,
-      run->rank_values_a_device, run->logical_population_count);
+      run->rank_values_a_device, run->logical_population_count,
+      run->device_content_fault_device);
   ++run->same_stream_enqueue_count;
   status = launch_status_v1();
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
@@ -1617,7 +1786,8 @@ std::int32_t launch_device_parent_selection_v1(NeoResidentGenerationRunV1* run,
         run->admitted_run_stream>>>(run->rank_values_b_device,
                                     run->rank_keys_a_device,
                                     run->selected_indices_device,
-                                    run->plan.survivor_count);
+                                    run->plan.survivor_count,
+                                    run->device_content_fault_device);
     ++run->same_stream_enqueue_count;
     status = launch_status_v1();
   }
@@ -1632,7 +1802,8 @@ std::int32_t launch_device_crossover_v1(NeoResidentGenerationRunV1* run,
       run->gene_scalars_device, run->gene_indices_device, run->gene_weights_device,
       run->selected_indices_device, run->parent_a_device, run->parent_b_device,
       run->offspring_gene_scalars_device, run->offspring_gene_indices_device,
-      run->offspring_gene_weights_device, run->plan, generation_index);
+      run->offspring_gene_weights_device, run->plan, generation_index,
+      run->device_content_fault_device);
   ++run->same_stream_enqueue_count;
   return launch_status_v1();
 }
@@ -1643,7 +1814,8 @@ std::int32_t launch_device_mutation_v1(NeoResidentGenerationRunV1* run,
   mutate_resident_genes_kernel_v1<<<grid_for_v1(run->logical_population_count),
                                     threads, 0, run->admitted_run_stream>>>(
       run->offspring_gene_scalars_device, run->offspring_gene_indices_device,
-      run->offspring_gene_weights_device, run->plan, generation_index);
+      run->offspring_gene_weights_device, run->plan, generation_index,
+      run->device_content_fault_device);
   ++run->same_stream_enqueue_count;
   return launch_status_v1();
 }
@@ -1658,6 +1830,7 @@ void rotate_resident_generation_stores_v1(NeoResidentGenerationRunV1* run) {
   auto* weight = run->gene_weights_device;
   run->gene_weights_device = run->offspring_gene_weights_device;
   run->offspring_gene_weights_device = weight;
+  run->current_store_index_v2 ^= 1u;
 }
 
 constexpr bool strict_generation_has_no_candidate_revival_v1 = true;
@@ -1691,22 +1864,46 @@ extern "C" std::int32_t query_resident_generation_allocation_v1(
       static_cast<std::uint32_t>(current_device) != import->selected_cuda_ordinal) {
     return NEO_RESIDENT_STATUS_IDENTITY_MISMATCH_V1;
   }
-  GenerationPhysicalLayoutV1 layout{};
-  if (!checked_physical_layout_v1(*plan, import->admitted_run_stream, &layout)) {
-    return NEO_RESIDENT_STATUS_ARITHMETIC_OVERFLOW_V1;
-  }
   std::size_t same_context_free_bytes = 0;
   std::size_t same_context_total_bytes = 0;
   if (cudaMemGetInfo(&same_context_free_bytes, &same_context_total_bytes) != cudaSuccess) {
     return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
   }
   (void)same_context_total_bytes;
-  if (import->full_discovery_reserve_bytes > same_context_free_bytes ||
+  return calculate_resident_generation_allocation_v2(
+      plan, import->admitted_run_stream, same_context_free_bytes,
+      import->full_discovery_reserve_bytes, receipt);
+}
+
+extern "C" std::int32_t calculate_resident_generation_allocation_v2(
+    const NeoResidentGenerationPlanV1* plan,
+    cudaStream_t admitted_run_stream,
+    std::uint64_t same_context_free_bytes,
+    std::uint64_t full_discovery_reserve_bytes,
+    NeoResidentGenerationAllocationReceiptV1* receipt) {
+  if (plan == nullptr || receipt == nullptr || admitted_run_stream == nullptr) {
+    return NEO_RESIDENT_STATUS_INVALID_ARGUMENT_V1;
+  }
+  if (plan->abi_version != NEO_RESIDENT_GENERATION_ABI_V1) {
+    return NEO_RESIDENT_STATUS_ABI_MISMATCH_V1;
+  }
+  if (plan->parent_selection_policy != NEO_RESIDENT_PARENT_RANK_WEIGHTED_V1 ||
+      plan->survivor_selection_policy != NEO_RESIDENT_SURVIVOR_RANK_WEIGHTED_V1) {
+    return NEO_RESIDENT_STATUS_UNSUPPORTED_SELECTION_V1;
+  }
+  if (!validate_plan_v1(plan)) {
+    return NEO_RESIDENT_STATUS_INVALID_ARGUMENT_V1;
+  }
+  GenerationPhysicalLayoutV1 layout{};
+  if (!checked_physical_layout_v1(*plan, admitted_run_stream, &layout)) {
+    return NEO_RESIDENT_STATUS_ARITHMETIC_OVERFLOW_V1;
+  }
+  if (full_discovery_reserve_bytes > same_context_free_bytes ||
       layout.total_device_bytes >
-          same_context_free_bytes -
-              static_cast<std::size_t>(import->full_discovery_reserve_bytes)) {
+          same_context_free_bytes - full_discovery_reserve_bytes) {
     return NEO_RESIDENT_STATUS_OUT_OF_MEMORY_V1;
   }
+  std::memset(receipt, 0, sizeof(*receipt));
   receipt->abi_version = NEO_RESIDENT_GENERATION_ABI_V1;
   receipt->generation_store_allocation_count = 1;
   receipt->logical_gene_scalar_bytes = layout.logical_gene_scalar_bytes;
@@ -1720,9 +1917,11 @@ extern "C" std::int32_t query_resident_generation_allocation_v1(
   receipt->cub_scratch_bytes = layout.cub_scratch_bytes;
   receipt->retained_evaluation_workspace_bytes =
       layout.retained_evaluation_workspace_bytes;
+  receipt->terminal_device_receipt_bytes =
+      layout.terminal_device_receipt_bytes;
   receipt->total_device_bytes = layout.total_device_bytes;
   receipt->same_context_free_bytes = same_context_free_bytes;
-  receipt->full_discovery_reserve_bytes = import->full_discovery_reserve_bytes;
+  receipt->full_discovery_reserve_bytes = full_discovery_reserve_bytes;
   receipt->logical_population_count = plan->logical_population_count;
   receipt->retained_evaluation_capacity = plan->retained_evaluation_capacity;
   receipt->generation_chunk_count = layout.generation_chunk_count;
@@ -1747,22 +1946,21 @@ extern "C" std::int32_t create_resident_generation_run_from_import_v1(
       !identity_equal_v1(receipt->allocation_plan_sha256, plan->plan_identity_sha256)) {
     return NEO_RESIDENT_STATUS_IDENTITY_MISMATCH_V1;
   }
-  std::size_t current_free = 0;
-  std::size_t current_total = 0;
-  if (cudaMemGetInfo(&current_free, &current_total) != cudaSuccess) {
-    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
-  }
-  (void)current_total;
-  if (receipt->full_discovery_reserve_bytes > current_free ||
-      receipt->total_device_bytes > current_free - receipt->full_discovery_reserve_bytes) {
-    return NEO_RESIDENT_STATUS_OUT_OF_MEMORY_V1;
-  }
   auto* created = new (std::nothrow) NeoResidentGenerationRunV1{};
   if (created == nullptr) {
     return NEO_RESIDENT_STATUS_OUT_OF_MEMORY_V1;
   }
   created->plan = *plan;
   created->allocation = *receipt;
+  std::memcpy(created->cuda_device_identity_sha256,
+              import->cuda_device_identity_sha256,
+              sizeof(created->cuda_device_identity_sha256));
+  std::memcpy(created->primary_context_identity_sha256,
+              import->primary_context_identity_sha256,
+              sizeof(created->primary_context_identity_sha256));
+  std::memcpy(created->run_stream_identity_sha256,
+              import->run_stream_identity_sha256,
+              sizeof(created->run_stream_identity_sha256));
   created->admitted_run_stream = import->admitted_run_stream;
   created->resident_parent_ready_event = import->resident_parent_ready_event;
   created->ready_event = import->generation_ready_event;
@@ -1771,8 +1969,10 @@ extern "C" std::int32_t create_resident_generation_run_from_import_v1(
   created->retained_evaluation_capacity = plan->retained_evaluation_capacity;
   created->next_expected_logical_offset = 0;
   created->current_generation_index = 0;
+  created->store_epoch_v2 = 0;
   created->same_stream_enqueue_count = 0;
   created->next_event_id = 0;
+  created->completion_event_query_count_v2 = 0;
   created->sealed = false;
   created->post_ga_in_place_bound = false;
   created->current_store_index_v2 = 0;
@@ -1805,29 +2005,47 @@ extern "C" std::int32_t create_resident_generation_run_from_import_v1(
   if (created->run_token == 0) {
     created->run_token = 1;
   }
-  cudaError_t status = cudaMallocAsync(&created->allocation_base,
-                                       static_cast<std::size_t>(receipt->total_device_bytes),
-                                       created->admitted_run_stream);
+  void* attempted_allocation = nullptr;
+  cudaError_t status = cudaMallocAsync(
+      &attempted_allocation,
+      static_cast<std::size_t>(receipt->total_device_bytes),
+      created->admitted_run_stream);
   if (status != cudaSuccess) {
+    // Runtime allocation APIs may surface an earlier asynchronous fault. An
+    // attempted output identity is deliberately discarded without query/free.
+    attempted_allocation = nullptr;
     delete created;
-    return NEO_RESIDENT_STATUS_OUT_OF_MEMORY_V1;
+    return NEO_RESIDENT_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2;
   }
+  created->allocation_base = attempted_allocation;
   if (!partition_generation_allocation_v1(created)) {
+    void* allocation_to_retire =
+        retire_generation_allocation_identity_v2(created);
     const cudaError_t release_status =
-        cudaFreeAsync(created->allocation_base, created->admitted_run_stream);
-    if (release_status == cudaSuccess) {
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
       delete created;
+      return NEO_RESIDENT_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
     }
+    delete created;
     return NEO_RESIDENT_STATUS_ARITHMETIC_OVERFLOW_V1;
   }
   status = cudaStreamWaitEvent(created->admitted_run_stream,
                                created->resident_parent_ready_event, 0);
   if (status != cudaSuccess) {
+    void* allocation_to_retire =
+        retire_generation_allocation_identity_v2(created);
     const cudaError_t release_status =
-        cudaFreeAsync(created->allocation_base, created->admitted_run_stream);
-    if (release_status == cudaSuccess) {
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
       delete created;
+      return NEO_RESIDENT_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
     }
+    delete created;
     return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
   }
   created->same_stream_enqueue_count = 1;
@@ -1835,12 +2053,139 @@ extern "C" std::int32_t create_resident_generation_run_from_import_v1(
   return NEO_RESIDENT_STATUS_OK_V1;
 }
 
+extern "C" std::int32_t bind_resident_search_terminal_receipt_v2(
+    NeoResidentGenerationRunV1* run,
+    NeoResidentSearchTerminalReceiptV2* pinned_host_receipt) {
+  if (run == nullptr || pinned_host_receipt == nullptr || run->initialized_v2 ||
+      run->terminal_host_receipt_v2 != nullptr ||
+      run->terminal_device_receipt_v2 == nullptr) {
+    return NEO_RESIDENT_STATUS_STATE_ERROR_V1;
+  }
+  std::memset(pinned_host_receipt, 0, sizeof(*pinned_host_receipt));
+  run->terminal_host_receipt_v2 = pinned_host_receipt;
+  return NEO_RESIDENT_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t try_complete_resident_generation_advance_v2(
+    NeoResidentGenerationRunV1* run,
+    const NeoResidentSearchAdvancePendingReceiptV2* pending,
+    NeoResidentGenerationReadyEventV1* committed_ready,
+    NeoResidentSearchTerminalReceiptV2* terminal_copy) {
+  if (run == nullptr || pending == nullptr || committed_ready == nullptr ||
+      terminal_copy == nullptr || run->poisoned_v2 ||
+      !run->one_generation_advance_pending_v2 ||
+      run->pending_receipt_token_v2 != pending ||
+      pending->abi_version !=
+          resident_generation_v2::NEO_RESIDENT_GENERATION_GENE_VIEW_ABI_V2 ||
+      pending->reserved != 0u ||
+      pending->dependency_receipt_token != run->ready_receipt_token_v2 ||
+      pending->terminal_host_receipt_token != run->terminal_host_receipt_v2 ||
+      pending->completion_event_id != run->next_event_id ||
+      pending->target_generation_index != 1ull ||
+      pending->target_store_epoch != 2ull ||
+      pending->target_store_index != 1ull ||
+      pending->run_token != run->run_token) {
+    return NEO_RESIDENT_STATUS_STATE_ERROR_V1;
+  }
+  const cudaError_t query = cudaEventQuery(run->ready_event);
+  ++run->completion_event_query_count_v2;
+  if (query == cudaErrorNotReady) {
+    return resident_generation_v2::NEO_RESIDENT_SEARCH_NOT_READY_V2;
+  }
+  if (query != cudaSuccess) {
+    run->poisoned_v2 = true;
+    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
+  }
+  // The event was recorded after the compact D2H. Only now may the host read
+  // the pinned destination; NotReady never writes memory owned by that DMA.
+  *terminal_copy = *run->terminal_host_receipt_v2;
+  const std::uint64_t device_reported_query_count =
+      terminal_copy->completion_event_query_count;
+  terminal_copy->completion_event_query_count =
+      run->completion_event_query_count_v2;
+  const bool exact_terminal =
+      terminal_copy->abi_version ==
+          resident_generation_v2::NEO_RESIDENT_GENERATION_GENE_VIEW_ABI_V2 &&
+      terminal_copy->reserved == 0u &&
+      terminal_copy->run_token == run->run_token &&
+      terminal_copy->completion_event_id == pending->completion_event_id &&
+      terminal_copy->same_stream_enqueue_count ==
+          pending->same_stream_enqueue_count &&
+      terminal_copy->compact_async_d2h_count == 1ull &&
+      terminal_copy->compact_async_d2h_bytes == sizeof(*terminal_copy) &&
+      device_reported_query_count == 0ull &&
+      terminal_copy->completion_stream_synchronize_count == 0ull;
+  if (!exact_terminal) {
+    run->poisoned_v2 = true;
+    run->one_generation_advance_pending_v2 = false;
+    return NEO_RESIDENT_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  const bool has_device_fault = terminal_copy->scoring_device_fault != 0u ||
+                                terminal_copy->generation_device_fault != 0u ||
+                                terminal_copy->control_fault_word != 0u ||
+                                terminal_copy->stop_requested != 0u;
+  const bool exact_fault_terminal =
+      terminal_copy->terminal_status ==
+          resident_generation_v2::NEO_RESIDENT_SEARCH_TERMINAL_FAULT_V2 &&
+      has_device_fault && terminal_copy->generation_index == 0ull &&
+      terminal_copy->store_epoch == 1ull &&
+      terminal_copy->current_store_index == 0u;
+  const bool exact_committed_terminal =
+      terminal_copy->terminal_status ==
+          resident_generation_v2::NEO_RESIDENT_SEARCH_TERMINAL_COMMITTED_V2 &&
+      !has_device_fault && terminal_copy->generation_index == 1ull &&
+      terminal_copy->store_epoch == 2ull &&
+      terminal_copy->current_store_index == 1u;
+  if (!exact_fault_terminal && !exact_committed_terminal) {
+    run->poisoned_v2 = true;
+    run->one_generation_advance_pending_v2 = false;
+    return NEO_RESIDENT_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  // Cleanup authority requires both event completion and an exact compact
+  // receipt, including its fault/commit generation-store tuple. Event readiness
+  // alone cannot authorize release/reuse.
+  run->terminal_event_proven_v2 = true;
+  run->one_generation_advance_pending_v2 = false;
+  run->one_generation_advance_enqueued_v2 = true;
+  run->pending_receipt_token_v2 = nullptr;
+  if (exact_fault_terminal) {
+    run->poisoned_v2 = true;
+    return NEO_RESIDENT_STATUS_DEVICE_FAULT_V1;
+  }
+  rotate_resident_generation_stores_v1(run);
+  run->current_generation_index = terminal_copy->generation_index;
+  run->store_epoch_v2 = terminal_copy->store_epoch;
+  run->current_store_index_v2 = terminal_copy->current_store_index;
+  run->terminal_committed_v2 = true;
+  committed_ready->abi_version = NEO_RESIDENT_GENERATION_ABI_V1;
+  committed_ready->reserved = 0;
+  committed_ready->event_id = terminal_copy->completion_event_id;
+  committed_ready->generation_index = terminal_copy->generation_index;
+  committed_ready->same_stream_enqueue_count =
+      terminal_copy->same_stream_enqueue_count;
+  committed_ready->intermediate_host_wait_count = 0;
+  committed_ready->intermediate_readback_count = 0;
+  run->ready_receipt_token_v2 = committed_ready;
+  return NEO_RESIDENT_STATUS_OK_V1;
+}
+
 extern "C" std::int32_t initialize_resident_generation_population_v1(
     NeoResidentGenerationRunV1* run,
     NeoResidentGenerationReadyEventV1* ready) {
-  if (run == nullptr || ready == nullptr || run->sealed) {
+  if (run == nullptr || ready == nullptr || run->sealed || run->initialized_v2) {
     return NEO_RESIDENT_STATUS_STATE_ERROR_V1;
   }
+  if (cudaMemsetAsync(run->device_seal_v2, 0,
+                      sizeof(NeoResidentGenerationDeviceSealV2),
+                      run->admitted_run_stream) != cudaSuccess ||
+      cudaMemsetAsync(run->resident_control_device_v2, 0,
+                      sizeof(NeoResidentSearchDeviceControlV2),
+                      run->admitted_run_stream) != cudaSuccess ||
+      cudaMemsetAsync(run->smc_weights_device_v2, 0, 11 * sizeof(double),
+                      run->admitted_run_stream) != cudaSuccess) {
+    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
+  }
+  run->same_stream_enqueue_count += 3;
   constexpr std::uint32_t threads = 256;
   clear_generation_metadata_kernel_v1<<<grid_for_v1(run->logical_population_count),
                                         threads, 0, run->admitted_run_stream>>>(
@@ -1871,6 +2216,8 @@ extern "C" std::int32_t initialize_resident_generation_population_v1(
   }
   (void)strict_generation_has_no_candidate_revival_v1;
   (void)exact_candidate_identity_without_fillers_v1;
+  run->initialized_v2 = true;
+  run->store_epoch_v2 = 1;
   return record_ready_event_v1(run, ready);
 }
 
@@ -1974,6 +2321,7 @@ extern "C" std::int32_t enqueue_resident_rank_selection_offspring_v1(
   }
   rotate_resident_generation_stores_v1(run);
   ++run->current_generation_index;
+  ++run->store_epoch_v2;
   run->next_expected_logical_offset = 0;
   clear_exact_chunk_coverage_kernel_v1<<<grid_for_v1(run->logical_population_count),
                                          threads, 0, run->admitted_run_stream>>>(
@@ -2090,17 +2438,45 @@ extern "C" std::int32_t begin_resident_post_ga_in_place_v1(
 
 extern "C" std::int32_t enqueue_resident_generation_release_v1(
     NeoResidentGenerationRunV1* run) {
-  if (run == nullptr || run->allocation_base == nullptr || run->admitted_run_stream == nullptr) {
+  if (run == nullptr || run->allocation_base == nullptr ||
+      run->admitted_run_stream == nullptr ||
+      run->allocation_free_issued_v2) {
     return NEO_RESIDENT_STATUS_INVALID_ARGUMENT_V1;
   }
-  const cudaError_t release_status =
-      cudaFreeAsync(run->allocation_base, run->admitted_run_stream);
-  if (release_status != cudaSuccess) {
-    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
+  if (run->one_generation_advance_pending_v2 ||
+      (run->poisoned_v2 && !run->terminal_event_proven_v2)) {
+    // In-flight or fault-reachable storage is intentionally leaked rather than
+    // being reused/freed before its admitted stream reaches a safe boundary.
+    return NEO_RESIDENT_STATUS_STATE_ERROR_V1;
   }
-  run->allocation_base = nullptr;
+  void* allocation_to_retire =
+      retire_generation_allocation_identity_v2(run);
+  const cudaError_t release_status =
+      cudaFreeAsync(allocation_to_retire, run->admitted_run_stream);
+  if (release_status != cudaSuccess) {
+    run->poisoned_v2 = true;
+    run->free_outcome_unknown_deliberate_leak_v2 = true;
+    return NEO_RESIDENT_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
+  }
   run->ready_event = nullptr;
   delete run;
+  return NEO_RESIDENT_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t detach_resident_search_terminal_receipt_v2(
+    NeoResidentGenerationRunV1* run,
+    const void* expected_terminal_host_receipt) {
+  if (run == nullptr || expected_terminal_host_receipt == nullptr ||
+      static_cast<const void*>(run->terminal_host_receipt_v2) !=
+          expected_terminal_host_receipt ||
+      run->one_generation_advance_pending_v2 ||
+      (run->poisoned_v2 && !run->terminal_event_proven_v2)) {
+    return NEO_RESIDENT_STATUS_STATE_ERROR_V1;
+  }
+  // The population session remains the allocation owner until cudaFreeHost
+  // succeeds. Detaching first keeps the native generation owner valid if that
+  // host release fails and Rust must retain the handle fail-closed.
+  run->terminal_host_receipt_v2 = nullptr;
   return NEO_RESIDENT_STATUS_OK_V1;
 }
 

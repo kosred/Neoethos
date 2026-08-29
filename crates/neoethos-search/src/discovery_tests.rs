@@ -299,6 +299,7 @@ fn empty_portfolio_is_an_explicit_error() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: Vec::new(),
         candidates: vec![Gene::default()],
         quality_metrics: Vec::new(),
@@ -332,6 +333,7 @@ fn non_empty_portfolio_is_accepted() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![Gene::default()],
         candidates: vec![Gene::default()],
         quality_metrics: Vec::new(),
@@ -484,6 +486,7 @@ fn portfolio_export_requires_validation_gates() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -518,6 +521,7 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -659,6 +663,7 @@ fn holdout_portfolio_export_uses_effective_names_and_stored_selection_scope() {
         holdout_scope: Some(holdout_scope.clone()),
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -734,6 +739,7 @@ fn discovery_profile_exports_validation_gate_status() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: vec![profitable_gene("alpha-1")],
         quality_metrics: Vec::new(),
@@ -1094,6 +1100,7 @@ fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_owned(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio,
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1669,6 +1676,7 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![alpha_1.clone(), alpha_2.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1715,6 +1723,7 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![alpha.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1754,6 +1763,7 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -1857,6 +1867,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2364,6 +2375,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio,
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2410,6 +2422,7 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         holdout_scope: Some(holdout_scope.clone()),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![gene.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2475,6 +2488,7 @@ fn empty_discovery_result_with_gates(
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2667,6 +2681,7 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: vec![alpha],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -2762,6 +2777,7 @@ fn populated_discovery_result(
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio,
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -5336,6 +5352,7 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -5418,6 +5435,7 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
+        cost_band_census: CostBandCensus::default(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
@@ -5770,6 +5788,25 @@ fn a_cost_band_below_the_charged_cost_cannot_discriminate() {
         Some((2.8, 4.4)),
         f64::NAN
     ));
+}
+
+#[test]
+fn discovery_result_preserves_the_measured_cost_band_census() {
+    let mut result = strict_split_validation_result(vec![profitable_gene("measured-band")]);
+    result.cost_band_census = CostBandCensus {
+        survives: 3,
+        optimistic_edge_only: 1,
+        fails: 2,
+        unmeasured: 4,
+        not_discriminating: 5,
+    };
+
+    let encoded = serde_json::to_value(&result).expect("serialize discovery result");
+    assert_eq!(encoded["cost_band_census"]["survives"], 3);
+    assert_eq!(encoded["cost_band_census"]["optimistic_edge_only"], 1);
+    assert_eq!(encoded["cost_band_census"]["fails"], 2);
+    assert_eq!(encoded["cost_band_census"]["unmeasured"], 4);
+    assert_eq!(encoded["cost_band_census"]["not_discriminating"], 5);
 }
 
 /// Audit #75/#217 — the weekend kill zones are ONE knob, and the search reads it.

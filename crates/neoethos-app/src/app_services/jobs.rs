@@ -12,6 +12,17 @@ use std::sync::{
 pub enum JobKind {
     Discovery,
     Training,
+    CanonicalNativeResearch,
+}
+
+impl JobKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Training => "training",
+            Self::CanonicalNativeResearch => "canonical_native_research",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

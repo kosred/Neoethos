@@ -23,9 +23,9 @@
 //! input drives the choice) and delete the others.
 
 use super::ingredients::{
-    consistency_component, drawdown_penalty, drawdown_penalty_window, expectancy_component,
-    ga_pf_component, net_component, profit_factor_component, sharpe_component, trades_confidence,
-    trades_confidence_window, win_rate_component,
+    consistency_component, drawdown_penalty_window, expectancy_component, net_component,
+    profit_factor_component, sharpe_component, trades_confidence, trades_confidence_window,
+    win_rate_component,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,118 +87,7 @@ pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(5);
 /// trade_count < 1 → caller (the GA selection step) treats this as a
 /// "do not propagate" marker.
 pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
-    let net = metrics[0];
-    let sharpe = metrics[1];
-    let max_dd = metrics[3];
-    let win_rate = metrics[4];
-    let profit_factor = metrics[5];
-    // slot 7 (scoring_version 3): monthly_target_hit_rate — fraction of months hitting
-    // the operator's >=4% bar. The CONSISTENT-monthly-return signal (see eval.rs).
-    let monthly_hit = metrics[7];
-    let trades = metrics[8];
-    let consistency = metrics[9];
-
-    // Sharpe non-finite is still a hard reject — the metric is unusable
-    // and any score derived from it is meaningless.
-    if !sharpe.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    let trades_f = trades;
-
-    // **2026-05-26 (GA Fix B — graduated fitness, taskdoc #274)**: the
-    // Python prototype this engine replaced learned to NEVER trade
-    // because `max_dd == 0` trivially satisfies the operator's
-    // `max_dd <= 4%` filter. Returning `f64::NEG_INFINITY` for the
-    // zero-trade case makes 0-trade and 1-trade candidates indistinguishable,
-    // denying the GA any fitness gradient to escape this reward-hack —
-    // every Discovery cycle ends with an empty archive.
-    //
-    // The fix is a graduated penalty:
-    //   1. Zero-trade returns a STRONGLY-NEGATIVE-BUT-FINITE score
-    //      (-100.0) so any trading strategy beats it but mutation can
-    //      still reach trade-firing genes through small fitness deltas.
-    //   2. Trade-count up to ~30/month earns an `activity` multiplier
-    //      [0.033, 1.0] that scales the positive-fitness components.
-    //      30 trades/month is a typical pro-trader pace.
-    //   3. The drawdown PENALTY is unscaled — we still want the GA to
-    //      avoid blowups, just not via the "do nothing" loophole.
-    //
-    // Side effect: the previous Phase-A pin test
-    // (`ga_fitness_matches_legacy_score_from_metrics_pin`) updates from
-    // 0.335 to ~0.335 because 100 trades / 30 = 3.33 → activity clamped
-    // to 1.0 → multiplier (0.3 + 0.7 * 1.0) = 1.0 → math unchanged.
-    if trades_f < 1.0 {
-        return -100.0;
-    }
-
-    // Activity bonus: 1 trade/month = 0.033, 30+/month = 1.0. We can't
-    // know the actual run-month-count from a `[f64;11]` here, so we use
-    // a coarse proxy: trade-count itself capped at 30. This is fine
-    // because the GA's purpose at this level is to PREFER trade-firing
-    // genes — once the population has them, downstream gating
-    // (passes_filter, quality_score) applies stricter trades_per_month
-    // checks.
-    let activity = (trades_f / 30.0).clamp(0.0, 1.0);
-    let activity_mult = 0.3 + 0.7 * activity;
-
-    let conf = trades_confidence(trades);
-    // **2026-06-06 (scoring_version 3 — CONSISTENT-monthly-return GA)**:
-    // v2 rewarded TOTAL net (net/12k), but compounding made that reward LUMPY — the GA
-    // converged on genes with huge AGGREGATE return concentrated in a few periods
-    // (in-sample Sharpe 6-13) that ALL failed the prop-firm window-consistency gate
-    // (best gene passed only ~11% of 60-day windows vs the 65% floor). High total net
-    // ≠ a temporally-stable edge.
-    //
-    // The DOMINANT reward is now `monthly_hit` (metrics[7]) = the fraction of months
-    // that hit the operator's >=4%/month bar — the SAME consistency the prop-firm gate
-    // checks, so the GA now searches FOR what survives the gate. `net` is kept as a
-    // smaller magnitude bonus (so among equally-consistent genes the GA still prefers
-    // bigger returns). `sharpe`/`consistency` are demoted: both are monthly mean/std
-    // (consistency = sharpe/3.46 clamped), which a few big months inflate — they do
-    // NOT predict the window pass-rate, which is exactly why v2 over-rewarded lumpy
-    // genes. The DD penalty stays UNSCALED so blow-ups are still rejected.
-    // ⚠ WHERE `monthly_hit` COMES FROM, and the knob that silently truncates it
-    // (2026-08-10). Slot 7 is produced from `monthly_pnls` / `month_start_equities`
-    // in `eval.rs`, both of which are sized by
-    // `models.backtest_runtime.month_capacity`. Months beyond that capacity are
-    // DROPPED — silently, in two places — so this term, the dominant one in the
-    // whole objective at 0.45, is computed over the FIRST `month_capacity`
-    // months of the dataset and not over the dataset. The knob catalog
-    // advertises `min: Some(12)` while describing it as a RAM cap: setting the
-    // UI-endorsed minimum scores every gene on its first twelve months of a
-    // ten-year record and returns a perfectly plausible number.
-    //
-    // The 0.45 is NOT the defect and is deliberately not touched here — the
-    // coverage is. A validator refusing a `month_capacity` below the months the
-    // loaded frame spans, plus a logged coverage figure, is the fix; it lands
-    // with the evaluator that does the dropping, not with this weight.
-    let hit = monthly_hit.clamp(0.0, 1.0) * 0.45;
-    let ret = (net / 20_000.0).clamp(-2.0, 2.0) * 0.15;
-    let sh = sharpe_component(sharpe, conf) * 0.10;
-    let cons = consistency_component(consistency) * 0.10;
-    let pf = ga_pf_component(profit_factor) * if profit_factor >= 1.0 { 0.15 } else { 0.25 };
-    let wr = win_rate_component(win_rate) * 0.10;
-    let dd = drawdown_penalty(max_dd);
-
-    // **2026-07-02 (scoring_version 4 — STEADY-INCOME worst-period penalty)**:
-    // the operator's product goal is a stable MONTHLY income, and the missing
-    // half of "stable" was the DOWNSIDE: v3 rewarded frequent >=4% months
-    // (slot 7) but nothing punished the occasional CATASTROPHIC period that
-    // sets a small account back months. `max_daily_drawdown` (slot 10) was
-    // computed by the evaluator and IGNORED by the GA. Penalize it now —
-    // catastrophic months are built from catastrophic days, so the daily
-    // granularity is the stricter, earlier signal. Weight 10.0 (vs overall-DD's
-    // 15.0): a 3% worst-day costs 0.30 — decisive between otherwise-equal
-    // genes, not dominant over the whole objective. Like the DD penalty it is
-    // NOT activity-scaled: a blow-up day disqualifies regardless of activity.
-    let max_daily_dd = metrics[10];
-    let daily_dd_pen = max_daily_dd.clamp(0.0, 1.0) * 10.0;
-
-    // Positive components scaled by activity so low-trade candidates (1–5 trades
-    // over the whole window) cannot win on noise; the DD penalties are NOT scaled —
-    // full weight, rejects blow-ups even when return is high.
-    (hit + ret + sh + cons + pf + wr) * activity_mult - dd - daily_dd_pen
+    neoethos_gpu_contracts::resident_search_scoring_v2::score_prop_firm_ga_fitness_v4(metrics)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,48 +119,7 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
 /// `risky_mode` domain manager + the risky WF filter, not the fitness), so
 /// unlike v4 there is no DD or worst-day penalty here.
 pub fn ga_fitness_growth(metrics: &[f64; 11]) -> f64 {
-    let net = metrics[0];
-    let sharpe = metrics[1];
-    let win_rate = metrics[4];
-    let profit_factor = metrics[5];
-    let trades = metrics[8];
-
-    if !sharpe.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-    if trades < 1.0 {
-        return -100.0;
-    }
-
-    // p capped at 0.99: an all-wins tiny-sample gene would otherwise zero out
-    // rr (no observed losses) and score 0 — worse than genes with real edges.
-    let p = win_rate.clamp(0.0, 0.99);
-    // pf capped at 10: a lucky 3-trade gene can post an absurd PF; the cap
-    // keeps growth finite-ish and lets trade count (evidence) do the talking.
-    let pf = profit_factor.clamp(0.0, 10.0);
-    // Kelly fraction f* = p·(pf−1)/pf; half-Kelly, capped 25% — identical to
-    // the Risky ranking so search and ranking agree on what "growth" means.
-    let f_star = if pf > 1.0 && p > 0.0 {
-        p * (pf - 1.0) / pf
-    } else {
-        0.0
-    };
-    let f = (f_star * 0.5).clamp(0.0, 0.25);
-    let rr = if p > 0.0 { pf * (1.0 - p) / p } else { 0.0 };
-    let g_trade = if f > 0.0 && rr > 0.0 {
-        p * (1.0 + rr * f).ln() + (1.0 - p) * (1.0 - f).ln()
-    } else {
-        0.0
-    };
-    let growth = g_trade * trades;
-
-    // ≤ 0 by construction (each term clamps its positive side away): only
-    // shapes the BELOW-edge region, never competes with a positive growth.
-    let edge_gradient = (pf - 1.0).clamp(-1.0, 0.0) * 0.05
-        + (p - 0.5).clamp(-0.5, 0.0) * 0.05
-        + (net / 20_000.0).clamp(-2.0, 0.0) * 0.01;
-
-    growth * 10.0 + edge_gradient
+    neoethos_gpu_contracts::resident_search_scoring_v2::score_risky_ga_fitness_growth_v5(metrics)
 }
 
 // ---------------------------------------------------------------------------

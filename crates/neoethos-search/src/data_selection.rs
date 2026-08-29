@@ -20,6 +20,10 @@ use neoethos_data::{
     load_exact_dataset_series_receipt, prepare_multitimeframe_features_with_options,
     require_direct_timeframes, resolved_canonical_feature_execution_authority_v1,
 };
+#[cfg(feature = "gpu-cuda")]
+use neoethos_data::{
+    CanonicalGpuResidentFeatureExecutionSemanticV1, SealedGpuResidentFeatureStoreV3,
+};
 use neoethos_dataset_contracts::CanonicalDatasetScope;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -29,10 +33,23 @@ const CANONICAL_SEARCH_INPUT_RECEIPT_SCHEMA_VERSION_V2: u16 = 2;
 const CANONICAL_SEARCH_INPUT_RECEIPT_HASH_DOMAIN_V2: &[u8] =
     b"neoethos.canonical-search-input-receipt.v2\0";
 const CANONICAL_FEATURE_CONTENT_HASH_DOMAIN_V1: &[u8] = b"neoethos.canonical-feature-content.v1\0";
+#[cfg(feature = "gpu-cuda")]
+const CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_SCHEMA_VERSION_V3: u16 = 3;
+#[cfg(feature = "gpu-cuda")]
+const CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_HASH_DOMAIN_V3: &[u8] =
+    b"neoethos.canonical-gpu-resident-search-input-receipt.v3\0";
+#[cfg(feature = "gpu-cuda")]
+const CANONICAL_GPU_RESIDENT_CONTENT_MERKLE_ALGORITHM_V3: &str =
+    "neoethos.canonical-feature-content.merkle.v3";
 const CANONICAL_FEATURE_EXECUTION_SCHEMA_VERSION_V1: u16 = 1;
 const CANONICAL_SEARCH_ARTIFACT_SCOPE_SCHEMA_VERSION_V2: u16 = 2;
 const CANONICAL_SEARCH_ARTIFACT_SCOPE_HASH_DOMAIN_V2: &[u8] =
     b"neoethos.canonical-search-artifact-scope.v2\0";
+#[cfg(feature = "gpu-cuda")]
+const CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_SCHEMA_VERSION_V3: u16 = 3;
+#[cfg(feature = "gpu-cuda")]
+const CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_HASH_DOMAIN_V3: &[u8] =
+    b"neoethos.canonical-gpu-resident-search-artifact-scope.v3\0";
 const CANONICAL_SEARCH_ARTIFACT_ENVELOPE_SCHEMA_VERSION_V2: u16 = 2;
 
 pub const CANONICAL_VECTOR_TA_CPU_MATH_AUTHORITY_V1: &str = VECTOR_TA_CPU_F64_MATH_AUTHORITY_V1;
@@ -748,6 +765,29 @@ pub struct CanonicalSearchInputReceiptV2 {
     source_bindings: Vec<CanonicalSearchSourceBindingReceiptV1>,
 }
 
+/// Versioned identity of one exact GPU-resident feature payload.
+///
+/// V3 deliberately does not alias the CPU V2 linear content hash. It binds
+/// the semantic-v3 Merkle root produced by the strict CUDA graph under its
+/// own algorithm identifier, together with the exact resident shape and the
+/// immutable source/plan provenance. Missing or legacy fields fail closed.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalGpuResidentSearchInputReceiptV3 {
+    schema_version: u16,
+    anchor_dataset_identity: String,
+    feature_plan_identity: String,
+    feature_provenance_identity: String,
+    content_merkle_algorithm: String,
+    feature_content_merkle_sha256: String,
+    normalization_fit_sha256: String,
+    row_count: u64,
+    column_count: u64,
+    feature_execution: CanonicalFeatureExecutionReceiptV1,
+    source_bindings: Vec<CanonicalSearchSourceBindingReceiptV1>,
+}
+
 /// Exclusive production policy recorded by a canonical feature receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -802,6 +842,60 @@ pub struct CanonicalSearchSourceSegmentReceiptV1 {
     timestamp_end_ms: i64,
 }
 
+#[cfg(all(test, feature = "gpu-cuda"))]
+pub(crate) fn canonical_result_maximum_json_receipt_v3_for_test(
+    maximum_general_string: &str,
+    source_count: usize,
+    total_segment_count: usize,
+) -> CanonicalGpuResidentSearchInputReceiptV3 {
+    assert!(source_count > 0);
+    assert!(total_segment_count >= source_count);
+    let fixed_sha256 = "f".repeat(64);
+    let mut remaining_segments = total_segment_count;
+    let source_bindings = (0..source_count)
+        .map(|source_index| {
+            let remaining_sources = source_count - source_index;
+            let segment_count = remaining_segments / remaining_sources;
+            remaining_segments -= segment_count;
+            CanonicalSearchSourceBindingReceiptV1 {
+                source_node_id: maximum_general_string.to_owned(),
+                dataset_identity: maximum_general_string.to_owned(),
+                manifest_schema_id: maximum_general_string.to_owned(),
+                manifest_sha256: fixed_sha256.clone(),
+                generation_id: maximum_general_string.to_owned(),
+                vortex_sha256: fixed_sha256.clone(),
+                bar_timestamp_convention: maximum_general_string.to_owned(),
+                segments: (0..segment_count)
+                    .map(|_| CanonicalSearchSourceSegmentReceiptV1 {
+                        row_start: u64::MAX,
+                        row_end: u64::MAX,
+                        timestamp_start_ms: i64::MIN,
+                        timestamp_end_ms: i64::MIN,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    CanonicalGpuResidentSearchInputReceiptV3 {
+        schema_version: u16::MAX,
+        anchor_dataset_identity: maximum_general_string.to_owned(),
+        feature_plan_identity: fixed_sha256.clone(),
+        feature_provenance_identity: fixed_sha256.clone(),
+        content_merkle_algorithm: CANONICAL_GPU_RESIDENT_CONTENT_MERKLE_ALGORITHM_V3.to_owned(),
+        feature_content_merkle_sha256: fixed_sha256.clone(),
+        normalization_fit_sha256: fixed_sha256,
+        row_count: u64::MAX,
+        column_count: u64::MAX,
+        feature_execution: CanonicalFeatureExecutionReceiptV1 {
+            schema_version: u16::MAX,
+            compute_policy: CanonicalFeatureComputePolicyV1::GpuOnly,
+            vector_ta_math_authority: CANONICAL_VECTOR_TA_CUDA_MATH_AUTHORITY_V1.to_owned(),
+            selected_lane: CanonicalFeatureMathLaneV1::GpuCudaF64Strict,
+        },
+        source_bindings,
+    }
+}
+
 /// Semantic role of one exact evaluated window inside a receipt-bound search.
 ///
 /// Roles are serialized as part of the artifact identity so in-sample,
@@ -845,6 +939,18 @@ pub struct CanonicalSearchEvaluatedWindowV1 {
 pub struct CanonicalSearchArtifactScopeV2 {
     schema_version: u16,
     receipt: CanonicalSearchInputReceiptV2,
+    receipt_sha256: String,
+    evaluated_window: CanonicalSearchEvaluatedWindowV1,
+}
+
+/// GPU-native artifact scope. This is a separate schema rather than a V2
+/// receipt with a Merkle root smuggled into the linear-hash field.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalGpuResidentSearchArtifactScopeV3 {
+    schema_version: u16,
+    receipt: CanonicalGpuResidentSearchInputReceiptV3,
     receipt_sha256: String,
     evaluated_window: CanonicalSearchEvaluatedWindowV1,
 }
@@ -1656,6 +1762,312 @@ impl CanonicalSearchInputReceiptV2 {
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
+impl CanonicalGpuResidentSearchInputReceiptV3 {
+    pub fn from_resident_store(
+        anchor: &CanonicalDatasetIdentity,
+        store: &SealedGpuResidentFeatureStoreV3,
+    ) -> Result<Self, CanonicalDataSelectionError> {
+        let row_count = store.contract().layout().row_count();
+        let column_count = store.contract().layout().column_count();
+        let receipt = Self {
+            schema_version: CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_SCHEMA_VERSION_V3,
+            anchor_dataset_identity: anchor.to_path_component(),
+            feature_plan_identity: hex(&store.final_feature_plan_v3_sha256()),
+            feature_provenance_identity: hex(&store.source_provenance_sha256()),
+            content_merkle_algorithm: CANONICAL_GPU_RESIDENT_CONTENT_MERKLE_ALGORITHM_V3.to_owned(),
+            feature_content_merkle_sha256: hex(&store
+                .contract()
+                .canonical_feature_content_merkle_sha256()),
+            normalization_fit_sha256: hex(&store.normalization_fit_sha256()),
+            row_count,
+            column_count,
+            feature_execution: CanonicalFeatureExecutionReceiptV1 {
+                schema_version: CANONICAL_FEATURE_EXECUTION_SCHEMA_VERSION_V1,
+                compute_policy: CanonicalFeatureComputePolicyV1::GpuOnly,
+                vector_ta_math_authority: CANONICAL_VECTOR_TA_CUDA_MATH_AUTHORITY_V1.to_owned(),
+                selected_lane: CanonicalFeatureMathLaneV1::GpuCudaF64Strict,
+            },
+            source_bindings: source_binding_receipts_from_store_v3(store),
+        };
+        receipt.validate_against_store(anchor, store)?;
+        Ok(receipt)
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn anchor_dataset_identity(&self) -> &str {
+        &self.anchor_dataset_identity
+    }
+
+    pub fn feature_plan_identity(&self) -> &str {
+        &self.feature_plan_identity
+    }
+
+    pub fn feature_provenance_identity(&self) -> &str {
+        &self.feature_provenance_identity
+    }
+
+    pub fn content_merkle_algorithm(&self) -> &str {
+        &self.content_merkle_algorithm
+    }
+
+    pub fn feature_content_merkle_sha256(&self) -> &str {
+        &self.feature_content_merkle_sha256
+    }
+
+    pub fn normalization_fit_sha256(&self) -> &str {
+        &self.normalization_fit_sha256
+    }
+
+    pub const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub const fn column_count(&self) -> u64 {
+        self.column_count
+    }
+
+    pub const fn feature_execution(&self) -> &CanonicalFeatureExecutionReceiptV1 {
+        &self.feature_execution
+    }
+
+    pub fn source_bindings(&self) -> &[CanonicalSearchSourceBindingReceiptV1] {
+        &self.source_bindings
+    }
+
+    pub fn validate(&self) -> Result<CanonicalDatasetIdentity, CanonicalDataSelectionError> {
+        if self.schema_version != CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_SCHEMA_VERSION_V3 {
+            return Err(invalid_receipt(format!(
+                "unsupported GPU-resident input receipt schema version {}; expected {}",
+                self.schema_version, CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_SCHEMA_VERSION_V3
+            )));
+        }
+        let anchor = CanonicalDatasetIdentity::from_path_component(&self.anchor_dataset_identity)
+            .map_err(|error| {
+            invalid_receipt(format!("GPU-resident anchor identity: {error}"))
+        })?;
+        validate_sha256_hex(
+            "GPU-resident feature plan identity",
+            &self.feature_plan_identity,
+        )?;
+        validate_sha256_hex(
+            "GPU-resident feature provenance identity",
+            &self.feature_provenance_identity,
+        )?;
+        validate_sha256_hex(
+            "GPU-resident feature content Merkle SHA-256",
+            &self.feature_content_merkle_sha256,
+        )?;
+        validate_sha256_hex(
+            "GPU-resident normalization-fit SHA-256",
+            &self.normalization_fit_sha256,
+        )?;
+        if self.content_merkle_algorithm != CANONICAL_GPU_RESIDENT_CONTENT_MERKLE_ALGORITHM_V3 {
+            return Err(invalid_receipt(format!(
+                "unsupported GPU-resident content Merkle algorithm `{}`",
+                self.content_merkle_algorithm
+            )));
+        }
+        if self.row_count == 0 || self.column_count == 0 {
+            return Err(invalid_receipt(
+                "GPU-resident input receipt has an empty row/column shape",
+            ));
+        }
+        self.feature_execution.validate()?;
+        if self.feature_execution.compute_policy() != CanonicalFeatureComputePolicyV1::GpuOnly
+            || self.feature_execution.selected_lane()
+                != CanonicalFeatureMathLaneV1::GpuCudaF64Strict
+        {
+            return Err(invalid_receipt(
+                "GPU-resident input receipt is not bound to the strict CUDA lane",
+            ));
+        }
+        validate_source_binding_receipts_v3(&anchor, &self.source_bindings)?;
+        let anchor_id = anchor.to_path_component();
+        let anchor_bindings = self
+            .source_bindings
+            .iter()
+            .filter(|binding| binding.dataset_identity == anchor_id)
+            .collect::<Vec<_>>();
+        let anchor_rows = anchor_bindings[0]
+            .segments
+            .iter()
+            .try_fold(0_u64, |rows, segment| {
+                rows.checked_add(segment.row_end - segment.row_start)
+                    .ok_or_else(|| invalid_receipt("GPU-resident anchor row-count overflow"))
+            })?;
+        if anchor_rows != self.row_count {
+            return Err(provenance_mismatch(
+                &anchor,
+                format!(
+                    "GPU-resident receipt has {} rows but its anchor segments cover {anchor_rows}",
+                    self.row_count
+                ),
+            ));
+        }
+        Ok(anchor)
+    }
+
+    pub fn validate_against_store(
+        &self,
+        anchor: &CanonicalDatasetIdentity,
+        store: &SealedGpuResidentFeatureStoreV3,
+    ) -> Result<(), CanonicalDataSelectionError> {
+        let received_anchor = self.validate()?;
+        let device = store.device_identity();
+        let execution_authority = store
+            .validated_gpu_resident_feature_execution_authority_v1()
+            .map_err(|error| {
+                provenance_mismatch(
+                    anchor,
+                    format!("sealed Data store GPU execution authority is invalid: {error}"),
+                )
+            })?;
+        let expected_bindings = source_binding_receipts_from_store_v3(store);
+        if &received_anchor != anchor
+            || self.feature_plan_identity != hex(&store.final_feature_plan_v3_sha256())
+            || self.feature_plan_identity != store.feature_plan().identity().to_hex()
+            || execution_authority.semantic()
+                != CanonicalGpuResidentFeatureExecutionSemanticV1::GpuCudaF64Strict
+            || execution_authority.final_feature_plan_v3_sha256()
+                != store.final_feature_plan_v3_sha256()
+            || self.feature_plan_identity
+                != hex(&execution_authority.final_feature_plan_v3_sha256())
+            || execution_authority.classic_ta_implementation_sha256()
+                != execution_authority.vector_ta_build_sha256()
+            || execution_authority.identity_sha256() == [0; 32]
+            || self.feature_provenance_identity != hex(&store.source_provenance_sha256())
+            || self.feature_provenance_identity != store.source_provenance().identity().to_hex()
+            || self.feature_content_merkle_sha256
+                != hex(&store.contract().canonical_feature_content_merkle_sha256())
+            || self.normalization_fit_sha256 != hex(&store.normalization_fit_sha256())
+            || self.row_count != store.contract().layout().row_count()
+            || self.column_count != store.contract().layout().column_count()
+            || self.source_bindings != expected_bindings
+            || device.vector_ta_build_sha256() == [0; 32]
+        {
+            return Err(provenance_mismatch(
+                anchor,
+                "GPU-resident receipt does not match the sealed Data store",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn identity_sha256(&self) -> Result<String, CanonicalDataSelectionError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| invalid_receipt(format!("serialize GPU-resident receipt: {error}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(CANONICAL_GPU_RESIDENT_SEARCH_INPUT_RECEIPT_HASH_DOMAIN_V3);
+        hasher.update(bytes);
+        Ok(hex(&hasher.finalize()))
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, CanonicalDataSelectionError> {
+        self.validate()?;
+        serde_json::to_vec(self)
+            .map_err(|error| invalid_receipt(format!("serialize GPU-resident JSON: {error}")))
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, CanonicalDataSelectionError> {
+        let receipt: Self = serde_json::from_slice(bytes)
+            .map_err(|error| invalid_receipt(format!("parse GPU-resident JSON: {error}")))?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+impl CanonicalGpuResidentSearchArtifactScopeV3 {
+    pub fn for_entire_receipt(
+        role: CanonicalSearchWindowRoleV1,
+        receipt: CanonicalGpuResidentSearchInputReceiptV3,
+    ) -> Result<Self, CanonicalDataSelectionError> {
+        let anchor = receipt.validate()?;
+        let anchor_id = anchor.to_path_component();
+        let anchor_bindings = receipt
+            .source_bindings()
+            .iter()
+            .filter(|binding| binding.dataset_identity() == anchor_id)
+            .collect::<Vec<_>>();
+        if anchor_bindings.len() != 1 {
+            return Err(provenance_mismatch(
+                &anchor,
+                "GPU-resident scope requires exactly one anchor source binding",
+            ));
+        }
+        let segments = anchor_bindings[0].segments();
+        for adjacent in segments.windows(2) {
+            if adjacent[0].row_end() != adjacent[1].row_start() {
+                return Err(provenance_mismatch(
+                    &anchor,
+                    "one GPU-resident scope cannot represent disjoint anchor segments",
+                ));
+            }
+        }
+        let first = segments
+            .first()
+            .ok_or_else(|| provenance_mismatch(&anchor, "GPU-resident anchor has no segments"))?;
+        let last = segments
+            .last()
+            .ok_or_else(|| provenance_mismatch(&anchor, "GPU-resident anchor has no segments"))?;
+        let evaluated_window = CanonicalSearchEvaluatedWindowV1::new(
+            role,
+            first.row_start(),
+            last.row_end(),
+            first.timestamp_start_ms(),
+            last.timestamp_end_ms(),
+        )?;
+        let receipt_sha256 = receipt.identity_sha256()?;
+        let scope = Self {
+            schema_version: CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_SCHEMA_VERSION_V3,
+            receipt,
+            receipt_sha256,
+            evaluated_window,
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub const fn receipt(&self) -> &CanonicalGpuResidentSearchInputReceiptV3 {
+        &self.receipt
+    }
+
+    pub const fn evaluated_window(&self) -> &CanonicalSearchEvaluatedWindowV1 {
+        &self.evaluated_window
+    }
+
+    pub fn validate(&self) -> Result<(), CanonicalDataSelectionError> {
+        if self.schema_version != CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_SCHEMA_VERSION_V3 {
+            return Err(invalid_receipt(format!(
+                "unsupported GPU-resident artifact scope schema {}; expected {}",
+                self.schema_version, CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_SCHEMA_VERSION_V3
+            )));
+        }
+        if self.receipt_sha256 != self.receipt.identity_sha256()? {
+            return Err(invalid_receipt(
+                "GPU-resident artifact scope receipt SHA-256 drifted",
+            ));
+        }
+        validate_gpu_resident_window_v3(&self.evaluated_window, &self.receipt)
+    }
+
+    pub fn identity_sha256(&self) -> Result<String, CanonicalDataSelectionError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            invalid_receipt(format!("serialize GPU-resident artifact scope: {error}"))
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(CANONICAL_GPU_RESIDENT_SEARCH_ARTIFACT_SCOPE_HASH_DOMAIN_V3);
+        hasher.update(bytes);
+        Ok(hex(&hasher.finalize()))
+    }
+}
+
 impl CanonicalSearchSourceBindingReceiptV1 {
     pub fn source_node_id(&self) -> &str {
         &self.source_node_id
@@ -1810,6 +2222,152 @@ fn source_binding_receipts(features: &FeatureFrame) -> Vec<CanonicalSearchSource
         .collect::<Vec<_>>();
     bindings.sort_by(|left, right| left.source_node_id.cmp(&right.source_node_id));
     bindings
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn source_binding_receipts_from_store_v3(
+    store: &neoethos_data::SealedGpuResidentFeatureStoreV3,
+) -> Vec<CanonicalSearchSourceBindingReceiptV1> {
+    let mut bindings = store
+        .source_provenance()
+        .bindings()
+        .iter()
+        .map(|binding| CanonicalSearchSourceBindingReceiptV1 {
+            source_node_id: binding.source_node_id().to_owned(),
+            dataset_identity: binding.dataset_identity().to_path_component(),
+            manifest_schema_id: binding.manifest_schema_id().to_owned(),
+            manifest_sha256: hex(binding.manifest_hash()),
+            generation_id: binding.generation_id().to_owned(),
+            vortex_sha256: hex(binding.vortex_hash()),
+            bar_timestamp_convention: binding.bar_timestamp_convention().to_string(),
+            segments: binding
+                .segments()
+                .iter()
+                .map(|segment| CanonicalSearchSourceSegmentReceiptV1 {
+                    row_start: segment.row_start(),
+                    row_end: segment.row_end(),
+                    timestamp_start_ms: segment.timestamp_start_ms(),
+                    timestamp_end_ms: segment.timestamp_end_ms(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.source_node_id.cmp(&right.source_node_id));
+    bindings
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn validate_source_binding_receipts_v3(
+    anchor: &CanonicalDatasetIdentity,
+    bindings: &[CanonicalSearchSourceBindingReceiptV1],
+) -> Result<(), CanonicalDataSelectionError> {
+    if bindings.is_empty() {
+        return Err(invalid_receipt(
+            "GPU-resident receipt source bindings are empty",
+        ));
+    }
+    let mut previous_node: Option<&str> = None;
+    let mut contains_anchor = false;
+    for binding in bindings {
+        validate_nonempty("GPU-resident source node id", &binding.source_node_id)?;
+        if previous_node.is_some_and(|previous| previous >= binding.source_node_id.as_str()) {
+            return Err(invalid_receipt(format!(
+                "GPU-resident source bindings are not strictly ordered or repeat `{}`",
+                binding.source_node_id
+            )));
+        }
+        previous_node = Some(&binding.source_node_id);
+        let identity = CanonicalDatasetIdentity::from_path_component(&binding.dataset_identity)
+            .map_err(|error| {
+                invalid_receipt(format!(
+                    "GPU-resident source node `{}` dataset identity: {error}",
+                    binding.source_node_id
+                ))
+            })?;
+        contains_anchor |= &identity == anchor;
+        validate_nonempty(
+            "GPU-resident manifest schema id",
+            &binding.manifest_schema_id,
+        )?;
+        validate_sha256_hex("GPU-resident manifest SHA-256", &binding.manifest_sha256)?;
+        validate_nonempty("GPU-resident generation id", &binding.generation_id)?;
+        validate_sha256_hex("GPU-resident Vortex SHA-256", &binding.vortex_sha256)?;
+        if binding.bar_timestamp_convention != identity.bar_timestamp_convention().to_string() {
+            return Err(invalid_receipt(format!(
+                "GPU-resident source node `{}` bar convention disagrees with its identity",
+                binding.source_node_id
+            )));
+        }
+        validate_segments(&binding.source_node_id, &binding.segments)?;
+    }
+    if !contains_anchor {
+        return Err(provenance_mismatch(
+            anchor,
+            "GPU-resident receipt has no exact anchor source binding",
+        ));
+    }
+    let anchor_count = bindings
+        .iter()
+        .filter(|binding| binding.dataset_identity == anchor.to_path_component())
+        .count();
+    if anchor_count != 1 {
+        return Err(provenance_mismatch(
+            anchor,
+            format!(
+                "GPU-resident receipt requires one anchor source binding; found {anchor_count}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn validate_gpu_resident_window_v3(
+    window: &CanonicalSearchEvaluatedWindowV1,
+    receipt: &CanonicalGpuResidentSearchInputReceiptV3,
+) -> Result<(), CanonicalDataSelectionError> {
+    window.validate_shape()?;
+    let anchor = receipt.validate()?;
+    let anchor_id = anchor.to_path_component();
+    let anchor_binding = receipt
+        .source_bindings()
+        .iter()
+        .find(|binding| binding.dataset_identity() == anchor_id)
+        .ok_or_else(|| {
+            provenance_mismatch(&anchor, "GPU-resident scope anchor binding is absent")
+        })?;
+    let segments = anchor_binding.segments();
+    let first = segments
+        .first()
+        .ok_or_else(|| provenance_mismatch(&anchor, "GPU-resident anchor has no segments"))?;
+    let last = segments
+        .last()
+        .ok_or_else(|| provenance_mismatch(&anchor, "GPU-resident anchor has no segments"))?;
+    if window.timestamp_start_ms() < first.timestamp_start_ms()
+        || window.timestamp_end_ms() > last.timestamp_end_ms()
+    {
+        return Err(provenance_mismatch(
+            &anchor,
+            "GPU-resident evaluated timestamps fall outside the anchor segments",
+        ));
+    }
+    let mut cursor = window.row_start();
+    for segment in segments {
+        if cursor >= window.row_end() {
+            break;
+        }
+        if cursor < segment.row_start() || cursor >= segment.row_end() {
+            continue;
+        }
+        cursor = window.row_end().min(segment.row_end());
+    }
+    if cursor != window.row_end() {
+        return Err(provenance_mismatch(
+            &anchor,
+            "GPU-resident evaluated row window is not covered by contiguous anchor segments",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_receipt(detail: impl Into<String>) -> CanonicalDataSelectionError {

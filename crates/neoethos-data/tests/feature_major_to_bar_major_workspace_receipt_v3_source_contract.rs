@@ -125,9 +125,9 @@ fn receipt_moves_through_preflight_admission_and_seal_then_checks_real_evidence(
     require_all(
         &compact,
         &[
-            "GpuOnlyFeatureRecipePreflightV3{plan,footprint,regime,robust_normalization,feature_major_to_bar_major,canonical_content_sha256,}",
-            "GpuOnlyFeatureMaterializationAdmissionV3{authority:DATA_GPU_ONLY_ADMISSION_AUTHORITY_V3,contract,run_device,footprint,regime,robust_normalization,feature_major_to_bar_major,canonical_content_sha256,}",
-            "GpuOnlyFeatureMaterializationSealTokenV3{authority:self.authority,contract:self.contract,footprint:self.footprint,regime:self.regime,robust_normalization:self.robust_normalization,feature_major_to_bar_major:self.feature_major_to_bar_major,canonical_content_sha256:self.canonical_content_sha256,}",
+            "GpuOnlyFeatureRecipePreflightV3{plan,footprint,feature_major_to_bar_major,canonical_content_sha256,}",
+            "GpuOnlyFeatureMaterializationAdmissionV3{authority:DATA_GPU_ONLY_ADMISSION_AUTHORITY_V3,contract,run_device,footprint,feature_major_to_bar_major,canonical_content_sha256,}",
+            "GpuOnlyFeatureMaterializationSealTokenV3{authority:self.authority,contract:self.contract,footprint:self.footprint,feature_major_to_bar_major:self.feature_major_to_bar_major,canonical_content_sha256:self.canonical_content_sha256,}",
             "feature_major_to_bar_major.validate_working_set(&working_set)?",
             "feature_major_to_bar_major.validate_runtime_evidence(&evidence,&ready_event)?",
         ],
@@ -152,7 +152,6 @@ fn production_census_retains_the_real_layout_producer_after_later_receipts() {
         &[
             "resident_classic_ta_capability_v3()?",
             "resident_smc_capability_v3()?",
-            "resident_robust_normalization_capability_v2()?",
             "resident_feature_major_to_bar_major_capability_v3()?",
         ],
     );
@@ -165,12 +164,13 @@ fn production_census_retains_the_real_layout_producer_after_later_receipts() {
     for producer in [
         "ResidentFeatureProducerV3::Quant",
         "ResidentFeatureProducerV3::Session",
+        "ResidentFeatureProducerV3::Regime",
         "ResidentFeatureProducerV3::HigherTimeframeAlignment",
+        "ResidentFeatureProducerV3::RobustNormalization",
     ] {
         assert!(pending.contains(producer), "missing pending {producer}");
     }
-    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 3);
-    assert!(!pending.contains("ResidentFeatureProducerV3::RobustNormalization"));
+    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 5);
     assert!(!pending.contains("CanonicalContentSha256"));
     assert!(!pending.contains("FeatureMajorToBarMajor"));
 }

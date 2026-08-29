@@ -292,11 +292,11 @@ fn normalize_feature_name(name: &str) -> String {
 ///    vocabulary at 217 columns the collision surface was already populated —
 ///    `ob` matches `obv` and `moving_average_cross_probability`, `fvg` matches
 ///    `fvg_positioning_average` and `fvg_trailing_stop`, `liq` matches
-///    `quant_amihud_illiquidity`, and `trend` matched 25 classic ids plus the
-///    retired v2 Regime trend-strength label. The correct binding held only
-///    because the SMC family is emitted FIRST in the frame and its own column
-///    therefore came first in column order. That is positional luck, not a
-///    binding rule, and the vocabulary just grew 27x.
+///    `quant_amihud_illiquidity`, `trend` matches 25 classic ids plus
+///    `regime_trend_strength`. The correct binding held only because the SMC
+///    family is emitted FIRST in the frame and its own column therefore came
+///    first in column order. That is positional luck, not a binding rule, and
+///    the vocabulary just grew 27x.
 /// 2. The alias PRIORITY ORDER was inert. `["smc_ob", "order_block", "ob"]`
 ///    did not prefer `smc_ob`: the first matching COLUMN won, whichever alias
 ///    it happened to match. Here the candidate list is the outer loop, so the
@@ -809,7 +809,7 @@ mod column_binding_tests {
         "fvg_trailing_stop",
         "quant_amihud_illiquidity",
         "adaptive_schaff_trend_cycle",
-        "regime_wilder_adx_14_v3",
+        "regime_trend_strength",
         "supertrend",
         "choch_reversal_probability",
         "premium_zone_index",

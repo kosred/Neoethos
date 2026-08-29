@@ -1,6 +1,13 @@
 use std::f64::consts::LN_2;
 use std::sync::OnceLock;
 
+/// Frozen operation schedule shared by every CPU stop-target logarithm and
+/// the resident CUDA adaptive-base producer. This is a broad stop-target
+/// semantic version: Parkinson, Garman-Klass, Rogers-Satchell, Yang-Zhang,
+/// expected shortfall, Hurst and regime inference all consume `safe_log`.
+pub const STOP_TARGET_LOG_OPERATION_SCHEDULE_V3: &str =
+    neoethos_data::QUANT_LOG_OPERATION_SCHEDULE_V3;
+
 /// Why a per-bar stop-distance series could not be built.
 ///
 /// This is deliberately NOT an `Option`. The old `Option` collapsed two
@@ -291,7 +298,7 @@ impl Default for StopTargetSettings {
 }
 
 fn safe_log(v: f64) -> f64 {
-    v.max(1e-12).ln()
+    neoethos_data::quant_log_positive_f64_v3(v.max(1e-12)).unwrap_or(f64::NAN)
 }
 
 fn rolling_mean(values: &[f64], window: usize) -> Vec<f64> {
@@ -1358,6 +1365,89 @@ pub fn adaptive_stops_rr() -> f64 {
 #[cfg(test)]
 mod adaptive_stop_tests {
     use super::*;
+
+    #[test]
+    fn stop_target_safe_log_is_the_frozen_quant_semantic_v3_schedule() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for _ in 0..200_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let exponent = 1_u64 + ((state >> 52) % 0x7fe);
+            let mantissa = state & 0x000f_ffff_ffff_ffff;
+            let value = f64::from_bits((exponent << 52) | mantissa).max(1e-12);
+            let expected = neoethos_data::quant_log_positive_f64_v3(value)
+                .expect("positive finite stop-target log input");
+            assert_eq!(
+                safe_log(value).to_bits(),
+                expected.to_bits(),
+                "stop-target safe_log detached from quant semantic-v3 for input_bits=0x{:016x}",
+                value.to_bits()
+            );
+        }
+
+        let floor = neoethos_data::quant_log_positive_f64_v3(1e-12)
+            .expect("safe-log floor is positive and finite");
+        for value in [0.0, -0.0, -1.0, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(safe_log(value).to_bits(), floor.to_bits());
+        }
+        assert_eq!(
+            STOP_TARGET_LOG_OPERATION_SCHEDULE_V3,
+            neoethos_data::QUANT_LOG_OPERATION_SCHEDULE_V3
+        );
+        assert!(STOP_TARGET_LOG_OPERATION_SCHEDULE_V3.contains("cpu-cuda-bit-tolerance=zero"));
+    }
+
+    #[test]
+    fn canonical_resident_adaptive_view_golden_is_bit_frozen() {
+        use sha2::{Digest, Sha256};
+
+        const ROWS: usize = 160;
+        const CHECKPOINTS: [usize; 7] = [0, 48, 49, 99, 100, 101, 159];
+        let mut high = Vec::with_capacity(ROWS);
+        let mut low = Vec::with_capacity(ROWS);
+        let mut close = Vec::with_capacity(ROWS);
+        for index in 0..ROWS {
+            let base = 1.08 + index as f64 * 1e-5;
+            let delta = [3e-5, -2e-5, 1e-5, -4e-5][index % 4];
+            let bar_close = base + delta;
+            high.push(base.max(bar_close) + 7e-5 + (index % 3) as f64 * 1e-6);
+            low.push(base.min(bar_close) - 6e-5 - (index % 5) as f64 * 1e-6);
+            close.push(bar_close);
+        }
+
+        let base = adaptive_base_pips_series(&high, &low, &close, 1e-4)
+            .expect("canonical 160-row adaptive fixture must build");
+        let mut bytes = Vec::with_capacity(base.len() * std::mem::size_of::<f64>());
+        for value in &base {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let digest = Sha256::digest(bytes);
+        let digest_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let checkpoint_bits = CHECKPOINTS.map(|index| base[index].to_bits());
+        eprintln!("adaptive-golden-sha256={digest_hex}");
+        eprintln!("adaptive-golden-checkpoints={checkpoint_bits:x?}");
+
+        assert_eq!(
+            digest_hex,
+            "f407ad99d1bdc238602ab1b28065e61e828183e56e97528759a1d992274ba78b"
+        );
+        assert_eq!(
+            checkpoint_bits,
+            [
+                0x3e11_2e0b_e826_d695,
+                0x3e11_2e0b_e826_d695,
+                0x4001_049e_d07d_1db7,
+                0x4001_0569_5b28_6744,
+                0x4001_0fae_b68c_45f7,
+                0x4001_055c_7dca_6cbb,
+                0x4001_0569_3d50_cb03,
+            ]
+        );
+    }
 
     #[test]
     fn adaptive_sl_tp_series_scales_with_vol_and_holds_rr() {

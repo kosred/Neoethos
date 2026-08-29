@@ -57,6 +57,9 @@ pub mod indicator_telemetry;
 pub mod indicators;
 pub mod normalization;
 pub mod pinned_canonical_series_v1;
+#[cfg(feature = "gpu-cuda")]
+pub mod pinned_source_projection_v1;
+pub mod quant_exact_math_v3;
 pub mod quant_features;
 pub mod regime_detection;
 mod regime_exact_math_v1;

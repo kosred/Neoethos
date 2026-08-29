@@ -32,8 +32,17 @@ use crate::eval::SmcRow;
 use crate::gpu_native::prototype_a::PrototypeAGeneUpload;
 use crate::gpu_native::prototype_population_oracle::population_settings_for_settings;
 use crate::gpu_native::scenario;
+use crate::population_auto_sizing_receipt_v1::{
+    NativePopulationAutoPlanFactsV1, POPULATION_AUTO_ALLOCATOR_RESERVE_BYTES_V1,
+    POPULATION_AUTO_HARD_GROWTH_CAP_V1, PopulationAutoSizingErrorCodeV1,
+    PopulationAutoSizingErrorV1, sizing_error_v1,
+};
+use crate::population_execution_evidence_v1::UnsplittablePopulationAllocationV1;
 
-use neoethos_gpu_cuda::{CudaPopulationError, PopulationGeneView, PopulationResidencyCountersV1};
+use neoethos_gpu_cuda::{
+    CudaPopulationError, PopulationGeneStorePlanV1, PopulationGeneView,
+    PopulationMetricsOnlyPlanV1, PopulationParentDevicePlanV1, PopulationResidencyCountersV1,
+};
 
 /// Metric row shape shared with the CPU and CubeCL lanes.
 const ZERO_METRICS: [f64; 11] = [0.0; 11];
@@ -48,23 +57,6 @@ pub(crate) fn prototype_b_available() -> bool {
     neoethos_gpu_cuda::runtime_available() && neoethos_gpu_cuda::device_count() > 0
 }
 
-/// Candidates the card can host at once, from free VRAM rather than from the
-/// caller's population.
-///
-/// What the session allocates per candidate is `MAX_TRADES_PER_CANDIDATE`
-/// outcome records — ~590 KB — plus the monthly buckets and its metric row, so
-/// peak memory is a function of the requested population. That is the never-OOM
-/// invariant inverted, and it is why this ceiling is computed from the device
-/// instead: the caller asks for what the hardware has room for, never for what
-/// it wants.
-///
-/// Measured: validation asks for ~25 000 candidates in one call (250 folds x
-/// 100 Monte-Carlo runs). At 1.03 MB each over 87 715 bars that is ~25 GB on a
-/// 24 GB card — it failed, the retry halved it, the halves failed too because
-/// the first failure had already left the context unusable, and 25 000 of
-/// 25 250 items ran on the CPU after 30 s of wasted attempts.
-///
-/// Deciding the size up front costs one query and removes the failure entirely.
 /// Sustained device throughput, in scenario-bars per second.
 ///
 /// Measured 2026-08 on an RTX 3090 at populations 16 384 and 131 072: 843-966 M
@@ -83,14 +75,12 @@ const SCENARIO_BARS_PER_SECOND: u64 = 843_000_000;
 
 /// How long one submission should take.
 ///
-/// This constant exists because fusing signal synthesis into the walk removed
-/// the thing that used to bound a launch. Per-scenario device memory fell from
-/// 4 811 048 B to 593 768 B, so a 24 GB card now fits on the order of 30 000
-/// scenarios at 87 715 bars — and if the trade slots are ever dropped for a
-/// metrics-only mode, over four million. At ~1 000 scenarios/second a four
-/// million scenario launch runs for more than an hour with NO host observation
-/// point: no progress, no telemetry line, no chance to cancel, and a failure
-/// anywhere in it discards all of it.
+/// The active strict path is metrics-only: at the default 240-month capacity it
+/// allocates exactly 4 000 bytes per scenario and zero outcome records. That
+/// makes time, rather than scenario VRAM, the normal launch bound. At about
+/// 1 000 scenarios/second a multi-million-scenario launch can run for more than
+/// an hour with no host observation point: no progress, no telemetry line, no
+/// chance to cancel, and a failure anywhere in it discards all of it.
 ///
 /// So sizing gained a second term. Memory says what the card can HOLD; this
 /// says what the operator can WATCH. The launch takes the smaller.
@@ -113,9 +103,25 @@ const OCCUPANCY_KNEE: u64 = 16_384;
 /// estimated 102 s launch against a 20 s target. That is the right trade — a
 /// launch that does not fill the card wastes more than it saves — but an
 /// unobservable 102 s is exactly what this term exists to stop being a surprise.
-fn candidates_for_target_launch(bars: usize) -> u64 {
-    let bars = (bars as u64).max(1);
-    let raw = SCENARIO_BARS_PER_SECOND.saturating_mul(TARGET_LAUNCH_SECONDS) / bars;
+pub(crate) fn checked_candidates_for_target_launch_v1(
+    bars: usize,
+) -> std::result::Result<(u64, u64, bool), CudaPopulationError> {
+    let bars = u64::try_from(bars)
+        .map_err(|_| {
+            CudaPopulationError::InvalidInput(
+                "evaluation rows do not fit the strict u64 time plan".to_owned(),
+            )
+        })?
+        .max(1);
+    let raw = SCENARIO_BARS_PER_SECOND
+        .checked_mul(TARGET_LAUNCH_SECONDS)
+        .ok_or_else(|| {
+            CudaPopulationError::InvalidInput(
+                "strict target-launch numerator overflows u64".to_owned(),
+            )
+        })?
+        / bars;
+    let floor_overrode = raw < OCCUPANCY_KNEE;
     if raw < OCCUPANCY_KNEE {
         tracing::warn!(
             target: "neoethos_search::eval",
@@ -128,7 +134,42 @@ fn candidates_for_target_launch(bars: usize) -> u64 {
              longer than the target with no host observation point"
         );
     }
-    raw.max(OCCUPANCY_KNEE)
+    Ok((raw, raw.max(OCCUPANCY_KNEE), floor_overrode))
+}
+
+fn max_effective_scenario_window_rows_v1(
+    scenarios: &[ScenarioDescriptor],
+    evaluation_rows: usize,
+) -> Result<usize> {
+    let mut maximum = 0usize;
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let offset = usize::try_from(scenario.window_offset)
+            .with_context(|| format!("scenario {index} window offset does not fit this process"))?;
+        let length = if scenario.window_len == 0 {
+            evaluation_rows.checked_sub(offset).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scenario {index} starts at {offset}, past the {evaluation_rows}-row evaluation view"
+                )
+            })?
+        } else {
+            usize::try_from(scenario.window_len).with_context(|| {
+                format!("scenario {index} window length does not fit this process")
+            })?
+        };
+        let end = offset.checked_add(length).ok_or_else(|| {
+            anyhow::anyhow!("scenario {index} effective window extent overflows usize")
+        })?;
+        if length == 0 || end > evaluation_rows {
+            bail!(
+                "scenario {index} effective window {offset}..{end} is outside the {evaluation_rows}-row evaluation view"
+            );
+        }
+        maximum = maximum.max(length);
+    }
+    if maximum == 0 {
+        bail!("strict time sizing requires at least one non-empty scenario window");
+    }
+    Ok(maximum)
 }
 
 /// What the sizing arithmetic concluded.
@@ -143,136 +184,391 @@ fn candidates_for_target_launch(bars: usize) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sizing {
     /// The card can host this many scenarios in one launch.
-    Fits(usize),
-    /// `cudaMemGetInfo` did not answer. Size conservatively and carry on.
-    Unreadable,
-    /// The card answered and it has no usable room. Not a batching problem.
+    Fits {
+        memory_ceiling: usize,
+        time_ceiling: usize,
+        chosen: usize,
+    },
+    /// The admitted card has no usable room. Scenario splitting cannot repair
+    /// an immutable parent or gene-store allocation that does not fit.
     NoRoom {
-        dataset_bytes: u64,
+        fixed_device_bytes: u64,
         budget_bytes: u64,
+    },
+    /// The immutable parent and exact gene store fit, but even one strict
+    /// metrics-only scenario does not fit in the remaining admitted budget.
+    NoScenarioRoom {
+        available_device_bytes: u64,
+        one_scenario_device_bytes: u64,
     },
 }
 
-fn candidates_that_fit(
-    device: usize,
-    bars: usize,
-    feature_count: usize,
-    month_capacity: usize,
-) -> Sizing {
-    match neoethos_gpu_cuda::device_free_memory_bytes(device) {
-        Some(free) => candidates_for_free_memory(free, bars, feature_count, month_capacity),
-        None => Sizing::Unreadable,
-    }
+const ALLOCATOR_RESERVE_BYTES_V1: u64 = POPULATION_AUTO_ALLOCATOR_RESERVE_BYTES_V1;
+
+fn admitted_budget_bytes_v1(
+    pre_parent_free_memory_bytes: u64,
+) -> std::result::Result<u64, CudaPopulationError> {
+    (pre_parent_free_memory_bytes / 10)
+        .checked_mul(7)
+        .ok_or_else(|| {
+            CudaPopulationError::InvalidInput(
+                "strict admitted memory budget overflows u64".to_owned(),
+            )
+        })
 }
 
-/// The arithmetic, separated from the device query so it can be checked without
-/// a card. The numbers it produces decide whether a run uses the GPU at all.
+/// Exact strict runtime plan against the free-memory snapshot captured on the
+/// selected ordinal before this run allocated its resident parent.
 ///
-/// TWO terms now, and they answer different questions:
-///
-///   * memory — what the card can HOLD. Unchanged in intent, but the
-///     per-scenario cost collapsed: `bars * 5` is gone because the `signal_values`
-///     (i8) and `signal_confidences` (f32) columns are gone. Those two carried a
-///     value from the signal kernel to the reduce and nothing else; the walk
-///     now produces it in registers as it advances. At 843 456 bars they were
-///     4 217 280 B per scenario — 87.7 % of the old 4 811 048 B, and the sole
-///     reason a 24 GB card resolved to 3 316 scenarios and the quality screen
-///     grew a six-chunk loop. What is left is real: 8 192 trade slots at 72 B
-///     plus 3 944 B of monthly buckets and metric row = 593 768 B.
-///
-///   * time — what the operator can WATCH. See [`TARGET_LAUNCH_SECONDS`].
-///     Memory no longer binds anywhere near as early, so without this a launch
-///     could run for an hour with no observation point.
-///
-/// The launch takes the SMALLER. Peak memory therefore stays a function of the
-/// hardware alone — the time term can only ever lower the count, never raise it
-/// past what the card was measured to hold.
-fn prototype_b_dataset_peak_bytes(bars: usize, feature_count: usize) -> u64 {
-    let bars = bars as u64;
-    let indicator_elements = bars.saturating_mul(feature_count as u64);
-    let indicator_bytes = indicator_elements.saturating_mul(std::mem::size_of::<f64>() as u64);
-    let fixed_per_bar = (3 * std::mem::size_of::<f64>()
-        + 3 * std::mem::size_of::<i64>()
-        + std::mem::size_of::<f64>()
-        + std::mem::size_of::<u8>()
-        + 11 * std::mem::size_of::<i8>()) as u64;
-    bars.saturating_mul(fixed_per_bar)
-        .saturating_add(indicator_bytes)
-}
-
-fn candidates_for_free_memory(
-    free: u64,
-    bars: usize,
+/// `resident_parent_rows` and `evaluation_rows` are deliberately different:
+/// the former sizes immutable VRAM, while the latter sizes the observable
+/// launch-duration ceiling. Stage 1 may evaluate 25% of a parent that must
+/// remain resident in full.
+fn candidates_for_pre_parent_free_memory(
+    pre_parent_free_memory_bytes: u64,
+    resident_parent_rows: usize,
+    evaluation_rows: usize,
     feature_count: usize,
     month_capacity: usize,
-) -> Sizing {
-    // Leave three tenths for context, fragmentation and the allocator's own
-    // bookkeeping.
-    let budget = (free / 10) * 7;
-    // The sealed parent owns exactly one feature-major indicator matrix. The V1
-    // native walk consumes it directly, so neither a staging transpose nor a
-    // second resident indicator copy belongs in this production budget.
-    // Every bars-scaled array `upload_parent_dataset_v1` allocates, named so the next one
-    // added has an obvious place to go:
-    //   close + high + low                    3 x f64
-    //   months + days + timestamps            3 x i64
-    //   adaptive_base_pips                    1 x f64   (WAS MISSING)
-    //   gap_flags                             1 x u8    (WAS MISSING)
-    //   smc_rows                             11 x i8
-    //   indicators, once (immutable feature-major parent)
-    let dataset = prototype_b_dataset_peak_bytes(bars, feature_count);
-    // The card answered and the DATASET alone does not fit. That is not a
-    // batching problem: no work list, however small, makes a 10.8 GB f64
-    // indicator matrix (21.6 GB at the transpose peak) smaller. Saying so here
-    // is what stops the caller from sizing a launch out of a stale number and
-    // then discovering it by failing.
-    if dataset.saturating_add(64 * 1024 * 1024) >= budget {
-        return Sizing::NoRoom {
-            dataset_bytes: dataset,
-            budget_bytes: budget,
-        };
+    gene_count: usize,
+    gene_term_count: usize,
+) -> std::result::Result<Sizing, CudaPopulationError> {
+    let month_capacity = u32::try_from(month_capacity).map_err(|_| {
+        CudaPopulationError::InvalidInput(
+            "month capacity does not fit the strict native u32 plan".to_owned(),
+        )
+    })?;
+    let parent = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+        resident_parent_rows,
+        feature_count,
+    )?;
+    let genes =
+        PopulationGeneStorePlanV1::checked_from_gene_extents_v1(gene_count, gene_term_count)?;
+    let one_scenario =
+        PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, month_capacity)?;
+    let budget_bytes = admitted_budget_bytes_v1(pre_parent_free_memory_bytes)?;
+    let fixed_device_bytes = parent
+        .total_device_bytes()
+        .checked_add(genes.total_device_bytes())
+        .and_then(|bytes| bytes.checked_add(ALLOCATOR_RESERVE_BYTES_V1))
+        .ok_or_else(|| {
+            CudaPopulationError::InvalidInput(
+                "strict fixed device allocation plan overflows u64".to_owned(),
+            )
+        })?;
+    if fixed_device_bytes > budget_bytes {
+        return Ok(Sizing::NoRoom {
+            fixed_device_bytes,
+            budget_bytes,
+        });
     }
-    // The 64 MiB is the reserve for allocator fragmentation, the context, and
-    // the GENE arrays — which are not bars-scaled and not scenario-scaled:
-    // `population * 59 B + (population + 1) * 4 B + terms * 12 B + 88 B`.
-    // The largest gene array any lane uploads is the quality screen's 131 072
-    // clones; the fixed per-gene portion is ~7.4 MiB before its CSR terms and
-    // stays inside this reserve. A work list is scenarios, charged below.
-    let room = budget
-        .saturating_sub(dataset)
-        .saturating_sub(64 * 1024 * 1024);
-    // Per SCENARIO: its trade slots, its monthly buckets, its metric row, and
-    // the nine scenario-descriptor arrays the upload stages on the device.
-    // No signal column, no confidence column, no event buffer — none of them
-    // exists on the device any more.
-    //
-    // `month_capacity` is a PARAMETER here, not the literal 3 840 it used to be
-    // folded into. The device allocates `scenario_count * month_capacity`
-    // doubles twice, and `month_capacity` is an operator-configurable runtime
-    // override with no upper bound — so hardcoding the default made peak device
-    // memory a function of a user parameter, in the one function that exists to
-    // stop exactly that.
-    let outcome =
-        std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>() as u64;
-    let metric_row =
-        std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationMetricRow>() as u64;
-    // 8 (base id) + 8 (scenario id) + 8 (rng counter) + 8 (window offset)
-    // + 4 (window len) + 4 (type) + 4 (spread) + 4 (slippage) + 8 (commission)
-    const SCENARIO_UPLOAD_BYTES: u64 = 56;
-    let per_candidate = neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * outcome
-        + 2 * month_capacity as u64 * 8
-        + metric_row
-        + SCENARIO_UPLOAD_BYTES;
-    let fits = room / per_candidate.max(1);
-    // Below this the card cannot do useful work and the CPU lane is the honest
-    // answer.
-    if fits < 16 {
-        return Sizing::NoRoom {
-            dataset_bytes: dataset,
-            budget_bytes: budget,
-        };
+    let available_device_bytes = budget_bytes
+        .checked_sub(fixed_device_bytes)
+        .expect("fixed bytes were checked within the admitted budget");
+    let one_scenario_device_bytes = one_scenario.total_device_bytes();
+    let memory_ceiling = available_device_bytes / one_scenario_device_bytes;
+    if memory_ceiling == 0 {
+        return Ok(Sizing::NoScenarioRoom {
+            available_device_bytes,
+            one_scenario_device_bytes,
+        });
     }
-    Sizing::Fits(fits.min(candidates_for_target_launch(bars)) as usize)
+    let (_, time_ceiling, _) = checked_candidates_for_target_launch_v1(evaluation_rows)?;
+    let chosen = memory_ceiling.min(time_ceiling);
+    let memory_ceiling = usize::try_from(memory_ceiling).map_err(|_| {
+        CudaPopulationError::InvalidInput(
+            "strict memory ceiling does not fit this process".to_owned(),
+        )
+    })?;
+    let time_ceiling = usize::try_from(time_ceiling).map_err(|_| {
+        CudaPopulationError::InvalidInput(
+            "strict time ceiling does not fit this process".to_owned(),
+        )
+    })?;
+    let chosen = usize::try_from(chosen).map_err(|_| {
+        CudaPopulationError::InvalidInput(
+            "strict submission ceiling does not fit this process".to_owned(),
+        )
+    })?;
+    Ok(Sizing::Fits {
+        memory_ceiling,
+        time_ceiling,
+        chosen,
+    })
+}
+
+fn auto_sizing_error_from_cuda_v1(
+    context: &'static str,
+    source: CudaPopulationError,
+) -> PopulationAutoSizingErrorV1 {
+    sizing_error_v1(
+        PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+        format!("{context}: {source}"),
+    )
+}
+
+/// One admission-bound auto plan. Every byte comes from the same checked CUDA
+/// allocation plans as runtime submission sizing; this function never probes a
+/// device or reads live free memory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_auto_plan_for_pre_parent_free_memory_v1(
+    pre_parent_free_memory_bytes: u64,
+    resident_parent_rows: usize,
+    evaluation_rows: usize,
+    feature_count: usize,
+    month_capacity: usize,
+    configured_population: usize,
+    term_cap: usize,
+) -> std::result::Result<NativePopulationAutoPlanFactsV1, PopulationAutoSizingErrorV1> {
+    let month_capacity_u32 = u32::try_from(month_capacity).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "month capacity does not fit the authoritative native u32 plan",
+        )
+    })?;
+    let configured_terms = configured_population.checked_mul(term_cap).ok_or_else(|| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "configured population × sealed term cap overflows usize",
+        )
+    })?;
+    let parent = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+        resident_parent_rows,
+        feature_count,
+    )
+    .map_err(|source| auto_sizing_error_from_cuda_v1("strict parent plan", source))?;
+    let one_gene = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, term_cap)
+        .map_err(|source| auto_sizing_error_from_cuda_v1("one-gene plan", source))?;
+    let two_terms = term_cap.checked_mul(2).ok_or_else(|| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "two sealed-cap genes overflow the term extent",
+        )
+    })?;
+    let two_genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(2, two_terms)
+        .map_err(|source| auto_sizing_error_from_cuda_v1("two-gene plan", source))?;
+    let configured_genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(
+        configured_population,
+        configured_terms,
+    )
+    .map_err(|source| auto_sizing_error_from_cuda_v1("configured gene plan", source))?;
+    let one_scenario =
+        PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, month_capacity_u32)
+            .map_err(|source| auto_sizing_error_from_cuda_v1("one-scenario plan", source))?;
+    let configured_scenarios = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+        configured_population,
+        month_capacity_u32,
+    )
+    .map_err(|source| auto_sizing_error_from_cuda_v1("configured scenario plan", source))?;
+    let budget = admitted_budget_bytes_v1(pre_parent_free_memory_bytes)
+        .map_err(|source| auto_sizing_error_from_cuda_v1("admitted budget", source))?;
+    let parent_and_reserve = parent
+        .total_device_bytes()
+        .checked_add(ALLOCATOR_RESERVE_BYTES_V1)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "parent plus allocator reserve overflows u64",
+            )
+        })?;
+    if parent_and_reserve > budget {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ParentNoRoom,
+            format!(
+                "admitted budget {budget} B cannot host parent+reserve {} B",
+                parent_and_reserve
+            ),
+        ));
+    }
+    let configured_fixed = parent_and_reserve
+        .checked_add(configured_genes.total_device_bytes())
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "parent plus configured gene store overflows u64",
+            )
+        })?;
+    if configured_fixed > budget {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::GeneNoRoom,
+            format!(
+                "configured unsplittable gene store needs {configured_fixed} B with parent/reserve against {budget} B"
+            ),
+        ));
+    }
+    let configured_one_launch = configured_fixed
+        .checked_add(one_scenario.total_device_bytes())
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "configured fixed bytes plus one scenario overflow u64",
+            )
+        })?;
+    if configured_one_launch > budget {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ScenarioNoRoom,
+            format!(
+                "configured parent/gene store fits but one strict scenario raises it to {configured_one_launch} B against {budget} B"
+            ),
+        ));
+    }
+
+    // Derive the affine gene slope and fixed overhead from two authoritative
+    // plans instead of restating the native layout formula here.
+    let gene_slope = two_genes
+        .total_device_bytes()
+        .checked_sub(one_gene.total_device_bytes())
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "authoritative gene plan is not monotone",
+            )
+        })?;
+    let gene_fixed_overhead = one_gene
+        .total_device_bytes()
+        .checked_sub(gene_slope)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "authoritative gene fixed overhead underflows",
+            )
+        })?;
+    let available_after_parent_reserve_and_gene_overhead = budget
+        .checked_sub(parent_and_reserve)
+        .and_then(|bytes| bytes.checked_sub(gene_fixed_overhead))
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::GeneNoRoom,
+                "admitted budget leaves no room for one authoritative gene-store header",
+            )
+        })?;
+    let fixed_gene_bytes = available_after_parent_reserve_and_gene_overhead
+        .checked_sub(one_scenario.total_device_bytes())
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ScenarioNoRoom,
+                "admitted budget leaves no room for a gene store plus one strict scenario",
+            )
+        })?;
+    let fixed_gene_capacity_u64 = fixed_gene_bytes / gene_slope;
+    let combined_slope = gene_slope
+        .checked_add(one_scenario.total_device_bytes())
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "combined gene/scenario slope overflows u64",
+            )
+        })?;
+    let memory_population_cap_u64 =
+        available_after_parent_reserve_and_gene_overhead / combined_slope;
+    let fixed_gene_capacity = usize::try_from(fixed_gene_capacity_u64).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "fixed gene capacity does not fit this process",
+        )
+    })?;
+    let memory_population_cap = usize::try_from(memory_population_cap_u64).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "memory population cap does not fit this process",
+        )
+    })?;
+    let (raw_time_cap, effective_time_cap, floor_overrode) =
+        checked_candidates_for_target_launch_v1(evaluation_rows)
+            .map_err(|source| auto_sizing_error_from_cuda_v1("strict time plan", source))?;
+    let raw_time_cap = usize::try_from(raw_time_cap).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "raw time cap does not fit this process",
+        )
+    })?;
+    let effective_time_cap = usize::try_from(effective_time_cap).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "effective time cap does not fit this process",
+        )
+    })?;
+    let hard_growth_cap = POPULATION_AUTO_HARD_GROWTH_CAP_V1;
+    let growth_cap = memory_population_cap
+        .min(effective_time_cap)
+        .min(hard_growth_cap);
+    Ok(NativePopulationAutoPlanFactsV1 {
+        admitted_budget_bytes: budget,
+        parent_device_bytes: parent.total_device_bytes(),
+        gene_bytes_per_candidate_at_term_cap: gene_slope,
+        gene_fixed_overhead_bytes: gene_fixed_overhead,
+        scenario_device_bytes_per_candidate: one_scenario.total_device_bytes(),
+        configured_gene_device_bytes: configured_genes.total_device_bytes(),
+        configured_scenario_device_bytes: configured_scenarios.total_device_bytes(),
+        fixed_gene_capacity,
+        memory_population_cap,
+        raw_time_cap,
+        effective_time_cap,
+        occupancy_floor_overrode_time_target: floor_overrode,
+        hard_growth_cap,
+        growth_cap,
+    })
+}
+
+pub(crate) fn population_auto_resolved_bytes_v1(
+    population: usize,
+    term_cap: usize,
+    month_capacity: usize,
+) -> std::result::Result<(u64, u64), PopulationAutoSizingErrorV1> {
+    let terms = population.checked_mul(term_cap).ok_or_else(|| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "resolved population × term cap overflows usize",
+        )
+    })?;
+    let month_capacity = u32::try_from(month_capacity).map_err(|_| {
+        sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            "month capacity does not fit native u32 plan",
+        )
+    })?;
+    let genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(population, terms)
+        .map_err(|source| auto_sizing_error_from_cuda_v1("resolved gene plan", source))?;
+    let scenarios =
+        PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(population, month_capacity)
+            .map_err(|source| auto_sizing_error_from_cuda_v1("resolved scenario plan", source))?;
+    Ok((genes.total_device_bytes(), scenarios.total_device_bytes()))
+}
+
+pub(crate) fn runtime_submission_ceiling_for_admitted_ordinal_v1(
+    admitted: &crate::ExactCudaDeviceOrdinalV1,
+    resident_parent_rows: usize,
+    evaluation_rows: usize,
+    feature_count: usize,
+    month_capacity: usize,
+    gene_count: usize,
+    gene_term_count: usize,
+) -> Result<usize> {
+    match candidates_for_pre_parent_free_memory(
+        admitted.pre_parent_free_memory_bytes(),
+        resident_parent_rows,
+        evaluation_rows,
+        feature_count,
+        month_capacity,
+        gene_count,
+        gene_term_count,
+    )
+    .map_err(anyhow::Error::new)?
+    {
+        Sizing::Fits { chosen, .. } => Ok(chosen),
+        Sizing::NoRoom {
+            fixed_device_bytes,
+            budget_bytes,
+        } => bail!(
+            "prototype B: the admitted pre-parent snapshot cannot host the immutable parent and exact unsplittable gene store: fixed {fixed_device_bytes} B against {budget_bytes} B usable budget"
+        ),
+        Sizing::NoScenarioRoom {
+            available_device_bytes,
+            one_scenario_device_bytes,
+        } => bail!(
+            "prototype B: the immutable parent and exact unsplittable gene store fit, but only {available_device_bytes} B remains in the admitted budget and one strict metrics-only scenario needs {one_scenario_device_bytes} B"
+        ),
+    }
 }
 
 /// The `max_events` the native session is created with — a formality.
@@ -296,9 +592,10 @@ fn candidates_for_free_memory(
 /// a smaller capacity — the arithmetic ran backwards with respect to the one
 /// quantity that actually matters.
 ///
-/// What still bounds device memory is [`candidates_for_free_memory`], which
-/// counts only allocations that exist. This constant just satisfies the ABI's
-/// "must be non-zero" check; the device stores it nowhere and reads it never.
+/// What now bounds device memory is the admitted pre-parent snapshot together
+/// with exact parent, gene-store, and metrics-only plans. This constant just
+/// satisfies the ABI's "must be non-zero" check; the device stores it nowhere
+/// and reads it never.
 /// What a learned launch size is a fact ABOUT.
 ///
 /// A fit is measured in scenarios, and the room available for scenarios is
@@ -308,22 +605,27 @@ fn candidates_for_free_memory(
 /// symbol/timeframe's fit as another's launch size, and one dataset's FAILURE
 /// permanently capped every other dataset's launches for the life of the
 /// process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LimitKey {
     device: usize,
-    bars: usize,
+    cuda_device_identity_sha256: String,
+    parent_dataset_identity_sha256: String,
+    pre_parent_free_memory_bytes: u64,
+    resident_parent_rows: usize,
+    evaluation_rows: usize,
     feature_count: usize,
     month_capacity: usize,
+    gene_count: usize,
+    gene_term_count: usize,
 }
 
 /// Largest work list known to have fitted THIS (device, dataset shape).
 ///
-/// Discovering the limit by failing costs the whole attempt: the kernel runs,
-/// exhausts capacity, and its work is discarded before the halves are retried.
-/// Paying that once is the price of not knowing how many trades a population
-/// emits; paying it every generation is waste. A 2026-07-29 M3 run spent 391 s
-/// on a single population evaluation that way, against a benchmark rate that
-/// would place it near 4 s.
+/// Discovering a fragmentation/runtime-pressure limit by failing costs the
+/// whole attempt: the allocation is discarded before the halves are retried.
+/// Paying that once is unavoidable; paying it every generation is waste. A
+/// 2026-07-29 M3 run spent 391 s on a single population evaluation that way,
+/// against a benchmark rate that would place it near 4 s.
 ///
 /// So the size that worked is remembered and used as the starting point — for
 /// the shape it was learned on, and no other. An absent entry means "not yet
@@ -335,62 +637,34 @@ fn learned_batch_limits() -> &'static std::sync::Mutex<std::collections::HashMap
     LIMITS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn learned_batch_limit(key: LimitKey) -> usize {
+fn learned_batch_limit(key: &LimitKey) -> usize {
     learned_batch_limits()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&key)
+        .get(key)
         .copied()
         .unwrap_or(usize::MAX)
 }
 
 /// Raise the learned ceiling: this size was accepted.
-fn learn_batch_success(key: LimitKey, scenarios: usize) {
+fn learn_batch_success(key: &LimitKey, scenarios: usize) {
     let mut limits = learned_batch_limits()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = limits.entry(key).or_insert(scenarios);
+    let entry = limits.entry(key.clone()).or_insert(scenarios);
     if *entry != usize::MAX {
         *entry = (*entry).max(scenarios);
     }
 }
 
 /// Lower the learned ceiling: this size was refused for capacity.
-fn learn_batch_failure(key: LimitKey, ceiling: usize) {
+fn learn_batch_failure(key: &LimitKey, ceiling: usize) {
     let mut limits = learned_batch_limits()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = limits.entry(key).or_insert(ceiling);
+    let entry = limits.entry(key.clone()).or_insert(ceiling);
     *entry = (*entry).min(ceiling);
 }
-
-/// A failure that must NEVER be retried by making the work list smaller.
-///
-/// `upload_dataset` returns `STATUS_ALLOCATION_FAILED` exactly like a workspace
-/// exhaustion, and `is_capacity_exhaustion` cannot tell them apart from the
-/// status alone — so a dataset that does not fit was halved, and halved, and
-/// halved, down to `n_scenarios < 2`. For a 17 748-scenario quality screen that
-/// is ~35 000 failed launches, each one re-attempting the same multi-gigabyte
-/// `cudaMalloc` that just failed, and the lane's own history records that one
-/// such mid-stream failure left the CUDA context unusable for the 27
-/// evaluations after it.
-///
-/// Slicing the descriptor array cannot change the dataset by one byte. This
-/// marker is attached to every upload error so the retry can say so.
-#[derive(Debug)]
-struct NotAWorkListSizeProblem(&'static str);
-
-impl std::fmt::Display for NotAWorkListSizeProblem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} does not depend on the work list size — splitting it cannot help",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for NotAWorkListSizeProblem {}
 
 /// Evaluate one full-series scenario per gene — the identity work list.
 ///
@@ -513,20 +787,19 @@ fn evaluate_population_b_raw_v1(
     )
 }
 
-/// Evaluate an arbitrary work list on Prototype B, splitting when the card
-/// cannot hold the trades it produces.
+/// Evaluate an arbitrary work list on Prototype B, splitting when a
+/// scenario-sized allocation cannot fit despite the admitted exact plan.
 ///
 /// THE SCENARIO IS THE UNIT OF WORK. The gene arrays stay whole and resident;
 /// what is sized, split and submitted is the DESCRIPTOR ARRAY. That is the
 /// difference that turns the quality screen's seven launches — six Monte-Carlo
 /// chunks and one sensitivity pass — into one.
 ///
-/// The device allocation is bounded by VRAM, and `candidates_for_free_memory`
-/// predicts it — but a prediction can still be beaten by fragmentation or by
-/// another process taking memory between the query and the allocation. The
-/// engine reports an out-of-memory distinctly (`is_capacity_exhausted`) rather
-/// than as a generic failure, so the answer is to give it less work rather than
-/// to give up: the work list is cut and each part evaluated in turn.
+/// The device allocation is bounded by the run's admitted pre-parent snapshot
+/// and exact allocation plans. Fragmentation can still exhaust a scenario-sized
+/// allocation, so the engine reports that condition distinctly and the work
+/// list is cut and each part evaluated in turn. Parent and gene allocation
+/// failures carry an unsplittable marker and never enter this recursion.
 ///
 /// Scenarios are independent — each is one thread reading shared, read-only gene
 /// and dataset arrays — so a split result equals the whole one. This is the
@@ -628,10 +901,10 @@ fn evaluate_scenarios_b_raw_v1(
     if let Err(detail) = scenario::validate_scenarios(scenarios, n_genes, evidence.row_count()) {
         bail!("prototype B scenario list: {detail}");
     }
+    let evaluation_rows = max_effective_scenario_window_rows_v1(scenarios, evidence.row_count())?;
 
-    let selected_ordinal = evidence
-        .require_exact_cuda_device_ordinal_v1()?
-        .selected_ordinal();
+    let admitted_ordinal = evidence.require_exact_cuda_device_ordinal_v1()?;
+    let selected_ordinal = admitted_ordinal.selected_ordinal();
     let device = usize::try_from(selected_ordinal).map_err(|_| {
         anyhow::anyhow!("sealed CUDA ordinal {selected_ordinal} does not fit this process")
     })?;
@@ -639,52 +912,32 @@ fn evaluate_scenarios_b_raw_v1(
     // Everything the launch size is a fact about, in one key.
     let limit_key = LimitKey {
         device,
-        bars: evidence.row_count(),
+        cuda_device_identity_sha256: admitted_ordinal.cuda_device_identity_sha256().to_owned(),
+        parent_dataset_identity_sha256: evidence.parent_dataset_identity_sha256().to_owned(),
+        pre_parent_free_memory_bytes: admitted_ordinal.pre_parent_free_memory_bytes(),
+        resident_parent_rows: evidence.parent_row_count(),
+        evaluation_rows,
         feature_count: evidence.feature_count(),
         month_capacity: crate::eval::current_backtest_runtime_overrides().month_capacity,
+        gene_count: n_genes,
+        gene_term_count: gene_indices.len(),
     };
     // Start at the size already known to fit THIS shape rather than
     // rediscovering the limit by throwing away a full evaluation every
     // generation.
-    let learned = learned_batch_limit(limit_key);
+    let learned = learned_batch_limit(&limit_key);
     // What the card can hold is knowable before asking it, so ask first. The
-    // retry below still exists for what cannot be predicted — how many trades a
-    // population actually emits — but it should never be reached for a size
-    // that was arithmetic all along.
-    let fits = match candidates_that_fit(
-        limit_key.device,
-        limit_key.bars,
+    // retry below still exists for fragmentation or external runtime pressure,
+    // but it should never be reached for a size that was arithmetic all along.
+    let fits = runtime_submission_ceiling_for_admitted_ordinal_v1(
+        admitted_ordinal,
+        limit_key.resident_parent_rows,
+        limit_key.evaluation_rows,
         limit_key.feature_count,
         limit_key.month_capacity,
-    ) {
-        Sizing::Fits(fits) => fits,
-        // The card was READ and it has no room. Sizing a launch here — from a
-        // constant, or worse from a fit learned on some other dataset — is how
-        // a 12 GB card came to be handed a batch that needed 15.9 GB of
-        // workspace on top of a dataset it could not hold either. There is no
-        // batch that fixes it, so say so and let the caller's own policy
-        // decide: with NEOETHOS_REQUIRE_GPU set that is a loud failure, and
-        // without it the CPU lane is the honest answer.
-        Sizing::NoRoom {
-            dataset_bytes,
-            budget_bytes,
-        } => {
-            bail!(
-                "prototype B: this device has no room for the dataset — it needs \
-                 {dataset_bytes} B (close/high/low, months/days/timestamps, the adaptive stop \
-                 base, gap flags, SMC rows and one immutable feature-major indicator matrix) \
-                 against a {budget_bytes} B budget of free VRAM. {n_scenarios} \
-                 scenarios over {} bars x {} features. Splitting the work list cannot help: \
-                 the dataset is the same size whatever the launch asks for.",
-                limit_key.bars,
-                limit_key.feature_count
-            );
-        }
-        Sizing::Unreadable => bail!(
-            "prototype B could not read free memory on sealed CUDA ordinal {selected_ordinal}; \
-             a runtime/device probe fault cannot authorize a guessed batch or CPU substitution"
-        ),
-    };
+        limit_key.gene_count,
+        limit_key.gene_term_count,
+    )?;
     if fits < n_scenarios {
         tracing::info!(
             target: "neoethos_search::eval",
@@ -733,28 +986,27 @@ fn evaluate_scenarios_b_raw_v1(
     let Err(error) = attempt else {
         // This size fits; keep it as the starting point for the next call over
         // this same shape.
-        learn_batch_success(limit_key, n_scenarios);
+        learn_batch_success(&limit_key, n_scenarios);
         return attempt;
     };
     // Only a capacity exhaustion is worth retrying smaller. Anything else is a
     // fault, and halving the work would just hide it behind a slower failure.
     //
-    // "Capacity exhaustion" now excludes the uploads. `upload_dataset` reports
-    // the same `STATUS_ALLOCATION_FAILED` as a workspace exhaustion, so without
-    // the marker a dataset that does not fit was halved down to one scenario —
-    // ~35 000 failed launches for a 17 748-scenario screen, each re-attempting
-    // the identical multi-gigabyte `cudaMalloc`.
+    // "Capacity exhaustion" now excludes immutable parent and gene uploads.
+    // They report the same `STATUS_ALLOCATION_FAILED` as a scenario-sized
+    // workspace exhaustion, so without the marker an unchanged multi-gigabyte
+    // allocation was retried at every recursive leaf.
     if !is_capacity_exhaustion(&error) || n_scenarios < 2 {
         return Err(error);
     }
     // Remember the ceiling so the next generation does not pay this again.
-    learn_batch_failure(limit_key, n_scenarios / 2);
+    learn_batch_failure(&limit_key, n_scenarios / 2);
     tracing::info!(
         target: "neoethos_search::eval",
         n_genes,
         n_scenarios,
-        learned = learned_batch_limit(limit_key),
-        "the work list emitted more trades than the card can hold — splitting, and \
+        learned = learned_batch_limit(&limit_key),
+        "a scenario-sized allocation hit runtime capacity pressure — splitting, and \
          remembering the limit so later launches start there"
     );
     return split_and_evaluate(
@@ -797,20 +1049,23 @@ fn evaluate_scenarios_b_raw_v1(
 /// throws the value away, which left this check unable to find anything and
 /// made it dead code the moment it was written.
 fn is_capacity_exhaustion(error: &anyhow::Error) -> bool {
-    // An UPLOAD that ran out of memory is never a work-list size problem. The
-    // dataset, the genes and the descriptor array are the same size whatever
-    // the launch asks for, and the split halves only the descriptor array — so
-    // retrying a failed `upload_dataset` smaller re-attempts the identical
-    // `cudaMalloc` at every leaf of the recursion. See
-    // [`NotAWorkListSizeProblem`].
+    // An immutable parent or gene upload that ran out of memory is never a
+    // work-list size problem. A split halves only the descriptor/workspace
+    // extent, so
+    // retrying a failed immutable parent or gene upload smaller re-attempts the
+    // identical `cudaMalloc` at every leaf of the recursion. See
+    // [`UnsplittablePopulationAllocationV1`].
     //
     // `anyhow::Error::downcast_ref` is what searches the context chain.
     // `error.chain()` does NOT work here: it yields anyhow's internal
     // `ContextError` wrapper as `&dyn Error`, and downcasting THAT to the
     // marker fails — the check compiles, always answers "no", and the marker
-    // silently does nothing. `a_dataset_allocation_failure_is_never_split`
+    // silently does nothing. `an_unsplittable_allocation_failure_is_never_split`
     // caught exactly that.
-    if error.downcast_ref::<NotAWorkListSizeProblem>().is_some() {
+    if error
+        .downcast_ref::<UnsplittablePopulationAllocationV1>()
+        .is_some()
+    {
         return false;
     }
     error
@@ -827,97 +1082,295 @@ mod capacity_detection_tests {
     /// production computes.
     const MONTHS: usize = 240;
 
-    fn fits_or_panic(free: u64, bars: usize, features: usize) -> usize {
-        match candidates_for_free_memory(free, bars, features, MONTHS) {
-            Sizing::Fits(fits) => fits,
+    const DEFAULT_GENES: usize = 200;
+    const DEFAULT_TERMS: usize = 3_200;
+
+    fn sizing(
+        free: u64,
+        resident_parent_rows: usize,
+        evaluation_rows: usize,
+        features: usize,
+        months: usize,
+        genes: usize,
+        terms: usize,
+    ) -> Sizing {
+        candidates_for_pre_parent_free_memory(
+            free,
+            resident_parent_rows,
+            evaluation_rows,
+            features,
+            months,
+            genes,
+            terms,
+        )
+        .expect("checked sizing inputs")
+    }
+
+    fn fits(
+        free: u64,
+        resident_parent_rows: usize,
+        evaluation_rows: usize,
+        features: usize,
+        months: usize,
+        genes: usize,
+        terms: usize,
+    ) -> (usize, usize, usize) {
+        match sizing(
+            free,
+            resident_parent_rows,
+            evaluation_rows,
+            features,
+            months,
+            genes,
+            terms,
+        ) {
+            Sizing::Fits {
+                memory_ceiling,
+                time_ceiling,
+                chosen,
+            } => (memory_ceiling, time_ceiling, chosen),
             other => panic!("expected a fit, got {other:?}"),
         }
     }
 
     #[test]
-    fn sealed_parent_sizes_one_f64_indicator_matrix_without_transpose_staging() {
-        const BARS: usize = 37;
-        const FEATURES: usize = 13;
-        let fixed_per_bar = 3 * std::mem::size_of::<f64>()
-            + 3 * std::mem::size_of::<i64>()
-            + std::mem::size_of::<f64>()
-            + std::mem::size_of::<u8>()
-            + 11 * std::mem::size_of::<i8>();
-        let expected = BARS * fixed_per_bar + BARS * FEATURES * std::mem::size_of::<f64>();
+    fn strict_default_plan_is_4000_bytes_per_scenario_with_zero_outcomes() {
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, 240)
+            .expect("default strict plan");
+        assert_eq!(plan.metric_rows_bytes(), 104);
+        assert_eq!(plan.monthly_pnls_bytes(), 1_920);
+        assert_eq!(plan.month_start_equities_bytes(), 1_920);
+        assert_eq!(plan.scenario_descriptor_bytes(), 56);
+        assert_eq!(plan.outcome_bytes(), 0);
+        assert_eq!(plan.total_device_bytes(), 4_000);
+        assert_ne!(plan.total_device_bytes(), 8_192 * 72 + 4_000);
+    }
+
+    #[test]
+    fn full_resident_parent_not_stage1_rows_controls_admission() {
+        const RESIDENT_PARENT_ROWS: usize = 1_049_160;
+        const STAGE1_ROWS: usize = 262_290;
+        const FEATURES: usize = 1_800;
+        const SNAPSHOT: u64 = 20 * 1024 * 1024 * 1024;
+
+        assert!(matches!(
+            sizing(
+                SNAPSHOT,
+                RESIDENT_PARENT_ROWS,
+                STAGE1_ROWS,
+                FEATURES,
+                MONTHS,
+                DEFAULT_GENES,
+                DEFAULT_TERMS,
+            ),
+            Sizing::NoRoom { .. }
+        ));
+        assert!(matches!(
+            sizing(
+                SNAPSHOT,
+                STAGE1_ROWS,
+                STAGE1_ROWS,
+                FEATURES,
+                MONTHS,
+                DEFAULT_GENES,
+                DEFAULT_TERMS,
+            ),
+            Sizing::Fits { .. }
+        ));
+
+        let full = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+            RESIDENT_PARENT_ROWS,
+            FEATURES,
+        )
+        .expect("full parent plan");
+        assert_eq!(full.total_device_bytes(), 15_187_640_160);
+    }
+
+    #[test]
+    fn resident_parent_and_evaluation_extents_change_independent_terms() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let (memory, time, chosen) = fits(
+            24 * GIB,
+            100_000,
+            843_456,
+            64,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
+        );
+        let (same_memory, shorter_time, shorter_chosen) = fits(
+            24 * GIB,
+            100_000,
+            1_686_912,
+            64,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
+        );
+        assert_eq!(memory, same_memory, "evaluation rows changed VRAM sizing");
+        assert_ne!(
+            time, shorter_time,
+            "evaluation rows did not change time sizing"
+        );
+        assert_eq!(chosen, time);
+        assert_eq!(shorter_chosen, shorter_time);
+
+        let (small_parent_memory, same_time, small_parent_chosen) = fits(
+            2 * GIB,
+            1_000,
+            4_096,
+            1_800,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
+        );
+        let (large_parent_memory, same_time_again, large_parent_chosen) = fits(
+            2 * GIB,
+            50_000,
+            4_096,
+            1_800,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
+        );
         assert_eq!(
-            prototype_b_dataset_peak_bytes(BARS, FEATURES),
-            expected as u64
+            same_time, same_time_again,
+            "parent rows changed time sizing"
+        );
+        assert!(small_parent_memory > large_parent_memory);
+        assert_eq!(small_parent_chosen, small_parent_memory);
+        assert_eq!(large_parent_chosen, large_parent_memory);
+    }
+
+    #[test]
+    fn time_extent_is_the_maximum_effective_scenario_window() {
+        let scenarios = [
+            ScenarioDescriptor {
+                window_offset: 100,
+                window_len: 500,
+                ..ScenarioDescriptor::default()
+            },
+            ScenarioDescriptor {
+                window_offset: 200,
+                window_len: 0,
+                ..ScenarioDescriptor::default()
+            },
+        ];
+        assert_eq!(
+            max_effective_scenario_window_rows_v1(&scenarios, 1_000)
+                .expect("validated effective window"),
+            800
         );
     }
 
-    /// What fusion bought, stated as a number rather than as a claim.
-    ///
-    /// This test used to assert `fits < 25_000` — that the population
-    /// validation asks for (250 folds x 100 Monte-Carlo runs) could NOT be done
-    /// in one launch on a 24 GB card. That was true while every scenario also
-    /// carried a `bars`-long i8 signal column and an f32 confidence column:
-    /// 4 217 280 B of the 4 811 048 B per scenario at 843 456 bars, 87.7 % of
-    /// the total, existing only to hand a value between two kernels.
-    ///
-    /// Those columns are gone — the walk synthesises the signal in registers —
-    /// so the per-scenario cost is 593 768 B and the same card hosts the whole
-    /// request. Pinning the OLD ceiling would pin the defect.
-    ///
-    /// What must stay true is the shape: a finite ceiling, well clear of the
-    /// request, and still derived from the card rather than from the caller.
     #[test]
-    fn the_population_validation_asks_for_now_fits_a_24gb_card() {
-        const BARS: usize = 87_715;
-        const FEATURES: usize = 257;
-        let fits = fits_or_panic(24 * 1024 * 1024 * 1024, BARS, FEATURES);
-        assert!(
-            fits >= 25_000,
-            "deleting 4.2 MB of per-scenario handoff must let the 25 000-candidate \
-             validation call run in one launch: {fits}"
-        );
-        // And it is still a ceiling, not "unlimited". The old failure mode was
-        // `unwrap_or(usize::MAX)` — unknown treated as unbounded — which
-        // launched 24 700 candidates at a card holding ~16 300 and left the
-        // CUDA context unusable for the rest of the run.
-        assert!(
-            fits < 10_000_000,
-            "the ceiling has to remain a real bound: {fits}"
-        );
+    fn exact_gene_store_is_unsplittable_and_can_exceed_the_old_reserve() {
+        const QUALITY_SCREEN_GENES: usize = 262_144;
+        const TERMS_PER_GENE: usize = 20;
+        let term_count = QUALITY_SCREEN_GENES * TERMS_PER_GENE;
+        let genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(
+            QUALITY_SCREEN_GENES,
+            term_count,
+        )
+        .expect("quality-screen gene store");
+        assert_eq!(genes.total_device_bytes(), 79_429_724);
+        assert!(genes.total_device_bytes() > ALLOCATOR_RESERVE_BYTES_V1);
+
+        assert!(matches!(
+            sizing(128 * 1024 * 1024, 1, 1, 1, MONTHS, 1, 1),
+            Sizing::Fits { .. }
+        ));
+        assert!(matches!(
+            sizing(
+                128 * 1024 * 1024,
+                1,
+                1,
+                1,
+                MONTHS,
+                QUALITY_SCREEN_GENES,
+                term_count,
+            ),
+            Sizing::NoRoom { .. }
+        ));
     }
 
-    /// Memory stopped being the binding constraint, so time became one.
-    ///
-    /// At EURUSD M5 dimensions the memory term alone approves ~29 000
-    /// scenarios; the operator-visibility term cuts that to ~20 000, which is
-    /// one launch of about `TARGET_LAUNCH_SECONDS`. Both must be in play, and
-    /// the smaller must win.
     #[test]
-    fn a_launch_stays_observable_once_memory_stops_binding() {
-        // Real EURUSD M5: 843 456 bars, 64 features.
-        const BARS: usize = 843_456;
-        const FEATURES: usize = 64;
-        let approved = fits_or_panic(24 * 1024 * 1024 * 1024, BARS, FEATURES);
-        let time_term = candidates_for_target_launch(BARS) as usize;
-        assert_eq!(
-            approved, time_term,
-            "at these dimensions the launch length binds, not the card"
+    fn month_capacity_is_charged_by_the_authoritative_scenario_plan() {
+        const FREE: u64 = 1024 * 1024 * 1024;
+        let (default_memory, _, _) =
+            fits(FREE, 1_000, 4_096, 64, MONTHS, DEFAULT_GENES, DEFAULT_TERMS);
+        let (doubled_memory, _, _) = fits(
+            FREE,
+            1_000,
+            4_096,
+            64,
+            2 * MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
         );
-        // ~843 M scenario-bars/s over 843 456 bars is ~1 000 scenarios/s, so
-        // the approved batch has to land near the target rather than an hour
-        // away from it.
-        let seconds = approved as u64 * BARS as u64 / SCENARIO_BARS_PER_SECOND;
-        assert!(
-            seconds <= TARGET_LAUNCH_SECONDS,
-            "an approved launch estimates at {seconds} s against a {TARGET_LAUNCH_SECONDS} s target"
-        );
+        assert!(doubled_memory < default_memory);
+    }
 
-        // The time term must never be the reason a launch exceeds what the card
-        // holds — it is combined by `min`, so a tiny card still wins.
-        let small = fits_or_panic(4 * 1024 * 1024 * 1024, BARS, FEATURES);
-        assert!(
-            small < time_term,
-            "a 4 GB card approved {small} where the time term alone would allow {time_term}"
+    #[test]
+    fn smaller_admitted_snapshot_produces_a_smaller_memory_ceiling() {
+        let (large_memory, large_time, large_chosen) = fits(
+            4 * 1024 * 1024 * 1024,
+            1_000,
+            4_096,
+            64,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
         );
+        let (small_memory, small_time, small_chosen) = fits(
+            2 * 1024 * 1024 * 1024,
+            1_000,
+            4_096,
+            64,
+            MONTHS,
+            DEFAULT_GENES,
+            DEFAULT_TERMS,
+        );
+        assert_eq!(large_time, small_time);
+        assert!(small_memory < large_memory);
+        assert_eq!(large_chosen, large_memory);
+        assert_eq!(small_chosen, small_memory);
+    }
+
+    #[test]
+    fn one_to_fifteen_scenario_capacity_is_a_real_fit_not_immutable_no_room() {
+        let fixed = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(1, 1)
+            .expect("one-row parent")
+            .total_device_bytes()
+            + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
+                .expect("one-gene store")
+                .total_device_bytes()
+            + ALLOCATOR_RESERVE_BYTES_V1;
+        let desired_budget = fixed + 15 * 4_000;
+        let snapshot = desired_budget.div_ceil(7) * 10;
+        let (memory, _, chosen) = fits(snapshot, 1, 1, 1, MONTHS, 1, 1);
+        assert_eq!(memory, 15);
+        assert_eq!(chosen, 15);
+    }
+
+    #[test]
+    fn zero_scenario_capacity_has_a_distinct_fail_loud_classification() {
+        let fixed = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(1, 1)
+            .expect("one-row parent")
+            .total_device_bytes()
+            + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
+                .expect("one-gene store")
+                .total_device_bytes()
+            + ALLOCATOR_RESERVE_BYTES_V1;
+        let snapshot = fixed.div_ceil(7) * 10;
+        match sizing(snapshot, 1, 1, 1, MONTHS, 1, 1) {
+            Sizing::NoScenarioRoom {
+                available_device_bytes,
+                one_scenario_device_bytes,
+            } => assert!(available_device_bytes < one_scenario_device_bytes),
+            other => panic!("expected distinct scenario-space refusal, got {other:?}"),
+        }
     }
 
     /// Short series make the time term generous, and the occupancy knee is the
@@ -925,16 +1378,23 @@ mod capacity_detection_tests {
     #[test]
     fn the_time_term_never_starves_a_short_series() {
         assert_eq!(
-            candidates_for_target_launch(usize::MAX),
+            checked_candidates_for_target_launch_v1(usize::MAX)
+                .expect("checked time ceiling")
+                .1,
             OCCUPANCY_KNEE,
             "even an absurd bar count must not push the launch under the knee"
         );
-        assert!(candidates_for_target_launch(4_096) > OCCUPANCY_KNEE);
+        assert!(
+            checked_candidates_for_target_launch_v1(4_096)
+                .expect("checked time ceiling")
+                .1
+                > OCCUPANCY_KNEE
+        );
         // The floor really does OVERRIDE the target on a long series, and that
         // is a deliberate trade rather than a bound: at EURUSD M1 dimensions the
         // honest time term is ~3 200 scenarios and the floor lifts it to 16 384,
         // an estimated 102 s launch against a 20 s target. It is pinned here so
-        // the warning `candidates_for_target_launch` emits stays true, and so
+        // the occupancy override remains explicit in the checked result, and so
         // that nobody reads the target as a guarantee.
         const M1_BARS: u64 = 5_270_000;
         assert!(
@@ -943,168 +1403,82 @@ mod capacity_detection_tests {
         );
     }
 
-    /// A workspace may be reused DOWNWARD and grown UPWARD, and neither costs a
-    /// dataset re-upload.
-    ///
-    /// The old `event_capacity` subtracted `population * bars * 5 + population *
-    /// 3944` from the budget, so asking for MORE candidates yielded a SMALLER
-    /// required capacity — and `capacity >= capacity` therefore passed exactly
-    /// when it should have failed. A session built for 256 candidates was
-    /// reused for 25 600.
-    ///
-    /// What replaced it was `workspace_scenarios >= n_scenarios` in the HOST
-    /// reuse predicate, and that over-corrected. `workspace_scenarios` is
-    /// written only at session creation, so the first LARGER launch tore the
-    /// session down and re-uploaded the entire dataset — more than 10 GB of H2D
-    /// traffic plus a same-sized transient transpose allocation — in order to
-    /// grow a 594 B/scenario workspace that the device grows by itself. The
-    /// guard that matters is the device's
-    /// (`workspace_scenarios < scenario_count`), and it is exact.
     #[test]
-    fn a_workspace_is_reusable_downward_and_grown_upward() {
-        // The device predicate, verbatim, and the host record that follows it.
-        let device_reallocates = |workspace: usize, requested: usize| workspace < requested;
-        let host_record_after = |workspace: usize, requested: usize| workspace.max(requested);
+    fn previous_strict_transients_are_released_before_a_new_gene_allocation() {
+        let source = include_str!("../../../neoethos-gpu-cuda/native/prototype_b_population.cu");
+        let start = source
+            .find("neoethos_gpu_cuda_population_upload_genes(")
+            .expect("native gene upload entry point");
+        let rest = &source[start..];
+        let end = rest
+            .find("neoethos_gpu_cuda_population_upload_scenarios(")
+            .expect("next native upload entry point");
+        let upload = &rest[..end];
+        let release_scenarios = upload
+            .find("session->release_scenarios();")
+            .expect("old scenario arrays must be released");
+        let release_workspace = upload
+            .find("session->release_workspace();")
+            .expect("old strict workspace must be released");
+        let first_gene_allocation = upload
+            .find("device_alloc(&session->candidate_ids")
+            .expect("first new gene allocation");
+        assert!(release_scenarios < first_gene_allocation);
+        assert!(release_workspace < first_gene_allocation);
+    }
 
-        // The measured case: a session built for 25 600 then asked for 12 800
-        // and 6 400 by the recursive split. None re-allocates, and the record
-        // does not follow them down.
-        for requested in [25_600usize, 12_800, 6_400, 3_300, 1] {
-            assert!(
-                !device_reallocates(25_600, requested),
-                "asking for {requested} against a 25 600 workspace must not re-allocate \
-                 — that is the 15.9 GB free-and-realloc this fix exists to remove"
+    fn base_limit_key() -> LimitKey {
+        LimitKey {
+            device: 7,
+            cuda_device_identity_sha256: "cuda-device-a".to_owned(),
+            parent_dataset_identity_sha256: "parent-a".to_owned(),
+            pre_parent_free_memory_bytes: 23_000_000_000,
+            resident_parent_rows: 1_049_160,
+            evaluation_rows: 262_290,
+            feature_count: 1_800,
+            month_capacity: 240,
+            gene_count: 200,
+            gene_term_count: 3_200,
+        }
+    }
+
+    #[test]
+    fn learned_limit_binds_parent_snapshot_and_exact_gene_shape() {
+        let base = base_limit_key();
+        learn_batch_success(&base, 26_777);
+        assert_eq!(learned_batch_limit(&base), 26_777);
+
+        let mut variants = Vec::new();
+        let mut different_parent_rows = base.clone();
+        different_parent_rows.resident_parent_rows += 1;
+        variants.push(different_parent_rows);
+        let mut different_parent = base.clone();
+        different_parent.parent_dataset_identity_sha256 = "parent-b".to_owned();
+        variants.push(different_parent);
+        let mut different_snapshot = base.clone();
+        different_snapshot.pre_parent_free_memory_bytes -= 1;
+        variants.push(different_snapshot);
+        let mut different_gene_terms = base.clone();
+        different_gene_terms.gene_term_count += 1;
+        variants.push(different_gene_terms);
+        let mut different_device_identity = base.clone();
+        different_device_identity.cuda_device_identity_sha256 = "cuda-device-b".to_owned();
+        variants.push(different_device_identity);
+
+        for variant in &variants {
+            assert_eq!(
+                learned_batch_limit(variant),
+                usize::MAX,
+                "a learned fit leaked across a distinct sizing receipt fact: {variant:?}"
             );
-            assert_eq!(host_record_after(25_600, requested), 25_600);
         }
-
-        // Growth re-allocates the WORKSPACE, and only the workspace; the host
-        // record then matches what the device holds.
-        assert!(device_reallocates(256, 25_600));
-        assert_eq!(host_record_after(256, 25_600), 25_600);
-
-        // 1 000 -> 5 000 -> 1 000 -> 5 000 is ONE device re-allocation and no
-        // dataset re-upload at all. Under the old host predicate the first
-        // 5 000 rebuilt the whole session.
-        let mut record = 1_000usize;
-        let mut reallocations = 0;
-        for requested in [1_000usize, 5_000, 1_000, 5_000] {
-            if device_reallocates(record, requested) {
-                reallocations += 1;
-            }
-            record = host_record_after(record, requested);
-        }
-        assert_eq!(
-            reallocations, 1,
-            "the workspace grows once and is then reused"
-        );
+        learn_batch_failure(&variants[0], 512);
+        assert_eq!(learned_batch_limit(&variants[0]), 512);
+        assert_eq!(learned_batch_limit(&base), 26_777);
     }
 
-    /// Peak memory must follow the hardware, never the request.
     #[test]
-    fn a_smaller_card_approves_a_smaller_batch() {
-        const BARS: usize = 87_715;
-        const FEATURES: usize = 257;
-        let big = fits_or_panic(24 * 1024 * 1024 * 1024, BARS, FEATURES);
-        let small = fits_or_panic(8 * 1024 * 1024 * 1024, BARS, FEATURES);
-        assert!(small < big, "8 GB approved {small}, 24 GB approved {big}");
-    }
-
-    /// "No room" and "cannot read the card" are DIFFERENT ANSWERS.
-    ///
-    /// They were the same `None`, and the caller's `None` arm sized the launch
-    /// up to `last_known_fit()` — so the branch taken when the card is provably
-    /// too small was the branch that replayed the biggest batch that had ever
-    /// worked, on any dataset. That is the `unwrap_or(usize::MAX)` incident
-    /// rebuilt with more steps.
-    #[test]
-    fn no_room_is_not_the_same_answer_as_cannot_read() {
-        const BARS: usize = 87_715;
-        const FEATURES: usize = 257;
-        assert!(matches!(
-            candidates_for_free_memory(64 * 1024 * 1024, BARS, FEATURES, MONTHS),
-            Sizing::NoRoom { .. }
-        ));
-
-        // The worked shape: a 12 GB card asked for EURUSD M1 at 257 features.
-        // The f64 indicator matrix alone is 10.8 GB and it is charged twice for
-        // the bar-major transpose, so the DATASET does not fit — and no work
-        // list, however small, makes a dataset smaller.
-        assert!(matches!(
-            candidates_for_free_memory(12 * 1024 * 1024 * 1024, 5_270_000, 257, MONTHS),
-            Sizing::NoRoom { .. }
-        ));
-    }
-
-    /// `month_capacity` is an operator knob with no upper bound, and the device
-    /// allocates `scenario_count * month_capacity` doubles TWICE. Folding the
-    /// default 240 into a literal 3 944 made peak device memory a function of a
-    /// user parameter — the never-OOM invariant inverted, inside the one
-    /// function that exists to enforce it.
-    #[test]
-    fn the_month_capacity_knob_is_charged_rather_than_assumed() {
-        const BARS: usize = 87_715;
-        const FEATURES: usize = 257;
-        const FREE: u64 = 24 * 1024 * 1024 * 1024;
-        let default = fits_or_panic(FREE, BARS, FEATURES);
-        let doubled = match candidates_for_free_memory(FREE, BARS, FEATURES, 2 * MONTHS) {
-            Sizing::Fits(fits) => fits,
-            other => panic!("expected a fit, got {other:?}"),
-        };
-        assert!(
-            doubled < default,
-            "doubling month_capacity adds 3 840 B per scenario, so it must LOWER the \
-             approved count: {doubled} vs {default}"
-        );
-        // The default still costs what the old literal did — 2 * 240 * 8 + 104
-        // = 3 944 — plus the 56 B of scenario-descriptor arrays that were never
-        // charged at all.
-        assert_eq!(2 * MONTHS * 8 + 104, 3_944);
-    }
-
-    /// A fit learned on one dataset must never size a launch on another.
-    ///
-    /// `last_known_fit` and `learned_batch_limit` were process-wide atomics
-    /// keyed to nothing, so an M5 fit of 26 777 scenarios was replayed as the
-    /// batch size for an M1 dataset whose indicator matrix alone is ten times
-    /// larger — and one dataset's capacity failure permanently capped every
-    /// other dataset's launches for the life of the process.
-    #[test]
-    fn a_learned_limit_belongs_to_one_shape() {
-        let m5 = LimitKey {
-            device: 0,
-            bars: 843_456,
-            feature_count: 64,
-            month_capacity: 240,
-        };
-        let m1 = LimitKey {
-            device: 0,
-            bars: 5_270_000,
-            feature_count: 257,
-            month_capacity: 240,
-        };
-        learn_batch_success(m5, 26_777);
-        assert_eq!(learned_batch_limit(m5), 26_777);
-        assert_eq!(
-            learned_batch_limit(m1),
-            usize::MAX,
-            "an M1 dataset has no learned limit just because an M5 one does"
-        );
-        // Nor does a failure on one shape cap the other.
-        learn_batch_failure(m1, 512);
-        assert_eq!(learned_batch_limit(m1), 512);
-        assert_eq!(learned_batch_limit(m5), 26_777);
-    }
-
-    /// A DATASET allocation failure must not be retried by halving the work.
-    ///
-    /// `upload_dataset` returns the same `STATUS_ALLOCATION_FAILED` as a
-    /// workspace exhaustion, so the retry could not tell them apart and split a
-    /// 17 748-scenario screen down to one scenario — ~35 000 launches, each
-    /// re-attempting the identical multi-gigabyte `cudaMalloc`, on a context the
-    /// first failure may already have left unusable.
-    #[test]
-    fn a_dataset_allocation_failure_is_never_split() {
+    fn an_unsplittable_allocation_failure_is_never_split() {
         let workspace: Result<()> = Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
             .map_err(anyhow::Error::new)
             .context("prototype B evaluate");
@@ -1113,25 +1487,44 @@ mod capacity_detection_tests {
             "a workspace exhaustion IS worth retrying smaller"
         );
 
-        let dataset: Result<()> = Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
+        let parent: Result<()> = Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
             .map_err(anyhow::Error::new)
-            .context(NotAWorkListSizeProblem("the dataset upload"))
-            .context("prototype B dataset upload");
-        let error = dataset.expect_err("constructed as an error");
+            .context(UnsplittablePopulationAllocationV1(
+                "the immutable native population parent upload",
+            ))
+            .context("upload immutable native population parent");
+        let error = parent.expect_err("constructed as an error");
         assert!(
             !is_capacity_exhaustion(&error),
-            "a dataset upload failure is the same size at every leaf: {error:#}"
+            "a parent upload failure is the same size at every leaf: {error:#}"
         );
-        // And the reason still reaches the log.
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("prototype B dataset upload"),
+            rendered.contains("upload immutable native population parent"),
             "{rendered}"
         );
         assert!(
             rendered.contains("does not depend on the work list size"),
             "{rendered}"
         );
+    }
+
+    #[cfg(feature = "gpu-b-native")]
+    #[test]
+    #[ignore = "requires a real CUDA device"]
+    fn real_admitted_cuda_snapshot_sizes_full_parent_and_exact_genes() {
+        let admission =
+            crate::acquire_strict_discovery_device_admission_v1().expect("real CUDA admission");
+        let route = admission.into_route_v1();
+        let admitted = route
+            .require_exact_cuda_device_ordinal_v1()
+            .expect("admission must seal a CUDA ordinal");
+        assert!(admitted.pre_parent_free_memory_bytes() > 0);
+        let ceiling = runtime_submission_ceiling_for_admitted_ordinal_v1(
+            admitted, 1_049_160, 262_290, 1_800, 240, 200, 3_200,
+        )
+        .expect("the admitted RTX route must fit the exact strict plan");
+        assert!(ceiling >= 16, "admitted strict ceiling is {ceiling}");
     }
 
     /// Built exactly as the engine builds it, so the test exercises the real
@@ -1180,7 +1573,7 @@ mod capacity_detection_tests {
     fn resident_reuse_is_owned_by_the_run_scoped_sealed_native_boundary() {
         let source = include_str!("prototype_b_population_eval.rs");
         let production = &source[source
-            .find("fn evaluate_population_b_batch(")
+            .rfind("\nfn evaluate_population_b_batch(")
             .expect("native population adapter boundary")..];
         assert!(production.contains("bind_exact_native_population_view_v1"));
         assert!(!production.contains("fn resident_slot()"));
@@ -1423,8 +1816,8 @@ fn evaluate_population_b_batch(
     // `scenario::base_scenario` / `cost_scenario` / `perturb_scenario` is how
     // that becomes a free-trading backtest, which is why there is no third
     // construction site.
-    let ((rows, counters, host_prep, device_elapsed, adapter_counters), residency_counters) =
-        evidence.bind_exact_native_population_view_v1(native_device, |session| {
+    let ((rows, counters, host_prep, device_elapsed), residency_counters) = evidence
+        .bind_exact_native_population_view_v1(native_device, |session| {
             session
                 .upload_genes(PopulationGeneView {
                     descriptors: &descriptors,
@@ -1440,46 +1833,25 @@ fn evaluate_population_b_batch(
                     smc_gate_disabled: crate::genetic::smc_gate_disabled(),
                 })
                 .map_err(anyhow::Error::new)
-                .context(NotAWorkListSizeProblem("the gene upload"))
+                .context(UnsplittablePopulationAllocationV1("the gene upload"))
                 .context("prototype B gene upload")?;
             session
                 .upload_scenarios(scenarios)
                 .map_err(anyhow::Error::new)
                 .context("prototype B scenario upload")?;
 
-            // The parent upload/view bind and all changing input staging are
-            // included in host prep. The device interval still includes the
-            // full population-metric D2H readback; P1-E must eliminate that
-            // intermediate transfer before this can be final-only evidence.
+            // Parent/view bind plus changing gene/scenario staging are host
+            // prep. Evaluation itself uses the strict metrics-only workspace:
+            // no outcome ledger, seed kernel, or accepted-total scalar exists.
             let host_prep = host_prep_started.elapsed();
             let device_started = std::time::Instant::now();
-            let (event_id, counters) = session
-                .evaluate(&native_settings)
-                .map_err(anyhow::Error::new)
-                .context("prototype B evaluate")?;
-            session
-                .wait(event_id)
-                .map_err(anyhow::Error::new)
-                .context("prototype B wait")?;
-            let rows = session
-                .read_metrics()
-                .map_err(anyhow::Error::new)
-                .context("prototype B readback")?;
-            let adapter_counters = session
-                .read_residency_counters_v1()
-                .map_err(anyhow::Error::new)
-                .context("prototype B residency counter readback")?;
-            Ok((
-                rows,
-                counters,
-                host_prep,
-                device_started.elapsed(),
-                adapter_counters,
-            ))
+            let host_metrics = session
+                .enqueue_metrics_only_v1(&native_settings)?
+                .consume_host_metrics_v1()?;
+            let counters = host_metrics.counters();
+            let rows = host_metrics.into_metric_rows();
+            Ok((rows, counters, host_prep, device_started.elapsed()))
         })?;
-    if adapter_counters != residency_counters {
-        bail!("native population residency counters changed without an intervening operation");
-    }
     let session_rebuilt = residency_counters.parent_upload_count() == 1
         && residency_counters.view_binding_count() == 1;
 
@@ -1495,20 +1867,9 @@ fn evaluate_population_b_batch(
         },
     );
 
-    // How full the trade slots actually are.
-    //
-    // Every candidate reserves MAX_TRADES_PER_CANDIDATE slots — 589 824 B of
-    // the 593 768 B it now costs. Since the signal and confidence columns were
-    // deleted this array is 99.3 % of the per-scenario footprint, so it is the
-    // ONLY thing left standing between the card and a far larger population,
-    // and the reservation is a constant while what a candidate records is not.
-    // Nothing measured the difference, so nothing could tell whether the card
-    // was full of trades or of empty space.
-    //
-    // `accepted_trade_count` in the counters looks like the answer and is
-    // always zero: the kernel never fills that field, it only stores the total
-    // on the session after `wait`. Slot 8 of a metric row is the same fact per
-    // candidate, already read back.
+    // The strict workspace has no outcome ledger or accepted-trade scalar.
+    // Slot 8 is the authoritative per-scenario trade count already present in
+    // the single bounded metric readback.
     let trade_counts = rows
         .iter()
         .map(|row| row.values[8])
@@ -1520,14 +1881,9 @@ fn evaluate_population_b_batch(
         target: "neoethos_search::eval",
         n_genes,
         n_scenarios,
-        reserved_slots = neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE,
         busiest_candidate = peak as u64,
         mean_trades = (total / (rows.len() as f64).max(1.0)) as u64,
-        peak_fill_pct = format!(
-            "{:.2}",
-            peak * 100.0 / neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE as f64
-        ),
-        "trade slot usage — what was reserved per candidate against what was recorded"
+        "strict metrics-only trade counts — no diagnostic outcome slots allocated"
     );
 
     // Where this launch's time went.

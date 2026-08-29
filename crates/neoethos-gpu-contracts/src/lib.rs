@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod resident_feature_store_v3;
+pub mod resident_search_scoring_v2;
 
 pub const ABI_VERSION: u32 = 4;
 pub const POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING: u32 = 1 << 0;

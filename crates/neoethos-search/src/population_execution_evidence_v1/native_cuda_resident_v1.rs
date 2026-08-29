@@ -1,4 +1,6 @@
-use super::{ExactPopulationEvaluationV1, ExactPopulationTimestampModeV1};
+use super::{
+    ExactPopulationEvaluationV1, ExactPopulationTimestampModeV1, UnsplittablePopulationAllocationV1,
+};
 use crate::eval::BacktestSettings;
 use crate::exact_resident_dataset_authority_v1::{
     ExactResidentDatasetAuthorityV1, ExactResidentDatasetViewV1, SealedExactResidentDatasetParentV1,
@@ -156,6 +158,9 @@ impl NativePopulationResidencyRunV1 {
             native
                 .upload_parent_dataset_v1(self.parent.clone())
                 .map_err(anyhow::Error::new)
+                .context(UnsplittablePopulationAllocationV1(
+                    "the immutable native population parent upload",
+                ))
                 .context("upload immutable native population parent")?;
             *session = Some(SendNativePopulationSessionV1(NativePopulationSessionV1 {
                 device,

@@ -5,6 +5,7 @@ pub mod bootstrap_writer;
 // override the app crate honours. Mirror of `neoethos_core::env_overrides`.
 // Call-sites elsewhere consult `env_overrides::*` typed getters instead
 // of reading `std::env::var` directly.
+pub mod entrypoints;
 pub mod env_overrides;
 pub mod execution_admission;
 // 2026-08-10 config consolidation: the tombstone list. Every env var this
@@ -14,6 +15,7 @@ pub mod execution_admission;
 pub mod broker_config;
 pub mod broker_deal_economics;
 pub mod broker_persistence;
+pub mod canonical_native_discovery;
 pub mod ctrader_account;
 pub mod ctrader_auth;
 pub mod ctrader_data;
@@ -99,4 +101,5 @@ use crate::app_services::jobs::JobSnapshot;
 pub enum ServiceEvent {
     DiscoveryUpdated(JobSnapshot),
     TrainingUpdated(JobSnapshot),
+    CanonicalNativeResearchUpdated(canonical_native_discovery::CanonicalNativeResearchEventV1),
 }
