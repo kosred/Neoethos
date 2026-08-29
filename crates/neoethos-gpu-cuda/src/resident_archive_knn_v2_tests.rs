@@ -432,6 +432,37 @@ fn r2_current_and_archive_neighbors_use_exact_rational_order_and_sum() {
     );
     assert_eq!(result.exact_sum, CheckedRational::new(3, 2));
     assert_eq!(result.mean.to_bits(), 0.5_f64.to_bits());
+
+    let cross_denominator_query = signature(0b0011);
+    let shuffled_cross_denominator_neighbors = [
+        wire(SOURCE_CURRENT, 0, 99, cross_denominator_query),
+        wire(SOURCE_CURRENT, 1, 50, signature(0b0101)),
+        wire(SOURCE_CURRENT, 2, 30, signature(0b0001)),
+        wire(SOURCE_CURRENT, 3, 40, signature(0b1_1111)),
+        wire(SOURCE_CURRENT, 4, 20, signature(0b1111)),
+    ];
+    let cross_denominator_result = select_exact_knn(
+        0,
+        cross_denominator_query,
+        5,
+        0,
+        &shuffled_cross_denominator_neighbors,
+    )
+    .unwrap();
+
+    assert_eq!(
+        selected_keys(&cross_denominator_result),
+        vec![
+            (20, SOURCE_CURRENT, 4, 2, 4),
+            (30, SOURCE_CURRENT, 2, 1, 2),
+            (40, SOURCE_CURRENT, 3, 3, 5),
+            (50, SOURCE_CURRENT, 1, 2, 3),
+        ]
+    );
+    assert_eq!(
+        cross_denominator_result.exact_sum,
+        CheckedRational::new(34, 15)
+    );
 }
 
 #[test]
@@ -475,6 +506,69 @@ fn r2_fewer_than_k_selects_every_available_neighbor() {
     );
     assert_eq!(result.exact_sum, CheckedRational::new(3, 4));
     assert_eq!(result.mean.to_bits(), 0.375_f64.to_bits());
+
+    let order_sensitive_query = signature(1);
+    let shuffled_order_sensitive_neighbors = [
+        wire(SOURCE_CURRENT, 0, 999, order_sensitive_query),
+        wire(SOURCE_CURRENT, 7, 70, signature(0x3fff)),
+        wire(SOURCE_CURRENT, 2, 22, signature(0x001f)),
+        wire(SOURCE_CURRENT, 5, 52, signature(0x1fff)),
+        wire(SOURCE_CURRENT, 1, 20, signature(0x0007)),
+        wire(SOURCE_CURRENT, 4, 40, signature(0x07ff)),
+        wire(SOURCE_CURRENT, 3, 21, signature(0x001f)),
+        wire(SOURCE_CURRENT, 6, 51, signature(0x1fff)),
+    ];
+    let order_sensitive_result = select_exact_knn(
+        0,
+        order_sensitive_query,
+        8,
+        0,
+        &shuffled_order_sensitive_neighbors,
+    )
+    .unwrap();
+
+    assert_eq!(
+        selected_keys(&order_sensitive_result),
+        vec![
+            (20, SOURCE_CURRENT, 1, 2, 3),
+            (21, SOURCE_CURRENT, 3, 4, 5),
+            (22, SOURCE_CURRENT, 2, 4, 5),
+            (40, SOURCE_CURRENT, 4, 10, 11),
+            (51, SOURCE_CURRENT, 6, 12, 13),
+            (52, SOURCE_CURRENT, 5, 12, 13),
+            (70, SOURCE_CURRENT, 7, 13, 14),
+        ]
+    );
+    assert_eq!(
+        order_sensitive_result.exact_sum,
+        CheckedRational::new(178_693, 30_030)
+    );
+    assert_eq!(order_sensitive_result.mean.to_bits(), 0x3feb_33c3_dbd3_5979);
+
+    let mut reverse_sum = 0.0_f64;
+    for (numerator, denominator) in [
+        (13_u32, 14_u32),
+        (12, 13),
+        (12, 13),
+        (10, 11),
+        (4, 5),
+        (4, 5),
+        (2, 3),
+    ] {
+        reverse_sum += f64::from(numerator) / f64::from(denominator);
+    }
+    let reverse_mean = reverse_sum / 7.0;
+    let exact_sum_once_mean = (178_693.0_f64 / 30_030.0_f64) / 7.0_f64;
+    assert_eq!(reverse_mean.to_bits(), 0x3feb_33c3_dbd3_5978);
+    assert_eq!(exact_sum_once_mean.to_bits(), 0x3feb_33c3_dbd3_5978);
+    assert_ne!(
+        order_sensitive_result.mean.to_bits(),
+        reverse_mean.to_bits()
+    );
+    assert_ne!(
+        order_sensitive_result.mean.to_bits(),
+        exact_sum_once_mean.to_bits()
+    );
 }
 
 #[test]
@@ -539,22 +633,22 @@ fn r2_k15_cutoff_prefers_current_over_archive_for_equal_distance_and_identity() 
     let query = [0xff; W];
     let neighbors = [
         wire(SOURCE_CURRENT, 0, 9999, query),
-        wire(SOURCE_CURRENT, 1, 101, [0xff, 0xff, 0xff, 0x7f]),
-        wire(SOURCE_CURRENT, 2, 102, [0xff, 0xff, 0xff, 0x3f]),
-        wire(SOURCE_CURRENT, 3, 103, [0xff, 0xff, 0xff, 0x1f]),
-        wire(SOURCE_CURRENT, 4, 104, [0xff, 0xff, 0xff, 0x0f]),
-        wire(SOURCE_CURRENT, 5, 105, [0xff, 0xff, 0xff, 0x07]),
-        wire(SOURCE_CURRENT, 6, 106, [0xff, 0xff, 0xff, 0x03]),
-        wire(SOURCE_CURRENT, 7, 107, [0xff, 0xff, 0xff, 0x01]),
-        wire(SOURCE_CURRENT, 8, 108, [0xff, 0xff, 0xff, 0x00]),
-        wire(SOURCE_CURRENT, 9, 109, [0xff, 0xff, 0x7f, 0x00]),
-        wire(SOURCE_CURRENT, 10, 110, [0xff, 0xff, 0x3f, 0x00]),
-        wire(SOURCE_CURRENT, 11, 111, [0xff, 0xff, 0x1f, 0x00]),
-        wire(SOURCE_CURRENT, 12, 112, [0xff, 0xff, 0x0f, 0x00]),
-        wire(SOURCE_CURRENT, 13, 113, [0xff, 0xff, 0x07, 0x00]),
-        wire(SOURCE_CURRENT, 14, 114, [0xff, 0xff, 0x03, 0x00]),
-        wire(SOURCE_CURRENT, 15, 999, [0xff, 0xff, 0x00, 0x00]),
         wire(SOURCE_ARCHIVE, 0, 999, [0xff, 0xff, 0x00, 0x00]),
+        wire(SOURCE_CURRENT, 7, 107, [0xff, 0xff, 0xff, 0x01]),
+        wire(SOURCE_CURRENT, 1, 101, [0xff, 0xff, 0xff, 0x7f]),
+        wire(SOURCE_CURRENT, 14, 114, [0xff, 0xff, 0x03, 0x00]),
+        wire(SOURCE_CURRENT, 4, 104, [0xff, 0xff, 0xff, 0x0f]),
+        wire(SOURCE_CURRENT, 10, 110, [0xff, 0xff, 0x3f, 0x00]),
+        wire(SOURCE_CURRENT, 2, 102, [0xff, 0xff, 0xff, 0x3f]),
+        wire(SOURCE_CURRENT, 12, 112, [0xff, 0xff, 0x0f, 0x00]),
+        wire(SOURCE_CURRENT, 5, 105, [0xff, 0xff, 0xff, 0x07]),
+        wire(SOURCE_CURRENT, 9, 109, [0xff, 0xff, 0x7f, 0x00]),
+        wire(SOURCE_CURRENT, 3, 103, [0xff, 0xff, 0xff, 0x1f]),
+        wire(SOURCE_CURRENT, 13, 113, [0xff, 0xff, 0x07, 0x00]),
+        wire(SOURCE_CURRENT, 6, 106, [0xff, 0xff, 0xff, 0x03]),
+        wire(SOURCE_CURRENT, 11, 111, [0xff, 0xff, 0x1f, 0x00]),
+        wire(SOURCE_CURRENT, 8, 108, [0xff, 0xff, 0xff, 0x00]),
+        wire(SOURCE_CURRENT, 15, 999, [0xff, 0xff, 0x00, 0x00]),
     ];
 
     let result = select_exact_knn(0, query, 16, 1, &neighbors).unwrap();
@@ -655,6 +749,10 @@ fn r2_checked_fraction_comparator_accepts_the_limit_and_rejects_overflow() {
         compare_fraction_checked(at_limit, multiplier_two),
         Err(OracleError::ComparatorOverflow)
     );
+    assert_eq!(
+        compare_fraction_checked(multiplier_two, at_limit),
+        Err(OracleError::ComparatorOverflow)
+    );
 }
 
 #[test]
@@ -674,6 +772,31 @@ fn r2_exact_rational_sum_reduces_and_checks_u128_arithmetic() {
         ]),
         Err(OracleError::RationalSumOverflow)
     );
+    assert_eq!(
+        checked_rational_sum(&[
+            CheckedRational::new(u128::MAX, 1),
+            CheckedRational::new(0, 2),
+        ]),
+        Err(OracleError::RationalSumOverflow)
+    );
+    assert_eq!(
+        checked_rational_sum(&[
+            CheckedRational::new(1, 2),
+            CheckedRational::new(u128::MAX, 1),
+        ]),
+        Err(OracleError::RationalSumOverflow)
+    );
+    assert_eq!(
+        checked_rational_sum(&[CheckedRational::new(1, 2), CheckedRational::new(1, 0),]),
+        Err(OracleError::RationalZeroDenominator)
+    );
+    assert_eq!(
+        checked_rational_sum(&[
+            CheckedRational::new(1, u128::MAX),
+            CheckedRational::new(0, 2),
+        ]),
+        Err(OracleError::RationalSumOverflow)
+    );
 }
 
 #[test]
@@ -684,6 +807,12 @@ fn r2_acceptance_includes_the_exact_absolute_error_boundary() {
 
     assert_eq!(absolute_error.to_bits(), 2.0_f64.powi(-50).to_bits());
     assert!(accept_sealed_mean(expected, actual));
+
+    let lower_expected = 8.0_f64;
+    let lower_actual = f64::from_bits(lower_expected.to_bits() - 1);
+    let lower_absolute_error = (lower_actual - lower_expected).abs();
+    assert_eq!(lower_absolute_error.to_bits(), 2.0_f64.powi(-50).to_bits());
+    assert!(accept_sealed_mean(lower_expected, lower_actual));
 }
 
 #[test]
@@ -694,6 +823,11 @@ fn r2_acceptance_includes_the_exact_relative_error_boundary() {
 
     assert_eq!(relative_error.to_bits(), 2.0_f64.powi(-48).to_bits());
     assert!(accept_sealed_mean(expected, actual));
+
+    let lower_actual = f64::from_bits((1_u64 << 48) - 1);
+    let lower_relative_error = (lower_actual - expected).abs() / expected;
+    assert_eq!(lower_relative_error.to_bits(), 2.0_f64.powi(-48).to_bits());
+    assert!(accept_sealed_mean(expected, lower_actual));
 }
 
 #[test]
@@ -701,9 +835,13 @@ fn r2_acceptance_includes_four_ulps_and_rejects_five_ulps() {
     let expected = 0.5_f64;
     let four_ulps = f64::from_bits(expected.to_bits() + 4);
     let five_ulps = f64::from_bits(expected.to_bits() + 5);
+    let lower_four_ulps = f64::from_bits(expected.to_bits() - 4);
+    let lower_five_ulps = f64::from_bits(expected.to_bits() - 5);
 
     assert!(accept_sealed_mean(expected, four_ulps));
     assert!(!accept_sealed_mean(expected, five_ulps));
+    assert!(accept_sealed_mean(expected, lower_four_ulps));
+    assert!(!accept_sealed_mean(expected, lower_five_ulps));
 }
 
 #[test]
@@ -716,6 +854,17 @@ fn r2_acceptance_rejects_absolute_only_and_relative_only_failures() {
     assert!(large_relative_error <= 2.0_f64.powi(-48));
     assert!(!accept_sealed_mean(large_expected, one_large_ulp));
 
+    let two_lower_large_steps = f64::from_bits(large_expected.to_bits() - 2);
+    let lower_large_absolute_error = (two_lower_large_steps - large_expected).abs();
+    let lower_large_relative_error = lower_large_absolute_error / large_expected;
+    assert!(lower_large_absolute_error > 2.0_f64.powi(-50));
+    assert!(lower_large_relative_error <= 2.0_f64.powi(-48));
+    assert_eq!(
+        large_expected.to_bits() - two_lower_large_steps.to_bits(),
+        2
+    );
+    assert!(!accept_sealed_mean(large_expected, two_lower_large_steps));
+
     let subnormal_expected = f64::from_bits(1_u64 << 47);
     let one_subnormal_ulp = f64::from_bits((1_u64 << 47) + 1);
     let subnormal_absolute_error = (one_subnormal_ulp - subnormal_expected).abs();
@@ -723,6 +872,16 @@ fn r2_acceptance_rejects_absolute_only_and_relative_only_failures() {
     assert!(subnormal_absolute_error <= 2.0_f64.powi(-50));
     assert!(subnormal_relative_error > 2.0_f64.powi(-48));
     assert!(!accept_sealed_mean(subnormal_expected, one_subnormal_ulp));
+
+    let one_lower_subnormal_ulp = f64::from_bits((1_u64 << 47) - 1);
+    let lower_subnormal_absolute_error = (one_lower_subnormal_ulp - subnormal_expected).abs();
+    let lower_subnormal_relative_error = lower_subnormal_absolute_error / subnormal_expected;
+    assert!(lower_subnormal_absolute_error <= 2.0_f64.powi(-50));
+    assert!(lower_subnormal_relative_error > 2.0_f64.powi(-48));
+    assert!(!accept_sealed_mean(
+        subnormal_expected,
+        one_lower_subnormal_ulp
+    ));
 }
 
 #[test]
@@ -734,9 +893,11 @@ fn r2_acceptance_requires_exact_positive_zero_and_rejects_nonfinite_or_sign() {
     assert!(accept_sealed_mean(positive_zero, positive_zero));
     assert!(!accept_sealed_mean(positive_zero, negative_zero));
     assert!(!accept_sealed_mean(negative_zero, positive_zero));
+    assert!(!accept_sealed_mean(negative_zero, negative_zero));
     assert!(!accept_sealed_mean(positive_zero, f64::from_bits(1)));
     assert!(!accept_sealed_mean(1.0, -1.0));
     assert!(!accept_sealed_mean(-1.0, 1.0));
+    assert!(!accept_sealed_mean(-1.0, -1.0));
     assert!(!accept_sealed_mean(1.0, f64::NAN));
     assert!(!accept_sealed_mean(f64::NAN, 1.0));
     assert!(!accept_sealed_mean(1.0, f64::INFINITY));
