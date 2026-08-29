@@ -4499,6 +4499,7 @@ neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
   source->metrics_ready_event = session->event;
   source->scoring_ready_event = session->scoring_ready_event_v2;
   source->receipt_token = resident_metrics;
+  source->population_lifetime_owner = session;
   source->metric_rows_device = session->metric_rows;
   static_assert(CHAR_BIT == 8);
   static_assert(sizeof(unsigned long long) == sizeof(std::uint64_t));

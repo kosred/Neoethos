@@ -407,17 +407,6 @@ fn slice2_layout_subtotal(layout: &ResidentSearchSlice2AlignedLayoutV2) -> u64 {
     ])
 }
 
-fn archive_subreceipt_bytes(layout: &ResidentSearchSlice2AlignedLayoutV2) -> u64 {
-    checked_sum(&[
-        layout.archive_gene_scalars,
-        layout.archive_term_indices,
-        layout.archive_term_weights,
-        layout.archive_metric_rows,
-        layout.archive_signatures,
-        layout.archive_hashes,
-    ])
-}
-
 fn valid_slice2_layout() -> ResidentSearchSlice2AlignedLayoutV2 {
     let mut layout = ResidentSearchSlice2AlignedLayoutV2 {
         archive_gene_scalars: 3_600_128,
@@ -761,7 +750,7 @@ fn valid_request() -> ResidentSearchSlice2AdmissionRequestV2 {
         device_alignment_bytes: SLICE2_ALIGNMENT_BYTES,
         terminal_host_flags: CUDA_HOST_ALLOC_PORTABLE,
         archive_arena_present: true,
-        archive_arena_bytes: archive_subreceipt_bytes(&layout),
+        archive_arena_bytes: layout.replacement_subtotal_bytes,
         expected_slice2_layout: layout,
         generation_receipt,
         scoring_archive_receipt,
@@ -1036,8 +1025,112 @@ fn assert_v8_source_topology_is_frozen() {
             .count()
     }
 
+    fn native_bind_authority_surface_error(source: &str) -> Option<&'static str> {
+        const TYPE_NAME: &str = "ResidentSearchSlice2NativeBindAuthorityV2";
+        let struct_marker = format!("pub(crate) struct {TYPE_NAME}");
+        let Some(struct_index) = source
+            .find(&struct_marker)
+            .or_else(|| source.find(&format!("struct {TYPE_NAME}")))
+        else {
+            return Some("native bind authority declaration must remain present");
+        };
+        let Some(derive_start) = source[..struct_index].rfind("#[derive(") else {
+            return Some("native bind authority derive surface must remain explicit");
+        };
+        let derive_tail = &source[derive_start + "#[derive(".len()..struct_index];
+        let Some(derive_end) = derive_tail.find(")]") else {
+            return Some("native bind authority derive surface must remain explicit");
+        };
+        let derives = &derive_tail[..derive_end];
+        if derives
+            .split(',')
+            .map(str::trim)
+            .any(|item| matches!(item, "Clone" | "Copy"))
+        {
+            return Some("native bind authority must remain move-only");
+        }
+
+        let flattened = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for trait_name in ["Clone", "Copy"] {
+            if flattened.contains(&format!("impl {trait_name} for {TYPE_NAME}")) {
+                return Some("native bind authority must not implement copy traits");
+            }
+        }
+
+        let struct_tail = &source[struct_index..];
+        let Some(body_start) = struct_tail.find('{') else {
+            return Some("native bind authority body must remain present");
+        };
+        let body_tail = &struct_tail[body_start + 1..];
+        let Some(body_end) = body_tail.find('}') else {
+            return Some("native bind authority body must remain present");
+        };
+        let body = body_tail[..body_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if body.contains("pub raw:") || body.contains("pub(crate) raw:") {
+            return Some("native bind raw field must remain private");
+        }
+
+        for (fn_index, _) in source.match_indices("fn ") {
+            let tail = &source[fn_index..];
+            let brace = tail.find('{').unwrap_or(tail.len());
+            let semicolon = tail.find(';').unwrap_or(tail.len());
+            let signature = &tail[..brace.min(semicolon)];
+            let Some((_, return_type)) = signature.split_once("->") else {
+                continue;
+            };
+            if !return_type.contains("RawResidentArchiveKnnBindV2") {
+                continue;
+            }
+            let declaration_start = source[..fn_index]
+                .rfind(['{', '}', ';'])
+                .map_or(0, |index| index + 1);
+            let prefix = source[declaration_start..fn_index]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if prefix
+                .split_whitespace()
+                .any(|token| token == "pub" || token.starts_with("pub(") || token == "unsafe")
+            {
+                return Some("native bind raw accessor must remain private and safe");
+            }
+        }
+        None
+    }
+
     let shared = include_str!("resident_search_slice2_admission_v2.rs").replace("\r\n", "\n");
     let child = include_str!("resident_search_v2_tests.rs").replace("\r\n", "\n");
+    assert_eq!(native_bind_authority_surface_error(&shared), None);
+    let native_bind_declaration = "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct ResidentSearchSlice2NativeBindAuthorityV2";
+    for copy_trait in ["Clone", "Copy"] {
+        let mutant = shared.replacen(
+            native_bind_declaration,
+            &format!(
+                "#[derive(Debug, {copy_trait}, PartialEq, Eq)]\npub(crate) struct ResidentSearchSlice2NativeBindAuthorityV2"
+            ),
+            1,
+        );
+        assert_eq!(
+            native_bind_authority_surface_error(&mutant),
+            Some("native bind authority must remain move-only")
+        );
+    }
+    for raw_accessor in [
+        "pub fn raw_escape_v2(&self) -> &RawResidentArchiveKnnBindV2 { &self.raw }",
+        "pub(crate)\nfn raw_escape_v2(\n    &self,\n) -> &RawResidentArchiveKnnBindV2 { &self.raw }",
+        "unsafe fn raw_escape_v2(&self) -> &RawResidentArchiveKnnBindV2 { &self.raw }",
+    ] {
+        let mutant = format!(
+            "{shared}\nimpl ResidentSearchSlice2NativeBindAuthorityV2 {{\n{raw_accessor}\n}}\n"
+        );
+        assert_eq!(
+            native_bind_authority_surface_error(&mutant),
+            Some("native bind raw accessor must remain private and safe")
+        );
+    }
     let trusted_authority = "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct ResidentSearchSlice2TrustedReserveAuthorityV2 {\n    expected_bytes: u64,\n    expected_binding: ResidentSearchSlice2AuthorityBindingV2,\n}";
     let trusted_set = "#[derive(Debug, PartialEq, Eq)]\npub(crate) struct ResidentSearchSlice2TrustedReserveSetV2 {\n    allocator_context_headroom: ResidentSearchSlice2TrustedReserveAuthorityV2,\n    full_workspace_authority: ResidentSearchSlice2TrustedReserveAuthorityV2,\n    retained_pre_search_workspace: ResidentSearchSlice2TrustedReserveAuthorityV2,\n    remaining_search_allocation_after_trim: ResidentSearchSlice2TrustedReserveAuthorityV2,\n    same_context_free: ResidentSearchSlice2TrustedReserveAuthorityV2,\n}";
     let trusted_seal = "pub(crate) struct ResidentSearchSlice2TrustedReserveSealV2 {\n    trusted_reserve: ResidentSearchSlice2TrustedReserveSetV2,\n    expected_calibration: ResidentSearchSlice2CalibrationBindingV2,\n    sealed_full_workspace_receipt_identity: u64,\n    sealed_post_trim_receipt_identity: u64,\n}";
@@ -1183,6 +1276,75 @@ fn slice2_combined_admission_rejects_missing_or_zero_archive_arena_before_alloca
     );
     assert_zero_before_native_create(&recorder);
 
+    for observed_bytes in [
+        TERMINAL_HOST_RECEIPT_BYTES - 1,
+        TERMINAL_HOST_RECEIPT_BYTES + 1,
+    ] {
+        let mut request = valid_request();
+        request.terminal_host_receipt_bytes = observed_bytes;
+        let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
+        let actual = admit_with_pristine_seal(request, &mut recorder);
+        assert_eq!(
+            actual.expect_err("non-canonical terminal host receipt bytes must fail"),
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostReceiptBytesMismatch {
+                expected_bytes: TERMINAL_HOST_RECEIPT_BYTES,
+                observed_bytes,
+            }
+        );
+        assert_zero_before_native_create(&recorder);
+    }
+
+    for observed_alignment_bytes in [
+        TERMINAL_HOST_ALIGNMENT_BYTES - 1,
+        TERMINAL_HOST_ALIGNMENT_BYTES + 1,
+    ] {
+        let mut request = valid_request();
+        request.terminal_host_alignment_bytes = observed_alignment_bytes;
+        let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
+        let actual = admit_with_pristine_seal(request, &mut recorder);
+        assert_eq!(
+            actual.expect_err("non-canonical terminal host alignment must fail"),
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostAlignmentMismatch {
+                expected_alignment_bytes: TERMINAL_HOST_ALIGNMENT_BYTES,
+                observed_alignment_bytes,
+            }
+        );
+        assert_zero_before_native_create(&recorder);
+    }
+
+    for observed_flags in [0, CUDA_HOST_ALLOC_PORTABLE + 1] {
+        let mut request = valid_request();
+        request.terminal_host_flags = observed_flags;
+        let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
+        let actual = admit_with_pristine_seal(request, &mut recorder);
+        assert_eq!(
+            actual.expect_err("non-portable or foreign terminal host flags must fail"),
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostFlagsMismatch {
+                expected_flags: CUDA_HOST_ALLOC_PORTABLE,
+                observed_flags,
+            }
+        );
+        assert_zero_before_native_create(&recorder);
+    }
+
+    for observed_bytes in [
+        REPLACEMENT_SUBTOTAL_BYTES - 1,
+        REPLACEMENT_SUBTOTAL_BYTES + 1,
+    ] {
+        let mut request = valid_request();
+        request.archive_arena_bytes = observed_bytes;
+        let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
+        let actual = admit_with_pristine_seal(request, &mut recorder);
+        assert_eq!(
+            actual.expect_err("logical archive subreceipt must equal the replacement subtotal"),
+            ResidentSearchSlice2AdmissionErrorV2::ArchiveArenaBytesMismatch {
+                expected_bytes: REPLACEMENT_SUBTOTAL_BYTES,
+                observed_bytes,
+            }
+        );
+        assert_zero_before_native_create(&recorder);
+    }
+
     for axis in [
         ResidentSearchSlice2ShapeAxisV2::PopulationCount,
         ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
@@ -1261,7 +1423,6 @@ fn slice2_combined_admission_rejects_each_aligned_layout_field_mismatch_before_a
         let mut mutated_layout = request.scoring_archive_receipt.layout;
         decrement_layout_field(&mut mutated_layout, field);
         let observed_aligned_bytes = observed_layout_field(&mutated_layout, field);
-        request.archive_arena_bytes = archive_subreceipt_bytes(&mutated_layout);
         request.scoring_archive_receipt = scoring_archive_receipt(mutated_layout);
         let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
         let actual = admit_with_pristine_seal(request, &mut recorder);
@@ -1901,6 +2062,7 @@ fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_gener
     assert_eq!(request.signature_word_count, SIGNATURE_WORD_COUNT);
     assert_eq!(request.novelty_neighbor_count, NOVELTY_NEIGHBOR_COUNT);
     assert_eq!(request.max_terms_per_gene, MAX_TERMS_PER_GENE);
+    assert_eq!(request.archive_arena_bytes, REPLACEMENT_SUBTOTAL_BYTES);
     assert_eq!(
         request
             .scoring_archive_receipt
@@ -1943,6 +2105,45 @@ fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_gener
             .scoring_archive_layout
             .test_total_device_bytes_v2(),
         SCORING_ARCHIVE_TOTAL_BYTES
+    );
+    let native_authority = runtime_authority.into_native_bind_authority_v2();
+    let native = native_authority.test_raw_v2();
+    assert_eq!(std::mem::size_of_val(native), 384);
+    assert_eq!(native.abi_version, 2);
+    assert_eq!(native.reserved, 0);
+    assert_eq!(native.reserved_extents, 0);
+    assert_eq!(native.fitness_scores.offset_bytes, 0);
+    assert_eq!(native.fitness_scores.size_bytes, 1_792);
+    assert_eq!(native.cub_scratch.offset_bytes, 3_584);
+    assert_eq!(native.cub_scratch.size_bytes, 65_536);
+    assert_eq!(native.archive_gene_scalars.offset_bytes, 69_120);
+    assert_eq!(native.archive_control_and_seal.offset_bytes, 23_776_512);
+    assert_eq!(native.total_device_bytes, SCORING_ARCHIVE_TOTAL_BYTES);
+    assert_eq!(native.population_count, POPULATION_COUNT);
+    assert_eq!(native.archive_capacity, ARCHIVE_CAPACITY);
+    assert_eq!(native.signature_word_count, SIGNATURE_WORD_COUNT);
+    assert_eq!(native.novelty_neighbor_count, NOVELTY_NEIGHBOR_COUNT);
+    assert_eq!(native.max_terms_per_gene, MAX_TERMS_PER_GENE);
+    assert_eq!(native.device_uuid, DEVICE_UUID);
+    assert_eq!(native.primary_context_identity, PRIMARY_CONTEXT_IDENTITY);
+    assert_eq!(native.search_stream_identity, SEARCH_STREAM_IDENTITY);
+    assert_eq!(native.active_pool_identity, ACTIVE_POOL_IDENTITY);
+    assert_eq!(native.cuda_build_identity, CUDA_BUILD_IDENTITY);
+    assert_eq!(native.kernel_semantics_identity, KERNEL_SEMANTICS_IDENTITY);
+    assert_eq!(native.binary64_math_identity, BINARY64_MATH_IDENTITY);
+    assert_eq!(native.plan_identity, PLAN_IDENTITY);
+    assert_eq!(native.run_identity, RUN_IDENTITY);
+    assert_eq!(
+        native.full_workspace_receipt_identity,
+        FULL_WORKSPACE_RECEIPT_IDENTITY
+    );
+    assert_eq!(
+        native.post_trim_receipt_identity,
+        POST_TRIM_RECEIPT_IDENTITY
+    );
+    assert_eq!(
+        native_authority.test_observed_reserve_v2(),
+        &valid_observed_reserve()
     );
 
     let mut dynamic_request = valid_request();

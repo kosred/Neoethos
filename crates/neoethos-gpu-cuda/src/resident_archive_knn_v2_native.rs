@@ -1,12 +1,62 @@
 use super::{
     ResidentSearchSlice2AllocationCategoryV2, ResidentSearchSlice2AsyncAllocationArgsV2,
-    ResidentSearchSlice2ScoringArchiveReceiptV2,
+    ResidentSearchSlice2CalibrationBindingV2, ResidentSearchSlice2ScoringArchiveReceiptV2,
 };
 
 const SCORING_ARCHIVE_ALIGNMENT_BYTES_V2: u64 = 256;
 const FITNESS_SCORE_BYTES_V2: u64 = 1_792;
 const DECISION_KEY_BYTES_V2: u64 = 1_792;
 const REPLACEMENT_SUBTOTAL_BYTES_V2: u64 = 23_707_648;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RawResidentArchiveKnnArenaRegionV2 {
+    pub(super) offset_bytes: u64,
+    pub(super) size_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RawResidentArchiveKnnBindV2 {
+    pub(super) abi_version: u32,
+    pub(super) reserved: u32,
+    pub(super) fitness_scores: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) decision_keys: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) cub_scratch: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_gene_scalars: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_term_indices: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_term_weights: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_metric_rows: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_signatures: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_hashes: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) current_population_signatures: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) novelty_scores: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) exact_top_k_keys: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) admission_flags: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) admission_offsets: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) archive_control_and_seal: RawResidentArchiveKnnArenaRegionV2,
+    pub(super) total_device_bytes: u64,
+    pub(super) population_count: u64,
+    pub(super) archive_capacity: u64,
+    pub(super) signature_word_count: u32,
+    pub(super) novelty_neighbor_count: u32,
+    pub(super) max_terms_per_gene: u32,
+    pub(super) reserved_extents: u32,
+    pub(super) device_uuid: [u8; 16],
+    pub(super) primary_context_identity: u64,
+    pub(super) search_stream_identity: u64,
+    pub(super) active_pool_identity: u64,
+    pub(super) cuda_build_identity: u64,
+    pub(super) kernel_semantics_identity: u64,
+    pub(super) binary64_math_identity: u64,
+    pub(super) plan_identity: u64,
+    pub(super) run_identity: u64,
+    pub(super) full_workspace_receipt_identity: u64,
+    pub(super) post_trim_receipt_identity: u64,
+}
+
+const _: [(); 16] = [(); std::mem::size_of::<RawResidentArchiveKnnArenaRegionV2>()];
+const _: [(); 384] = [(); std::mem::size_of::<RawResidentArchiveKnnBindV2>()];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScoringArchiveArenaRegionV2 {
@@ -109,6 +159,63 @@ pub(super) struct ResidentScoringArchiveArenaLayoutV2 {
 }
 
 impl ResidentScoringArchiveArenaLayoutV2 {
+    pub(super) fn into_native_bind_v2(
+        self,
+        calibration: ResidentSearchSlice2CalibrationBindingV2,
+        population_count: u64,
+        archive_capacity: u64,
+        signature_word_count: u32,
+        novelty_neighbor_count: u32,
+        max_terms_per_gene: u32,
+        full_workspace_receipt_identity: u64,
+        post_trim_receipt_identity: u64,
+    ) -> RawResidentArchiveKnnBindV2 {
+        fn raw(region: RegionV2) -> RawResidentArchiveKnnArenaRegionV2 {
+            RawResidentArchiveKnnArenaRegionV2 {
+                offset_bytes: region.offset_bytes,
+                size_bytes: region.size_bytes,
+            }
+        }
+
+        RawResidentArchiveKnnBindV2 {
+            abi_version: 2,
+            reserved: 0,
+            fitness_scores: raw(self.fitness_scores),
+            decision_keys: raw(self.decision_keys),
+            cub_scratch: raw(self.cub_scratch),
+            archive_gene_scalars: raw(self.archive_gene_scalars),
+            archive_term_indices: raw(self.archive_term_indices),
+            archive_term_weights: raw(self.archive_term_weights),
+            archive_metric_rows: raw(self.archive_metric_rows),
+            archive_signatures: raw(self.archive_signatures),
+            archive_hashes: raw(self.archive_hashes),
+            current_population_signatures: raw(self.current_population_signatures),
+            novelty_scores: raw(self.novelty_scores),
+            exact_top_k_keys: raw(self.exact_top_k_keys),
+            admission_flags: raw(self.admission_flags),
+            admission_offsets: raw(self.admission_offsets),
+            archive_control_and_seal: raw(self.archive_control_and_seal),
+            total_device_bytes: self.total_device_bytes,
+            population_count,
+            archive_capacity,
+            signature_word_count,
+            novelty_neighbor_count,
+            max_terms_per_gene,
+            reserved_extents: 0,
+            device_uuid: calibration.device_uuid,
+            primary_context_identity: calibration.primary_context_identity,
+            search_stream_identity: calibration.search_stream_identity,
+            active_pool_identity: calibration.active_pool_identity,
+            cuda_build_identity: calibration.cuda_build_identity,
+            kernel_semantics_identity: calibration.kernel_semantics_identity,
+            binary64_math_identity: calibration.binary64_math_identity,
+            plan_identity: calibration.plan_identity,
+            run_identity: calibration.run_identity,
+            full_workspace_receipt_identity,
+            post_trim_receipt_identity,
+        }
+    }
+
     #[cfg(test)]
     fn regions_v2(&self) -> [RegionV2; 15] {
         [
@@ -432,6 +539,194 @@ mod tests {
 
     const HOST_FIXTURE_CUB_BYTES: u64 = 65_536;
     const HOST_FIXTURE_TOTAL_BYTES: u64 = 23_776_768;
+    const ARCHIVE_ABI_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2_abi.cuh");
+    const ARCHIVE_CUDA_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2.cu");
+    const CUDA_BUILD_SOURCE_V2: &str = include_str!("../build.rs");
+
+    fn source_occurrences_v2(source: &str, needle: &str) -> usize {
+        source.match_indices(needle).count()
+    }
+
+    fn definition_body_v2<'a>(source: &'a str, symbol: &str) -> &'a str {
+        let needle = format!("{symbol}(");
+        let symbol_offset = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing definition for `{symbol}`"));
+        let body_offset = source[symbol_offset..]
+            .find('{')
+            .map(|offset| symbol_offset + offset)
+            .unwrap_or_else(|| panic!("missing body for `{symbol}`"));
+        let mut depth = 0_u64;
+        for (relative_offset, byte) in source.as_bytes()[body_offset..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1).expect("balanced definition braces");
+                    if depth == 0 {
+                        return &source[body_offset..=body_offset + relative_offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated body for `{symbol}`");
+    }
+
+    fn struct_body_v2<'a>(source: &'a str, name: &str) -> &'a str {
+        let declaration = format!("struct {name}");
+        let struct_offset = source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("missing definition for `{declaration}`"));
+        let body_offset = source[struct_offset..]
+            .find('{')
+            .map(|offset| struct_offset + offset)
+            .unwrap_or_else(|| panic!("missing body for `{declaration}`"));
+        let mut depth = 0_u64;
+        for (relative_offset, byte) in source.as_bytes()[body_offset..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1).expect("balanced struct braces");
+                    if depth == 0 {
+                        return &source[body_offset..=body_offset + relative_offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated body for `{declaration}`");
+    }
+
+    fn compact_ascii_whitespace_v2(source: &str) -> String {
+        source
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn remove_ascii_whitespace_v2(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect()
+    }
+
+    fn assert_source_excludes_v2(source: &str, forbidden: &[&str], scope: &str) {
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "{scope} must not contain forbidden token `{token}`"
+            );
+        }
+    }
+
+    fn validate_stable_three_pass_cub_rank_v2(source: &str) -> Result<(), String> {
+        if source_occurrences_v2(source, "cub::DeviceRadixSort::SortPairs(") != 2 {
+            return Err("rank must contain exactly two ascending stable CUB passes".to_owned());
+        }
+        if source_occurrences_v2(source, "cub::DeviceRadixSort::SortPairsDescending(") != 1 {
+            return Err("rank must contain exactly one descending stable CUB pass".to_owned());
+        }
+        if source.contains("population_rank_less_v2")
+            || source.contains("blend_and_rank_population_v2")
+        {
+            return Err("serial insertion ranking must be absent".to_owned());
+        }
+
+        let build =
+            remove_ascii_whitespace_v2(definition_body_v2(source, "build_blended_rank_inputs_v2"));
+        for seed in [
+            "ordinal_keys[candidate]=candidate;",
+            "ordinal_values[candidate]=candidate;",
+        ] {
+            if !build.contains(seed) {
+                return Err(format!("ordinal-stability seed is missing `{seed}`"));
+            }
+        }
+        if build.contains("while(") {
+            return Err("rank input construction must not perform insertion sorting".to_owned());
+        }
+
+        let gene_gather = remove_ascii_whitespace_v2(definition_body_v2(
+            source,
+            "gather_gene_identity_rank_keys_v2",
+        ));
+        if !gene_gather.contains("gene_identity_keys[rank]=genes.scalars[ordinal].gene_identity;") {
+            return Err("the second stable pass must gather gene identities".to_owned());
+        }
+        let blended_gather =
+            remove_ascii_whitespace_v2(definition_body_v2(source, "gather_blended_rank_keys_v2"));
+        if !blended_gather.contains("blended_keys[rank]=decision_keys[ordinal];") {
+            return Err("the final stable pass must gather blended decision keys".to_owned());
+        }
+
+        let score = definition_body_v2(source, "enqueue_resident_archive_score_and_rank_v2");
+        let compact_score = remove_ascii_whitespace_v2(score);
+        for workspace in [
+            "auto*rank_keys_a=owner->current_population_signatures;",
+            "auto*rank_keys_b=rank_keys_a+owner->binding.population_count;",
+            "auto*rank_values_a=rank_keys_b+owner->binding.population_count;",
+            "auto*rank_values_b=rank_values_a+owner->binding.population_count;",
+        ] {
+            if !compact_score.contains(workspace) {
+                return Err(format!("bounded rank workspace is missing `{workspace}`"));
+            }
+        }
+        for preserved_output in [
+            "reinterpret_cast<std::uint64_t*>(owner->exact_top_k_keys)",
+            "reinterpret_cast<std::uint64_t*>(owner->novelty_scores)",
+            "reinterpret_cast<std::uint64_t*>(owner->fitness_scores)",
+        ] {
+            if compact_score.contains(preserved_output) {
+                return Err(format!(
+                    "rank workspace must preserve authoritative output `{preserved_output}`"
+                ));
+            }
+        }
+        let copy =
+            remove_ascii_whitespace_v2(definition_body_v2(source, "copy_ranked_ordinals_v2"));
+        if !copy.contains("admission_offsets[rank]=ranked_ordinals[rank];") {
+            return Err(
+                "final CUB rank must be copied out before signatures are rebuilt".to_owned(),
+            );
+        }
+        if source_occurrences_v2(score, "build_population_signatures_v2<<<") != 2 {
+            return Err(
+                "score/rank must rebuild signatures and admission flags after CUB reuse".to_owned(),
+            );
+        }
+        for pass in [
+            "cub::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
+            "cub::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_b,rank_values_a,",
+            "cub::DeviceRadixSort::SortPairsDescending(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
+        ] {
+            if !compact_score.contains(pass) {
+                return Err(format!("stable CUB pass is missing `{pass}`"));
+            }
+        }
+        if source_occurrences_v2(score, "owner->binding.cub_scratch.size_bytes") != 3 {
+            return Err("every CUB pass must reset the exact runtime scratch extent".to_owned());
+        }
+
+        let mut cursor = 0;
+        for step in [
+            "build_blended_rank_inputs_v2<<<",
+            "cub::DeviceRadixSort::SortPairs(",
+            "gather_gene_identity_rank_keys_v2<<<",
+            "cub::DeviceRadixSort::SortPairs(",
+            "gather_blended_rank_keys_v2<<<",
+            "cub::DeviceRadixSort::SortPairsDescending(",
+            "copy_ranked_ordinals_v2<<<",
+            "build_population_signatures_v2<<<",
+            "seal_ranked_population_v2<<<",
+        ] {
+            let relative = score[cursor..]
+                .find(step)
+                .ok_or_else(|| format!("rank chronology is missing `{step}`"))?;
+            cursor += relative + step.len();
+        }
+        Ok(())
+    }
 
     fn valid_receipt(cub_scratch_bytes: u64) -> ResidentSearchSlice2ScoringArchiveReceiptV2 {
         let layout = ResidentSearchSlice2AlignedLayoutV2 {
@@ -626,6 +921,486 @@ mod tests {
                     observed: HOST_FIXTURE_CUB_BYTES + 1,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn native_archive_knn_v2_declares_and_defines_only_the_seven_split_entrypoints() {
+        const SPLIT_ENTRYPOINTS: [&str; 7] = [
+            "bind_preallocated_resident_archive_knn_v2",
+            "enqueue_resident_archive_score_and_rank_v2",
+            "enqueue_resident_archive_stage_from_rank_v2",
+            "enqueue_resident_archive_evolve_and_publish_v2",
+            "enqueue_resident_archive_terminal_seal_v2",
+            "try_complete_resident_archive_terminal_v2",
+            "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
+        ];
+        for symbol in SPLIT_ENTRYPOINTS {
+            let call_token = format!("{symbol}(");
+            assert_eq!(
+                source_occurrences_v2(ARCHIVE_ABI_SOURCE_V2, &call_token),
+                1,
+                "ABI must declare `{symbol}` exactly once"
+            );
+            assert_eq!(
+                source_occurrences_v2(ARCHIVE_CUDA_SOURCE_V2, &call_token),
+                1,
+                "CUDA TU must define `{symbol}` exactly once"
+            );
+        }
+        assert_eq!(
+            source_occurrences_v2(ARCHIVE_CUDA_SOURCE_V2, "extern \"C\""),
+            SPLIT_ENTRYPOINTS.len(),
+            "the dedicated CUDA TU must export exactly the seven C entrypoints"
+        );
+
+        for obsolete in [
+            "query_resident_archive_knn_allocation_v2(",
+            "query_resident_archive_knn_cub_scratch_v2(",
+            "create_resident_archive_knn_owner_v2(",
+            "enqueue_resident_archive_knn_generation_v2(",
+            "try_complete_resident_archive_knn_generation_v2(",
+        ] {
+            assert_eq!(
+                source_occurrences_v2(ARCHIVE_ABI_SOURCE_V2, obsolete)
+                    + source_occurrences_v2(ARCHIVE_CUDA_SOURCE_V2, obsolete),
+                0,
+                "obsolete standalone/one-shot ABI `{obsolete}` must be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn native_archive_knn_v2_uses_stable_three_pass_cub_tuple_rank() {
+        validate_stable_three_pass_cub_rank_v2(ARCHIVE_CUDA_SOURCE_V2)
+            .expect("production rank must be stable three-pass CUB");
+
+        let mutants = [
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "cub::DeviceRadixSort::SortPairsDescending(",
+                "cub::DeviceRadixSort::SortPairs(",
+                1,
+            ),
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "gather_gene_identity_rank_keys_v2<<<",
+                "gather_blended_rank_keys_v2<<<",
+                1,
+            ),
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "owner->cub_scratch, scratch_bytes",
+                "nullptr, scratch_bytes",
+                1,
+            ),
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "ordinal_values[candidate] = candidate;",
+                "ordinal_values[candidate] = candidate; while (position != 0) {}",
+                1,
+            ),
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "auto* rank_keys_a = owner->current_population_signatures;",
+                "auto* rank_keys_a = reinterpret_cast<std::uint64_t*>(owner->exact_top_k_keys);",
+                1,
+            ),
+            ARCHIVE_CUDA_SOURCE_V2.replacen(
+                "auto* rank_keys_a = owner->current_population_signatures;",
+                "auto* rank_keys_a = reinterpret_cast<std::uint64_t*>(owner->novelty_scores);",
+                1,
+            ),
+        ];
+        for mutant in mutants {
+            assert_ne!(mutant, ARCHIVE_CUDA_SOURCE_V2, "mutant must alter source");
+            assert!(
+                validate_stable_three_pass_cub_rank_v2(&mutant).is_err(),
+                "source contract must kill rank-order/scratch/insertion mutants"
+            );
+        }
+    }
+
+    #[test]
+    fn native_archive_knn_v2_bind_dto_carries_the_dynamic_validated_arena_layout() {
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("#include \"resident_generation_v2_abi.cuh\""));
+        let region = struct_body_v2(ARCHIVE_ABI_SOURCE_V2, "NeoResidentArchiveKnnArenaRegionV2");
+        assert_eq!(source_occurrences_v2(region, "offset_bytes"), 1);
+        assert_eq!(source_occurrences_v2(region, "size_bytes"), 1);
+
+        let bind = struct_body_v2(ARCHIVE_ABI_SOURCE_V2, "NeoResidentArchiveKnnBindV2");
+        for region in [
+            "fitness_scores",
+            "decision_keys",
+            "cub_scratch",
+            "archive_gene_scalars",
+            "archive_term_indices",
+            "archive_term_weights",
+            "archive_metric_rows",
+            "archive_signatures",
+            "archive_hashes",
+            "current_population_signatures",
+            "novelty_scores",
+            "exact_top_k_keys",
+            "admission_flags",
+            "admission_offsets",
+            "archive_control_and_seal",
+        ] {
+            assert_eq!(
+                source_occurrences_v2(bind, region),
+                1,
+                "preallocated bind must carry nested region `{region}` exactly once"
+            );
+        }
+        assert_eq!(
+            source_occurrences_v2(bind, "NeoResidentArchiveKnnArenaRegionV2"),
+            15,
+            "preallocated bind must carry exactly fifteen typed regions"
+        );
+        for field in [
+            "abi_version",
+            "total_device_bytes",
+            "device_uuid",
+            "primary_context_identity",
+            "search_stream_identity",
+            "active_pool_identity",
+            "cuda_build_identity",
+            "kernel_semantics_identity",
+            "binary64_math_identity",
+            "plan_identity",
+            "run_identity",
+            "full_workspace_receipt_identity",
+            "post_trim_receipt_identity",
+            "population_count",
+            "archive_capacity",
+            "signature_word_count",
+            "novelty_neighbor_count",
+            "max_terms_per_gene",
+        ] {
+            assert_eq!(
+                source_occurrences_v2(bind, field),
+                1,
+                "preallocated bind must carry identity/shape field `{field}` exactly once"
+            );
+        }
+        assert_eq!(source_occurrences_v2(bind, "std::uint32_t reserved;"), 1);
+        assert_eq!(
+            source_occurrences_v2(bind, "std::uint32_t reserved_extents;"),
+            1
+        );
+        assert!(
+            compact_ascii_whitespace_v2(bind)
+                .contains("std::uint32_t max_terms_per_gene; std::uint32_t reserved_extents;")
+        );
+        assert_source_excludes_v2(
+            bind,
+            &[
+                "scoring_archive_arena_device",
+                "cudaStream_t",
+                "metric_count",
+                "void *",
+                "void*",
+            ],
+            "opaque preallocated bind",
+        );
+
+        let compact_header = compact_ascii_whitespace_v2(ARCHIVE_ABI_SOURCE_V2);
+        assert!(compact_header.contains("sizeof(NeoResidentArchiveKnnArenaRegionV2) == 16"));
+        assert!(compact_header.contains("sizeof(NeoResidentArchiveKnnBindV2) == 384"));
+        assert!(compact_header.contains("sizeof(NeoResidentArchiveKnnPendingV2) == 72"));
+        assert!(compact_header.contains("sizeof(NeoResidentArchiveKnnTerminalV2) == 104"));
+        assert!(compact_header.contains("NEO_RESIDENT_ARCHIVE_KNN_METRIC_COUNT_V2 = 11"));
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("NEO_ARCHIVE_KNN_TERMINAL_COMMITTED_V2"));
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("NEO_ARCHIVE_KNN_TERMINAL_FAULT_V2"));
+        assert!(!ARCHIVE_ABI_SOURCE_V2.contains("using NeoResidentArchiveKnnPendingV2"));
+        assert!(!ARCHIVE_ABI_SOURCE_V2.contains("using NeoResidentArchiveKnnTerminalV2"));
+
+        let pending = struct_body_v2(ARCHIVE_ABI_SOURCE_V2, "NeoResidentArchiveKnnPendingV2");
+        for field in [
+            "abi_version",
+            "flags",
+            "source_packed_commit_word",
+            "terminal_device_receipt_identity",
+            "run_identity",
+            "boxed_receipt_identity",
+            "staged_dependency_identity",
+            "same_stream_enqueue_count",
+            "completion_event_identity",
+            "terminal_host_receipt_identity",
+        ] {
+            assert_eq!(
+                source_occurrences_v2(pending, field),
+                1,
+                "private pending receipt must bind `{field}` exactly once"
+            );
+        }
+        assert!(!pending.contains("target_packed_commit_word"));
+
+        let terminal = struct_body_v2(ARCHIVE_ABI_SOURCE_V2, "NeoResidentArchiveKnnTerminalV2");
+        for field in [
+            "abi_version",
+            "terminal_status",
+            "device_fault_word",
+            "validation_fault_word",
+            "receipt_identity",
+            "run_identity",
+            "packed_commit_word",
+            "collision_count",
+            "compact_async_d2h_count",
+            "compact_async_d2h_bytes",
+            "completion_event_query_count",
+            "completion_stream_synchronize_count",
+            "same_stream_enqueue_count",
+            "completion_event_identity",
+            "validator_digest",
+        ] {
+            assert_eq!(
+                source_occurrences_v2(terminal, field),
+                1,
+                "private terminal receipt must carry `{field}` exactly once"
+            );
+        }
+        assert_source_excludes_v2(
+            terminal,
+            &[
+                "current_store",
+                "generation",
+                "archive_count",
+                "commit_epoch",
+            ],
+            "single-word terminal authority",
+        );
+        assert_source_excludes_v2(
+            ARCHIVE_ABI_SOURCE_V2,
+            &["65'536", "65536"],
+            "dynamic archive ABI",
+        );
+
+        let compact_abi = remove_ascii_whitespace_v2(ARCHIVE_ABI_SOURCE_V2);
+        let compact_cuda = remove_ascii_whitespace_v2(ARCHIVE_CUDA_SOURCE_V2);
+        let bind_signature = "bind_preallocated_resident_archive_knn_v2(resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1*scoring,resident_generation_v1::NeoResidentGenerationRunV1*generation,constresident_generation_v2::NeoResidentGenerationGeneViewV2*genes,constNeoResidentArchiveKnnBindV2*binding,NeoResidentArchiveKnnOwnerV2**owner)";
+        assert!(compact_abi.contains(bind_signature));
+        assert!(compact_cuda.contains(bind_signature));
+        let bind_definition = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "bind_preallocated_resident_archive_knn_v2",
+        );
+        assert!(bind_definition.contains("binding->reserved != 0"));
+        assert!(bind_definition.contains("binding->reserved_extents != 0"));
+        let release_signature = "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(void*session,NeoResidentArchiveKnnOwnerV2*owner)";
+        assert!(compact_abi.contains(release_signature));
+        assert!(compact_cuda.contains(release_signature));
+    }
+
+    #[test]
+    fn native_archive_knn_v2_never_owns_allocations_frees_or_event_creation() {
+        assert_source_excludes_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            &[
+                "cudaMalloc",
+                "cudaFree",
+                "cudaHostAlloc",
+                "cudaMemGetInfo",
+                "cudaEventCreate",
+            ],
+            "borrowed archive CUDA TU",
+        );
+        let release = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
+        );
+        for required in [
+            "HostPhaseV2::TerminalComplete",
+            "terminal_event_proven",
+            "population_lifetime_owner_v2()",
+            "session !=",
+        ] {
+            assert!(
+                release.contains(required),
+                "borrowed archive release is missing `{required}`"
+            );
+        }
+    }
+
+    #[test]
+    fn native_archive_knn_v2_split_transitions_stay_device_only_until_terminal() {
+        for symbol in [
+            "enqueue_resident_archive_score_and_rank_v2",
+            "enqueue_resident_archive_stage_from_rank_v2",
+            "enqueue_resident_archive_evolve_and_publish_v2",
+        ] {
+            let body = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, symbol);
+            assert_source_excludes_v2(
+                body,
+                &[
+                    "cudaMemcpyDeviceToHost",
+                    "cudaMemcpy(",
+                    "cudaEventRecord",
+                    "cudaEventQuery",
+                    "cudaStreamQuery",
+                    "cudaEventSynchronize",
+                    "cudaStreamSynchronize",
+                    "cudaDeviceSynchronize",
+                    "cuEventSynchronize",
+                    "cuStreamSynchronize",
+                ],
+                symbol,
+            );
+        }
+
+        let score = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_score_and_rank_v2",
+        );
+        for required in [
+            "owner->phase == HostPhaseV2::Bound",
+            "owner->phase == HostPhaseV2::Published",
+            "dependency == nullptr",
+            "dependency != nullptr",
+            "dependency != owner->terminal_lifecycle.source_ready_receipt_v2()",
+            "dependency->event_id !=",
+            "owner->terminal_lifecycle.source_event_id_v2()",
+            "dependency->same_stream_enqueue_count",
+            "owner->terminal_lifecycle.source_same_stream_enqueue_count_v2()",
+            "population->metrics_ready_event !=",
+            "owner->terminal_lifecycle.resident_parent_ready_event_v2()",
+            "population->population_lifetime_owner !=",
+            "owner->terminal_lifecycle.population_lifetime_owner_v2()",
+            "finite_rows.same_stream_enqueue_count -",
+            "advance_global_enqueue_count_v2(",
+        ] {
+            assert!(
+                score.contains(required),
+                "score phase is missing `{required}`"
+            );
+        }
+        assert!(
+            !score.contains(
+                "finite_rows.same_stream_enqueue_count > owner->same_stream_enqueue_count"
+            )
+        );
+        assert!(
+            !score.contains("owner->same_stream_enqueue_count = dependency"),
+            "the score phase must not replace the retained global count with caller data"
+        );
+
+        let evolve = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_evolve_and_publish_v2",
+        );
+        assert_eq!(
+            source_occurrences_v2(evolve, "borrow_resident_generation_terminal_lifecycle_v2("),
+            2,
+            "generation enqueue delta requires exact before/after snapshots"
+        );
+        assert!(evolve.contains("same_stream_enqueue_count_v2() -"));
+        assert!(evolve.contains("owner->same_stream_enqueue_count +="));
+
+        let terminal = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_terminal_seal_v2",
+        );
+        assert_eq!(source_occurrences_v2(terminal, "cudaMemcpyAsync("), 1);
+        assert_eq!(source_occurrences_v2(terminal, "cudaMemcpyDeviceToHost"), 1);
+        assert_eq!(source_occurrences_v2(terminal, "cudaEventRecord("), 1);
+        assert!(terminal.contains("sizeof(NeoResidentArchiveKnnTerminalV2)"));
+        assert!(terminal.contains("owner->same_stream_enqueue_count + 3ull"));
+        assert!(terminal.contains("lifecycle.same_stream_enqueue_count_v2() + 3ull"));
+        assert_source_excludes_v2(
+            terminal,
+            &[
+                "cudaMemcpy(",
+                "cudaEventQuery",
+                "cudaStreamQuery",
+                "cudaEventSynchronize",
+                "cudaStreamSynchronize",
+                "cudaDeviceSynchronize",
+            ],
+            "terminal seal",
+        );
+
+        let poll = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "try_complete_resident_archive_terminal_v2",
+        );
+        assert_eq!(source_occurrences_v2(poll, "cudaEventQuery("), 1);
+        assert_source_excludes_v2(
+            poll,
+            &[
+                "cudaMemcpy",
+                "cudaEventRecord",
+                "cudaStreamQuery",
+                "cudaEventSynchronize",
+                "cudaStreamSynchronize",
+                "cudaDeviceSynchronize",
+                "cuEventSynchronize",
+                "cuStreamSynchronize",
+            ],
+            "terminal poll",
+        );
+    }
+
+    #[test]
+    fn native_archive_knn_v2_collision_fallback_compares_the_full_normalized_gene() {
+        let compact_header = remove_ascii_whitespace_v2(ARCHIVE_ABI_SOURCE_V2);
+        let compact_cuda = remove_ascii_whitespace_v2(ARCHIVE_CUDA_SOURCE_V2);
+        assert!(!compact_header.contains("exact_gene[2]"));
+        assert!(!compact_cuda.contains("exact_gene[2]"));
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 = 16"));
+        assert!(ARCHIVE_CUDA_SOURCE_V2.contains("NeoResidentGenerationGeneScalarV1"));
+        assert!(ARCHIVE_CUDA_SOURCE_V2.contains("NeoResidentGenerationGeneViewV2"));
+
+        let equality =
+            definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "full_fixed_stride_gene_equal_v2");
+        for scalar_field in [
+            "term_count",
+            "smc_flags",
+            "long_threshold",
+            "short_threshold",
+            "target_pips",
+            "stop_pips",
+            "stop_vol_multiplier",
+        ] {
+            assert!(
+                source_occurrences_v2(equality, scalar_field) >= 2,
+                "full equality must compare both `{scalar_field}` values"
+            );
+        }
+        for token in [
+            "NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2",
+            "term_indices",
+            "term_weights",
+            "f64_bits",
+        ] {
+            assert!(
+                equality.contains(token),
+                "full equality is missing `{token}`"
+            );
+        }
+        assert!(
+            source_occurrences_v2(equality, "f64_bits") >= 12,
+            "five scalar f64 fields and all term weights require bitwise equality"
+        );
+        assert!(source_occurrences_v2(equality, "term_indices") >= 2);
+        assert!(source_occurrences_v2(equality, "term_weights") >= 2);
+        assert!(
+            compact_ascii_whitespace_v2(equality)
+                .contains("< NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2")
+        );
+    }
+
+    #[test]
+    fn native_archive_knn_v2_translation_unit_and_header_are_registered_once() {
+        assert_eq!(
+            source_occurrences_v2(
+                CUDA_BUILD_SOURCE_V2,
+                "\"native/resident_archive_knn_v2.cu\""
+            ),
+            1,
+            "archive CUDA TU must appear exactly once in build.rs"
+        );
+        assert_eq!(
+            source_occurrences_v2(
+                CUDA_BUILD_SOURCE_V2,
+                "\"native/resident_archive_knn_v2_abi.cuh\""
+            ),
+            1,
+            "archive ABI header must appear exactly once in build.rs"
         );
     }
 }

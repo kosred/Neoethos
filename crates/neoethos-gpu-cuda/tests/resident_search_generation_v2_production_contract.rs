@@ -1,8 +1,9 @@
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "resident-search-slice2-compile-contract"))]
 
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(feature = "cuda")]
 use neoethos_gpu_cuda::resident_search_v2::resident_search_v2_production_readiness;
 
 fn manifest_dir() -> PathBuf {
@@ -67,6 +68,63 @@ fn braced_item<'a>(source: &'a str, needle: &str) -> &'a str {
         }
     }
     panic!("unterminated braced item {needle:?}");
+}
+
+fn validate_slice2_scoring_archive_cub_scratch_query(source: &str) -> Result<(), String> {
+    let query = braced_item(source, "std::int32_t query_cub_reduce_scratch_bytes_v1(");
+    let required_counts = [
+        (
+            "const int count = static_cast<int>(plan.logical_population_count);",
+            1_usize,
+        ),
+        (
+            "auto* rank_keys = static_cast<std::uint64_t*>(nullptr);",
+            1_usize,
+        ),
+        (
+            "auto* rank_values = static_cast<std::uint64_t*>(nullptr);",
+            1_usize,
+        ),
+        ("cub::DeviceReduce::Min(", 1_usize),
+        ("cub::DeviceReduce::Max(", 1_usize),
+        ("cub::DeviceRadixSort::SortPairs(", 2_usize),
+        ("cub::DeviceRadixSort::SortPairsDescending(", 1_usize),
+        (
+            "nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,\n      count, 0, 64, stream);",
+            3_usize,
+        ),
+        (
+            "maximum = candidate > maximum ? candidate : maximum;",
+            4_usize,
+        ),
+        ("align_device_bytes_v1(maximum, scratch_bytes)", 1_usize),
+    ];
+    for (token, expected) in required_counts {
+        let observed = query.matches(token).count();
+        if observed != expected {
+            return Err(format!(
+                "Slice2 combined CUB scratch query requires {expected} occurrences of {token:?}, observed {observed}"
+            ));
+        }
+    }
+    for forbidden in ["65_536", "65'536", "65536"] {
+        if query.contains(forbidden) {
+            return Err(format!(
+                "Slice2 combined CUB scratch query must not seal a literal fallback {forbidden:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_nth(source: &str, needle: &str, replacement: &str, occurrence: usize) -> String {
+    let (offset, _) = source
+        .match_indices(needle)
+        .nth(occurrence)
+        .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"));
+    let mut mutant = source.to_owned();
+    mutant.replace_range(offset..offset + needle.len(), replacement);
+    mutant
 }
 
 fn assert_cpp_symbol_not_fixture_gated(source: &str, symbol: &str) {
@@ -392,6 +450,9 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
 fn d_metric_receipt_is_move_consumed_as_one_full_device_chunk() {
     let population = read_required("src/population.rs");
     let search = read_required("src/resident_search_v2.rs");
+    let private_header = read_required("native/resident_search_generation_v2_abi.cuh");
+    let public_header = read_required("native/neoethos_gpu_cuda.h");
+    let population_cuda = read_required("native/prototype_b_population.cu");
 
     forbid_all(
         &population,
@@ -423,6 +484,9 @@ fn d_metric_receipt_is_move_consumed_as_one_full_device_chunk() {
             "enqueue_resident_gene_metrics_v2",
             "Box::new(RawResidentPopulationMetricsHandleV1::default())",
             "export_resident_scoring_source_v2",
+            "raw.population_lifetime_owner.is_null()",
+            "raw.population_lifetime_owner != self.handle",
+            "std::ptr::eq(\n                raw.population_lifetime_owner.cast_const(),\n                raw.receipt_token",
             "session: Some(self)",
         ],
     );
@@ -480,6 +544,76 @@ fn d_metric_receipt_is_move_consumed_as_one_full_device_chunk() {
             "self.state = ResidentSearchStateV2::AdvancedOnce",
         ],
     );
+
+    let native_source = braced_item(
+        &private_header,
+        "struct NeoResidentScoringPopulationSourceV2",
+    );
+    require_in_order(
+        native_source,
+        &[
+            "const void* receipt_token;",
+            "void* population_lifetime_owner;",
+            "metric_rows_device;",
+        ],
+    );
+    require_all(
+        &private_header,
+        &[
+            "sizeof(NeoResidentScoringPopulationSourceV2) == 96",
+            "alignof(NeoResidentScoringPopulationSourceV2) == 8",
+            "population_lifetime_owner) == 40",
+            "full_discovery_reserve_bytes) == 88",
+        ],
+    );
+    let raw_source = braced_item(
+        &population,
+        "pub(crate) struct RawResidentScoringPopulationSourceV2",
+    );
+    require_in_order(
+        raw_source,
+        &[
+            "receipt_token: *const c_void",
+            "population_lifetime_owner: *mut c_void",
+            "metric_rows_device: *const NeoPopulationMetricRow",
+        ],
+    );
+    let raw_default = braced_item(
+        &population,
+        "impl Default for RawResidentScoringPopulationSourceV2",
+    );
+    require_all(
+        raw_default,
+        &["population_lifetime_owner: std::ptr::null_mut()"],
+    );
+    require_all(
+        &population,
+        &[
+            "const _: [(); 96] = [(); std::mem::size_of::<RawResidentScoringPopulationSourceV2>()]",
+            "layout!(RawResidentScoringPopulationSourceV2, 96, 8)",
+            "RawResidentScoringPopulationSourceV2,\n                population_lifetime_owner",
+            "RawResidentScoringPopulationSourceV2,\n                full_discovery_reserve_bytes",
+        ],
+    );
+    let export = braced_item(
+        &population_cuda,
+        "neoethos_gpu_cuda_population_export_resident_scoring_source_v2(",
+    );
+    require_in_order(
+        export,
+        &[
+            "source->receipt_token = resident_metrics;",
+            "source->population_lifetime_owner = session;",
+            "source->metric_rows_device = session->metric_rows;",
+        ],
+    );
+    forbid_all(
+        &public_header,
+        &[
+            "struct NeoResidentScoringPopulationSourceV2 {",
+            "population_lifetime_owner",
+        ],
+    );
 }
 
 #[test]
@@ -503,21 +637,33 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         ],
     );
 
-    let advance = braced_item(
+    let wrapper = braced_item(
         &generation_cuda,
         "extern \"C\" std::int32_t enqueue_full_population_scored_generation_advance_v2(",
     );
     require_in_order(
-        advance,
+        wrapper,
         &[
             "bind_and_seal_resident_scoring_v2",
+            "cudaStreamWaitEvent",
+            "export_current_resident_gene_view_v2",
+            "enqueue_resident_generation_offspring_from_scored_rows_v2",
+            "publish_one_generation_commit_kernel_v2",
+        ],
+    );
+    let advance = braced_item(
+        &generation_cuda,
+        "std::int32_t enqueue_resident_generation_offspring_from_scored_rows_v2(",
+    );
+    require_in_order(
+        advance,
+        &[
             "promote_scoring_device_seal_kernel_v2",
             "validate_and_import_scored_rows_kernel_v1",
             "launch_device_parent_selection_v1",
             "launch_device_crossover_v1",
             "launch_device_mutation_v1",
             "launch_device_gene_hash_v1",
-            "publish_one_generation_commit_kernel_v2",
         ],
     );
     require_all(
@@ -529,7 +675,7 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         ],
     );
     forbid_all(
-        advance,
+        wrapper,
         &[
             "rotate_resident_generation_stores_v1",
             "cudaDeviceSynchronize",
@@ -538,7 +684,7 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         ],
     );
     assert_eq!(
-        advance.matches("cudaMemcpyDeviceToHost").count(),
+        wrapper.matches("cudaMemcpyDeviceToHost").count(),
         1,
         "enqueue may copy only the compact terminal seal/fault receipt to host",
     );
@@ -549,7 +695,6 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         "__global__ void crossover_resident_genes_kernel_v1(",
         "__global__ void mutate_resident_genes_kernel_v1(",
         "__global__ void verify_exact_chunk_coverage_kernel_v1(",
-        "__global__ void publish_one_generation_commit_kernel_v2(",
     ] {
         let body = braced_item(&generation_cuda, kernel);
         require_all(body, &["device_content_fault", "!= 0", "return"]);
@@ -561,16 +706,17 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
     require_in_order(
         commit,
         &[
-            "fault != 0u",
+            "publish.combined_fault != 0u",
             "stop_requested = 1",
             "return",
-            "current_store_index = 1u",
-            "generation_index = next_generation_index",
+            "NEO_RESIDENT_SEARCH_TERMINAL_COMMITTED_V2",
+            "current_store_index = publish.current_store_index",
+            "generation_index = publish.generation_index",
         ],
     );
 
     require_in_order(
-        advance,
+        wrapper,
         &[
             "publish_one_generation_commit_kernel_v2<<<",
             "cudaMemcpyAsync(generation->terminal_host_receipt_v2",
@@ -801,6 +947,7 @@ fn g_new_owners_are_move_only_private_and_fail_closed_after_enqueue() {
     );
 }
 
+#[cfg(feature = "cuda")]
 #[test]
 fn h_implementation_patch_keeps_all_five_unproven_readiness_facts_false() {
     let readiness = resident_search_v2_production_readiness();
@@ -1778,12 +1925,13 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
     );
     assert_eq!(
         scoring_cuda.matches("cudaFreeAsync(").count(),
-        4,
-        "scoring must retain exactly two bound-create, one unbound-create, and one release free"
+        5,
+        "scoring must retain exactly two V1-create, one V2-create, one Slice2-create, and one release free"
     );
     for creator in [
         "extern \"C\" std::int32_t create_resident_scoring_novelty_run_v1(",
         "extern \"C\" std::int32_t create_unbound_resident_scoring_run_v2(",
+        "std::int32_t create_slice2_combined_scoring_archive_run_v2(",
     ] {
         let body = braced_item(&scoring_cuda, creator);
         require_all(
@@ -1919,4 +2067,243 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
             "CudaPopulationError::native",
         ],
     );
+}
+
+#[test]
+fn u_slice2_scoring_owns_one_combined_arena_and_exports_only_native_same_stream_authority() {
+    let public_header = read_required("native/resident_scoring_novelty_v1_abi.cuh");
+    let internal_header = read_required("native/resident_scoring_novelty_v2_internal.cuh");
+    let scoring_cuda = read_required("native/resident_scoring_novelty_v1.cu");
+
+    require_all(
+        &internal_header,
+        &[
+            "namespace neoethos::resident_scoring_novelty_v2_internal",
+            "struct ResidentScoringArenaAccessV2",
+            "cudaStream_t admitted_run_stream;",
+            "void* allocation_base;",
+            "std::uint64_t allocation_bytes;",
+            "struct ResidentScoringFiniteObjectiveRowsV2",
+            "NeoResidentScoringNoveltyRunV1* scoring_owner;",
+            "const NeoResidentScoringNoveltyMetricRowV1* metric_rows_device;",
+            "const std::uint64_t* expected_scenario_ids_device;",
+            "double* fitness_scores_device;",
+            "std::uint64_t* decision_keys_device;",
+            "const NeoResidentScoringNoveltyDeviceSealV1* device_seal;",
+            "std::uint8_t metric_semantics_sha256[32];",
+            "std::uint8_t scoring_semantics_sha256[32];",
+            "std::uint8_t novelty_semantics_sha256[32];",
+            "std::uint8_t scenario_order_semantics_sha256[32];",
+            "std::uint8_t rank_semantics_sha256[32];",
+            "std::uint8_t cuda_build_manifest_sha256[32];",
+            "std::uint8_t cuda_math_flags_sha256[32];",
+            "std::int32_t create_slice2_combined_scoring_archive_run_v2(",
+            "std::int32_t borrow_resident_scoring_archive_arena_v2(",
+            "std::int32_t enqueue_resident_scoring_finite_objective_v2(",
+            "NEO_RESIDENT_SCORING_SLICE2_CONTROL_BYTES_V2 = 64",
+            "NEO_RESIDENT_SCORING_SLICE2_ARCHIVE_CONTROL_OFFSET_V2 = 64",
+        ],
+    );
+    let arena_access = braced_item(&internal_header, "struct ResidentScoringArenaAccessV2");
+    require_all(
+        arena_access,
+        &[
+            "cudaStream_t admitted_run_stream;",
+            "void* allocation_base;",
+            "std::uint64_t allocation_bytes;",
+            "std::uint64_t same_stream_enqueue_count;",
+        ],
+    );
+    forbid_all(
+        &internal_header,
+        &[
+            "extern \"C\"",
+            "cudaMemcpy",
+            "cudaEventRecord",
+            "cudaEventQuery",
+            "cudaStreamSynchronize",
+            "cudaDeviceSynchronize",
+            "cudaHostAlloc",
+        ],
+    );
+    for private_name in [
+        "ResidentScoringArenaAccessV2",
+        "ResidentScoringFiniteObjectiveRowsV2",
+        "create_slice2_combined_scoring_archive_run_v2",
+        "borrow_resident_scoring_archive_arena_v2",
+        "enqueue_resident_scoring_finite_objective_v2",
+    ] {
+        assert!(
+            !public_header.contains(private_name),
+            "native-only Slice2 scoring authority escaped through the public ABI as {private_name:?}"
+        );
+    }
+
+    let create = braced_item(
+        &scoring_cuda,
+        "std::int32_t create_slice2_combined_scoring_archive_run_v2(",
+    );
+    require_all(
+        create,
+        &[
+            "validate_slice2_combined_binding_v2",
+            "binding->total_device_bytes",
+            "cudaMallocAsync(",
+            "partition_slice2_combined_arena_v2",
+            "created->slice2_combined_arena_v2 = true",
+            "created->retained_slice2_binding_v2 = *binding",
+            "*run = created",
+        ],
+    );
+    assert_eq!(
+        create.matches("cudaMallocAsync(").count(),
+        1,
+        "the combined ScoringArchiveArena creator must issue exactly one device allocation"
+    );
+    forbid_all(
+        create,
+        &[
+            "cudaMemGetInfo",
+            "cudaHostAlloc",
+            "cudaEventCreate",
+            "cudaEventRecord",
+            "cudaMemcpy",
+            "cudaStreamSynchronize",
+            "cudaDeviceSynchronize",
+        ],
+    );
+
+    let partition = braced_item(&scoring_cuda, "bool partition_slice2_combined_arena_v2(");
+    require_all(
+        partition,
+        &[
+            "binding.fitness_scores",
+            "binding.decision_keys",
+            "binding.cub_scratch",
+            "binding.current_population_signatures",
+            "binding.novelty_scores",
+            "binding.archive_control_and_seal",
+            "run->fitness_scores_device",
+            "run->decision_keys_device",
+            "run->cub_scratch_device",
+            "run->device_fault_word",
+            "run->device_seal",
+        ],
+    );
+
+    let borrow = braced_item(
+        &scoring_cuda,
+        "std::int32_t borrow_resident_scoring_archive_arena_v2(",
+    );
+    require_all(
+        borrow,
+        &[
+            "run->slice2_combined_arena_v2",
+            "same_slice2_binding_v2(run->retained_slice2_binding_v2, *binding)",
+            "access->admitted_run_stream = run->admitted_run_stream",
+            "access->allocation_base = run->allocation_base",
+            "access->allocation_bytes = run->allocation.total_device_bytes",
+            "access->same_stream_enqueue_count = run->same_stream_enqueue_count",
+        ],
+    );
+    forbid_all(
+        borrow,
+        &[
+            "cudaMalloc",
+            "cudaFree",
+            "cudaMemGetInfo",
+            "cudaMemcpy",
+            "cudaEvent",
+        ],
+    );
+
+    let score = braced_item(
+        &scoring_cuda,
+        "std::int32_t enqueue_resident_scoring_finite_objective_v2(",
+    );
+    require_in_order(
+        score,
+        &[
+            "validate_slice2_population_source_v2",
+            "cudaMemsetAsync(run->device_fault_word",
+            "cudaMemsetAsync(run->device_seal",
+            "score_canonical_metrics_kernel_v1<<<",
+            "encode_finite_objective_keys_kernel_v2<<<",
+            "seal_finite_objective_content_kernel_v2<<<",
+            "rows->fitness_scores_device = run->fitness_scores_device",
+            "rows->device_seal = run->device_seal",
+        ],
+    );
+    forbid_all(
+        score,
+        &[
+            "candidate_ordered_mean_jaccard_kernel_v1",
+            "blend_and_encode_decision_keys_kernel_v1",
+            "cudaMemcpy",
+            "cudaEventRecord",
+            "cudaEventQuery",
+            "cudaStreamWaitEvent",
+            "cudaStreamSynchronize",
+            "cudaDeviceSynchronize",
+            "cudaMalloc",
+            "cudaFree",
+        ],
+    );
+
+    let objective_seal = braced_item(
+        &scoring_cuda,
+        "__global__ void seal_finite_objective_content_kernel_v2(",
+    );
+    require_all(
+        objective_seal,
+        &[
+            "const double* fitness_scores",
+            "f64_bits_v1(fitness_scores[candidate])",
+            "plan.metric_semantics_sha256",
+            "plan.scoring_semantics_sha256",
+            "plan.cuda_math_flags_sha256",
+        ],
+    );
+    forbid_all(objective_seal, &["decision_keys"]);
+}
+
+#[test]
+fn u_slice2_combined_cub_scratch_query_covers_reduce_and_all_three_rank_passes() {
+    let scoring_cuda = read_required("native/resident_scoring_novelty_v1.cu");
+    validate_slice2_scoring_archive_cub_scratch_query(&scoring_cuda)
+        .expect("combined arena scratch must cover scoring reductions and archive tuple rank");
+
+    let query = braced_item(
+        &scoring_cuda,
+        "std::int32_t query_cub_reduce_scratch_bytes_v1(",
+    );
+    let mut mutants = Vec::new();
+    for occurrence in 0..2 {
+        mutants.push(replace_nth(
+            query,
+            "cub::DeviceRadixSort::SortPairs(",
+            "cub::DeviceRadixSort::SortKeys(",
+            occurrence,
+        ));
+    }
+    mutants.push(replace_nth(
+        query,
+        "cub::DeviceRadixSort::SortPairsDescending(",
+        "cub::DeviceRadixSort::SortPairs(",
+        0,
+    ));
+    for occurrence in 1..4 {
+        mutants.push(replace_nth(
+            query,
+            "maximum = candidate > maximum ? candidate : maximum;",
+            "candidate = maximum;",
+            occurrence,
+        ));
+    }
+    for mutant in mutants {
+        assert!(
+            validate_slice2_scoring_archive_cub_scratch_query(&mutant).is_err(),
+            "source contract must kill removal of every rank query and its maximum fold"
+        );
+    }
 }

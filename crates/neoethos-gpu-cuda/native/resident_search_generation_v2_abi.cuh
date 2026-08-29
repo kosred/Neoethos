@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace neoethos::resident_search_generation_v2 {
@@ -69,6 +70,8 @@ static_assert(sizeof(NeoResidentSearchCombinedAdmissionV2) == 592,
               "resident Search combined admission V2 ABI changed");
 
 /// Private one-shot source minted only by the exact boxed population receipt.
+/// The session owner is retained separately so later native stages can prove
+/// the same population lifetime without treating the receipt address as it.
 struct NeoResidentScoringPopulationSourceV2 {
   std::uint32_t abi_version;
   std::uint32_t selected_cuda_ordinal;
@@ -76,6 +79,7 @@ struct NeoResidentScoringPopulationSourceV2 {
   cudaEvent_t metrics_ready_event;
   cudaEvent_t scoring_ready_event;
   const void* receipt_token;
+  void* population_lifetime_owner;
   const resident_scoring_novelty_v1::NeoResidentScoringNoveltyMetricRowV1*
       metric_rows_device;
   const std::uint64_t* expected_scenario_ids_device;
@@ -86,8 +90,18 @@ struct NeoResidentScoringPopulationSourceV2 {
   std::uint64_t full_discovery_reserve_bytes;
 };
 
-static_assert(sizeof(NeoResidentScoringPopulationSourceV2) == 88,
+static_assert(sizeof(NeoResidentScoringPopulationSourceV2) == 96,
               "resident Search scoring source V2 ABI changed");
+static_assert(alignof(NeoResidentScoringPopulationSourceV2) == 8,
+              "resident Search scoring source V2 alignment changed");
+static_assert(
+    offsetof(NeoResidentScoringPopulationSourceV2,
+             population_lifetime_owner) == 40,
+    "resident Search scoring source V2 lifetime owner offset changed");
+static_assert(
+    offsetof(NeoResidentScoringPopulationSourceV2,
+             full_discovery_reserve_bytes) == 88,
+    "resident Search scoring source V2 reserve offset changed");
 
 extern "C" std::int32_t enqueue_full_population_scored_generation_advance_v2(
     resident_generation_v1::NeoResidentGenerationRunV1* generation,

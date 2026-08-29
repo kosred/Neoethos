@@ -8,7 +8,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-const DEVICE_SOURCES: [&str; 15] = [
+const DEVICE_SOURCES: [&str; 16] = [
     "native/smoke.cu",
     "native/prototype_b.cu",
     "native/prototype_b_population.cu",
@@ -19,11 +19,18 @@ const DEVICE_SOURCES: [&str; 15] = [
     "native/resident_regime_v3.cu",
     "native/resident_scoring_novelty_v1.cu",
     "native/resident_generation_v1.cu",
+    "native/resident_archive_knn_v2.cu",
     "native/resident_session_v2.cu",
     "native/resident_robust_normalization_v2.cu",
     "native/resident_smc_v3.cu",
     "native/resident_classic_ta_v3.cu",
     "native/resident_trim_prefilter_v1.cu",
+];
+
+const RESIDENT_SEARCH_SLICE2_PRIVATE_HEADERS: [&str; 3] = [
+    "native/resident_generation_v2_internal.cuh",
+    "native/resident_scoring_novelty_v2_internal.cuh",
+    "native/resident_archive_knn_v2_abi.cuh",
 ];
 
 const PRECISION_FLAGS: [&str; 4] = [
@@ -667,6 +674,9 @@ fn emit_rerun_contract(cuda_feature: bool) {
     println!("cargo:rerun-if-changed=native/stub.cpp");
     for source in DEVICE_SOURCES {
         println!("cargo:rerun-if-changed={source}");
+    }
+    for header in RESIDENT_SEARCH_SLICE2_PRIVATE_HEADERS {
+        println!("cargo:rerun-if-changed={header}");
     }
     for name in [
         "CUDACXX",

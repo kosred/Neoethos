@@ -2,8 +2,8 @@
 mod resident_archive_knn_v2_native;
 
 use self::resident_archive_knn_v2_native::{
-    ResidentScoringArchiveArenaLayoutV2, ScoringArchiveArenaLayoutErrorV2,
-    validate_scoring_archive_arena_layout_v2,
+    RawResidentArchiveKnnBindV2, ResidentScoringArchiveArenaLayoutV2,
+    ScoringArchiveArenaLayoutErrorV2, validate_scoring_archive_arena_layout_v2,
 };
 
 const SLICE2_POPULATION_COUNT_V2: u64 = 200;
@@ -11,6 +11,10 @@ const SLICE2_ARCHIVE_CAPACITY_V2: u64 = 50_000;
 const SLICE2_SIGNATURE_WORD_COUNT_V2: u32 = 4;
 const SLICE2_NOVELTY_NEIGHBOR_COUNT_V2: u32 = 15;
 const SLICE2_MAX_TERMS_PER_GENE_V2: u32 = 16;
+const SLICE2_TERMINAL_HOST_RECEIPT_BYTES_V2: u64 = 104;
+const SLICE2_TERMINAL_HOST_ALIGNMENT_BYTES_V2: u64 = 8;
+const SLICE2_TERMINAL_HOST_FLAGS_V2: u32 = 0x01;
+const SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2: u64 = 23_707_648;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentSearchSlice2AlignedFieldV2 {
@@ -108,6 +112,22 @@ pub(crate) enum ResidentSearchSlice2ShapeAxisV2 {
 pub(crate) enum ResidentSearchSlice2AdmissionErrorV2 {
     MissingArchiveArena,
     ZeroArchiveArenaBytes,
+    ArchiveArenaBytesMismatch {
+        expected_bytes: u64,
+        observed_bytes: u64,
+    },
+    TerminalHostReceiptBytesMismatch {
+        expected_bytes: u64,
+        observed_bytes: u64,
+    },
+    TerminalHostAlignmentMismatch {
+        expected_alignment_bytes: u64,
+        observed_alignment_bytes: u64,
+    },
+    TerminalHostFlagsMismatch {
+        expected_flags: u32,
+        observed_flags: u32,
+    },
     ShapeMismatch {
         axis: ResidentSearchSlice2ShapeAxisV2,
         expected: u64,
@@ -351,6 +371,54 @@ pub(crate) struct ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
     max_terms_per_gene: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResidentSearchSlice2NativeBindAuthorityV2 {
+    raw: RawResidentArchiveKnnBindV2,
+    observed_reserve: ResidentSearchSlice2ObservedReserveSetV2,
+}
+
+impl ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
+    pub(crate) fn into_native_bind_authority_v2(self) -> ResidentSearchSlice2NativeBindAuthorityV2 {
+        let Self {
+            scoring_archive_layout,
+            calibration,
+            observed_reserve,
+            sealed_full_workspace_receipt_identity,
+            sealed_post_trim_receipt_identity,
+            population_count,
+            archive_capacity,
+            signature_word_count,
+            novelty_neighbor_count,
+            max_terms_per_gene,
+        } = self;
+        let raw = scoring_archive_layout.into_native_bind_v2(
+            calibration,
+            population_count,
+            archive_capacity,
+            signature_word_count,
+            novelty_neighbor_count,
+            max_terms_per_gene,
+            sealed_full_workspace_receipt_identity,
+            sealed_post_trim_receipt_identity,
+        );
+        ResidentSearchSlice2NativeBindAuthorityV2 {
+            raw,
+            observed_reserve,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
+impl ResidentSearchSlice2NativeBindAuthorityV2 {
+    fn test_raw_v2(&self) -> &RawResidentArchiveKnnBindV2 {
+        &self.raw
+    }
+
+    fn test_observed_reserve_v2(&self) -> &ResidentSearchSlice2ObservedReserveSetV2 {
+        &self.observed_reserve
+    }
+}
+
 pub(crate) struct ResidentSearchSlice2ValidatedAdmissionV2 {
     terminal_host_receipt: ResidentSearchSlice2HostAllocationArgsV2,
     generation_arena: ResidentSearchSlice2AsyncAllocationArgsV2,
@@ -474,6 +542,38 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
     }
     if request.archive_arena_bytes == 0 {
         return Err(ResidentSearchSlice2AdmissionErrorV2::ZeroArchiveArenaBytes);
+    }
+    if request.archive_arena_bytes != SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2 {
+        return Err(
+            ResidentSearchSlice2AdmissionErrorV2::ArchiveArenaBytesMismatch {
+                expected_bytes: SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2,
+                observed_bytes: request.archive_arena_bytes,
+            },
+        );
+    }
+    if request.terminal_host_receipt_bytes != SLICE2_TERMINAL_HOST_RECEIPT_BYTES_V2 {
+        return Err(
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostReceiptBytesMismatch {
+                expected_bytes: SLICE2_TERMINAL_HOST_RECEIPT_BYTES_V2,
+                observed_bytes: request.terminal_host_receipt_bytes,
+            },
+        );
+    }
+    if request.terminal_host_alignment_bytes != SLICE2_TERMINAL_HOST_ALIGNMENT_BYTES_V2 {
+        return Err(
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostAlignmentMismatch {
+                expected_alignment_bytes: SLICE2_TERMINAL_HOST_ALIGNMENT_BYTES_V2,
+                observed_alignment_bytes: request.terminal_host_alignment_bytes,
+            },
+        );
+    }
+    if request.terminal_host_flags != SLICE2_TERMINAL_HOST_FLAGS_V2 {
+        return Err(
+            ResidentSearchSlice2AdmissionErrorV2::TerminalHostFlagsMismatch {
+                expected_flags: SLICE2_TERMINAL_HOST_FLAGS_V2,
+                observed_flags: request.terminal_host_flags,
+            },
+        );
     }
 
     for (axis, expected, observed) in [

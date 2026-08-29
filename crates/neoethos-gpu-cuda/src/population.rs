@@ -1381,6 +1381,7 @@ pub(crate) struct RawResidentScoringPopulationSourceV2 {
     metrics_ready_event: *mut c_void,
     scoring_ready_event: *mut c_void,
     receipt_token: *const c_void,
+    population_lifetime_owner: *mut c_void,
     metric_rows_device: *const NeoPopulationMetricRow,
     expected_scenario_ids_device: *const u64,
     logical_population_count: u64,
@@ -1399,6 +1400,7 @@ impl Default for RawResidentScoringPopulationSourceV2 {
             metrics_ready_event: std::ptr::null_mut(),
             scoring_ready_event: std::ptr::null_mut(),
             receipt_token: std::ptr::null(),
+            population_lifetime_owner: std::ptr::null_mut(),
             metric_rows_device: std::ptr::null(),
             expected_scenario_ids_device: std::ptr::null(),
             logical_population_count: 0,
@@ -1410,7 +1412,7 @@ impl Default for RawResidentScoringPopulationSourceV2 {
     }
 }
 
-const _: [(); 88] = [(); std::mem::size_of::<RawResidentScoringPopulationSourceV2>()];
+const _: [(); 96] = [(); std::mem::size_of::<RawResidentScoringPopulationSourceV2>()];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -3700,6 +3702,12 @@ impl PopulationSession {
             || raw.metrics_ready_event.is_null()
             || raw.scoring_ready_event.is_null()
             || raw.receipt_token.is_null()
+            || raw.population_lifetime_owner.is_null()
+            || raw.population_lifetime_owner != self.handle
+            || std::ptr::eq(
+                raw.population_lifetime_owner.cast_const(),
+                raw.receipt_token,
+            )
             || raw.metric_rows_device.is_null()
             || raw.expected_scenario_ids_device.is_null()
             || raw.logical_population_count != logical_population_count
@@ -4157,6 +4165,24 @@ mod tests {
             offset_of!(RawResidentPopulationMetricsHandleV1, total_device_bytes),
             64
         );
+        layout!(RawResidentScoringPopulationSourceV2, 96, 8);
+        assert_eq!(
+            offset_of!(
+                RawResidentScoringPopulationSourceV2,
+                population_lifetime_owner
+            ),
+            40
+        );
+        assert_eq!(
+            offset_of!(
+                RawResidentScoringPopulationSourceV2,
+                full_discovery_reserve_bytes
+            ),
+            88
+        );
+        let default_scoring_source = RawResidentScoringPopulationSourceV2::default();
+        assert!(default_scoring_source.receipt_token.is_null());
+        assert!(default_scoring_source.population_lifetime_owner.is_null());
         layout!(RawTerminalCompactPopulationResultV1, 160, 8);
         assert_eq!(
             offset_of!(RawTerminalCompactPopulationResultV1, metric_row),
