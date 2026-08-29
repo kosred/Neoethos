@@ -23,8 +23,12 @@ pub mod deep_models;
 pub mod ensemble;
 pub mod ensemble_inference;
 pub mod parallel_trainer;
+pub mod promotion_candidate_training_v1;
 pub mod training_orchestrator;
 pub mod tree_models;
+
+#[cfg(test)]
+mod promotion_candidate_training_v1_tests;
 
 pub use ensemble_inference::{
     DEFAULT_BOOTSTRAP_EXPERT_NAMES, EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome,
@@ -42,6 +46,16 @@ pub use ensemble::{
     ProbabilityCalibrationExpert, ProbabilityCalibrator,
 };
 pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
+pub use promotion_candidate_training_v1::{
+    MAX_PROMOTION_CANDIDATE_HANDOFF_BYTES_V1, MAX_PROMOTION_CANDIDATE_MODEL_FILE_COUNT_V1,
+    MAX_PROMOTION_CANDIDATE_MODEL_TREE_BYTES_V1, PROMOTION_CANDIDATE_TRAINING_EVIDENCE_FILE_V1,
+    PromotionCandidateBrokerAuthorityIdentityV1, PromotionCandidateLockedPortfolioV1,
+    PromotionCandidateModelArtifactV1, PromotionCandidateTrainingConfigIdentityV1,
+    PromotionCandidateTrainingHandoffV1, PromotionCandidateTrainingManifestV1,
+    PromotionCandidateTrainingRefusalCodeV1, PromotionCandidateTrainingRefusalV1,
+    PromotionCandidateTrainingTerminalV1, resolve_promotion_candidate_training_config_identity_v1,
+    train_and_deploy_promotion_candidate_v1,
+};
 pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary, set_training_cancel};
 
 // Hardware detection (derived from models/device.py)

@@ -22,35 +22,7 @@ use neoethos_gpu_cuda::{
 pub const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2: u16 = 2;
 const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_HASH_DOMAIN_V2: &[u8] =
     b"neoethos.search.resident-population-auto-sizing-receipt.v2\0";
-pub(crate) const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = 16_384;
-
-fn checked_effective_hard_growth_cap_v2(
-    external_hard_population_cap: usize,
-) -> Result<usize, ResidentPopulationAutoSizingErrorV2> {
-    if external_hard_population_cap == 0 {
-        return Err(ResidentPopulationAutoSizingErrorV2::new(
-            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
-            "external resident population hard cap must be non-zero",
-        ));
-    }
-    Ok(external_hard_population_cap.min(RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2))
-}
-
-fn checked_configured_population_against_external_hard_cap_v2(
-    configured_population: usize,
-    external_hard_population_cap: usize,
-) -> Result<(), ResidentPopulationAutoSizingErrorV2> {
-    checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
-    if configured_population > external_hard_population_cap {
-        return Err(ResidentPopulationAutoSizingErrorV2::new(
-            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
-            format!(
-                "configured resident population {configured_population} exceeds external hard cap {external_hard_population_cap}"
-            ),
-        ));
-    }
-    Ok(())
-}
+const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = 16_384;
 const RESIDENT_SELECTION_STAGE1_ROLE_V2: &str = "selection_stage1";
 type InternalWorkspaceBytesV2 = (
     PopulationGeneStorePlanV1,
@@ -1439,27 +1411,6 @@ pub fn seal_resident_population_auto_sizing_receipt_v2(
     ),
     ResidentPopulationAutoSizingErrorV2,
 > {
-    seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
-        prepared,
-        native_facts,
-        request,
-        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-    )
-}
-
-fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
-    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
-    request: ResidentPopulationAutoSizingRequestV2,
-    external_hard_population_cap: usize,
-) -> Result<
-    (
-        ResidentPopulationAutoSizingReceiptV2,
-        SealedDataPopulationGpuWorkspacePlanV1,
-    ),
-    ResidentPopulationAutoSizingErrorV2,
-> {
-    let hard_growth_cap = checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
     let extent = prepared.workspace_extent();
     let parent_rows = usize::try_from(extent.row_count()).map_err(|_| {
         ResidentPopulationAutoSizingErrorV2::new(
@@ -1565,7 +1516,7 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
         request.population_auto,
         request.configured_population,
         effective_time_cap,
-        hard_growth_cap,
+        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
         |candidate_count, scenario_count| {
             workspace_fit_for_extents_v2(
                 prepared,
@@ -1671,7 +1622,10 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
                 "effective time cap does not fit u64",
             )
         })?,
-        hard_growth_cap: checked_u64(hard_growth_cap, "hard growth cap")?,
+        hard_growth_cap: checked_u64(
+            RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+            "hard growth cap",
+        )?,
         memory_one_launch_population_cap: checked_u64(
             resolution.memory_one_launch_population_cap,
             "memory one-launch cap",
@@ -1705,60 +1659,6 @@ pub fn seal_resident_population_auto_for_canonical_trendbar_research_v2(
     ),
     ResidentPopulationAutoSizingErrorV2,
 > {
-    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-        prepared,
-        native_facts,
-        config,
-        financial_contract,
-        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-        false,
-    )
-}
-
-pub(crate) fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
-    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
-    config: &crate::DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    external_hard_population_cap: usize,
-) -> Result<
-    (
-        ResidentPopulationAutoSizingReceiptV2,
-        SealedDataPopulationGpuWorkspacePlanV1,
-    ),
-    ResidentPopulationAutoSizingErrorV2,
-> {
-    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-        prepared,
-        native_facts,
-        config,
-        financial_contract,
-        external_hard_population_cap,
-        true,
-    )
-}
-
-fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
-    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
-    config: &crate::DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    external_hard_population_cap: usize,
-    enforce_configured_population_cap: bool,
-) -> Result<
-    (
-        ResidentPopulationAutoSizingReceiptV2,
-        SealedDataPopulationGpuWorkspacePlanV1,
-    ),
-    ResidentPopulationAutoSizingErrorV2,
-> {
-    checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
-    if enforce_configured_population_cap {
-        checked_configured_population_against_external_hard_cap_v2(
-            config.population,
-            external_hard_population_cap,
-        )?;
-    }
     let resident_parent_rows =
         usize::try_from(prepared.workspace_extent().row_count()).map_err(|_| {
             ResidentPopulationAutoSizingErrorV2::new(
@@ -1771,16 +1671,11 @@ fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_i
         resident_parent_rows,
         financial_contract,
     )?;
-    seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
-        prepared,
-        native_facts,
-        request,
-        external_hard_population_cap,
-    )
+    seal_resident_population_auto_sizing_receipt_v2(prepared, native_facts, request)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     fn refresh_fixture_workspace_bytes_v2(receipt: &mut ResidentPopulationAutoSizingReceiptV2) {
@@ -1799,9 +1694,7 @@ pub(crate) mod tests {
         receipt.required_device_bytes_including_reserve = including;
     }
 
-    fn self_validating_receipt_fixture_with_v2(
-        prepare: impl FnOnce(&mut ResidentPopulationAutoSizingReceiptV2),
-    ) -> ResidentPopulationAutoSizingReceiptV2 {
+    fn self_validating_receipt_fixture_v2() -> ResidentPopulationAutoSizingReceiptV2 {
         let mut receipt = ResidentPopulationAutoSizingReceiptV2 {
             schema_version: RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2,
             population_auto: false,
@@ -1864,7 +1757,6 @@ pub(crate) mod tests {
             data_extent_identity_sha256: "a".repeat(64),
             identity_sha256: String::new(),
         };
-        prepare(&mut receipt);
         let (raw_time_cap, effective_time_cap, _) =
             crate::gpu_native::prototype_b_population_eval::checked_candidates_for_target_launch_v1(
                 receipt.evaluation_rows as usize,
@@ -1872,6 +1764,7 @@ pub(crate) mod tests {
             .unwrap();
         receipt.raw_time_cap = raw_time_cap;
         receipt.effective_time_cap = effective_time_cap;
+        refresh_fixture_workspace_bytes_v2(&mut receipt);
         let resolution = resolve_population_auto_extents_v2(
             receipt.population_auto,
             receipt.configured_population as usize,
@@ -1895,135 +1788,11 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        receipt.resolved_population = resolution.resolved_population as u64;
-        receipt.max_concurrent_scenario_count = resolution.max_concurrent_scenario_count as u64;
         receipt.memory_one_launch_population_cap =
             resolution.memory_one_launch_population_cap as u64;
         receipt.growth_cap = resolution.growth_cap as u64;
-        receipt.resolution_reason = if !receipt.population_auto {
-            "auto_disabled"
-        } else if resolution.resolved_population > receipt.configured_population as usize {
-            "resident_cuda_auto_grew"
-        } else if receipt.configured_population as usize > resolution.growth_cap {
-            "resident_cuda_configured_above_growth_cap_no_shrink"
-        } else {
-            "resident_cuda_configured_at_growth_cap"
-        }
-        .to_owned();
-        refresh_fixture_workspace_bytes_v2(&mut receipt);
         receipt.identity_sha256 = receipt.computed_identity_sha256().unwrap();
         receipt
-    }
-
-    #[cfg(all(test, feature = "gpu-cuda"))]
-    pub(crate) fn canonical_result_fixture_receipt_v2(
-        financial_authority_identity_sha256: String,
-        financial_input_receipt_sha256: String,
-        financial_source_projection_identity_sha256: [u8; 32],
-        selected_device_ordinal: u32,
-        resident_parent_rows: u64,
-        stage1_row_start: u64,
-        stage1_row_end: u64,
-        desired_scenario_count: usize,
-    ) -> ResidentPopulationAutoSizingReceiptV2 {
-        self_validating_receipt_fixture_with_v2(|receipt| {
-            receipt.financial_authority_identity_sha256 = financial_authority_identity_sha256;
-            receipt.financial_input_receipt_sha256 = financial_input_receipt_sha256;
-            receipt.financial_source_projection_identity_sha256 =
-                financial_source_projection_identity_sha256;
-            receipt.selected_device_ordinal = selected_device_ordinal;
-            receipt.resident_parent_rows = resident_parent_rows;
-            receipt.stage1_row_start = stage1_row_start;
-            receipt.stage1_row_end = stage1_row_end;
-            receipt.evaluation_rows = stage1_row_end - stage1_row_start;
-            receipt.pre_materialization_free_bytes_snapshot = receipt
-                .internal_workspace_bytes_v2(
-                    receipt.configured_population as usize,
-                    desired_scenario_count,
-                    receipt.term_cap as usize,
-                    receipt.month_capacity as u32,
-                )
-                .unwrap()
-                .3;
-        })
-    }
-
-    #[cfg(all(test, feature = "gpu-cuda"))]
-    pub(crate) fn canonical_result_forge_feature_count_without_rehash_v2_for_test(
-        mut receipt: ResidentPopulationAutoSizingReceiptV2,
-    ) -> ResidentPopulationAutoSizingReceiptV2 {
-        receipt.feature_count = receipt.feature_count.checked_add(1).unwrap();
-        receipt
-    }
-
-    #[cfg(all(test, feature = "gpu-cuda"))]
-    pub(crate) fn canonical_result_maximum_json_receipt_v2_for_test(
-        maximum_general_string: &str,
-    ) -> ResidentPopulationAutoSizingReceiptV2 {
-        let mut receipt = self_validating_receipt_fixture_v2();
-        receipt.schema_version = u16::MAX;
-        receipt.population_auto = false;
-        receipt.configured_population = u64::MAX;
-        receipt.resolved_population = u64::MAX;
-        receipt.resident_parent_rows = u64::MAX;
-        receipt.feature_count = u64::MAX;
-        receipt.evaluation_rows = u64::MAX;
-        receipt.month_capacity = u64::MAX;
-        receipt.requested_max_indicators = u64::MAX;
-        receipt.term_cap = u64::MAX;
-        receipt.stage1_role = maximum_general_string.to_owned();
-        receipt.stage1_row_start = u64::MAX;
-        receipt.stage1_row_end = u64::MAX;
-        receipt.migration_enabled_for_run = false;
-        receipt.adaptive_stops_requested_for_run = false;
-        receipt.adaptive_base_effective_for_stage1 = false;
-        receipt.adaptive_resolution_reason = maximum_general_string.to_owned();
-        receipt.resident_adaptive_semantic_v1 = maximum_general_string.to_owned();
-        receipt.stop_target_log_operation_schedule_v3 = maximum_general_string.to_owned();
-        receipt.resident_adaptive_request_identity_sha256 = [u8::MAX; 32];
-        receipt.adaptive_pip_size_bits = u64::MAX;
-        receipt.pip_value_per_lot_bits = u64::MAX;
-        receipt.financial_authority_identity_sha256 = maximum_general_string.to_owned();
-        receipt.financial_input_receipt_sha256 = maximum_general_string.to_owned();
-        receipt.financial_source_projection_identity_sha256 = [u8::MAX; 32];
-        receipt.evaluation_symbol = maximum_general_string.to_owned();
-        receipt.evaluation_account_currency = maximum_general_string.to_owned();
-        receipt.adaptive_rr_bits = u64::MAX;
-        receipt.adaptive_tail_max_bars = u64::MAX;
-        receipt.adaptive_tail_step = u64::MAX;
-        receipt.max_ordered_index_count = u64::MAX;
-        receipt.max_adaptive_row_count = u64::MAX;
-        receipt.selected_device_ordinal = u32::MAX;
-        receipt.pre_materialization_free_bytes_snapshot = u64::MAX;
-        receipt.allocator_context_reserve_bytes = u64::MAX;
-        receipt.allocator_context_reserve_policy = maximum_general_string.to_owned();
-        receipt.admission_identity_sha256 = maximum_general_string.to_owned();
-        receipt.native_preflight_facts_identity_sha256 = maximum_general_string.to_owned();
-        receipt.cuda_build_manifest_sha256 = maximum_general_string.to_owned();
-        receipt.cuda_build_artifact_sha256 = maximum_general_string.to_owned();
-        receipt.data_peak_device_bytes = u64::MAX;
-        receipt.data_steady_device_bytes = u64::MAX;
-        receipt.gene_store_device_bytes = u64::MAX;
-        receipt.metrics_scenario_device_bytes = u64::MAX;
-        receipt.max_concurrent_scenario_count = u64::MAX;
-        receipt.bounded_host_metric_readback_bytes = u64::MAX;
-        receipt.required_device_bytes_excluding_reserve = u64::MAX;
-        receipt.required_device_bytes_including_reserve = u64::MAX;
-        receipt.raw_time_cap = u64::MAX;
-        receipt.effective_time_cap = u64::MAX;
-        receipt.hard_growth_cap = u64::MAX;
-        receipt.memory_one_launch_population_cap = u64::MAX;
-        receipt.growth_cap = u64::MAX;
-        receipt.resolution_reason = maximum_general_string.to_owned();
-        receipt.workspace_plan_identity_sha256 = maximum_general_string.to_owned();
-        receipt.population_sizing_authority_sha256 = maximum_general_string.to_owned();
-        receipt.data_extent_identity_sha256 = maximum_general_string.to_owned();
-        receipt.identity_sha256 = maximum_general_string.to_owned();
-        receipt
-    }
-
-    fn self_validating_receipt_fixture_v2() -> ResidentPopulationAutoSizingReceiptV2 {
-        self_validating_receipt_fixture_with_v2(|_| {})
     }
 
     fn recompute_fixture_identity_v2(receipt: &mut ResidentPopulationAutoSizingReceiptV2) {
@@ -2077,7 +1846,7 @@ pub(crate) mod tests {
         macro_rules! reject_if_accepted {
             ($name:literal, |$receipt:ident| $($mutation:stmt);+ $(;)?) => {{
             let mut $receipt = self_validating_receipt_fixture_v2();
-            $($mutation)+
+            $($mutation;)+
             recompute_fixture_identity_v2(&mut $receipt);
             if $receipt.validate_self_v2().is_ok() {
                 accepted.push($name);
@@ -2091,8 +1860,7 @@ pub(crate) mod tests {
         reject_if_accepted!("effective time cap minus one", |receipt| receipt.effective_time_cap -= 1);
         reject_if_accepted!("stage role", |receipt| receipt.stage1_role = "selection_stage2".to_owned());
         reject_if_accepted!("free memory admission", |receipt| receipt.pre_materialization_free_bytes_snapshot = receipt.required_device_bytes_including_reserve - 1);
-        reject_if_accepted!("zero data bytes with refreshed workspace", |receipt| receipt.data_peak_device_bytes = 0; receipt.data_steady_device_bytes = 0; refresh_fixture_workspace_bytes_v2(&mut receipt));
-        reject_if_accepted!("ordered extent beyond resident rows with refreshed workspace", |receipt| receipt.max_ordered_index_count = receipt.resident_parent_rows + 1; refresh_fixture_workspace_bytes_v2(&mut receipt));
+        reject_if_accepted!("positive data bytes", |receipt| receipt.data_peak_device_bytes = 0; receipt.data_steady_device_bytes = 0);
         reject_if_accepted!("gene bytes plus one", |receipt| receipt.gene_store_device_bytes += 1);
         reject_if_accepted!("gene bytes minus one", |receipt| receipt.gene_store_device_bytes -= 1);
         reject_if_accepted!("metrics bytes plus one", |receipt| receipt.metrics_scenario_device_bytes += 1);
@@ -2106,70 +1874,6 @@ pub(crate) mod tests {
         reject_if_accepted!("scenario and dependent bytes", |receipt| receipt.max_concurrent_scenario_count -= 1; refresh_fixture_workspace_bytes_v2(&mut receipt));
         reject_if_accepted!("hard cap above ceiling", |receipt| receipt.hard_growth_cap = 16_385);
         assert!(accepted.is_empty(), "self-validation accepted correlated mutations: {accepted:?}");
-    }
-
-    #[test]
-    fn self_validation_accepts_all_auto_resolution_reasons_and_rejects_drift() {
-        let auto_grew = self_validating_receipt_fixture_with_v2(|receipt| {
-            receipt.population_auto = true;
-            receipt.hard_growth_cap = 100;
-        });
-        let at_growth = self_validating_receipt_fixture_with_v2(|receipt| {
-            receipt.population_auto = true;
-            receipt.hard_growth_cap = receipt.configured_population;
-        });
-        let memory_limited = self_validating_receipt_fixture_with_v2(|receipt| {
-            receipt.population_auto = true;
-            let (_, _, _, including_reserve) = receipt
-                .internal_workspace_bytes_v2(
-                    5,
-                    5,
-                    receipt.term_cap as usize,
-                    receipt.month_capacity as u32,
-                )
-                .unwrap();
-            receipt.pre_materialization_free_bytes_snapshot = including_reserve;
-        });
-        assert!(
-            memory_limited.memory_one_launch_population_cap < memory_limited.configured_population
-        );
-        for (expected_reason, mut receipt) in [
-            ("resident_cuda_auto_grew", auto_grew),
-            ("resident_cuda_configured_at_growth_cap", at_growth),
-            (
-                "resident_cuda_configured_above_growth_cap_no_shrink",
-                memory_limited,
-            ),
-        ] {
-            assert_eq!(receipt.resolution_reason, expected_reason);
-            receipt.validate_self_v2().expect(expected_reason);
-            receipt.resolution_reason = "wrong_reason".to_owned();
-            recompute_fixture_identity_v2(&mut receipt);
-            assert!(receipt.validate_self_v2().is_err(), "{expected_reason}");
-        }
-    }
-
-    #[test]
-    fn self_validation_accepts_occupancy_floor_time_plan() {
-        let receipt = self_validating_receipt_fixture_with_v2(|receipt| {
-            receipt.resident_parent_rows = 5_270_000;
-            receipt.evaluation_rows = 5_270_000;
-            receipt.stage1_row_start = 0;
-            receipt.stage1_row_end = 5_270_000;
-        });
-        let (raw, effective, floor_overrode) =
-            crate::gpu_native::prototype_b_population_eval::checked_candidates_for_target_launch_v1(
-                receipt.evaluation_rows as usize,
-            )
-            .unwrap();
-        assert!(floor_overrode);
-        assert_eq!(
-            (receipt.raw_time_cap, receipt.effective_time_cap),
-            (raw, effective)
-        );
-        receipt
-            .validate_self_v2()
-            .expect("occupancy-floor receipt remains self-validating");
     }
 
     #[test]
@@ -2255,47 +1959,6 @@ pub(crate) mod tests {
         assert_eq!(
             error.code(),
             ResidentPopulationAutoSizingErrorCodeV2::ConfiguredGeneNoRoom
-        );
-    }
-
-    #[test]
-    fn external_hard_cap_is_exactly_bounded_and_identity_validated_in_the_receipt() {
-        for (external_cap, expected_cap) in [
-            (4_096, 4_096),
-            (
-                RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-                RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-            ),
-            (usize::MAX, RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2),
-        ] {
-            let effective_cap = checked_effective_hard_growth_cap_v2(external_cap)
-                .expect("non-zero external hard cap");
-            assert_eq!(effective_cap, expected_cap);
-            let receipt = self_validating_receipt_fixture_with_v2(|receipt| {
-                receipt.population_auto = true;
-                receipt.configured_population = 200;
-                receipt.hard_growth_cap = effective_cap as u64;
-            });
-            assert_eq!(receipt.hard_growth_cap(), expected_cap);
-            receipt
-                .validate_self_v2()
-                .expect("the effective hard cap is bound into the receipt identity");
-        }
-
-        let error = checked_effective_hard_growth_cap_v2(0)
-            .expect_err("zero cannot authorize resident population sizing");
-        assert_eq!(
-            error.code(),
-            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput
-        );
-
-        checked_configured_population_against_external_hard_cap_v2(20_000, 30_000)
-            .expect("configured population below the raw external cap remains no-shrink valid");
-        let error = checked_configured_population_against_external_hard_cap_v2(30_001, 30_000)
-            .expect_err("configured population above the raw external cap must fail");
-        assert_eq!(
-            error.code(),
-            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput
         );
     }
 

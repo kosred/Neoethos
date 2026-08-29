@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu-cuda")]
+use super::evolution_math::current_gene_stop_bounds;
 use super::evolution_math::{
     EvolutionSearchPolicy, SeenSignatureMemory, SurvivorSelectionPolicy, apply_metrics, crossover,
     gene_signature_hash, generate_random_genes, mutate, new_random_gene, select_parent_index,
@@ -8,6 +10,8 @@ use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_populatio
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
 use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
+#[cfg(feature = "gpu-cuda")]
+use anyhow::{Context, ensure};
 use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
 use ndarray::Array2;
@@ -36,6 +40,177 @@ fn build_search_rng() -> StdRng {
 }
 
 type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f64>, Vec<f64>, Vec<f64>);
+
+/// Immutable gene-width and migration authority for one search invocation.
+///
+/// Exact receipt-governed searches construct this only from the validated
+/// sizing/search authority. Legacy callers capture the process migration flag
+/// once at their public entrypoint; the generation loop never re-reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactSearchSizingPolicyV1 {
+    migration_enabled_for_run: bool,
+    term_cap: usize,
+}
+
+impl ExactSearchSizingPolicyV1 {
+    fn new(migration_enabled_for_run: bool, term_cap: usize) -> Result<Self> {
+        if term_cap == 0 {
+            bail!("exact search sizing policy requires a non-zero term cap");
+        }
+        Ok(Self {
+            migration_enabled_for_run,
+            term_cap,
+        })
+    }
+
+    fn from_search_authority_v1(
+        authority: &crate::run_identity::PopulationAutoSearchAuthorityV1,
+    ) -> Result<Self> {
+        authority.validate()?;
+        let receipt = authority.population_auto_sizing_receipt();
+        if receipt.migration_enabled_for_run() {
+            bail!("receipt-governed exact search requires migration disabled for the whole run");
+        }
+        Self::new(false, receipt.term_cap())
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn from_resident_population_receipt_v2(
+        receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
+    ) -> Result<Self> {
+        if receipt.migration_enabled_for_run() {
+            bail!("resident receipt-governed Search requires migration disabled for the whole run");
+        }
+        Self::new(false, receipt.term_cap())
+    }
+
+    const fn migration_enabled_for_run(&self) -> bool {
+        self.migration_enabled_for_run
+    }
+
+    fn validate_gene_batch_v1(&self, genes: &[Gene], context: &str) -> Result<()> {
+        let maximum_terms = genes
+            .len()
+            .checked_mul(self.term_cap)
+            .ok_or_else(|| anyhow!("{context}: gene-count × term-cap overflow"))?;
+        let mut total_terms = 0usize;
+        for gene in genes {
+            if gene.indices.len() != gene.weights.len() {
+                bail!(
+                    "{context}: gene `{}` has {} indices but {} weights",
+                    gene.strategy_id,
+                    gene.indices.len(),
+                    gene.weights.len()
+                );
+            }
+            if gene.indices.len() > self.term_cap {
+                bail!(
+                    "{context}: gene `{}` has {} terms, exceeding sealed term cap {}",
+                    gene.strategy_id,
+                    gene.indices.len(),
+                    self.term_cap
+                );
+            }
+            total_terms = total_terms
+                .checked_add(gene.indices.len())
+                .ok_or_else(|| anyhow!("{context}: total gene-term count overflow"))?;
+        }
+        if total_terms > maximum_terms {
+            bail!(
+                "{context}: total terms {total_terms} exceed sealed batch capacity {maximum_terms}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Run-scoped snapshot of every process-wide input consumed while constructing
+/// and scoring the Generation-0 population. This milestone is launch evidence,
+/// not a persisted replay receipt: in particular, it does not hash the current
+/// contents of the optional seen-signature file. It does, however, fail if any
+/// installed runtime authority drifts between V5 preparation and evaluation.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResidentGenerationZeroRuntimeSnapshotV1 {
+    genetic_search: super::runtime_overrides::GeneticSearchRuntimeOverrides,
+    strategy_evaluation: super::runtime_overrides::StrategyEvaluationRuntimeOverrides,
+    gene_stop_bounds_overrides: super::runtime_overrides::GeneStopBoundsOverrides,
+    backtest: crate::eval::BacktestRuntimeOverrides,
+    stop_target: crate::stop_target::StopTargetRuntimeOverrides,
+    seen_memory: super::evolution_math::SeenSignatureMemoryRuntimeOverrides,
+    smc_search: SmcSearchConfig,
+    gene_stop_bounds: super::evolution_math::ResolvedGeneStopBounds,
+    threshold_ladder: [f64; 6],
+    adaptive_stops_enabled: bool,
+    adaptive_stops_rr_bits: u64,
+    migration_enabled: bool,
+    smc_gate_disabled: bool,
+}
+
+#[cfg(feature = "gpu-cuda")]
+impl ResidentGenerationZeroRuntimeSnapshotV1 {
+    pub(crate) fn capture() -> Self {
+        Self {
+            genetic_search: current_genetic_search_runtime_overrides(),
+            strategy_evaluation:
+                super::runtime_overrides::current_strategy_evaluation_runtime_overrides(),
+            gene_stop_bounds_overrides:
+                super::runtime_overrides::current_gene_stop_bounds_overrides(),
+            backtest: crate::eval::current_backtest_runtime_overrides(),
+            stop_target: crate::stop_target::current_stop_target_runtime_overrides(),
+            seen_memory: super::evolution_math::current_seen_signature_memory_runtime_overrides(),
+            smc_search: SmcSearchConfig::current(),
+            gene_stop_bounds: current_gene_stop_bounds(),
+            threshold_ladder: super::evolution_math::current_threshold_ladder(),
+            adaptive_stops_enabled: crate::stop_target::adaptive_stops_enabled(),
+            adaptive_stops_rr_bits: crate::stop_target::adaptive_stops_rr().to_bits(),
+            migration_enabled: super::migration::migration_enabled(),
+            smc_gate_disabled: super::runtime_overrides::smc_gate_disabled(),
+        }
+    }
+
+    pub(crate) fn validate_current(&self, context: &str) -> Result<()> {
+        ensure!(
+            self == &Self::capture(),
+            "{context}: Generation-0 runtime authority drifted after V5 preparation"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_against_receipt_v2(
+        &self,
+        receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
+    ) -> Result<()> {
+        ensure!(
+            !self.migration_enabled && !receipt.migration_enabled_for_run(),
+            "resident Generation-0 requires migration disabled in both runtime snapshot and receipt"
+        );
+        ensure!(
+            !self.gene_stop_bounds_overrides.atr_scaled && self.gene_stop_bounds.atr_pips.is_none(),
+            "resident Generation-0 first-route policy requires fixed threshold and non-ATR gene geometry"
+        );
+        ensure!(
+            self.backtest.month_capacity == receipt.month_capacity(),
+            "resident Generation-0 month capacity drifted from the sizing receipt"
+        );
+        ensure!(
+            self.adaptive_stops_enabled == receipt.adaptive_stops_requested_for_run()
+                && self.adaptive_stops_rr_bits == receipt.adaptive_rr().to_bits()
+                && self.stop_target.tail_step == receipt.adaptive_tail_step()
+                && self.stop_target.tail_max_bars == receipt.adaptive_tail_max_bars(),
+            "resident Generation-0 adaptive runtime authority drifted from the sizing receipt"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn replay_identity_sealed(&self) -> bool {
+        false
+    }
+
+    const fn smc_gate_disabled(&self) -> bool {
+        self.smc_gate_disabled
+    }
+}
 
 /// Holds data that is stable across all generations (OHLCV + features don't change).
 /// Computing this once outside the generation loop saves ~5-15% eval time.
@@ -166,8 +341,8 @@ pub fn signals_for_gene_with_config(
 ///
 /// Confidence per bar: `0.0` when the signal is `0`; otherwise
 ///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
-///   long:  margin = `combined[i] - long_threshold`
-///   short: margin = `short_threshold - combined[i]`
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
 ///   conf   = (margin / gap).clamp(0.0, 1.0)
 pub fn signals_and_confidence_for_gene_with_config(
     features: &FeatureFrame,
@@ -370,8 +545,8 @@ pub fn signals_for_gene_full_with_smc(
 ///
 /// Confidence per bar: `0.0` when the signal is `0`; otherwise
 ///   gap    = (long_threshold - short_threshold).abs().max(1e-6)
-///   long:  margin = `combined[i] - long_threshold`
-///   short: margin = `short_threshold - combined[i]`
+///   long:  margin = combined[i] - long_threshold
+///   short: margin = short_threshold - combined[i]
 ///   conf   = (margin / gap).clamp(0.0, 1.0)
 pub fn signals_and_confidence_for_gene_full(
     features: &FeatureFrame,
@@ -536,6 +711,7 @@ pub(crate) fn evaluate_genes_cached(
     genes: &[Gene],
     config: &EvaluationConfig,
     cache: &EvalDataCache,
+    sizing_policy: &ExactSearchSizingPolicyV1,
     exact_execution: Option<(
         &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
@@ -556,6 +732,7 @@ pub(crate) fn evaluate_genes_cached(
     if genes.is_empty() {
         return Ok(Vec::new());
     }
+    sizing_policy.validate_gene_batch_v1(genes, "exact generation upload")?;
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
     let mut gene_smc_flags = Vec::with_capacity(genes.len());
@@ -658,6 +835,543 @@ pub(crate) fn evaluate_genes_cached(
     }
 }
 
+/// Exact evidence from one host-evolution Generation-0 evaluation over the
+/// admitted resident V3 population session. The identities are diagnostic
+/// output only; the non-Clone adaptive token is validated inside the session
+/// binder and never escapes as an authorization capability.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Debug)]
+pub(crate) struct ResidentGenerationZeroEvaluationEvidenceV1 {
+    pub(crate) metrics_receipt_identities_sha256: Vec<[u8; 32]>,
+    pub(crate) adaptive_token_identity_sha256: Option<[u8; 32]>,
+    pub(crate) residency_counters: neoethos_gpu_cuda::PopulationResidencyCountersV1,
+}
+
+#[cfg(feature = "gpu-cuda")]
+struct ResidentGenerationGeneBatchV1 {
+    descriptors: Vec<neoethos_gpu_contracts::device::GeneDescriptor>,
+    offsets: Vec<i32>,
+    indices: Vec<i32>,
+    weights: Vec<f64>,
+    stop_pips: Vec<f64>,
+    target_pips: Vec<f64>,
+    stop_vol_multipliers: Vec<f64>,
+    smc_flags: Vec<i8>,
+    smc_weights: [f64; 11],
+    gate_threshold: f64,
+    smc_gate_disabled: bool,
+}
+
+#[cfg(feature = "gpu-cuda")]
+impl ResidentGenerationGeneBatchV1 {
+    fn view(&self) -> neoethos_gpu_cuda::PopulationGeneView<'_> {
+        neoethos_gpu_cuda::PopulationGeneView {
+            descriptors: &self.descriptors,
+            offsets: &self.offsets,
+            indices: &self.indices,
+            weights: &self.weights,
+            stop_pips: &self.stop_pips,
+            target_pips: &self.target_pips,
+            stop_vol_multipliers: &self.stop_vol_multipliers,
+            smc_flags: &self.smc_flags,
+            smc_weights: &self.smc_weights,
+            gate_threshold: self.gate_threshold,
+            smc_gate_disabled: self.smc_gate_disabled,
+        }
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn try_reserve_exact_v1<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
+    values
+        .try_reserve_exact(additional)
+        .map_err(|error| anyhow!("{context}: {error}"))
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn pack_resident_generation_genes_v1(
+    genes: &[Gene],
+    feature_count: usize,
+    config: &EvaluationConfig,
+    sizing_policy: &ExactSearchSizingPolicyV1,
+    smc_gate_disabled: bool,
+) -> Result<ResidentGenerationGeneBatchV1> {
+    sizing_policy.validate_gene_batch_v1(genes, "resident Generation-0 upload")?;
+    ensure!(
+        !genes.is_empty(),
+        "resident Generation-0 gene batch is empty"
+    );
+    let total_terms = genes.iter().try_fold(0usize, |total, gene| {
+        total
+            .checked_add(gene.indices.len())
+            .context("resident Generation-0 total term count overflow")
+    })?;
+    let offset_count = genes
+        .len()
+        .checked_add(1)
+        .context("resident Generation-0 offset count overflow")?;
+    let smc_flag_count = genes
+        .len()
+        .checked_mul(11)
+        .context("resident Generation-0 SMC flag count overflow")?;
+
+    let mut descriptors = Vec::new();
+    let mut offsets = Vec::new();
+    let mut indices = Vec::new();
+    let mut weights = Vec::new();
+    let mut stop_pips = Vec::new();
+    let mut target_pips = Vec::new();
+    let mut stop_vol_multipliers = Vec::new();
+    let mut smc_flags = Vec::new();
+    try_reserve_exact_v1(
+        &mut descriptors,
+        genes.len(),
+        "reserve resident descriptors",
+    )?;
+    try_reserve_exact_v1(&mut offsets, offset_count, "reserve resident gene offsets")?;
+    try_reserve_exact_v1(&mut indices, total_terms, "reserve resident gene indices")?;
+    try_reserve_exact_v1(&mut weights, total_terms, "reserve resident gene weights")?;
+    try_reserve_exact_v1(&mut stop_pips, genes.len(), "reserve resident stop pips")?;
+    try_reserve_exact_v1(
+        &mut target_pips,
+        genes.len(),
+        "reserve resident target pips",
+    )?;
+    try_reserve_exact_v1(
+        &mut stop_vol_multipliers,
+        genes.len(),
+        "reserve resident adaptive multipliers",
+    )?;
+    try_reserve_exact_v1(&mut smc_flags, smc_flag_count, "reserve resident SMC flags")?;
+    offsets.push(0);
+
+    for (candidate_index, gene) in genes.iter().enumerate() {
+        ensure!(
+            gene.long_threshold.is_finite()
+                && gene.short_threshold.is_finite()
+                && gene.long_threshold > gene.short_threshold,
+            "resident Generation-0 gene `{}` has invalid thresholds",
+            gene.strategy_id
+        );
+        ensure!(
+            gene.sl_pips.is_finite() && gene.sl_pips > 0.0,
+            "resident Generation-0 gene `{}` has no exact positive stop",
+            gene.strategy_id
+        );
+        ensure!(
+            gene.tp_pips.is_finite() && gene.tp_pips > 0.0,
+            "resident Generation-0 gene `{}` has no exact positive target",
+            gene.strategy_id
+        );
+        ensure!(
+            gene.stop_vol_mult.is_finite() && gene.stop_vol_mult >= 0.0,
+            "resident Generation-0 gene `{}` has an invalid adaptive multiplier",
+            gene.strategy_id
+        );
+        let term_offset = u32::try_from(indices.len())
+            .context("resident Generation-0 term offset does not fit u32")?;
+        for (&index, &weight) in gene.indices.iter().zip(&gene.weights) {
+            ensure!(
+                index < feature_count,
+                "resident Generation-0 gene `{}` references feature {index} outside {feature_count}",
+                gene.strategy_id
+            );
+            ensure!(
+                weight.is_finite(),
+                "resident Generation-0 gene `{}` has a non-finite weight",
+                gene.strategy_id
+            );
+            indices.push(i32::try_from(index).with_context(|| {
+                format!(
+                    "resident Generation-0 gene `{}` feature index does not fit i32",
+                    gene.strategy_id
+                )
+            })?);
+            weights.push(weight);
+        }
+        let term_count = u32::try_from(gene.indices.len())
+            .context("resident Generation-0 term count does not fit u32")?;
+        offsets.push(
+            i32::try_from(indices.len())
+                .context("resident Generation-0 terminal offset does not fit i32")?,
+        );
+        descriptors.push(neoethos_gpu_contracts::device::GeneDescriptor {
+            candidate_id: u64::try_from(candidate_index)
+                .context("resident Generation-0 candidate index does not fit u64")?,
+            term_offset,
+            term_count,
+            long_threshold: gene.long_threshold,
+            short_threshold: gene.short_threshold,
+            stop_ticks: 0,
+            target_ticks: 0,
+            stop_vol_multiplier: gene.stop_vol_mult,
+            flags: 0,
+            reserved: 0,
+        });
+        stop_pips.push(gene.sl_pips);
+        target_pips.push(gene.tp_pips);
+        stop_vol_multipliers.push(gene.stop_vol_mult);
+        smc_flags.extend_from_slice(&[
+            gene.use_ob as i8,
+            gene.use_fvg as i8,
+            gene.use_liq_sweep as i8,
+            gene.mtf_confirmation as i8,
+            gene.use_premium_discount as i8,
+            gene.use_inducement as i8,
+            gene.use_bos as i8,
+            gene.use_choch as i8,
+            gene.use_eqh as i8,
+            gene.use_eql as i8,
+            gene.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+    ensure!(
+        smc_weights.iter().all(|weight| weight.is_finite())
+            && config.smc_gate_threshold.is_finite(),
+        "resident Generation-0 SMC settings are non-finite"
+    );
+    Ok(ResidentGenerationGeneBatchV1 {
+        descriptors,
+        offsets,
+        indices,
+        weights,
+        stop_pips,
+        target_pips,
+        stop_vol_multipliers,
+        smc_flags,
+        smc_weights,
+        gate_threshold: config.smc_gate_threshold,
+        smc_gate_disabled,
+    })
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn resident_generation_backtest_settings_v1(
+    config: &EvaluationConfig,
+    receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
+) -> Result<BacktestSettings> {
+    ensure!(
+        config.pip_value.to_bits() == receipt.adaptive_pip_size().to_bits()
+            && config.pip_value_per_lot.to_bits() == receipt.pip_value_per_lot().to_bits(),
+        "resident Generation-0 evaluation settings drifted from the financial sizing receipt"
+    );
+    Ok(BacktestSettings {
+        max_hold_bars: config.max_hold_bars,
+        trailing_enabled: config.trailing_enabled,
+        trailing_atr_multiplier: config.trailing_atr_multiplier,
+        trailing_be_trigger_r: config.trailing_be_trigger_r,
+        trailing_min_lock_pips: config.trailing_min_lock_pips,
+        pip_value: config.pip_value,
+        spread_pips: config.spread_pips,
+        commission_per_trade: config.commission_per_trade,
+        pip_value_per_lot: config.pip_value_per_lot,
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
+        adaptive_base_pips: None,
+        adaptive_rr: receipt.adaptive_rr(),
+        ..Default::default()
+    })
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn evaluate_resident_generation_zero_v3(
+    session: &mut neoethos_gpu_cuda::resident_feature_store_v3::ResidentPopulationSessionV3,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
+    sizing_policy: &ExactSearchSizingPolicyV1,
+    runtime_snapshot: &ResidentGenerationZeroRuntimeSnapshotV1,
+) -> Result<(Vec<[f64; 11]>, ResidentGenerationZeroEvaluationEvidenceV1)> {
+    const RESIDENT_METRIC_ROW_BYTES_V1: u64 = 104;
+    let limits = session
+        .data_population_limits()
+        .context("resident Generation-0 session lacks Data+population limits")?;
+    receipt
+        .validate_against_execution_limits_v2(
+            session.device_identity().ordinal(),
+            session.pre_materialization_free_bytes_snapshot(),
+            session.rows(),
+            session.columns(),
+            limits,
+        )
+        .map_err(anyhow::Error::new)
+        .context("validate Generation-0 sizing receipt against the exact resident session")?;
+    ensure!(
+        genes.len() == receipt.resolved_population(),
+        "resident Generation-0 gene count {} differs from resolved population {}",
+        genes.len(),
+        receipt.resolved_population()
+    );
+
+    let batch = pack_resident_generation_genes_v1(
+        genes,
+        session.columns(),
+        config,
+        sizing_policy,
+        runtime_snapshot.smc_gate_disabled(),
+    )?;
+    let settings = resident_generation_backtest_settings_v1(config, receipt)?;
+    let native_settings =
+        crate::gpu_native::prototype_population_oracle::population_settings_for_settings(&settings)
+            .map_err(anyhow::Error::new)
+            .context("build exact resident Generation-0 native settings")?;
+    ensure!(
+        usize::try_from(native_settings.month_capacity).ok() == Some(receipt.month_capacity()),
+        "resident Generation-0 native month capacity drifted from the workspace receipt"
+    );
+
+    let adaptive_token_identity_sha256 = if let Some((view, request)) = receipt
+        .resident_adaptive_view_and_request_v2()
+        .map_err(anyhow::Error::new)?
+    {
+        let validation_request = request;
+        let facts = session
+                .bind_evaluation_view_with_resident_adaptive_base_checked_v1(
+                    view,
+                    request,
+                    |current_token| {
+                        receipt
+                            .validate_resident_adaptive_view_token_v2(
+                                &validation_request,
+                                current_token,
+                            )
+                            .map_err(|error| {
+                                neoethos_gpu_cuda::resident_feature_store_v3::ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                                    format!("resident Generation-0 adaptive receipt rejected the current session token: {error}"),
+                                )
+                            })
+                    },
+                )
+                .map_err(anyhow::Error::new)
+                .context("bind and validate the exact resident adaptive Stage1 view")?;
+        Some(facts.token_identity_sha256())
+    } else {
+        let view = if receipt.stage1_row_start() == 0 && receipt.stage1_row_end() == session.rows()
+        {
+            neoethos_gpu_cuda::PopulationEvaluationViewV1::full(
+                session.rows(),
+                neoethos_gpu_cuda::PopulationTimestampModeV1::Canonical,
+                None,
+            )
+        } else {
+            neoethos_gpu_cuda::PopulationEvaluationViewV1::contiguous_range(
+                session.rows(),
+                receipt.stage1_row_start(),
+                receipt.stage1_row_end(),
+                neoethos_gpu_cuda::PopulationTimestampModeV1::Canonical,
+                None,
+            )
+        }
+        .map_err(anyhow::Error::new)
+        .context("build fixed-pip resident Stage1 view")?;
+        session
+            .bind_evaluation_view_v1(view)
+            .map_err(anyhow::Error::new)
+            .context("bind fixed-pip resident Stage1 view")?;
+        None
+    };
+
+    // The gene store is the unsplittable unit and is uploaded once. Scenario
+    // chunks alone are resized below, preserving the global candidate IDs and
+    // original metric order.
+    session
+        .upload_genes(batch.view())
+        .map_err(anyhow::Error::new)
+        .context("upload exact resident Generation-0 gene store")?;
+    let view_rows = receipt
+        .stage1_row_end()
+        .checked_sub(receipt.stage1_row_start())
+        .context("resident Generation-0 Stage1 range underflow")?;
+    u32::try_from(view_rows).context("resident Generation-0 Stage1 rows exceed scenario ABI")?;
+    let mut scenarios = Vec::new();
+    try_reserve_exact_v1(
+        &mut scenarios,
+        genes.len(),
+        "reserve resident Generation-0 base scenarios",
+    )?;
+    for candidate in 0..genes.len() {
+        let candidate = u64::try_from(candidate)
+            .context("resident Generation-0 candidate ID does not fit u64")?;
+        scenarios.push(crate::gpu_native::scenario::base_scenario(
+            candidate, candidate, view_rows,
+        ));
+    }
+    let chunk_cap = receipt.max_concurrent_scenario_count();
+    ensure!(
+        chunk_cap > 0,
+        "resident Generation-0 receipt has zero scenario capacity"
+    );
+    let mut metrics = Vec::new();
+    let mut metric_receipt_identities = Vec::new();
+    try_reserve_exact_v1(
+        &mut metrics,
+        genes.len(),
+        "reserve resident Generation-0 metrics",
+    )?;
+    let launch_count = scenarios.len().div_ceil(chunk_cap);
+    try_reserve_exact_v1(
+        &mut metric_receipt_identities,
+        launch_count,
+        "reserve resident Generation-0 metric receipts",
+    )?;
+    for chunk in scenarios.chunks(chunk_cap) {
+        session
+            .upload_scenarios(chunk)
+            .map_err(anyhow::Error::new)
+            .context("upload resident Generation-0 scenario chunk")?;
+        let host_metrics = session
+            .enqueue_metrics_only_v1(&native_settings)
+            .map_err(anyhow::Error::new)
+            .context("enqueue resident Generation-0 metrics-only kernel")?
+            .consume_host_metrics_v1()
+            .map_err(anyhow::Error::new)
+            .context("consume resident Generation-0 bounded metric rows")?;
+        ensure!(
+            host_metrics.metric_rows().len() == chunk.len(),
+            "resident Generation-0 returned {} rows for {} scenarios",
+            host_metrics.metric_rows().len(),
+            chunk.len()
+        );
+        for (scenario, row) in chunk.iter().zip(host_metrics.metric_rows()) {
+            ensure!(
+                row.candidate_id == scenario.base_candidate_id
+                    && row.scenario_id == scenario.scenario_id,
+                "resident Generation-0 metric order/identity drifted"
+            );
+            metrics.push(row.values);
+        }
+        metric_receipt_identities.push(host_metrics.receipt_identity_sha256());
+    }
+    ensure!(
+        metrics.len() == genes.len(),
+        "resident Generation-0 produced {} metrics for {} genes",
+        metrics.len(),
+        genes.len()
+    );
+    let residency_counters = session
+        .read_residency_counters_v1()
+        .map_err(anyhow::Error::new)
+        .context("read resident Generation-0 residency counters")?;
+    let launch_count = u64::try_from(launch_count)
+        .context("resident Generation-0 launch count does not fit u64")?;
+    let population_rows =
+        u64::try_from(genes.len()).context("resident Generation-0 population does not fit u64")?;
+    let expected_metric_bytes = population_rows
+        .checked_mul(RESIDENT_METRIC_ROW_BYTES_V1)
+        .context("resident Generation-0 metric readback byte count overflow")?;
+    ensure!(
+        residency_counters.parent_upload_count() == 0
+            && residency_counters.parent_upload_bytes() == 0
+            && residency_counters.stream_creation_count() == 0,
+        "resident Generation-0 re-uploaded its immutable Data parent or created a second stream"
+    );
+    ensure!(
+        residency_counters.view_binding_count() == 1
+            && residency_counters.full_binding_count() + residency_counters.range_binding_count()
+                == 1
+            && residency_counters.ordered_binding_count() == 0
+            && residency_counters.ordered_index_upload_bytes() == 0,
+        "resident Generation-0 did not bind exactly one full/contiguous Stage1 view"
+    );
+    ensure!(
+        residency_counters.metric_rows_readback_count() == launch_count
+            && residency_counters.explicit_synchronization_count() == launch_count
+            && residency_counters.metric_rows_readback_rows() == population_rows
+            && residency_counters.metric_rows_readback_bytes() == expected_metric_bytes
+            && residency_counters.diagnostic_readback_count() == 0
+            && residency_counters.diagnostic_readback_rows() == 0
+            && residency_counters.diagnostic_readback_bytes() == 0
+            && residency_counters.accepted_trade_total_readback_count() == 0
+            && residency_counters.accepted_trade_total_readback_bytes() == 0,
+        "resident Generation-0 terminal readback counters drifted from the bounded metrics-only plan"
+    );
+    if receipt.adaptive_base_effective_for_stage1() {
+        ensure!(
+            residency_counters.adaptive_upload_bytes() == 0,
+            "resident Generation-0 adaptive base crossed H2D"
+        );
+    }
+    Ok((
+        metrics,
+        ResidentGenerationZeroEvaluationEvidenceV1 {
+            metrics_receipt_identities_sha256: metric_receipt_identities,
+            adaptive_token_identity_sha256,
+            residency_counters,
+        },
+    ))
+}
+
+/// Run the real host evolution/selection Generation-0 construction while the
+/// evaluator is the already-admitted resident CUDA V3 session. This function
+/// is intentionally fixed to `generations = 0`: its caller returns a typed
+/// milestone and cannot enter Discovery's funnel/finalize path.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn evolve_resident_generation_zero_v3<F>(
+    session: &mut neoethos_gpu_cuda::resident_feature_store_v3::ResidentPopulationSessionV3,
+    feature_names: &[String],
+    receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
+    runtime_snapshot: &ResidentGenerationZeroRuntimeSnapshotV1,
+    evaluation_config: EvaluationConfig,
+    progress_fn: F,
+) -> Result<(SearchResult, ResidentGenerationZeroEvaluationEvidenceV1)>
+where
+    F: FnMut(usize, usize, f64, usize, usize),
+{
+    runtime_snapshot.validate_current("before resident Generation-0")?;
+    runtime_snapshot.validate_against_receipt_v2(receipt)?;
+    let sizing_policy = ExactSearchSizingPolicyV1::from_resident_population_receipt_v2(receipt)?;
+    let mut launch_evidence = None;
+    let result = evolve_search_with_generation_evaluator_v1(
+        feature_names,
+        receipt.resolved_population(),
+        0,
+        receipt.requested_max_indicators(),
+        None,
+        Some(evaluation_config),
+        &sizing_policy,
+        |genes, config| {
+            ensure!(
+                launch_evidence.is_none(),
+                "resident Generation-0 evaluator was invoked more than once"
+            );
+            let (metrics, evidence) = evaluate_resident_generation_zero_v3(
+                session,
+                genes,
+                config,
+                receipt,
+                &sizing_policy,
+                runtime_snapshot,
+            )?;
+            launch_evidence = Some(evidence);
+            Ok(metrics)
+        },
+        progress_fn,
+    )?;
+    let evidence = launch_evidence.context("resident Generation-0 never reached CUDA")?;
+    ensure!(
+        result.genes.len() == receipt.resolved_population()
+            && result.metrics.len() == receipt.resolved_population(),
+        "resident Generation-0 result cardinality drifted from resolved population"
+    );
+    runtime_snapshot.validate_current("after resident Generation-0")?;
+    Ok((result, evidence))
+}
+
 /// AREA 2 / Stage A (2026-06-09) — GPU-routed **validation** population eval.
 ///
 /// Mirrors [`evaluate_genes`] (same CSR/SMC array packing via the SHARED
@@ -665,7 +1379,7 @@ pub(crate) fn evaluate_genes_cached(
 /// the GA), but with two deliberate differences so it reproduces the post-search
 /// validation screens (Monte-Carlo / re-eval) bit-for-bit:
 ///
-/// 1. It routes through `crate::eval::validation_backtest_population` (whole
+/// 1. It routes through [`crate::eval::validation_backtest_population`] (whole
 ///    population → ONE GPU launch, CPU fallback) instead of the GA's CPU+GPU
 ///    *split* [`crate::eval::evaluate_population_core`].
 /// 2. The caller supplies the **exact** [`BacktestSettings`] template the serial
@@ -1046,7 +1760,7 @@ pub fn validation_genes_population(
 ///     avoids this by gathering the *full-series* precomputed signals/confidence;
 ///     this helper mirrors it by computing the full-series SMC arrays ONCE and
 ///     GATHERING them at `absolute_idx`. Signal synthesis is fully pointwise
-///     (`combined[i]` = weighted sum of `indicator[i]`; the gate reads only
+///     (`combined[i]` = weighted sum of indicator[i]; the gate reads only
 ///     `smc_row[i]`), so the on-device synth at gathered position `k` reads the
 ///     SAME indicator+SMC values the full-series synth read at `absolute_idx[k]`
 ///     → identical signals/confidence → identical fold metrics.
@@ -1456,7 +2170,7 @@ impl WalkforwardPopulationGenePack {
 /// calls this once per qualifying split. It slices the FULL-SERIES indicators +
 /// SMC + OHLCV + calendar arrays contiguously at `[a, b)` (NO gather — the WF
 /// test slice is contiguous by construction) and runs ONE GPU population launch
-/// over all genes in `pack` via `crate::eval::validation_backtest_population`
+/// over all genes in `pack` via [`crate::eval::validation_backtest_population`]
 /// (GPU-try → CPU fallback, fail-loud).
 ///
 /// ## Parity with the single-gene walk-forward
@@ -2046,6 +2760,10 @@ pub fn evolve_search_with_progress_and_limits<F>(
 where
     F: FnMut(usize, usize, f64, usize, usize),
 {
+    let sizing_policy = ExactSearchSizingPolicyV1::new(
+        super::migration::migration_enabled(),
+        features.n_features().max(1),
+    )?;
     evolve_search_with_progress_impl(
         features,
         ohlcv,
@@ -2055,6 +2773,7 @@ where
         max_runtime,
         eval_config,
         None,
+        &sizing_policy,
         progress_fn,
     )
 }
@@ -2071,6 +2790,10 @@ pub fn evolve_search_with_progress<F>(
 where
     F: FnMut(usize, usize, f64, usize, usize),
 {
+    let sizing_policy = ExactSearchSizingPolicyV1::new(
+        super::migration::migration_enabled(),
+        features.n_features().max(1),
+    )?;
     evolve_search_with_progress_impl(
         features,
         ohlcv,
@@ -2080,6 +2803,7 @@ where
         None,
         eval_config,
         None,
+        &sizing_policy,
         progress_fn,
     )
 }
@@ -2095,11 +2819,21 @@ pub(crate) fn evolve_search_with_progress_and_limits_exact<F>(
     eval_config: Option<EvaluationConfig>,
     exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
     exact_view: crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
+    search_authority: &crate::run_identity::PopulationAutoSearchAuthorityV1,
     progress_fn: F,
 ) -> Result<SearchResult>
 where
     F: FnMut(usize, usize, f64, usize, usize),
 {
+    search_authority.validate()?;
+    anyhow::ensure!(
+        population
+            == search_authority
+                .population_auto_sizing_receipt()
+                .resolved_population(),
+        "exact search population is detached from its sizing authority"
+    );
+    let sizing_policy = ExactSearchSizingPolicyV1::from_search_authority_v1(search_authority)?;
     evolve_search_with_progress_impl(
         features,
         ohlcv,
@@ -2109,6 +2843,7 @@ where
         max_runtime,
         eval_config,
         Some((exact_run, exact_view)),
+        &sizing_policy,
         progress_fn,
     )
 }
@@ -2126,15 +2861,64 @@ fn evolve_search_with_progress_impl<F>(
         &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
     )>,
-    mut progress_fn: F,
+    sizing_policy: &ExactSearchSizingPolicyV1,
+    progress_fn: F,
 ) -> Result<SearchResult>
 where
     F: FnMut(usize, usize, f64, usize, usize),
 {
+    // Host and resident execution share one evolution/selection loop. The
+    // host route builds its immutable bar cache once and supplies only the
+    // generation evaluator closure below; the resident V3 route supplies a
+    // purpose-bound session evaluator and never constructs this cache.
+    let eval_cache = EvalDataCache::build(features, ohlcv)?;
+    let mut evaluate_generation = |genes: &[Gene], config: &EvaluationConfig| {
+        evaluate_genes_cached(
+            features,
+            ohlcv,
+            genes,
+            config,
+            &eval_cache,
+            sizing_policy,
+            exact_execution,
+        )
+    };
+    evolve_search_with_generation_evaluator_v1(
+        &features.names,
+        population,
+        generations,
+        max_indicators,
+        max_runtime,
+        eval_config,
+        sizing_policy,
+        &mut evaluate_generation,
+        progress_fn,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evolve_search_with_generation_evaluator_v1<F, E>(
+    feature_names: &[String],
+    population: usize,
+    generations: usize,
+    max_indicators: usize,
+    max_runtime: Option<Duration>,
+    eval_config: Option<EvaluationConfig>,
+    sizing_policy: &ExactSearchSizingPolicyV1,
+    mut evaluate_generation: E,
+    mut progress_fn: F,
+) -> Result<SearchResult>
+where
+    F: FnMut(usize, usize, f64, usize, usize),
+    E: FnMut(&[Gene], &EvaluationConfig) -> Result<Vec<[f64; 11]>>,
+{
     if population == 0 {
         bail!("population must be > 0");
     }
-    let n_indicators = features.n_features();
+    if feature_names.is_empty() {
+        bail!("resident search feature schema must not be empty");
+    }
+    let n_indicators = feature_names.len();
     let smc_cfg = SmcSearchConfig::current();
 
     // All `NEOETHOS_BOT_*` search-engine knobs are resolved through the typed
@@ -2173,7 +2957,7 @@ where
     let mut genes: Vec<Gene> = if seed_count > 0 {
         let seeds = super::seed_templates::seed_professional_templates(
             seed_count,
-            &features.names,
+            feature_names,
             n_indicators,
             &mut rng,
         );
@@ -2187,7 +2971,7 @@ where
             tracing::warn!(
                 target: "neoethos_search::search_engine",
                 seed_count,
-                feature_count = features.names.len(),
+                feature_count = feature_names.len(),
                 n_indicators,
                 "GA Fix C seed templates returned 0 genes — check that the upstream feature pipeline exposes the expected multi-TF prefixes (e.g. D1_, H4_, H1_, M15_, M5_); falling back to pure-random cold start"
             );
@@ -2300,9 +3084,6 @@ where
     // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
     let novelty_weight = genetic_runtime_overrides.novelty_weight;
 
-    // Perf #3: build stable eval data cache ONCE before the generation loop
-    let eval_cache = EvalDataCache::build(features, ohlcv)?;
-
     let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
@@ -2318,14 +3099,7 @@ where
     let mut warned_gate_floor = false;
 
     if generations == 0 {
-        let metrics = evaluate_genes_cached(
-            features,
-            ohlcv,
-            &genes,
-            &eval_cfg,
-            &eval_cache,
-            exact_execution,
-        )?;
+        let metrics = evaluate_generation(&genes, &eval_cfg)?;
         apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
         seen_memory.flush();
         return Ok(SearchResult {
@@ -2379,14 +3153,7 @@ where
         }
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
-        let metrics = evaluate_genes_cached(
-            features,
-            ohlcv,
-            &genes,
-            &eval_cfg,
-            &eval_cache,
-            exact_execution,
-        )?;
+        let metrics = evaluate_generation(&genes, &eval_cfg)?;
         apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
 
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
@@ -2473,7 +3240,8 @@ where
         // sidecar enabled it). Every INTERVAL generations, publish this
         // island's top elites for the mesh to gossip to peer nodes. `scored`
         // is sorted best-first, so the head is the elite set.
-        if super::migration::migration_enabled() && generation % super::migration::INTERVAL == 0 {
+        if sizing_policy.migration_enabled_for_run() && generation % super::migration::INTERVAL == 0
+        {
             let elites: Vec<Gene> = scored
                 .iter()
                 .take(super::migration::ELITES)
@@ -2530,7 +3298,7 @@ where
             // mutated copies that produce the SAME signal collapse to one
             // archive entry regardless of their randomly-assigned strategy_id.
             let mut canonical = gene.clone();
-            canonical.normalize(features.n_features(), 1);
+            canonical.normalize(n_indicators, 1);
             let hash = gene_signature_hash(&canonical);
             if !seen_gene_hashes.insert(hash) {
                 rejected_duplicate += 1;
@@ -2811,8 +3579,9 @@ where
         // generation. They compete on THIS node's data in the upcoming
         // evaluation (re-scored from scratch), so a bad/hostile migrant simply
         // fails selection — no cross-node trust needed.
-        if super::migration::migration_enabled() {
+        if sizing_policy.migration_enabled_for_run() {
             let migrants = super::migration::take_incoming();
+            sizing_policy.validate_gene_batch_v1(&migrants, "incoming migrants")?;
             let room = population.saturating_sub(next.len());
             for gene in migrants
                 .into_iter()
@@ -2844,7 +3613,7 @@ where
             // feature set can't resolve enough template roles.
             let seeds = super::seed_templates::seed_professional_templates(
                 rescue_target,
-                &features.names,
+                feature_names,
                 n_indicators,
                 &mut rng,
             );
@@ -3546,5 +4315,145 @@ mod adaptive_stop_parity_tests {
                 "expected a clean 100x from the pip error, got {r}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_search_sizing_policy_tests {
+    use super::*;
+
+    #[test]
+    fn generation_zero_accepts_a_resident_evaluator_without_host_frames() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 1).expect("one-term exact policy");
+        let feature_names = vec!["resident_feature_0".to_owned()];
+        let mut evaluation_calls = 0usize;
+        let result = evolve_search_with_generation_evaluator_v1(
+            &feature_names,
+            4,
+            0,
+            1,
+            None,
+            Some(EvaluationConfig::default()),
+            &policy,
+            |genes, _config| {
+                evaluation_calls += 1;
+                let mut row = [0.0; 11];
+                row[0] = 10.0;
+                row[1] = 1.0;
+                row[5] = 1.5;
+                row[8] = 1.0;
+                Ok(vec![row; genes.len()])
+            },
+            |_generation, _generations, _best, _stagnant, _archive| {},
+        )
+        .expect("resident generation-zero evaluator");
+
+        assert_eq!(evaluation_calls, 1);
+        assert_eq!(result.genes.len(), 4);
+        assert_eq!(result.metrics.len(), 4);
+    }
+
+    #[test]
+    fn hostile_migrant_is_rejected_before_any_exact_gene_upload() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 5).expect("five-term exact policy");
+        let hostile = Gene {
+            indices: vec![0, 1, 2, 3, 4, 5],
+            weights: vec![1.0; 6],
+            strategy_id: "hostile-migrant".to_owned(),
+            ..Gene::default()
+        };
+        let error = policy
+            .validate_gene_batch_v1(std::slice::from_ref(&hostile), "incoming migrants")
+            .expect_err("six terms exceed the sealed five-term cap");
+        assert!(error.to_string().contains("hostile-migrant"));
+        assert!(error.to_string().contains("term cap 5"));
+    }
+
+    #[test]
+    fn run_scoped_migration_authority_does_not_requery_the_atomic_flag() {
+        let disabled = ExactSearchSizingPolicyV1::new(false, 5).expect("disabled migration");
+        let enabled = ExactSearchSizingPolicyV1::new(true, 5).expect("enabled migration");
+        assert!(!disabled.migration_enabled_for_run());
+        assert!(enabled.migration_enabled_for_run());
+
+        let source = include_str!("search_engine.rs");
+        let implementation = source
+            .split_once("fn evolve_search_with_progress_impl")
+            .expect("evolution implementation exists")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("production implementation ends before unit tests")
+            .0;
+        assert!(
+            !implementation.contains("migration::migration_enabled()"),
+            "the generation loop must consume the immutable run policy, not requery the AtomicBool"
+        );
+    }
+
+    #[test]
+    fn exact_upload_validation_rejects_mismatched_or_overflowing_term_extents() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 2).expect("two-term exact policy");
+        let mismatched = Gene {
+            indices: vec![0, 1],
+            weights: vec![1.0],
+            strategy_id: "mismatched".to_owned(),
+            ..Gene::default()
+        };
+        assert!(
+            policy
+                .validate_gene_batch_v1(&[mismatched], "generation upload")
+                .is_err()
+        );
+
+        let oversized = Gene {
+            indices: vec![0, 1, 2],
+            weights: vec![1.0; 3],
+            strategy_id: "oversized".to_owned(),
+            ..Gene::default()
+        };
+        assert!(
+            policy
+                .validate_gene_batch_v1(&[oversized], "generation upload")
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    #[test]
+    fn resident_generation_pack_preserves_the_exact_eleven_smc_slots() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 2).expect("two-term exact policy");
+        let gene = Gene {
+            indices: vec![0, 1],
+            weights: vec![0.25, -0.5],
+            long_threshold: 0.5,
+            short_threshold: -0.5,
+            strategy_id: "resident-smc-pack".to_owned(),
+            use_ob: true,
+            use_fvg: false,
+            use_liq_sweep: true,
+            mtf_confirmation: false,
+            use_premium_discount: true,
+            use_inducement: false,
+            use_bos: true,
+            use_choch: false,
+            use_eqh: true,
+            use_eql: false,
+            use_displacement: true,
+            sl_pips: 10.0,
+            tp_pips: 20.0,
+            stop_vol_mult: 1.0,
+            ..Gene::default()
+        };
+        let config = EvaluationConfig::default();
+        let packed = pack_resident_generation_genes_v1(&[gene], 2, &config, &policy, false)
+            .expect("pack one exact resident gene");
+
+        assert_eq!(packed.offsets, vec![0, 2]);
+        assert_eq!(packed.indices, vec![0, 1]);
+        assert_eq!(packed.smc_flags, vec![1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(packed.descriptors.len(), 1);
+        assert_eq!(packed.descriptors[0].candidate_id, 0);
+        assert_eq!(packed.descriptors[0].term_offset, 0);
+        assert_eq!(packed.descriptors[0].term_count, 2);
     }
 }

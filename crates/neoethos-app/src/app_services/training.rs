@@ -8,11 +8,16 @@ use crate::app_services::{
 use anyhow::{Context, Result};
 use neoethos_core::{
     Settings,
+    execution_budget::CpuLease,
     logging::{canonical_log_path, write_subsystem_record},
     sectioned_log::{SectionedRunRecord, SubsystemSection},
 };
-use neoethos_models::{ModelTrainingProgress, TrainingOrchestrator, TrainingRunSummary};
-use std::path::PathBuf;
+use neoethos_models::{
+    ModelTrainingProgress, PromotionCandidateTrainingHandoffV1,
+    PromotionCandidateTrainingTerminalV1, TrainingOrchestrator, TrainingRunSummary,
+    train_and_deploy_promotion_candidate_v1,
+};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -41,6 +46,29 @@ impl TrainingRequest {
         }
         Ok(())
     }
+}
+
+/// Run exact promotion-candidate training without entering the legacy
+/// ambient/current dataset path or translating a typed refusal into Degraded.
+pub fn run_promotion_candidate_training_v1<R>(
+    settings: &Settings,
+    handoff: PromotionCandidateTrainingHandoffV1,
+    candidate_root: &Path,
+    data_root: &Path,
+    lease: &CpuLease,
+    progress_fn: R,
+) -> PromotionCandidateTrainingTerminalV1
+where
+    R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+{
+    train_and_deploy_promotion_candidate_v1(
+        settings,
+        handoff,
+        candidate_root,
+        data_root,
+        lease,
+        progress_fn,
+    )
 }
 
 #[derive(Debug, Clone)]

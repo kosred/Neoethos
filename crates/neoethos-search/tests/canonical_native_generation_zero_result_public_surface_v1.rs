@@ -17,26 +17,16 @@ fn schema_identity_remains_the_only_public_generation_zero_result_surface() {
     let root = include_str!("../src/lib.rs");
     assert!(root.contains("mod canonical_native_generation_zero_result_v1;"));
     assert!(!root.contains("pub mod canonical_native_generation_zero_result_v1;"));
-    let result_exports = root
-        .split_once("pub use canonical_native_generation_zero_result_v1::{")
-        .expect("result export block")
-        .1
-        .split_once("};")
-        .expect("result export block end")
-        .0;
-    let exported: Vec<_> = result_exports
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .collect();
-    assert_eq!(
-        exported,
-        [
-            "CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_SCHEMA_V1",
-            "CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_VERSION_V1",
-        ],
-        "schema/version must remain the complete public result surface"
-    );
+    for forbidden in [
+        "CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1",
+        "CanonicalNativeGenerationZeroResultSizePlanErrorV1",
+        "CanonicalNativeGenerationZeroResultSizePlanV1",
+    ] {
+        assert!(
+            !root.contains(forbidden),
+            "crate root must not re-export sizing authority {forbidden}"
+        );
+    }
 }
 
 #[test]

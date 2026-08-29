@@ -21,6 +21,7 @@ use crate::base::{
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
+    requested_runtime_device_policy,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
@@ -29,6 +30,13 @@ use crate::statistical::common::{
 };
 #[cfg(feature = "adaptive-models")]
 use tracing::warn;
+
+#[cfg(feature = "statistical-gpu")]
+use super::adaptive_gpu::{
+    try_fit_passive_aggressive_cuda_full_pipeline,
+    try_predict_passive_aggressive_cuda_full_pipeline,
+    validate_passive_aggressive_cuda_device_identity,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum AdaptiveModelKind {
@@ -362,6 +370,242 @@ fn validate_passive_aggressive_artifact(artifact: &PassiveAggressiveArtifact) ->
     if artifact.epochs == 0 {
         bail!("online_pa epochs must stay positive");
     }
+    match artifact.training_semantics_schema.as_str() {
+        ONLINE_PA_LEGACY_TRAINING_SEMANTICS_V1 => {
+            if artifact.training_backend != "online_pa_cpu_legacy_v1"
+                || artifact.effective_device_policy != "cpu"
+                || artifact.class_slack_weight_policy
+                    != ONLINE_PA_LEGACY_CLASS_SLACK_WEIGHT_POLICY_V1
+                || artifact.class_slack_weights.is_some()
+                || artifact.cuda_training_evidence.is_some()
+            {
+                bail!(
+                    "online_pa legacy-v1 artifact must bind its implicit loss-multiplier policy, CPU training, and no CUDA evidence"
+                );
+            }
+        }
+        ONLINE_PA_CUDA_TRAINING_SEMANTICS_V2 => {
+            let ordinal =
+                match crate::common::parse_cuda_device_policy(&artifact.effective_device_policy)? {
+                    crate::common::CudaDevicePolicy::Gpu { ordinal } => ordinal,
+                    _ => bail!("online_pa CUDA-v2 artifact must bind an explicit GPU ordinal"),
+                };
+            if artifact.class_slack_weight_policy != ONLINE_PA_CUDA_CLASS_SLACK_WEIGHT_POLICY_V1 {
+                bail!(
+                    "online_pa CUDA-v2 class-slack weight policy mismatch: expected {}, got {}",
+                    ONLINE_PA_CUDA_CLASS_SLACK_WEIGHT_POLICY_V1,
+                    artifact.class_slack_weight_policy
+                );
+            }
+            let class_slack_weights = artifact
+                .class_slack_weights
+                .context("online_pa CUDA-v2 artifact is missing class-slack weights")?;
+            if class_slack_weights
+                .iter()
+                .any(|weight| !weight.is_finite() || !(0.5..=4.0).contains(weight))
+            {
+                bail!(
+                    "online_pa CUDA-v2 class-slack weights must be finite within the bound policy [0.5, 4.0]"
+                );
+            }
+            let evidence = artifact
+                .cuda_training_evidence
+                .as_ref()
+                .context("online_pa CUDA-v2 artifact is missing CUDA evidence")?;
+            let rows = u64::try_from(artifact.dataset_rows)
+                .context("online_pa dataset rows exceed evidence width")?;
+            let cols = u64::try_from(expected_features)
+                .context("online_pa feature count exceeds evidence width")?;
+            let epochs =
+                u64::try_from(artifact.epochs).context("online_pa epochs exceed evidence width")?;
+            let feature_bytes = rows
+                .checked_mul(cols)
+                .and_then(|value| value.checked_mul(8))
+                .context("online_pa CUDA-v2 feature byte evidence overflow")?;
+            let label_bytes = rows
+                .checked_mul(4)
+                .context("online_pa CUDA-v2 label byte evidence overflow")?;
+            let weight_bytes = cols
+                .checked_mul(3)
+                .and_then(|value| value.checked_mul(8))
+                .context("online_pa CUDA-v2 weight byte evidence overflow")?;
+            let bias_bytes = 3_u64 * 8;
+            let class_weight_bytes = 3_u64 * 8;
+            let arithmetic_status_bytes = 4_u64;
+            let legacy_training_only_h2d = feature_bytes
+                .checked_add(label_bytes)
+                .and_then(|value| value.checked_add(class_weight_bytes))
+                .and_then(|value| value.checked_add(weight_bytes))
+                .and_then(|value| value.checked_add(bias_bytes))
+                .and_then(|value| value.checked_add(arithmetic_status_bytes))
+                .context("online_pa CUDA-v2 H2D evidence overflow")?;
+            let training_d2h = weight_bytes
+                .checked_add(bias_bytes)
+                .and_then(|value| value.checked_add(arithmetic_status_bytes))
+                .context("online_pa CUDA-v2 D2H evidence overflow")?;
+            let expected_visits = rows
+                .checked_mul(epochs)
+                .context("online_pa CUDA-v2 visit evidence overflow")?;
+            let expected_training_chunks_per_epoch =
+                rows.div_ceil(ONLINE_PA_CUDA_TRAINING_ROWS_PER_LAUNCH_V3);
+            let expected_training_launches = expected_training_chunks_per_epoch
+                .checked_mul(epochs)
+                .context("online_pa CUDA-v3 training launch evidence overflow")?;
+            let expected_whole_fit_launches = expected_training_launches
+                .checked_add(9)
+                .context("online_pa CUDA-v3 whole-fit launch evidence overflow")?;
+            if evidence.ordered_sample_visits != expected_visits {
+                bail!("online_pa CUDA-v2 training evidence does not match artifact dimensions");
+            }
+
+            match evidence.full_pipeline.as_ref() {
+                None => {
+                    let expected_backend = format!("online_pa_cuda[cuda:{ordinal}]");
+                    let launch_count_matches_schema = match evidence.evidence_scope_schema.as_str()
+                    {
+                        // Read-only compatibility for pre-r3 training-only
+                        // artifacts. No production path can infer from these.
+                        "neoethos.online_pa.cuda_evidence.training_stage.v1" => {
+                            evidence.kernel_launch_count == 1
+                        }
+                        "neoethos.online_pa.cuda_evidence.training_stage.v2" => {
+                            evidence.kernel_launch_count == expected_training_launches
+                        }
+                        _ => false,
+                    };
+                    if artifact.training_backend != expected_backend
+                        || !launch_count_matches_schema
+                        || evidence.host_to_device_bytes != legacy_training_only_h2d
+                        || evidence.device_to_host_bytes != training_d2h
+                    {
+                        bail!(
+                            "online_pa CUDA-v2 training-only evidence/backend mismatch; expected {expected_backend}"
+                        );
+                    }
+                }
+                Some(full_pipeline) => {
+                    let expected_backend = format!("online_pa_cuda_full_pipeline[cuda:{ordinal}]");
+                    let expected_inference_backend =
+                        format!("online_pa_cuda_fused_inference[cuda:{ordinal}]");
+                    let expected_effective = format!("gpu:{ordinal}");
+                    if artifact.training_backend != expected_backend
+                        || full_pipeline.training_backend != expected_backend
+                        || full_pipeline.bound_inference_backend != expected_inference_backend
+                        || full_pipeline.preprocessing_backend
+                            != ONLINE_PA_CUDA_PREPROCESSING_BACKEND_V2
+                        || full_pipeline.execution_pipeline_schema
+                            != ONLINE_PA_CUDA_FULL_PIPELINE_SCHEMA_V3
+                        || full_pipeline.evidence_scope_schema
+                            != "neoethos.online_pa.cuda_pipeline_stages.v3"
+                        || full_pipeline.loss_cost_policy != "rho(y,r)=1; PA-I cap=C*w_y"
+                        || full_pipeline.residency_scope != "call_scoped"
+                        || full_pipeline.persistent_model_buffers
+                        || full_pipeline.effective_device_policy != expected_effective
+                        || full_pipeline.effective_device_policy != artifact.effective_device_policy
+                    {
+                        bail!(
+                            "online_pa full CUDA pipeline backend/schema/device provenance mismatch"
+                        );
+                    }
+                    match crate::common::parse_cuda_device_policy(
+                        &full_pipeline.requested_device_policy,
+                    )? {
+                        crate::common::CudaDevicePolicy::Auto => {}
+                        crate::common::CudaDevicePolicy::Gpu {
+                            ordinal: requested_ordinal,
+                        } if requested_ordinal == ordinal => {}
+                        _ => bail!(
+                            "online_pa full CUDA requested policy does not bind effective ordinal {ordinal}"
+                        ),
+                    }
+                    if full_pipeline.device_identity.ordinal
+                        != u32::try_from(ordinal).context("online_pa CUDA ordinal exceeds u32")?
+                        || full_pipeline.device_identity.name.trim().is_empty()
+                        || full_pipeline
+                            .device_identity
+                            .uuid
+                            .iter()
+                            .all(|byte| *byte == 0)
+                        || full_pipeline.device_identity.pci_domain < 0
+                        || full_pipeline.device_identity.pci_bus < 0
+                        || full_pipeline.device_identity.pci_device < 0
+                        || full_pipeline.device_identity.compute_capability_major <= 0
+                        || full_pipeline.device_identity.compute_capability_minor < 0
+                        || full_pipeline.device_identity.multiprocessor_count <= 0
+                        || full_pipeline.device_identity.total_memory_bytes == 0
+                    {
+                        bail!("online_pa full CUDA physical-device identity is incomplete");
+                    }
+                    let expected_rows = u32::try_from(artifact.dataset_rows)
+                        .context("online_pa full CUDA rows exceed device counter width")?;
+                    let received_rows = full_pipeline
+                        .class_counts
+                        .iter()
+                        .map(|count| u64::from(*count))
+                        .sum::<u64>();
+                    if full_pipeline.class_counts.iter().any(|count| *count == 0)
+                        || received_rows != u64::from(expected_rows)
+                    {
+                        bail!("online_pa full CUDA class-count receipt is inconsistent");
+                    }
+                    let expected_class_weights = full_pipeline.class_counts.map(|count| {
+                        (f64::from(expected_rows) / (3.0 * f64::from(count))).clamp(0.5, 4.0)
+                    });
+                    if expected_class_weights != class_slack_weights {
+                        bail!("online_pa full CUDA class weights do not match device class counts");
+                    }
+                    let scaler_bytes = cols
+                        .checked_mul(8)
+                        .context("online_pa full CUDA scaler byte evidence overflow")?;
+                    let class_count_bytes = 3_u64 * 4;
+                    let expected_artifact_d2h = arithmetic_status_bytes
+                        .checked_add(class_count_bytes)
+                        .and_then(|value| value.checked_add(class_weight_bytes))
+                        .and_then(|value| value.checked_add(scaler_bytes))
+                        .and_then(|value| value.checked_add(scaler_bytes))
+                        .and_then(|value| value.checked_add(weight_bytes))
+                        .and_then(|value| value.checked_add(bias_bytes))
+                        .context("online_pa full CUDA artifact D2H evidence overflow")?;
+                    let expected_whole_fit_h2d = feature_bytes
+                        .checked_add(label_bytes)
+                        .context("online_pa full CUDA whole-fit H2D evidence overflow")?;
+                    if evidence.evidence_scope_schema
+                        != "neoethos.online_pa.cuda_evidence.whole_fit_call.v3"
+                        || evidence.kernel_launch_count != expected_whole_fit_launches
+                        || evidence.host_to_device_bytes != expected_whole_fit_h2d
+                        || evidence.device_to_host_bytes != expected_artifact_d2h
+                        || full_pipeline.kernel_launch_count != expected_whole_fit_launches
+                        || full_pipeline.initialization_launch_count != 1
+                        || full_pipeline.label_map_launch_count != 1
+                        || full_pipeline.label_count_partial_launch_count != 1
+                        || full_pipeline.label_count_weight_finalize_launch_count != 1
+                        || full_pipeline.scaler_partial_launch_count != 1
+                        || full_pipeline.scaler_finalize_launch_count != 1
+                        || full_pipeline.scaler_transform_launch_count != 1
+                        || full_pipeline.transform_fault_partial_launch_count != 1
+                        || full_pipeline.preprocess_fault_finalize_launch_count != 1
+                        || full_pipeline.training_rows_per_launch
+                            != ONLINE_PA_CUDA_TRAINING_ROWS_PER_LAUNCH_V3
+                        || full_pipeline.training_row_chunk_count_per_epoch
+                            != expected_training_chunks_per_epoch
+                        || full_pipeline.training_epoch_count != epochs
+                        || full_pipeline.training_launch_count != expected_training_launches
+                        || full_pipeline.training_interchunk_device_to_host_bytes != 0
+                        || full_pipeline.raw_feature_h2d_bytes != feature_bytes
+                        || full_pipeline.original_label_h2d_bytes != label_bytes
+                        || full_pipeline.scaled_feature_h2d_bytes != 0
+                        || full_pipeline.remapped_label_h2d_bytes != 0
+                        || full_pipeline.class_slack_weight_h2d_bytes != 0
+                        || full_pipeline.parameter_initialization_h2d_bytes != 0
+                        || full_pipeline.artifact_d2h_bytes != expected_artifact_d2h
+                    {
+                        bail!("online_pa full CUDA pipeline launch/byte evidence is inconsistent");
+                    }
+                }
+            }
+        }
+        other => bail!("unsupported online_pa training semantics schema `{other}`"),
+    }
     Ok(())
 }
 
@@ -536,6 +780,29 @@ fn balanced_class_weights(labels: &[usize], classes: usize) -> Vec<f64> {
             (total / (classes.max(1) as f64 * count)).clamp(0.5, 4.0)
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(super) fn clamped_balanced_class_slack_weights_v1(labels: &[usize]) -> Result<[f64; 3]> {
+    let mut counts = [0_u32; 3];
+    for &label in labels {
+        let count = counts
+            .get_mut(label)
+            .with_context(|| format!("online_pa CUDA-v2 label {label} is outside 0..3"))?;
+        *count = count
+            .checked_add(1)
+            .context("online_pa CUDA-v2 class count overflow")?;
+    }
+    for (class, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            bail!(
+                "online_pa CUDA-v2 class-slack weights require all three classes; class {class} is absent"
+            );
+        }
+    }
+    let total =
+        u32::try_from(labels.len()).context("online_pa CUDA-v2 label count exceeds u32")? as f64;
+    Ok(counts.map(|count| (total / (3.0 * f64::from(count))).clamp(0.5, 4.0)))
 }
 
 fn array2_from_logits(rows: usize, cols: usize, logits: Vec<f64>) -> Result<Array2<f64>> {
@@ -731,6 +998,12 @@ pub struct OnlinePassiveAggressiveExpert {
     pub scaler: Option<FeatureScaler>,
     pub weights: Option<Array2<f64>>,
     pub bias: Option<Array1<f64>>,
+    class_slack_weight_policy: String,
+    class_slack_weights: Option<[f64; 3]>,
+    training_semantics_schema: String,
+    training_backend: String,
+    effective_device_policy: String,
+    cuda_training_evidence: Option<PassiveAggressiveCudaEvidenceV1>,
 }
 
 impl OnlinePassiveAggressiveExpert {
@@ -744,6 +1017,12 @@ impl OnlinePassiveAggressiveExpert {
             scaler: None,
             weights: None,
             bias: None,
+            class_slack_weight_policy: legacy_online_pa_class_slack_weight_policy(),
+            class_slack_weights: None,
+            training_semantics_schema: legacy_online_pa_training_semantics(),
+            training_backend: legacy_online_pa_training_backend(),
+            effective_device_policy: legacy_online_pa_effective_device_policy(),
+            cuda_training_evidence: None,
         }
     }
 
@@ -767,6 +1046,12 @@ impl OnlinePassiveAggressiveExpert {
             bias: self.bias.clone().context("missing PA bias")?,
             aggressiveness: self.aggressiveness,
             epochs: self.epochs,
+            class_slack_weight_policy: self.class_slack_weight_policy.clone(),
+            class_slack_weights: self.class_slack_weights,
+            training_semantics_schema: self.training_semantics_schema.clone(),
+            training_backend: self.training_backend.clone(),
+            effective_device_policy: self.effective_device_policy.clone(),
+            cuda_training_evidence: self.cuda_training_evidence.clone(),
         })
     }
 }
@@ -777,16 +1062,88 @@ impl Default for OnlinePassiveAggressiveExpert {
     }
 }
 
+fn resolved_online_pa_device_policy(requested: &str) -> Result<String> {
+    match crate::common::resolve_cuda_device_policy(
+        requested,
+        crate::tree_models::config::nvidia_gpu_count(),
+    )? {
+        crate::common::ResolvedCudaDevicePolicy::Cpu => Ok("cpu".to_string()),
+        crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } => {
+            #[cfg(feature = "statistical-gpu")]
+            {
+                Ok(format!("gpu:{ordinal}"))
+            }
+            #[cfg(not(feature = "statistical-gpu"))]
+            {
+                bail!(
+                    "online_pa resolved CUDA ordinal {ordinal} from policy `{requested}`, but this binary was built without `statistical-gpu`"
+                )
+            }
+        }
+    }
+}
+
 impl ExpertModel for OnlinePassiveAggressiveExpert {
     fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
-        lease.scope(|| {
-            let (features, feature_columns) = feature_matrix_from_frame(x)?;
-            let labels = remap_three_class_labels(y)?;
-            ensure_label_count("online_pa", features.nrows(), labels.len())?;
-            let scaler = FeatureScaler::fit(&features)?;
-            let features = scaler.transform(&features)?;
-            let sample_weights = balanced_class_weights(&labels, 3);
+        let requested_device_policy = requested_runtime_device_policy("online_pa");
+        let resolved_device_policy = resolved_online_pa_device_policy(&requested_device_policy)?;
+        // Host-side FeatureFrame conversion is unavoidable input decoding and
+        // row-major packing.  It performs no PA preprocessing or model math.
+        let (raw_features, feature_columns) = feature_matrix_from_frame(x)?;
+        ensure_label_count("online_pa", raw_features.nrows(), y.len())?;
 
+        #[cfg(feature = "statistical-gpu")]
+        if crate::common::cuda_kernel_enabled(&resolved_device_policy)? {
+            // ONLINE_PA_FULL_GPU_FIT_BEGIN
+            let fit = try_fit_passive_aggressive_cuda_full_pipeline(
+                &requested_device_policy,
+                &resolved_device_policy,
+                &raw_features,
+                y,
+                self.aggressiveness,
+                self.epochs,
+            )
+            .context("fit online_pa through the required full CUDA pipeline")?;
+            let pipeline_receipt = fit
+                .evidence
+                .full_pipeline
+                .as_ref()
+                .context("online_pa full CUDA fit omitted its pipeline receipt")?;
+            if pipeline_receipt.device_identity != fit.device_identity
+                || pipeline_receipt.class_counts != fit.class_counts
+            {
+                bail!("online_pa full CUDA fit returned inconsistent device/count provenance");
+            }
+            self.feature_columns = feature_columns;
+            self.dataset_rows = raw_features.nrows();
+            self.scaler = Some(FeatureScaler {
+                means: fit.scaler_means,
+                stds: fit.scaler_stds,
+            });
+            self.weights = Some(fit.weights);
+            self.bias = Some(fit.bias);
+            self.class_slack_weight_policy =
+                ONLINE_PA_CUDA_CLASS_SLACK_WEIGHT_POLICY_V1.to_string();
+            self.class_slack_weights = Some(fit.class_slack_weights);
+            self.training_semantics_schema = fit.training_semantics_schema;
+            self.training_backend = fit.runtime_backend;
+            self.effective_device_policy = fit.effective_device_policy;
+            self.cuda_training_evidence = Some(fit.evidence);
+            // ONLINE_PA_FULL_GPU_FIT_END
+            return Ok(());
+        }
+
+        if resolved_device_policy != "cpu" {
+            bail!(
+                "online_pa resolved device `{resolved_device_policy}` without an executable CUDA lane"
+            );
+        }
+
+        lease.scope(|| {
+            let labels = remap_three_class_labels(y)?;
+            let scaler = FeatureScaler::fit(&raw_features)?;
+            let features = scaler.transform(&raw_features)?;
+            let sample_weights = balanced_class_weights(&labels, 3);
             let n_rows = features.nrows();
             let n_cols = features.ncols();
             let mut weights = Array2::<f64>::zeros((3, n_cols));
@@ -853,6 +1210,12 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
             self.scaler = Some(scaler);
             self.weights = Some(weights);
             self.bias = Some(bias);
+            self.class_slack_weight_policy = legacy_online_pa_class_slack_weight_policy();
+            self.class_slack_weights = None;
+            self.training_semantics_schema = legacy_online_pa_training_semantics();
+            self.training_backend = legacy_online_pa_training_backend();
+            self.effective_device_policy = legacy_online_pa_effective_device_policy();
+            self.cuda_training_evidence = None;
             Ok(())
         })
     }
@@ -982,15 +1345,7 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
         }
 
         lease.scope(|| {
-            ensure_feature_columns_match(&self.feature_columns, x)?;
-            let weights = self
-                .weights
-                .as_ref()
-                .context("online_pa model not fitted")?;
-            let bias = self.bias.as_ref().context("online_pa model not fitted")?;
-            let scaler = self.scaler.as_ref().context("online_pa scaler missing")?;
-            let (features, _) = feature_matrix_from_frame(x)?;
-            let features = scaler.transform(&features)?;
+            let features = scaler.transform(&raw_features)?;
 
             let mut logits = Vec::with_capacity(features.nrows() * 3);
             for row in 0..features.nrows() {
@@ -1052,6 +1407,39 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
         if artifact.model_name != AdaptiveModelKind::PassiveAggressive.model_name() {
             bail!("expected online_pa artifact, got {}", artifact.model_name);
         }
+        if let Some(full_pipeline) = artifact
+            .cuda_training_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.full_pipeline.as_ref())
+        {
+            let current_requested = requested_runtime_device_policy("online_pa");
+            if current_requested != full_pipeline.requested_device_policy {
+                bail!(
+                    "online_pa full CUDA artifact requested-policy drift: recorded `{}`, current `{}`",
+                    full_pipeline.requested_device_policy,
+                    current_requested
+                );
+            }
+            let current_effective = resolved_online_pa_device_policy(&current_requested)?;
+            if current_effective != artifact.effective_device_policy
+                || current_effective != full_pipeline.effective_device_policy
+            {
+                bail!(
+                    "online_pa full CUDA artifact device drift: recorded {}, current {}",
+                    artifact.effective_device_policy,
+                    current_effective
+                );
+            }
+            #[cfg(feature = "statistical-gpu")]
+            validate_passive_aggressive_cuda_device_identity(
+                &current_effective,
+                &full_pipeline.device_identity,
+            )?;
+            #[cfg(not(feature = "statistical-gpu"))]
+            bail!(
+                "online_pa full CUDA artifact cannot load because this binary lacks `statistical-gpu`"
+            );
+        }
         let metadata = resolve_adaptive_runtime_metadata(
             path,
             AdaptiveModelKind::PassiveAggressive.model_name(),
@@ -1078,6 +1466,12 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
         next_state.scaler = Some(artifact.scaler);
         next_state.weights = Some(artifact.weights);
         next_state.bias = Some(artifact.bias);
+        next_state.class_slack_weight_policy = artifact.class_slack_weight_policy;
+        next_state.class_slack_weights = artifact.class_slack_weights;
+        next_state.training_semantics_schema = artifact.training_semantics_schema;
+        next_state.training_backend = artifact.training_backend;
+        next_state.effective_device_policy = artifact.effective_device_policy;
+        next_state.cuda_training_evidence = artifact.cuda_training_evidence;
         *self = next_state;
         Ok(())
     }
@@ -1085,37 +1479,42 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
 
 impl OnlinePassiveAggressiveExpert {
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
-        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("online_pa");
         let has_runtime_state =
             self.scaler.is_some() && self.weights.is_some() && self.bias.is_some();
         if self.dataset_rows == 0 {
             return (
                 Some("online_pa_unknown".to_string()),
-                append_runtime_degraded_reason(
-                    Some("adaptive_policy_unavailable".to_string()),
-                    gpu_cpu_fallback,
-                ),
+                Some("adaptive_policy_unavailable".to_string()),
             );
         }
         if self.feature_columns.is_empty() {
             return (
                 Some("online_pa_unknown".to_string()),
-                append_runtime_degraded_reason(
-                    Some("pa_feature_schema_missing".to_string()),
-                    gpu_cpu_fallback,
-                ),
+                Some("pa_feature_schema_missing".to_string()),
             );
         }
         if !has_runtime_state {
             return (
                 Some("online_pa_unknown".to_string()),
-                append_runtime_degraded_reason(
-                    Some("pa_runtime_state_incomplete".to_string()),
-                    gpu_cpu_fallback,
-                ),
+                Some("pa_runtime_state_incomplete".to_string()),
             );
         }
 
+        if let Some(full_pipeline) = self
+            .cuda_training_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.full_pipeline.as_ref())
+        {
+            return (Some(full_pipeline.bound_inference_backend.clone()), None);
+        }
+        if self.effective_device_policy != "cpu" {
+            return (
+                Some("online_pa_cuda_inference_unavailable".to_string()),
+                Some("pa_full_gpu_inference_receipt_missing".to_string()),
+            );
+        }
+
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("online_pa");
         (Some("online_pa_cpu".to_string()), gpu_cpu_fallback)
     }
 
@@ -2011,6 +2410,235 @@ mod tests {
         ))
     }
 
+    fn valid_cuda_v2_pa_artifact() -> PassiveAggressiveArtifact {
+        PassiveAggressiveArtifact {
+            model_name: AdaptiveModelKind::PassiveAggressive
+                .model_name()
+                .to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 9,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            weights: Array2::zeros((3, 2)),
+            bias: Array1::zeros(3),
+            aggressiveness: 1.0,
+            epochs: 4,
+            class_slack_weight_policy: ONLINE_PA_CUDA_CLASS_SLACK_WEIGHT_POLICY_V1.to_string(),
+            class_slack_weights: Some([1.0, 1.0, 1.0]),
+            training_semantics_schema: ONLINE_PA_CUDA_TRAINING_SEMANTICS_V2.to_string(),
+            training_backend: "online_pa_cuda[cuda:0]".to_string(),
+            effective_device_policy: "gpu:0".to_string(),
+            cuda_training_evidence: Some(PassiveAggressiveCudaEvidenceV1 {
+                evidence_scope_schema: "neoethos.online_pa.cuda_evidence.training_stage.v2"
+                    .to_string(),
+                kernel_launch_count: 4,
+                host_to_device_bytes: 280,
+                device_to_host_bytes: 76,
+                ordered_sample_visits: 36,
+                full_pipeline: None,
+            }),
+        }
+    }
+
+    fn valid_cuda_full_pipeline_pa_artifact() -> PassiveAggressiveArtifact {
+        let mut artifact = valid_cuda_v2_pa_artifact();
+        artifact.training_backend = "online_pa_cuda_full_pipeline[cuda:0]".to_string();
+        artifact.cuda_training_evidence = Some(PassiveAggressiveCudaEvidenceV1 {
+            evidence_scope_schema: "neoethos.online_pa.cuda_evidence.whole_fit_call.v3".to_string(),
+            kernel_launch_count: 13,
+            host_to_device_bytes: 180,
+            device_to_host_bytes: 144,
+            ordered_sample_visits: 36,
+            full_pipeline: Some(PassiveAggressiveCudaPipelineEvidenceV1 {
+                execution_pipeline_schema: ONLINE_PA_CUDA_FULL_PIPELINE_SCHEMA_V3.to_string(),
+                evidence_scope_schema: "neoethos.online_pa.cuda_pipeline_stages.v3".to_string(),
+                requested_device_policy: "gpu:0".to_string(),
+                effective_device_policy: "gpu:0".to_string(),
+                preprocessing_backend: ONLINE_PA_CUDA_PREPROCESSING_BACKEND_V2.to_string(),
+                training_backend: "online_pa_cuda_full_pipeline[cuda:0]".to_string(),
+                bound_inference_backend: "online_pa_cuda_fused_inference[cuda:0]".to_string(),
+                device_identity: PassiveAggressiveCudaDeviceIdentityV1 {
+                    ordinal: 0,
+                    uuid: [1; 16],
+                    pci_domain: 0,
+                    pci_bus: 1,
+                    pci_device: 0,
+                    compute_capability_major: 12,
+                    compute_capability_minor: 0,
+                    multiprocessor_count: 1,
+                    total_memory_bytes: 1,
+                    name: "test CUDA device".to_string(),
+                },
+                loss_cost_policy: "rho(y,r)=1; PA-I cap=C*w_y".to_string(),
+                residency_scope: "call_scoped".to_string(),
+                persistent_model_buffers: false,
+                class_counts: [3, 3, 3],
+                kernel_launch_count: 13,
+                initialization_launch_count: 1,
+                label_map_launch_count: 1,
+                label_count_partial_launch_count: 1,
+                label_count_weight_finalize_launch_count: 1,
+                scaler_partial_launch_count: 1,
+                scaler_finalize_launch_count: 1,
+                scaler_transform_launch_count: 1,
+                transform_fault_partial_launch_count: 1,
+                preprocess_fault_finalize_launch_count: 1,
+                training_rows_per_launch: 1_024,
+                training_row_chunk_count_per_epoch: 1,
+                training_epoch_count: 4,
+                training_launch_count: 4,
+                training_interchunk_device_to_host_bytes: 0,
+                raw_feature_h2d_bytes: 144,
+                original_label_h2d_bytes: 36,
+                scaled_feature_h2d_bytes: 0,
+                remapped_label_h2d_bytes: 0,
+                class_slack_weight_h2d_bytes: 0,
+                parameter_initialization_h2d_bytes: 0,
+                artifact_d2h_bytes: 144,
+            }),
+        });
+        artifact
+    }
+
+    #[test]
+    fn online_pa_cuda_v2_class_slack_weights_are_explicit_and_require_all_classes() -> Result<()> {
+        let labels = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2];
+        assert_eq!(
+            clamped_balanced_class_slack_weights_v1(&labels)?,
+            [0.5, 4.0, 4.0]
+        );
+
+        let error = clamped_balanced_class_slack_weights_v1(&[0, 1, 0, 1])
+            .expect_err("CUDA-v2 class-slack weights must not fabricate an absent class");
+        assert!(
+            error.to_string().contains("class 2 is absent"),
+            "unexpected absent-class rejection: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn online_pa_cuda_v2_provenance_is_exact_and_mutation_closed() -> Result<()> {
+        let artifact = valid_cuda_v2_pa_artifact();
+        validate_passive_aggressive_artifact(&artifact)?;
+
+        let mut wrong_backend = artifact.clone();
+        wrong_backend.training_backend = "online_pa_cpu_legacy_v1".to_string();
+        assert!(validate_passive_aggressive_artifact(&wrong_backend).is_err());
+
+        let mut wrong_policy = artifact.clone();
+        wrong_policy.effective_device_policy = "cpu".to_string();
+        assert!(validate_passive_aggressive_artifact(&wrong_policy).is_err());
+
+        let mut wrong_slack_policy = artifact.clone();
+        wrong_slack_policy.class_slack_weight_policy = "online_pa.ambient".to_string();
+        assert!(validate_passive_aggressive_artifact(&wrong_slack_policy).is_err());
+
+        let mut wrong_slack_weights = artifact.clone();
+        wrong_slack_weights.class_slack_weights = Some([0.49, 4.0, 4.0]);
+        assert!(validate_passive_aggressive_artifact(&wrong_slack_weights).is_err());
+
+        let mut missing_slack_weights = artifact.clone();
+        missing_slack_weights.class_slack_weights = None;
+        assert!(validate_passive_aggressive_artifact(&missing_slack_weights).is_err());
+
+        let mut wrong_evidence = artifact.clone();
+        wrong_evidence
+            .cuda_training_evidence
+            .as_mut()
+            .expect("fixture has CUDA evidence")
+            .host_to_device_bytes += 1;
+        assert!(validate_passive_aggressive_artifact(&wrong_evidence).is_err());
+
+        let mut unknown_schema = artifact;
+        unknown_schema.training_semantics_schema = "online_pa.future".to_string();
+        assert!(validate_passive_aggressive_artifact(&unknown_schema).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn online_pa_full_cuda_pipeline_receipt_is_structurally_exact_and_mutation_closed() -> Result<()>
+    {
+        let artifact = valid_cuda_full_pipeline_pa_artifact();
+        validate_passive_aggressive_artifact(&artifact)?;
+
+        let mut wrong_requested = artifact.clone();
+        wrong_requested
+            .cuda_training_evidence
+            .as_mut()
+            .unwrap()
+            .full_pipeline
+            .as_mut()
+            .unwrap()
+            .requested_device_policy = "gpu:1".to_string();
+        assert!(validate_passive_aggressive_artifact(&wrong_requested).is_err());
+
+        let mut wrong_counts = artifact.clone();
+        wrong_counts
+            .cuda_training_evidence
+            .as_mut()
+            .unwrap()
+            .full_pipeline
+            .as_mut()
+            .unwrap()
+            .class_counts = [4, 3, 3];
+        assert!(validate_passive_aggressive_artifact(&wrong_counts).is_err());
+
+        let mut wrong_identity = artifact.clone();
+        wrong_identity
+            .cuda_training_evidence
+            .as_mut()
+            .unwrap()
+            .full_pipeline
+            .as_mut()
+            .unwrap()
+            .device_identity
+            .uuid = [0; 16];
+        assert!(validate_passive_aggressive_artifact(&wrong_identity).is_err());
+
+        let mut wrong_bytes = artifact.clone();
+        wrong_bytes
+            .cuda_training_evidence
+            .as_mut()
+            .unwrap()
+            .full_pipeline
+            .as_mut()
+            .unwrap()
+            .artifact_d2h_bytes += 1;
+        assert!(validate_passive_aggressive_artifact(&wrong_bytes).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn online_pa_pre_v2_json_is_read_only_as_explicit_legacy_semantics() -> Result<()> {
+        let mut legacy_json = serde_json::to_value(valid_cuda_v2_pa_artifact())?;
+        let object = legacy_json
+            .as_object_mut()
+            .context("serialized PA artifact must be an object")?;
+        object.remove("class_slack_weight_policy");
+        object.remove("class_slack_weights");
+        object.remove("training_semantics_schema");
+        object.remove("training_backend");
+        object.remove("effective_device_policy");
+        object.remove("cuda_training_evidence");
+        let artifact: PassiveAggressiveArtifact = serde_json::from_value(legacy_json)?;
+        assert_eq!(
+            artifact.training_semantics_schema,
+            ONLINE_PA_LEGACY_TRAINING_SEMANTICS_V1
+        );
+        assert_eq!(artifact.training_backend, "online_pa_cpu_legacy_v1");
+        assert_eq!(artifact.effective_device_policy, "cpu");
+        assert_eq!(
+            artifact.class_slack_weight_policy,
+            ONLINE_PA_LEGACY_CLASS_SLACK_WEIGHT_POLICY_V1
+        );
+        assert!(artifact.class_slack_weights.is_none());
+        assert!(artifact.cuda_training_evidence.is_none());
+        validate_passive_aggressive_artifact(&artifact)
+    }
+
     #[test]
     fn online_hoeffding_loads_fallback_when_committees_are_corrupt() -> Result<()> {
         let path = temp_model_dir("online_hoeffding");
@@ -2114,6 +2742,12 @@ mod tests {
             bias: Array1::zeros(3),
             aggressiveness: 1.0,
             epochs: 4,
+            class_slack_weight_policy: legacy_online_pa_class_slack_weight_policy(),
+            class_slack_weights: None,
+            training_semantics_schema: legacy_online_pa_training_semantics(),
+            training_backend: legacy_online_pa_training_backend(),
+            effective_device_policy: legacy_online_pa_effective_device_policy(),
+            cuda_training_evidence: None,
         };
         write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
         let mut drifted = adaptive_runtime_metadata(
@@ -2294,6 +2928,12 @@ mod tests {
             bias: Array1::zeros(3),
             aggressiveness: 1.0,
             epochs: 0,
+            class_slack_weight_policy: legacy_online_pa_class_slack_weight_policy(),
+            class_slack_weights: None,
+            training_semantics_schema: legacy_online_pa_training_semantics(),
+            training_backend: legacy_online_pa_training_backend(),
+            effective_device_policy: legacy_online_pa_effective_device_policy(),
+            cuda_training_evidence: None,
         };
 
         let err = validate_passive_aggressive_artifact(&artifact)
@@ -2315,6 +2955,12 @@ mod tests {
             bias: Array1::zeros(3),
             aggressiveness: 1.0,
             epochs: 4,
+            class_slack_weight_policy: legacy_online_pa_class_slack_weight_policy(),
+            class_slack_weights: None,
+            training_semantics_schema: legacy_online_pa_training_semantics(),
+            training_backend: legacy_online_pa_training_backend(),
+            effective_device_policy: legacy_online_pa_effective_device_policy(),
+            cuda_training_evidence: None,
         };
 
         let err = validate_passive_aggressive_artifact(&artifact)

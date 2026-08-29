@@ -92,6 +92,9 @@ pub mod resident_search_slice2_v3 {
 #[path = "gpu_full_discovery/gpu_resident_trim_prefilter_view_v1.rs"]
 pub mod gpu_resident_trim_prefilter_view_v1;
 mod native_population_residency_receipt_v1;
+mod population_auto_sizing_receipt_v1;
+#[cfg(all(test, feature = "gpu-b-adapter"))]
+mod population_auto_sizing_receipt_v1_tests;
 mod population_engine_run_receipt_v1;
 #[cfg(test)]
 #[path = "population_engine_run_receipt_v1_contract.rs"]
@@ -103,6 +106,12 @@ mod population_execution_evidence_v1_contract;
 mod population_execution_run_receipt_v2;
 #[cfg(feature = "gpu-cuda")]
 mod prepared_discovery_run_input_v3;
+mod process_execution_lease_v1;
+#[cfg(feature = "gpu-cuda")]
+pub mod resident_population_auto_sizing_receipt_v2;
+#[cfg(all(test, feature = "gpu-cuda"))]
+#[path = "resident_population_auto_sizing_receipt_v2_contract.rs"]
+mod resident_population_auto_sizing_receipt_v2_contract;
 mod strict_discovery_device_route_v1;
 #[cfg(test)]
 #[path = "strict_discovery_device_route_v1_contract.rs"]
@@ -173,6 +182,38 @@ pub use backend::{
     evaluate_population_core_with_backend_and_audit, install_evaluation_backend,
     install_evaluation_backend_from_settings,
 };
+#[cfg(feature = "gpu-cuda")]
+pub use canonical_native_discovery_request_v1::resolve_canonical_native_discovery_request_v1;
+pub use canonical_native_discovery_request_v1::{
+    CANONICAL_RESEARCH_CONTRACT_ARTIFACT_REF_SCHEMA_V1,
+    CANONICAL_RESEARCH_CONTRACT_ARTIFACT_REF_VERSION_V1, CanonicalNativeCostBandStatusV1,
+    CanonicalNativeDiscoveryRequestErrorV1, CanonicalNativeDiscoveryRequestV1,
+    CanonicalNativeExecutionScopeV1, CanonicalNativeGenerationZeroLimitsV1,
+    CanonicalNativeGenerationZeroOverridesV1, CanonicalNativeGenerationZeroScopeV1,
+    CanonicalResearchContractArtifactRefV1, LoadedCanonicalResearchContractV1,
+    MAX_CANONICAL_NATIVE_GEN0_CONFIGURED_POPULATION_V1,
+    MAX_CANONICAL_NATIVE_GEN0_RESOLVED_POPULATION_V1, MAX_CANONICAL_NATIVE_GEN0_RESULT_BYTES_V1,
+    MAX_CANONICAL_NATIVE_GEN0_SOURCE_COUNT_V1, MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1,
+    MAX_CANONICAL_NATIVE_GEN0_TERMS_V1, MAX_CANONICAL_NATIVE_GEN0_VECTOR_ELEMENTS_V1,
+    load_canonical_research_contract_artifact_v1,
+};
+pub use canonical_native_discovery_run_v1::{
+    CanonicalNativeCancellationTokenV1, CanonicalNativeDiscoveryExecutionErrorCodeV1,
+    CanonicalNativeDiscoveryExecutionErrorV1, CanonicalNativeDiscoveryExecutionStageV1,
+    PublishedCanonicalNativeGenerationZeroResearchV1,
+    run_canonical_native_discovery_generation_zero_from_ref_v1,
+};
+pub use canonical_native_generation_zero_result_v1::{
+    CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_SCHEMA_V1,
+    CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_VERSION_V1,
+};
+pub use canonical_native_root_io_v1::{
+    MAX_CANONICAL_RESEARCH_CONTRACT_BYTES_V1, SealedCanonicalRootV1,
+};
+pub use canonical_native_runtime_authority_v1::{
+    CanonicalNativeGenerationZeroRuntimeAuthorityV1, CanonicalNativeRuntimeInstallReceiptV1,
+    install_and_seal_canonical_native_runtime_authority_v1,
+};
 pub use canonical_trendbar_research::{
     CANONICAL_TRENDBAR_RESEARCH_DISCOVERY_RESULT_SCHEMA_VERSION_V3,
     CANONICAL_TRENDBAR_RESEARCH_EXECUTION_SCHEMA_VERSION_V3,
@@ -190,6 +231,11 @@ pub use exact_resident_dataset_authority_v1::{
     ExactResidentDatasetViewV1,
 };
 pub use native_population_residency_receipt_v1::NativePopulationResidencyReceiptV1;
+pub use population_auto_sizing_receipt_v1::{
+    POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V1, PopulationAutoCpuAuthorityV1,
+    PopulationAutoSizingErrorCodeV1, PopulationAutoSizingErrorV1, PopulationAutoSizingReceiptV1,
+    PopulationAutoSizingRouteV1, PopulationAutoStage1WindowV1,
+};
 pub use population_engine_run_receipt_v1::{
     POPULATION_ENGINE_RUN_RECEIPT_SCHEMA_VERSION_V1, PopulationEngineRunReceiptErrorCodeV1,
     PopulationEngineRunReceiptErrorV1, PopulationEngineRunReceiptV1,
@@ -197,12 +243,25 @@ pub use population_engine_run_receipt_v1::{
 pub use population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2;
 #[cfg(feature = "gpu-cuda")]
 pub use prepared_discovery_run_input_v3::{
-    PreparedCanonicalDiscoveryRunInputV3, PreparedCpuCanonicalDiscoveryRunInputV3,
-    PreparedCpuCanonicalTrendbarResearchRunV3, PreparedNativeCudaCanonicalDiscoveryRunInputV3,
-    dispatch_canonical_discovery_data_preparation_v3, prepare_canonical_discovery_run_input_v3,
+    PreparedCanonicalDiscoveryRunInputV3, PreparedCanonicalDiscoveryRunInputV5,
+    PreparedCpuCanonicalDiscoveryRunInputV3, PreparedCpuCanonicalTrendbarResearchRunV3,
+    PreparedNativeCudaCanonicalDiscoveryRunInputV3, PreparedNativeCudaCanonicalDiscoveryRunInputV5,
+    ResidentGenerationZeroMilestoneV1, dispatch_canonical_discovery_data_preparation_v3,
+    dispatch_staged_canonical_discovery_data_preparation_v4,
+    prepare_canonical_discovery_run_input_v3, prepare_staged_canonical_discovery_run_input_v4,
+    prepare_staged_canonical_trendbar_research_run_input_v5,
+    run_prepared_canonical_trendbar_research_generation_zero_v5,
     run_prepared_canonical_discovery_with_holdout_and_progress_v3,
     run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3,
     run_prepared_canonical_trendbar_research_with_holdout_and_progress_v3,
+};
+pub use process_execution_lease_v1::{
+    ProcessExecutionBusyV1, ProcessExecutionKindV1, ProcessExecutionLeaseTransitionErrorV1,
+    ProcessExecutionLeaseV1, try_acquire_process_execution_lease_v1,
+};
+#[cfg(feature = "gpu-cuda")]
+pub use strict_resident_feature_store_v3::{
+    StrictResidentPopulationExecutionRunV3, consume_strict_resident_population_execution_run_v3,
 };
 pub use strict_discovery_device_route_v1::{
     ExactCudaDeviceOrdinalV1, SealedNoCompatibleGpuProbeReceiptV1,
@@ -216,6 +275,10 @@ pub use data_selection::{
     CanonicalSearchEvaluatedWindowV1, CanonicalSearchInputReceiptV2, CanonicalSearchRunInputV2,
     CanonicalSearchSourceBindingReceiptV1, CanonicalSearchSourceSegmentReceiptV1,
     CanonicalSearchWindowRoleV1, ExactCanonicalSeries,
+};
+#[cfg(feature = "gpu-cuda")]
+pub use data_selection::{
+    CanonicalGpuResidentSearchArtifactScopeV3, CanonicalGpuResidentSearchInputReceiptV3,
 };
 pub use deflated::{
     DecodeError, DecodedTrialMatrix, DecodedTrialRow, DeflatedSharpeReport, PboReport,

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -120,6 +120,9 @@ pub struct TrainingOrchestrator {
     /// different bar store than the config named. `None` means
     /// `system.data_dir`, which is the configured answer.
     pub data_root_override: Option<PathBuf>,
+    /// Exact hardware/runtime plan sealed into a promotion-candidate handoff.
+    /// Ordinary callers leave this empty and probe once per orchestrator.
+    sealed_hardware_plan_v1: Option<HardwareExecutionPlan>,
 }
 
 const LEGACY_RLLIB_MIGRATION_ERROR_V1: &str = "legacy RLlib migration boundary v1: `use_rllib_agent`, `auto_enable_rllib`, and non-zero `rllib_num_workers` are unsupported because this build has no Ray runtime; set the flags to false, set `rllib_num_workers: 0`, and use `use_rl_agent: true` for the native rlkit DQN backend";
@@ -346,6 +349,7 @@ impl TrainingOrchestrator {
             models_dir,
             oos_lock_from_ms: None,
             data_root_override: None,
+            sealed_hardware_plan_v1: None,
         }
     }
 
@@ -372,6 +376,14 @@ impl TrainingOrchestrator {
     /// an OOS blend validation on `[oos_from_ms, end)`. See [`Self::oos_lock_from_ms`].
     pub fn with_oos_lock_from_ms(mut self, oos_from_ms: i64) -> Self {
         self.oos_lock_from_ms = Some(oos_from_ms);
+        self
+    }
+
+    pub(crate) fn with_sealed_hardware_plan_v1(
+        mut self,
+        hardware_plan: HardwareExecutionPlan,
+    ) -> Self {
+        self.sealed_hardware_plan_v1 = Some(hardware_plan);
         self
     }
 
@@ -425,41 +437,11 @@ impl TrainingOrchestrator {
         }
     }
 
-    /// Prove that one configured model has a compiled GPU implementation and
-    /// is pinned to the exact CUDA device admitted by the full-run hardware
-    /// plan. A full-GPU run never treats an explicit CPU plan as an acceptable
-    /// substitute: unsupported models stop before feature construction,
-    /// Search, or training spends accelerator time.
-    fn validate_nvidia_model_config_v1(&self, config: &ModelConfig) -> Result<()> {
-        let canonical = canonical_model_name(&config.name);
-        anyhow::ensure!(
-            crate::registry::supports_nvidia_cuda_for_model(canonical, config.capability_family),
-            "full NVIDIA model `{}` has no compiled NVIDIA CUDA implementation in this build",
-            config.name
-        );
-
-        let policy = self.full_nvidia_device_policy_for_config(config)?;
-        let parsed = crate::common::parse_cuda_device_policy(&policy).with_context(|| {
-            format!(
-                "full NVIDIA model `{}` has invalid device policy `{policy}`",
-                config.name
-            )
-        })?;
-        anyhow::ensure!(
-            policy.trim().contains(':')
-                && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
-            "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
-            config.name
-        );
-        Ok(())
-    }
-
-    /// Validate the complete configured model expansion and its exact CUDA-only
+    /// Validate the complete configured model expansion and its exact CUDA/CPU
     /// routing before a canonical full run spends time building features or
     /// searching. This is deliberately stricter than ordinary CPU-capable
-    /// training: every selected model must have a compiled NVIDIA CUDA
-    /// implementation and target exact CUDA ordinal zero. There is no CPU
-    /// substitution.
+    /// training: every compiled CUDA surface must target ordinal zero, while
+    /// every model without a CUDA implementation is explicitly pinned to CPU.
     pub fn preflight_full_nvidia_cuda_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
@@ -522,17 +504,110 @@ impl TrainingOrchestrator {
         );
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            self.validate_nvidia_model_config_v1(&config)?;
+            let requires_cuda =
+                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
+            if requires_cuda {
+                anyhow::ensure!(
+                    crate::registry::supports_gpu_for_model(
+                        canonical_model_name(&config.name),
+                        config.capability_family,
+                    ),
+                    "full NVIDIA build lacks the CUDA implementation required by model `{}`",
+                    config.name
+                );
+                let policy = self.full_nvidia_device_policy_for_config(&config)?;
+                let parsed =
+                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+                        format!(
+                            "full NVIDIA model `{}` has invalid device policy `{policy}`",
+                            config.name
+                        )
+                    })?;
+                anyhow::ensure!(
+                    policy.trim().contains(':')
+                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+                    "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+                    config.name
+                );
+            } else {
+                let policy = config.params.get("device").with_context(|| {
+                    format!(
+                        "CPU-only model `{}` lacks an explicit CPU device policy",
+                        config.name
+                    )
+                })?;
+                anyhow::ensure!(
+                    matches!(
+                        crate::common::parse_cuda_device_policy(policy)?,
+                        crate::common::CudaDevicePolicy::Cpu
+                    ),
+                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
+                    config.name
+                );
+            }
             planned_models.push(config.name);
         }
         Ok(planned_models)
+    }
+
+    fn configured_training_plan_v1(&self) -> Result<(Vec<ModelConfig>, HardwareExecutionPlan)> {
+        let dispatch_plan = self.create_dispatch_plan()?;
+        self.validate_dispatch_plan(&dispatch_plan)?;
+        let hardware_plan = self.hardware_execution_plan();
+        let configs =
+            self.build_training_configs_with_hardware_plan(&dispatch_plan, &hardware_plan)?;
+        anyhow::ensure!(
+            !configs.is_empty(),
+            "configured training resolved an empty model plan"
+        );
+        Ok((configs, hardware_plan))
+    }
+
+    /// Validate the complete effective model expansion used by ordinary exact
+    /// receipt-bound training without requiring one particular accelerator.
+    pub fn preflight_configured_training(&self) -> Result<Vec<String>> {
+        let (configs, _) = self.configured_training_plan_v1()?;
+        Ok(configs.into_iter().map(|config| config.name).collect())
+    }
+
+    /// Canonical identity material for the promotion-candidate handoff. The
+    /// BTreeMap conversion seals the effective parameter order rather than the
+    /// randomized iteration order of each ModelConfig HashMap.
+    pub(crate) fn promotion_candidate_training_plan_material_v1(
+        &self,
+    ) -> Result<(Vec<String>, HardwareExecutionPlan, serde_json::Value)> {
+        let (configs, hardware_plan) = self.configured_training_plan_v1()?;
+        let planned_models = configs
+            .iter()
+            .map(|config| config.name.clone())
+            .collect::<Vec<_>>();
+        let model_plan = serde_json::Value::Array(
+            configs
+                .iter()
+                .map(|config| {
+                    let params = config
+                        .params
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    serde_json::json!({
+                        "name": config.name,
+                        "model_type": format!("{:?}", config.model_type),
+                        "capability_family": format!("{:?}", config.capability_family),
+                        "capability_state": format!("{:?}", config.capability_state),
+                        "params": params,
+                    })
+                })
+                .collect(),
+        );
+        Ok((planned_models, hardware_plan, model_plan))
     }
 
     /// Validate only the exact model set enabled for one explicitly scoped
     /// NVIDIA training run. Unlike the full-ensemble preflight, this does not
     /// invent missing voters that are outside the configured plan; every model
     /// that is present still has to resolve to its real CUDA implementation on
-    /// ordinal zero. An explicit CPU-only policy is rejected, not substituted.
+    /// ordinal zero or to an explicit CPU-only policy.
     pub fn preflight_configured_nvidia_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
@@ -554,11 +629,57 @@ impl TrainingOrchestrator {
             "configured NVIDIA training resolved an empty model plan"
         );
 
+        let mut configured_cuda_models = 0_usize;
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            self.validate_nvidia_model_config_v1(&config)?;
+            let requires_cuda =
+                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
+            if requires_cuda {
+                configured_cuda_models += 1;
+                anyhow::ensure!(
+                    crate::registry::supports_gpu_for_model(
+                        canonical_model_name(&config.name),
+                        config.capability_family,
+                    ),
+                    "configured NVIDIA build lacks the CUDA implementation required by model `{}`",
+                    config.name
+                );
+                let policy = self.full_nvidia_device_policy_for_config(&config)?;
+                let parsed =
+                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+                        format!(
+                            "configured NVIDIA model `{}` has invalid device policy `{policy}`",
+                            config.name
+                        )
+                    })?;
+                anyhow::ensure!(
+                    policy.trim().contains(':')
+                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+                    "configured NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+                    config.name
+                );
+            } else {
+                let policy = config.params.get("device").with_context(|| {
+                    format!(
+                        "CPU-only model `{}` lacks an explicit CPU device policy",
+                        config.name
+                    )
+                })?;
+                anyhow::ensure!(
+                    matches!(
+                        crate::common::parse_cuda_device_policy(policy)?,
+                        crate::common::CudaDevicePolicy::Cpu
+                    ),
+                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
+                    config.name
+                );
+            }
             planned_models.push(config.name);
         }
+        anyhow::ensure!(
+            configured_cuda_models > 0,
+            "configured NVIDIA training plan contains no CUDA-backed model"
+        );
         Ok(planned_models)
     }
 
@@ -1118,6 +1239,9 @@ impl TrainingOrchestrator {
     }
 
     fn hardware_execution_plan(&self) -> HardwareExecutionPlan {
+        if let Some(plan) = &self.sealed_hardware_plan_v1 {
+            return plan.clone();
+        }
         let mut probe = HardwareProbe::new();
         let profile = probe.detect();
         HardwareExecutionPlan::from_settings_and_profile(&self.settings, profile)
@@ -6202,49 +6326,6 @@ mod tests {
         orchestrator.settings.system.device = "mystery_gpu".to_string();
 
         assert_eq!(orchestrator.preferred_burn_device_policy(), "gpu");
-    }
-
-    #[test]
-    fn full_nvidia_model_validation_rejects_a_model_without_a_compiled_gpu_route() {
-        let orchestrator = orchestrator_with_models(&["online_hoeffding"]);
-        let config = ModelConfig {
-            name: "online_hoeffding".to_string(),
-            model_type: ModelType::OnlineHoeffding,
-            capability_family: ModelFamily::Adaptive,
-            capability_state: CapabilityState::Verified,
-            params: HashMap::from([("device".to_string(), "cpu".to_string())]),
-        };
-
-        let error = orchestrator
-            .validate_nvidia_model_config_v1(&config)
-            .expect_err("full NVIDIA admission must reject every model without a GPU route");
-        let message = error.to_string();
-        assert!(
-            message.contains("online_hoeffding")
-                && message.contains("no compiled NVIDIA CUDA implementation"),
-            "full-GPU refusal must name the exact missing model and capability: {message}"
-        );
-    }
-
-    #[cfg(feature = "statistical-gpu")]
-    #[test]
-    fn full_nvidia_model_validation_rejects_cpu_policy_even_when_gpu_code_is_compiled() {
-        let orchestrator = orchestrator_with_models(&["logistic"]);
-        let config = ModelConfig {
-            name: "logistic".to_string(),
-            model_type: ModelType::Logistic,
-            capability_family: ModelFamily::Meta,
-            capability_state: CapabilityState::Verified,
-            params: HashMap::from([("device".to_string(), "cpu".to_string())]),
-        };
-
-        let error = orchestrator
-            .validate_nvidia_model_config_v1(&config)
-            .expect_err("compiled GPU code must not excuse an explicit CPU policy");
-        assert!(
-            error.to_string().contains("exact CUDA ordinal 0"),
-            "CPU policy must fail as a device mismatch, not silently fall back: {error:#}"
-        );
     }
 
     #[test]
