@@ -1,0 +1,11 @@
+# Resident Search Slice 2 R7 compile-contract authority manifest v9
+# Sole parent/source base: 6bff01cf2abbf711972f4fcac5348fe14753e5a1
+# Supersedes R7 compile-contract authority only; protected v5/v8 and R6 bytes remain immutable.
+# Digest inputs must be valid UTF-8 without BOM. CRLF and then bare CR normalize to LF;
+# every other byte and final-newline presence are preserved before SHA-256.
+a8159742fa56c958e0e16c1d54bf2ef2b61ec28cf7bdba4b26222336cb6205bd  docs/superpowers/specs/2026-08-29-resident-search-slice2-r7-compile-contract-design-v9.md
+b6298c4401247370e45f45264b05d0b7aee35874ee42c9a5d2f2838d1a6239fd  docs/superpowers/plans/2026-08-29-resident-search-slice2-r7-compile-contract-v9.md
+52b166cc52a09358e47e9da3ce1daad5a692783fea820027fb4db491d2b1431a  docs/superpowers/specs/2026-08-28-resident-search-slice2-archive-knn-design.md
+e3e876948d98bee1f6f8bdf351011ad3480a40d46505f378da759d0223e25a27  docs/superpowers/plans/2026-08-29-resident-search-slice2-r6-combined-preallocation.md
+3f370ffe7561dc26e99b1834b482d0399a188befa2bd68da2b661e771b7de144  audit/resident-search-slice2-design-v5.sha256
+413263ceaa403e486ed626571407a1af3f00ce6ee1fe5ebe02504eef1454e443  audit/resident-search-slice2-design-v8.sha256
