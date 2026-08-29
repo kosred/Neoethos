@@ -903,3 +903,792 @@ fn r2_acceptance_requires_exact_positive_zero_and_rejects_nonfinite_or_sign() {
     assert!(!accept_sealed_mean(1.0, f64::INFINITY));
     assert!(!accept_sealed_mean(f64::INFINITY, 1.0));
 }
+
+mod archive_reference {
+    use std::cmp::Ordering;
+
+    pub const METRIC_COUNT: usize = 11;
+    pub const NET_METRIC_SLOT: usize = 0;
+    pub const TRADE_COUNT_METRIC_SLOT: usize = 8;
+
+    /// Canonical full-gene bytes after normalization. Hashes are deliberately absent until R4.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ExactGene(pub [u64; 2]);
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct AdmissionCandidate {
+        pub exact_gene: ExactGene,
+        pub gene_identity: u64,
+        pub population_ordinal: u32,
+        pub score: f64,
+        pub metrics: [f64; METRIC_COUNT],
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ArchiveRecord {
+        pub exact_gene: ExactGene,
+        pub gene_identity: u64,
+        pub population_ordinal: u32,
+        pub admitted_generation: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NeighborSnapshot {
+        pub generation: u32,
+        pub records: Vec<ArchiveRecord>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StageReceipt {
+        pub generation: u32,
+        pub committed_count_at_start: usize,
+        pub target_committed_count: usize,
+        pub records: Vec<ArchiveRecord>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommitReceipt {
+        pub completed_generation: u32,
+        pub next_generation: u32,
+        pub previous_committed_count: usize,
+        pub committed_count: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ArchiveError {
+        GenerationMismatch {
+            current: u32,
+            requested: u32,
+        },
+        StageAlreadyPrepared {
+            generation: u32,
+        },
+        TransactionFaulted {
+            generation: u32,
+        },
+        NonFiniteMetric {
+            population_ordinal: u32,
+            metric_slot: usize,
+        },
+        NoStagedTransaction {
+            generation: u32,
+        },
+    }
+
+    #[derive(Debug)]
+    struct PendingArchive {
+        generation: u32,
+        records: Vec<ArchiveRecord>,
+    }
+
+    #[derive(Debug)]
+    pub struct ReferenceArchive {
+        capacity: usize,
+        current_generation: u32,
+        committed: Vec<ArchiveRecord>,
+        pending: Option<PendingArchive>,
+        faulted_generation: Option<u32>,
+    }
+
+    impl ReferenceArchive {
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                current_generation: 0,
+                committed: Vec::new(),
+                pending: None,
+                faulted_generation: None,
+            }
+        }
+
+        pub fn from_committed_fixture(
+            capacity: usize,
+            current_generation: u32,
+            committed: Vec<ArchiveRecord>,
+        ) -> Self {
+            assert!(committed.len() <= capacity);
+            Self {
+                capacity,
+                current_generation,
+                committed,
+                pending: None,
+                faulted_generation: None,
+            }
+        }
+
+        pub fn current_generation(&self) -> u32 {
+            self.current_generation
+        }
+
+        pub fn committed_count(&self) -> usize {
+            self.committed.len()
+        }
+
+        pub fn committed_records(&self) -> &[ArchiveRecord] {
+            &self.committed
+        }
+
+        pub fn staged_count(&self) -> usize {
+            self.pending
+                .as_ref()
+                .map_or(0, |pending| pending.records.len())
+        }
+
+        pub fn faulted_generation(&self) -> Option<u32> {
+            self.faulted_generation
+        }
+
+        pub fn neighbor_snapshot_at_generation_start(
+            &self,
+            generation: u32,
+        ) -> Result<NeighborSnapshot, ArchiveError> {
+            self.require_current_generation(generation)?;
+            Ok(NeighborSnapshot {
+                generation,
+                records: self.committed.clone(),
+            })
+        }
+
+        pub fn stage_ranked_admissions(
+            &mut self,
+            generation: u32,
+            candidates: &[AdmissionCandidate],
+        ) -> Result<StageReceipt, ArchiveError> {
+            self.require_current_generation(generation)?;
+            if let Some(faulted_generation) = self.faulted_generation {
+                return Err(ArchiveError::TransactionFaulted {
+                    generation: faulted_generation,
+                });
+            }
+            if self.pending.is_some() {
+                return Err(ArchiveError::StageAlreadyPrepared { generation });
+            }
+
+            for candidate in candidates {
+                if let Some(metric_slot) = candidate
+                    .metrics
+                    .iter()
+                    .position(|metric| !metric.is_finite())
+                {
+                    self.faulted_generation = Some(generation);
+                    return Err(ArchiveError::NonFiniteMetric {
+                        population_ordinal: candidate.population_ordinal,
+                        metric_slot,
+                    });
+                }
+            }
+
+            let mut ranked = candidates.iter().collect::<Vec<_>>();
+            ranked.sort_by(|left, right| compare_rank(left, right));
+
+            let available_slots = self.capacity.saturating_sub(self.committed.len());
+            let mut consumed_slots = 0_usize;
+            let mut staged = Vec::with_capacity(available_slots.min(ranked.len()));
+            for candidate in ranked {
+                let positive_trade_count = candidate.metrics[TRADE_COUNT_METRIC_SLOT] > 0.0;
+                let positive_net = candidate.metrics[NET_METRIC_SLOT] > 0.0;
+                if !positive_trade_count || !positive_net {
+                    continue;
+                }
+
+                let already_first_seen = self
+                    .committed
+                    .iter()
+                    .chain(staged.iter())
+                    .any(|record| record.exact_gene == candidate.exact_gene);
+                if already_first_seen {
+                    continue;
+                }
+                if consumed_slots == available_slots {
+                    break;
+                }
+
+                staged.push(ArchiveRecord {
+                    exact_gene: candidate.exact_gene,
+                    gene_identity: candidate.gene_identity,
+                    population_ordinal: candidate.population_ordinal,
+                    admitted_generation: generation,
+                });
+                consumed_slots += 1;
+            }
+
+            let committed_count_at_start = self.committed.len();
+            let target_committed_count = committed_count_at_start + staged.len();
+            let receipt = StageReceipt {
+                generation,
+                committed_count_at_start,
+                target_committed_count,
+                records: staged.clone(),
+            };
+            self.pending = Some(PendingArchive {
+                generation,
+                records: staged,
+            });
+            Ok(receipt)
+        }
+
+        pub fn fault_staged_transaction_before_commit(
+            &mut self,
+            generation: u32,
+        ) -> Result<(), ArchiveError> {
+            self.require_current_generation(generation)?;
+            if let Some(faulted_generation) = self.faulted_generation {
+                return Err(ArchiveError::TransactionFaulted {
+                    generation: faulted_generation,
+                });
+            }
+            let pending = self
+                .pending
+                .as_ref()
+                .ok_or(ArchiveError::NoStagedTransaction { generation })?;
+            if pending.generation != generation {
+                return Err(ArchiveError::GenerationMismatch {
+                    current: pending.generation,
+                    requested: generation,
+                });
+            }
+            self.faulted_generation = Some(generation);
+            Ok(())
+        }
+
+        pub fn combined_commit(&mut self, generation: u32) -> Result<CommitReceipt, ArchiveError> {
+            self.require_current_generation(generation)?;
+            if let Some(faulted_generation) = self.faulted_generation {
+                return Err(ArchiveError::TransactionFaulted {
+                    generation: faulted_generation,
+                });
+            }
+            let pending = self
+                .pending
+                .as_ref()
+                .ok_or(ArchiveError::NoStagedTransaction { generation })?;
+            if pending.generation != generation {
+                return Err(ArchiveError::GenerationMismatch {
+                    current: pending.generation,
+                    requested: generation,
+                });
+            }
+
+            let next_generation = generation
+                .checked_add(1)
+                .expect("R3 fixture generation must not overflow");
+            let previous_committed_count = self.committed.len();
+            let pending = self
+                .pending
+                .take()
+                .expect("the pending archive was checked above");
+            self.committed.extend(pending.records);
+            self.current_generation = next_generation;
+            Ok(CommitReceipt {
+                completed_generation: generation,
+                next_generation,
+                previous_committed_count,
+                committed_count: self.committed.len(),
+            })
+        }
+
+        fn require_current_generation(&self, requested: u32) -> Result<(), ArchiveError> {
+            if requested != self.current_generation {
+                return Err(ArchiveError::GenerationMismatch {
+                    current: self.current_generation,
+                    requested,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    pub fn compare_rank(left: &AdmissionCandidate, right: &AdmissionCandidate) -> Ordering {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.gene_identity.cmp(&right.gene_identity))
+            .then_with(|| left.population_ordinal.cmp(&right.population_ordinal))
+    }
+}
+
+use archive_reference::{
+    AdmissionCandidate, ArchiveError, ArchiveRecord, CommitReceipt, ExactGene, METRIC_COUNT,
+    NET_METRIC_SLOT, ReferenceArchive, StageReceipt, TRADE_COUNT_METRIC_SLOT,
+};
+
+fn archive_candidate(
+    exact_gene: [u64; 2],
+    gene_identity: u64,
+    population_ordinal: u32,
+    score: f64,
+    net: f64,
+    trade_count: f64,
+) -> AdmissionCandidate {
+    let mut metrics = [1.0_f64; METRIC_COUNT];
+    metrics[NET_METRIC_SLOT] = net;
+    metrics[TRADE_COUNT_METRIC_SLOT] = trade_count;
+    AdmissionCandidate {
+        exact_gene: ExactGene(exact_gene),
+        gene_identity,
+        population_ordinal,
+        score,
+        metrics,
+    }
+}
+
+fn archive_record_keys(records: &[ArchiveRecord]) -> Vec<(ExactGene, u64, u32, u32)> {
+    records
+        .iter()
+        .map(|record| {
+            (
+                record.exact_gene,
+                record.gene_identity,
+                record.population_ordinal,
+                record.admitted_generation,
+            )
+        })
+        .collect()
+}
+
+fn assert_stage_receipt(
+    receipt: &StageReceipt,
+    generation: u32,
+    committed_count_at_start: usize,
+    target_committed_count: usize,
+    expected_records: &[(ExactGene, u64, u32, u32)],
+) {
+    assert_eq!(receipt.generation, generation);
+    assert_eq!(receipt.committed_count_at_start, committed_count_at_start);
+    assert_eq!(receipt.target_committed_count, target_committed_count);
+    assert_eq!(archive_record_keys(&receipt.records), expected_records);
+}
+
+#[test]
+fn r3_staged_admissions_are_invisible_until_atomic_generation_commit() {
+    let initial = archive_candidate([10, 100], 10, 0, 30.0, 4.0, 2.0);
+    let mut archive = ReferenceArchive::new(4);
+    let initial_stage = archive.stage_ranked_admissions(0, &[initial]).unwrap();
+    assert_stage_receipt(&initial_stage, 0, 0, 1, &[(ExactGene([10, 100]), 10, 0, 0)]);
+    assert_eq!(
+        archive.combined_commit(0),
+        Ok(CommitReceipt {
+            completed_generation: 0,
+            next_generation: 1,
+            previous_committed_count: 0,
+            committed_count: 1,
+        })
+    );
+
+    let snapshot_at_start_of_g = archive.neighbor_snapshot_at_generation_start(1).unwrap();
+    assert_eq!(snapshot_at_start_of_g.generation, 1);
+    assert_eq!(
+        archive_record_keys(&snapshot_at_start_of_g.records),
+        vec![(ExactGene([10, 100]), 10, 0, 0)]
+    );
+
+    let candidates = [
+        archive_candidate([30, 300], 30, 2, 10.0, 2.0, 3.0),
+        archive_candidate([20, 200], 20, 1, 20.0, 3.0, 4.0),
+    ];
+    let staged = archive.stage_ranked_admissions(1, &candidates).unwrap();
+    assert_stage_receipt(
+        &staged,
+        1,
+        1,
+        3,
+        &[
+            (ExactGene([20, 200]), 20, 1, 1),
+            (ExactGene([30, 300]), 30, 2, 1),
+        ],
+    );
+    assert_eq!(archive.staged_count(), 2);
+    assert_eq!(archive.current_generation(), 1);
+    assert_eq!(archive.committed_count(), 1);
+    assert_eq!(
+        archive_record_keys(archive.committed_records()),
+        vec![(ExactGene([10, 100]), 10, 0, 0)]
+    );
+    assert_eq!(
+        archive_record_keys(
+            &archive
+                .neighbor_snapshot_at_generation_start(1)
+                .unwrap()
+                .records
+        ),
+        vec![(ExactGene([10, 100]), 10, 0, 0)]
+    );
+
+    assert_eq!(
+        archive.combined_commit(1),
+        Ok(CommitReceipt {
+            completed_generation: 1,
+            next_generation: 2,
+            previous_committed_count: 1,
+            committed_count: 3,
+        })
+    );
+    assert_eq!(archive.current_generation(), 2);
+    assert_eq!(archive.committed_count(), 3);
+    assert_eq!(archive.staged_count(), 0);
+    assert_eq!(
+        archive.neighbor_snapshot_at_generation_start(1),
+        Err(ArchiveError::GenerationMismatch {
+            current: 2,
+            requested: 1,
+        })
+    );
+    assert_eq!(
+        archive_record_keys(
+            &archive
+                .neighbor_snapshot_at_generation_start(2)
+                .unwrap()
+                .records
+        ),
+        vec![
+            (ExactGene([10, 100]), 10, 0, 0),
+            (ExactGene([20, 200]), 20, 1, 1),
+            (ExactGene([30, 300]), 30, 2, 1),
+        ]
+    );
+    assert_eq!(
+        archive_record_keys(&snapshot_at_start_of_g.records),
+        vec![(ExactGene([10, 100]), 10, 0, 0)]
+    );
+
+    let mut faulted_archive = ReferenceArchive::new(2);
+    let faulted_tail = faulted_archive
+        .stage_ranked_admissions(0, &[archive_candidate([90, 900], 90, 0, 10.0, 1.0, 1.0)])
+        .unwrap();
+    assert_stage_receipt(&faulted_tail, 0, 0, 1, &[(ExactGene([90, 900]), 90, 0, 0)]);
+    assert_eq!(faulted_archive.staged_count(), 1);
+    assert_eq!(faulted_archive.committed_count(), 0);
+    assert_eq!(faulted_archive.current_generation(), 0);
+    assert!(faulted_archive.committed_records().is_empty());
+    assert_eq!(
+        faulted_archive.fault_staged_transaction_before_commit(0),
+        Ok(())
+    );
+    assert_eq!(faulted_archive.faulted_generation(), Some(0));
+    assert_eq!(
+        faulted_archive.combined_commit(0),
+        Err(ArchiveError::TransactionFaulted { generation: 0 })
+    );
+    assert_eq!(
+        faulted_archive
+            .stage_ranked_admissions(0, &[archive_candidate([91, 901], 91, 1, 20.0, 1.0, 1.0,)],),
+        Err(ArchiveError::TransactionFaulted { generation: 0 })
+    );
+    assert_eq!(
+        faulted_archive.combined_commit(0),
+        Err(ArchiveError::TransactionFaulted { generation: 0 })
+    );
+    assert_eq!(faulted_archive.faulted_generation(), Some(0));
+    assert_eq!(faulted_archive.staged_count(), 1);
+    assert_eq!(faulted_archive.committed_count(), 0);
+    assert_eq!(faulted_archive.current_generation(), 0);
+    assert!(faulted_archive.committed_records().is_empty());
+}
+
+#[test]
+fn r3_admission_uses_total_rank_order_independent_of_input_order() {
+    let low_score = archive_candidate([40, 400], 20, 7, 10.0, 1.0, 1.0);
+    let high_identity = archive_candidate([30, 300], 30, 5, 20.0, 1.0, 1.0);
+    let later_ordinal = archive_candidate([20, 200], 10, 9, 20.0, 1.0, 1.0);
+    let earlier_ordinal = archive_candidate([10, 100], 10, 2, 20.0, 1.0, 1.0);
+    let expected = [
+        (ExactGene([10, 100]), 10, 2, 0),
+        (ExactGene([20, 200]), 10, 9, 0),
+        (ExactGene([30, 300]), 30, 5, 0),
+        (ExactGene([40, 400]), 20, 7, 0),
+    ];
+
+    let first_input = [
+        low_score.clone(),
+        high_identity.clone(),
+        later_ordinal.clone(),
+        earlier_ordinal.clone(),
+    ];
+    let second_input = [later_ordinal, low_score, earlier_ordinal, high_identity];
+    let mut first_archive = ReferenceArchive::new(4);
+    let mut second_archive = ReferenceArchive::new(4);
+    let first_stage = first_archive
+        .stage_ranked_admissions(0, &first_input)
+        .unwrap();
+    let second_stage = second_archive
+        .stage_ranked_admissions(0, &second_input)
+        .unwrap();
+
+    assert_stage_receipt(&first_stage, 0, 0, 4, &expected);
+    assert_stage_receipt(&second_stage, 0, 0, 4, &expected);
+    first_archive.combined_commit(0).unwrap();
+    second_archive.combined_commit(0).unwrap();
+    assert_eq!(
+        archive_record_keys(first_archive.committed_records()),
+        expected
+    );
+    assert_eq!(
+        archive_record_keys(second_archive.committed_records()),
+        expected
+    );
+}
+
+#[test]
+fn r3_trade_count_and_net_are_distinct_strictly_positive_gates() {
+    let smallest_positive = f64::from_bits(1);
+    let candidates = [
+        archive_candidate([10, 100], 10, 0, 80.0, 0.0, 1.0),
+        archive_candidate([20, 200], 20, 1, 70.0, -0.0, 1.0),
+        archive_candidate([30, 300], 30, 2, 60.0, -1.0, 1.0),
+        archive_candidate([40, 400], 40, 3, 50.0, 1.0, 0.0),
+        archive_candidate([50, 500], 50, 4, 40.0, 1.0, -0.0),
+        archive_candidate([60, 600], 60, 5, 30.0, 1.0, -1.0),
+        archive_candidate([70, 700], 70, 6, 20.0, smallest_positive, 1.0),
+        archive_candidate([80, 800], 80, 7, 10.0, 1.0, smallest_positive),
+    ];
+    let mut archive = ReferenceArchive::new(8);
+
+    let staged = archive.stage_ranked_admissions(0, &candidates).unwrap();
+
+    assert_stage_receipt(
+        &staged,
+        0,
+        0,
+        2,
+        &[
+            (ExactGene([70, 700]), 70, 6, 0),
+            (ExactGene([80, 800]), 80, 7, 0),
+        ],
+    );
+    archive.combined_commit(0).unwrap();
+    assert_eq!(
+        archive_record_keys(archive.committed_records()),
+        vec![
+            (ExactGene([70, 700]), 70, 6, 0),
+            (ExactGene([80, 800]), 80, 7, 0),
+        ]
+    );
+}
+
+#[test]
+fn r3_nonfinite_metric_faults_the_whole_transaction_before_staging() {
+    let canonical_quiet_nan = f64::from_bits(0x7ff8_0000_0000_0000);
+    for (metric_slot, nonfinite, invalid_trade_count) in [
+        (10_usize, canonical_quiet_nan, 2.0_f64),
+        (7_usize, f64::INFINITY, 0.0_f64),
+    ] {
+        let mut archive = ReferenceArchive::new(4);
+        let committed_prefix = archive_candidate([10, 100], 10, 9, 40.0, 2.0, 2.0);
+        archive
+            .stage_ranked_admissions(0, &[committed_prefix])
+            .unwrap();
+        archive.combined_commit(0).unwrap();
+
+        let eligible_before_fault = archive_candidate([20, 200], 20, 0, 30.0, 2.0, 2.0);
+        let mut invalid_candidate =
+            archive_candidate([30, 300], 30, 1, 20.0, 2.0, invalid_trade_count);
+        invalid_candidate.metrics[metric_slot] = nonfinite;
+        let eligible_after_fault = archive_candidate([40, 400], 40, 2, 10.0, 2.0, 2.0);
+
+        assert_eq!(
+            archive.stage_ranked_admissions(
+                1,
+                &[
+                    eligible_before_fault,
+                    invalid_candidate,
+                    eligible_after_fault,
+                ],
+            ),
+            Err(ArchiveError::NonFiniteMetric {
+                population_ordinal: 1,
+                metric_slot,
+            })
+        );
+        assert_eq!(archive.faulted_generation(), Some(1));
+        assert_eq!(archive.current_generation(), 1);
+        assert_eq!(archive.committed_count(), 1);
+        assert_eq!(archive.staged_count(), 0);
+        assert_eq!(
+            archive_record_keys(archive.committed_records()),
+            vec![(ExactGene([10, 100]), 10, 9, 0)]
+        );
+        assert_eq!(
+            archive_record_keys(
+                &archive
+                    .neighbor_snapshot_at_generation_start(1)
+                    .unwrap()
+                    .records
+            ),
+            vec![(ExactGene([10, 100]), 10, 9, 0)]
+        );
+        assert_eq!(
+            archive.combined_commit(1),
+            Err(ArchiveError::TransactionFaulted { generation: 1 })
+        );
+        assert_eq!(archive.current_generation(), 1);
+        assert_eq!(archive.committed_count(), 1);
+        assert_eq!(archive.staged_count(), 0);
+        assert_eq!(
+            archive_record_keys(archive.committed_records()),
+            vec![(ExactGene([10, 100]), 10, 9, 0)]
+        );
+    }
+}
+
+#[test]
+fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity() {
+    let later_ranked_duplicate = archive_candidate([10, 100], 5, 1, 20.0, 4.0, 7.0);
+    let other_unique = archive_candidate([20, 200], 20, 2, 10.0, 2.0, 2.0);
+    let one_field_different_gene = archive_candidate([10, 101], 10, 4, 15.0, 1.0, 1.0);
+    let first_ranked_gene = archive_candidate([10, 100], 100, 9, 30.0, 2.0, 2.0);
+    let mut archive = ReferenceArchive::new(4);
+
+    let generation_zero = archive
+        .stage_ranked_admissions(
+            0,
+            &[
+                later_ranked_duplicate,
+                other_unique,
+                one_field_different_gene,
+                first_ranked_gene,
+            ],
+        )
+        .unwrap();
+    assert_stage_receipt(
+        &generation_zero,
+        0,
+        0,
+        3,
+        &[
+            (ExactGene([10, 100]), 100, 9, 0),
+            (ExactGene([10, 101]), 10, 4, 0),
+            (ExactGene([20, 200]), 20, 2, 0),
+        ],
+    );
+    archive.combined_commit(0).unwrap();
+
+    let committed_duplicate = archive_candidate([10, 100], 1, 0, 100.0, 99.0, 11.0);
+    let first_new_unique = archive_candidate([30, 300], 30, 5, 90.0, 2.0, 2.0);
+    let staged_duplicate = archive_candidate([30, 300], 2, 1, 80.0, 7.0, 8.0);
+    let generation_one = archive
+        .stage_ranked_admissions(
+            1,
+            &[committed_duplicate, first_new_unique, staged_duplicate],
+        )
+        .unwrap();
+    assert_stage_receipt(
+        &generation_one,
+        1,
+        3,
+        4,
+        &[(ExactGene([30, 300]), 30, 5, 1)],
+    );
+    archive.combined_commit(1).unwrap();
+
+    assert_eq!(
+        archive_record_keys(archive.committed_records()),
+        vec![
+            (ExactGene([10, 100]), 100, 9, 0),
+            (ExactGene([10, 101]), 10, 4, 0),
+            (ExactGene([20, 200]), 20, 2, 0),
+            (ExactGene([30, 300]), 30, 5, 1),
+        ]
+    );
+}
+
+#[test]
+fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() {
+    let committed_prefix = (0_u64..49_999)
+        .map(|ordinal| ArchiveRecord {
+            exact_gene: ExactGene([ordinal, 1_000_000 + ordinal]),
+            gene_identity: 100_000 + ordinal,
+            population_ordinal: (ordinal % 200) as u32,
+            admitted_generation: (ordinal / 200) as u32,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed_prefix.first(),
+        Some(&ArchiveRecord {
+            exact_gene: ExactGene([0, 1_000_000]),
+            gene_identity: 100_000,
+            population_ordinal: 0,
+            admitted_generation: 0,
+        })
+    );
+    assert_eq!(
+        committed_prefix.last(),
+        Some(&ArchiveRecord {
+            exact_gene: ExactGene([49_998, 1_049_998]),
+            gene_identity: 149_998,
+            population_ordinal: 198,
+            admitted_generation: 249,
+        })
+    );
+    let mut archive =
+        ReferenceArchive::from_committed_fixture(50_000, 250, committed_prefix.clone());
+    assert_eq!(archive.committed_count(), 49_999);
+
+    let later_eligible = archive_candidate([60_000, 1_060_000], 300, 3, 80.0, 2.0, 2.0);
+    let committed_duplicate = archive_candidate([0, 1_000_000], 1, 199, 100.0, 9.0, 9.0);
+    let earliest_eligible = archive_candidate([50_000, 1_050_000], 200, 2, 90.0, 2.0, 2.0);
+    let cap_minus_one = archive
+        .stage_ranked_admissions(
+            250,
+            &[later_eligible, committed_duplicate, earliest_eligible],
+        )
+        .unwrap();
+    assert_stage_receipt(
+        &cap_minus_one,
+        250,
+        49_999,
+        50_000,
+        &[(ExactGene([50_000, 1_050_000]), 200, 2, 250)],
+    );
+    assert_eq!(archive.committed_count(), 49_999);
+    assert_eq!(archive.committed_records(), committed_prefix);
+    assert_eq!(
+        archive.combined_commit(250),
+        Ok(CommitReceipt {
+            completed_generation: 250,
+            next_generation: 251,
+            previous_committed_count: 49_999,
+            committed_count: 50_000,
+        })
+    );
+    assert_eq!(archive.committed_count(), 50_000);
+    assert_eq!(&archive.committed_records()[..49_999], committed_prefix);
+    assert_eq!(
+        archive.committed_records().last(),
+        Some(&ArchiveRecord {
+            exact_gene: ExactGene([50_000, 1_050_000]),
+            gene_identity: 200,
+            population_ordinal: 2,
+            admitted_generation: 250,
+        })
+    );
+    let full_archive = archive.committed_records().to_vec();
+
+    let full_stage = archive
+        .stage_ranked_admissions(
+            251,
+            &[archive_candidate(
+                [70_000, 1_070_000],
+                400,
+                5,
+                100.0,
+                2.0,
+                2.0,
+            )],
+        )
+        .unwrap();
+    assert_stage_receipt(&full_stage, 251, 50_000, 50_000, &[]);
+    assert_eq!(archive.committed_count(), 50_000);
+    assert_eq!(archive.committed_records(), full_archive);
+    assert_eq!(
+        archive.combined_commit(251),
+        Ok(CommitReceipt {
+            completed_generation: 251,
+            next_generation: 252,
+            previous_committed_count: 50_000,
+            committed_count: 50_000,
+        })
+    );
+    assert_eq!(archive.current_generation(), 252);
+    assert_eq!(archive.committed_count(), 50_000);
+    assert_eq!(archive.committed_records(), full_archive);
+}
