@@ -1,9 +1,12 @@
 #[cfg(feature = "cuda")]
+use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2CalibrationBindingV2;
+#[cfg(feature = "cuda")]
 use crate::resident_trim_prefilter_v1::ResidentTrimmedPopulationSessionV1;
 
 #[cfg(feature = "cuda")]
 struct ResidentSearchAuthorityStateV3 {
     session: ResidentTrimmedPopulationSessionV1,
+    calibration: ResidentArchiveKnnCalibrationReceiptV2,
 }
 
 #[cfg(feature = "cuda")]
@@ -16,7 +19,7 @@ enum ResidentSearchRejectedTransitionV3 {
 
 pub struct ResidentArchiveKnnCalibrationReceiptV2 {
     #[cfg(feature = "cuda")]
-    inner: ResidentSearchAuthorityStateV3,
+    inner: ResidentSearchSlice2CalibrationBindingV2,
     #[cfg(not(feature = "cuda"))]
     #[allow(dead_code)]
     inner: core::convert::Infallible,
@@ -82,7 +85,7 @@ impl ResidentSearchGenerationChainV3 {
     ) -> Result<ResidentSearchRankEnqueuedV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.inner.session;
+            let _ = (&self.inner.session, &self.inner.calibration);
             Err(reject_resident_search_transition_v3(
                 self,
                 ResidentSearchRejectedTransitionV3::ScoreAndRank,
@@ -99,7 +102,7 @@ impl ResidentSearchGenerationChainV3 {
     ) -> Result<ResidentSearchTerminalPendingV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.inner.session;
+            let _ = (&self.inner.session, &self.inner.calibration);
             Err(reject_resident_search_transition_v3(
                 self,
                 ResidentSearchRejectedTransitionV3::TerminalSeal,
@@ -118,7 +121,7 @@ impl ResidentSearchRankEnqueuedV3 {
     ) -> Result<ResidentSearchArchiveStagedV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.inner.session;
+            let _ = (&self.inner.session, &self.inner.calibration);
             Err(reject_resident_search_transition_v3(
                 self,
                 ResidentSearchRejectedTransitionV3::StageArchiveFromRank,
@@ -137,7 +140,7 @@ impl ResidentSearchArchiveStagedV3 {
     ) -> Result<ResidentSearchGenerationChainV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.inner.session;
+            let _ = (&self.inner.session, &self.inner.calibration);
             Err(reject_resident_search_transition_v3(
                 self,
                 ResidentSearchRejectedTransitionV3::EvolveAndPublish,
@@ -185,7 +188,7 @@ impl ResidentSearchTerminalPendingV3 {
     ) -> Result<ResidentSearchTryCompleteV3, ResidentSearchTransitionErrorV3> {
         #[cfg(feature = "cuda")]
         {
-            let _ = &self.inner.session;
+            let _ = (&self.inner.session, &self.inner.calibration);
             Ok(ResidentSearchTryCompleteV3::NotReady(self))
         }
         #[cfg(not(feature = "cuda"))]
@@ -206,9 +209,13 @@ impl<A> ResidentSearchRejectedAuthorityV3<A> {
 #[cfg(feature = "cuda")]
 pub(crate) fn start_resident_search_slice2_v3(
     session: ResidentTrimmedPopulationSessionV1,
+    calibration: ResidentArchiveKnnCalibrationReceiptV2,
 ) -> ResidentSearchGenerationChainV3 {
     ResidentSearchGenerationChainV3 {
-        inner: ResidentSearchAuthorityStateV3 { session },
+        inner: ResidentSearchAuthorityStateV3 {
+            session,
+            calibration,
+        },
     }
 }
 
@@ -243,10 +250,11 @@ mod tests {
             source
                 .matches(concat!("inner: ResidentSearchAuthority", "StateV3,"))
                 .count(),
-            6
+            5
         );
         assert!(source.contains("struct ResidentSearchAuthorityStateV3 {"));
         assert!(source.contains("session: ResidentTrimmedPopulationSessionV1,"));
+        assert!(source.contains("calibration: ResidentArchiveKnnCalibrationReceiptV2,"));
         assert!(source.contains("pub(crate) fn start_resident_search_slice2_v3("));
         assert_eq!(
             source.matches(concat!("                ", "self,")).count(),
@@ -254,5 +262,58 @@ mod tests {
         );
         assert!(source.contains("Ok(ResidentSearchTryCompleteV3::NotReady(self))"));
         assert!(trim_source.contains("pub fn begin_resident_search_slice2_v3("));
+    }
+
+    #[test]
+    fn slice2_start_requires_and_retains_opaque_calibration_receipt() {
+        let source = include_str!("resident_search_slice2_v3.rs").replace("\r\n", "\n");
+        let trim_source = include_str!("resident_trim_prefilter_v1.rs").replace("\r\n", "\n");
+
+        let calibration_receipt = concat!(
+            "pub ",
+            "struct ResidentArchiveKnnCalibrationReceiptV2",
+            " {\n    #[cfg(feature = \"cuda\")]\n    inner: ResidentSearchSlice2CalibrationBindingV2,"
+        );
+        let authority_state = "struct ResidentSearchAuthorityStateV3 {\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n}";
+        let private_start = "pub(crate) fn start_resident_search_slice2_v3(\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n) -> ResidentSearchGenerationChainV3";
+        let public_start = "pub fn begin_resident_search_slice2_v3(\n        self,\n        calibration: crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2,\n    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3";
+
+        assert!(source.contains(
+            "use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2CalibrationBindingV2;"
+        ));
+        assert!(source.contains(calibration_receipt));
+        assert!(source.contains(authority_state));
+        assert!(source.contains(private_start));
+        assert!(trim_source.contains(public_start));
+        assert!(source.contains("ResidentSearchAuthorityStateV3 {\n            session,\n            calibration,\n        }"));
+        assert!(trim_source.contains("start_resident_search_slice2_v3(self, calibration)"));
+
+        assert!(!source.contains(
+            "session: ResidentTrimmedPopulationSessionV1,\n) -> ResidentSearchGenerationChainV3"
+        ));
+        assert!(
+            !trim_source.contains("pub fn begin_resident_search_slice2_v3(\n        self,\n    )")
+        );
+        assert_eq!(
+            source
+                .matches(concat!("ResidentArchiveKnnCalibrationReceiptV2", " {"))
+                .count(),
+            2,
+            "only the type declaration and Drop impl may open this opaque receipt"
+        );
+        for forbidden in [
+            concat!("impl ResidentArchiveKnn", "CalibrationReceiptV2"),
+            concat!("Clone for ResidentArchiveKnn", "CalibrationReceiptV2"),
+            concat!("Copy for ResidentArchiveKnn", "CalibrationReceiptV2"),
+            concat!("Default for ResidentArchiveKnn", "CalibrationReceiptV2"),
+            concat!("mint_", "calibration"),
+            concat!("fixture_", "calibration"),
+            concat!("calibration_", "binding(&self)"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "forbidden fabrication seam: {forbidden}"
+            );
+        }
     }
 }
